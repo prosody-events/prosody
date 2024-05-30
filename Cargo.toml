@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+
+members = ["bindings/nodejs", "bindings/python", "bindings/ruby", "prosody"]
+
+[workspace.dependencies]
+magnus = "0.6"
+neon = "1.0"
+pyo3 = "0.21"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"

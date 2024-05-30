@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+name = "prosody-node"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib"]
+name = "prosody"
+
+[dependencies]
+neon = { workspace = true, features = ["napi-8"] }

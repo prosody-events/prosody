@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+name = "ruby"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib"]
+name = "prosody"
+
+[dependencies]
+magnus.workspace = true

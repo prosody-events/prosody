@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+name = "prosody-python"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib"]
+name = "prosody"
+
+[dependencies]
+pyo3 = { workspace = true, features = ["abi3-py37"] }

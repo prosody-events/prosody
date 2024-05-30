@@ -1,0 +1,7 @@
+/bindings/nodejs/cargo.log
+/bindings/nodejs/index.node
+/bindings/nodejs/node_modules
+/bindings/python/.venv
+/bindings/ruby/lib/prosody/prosody.bundle
+/bindings/ruby/tmp/
+/target

@@ -1,0 +1,27 @@
+{
+  "name": "prosody",
+  "version": "0.1.0",
+  "description": "High-level Kafka interface",
+  "main": "",
+  "scripts": {
+    "test": "cargo test",
+    "cargo-build": "cargo build --message-format=json > cargo.log",
+    "cross-build": "cross build --message-format=json > cross.log",
+    "postcargo-build": "neon dist < cargo.log",
+    "postcross-build": "neon dist -m /target < cross.log",
+    "debug": "npm run cargo-build --",
+    "build": "npm run cargo-build -- --release",
+    "cross": "npm run cross-build -- --release"
+  },
+  "author": "Joshua Griffith <joshua.griffith@realgeeks.com>",
+  "license": "ISC",
+  "devDependencies": {
+    "@neon-rs/cli": "0.1.68"
+  },
+  "keywords": [
+    "kafka",
+    "events",
+    "producer",
+    "consumer"
+  ]
+}
