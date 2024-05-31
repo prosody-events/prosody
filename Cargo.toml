@@ -4,9 +4,18 @@ resolver = "2"
 members = ["bindings/nodejs", "bindings/python", "bindings/ruby", "prosody"]
 
 [workspace.dependencies]
+crossbeam-utils = "0.8"
+educe = "0.5"
+internment = "0.8"
 magnus = "0.6"
 neon = "1.0"
 pyo3 = "0.21"
+rdkafka = "0.36"
+serde = "1.0"
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = "1.37"
+tracing = "0.1"
 
 [profile.release]
 codegen-units = 1

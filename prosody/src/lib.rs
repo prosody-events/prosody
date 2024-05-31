@@ -1,14 +1,11 @@
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
+use internment::Intern;
+use serde_json::Value;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod consumer;
+pub mod producer;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub type Topic = Intern<str>;
+pub type Partition = i32;
+pub type Key = Box<str>;
+pub type Payload = Value;
+pub type Offset = i64;
