@@ -5,6 +5,13 @@ use crate::consumer::message::ConsumerMessage;
 
 pub mod message;
 mod offsets;
+mod partition;
+
+pub trait Keyed {
+    type Key;
+
+    fn key(&self) -> &Self::Key;
+}
 
 pub trait MessageHandler {
     type Error: Error;

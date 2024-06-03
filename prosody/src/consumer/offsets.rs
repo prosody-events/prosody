@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
+use educe::Educe;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::{channel, OwnedPermit, Receiver, Sender};
@@ -10,16 +11,31 @@ use tracing::warn;
 
 use crate::Offset;
 
+#[derive(Educe)]
+#[educe(Debug)]
 pub struct OffsetTracker {
+    #[educe(Debug(ignore))]
     action_tx: Sender<Action>,
+
+    #[educe(Debug(ignore))]
     watermark: Arc<CachePadded<AtomicI64>>,
 }
 
-pub struct OffsetPermit {
+pub struct ReservedOffsetSlot {
+    take_permit: OwnedPermit<Action>,
+    commit_permit: OwnedPermit<Action>,
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct UncommittedOffset {
     offset: Offset,
+
+    #[educe(Debug(ignore))]
     permit: Option<OwnedPermit<Action>>,
 }
 
+#[derive(Debug)]
 struct Action {
     offset: Offset,
     operation: Operation,
@@ -48,7 +64,7 @@ impl OffsetTracker {
         }
     }
 
-    pub async fn take(&self, offset: Offset) -> Result<OffsetPermit, OffsetTrackerError> {
+    pub async fn take(&self, offset: Offset) -> Result<UncommittedOffset, OffsetTrackerError> {
         let permit = Some(
             self.action_tx
                 .clone()
@@ -62,7 +78,7 @@ impl OffsetTracker {
             .await
             .map_err(|_| OffsetTrackerError::Shutdown)?;
 
-        Ok(OffsetPermit { offset, permit })
+        Ok(UncommittedOffset { offset, permit })
     }
 
     pub fn watermark(&self) -> Option<Offset> {
@@ -77,7 +93,7 @@ pub enum OffsetTrackerError {
     Shutdown,
 }
 
-impl OffsetPermit {
+impl UncommittedOffset {
     pub fn commit(mut self) {
         let Some(permit) = self.permit.take() else {
             return;
@@ -86,13 +102,13 @@ impl OffsetPermit {
     }
 }
 
-impl Drop for OffsetPermit {
+impl Drop for UncommittedOffset {
     fn drop(&mut self) {
         let Some(permit) = self.permit.take() else {
             return;
         };
 
-        warn!(%self.offset, "permit was dropped without committing; committing offset");
+        warn!(%self.offset, "offset was dropped without committing; committing");
         permit.send(Action::commit(self.offset));
     }
 }

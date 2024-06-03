@@ -2,7 +2,8 @@ use educe::Educe;
 use tracing::{debug, Span};
 
 use crate::{Key, Offset, Partition, Payload, Topic};
-use crate::consumer::offsets::OffsetPermit;
+use crate::consumer::Keyed;
+use crate::consumer::offsets::UncommittedOffset;
 
 #[derive(Educe)]
 #[educe(Debug)]
@@ -19,7 +20,7 @@ pub struct ConsumerMessage {
     span: Span,
 
     #[educe(Debug(ignore))]
-    permit: OffsetPermit,
+    permit: UncommittedOffset,
 }
 
 impl ConsumerMessage {
@@ -50,5 +51,13 @@ impl ConsumerMessage {
     pub fn commit(self) {
         debug!(%self.topic, %self.partition, %self.key, %self.offset, "committing message");
         self.permit.commit();
+    }
+}
+
+impl Keyed for ConsumerMessage {
+    type Key = Key;
+
+    fn key(&self) -> &Self::Key {
+        &self.key
     }
 }

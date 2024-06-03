@@ -4,11 +4,15 @@ resolver = "2"
 members = ["bindings/nodejs", "bindings/python", "bindings/ruby", "prosody"]
 
 [workspace.dependencies]
+ahash = "0.8"
 crossbeam-utils = "0.8"
-educe = "0.5"
+educe = "0.6"
+futures = "0.3"
 internment = "0.8"
 magnus = "0.6"
 neon = "1.0"
+nohash-hasher = "0.2"
+pin-project = "1.1"
 pyo3 = "0.21"
 rdkafka = "0.36"
 serde = "1.0"
