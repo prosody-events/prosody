@@ -26,7 +26,7 @@ fn prevents_concurrent_key_execution(messages: Messages) -> TestResult {
 
 async fn prevents_concurrent_key_execution_impl(Messages(messages): Messages) -> TestResult {
     let failed = Arc::new(AtomicBool::new(false));
-    let active_keys = Arc::new(HashSet::new());
+    let active_keys = Arc::new(HashSet::with_capacity(messages.len()));
 
     let process_fn = |key: u8| {
         let failed = failed.clone();
