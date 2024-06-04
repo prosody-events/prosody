@@ -7,9 +7,13 @@ use educe::Educe;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::{channel, OwnedPermit, Receiver, Sender};
-use tracing::warn;
+use tokio::task::JoinHandle;
+use tracing::{error, warn};
 
 use crate::Offset;
+
+#[cfg(test)]
+mod test;
 
 #[derive(Educe)]
 #[educe(Debug)]
@@ -19,6 +23,9 @@ pub struct OffsetTracker {
 
     #[educe(Debug(ignore))]
     watermark: Arc<CachePadded<AtomicI64>>,
+
+    #[educe(Debug(ignore))]
+    handle: JoinHandle<()>,
 }
 
 pub struct ReservedOffsetSlot {
@@ -35,7 +42,7 @@ pub struct UncommittedOffset {
     permit: Option<OwnedPermit<Action>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Action {
     offset: Offset,
     operation: Operation,
@@ -52,7 +59,7 @@ impl OffsetTracker {
         let (action_tx, action_rx) = channel(max_uncommitted);
         let watermark = Arc::new(CachePadded::new(AtomicI64::new(-1)));
 
-        spawn(track_watermark(
+        let handle = spawn(track_watermark(
             action_rx,
             watermark.clone(),
             watermark_version,
@@ -61,6 +68,7 @@ impl OffsetTracker {
         Self {
             action_tx,
             watermark,
+            handle,
         }
     }
 
@@ -85,6 +93,14 @@ impl OffsetTracker {
         let watermark = self.watermark.load(Ordering::Acquire);
         (watermark >= 0).then_some(watermark)
     }
+
+    pub async fn shutdown(self) -> Option<Offset> {
+        drop(self.action_tx);
+        let _ = self.handle.await;
+
+        let watermark = self.watermark.load(Ordering::Acquire);
+        (watermark >= 0).then_some(watermark)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -104,12 +120,11 @@ impl UncommittedOffset {
 
 impl Drop for UncommittedOffset {
     fn drop(&mut self) {
-        let Some(permit) = self.permit.take() else {
+        let Some(_) = self.permit.take() else {
             return;
         };
 
-        warn!(%self.offset, "offset was dropped without committing; committing");
-        permit.send(Action::commit(self.offset));
+        warn!(%self.offset, "offset was dropped without committing");
     }
 }
 
@@ -148,8 +163,8 @@ async fn track_watermark(
             }
         }
 
-        if let Some(offset) = new_watermark {
-            watermark.store(offset, Ordering::Release);
+        if let Some(new_offset) = new_watermark {
+            watermark.store(new_offset, Ordering::Release);
             watermark_version.fetch_add(1, Ordering::AcqRel);
         }
     }
