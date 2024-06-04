@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -16,15 +17,22 @@ use crate::consumer::partition::keyed::KeyManager;
 struct Messages(Vec<u8>);
 
 #[quickcheck]
-fn prevents_concurrent_key_execution(messages: Messages) -> TestResult {
+fn prevents_concurrent_key_execution(messages: Messages, max_enqueued: u8) -> TestResult {
     Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap()
-        .block_on(prevents_concurrent_key_execution_impl(messages))
+        .block_on(prevents_concurrent_key_execution_impl(
+            messages,
+            max_enqueued,
+        ))
 }
 
-async fn prevents_concurrent_key_execution_impl(Messages(messages): Messages) -> TestResult {
+async fn prevents_concurrent_key_execution_impl(
+    Messages(messages): Messages,
+    max_enqueued: u8,
+) -> TestResult {
+    let max_enqueued = max(max_enqueued as usize, 1);
     let failed = Arc::new(AtomicBool::new(false));
     let active_keys = Arc::new(HashSet::with_capacity(messages.len()));
 
@@ -42,7 +50,7 @@ async fn prevents_concurrent_key_execution_impl(Messages(messages): Messages) ->
         }
     };
 
-    KeyManager::new(process_fn, usize::MAX)
+    KeyManager::new(process_fn, max_enqueued)
         .process_messages(iter(messages), Some(Duration::from_millis(100)))
         .await;
 
