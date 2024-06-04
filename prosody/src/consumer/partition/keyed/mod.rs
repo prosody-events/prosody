@@ -2,15 +2,21 @@ use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::Hash;
+use std::time::Duration;
 
 use ahash::RandomState;
 use futures::{pin_mut, Stream, StreamExt};
 use futures::stream::FuturesUnordered;
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
+use tokio::time::sleep;
+use tracing::warn;
 
 use crate::consumer::Keyed;
 use crate::consumer::partition::util::WithValue;
+
+#[cfg(test)]
+mod test;
 
 type HashValue = u64;
 
@@ -37,7 +43,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         }
     }
 
-    pub async fn process_messages<S>(&mut self, messages: S)
+    pub async fn process_messages<S>(mut self, messages: S, shutdown_timeout: Option<Duration>)
     where
         S: Stream<Item = M>,
         M: Keyed,
@@ -49,13 +55,47 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
 
         loop {
             select! {
+                biased;
+
+                Some(hash_value) = self.executing.next() => {
+                    self.handle_completion(hash_value);
+                }
+
                 maybe_message = messages.next() => match maybe_message {
                     None => break,
                     Some(message) => self.handle_message(message).await,
                 },
+            }
+        }
+
+        let Some(timeout) = shutdown_timeout else {
+            let count = self.executing.len();
+            if count > 0 {
+                warn!("shutting down with {count} tasks in progress");
+            };
+
+            return;
+        };
+
+        let deadline = sleep(timeout);
+        pin_mut!(deadline);
+
+        loop {
+            select! {
+                biased;
+
+                _ = &mut deadline => {
+                    let count = self.executing.len();
+                    warn!("shutdown timeout reached with {count} tasks in progress");
+                    break;
+                }
 
                 Some(hash_value) = self.executing.next() => {
                     self.handle_completion(hash_value);
+                }
+
+                else => {
+                    break;
                 }
             }
         }

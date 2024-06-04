@@ -90,17 +90,19 @@ impl OffsetTracker {
     }
 
     pub fn watermark(&self) -> Option<Offset> {
-        let watermark = self.watermark.load(Ordering::Acquire);
-        (watermark >= 0).then_some(watermark)
+        fetch_watermark(&self.watermark)
     }
 
     pub async fn shutdown(self) -> Option<Offset> {
         drop(self.action_tx);
         let _ = self.handle.await;
-
-        let watermark = self.watermark.load(Ordering::Acquire);
-        (watermark >= 0).then_some(watermark)
+        fetch_watermark(&self.watermark)
     }
+}
+
+fn fetch_watermark(watermark: &CachePadded<AtomicI64>) -> Option<Offset> {
+    let watermark = watermark.load(Ordering::Acquire);
+    (watermark >= 0).then_some(watermark)
 }
 
 #[derive(Debug, Error)]

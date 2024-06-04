@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ahash::{HashMap, HashMapExt, HashSet};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
-use tokio::runtime::Runtime;
+use tokio::runtime::Builder;
 
 use crate::consumer::offsets::{Action, OffsetTracker, Operation};
 use crate::Offset;
@@ -14,7 +14,8 @@ struct Actions(Vec<Action>);
 
 #[quickcheck]
 fn tracks_commit_watermark(actions: Actions) -> TestResult {
-    Runtime::new()
+    Builder::new_current_thread()
+        .build()
         .unwrap()
         .block_on(tracks_commit_watermark_impl(actions))
 }

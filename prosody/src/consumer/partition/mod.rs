@@ -10,8 +10,8 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinHandle;
 use tracing::{debug, error};
 
-use crate::consumer::{Keyed, MessageHandler};
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::MessageHandler;
 use crate::consumer::offsets::OffsetTracker;
 use crate::Partition;
 
