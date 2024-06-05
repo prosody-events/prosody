@@ -634,7 +634,9 @@ dependencies = [
  "educe",
  "futures",
  "internment",
+ "log",
  "nohash-hasher",
+ "parking_lot",
  "pin-project",
  "quickcheck",
  "quickcheck_macros",
@@ -643,6 +645,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -1071,6 +1074,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.66",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "267ac89e0bec6e691e5813911606935d77c476ff49024f98abcea3e7b15e37af"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use tokio::runtime::Builder;
 
-use crate::consumer::offsets::{Action, OffsetTracker, Operation};
+use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation};
 use crate::Offset;
 
 #[derive(Clone, Debug)]

@@ -3,7 +3,7 @@ use tracing::{debug, Span};
 
 use crate::{Key, Offset, Partition, Payload, Topic};
 use crate::consumer::Keyed;
-use crate::consumer::offsets::UncommittedOffset;
+use crate::consumer::partition::offsets::UncommittedOffset;
 
 #[derive(Educe)]
 #[educe(Debug)]
@@ -20,7 +20,7 @@ pub struct ConsumerMessage {
     span: Span,
 
     #[educe(Debug(ignore))]
-    permit: UncommittedOffset,
+    uncommitted_offset: UncommittedOffset,
 }
 
 impl ConsumerMessage {
@@ -50,11 +50,51 @@ impl ConsumerMessage {
 
     pub fn commit(self) {
         debug!(%self.topic, %self.partition, %self.key, %self.offset, "committing message");
-        self.permit.commit();
+        self.uncommitted_offset.commit();
     }
 }
 
 impl Keyed for ConsumerMessage {
+    type Key = Key;
+
+    fn key(&self) -> &Self::Key {
+        &self.key
+    }
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub(crate) struct UntrackedMessage {
+    pub(crate) topic: Topic,
+    pub(crate) partition: Partition,
+    pub(crate) offset: Offset,
+    pub(crate) key: Key,
+
+    #[educe(Debug(ignore))]
+    pub(crate) payload: Payload,
+
+    #[educe(Debug(ignore))]
+    pub(crate) span: Span,
+}
+
+impl UntrackedMessage {
+    pub(crate) fn into_consumer_message(
+        self,
+        uncommitted_offset: UncommittedOffset,
+    ) -> ConsumerMessage {
+        ConsumerMessage {
+            topic: self.topic,
+            partition: self.partition,
+            offset: self.offset,
+            key: self.key,
+            payload: self.payload,
+            span: self.span,
+            uncommitted_offset,
+        }
+    }
+}
+
+impl Keyed for UntrackedMessage {
     type Key = Key;
 
     fn key(&self) -> &Self::Key {

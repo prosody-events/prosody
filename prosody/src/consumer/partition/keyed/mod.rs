@@ -20,7 +20,7 @@ mod test;
 
 type HashValue = u64;
 
-struct KeyManager<M, F, Fut> {
+pub struct KeyManager<M, F, Fut> {
     max_enqueued: usize,
     process: F,
     executing: FuturesUnordered<WithValue<HashValue, Fut>>,

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::{channel, OwnedPermit, Receiver, Sender};
@@ -15,7 +16,7 @@ use crate::Offset;
 #[cfg(test)]
 mod test;
 
-#[derive(Educe)]
+#[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct OffsetTracker {
     #[educe(Debug(ignore))]
@@ -25,7 +26,7 @@ pub struct OffsetTracker {
     watermark: Arc<CachePadded<AtomicI64>>,
 
     #[educe(Debug(ignore))]
-    handle: JoinHandle<()>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 pub struct ReservedOffsetSlot {
@@ -59,11 +60,11 @@ impl OffsetTracker {
         let (action_tx, action_rx) = channel(max_uncommitted);
         let watermark = Arc::new(CachePadded::new(AtomicI64::new(-1)));
 
-        let handle = spawn(track_watermark(
+        let handle = Arc::new(Mutex::new(Some(spawn(track_watermark(
             action_rx,
             watermark.clone(),
             watermark_version,
-        ));
+        )))));
 
         Self {
             action_tx,
@@ -95,7 +96,11 @@ impl OffsetTracker {
 
     pub async fn shutdown(self) -> Option<Offset> {
         drop(self.action_tx);
-        let _ = self.handle.await;
+        let Some(handle) = self.handle.lock().take() else {
+            return fetch_watermark(&self.watermark);
+        };
+
+        let _ = handle.await;
         fetch_watermark(&self.watermark)
     }
 }

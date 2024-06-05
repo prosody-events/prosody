@@ -4,7 +4,6 @@ use std::future::Future;
 use crate::consumer::message::ConsumerMessage;
 
 pub mod message;
-mod offsets;
 mod partition;
 
 pub trait Keyed {
@@ -20,7 +19,7 @@ pub trait MessageHandler {
         &self,
         context: &MessageContext,
         message: ConsumerMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 #[derive(Debug)]
