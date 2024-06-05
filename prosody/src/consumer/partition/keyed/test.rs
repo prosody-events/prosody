@@ -3,11 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ahash::HashSetExt;
 use futures::stream::iter;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
-use scc::HashSet;
+use scc::{HashMap, HashSet};
 use tokio::runtime::Builder;
 use tokio::time::sleep;
 
@@ -30,7 +29,7 @@ fn prevents_concurrent_key_execution(messages: Messages, max_enqueued: u8) -> Te
 }
 
 #[quickcheck]
-fn processes_all_messages(messages: ahash::HashSet<u8>, max_enqueued: u8) -> TestResult {
+fn processes_all_messages(messages: Vec<u8>, max_enqueued: u8) -> TestResult {
     Builder::new_current_thread()
         .enable_time()
         .build()
@@ -71,25 +70,27 @@ async fn prevents_concurrent_key_execution_impl(
     }
 }
 
-async fn processes_all_messages_impl(expected: ahash::HashSet<u8>, max_enqueued: u8) -> TestResult {
+async fn processes_all_messages_impl(messages: Vec<u8>, max_enqueued: u8) -> TestResult {
     let max_enqueued = max(max_enqueued as usize, 1);
-    let processed = Arc::new(HashSet::with_capacity(expected.len()));
+    let expected: HashMap<u8, usize> = HashMap::new();
+    let actual: Arc<HashMap<u8, usize>> = Arc::default();
+
+    for message in &messages {
+        *expected.entry_async(*message).await.or_default().get_mut() += 1;
+    }
 
     let process_fn = |key: u8| {
-        let processed = processed.clone();
-        async move { processed.insert_async(key).await }
+        let processed = actual.clone();
+        async move {
+            *processed.entry_async(key).await.or_default().get_mut() += 1;
+        }
     };
 
     KeyManager::new(process_fn, max_enqueued)
-        .process_messages(iter(expected.clone()), Some(Duration::from_millis(100)))
+        .process_messages(iter(messages), Some(Duration::from_millis(100)))
         .await;
 
-    let mut actual = ahash::HashSet::with_capacity(processed.len());
-    processed.scan(|&key| {
-        actual.insert(key);
-    });
-
-    if expected == actual {
+    if &expected == actual.as_ref() {
         TestResult::passed()
     } else {
         TestResult::failed()
