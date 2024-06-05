@@ -90,12 +90,11 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                     break;
                 }
 
-                Some(hash_value) = self.executing.next() => {
-                    self.handle_completion(hash_value);
-                }
-
-                else => {
-                    break;
+                maybe_hash_value = self.executing.next() => {
+                    match maybe_hash_value {
+                        None => break,
+                        Some(hash_value) => self.handle_completion(hash_value),
+                    };
                 }
             }
         }
