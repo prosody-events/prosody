@@ -34,6 +34,11 @@ where
             return;
         };
 
+        // see: https://github.com/fede1024/rust-rdkafka/issues/681
+        if partitions.capacity() == 0 {
+            return;
+        }
+
         for element in partitions.elements() {
             let topic = Topic::from(element.topic());
             let partition = element.partition();
@@ -57,6 +62,11 @@ where
         let Rebalance::Revoke(partitions) = rebalance else {
             return;
         };
+
+        // see: https://github.com/fede1024/rust-rdkafka/issues/681
+        if partitions.capacity() == 0 {
+            return;
+        }
 
         for element in partitions.elements() {
             let topic = Topic::from(element.topic());
