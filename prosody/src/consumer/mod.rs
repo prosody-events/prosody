@@ -3,8 +3,10 @@ use std::future::Future;
 
 use crate::consumer::message::ConsumerMessage;
 
+mod context;
 pub mod message;
 mod partition;
+mod poll;
 
 pub trait Keyed {
     type Key;
@@ -24,3 +26,5 @@ pub trait MessageHandler {
 
 #[derive(Debug)]
 pub struct MessageContext;
+
+pub struct KafkaConsumer {}

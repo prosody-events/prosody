@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::{channel, OwnedPermit, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{error, instrument, warn};
 
 use crate::Offset;
 
@@ -73,6 +73,7 @@ impl OffsetTracker {
         }
     }
 
+    #[instrument(level = "debug")]
     pub async fn take(&self, offset: Offset) -> Result<UncommittedOffset, OffsetTrackerError> {
         let permit = Some(
             self.action_tx
@@ -94,6 +95,7 @@ impl OffsetTracker {
         fetch_watermark(&self.watermark)
     }
 
+    #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
         drop(self.action_tx);
         let Some(handle) = self.handle.lock().take() else {

@@ -9,11 +9,11 @@ crossbeam-utils.workspace = true
 educe.workspace = true
 futures.workspace = true
 internment.workspace = true
-log = "0.4.21"
 nohash-hasher.workspace = true
 parking_lot.workspace = true
 pin-project.workspace = true
 rdkafka.workspace = true
+scc.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }
@@ -23,5 +23,4 @@ tracing.workspace = true
 [dev-dependencies]
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
-scc.workspace = true
 tokio = { workspace = true, features = ["rt"] }

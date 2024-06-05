@@ -634,7 +634,6 @@ dependencies = [
  "educe",
  "futures",
  "internment",
- "log",
  "nohash-hasher",
  "parking_lot",
  "pin-project",

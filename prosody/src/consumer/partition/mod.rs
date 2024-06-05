@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error};
+use tracing::{error, info_span, instrument, Instrument};
 
 use crate::{Offset, Partition};
 use crate::consumer::{MessageContext, MessageHandler};
@@ -54,7 +54,6 @@ impl PartitionManager {
         let (message_tx, message_rx) = channel(buffer_size);
 
         let handle = spawn(handle_messages(
-            partition,
             message_handler,
             offsets.clone(),
             message_rx,
@@ -79,8 +78,8 @@ impl PartitionManager {
         self.offsets.watermark()
     }
 
+    #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
-        debug!(%self.partition, "shutting down partition");
         drop(self.message_tx);
 
         if let Err(error) = self.handle.await {
@@ -92,7 +91,6 @@ impl PartitionManager {
 }
 
 async fn handle_messages<T>(
-    partition: Partition,
     message_handler: T,
     offsets: OffsetTracker,
     message_rx: Receiver<UntrackedMessage>,
@@ -101,21 +99,27 @@ async fn handle_messages<T>(
 ) where
     T: MessageHandler,
 {
-    let process = |received: UntrackedMessage| async {
-        let message = match offsets.take(received.offset).await {
-            Ok(uncommitted_offset) => received.into_consumer_message(uncommitted_offset),
-            Err(error) => {
-                error!(
-                    %partition, ?received,
-                    "unable to take uncommitted offset: {error:#}; discarding message"
-                );
-                return;
-            }
-        };
+    let process = |received: UntrackedMessage| {
+        let parent_span = received.span.clone();
+        let span = info_span!(parent: &parent_span, "process-message",);
 
-        if let Err(error) = message_handler.handle(&MessageContext, message).await {
-            error!(%partition, "message handler returned an error: {error:#}");
+        async {
+            let message = match offsets.take(received.offset).await {
+                Ok(uncommitted_offset) => received.into_consumer_message(uncommitted_offset),
+                Err(error) => {
+                    error!(
+                        ?received,
+                        "unable to take uncommitted offset: {error:#}; discarding message"
+                    );
+                    return;
+                }
+            };
+
+            if let Err(error) = message_handler.handle(&MessageContext, message).await {
+                error!("message handler returned an error: {error:#}");
+            }
         }
+        .instrument(span)
     };
 
     KeyManager::new(process, max_enqueued)
