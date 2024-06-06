@@ -1,13 +1,15 @@
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
+use ahash::HashMap;
 use crossbeam_utils::CachePadded;
+use parking_lot::Mutex;
 use rdkafka::ClientContext;
 use rdkafka::consumer::{ConsumerContext, Rebalance};
-use scc::HashMap;
 use tokio::runtime::Handle;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{Partition, Topic};
 use crate::consumer::MessageHandler;
@@ -20,7 +22,7 @@ pub struct Context<T> {
     shutdown_timeout: Option<Duration>,
     message_handler: T,
     watermark_version: Arc<CachePadded<AtomicUsize>>,
-    managers: Arc<HashMap<(Topic, Partition), PartitionManager>>,
+    managers: Arc<Mutex<HashMap<(Topic, Partition), PartitionManager>>>,
 }
 
 impl<T> ClientContext for Context<T> where T: Send + Sync {}
@@ -35,13 +37,20 @@ where
         };
 
         // see: https://github.com/fede1024/rust-rdkafka/issues/681
-        if partitions.capacity() == 0 {
+        if partitions.count() == 0 {
             return;
         }
 
         for element in partitions.elements() {
             let topic = Topic::from(element.topic());
             let partition = element.partition();
+            let mut managers = self.managers.lock();
+
+            let Entry::Vacant(vacant) = managers.entry((topic, partition)) else {
+                warn!("topic {topic} partition {partition} was already assigned");
+                continue;
+            };
+
             let manager = PartitionManager::new(
                 element.partition(),
                 self.message_handler.clone(),
@@ -52,9 +61,7 @@ where
                 self.watermark_version.clone(),
             );
 
-            if self.managers.insert((topic, partition), manager).is_err() {
-                error!("cannot assign topic {topic} partition {partition}; already assigned");
-            }
+            vacant.insert(manager);
         }
     }
 
@@ -64,14 +71,14 @@ where
         };
 
         // see: https://github.com/fede1024/rust-rdkafka/issues/681
-        if partitions.capacity() == 0 {
+        if partitions.count() == 0 {
             return;
         }
 
         for element in partitions.elements() {
             let topic = Topic::from(element.topic());
             let partition = element.partition();
-            let Some((_, manager)) = self.managers.remove(&(topic, partition)) else {
+            let Some(manager) = self.managers.lock().remove(&(topic, partition)) else {
                 error!("cannot revoke topic {topic} partition {partition}; not assigned");
                 continue;
             };

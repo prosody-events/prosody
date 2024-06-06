@@ -29,11 +29,6 @@ pub struct OffsetTracker {
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-pub struct ReservedOffsetSlot {
-    take_permit: OwnedPermit<Action>,
-    commit_permit: OwnedPermit<Action>,
-}
-
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct UncommittedOffset {

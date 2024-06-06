@@ -7,7 +7,7 @@ use educe::Educe;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::mpsc::error::SendError;
+use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info_span, instrument, Instrument};
@@ -67,6 +67,19 @@ impl PartitionManager {
             message_tx,
             handle,
         }
+    }
+
+    pub fn has_capacity(&self) -> bool {
+        self.message_tx.capacity() > 0
+    }
+
+    pub fn try_send(&self, message: UntrackedMessage) -> Result<(), UntrackedMessage> {
+        self.message_tx
+            .try_send(message)
+            .map_err(|error| match error {
+                TrySendError::Full(message) => message,
+                TrySendError::Closed(message) => message,
+            })
     }
 
     pub async fn send(&self, message: UntrackedMessage) -> Result<(), PartitionError> {
