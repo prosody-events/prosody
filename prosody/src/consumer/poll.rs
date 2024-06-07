@@ -40,7 +40,7 @@ pub fn poll<T>(
             &commit_interval,
             &consumer,
             &watermark_version,
-            &managers.lock(),
+            &managers,
             &mut last_version,
             &mut last_commit,
         );
@@ -103,7 +103,7 @@ pub fn poll<T>(
         };
 
         loop {
-            let Err(error) = dispatch(message, managers.lock().deref_mut()) else {
+            let Err(error) = dispatch_message(message, &managers) else {
                 break;
             };
 
@@ -119,6 +119,45 @@ pub fn poll<T>(
                 }
             }
         }
+    }
+}
+
+fn commit_watermarks<T>(
+    commit_interval: &Duration,
+    consumer: &BaseConsumer<Context<T>>,
+    watermark_version: &CachePadded<AtomicUsize>,
+    managers: &Mutex<HashMap<(Topic, Partition), PartitionManager>>,
+    last_version: &mut usize,
+    last_commit: &mut Instant,
+) where
+    T: MessageHandler + Clone + Send + Sync + 'static,
+{
+    let current_version = watermark_version.load(Ordering::Acquire);
+    if current_version == *last_version {
+        return;
+    }
+
+    let now = Instant::now();
+    if now.duration_since(*last_commit) < *commit_interval {
+        return;
+    }
+
+    let mut success = true;
+    let managers = managers.lock();
+    for ((topic, partition), manager) in managers.iter() {
+        let Some(watermark) = manager.watermark() else {
+            continue;
+        };
+
+        if let Err(error) = consumer.store_offset(topic, *partition, watermark) {
+            error!(%topic, %partition, %watermark, "failed to commit offset: #{error:#}");
+            success = false;
+        }
+    }
+
+    if success {
+        *last_version = current_version;
+        *last_commit = now;
     }
 }
 
@@ -161,10 +200,11 @@ where
     Ok(())
 }
 
-fn dispatch(
+fn dispatch_message(
     message: UntrackedMessage,
-    managers: &mut HashMap<(Topic, Partition), PartitionManager>,
+    managers: &Mutex<HashMap<(Topic, Partition), PartitionManager>>,
 ) -> Result<(), DispatchError> {
+    let managers = managers.lock();
     let Some(manager) = managers.get(&(message.topic, message.partition)) else {
         return Err(DispatchError::PartitionNotFound(message));
     };
@@ -174,44 +214,6 @@ fn dispatch(
     };
 
     Err(DispatchError::Busy(message))
-}
-
-fn commit_watermarks<T>(
-    commit_interval: &Duration,
-    consumer: &BaseConsumer<Context<T>>,
-    watermark_version: &CachePadded<AtomicUsize>,
-    managers: &HashMap<(Topic, Partition), PartitionManager>,
-    last_version: &mut usize,
-    last_commit: &mut Instant,
-) where
-    T: MessageHandler + Clone + Send + Sync + 'static,
-{
-    let current_version = watermark_version.load(Ordering::Acquire);
-    if current_version == *last_version {
-        return;
-    }
-
-    let now = Instant::now();
-    if now.duration_since(*last_commit) < *commit_interval {
-        return;
-    }
-
-    let mut success = true;
-    for ((topic, partition), manager) in managers.iter() {
-        let Some(watermark) = manager.watermark() else {
-            continue;
-        };
-
-        if let Err(error) = consumer.store_offset(topic, *partition, watermark) {
-            error!(%topic, %partition, %watermark, "failed to commit offset: #{error:#}");
-            success = false;
-        }
-    }
-
-    if success {
-        *last_version = current_version;
-        *last_commit = now;
-    }
 }
 
 #[derive(Debug, Error)]
