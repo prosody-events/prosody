@@ -1,7 +1,6 @@
 use std::ops::DerefMut;
-use std::str::Utf8Error;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -30,9 +29,15 @@ pub fn poll<T>(
 ) where
     T: MessageHandler + Clone + Send + Sync + 'static,
 {
+    let mut last_version = watermark_version.load(Ordering::Acquire);
     let mut is_paused = false;
 
     loop {
+        let current_version = watermark_version.load(Ordering::Acquire);
+        if current_version != last_version && commit_watermarks(&consumer, &managers.lock()) {
+            last_version = current_version;
+        }
+
         if let Err(error) = pause_busy_partitions(&mut is_paused, &consumer, &managers) {
             error!("error pausing busy partitions: {error:#}; retrying");
             sleep(poll_interval);
@@ -162,6 +167,28 @@ fn dispatch(
     };
 
     Err(DispatchError::Busy(message))
+}
+
+fn commit_watermarks<T>(
+    consumer: &BaseConsumer<Context<T>>,
+    managers: &HashMap<(Topic, Partition), PartitionManager>,
+) -> bool
+where
+    T: MessageHandler + Clone + Send + Sync + 'static,
+{
+    let mut success = true;
+    for ((topic, partition), manager) in managers.iter() {
+        let Some(watermark) = manager.watermark() else {
+            continue;
+        };
+
+        if let Err(error) = consumer.store_offset(topic, *partition, watermark) {
+            error!(%topic, %partition, %watermark, "failed to commit offset: #{error:#}");
+            success = false;
+        }
+    }
+
+    success
 }
 
 #[derive(Debug, Error)]
