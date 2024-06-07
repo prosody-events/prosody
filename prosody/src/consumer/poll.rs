@@ -1,8 +1,9 @@
 use std::ops::DerefMut;
+use std::str;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ahash::HashMap;
 use crossbeam_utils::CachePadded;
@@ -15,7 +16,7 @@ use rdkafka::util::Timeout;
 use thiserror::Error;
 use tracing::{error, Span};
 
-use crate::{Key, Offset, Partition, Payload, Topic};
+use crate::{Partition, Topic};
 use crate::consumer::context::Context;
 use crate::consumer::message::UntrackedMessage;
 use crate::consumer::MessageHandler;
@@ -23,6 +24,7 @@ use crate::consumer::partition::PartitionManager;
 
 pub fn poll<T>(
     poll_interval: Duration,
+    commit_interval: Duration,
     consumer: BaseConsumer<Context<T>>,
     watermark_version: Arc<CachePadded<AtomicUsize>>,
     managers: Arc<Mutex<HashMap<(Topic, Partition), PartitionManager>>>,
@@ -30,13 +32,18 @@ pub fn poll<T>(
     T: MessageHandler + Clone + Send + Sync + 'static,
 {
     let mut last_version = watermark_version.load(Ordering::Acquire);
+    let mut last_commit = Instant::now();
     let mut is_paused = false;
 
     loop {
-        let current_version = watermark_version.load(Ordering::Acquire);
-        if current_version != last_version && commit_watermarks(&consumer, &managers.lock()) {
-            last_version = current_version;
-        }
+        commit_watermarks(
+            &commit_interval,
+            &consumer,
+            &watermark_version,
+            &managers.lock(),
+            &mut last_version,
+            &mut last_commit,
+        );
 
         if let Err(error) = pause_busy_partitions(&mut is_paused, &consumer, &managers) {
             error!("error pausing busy partitions: {error:#}; retrying");
@@ -56,9 +63,9 @@ pub fn poll<T>(
             }
         };
 
-        let topic: Topic = Intern::from(message.topic());
-        let partition: Partition = message.partition();
-        let offset: Offset = message.offset();
+        let topic = Intern::from(message.topic());
+        let partition = message.partition();
+        let offset = message.offset();
 
         let Some(key_data) = message.key() else {
             error!("missing key on {topic}:{partition}@{offset}; discarding message");
@@ -70,7 +77,7 @@ pub fn poll<T>(
             continue;
         };
 
-        let key: Key = match std::str::from_utf8(key_data) {
+        let key = match str::from_utf8(key_data) {
             Ok(key) => key.into(),
             Err(error) => {
                 error!("invalid key encoding: {error:#}; discarding message");
@@ -78,7 +85,7 @@ pub fn poll<T>(
             }
         };
 
-        let payload: Payload = match serde_json::from_slice(payload_data) {
+        let payload = match serde_json::from_slice(payload_data) {
             Ok(payload) => payload,
             Err(error) => {
                 error!("invalid payload on {topic}:{partition}@{offset}: {error:#}; discarding message");
@@ -170,12 +177,25 @@ fn dispatch(
 }
 
 fn commit_watermarks<T>(
+    commit_interval: &Duration,
     consumer: &BaseConsumer<Context<T>>,
+    watermark_version: &CachePadded<AtomicUsize>,
     managers: &HashMap<(Topic, Partition), PartitionManager>,
-) -> bool
-where
+    last_version: &mut usize,
+    last_commit: &mut Instant,
+) where
     T: MessageHandler + Clone + Send + Sync + 'static,
 {
+    let current_version = watermark_version.load(Ordering::Acquire);
+    if current_version == *last_version {
+        return;
+    }
+
+    let now = Instant::now();
+    if now.duration_since(*last_commit) < *commit_interval {
+        return;
+    }
+
     let mut success = true;
     for ((topic, partition), manager) in managers.iter() {
         let Some(watermark) = manager.watermark() else {
@@ -188,7 +208,10 @@ where
         }
     }
 
-    success
+    if success {
+        *last_version = current_version;
+        *last_commit = now;
+    }
 }
 
 #[derive(Debug, Error)]
