@@ -1,14 +1,11 @@
 use std::str;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use ahash::HashMap;
-use crossbeam_utils::CachePadded;
 use internment::Intern;
 use opentelemetry::propagation::TextMapPropagator;
-use parking_lot::Mutex;
 use rdkafka::{Message, TopicPartitionList};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
@@ -18,20 +15,21 @@ use tracing::{error, info_span, warn};
 use tracing::field::Empty;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::{Key, Partition, Topic};
+use crate::consumer::{Managers, MessageHandler, WatermarkVersion};
 use crate::consumer::context::Context;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::UntrackedMessage;
-use crate::consumer::MessageHandler;
 use crate::consumer::partition::PartitionManager;
+use crate::Key;
 use crate::propagator::new_propagator;
 
 pub fn poll<T>(
     poll_interval: Duration,
     commit_interval: Duration,
     consumer: BaseConsumer<Context<T>>,
-    watermark_version: Arc<CachePadded<AtomicUsize>>,
-    managers: Arc<Mutex<HashMap<(Topic, Partition), PartitionManager>>>,
+    watermark_version: Arc<WatermarkVersion>,
+    managers: Arc<Managers>,
+    shutdown: Arc<AtomicBool>,
 ) where
     T: MessageHandler + Clone + Send + Sync + 'static,
 {
@@ -40,7 +38,7 @@ pub fn poll<T>(
     let mut last_commit = Instant::now();
     let mut is_paused = false;
 
-    loop {
+    while !shutdown.load(Ordering::Relaxed) {
         commit_watermarks(
             &commit_interval,
             &consumer,
@@ -82,12 +80,12 @@ pub fn poll<T>(
         let _enter = span.enter();
 
         let Some(key_data) = message.key() else {
-            error!("missing key on {topic}:{partition}@{offset}; discarding message");
+            error!("missing key; discarding message");
             continue;
         };
 
         let Some(payload_data) = message.payload() else {
-            error!("missing payload on {topic}:{partition}@{offset}; discarding message");
+            error!("missing payload; discarding message");
             continue;
         };
         span.record("payload_size", payload_data.len());
@@ -106,7 +104,7 @@ pub fn poll<T>(
         let payload = match serde_json::from_slice(payload_data) {
             Ok(payload) => payload,
             Err(error) => {
-                error!("invalid payload on {topic}:{partition}@{offset}: {error:#}; discarding message");
+                error!("invalid payload: {error:#}; discarding message");
                 continue;
             }
         };
@@ -143,8 +141,8 @@ pub fn poll<T>(
 fn commit_watermarks<T>(
     commit_interval: &Duration,
     consumer: &BaseConsumer<Context<T>>,
-    watermark_version: &CachePadded<AtomicUsize>,
-    managers: &Mutex<HashMap<(Topic, Partition), PartitionManager>>,
+    watermark_version: &WatermarkVersion,
+    managers: &Managers,
     last_version: &mut usize,
     last_commit: &mut Instant,
 ) where
@@ -183,7 +181,7 @@ fn commit_watermarks<T>(
 fn pause_busy_partitions<T>(
     is_paused: &mut bool,
     consumer: &BaseConsumer<Context<T>>,
-    managers: &Mutex<HashMap<(Topic, Partition), PartitionManager>>,
+    managers: &Managers,
 ) -> Result<(), KafkaError>
 where
     T: MessageHandler + Clone + Send + Sync + 'static,
@@ -219,10 +217,7 @@ where
     Ok(())
 }
 
-fn dispatch_message(
-    message: UntrackedMessage,
-    managers: &Mutex<HashMap<(Topic, Partition), PartitionManager>>,
-) -> Result<(), DispatchError> {
+fn dispatch_message(message: UntrackedMessage, managers: &Managers) -> Result<(), DispatchError> {
     let managers = managers.lock();
     let Some(manager) = managers.get(&(message.topic, message.partition)) else {
         return Err(DispatchError::PartitionNotFound(message));

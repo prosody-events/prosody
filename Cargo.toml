@@ -5,9 +5,11 @@ members = ["bindings/nodejs", "bindings/python", "bindings/ruby", "prosody"]
 
 [workspace.dependencies]
 ahash = "0.8"
+confique = "0.2"
 crossbeam-utils = "0.8"
 educe = "0.6"
 futures = "0.3"
+humantime-serde = "1.1"
 internment = "0.8"
 magnus = "0.6"
 neon = "1.0"
@@ -28,6 +30,8 @@ tokio = "1.37"
 tokio-stream = "0.1"
 tracing = "0.1"
 tracing-opentelemetry = "0.24"
+validator = "0.18"
+whoami = "1.5"
 
 [profile.release]
 codegen-units = 1

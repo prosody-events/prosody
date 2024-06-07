@@ -13,8 +13,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info_span, instrument, Instrument};
 
 use crate::{Offset, Partition};
-use crate::consumer::{MessageContext, MessageHandler};
 use crate::consumer::message::UntrackedMessage;
+use crate::consumer::MessageHandler;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 
@@ -43,7 +43,7 @@ impl PartitionManager {
         message_handler: T,
         buffer_size: usize,
         max_uncommitted: usize,
-        max_enqueued: usize,
+        max_enqueued_per_key: usize,
         shutdown_timeout: Option<Duration>,
         watermark_version: Arc<CachePadded<AtomicUsize>>,
     ) -> Self
@@ -57,7 +57,7 @@ impl PartitionManager {
             message_handler,
             offsets.clone(),
             message_rx,
-            max_enqueued,
+            max_enqueued_per_key,
             shutdown_timeout,
         ));
 
@@ -82,11 +82,6 @@ impl PartitionManager {
             })
     }
 
-    pub async fn send(&self, message: UntrackedMessage) -> Result<(), PartitionError> {
-        self.message_tx.send(message).await?;
-        Ok(())
-    }
-
     pub fn watermark(&self) -> Option<Offset> {
         self.offsets.watermark()
     }
@@ -107,7 +102,7 @@ async fn handle_messages<T>(
     message_handler: T,
     offsets: OffsetTracker,
     message_rx: Receiver<UntrackedMessage>,
-    max_enqueued: usize,
+    max_enqueued_per_key: usize,
     shutdown_timeout: Option<Duration>,
 ) where
     T: MessageHandler,
@@ -128,14 +123,14 @@ async fn handle_messages<T>(
                 }
             };
 
-            if let Err(error) = message_handler.handle(&MessageContext, message).await {
+            if let Err(error) = message_handler.handle(message).await {
                 error!("message handler returned an error: {error:#}");
             }
         }
         .instrument(span)
     };
 
-    KeyManager::new(process, max_enqueued)
+    KeyManager::new(process, max_enqueued_per_key)
         .process_messages(ReceiverStream::new(message_rx), shutdown_timeout)
         .await;
 }

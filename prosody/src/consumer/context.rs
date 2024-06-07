@@ -1,28 +1,43 @@
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use ahash::HashMap;
-use crossbeam_utils::CachePadded;
-use parking_lot::Mutex;
 use rdkafka::ClientContext;
 use rdkafka::consumer::{ConsumerContext, Rebalance};
 use tokio::runtime::Handle;
 use tracing::{error, warn};
 
-use crate::{Partition, Topic};
-use crate::consumer::MessageHandler;
+use crate::consumer::{ConsumerConfiguration, Managers, MessageHandler, WatermarkVersion};
 use crate::consumer::partition::PartitionManager;
+use crate::Topic;
 
 pub struct Context<T> {
     buffer_size: usize,
     max_uncommitted: usize,
-    max_enqueued: usize,
+    max_enqueued_per_key: usize,
     shutdown_timeout: Option<Duration>,
     message_handler: T,
-    watermark_version: Arc<CachePadded<AtomicUsize>>,
-    managers: Arc<Mutex<HashMap<(Topic, Partition), PartitionManager>>>,
+    watermark_version: Arc<WatermarkVersion>,
+    managers: Arc<Managers>,
+}
+
+impl<T> Context<T> {
+    pub fn new(
+        config: &ConsumerConfiguration,
+        message_handler: T,
+        watermark_version: Arc<WatermarkVersion>,
+        managers: Arc<Managers>,
+    ) -> Self {
+        Self {
+            buffer_size: config.max_uncommitted,
+            max_uncommitted: config.max_uncommitted,
+            max_enqueued_per_key: config.max_enqueued_per_key,
+            shutdown_timeout: config.partition_shutdown_timeout,
+            message_handler,
+            watermark_version,
+            managers,
+        }
+    }
 }
 
 impl<T> ClientContext for Context<T> where T: Send + Sync {}
@@ -56,7 +71,7 @@ where
                 self.message_handler.clone(),
                 self.buffer_size,
                 self.max_uncommitted,
-                self.max_enqueued,
+                self.max_enqueued_per_key,
                 self.shutdown_timeout,
                 self.watermark_version.clone(),
             );

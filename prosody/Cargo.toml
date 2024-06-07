@@ -5,9 +5,11 @@ version = "0.1.0"
 
 [dependencies]
 ahash.workspace = true
+confique.workspace = true
 crossbeam-utils.workspace = true
 educe.workspace = true
 futures.workspace = true
+humantime-serde.workspace = true
 internment.workspace = true
 nohash-hasher.workspace = true
 opentelemetry.workspace = true
@@ -15,12 +17,15 @@ opentelemetry_sdk.workspace = true
 parking_lot.workspace = true
 pin-project.workspace = true
 rdkafka.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }
 tokio-stream.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
+validator = { workspace = true, features = ["derive"] }
+whoami.workspace = true
 
 [dev-dependencies]
 quickcheck.workspace = true

@@ -21,7 +21,7 @@ mod test;
 type HashValue = u64;
 
 pub struct KeyManager<M, F, Fut> {
-    max_enqueued: usize,
+    max_enqueued_per_key: usize,
     process: F,
     executing: FuturesUnordered<WithValue<HashValue, Fut>>,
     busy: IntSet<HashValue>,
@@ -30,11 +30,11 @@ pub struct KeyManager<M, F, Fut> {
 }
 
 impl<M, F, Fut> KeyManager<M, F, Fut> {
-    pub fn new(process: F, max_enqueued: usize) -> Self {
-        debug_assert!(max_enqueued > 0);
+    pub fn new(process: F, max_enqueued_per_key: usize) -> Self {
+        debug_assert!(max_enqueued_per_key > 0);
 
         Self {
-            max_enqueued,
+            max_enqueued_per_key,
             process,
             executing: FuturesUnordered::default(),
             busy: IntSet::default(),
@@ -146,7 +146,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             .map(VecDeque::len)
             .unwrap_or_default();
 
-        if queue_len >= self.max_enqueued {
+        if queue_len >= self.max_enqueued_per_key {
             while let Some(value) = self.executing.next().await {
                 self.handle_completion(value);
 
