@@ -3,6 +3,7 @@ use serde_json::Value;
 
 pub mod consumer;
 pub mod producer;
+mod propagator;
 
 pub type Topic = Intern<str>;
 pub type Partition = i32;

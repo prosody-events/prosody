@@ -4,6 +4,7 @@ use std::future::Future;
 use crate::consumer::message::ConsumerMessage;
 
 mod context;
+mod extractor;
 pub mod message;
 mod partition;
 mod poll;

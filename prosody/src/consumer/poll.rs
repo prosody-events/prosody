@@ -1,4 +1,3 @@
-use std::ops::DerefMut;
 use std::str;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,19 +7,24 @@ use std::time::{Duration, Instant};
 use ahash::HashMap;
 use crossbeam_utils::CachePadded;
 use internment::Intern;
+use opentelemetry::propagation::TextMapPropagator;
 use parking_lot::Mutex;
 use rdkafka::{Message, TopicPartitionList};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::util::Timeout;
 use thiserror::Error;
-use tracing::{error, Span};
+use tracing::{error, info_span, warn};
+use tracing::field::Empty;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::{Partition, Topic};
+use crate::{Key, Partition, Topic};
 use crate::consumer::context::Context;
+use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::UntrackedMessage;
 use crate::consumer::MessageHandler;
 use crate::consumer::partition::PartitionManager;
+use crate::propagator::new_propagator;
 
 pub fn poll<T>(
     poll_interval: Duration,
@@ -31,6 +35,7 @@ pub fn poll<T>(
 ) where
     T: MessageHandler + Clone + Send + Sync + 'static,
 {
+    let propagator = new_propagator();
     let mut last_version = watermark_version.load(Ordering::Acquire);
     let mut last_commit = Instant::now();
     let mut is_paused = false;
@@ -67,6 +72,15 @@ pub fn poll<T>(
         let partition = message.partition();
         let offset = message.offset();
 
+        let context = propagator.extract(&MessageExtractor::new(&message));
+        let span = info_span!(
+            "receive-message",
+            %topic, %partition, %offset, key = Empty, payload_size = Empty
+        );
+
+        span.set_parent(context);
+        let _enter = span.enter();
+
         let Some(key_data) = message.key() else {
             error!("missing key on {topic}:{partition}@{offset}; discarding message");
             continue;
@@ -76,9 +90,13 @@ pub fn poll<T>(
             error!("missing payload on {topic}:{partition}@{offset}; discarding message");
             continue;
         };
+        span.record("payload_size", payload_data.len());
 
-        let key = match str::from_utf8(key_data) {
-            Ok(key) => key.into(),
+        let key: Key = match str::from_utf8(key_data) {
+            Ok(key) => {
+                span.record("key", key);
+                key.into()
+            }
             Err(error) => {
                 error!("invalid key encoding: {error:#}; discarding message");
                 continue;
@@ -99,7 +117,7 @@ pub fn poll<T>(
             offset,
             key,
             payload,
-            span: Span::current(), // todo: extract from headers
+            span: span.clone(),
         };
 
         loop {
@@ -109,7 +127,7 @@ pub fn poll<T>(
 
             match error {
                 DispatchError::PartitionNotFound(_) => {
-                    error!("failed to dispatch message: {error:#}; discarding");
+                    warn!("failed to dispatch message: {error:#}; discarding");
                     break;
                 }
                 DispatchError::Busy(failed) => {
@@ -144,6 +162,7 @@ fn commit_watermarks<T>(
 
     let mut success = true;
     let managers = managers.lock();
+
     for ((topic, partition), manager) in managers.iter() {
         let Some(watermark) = manager.watermark() else {
             continue;
