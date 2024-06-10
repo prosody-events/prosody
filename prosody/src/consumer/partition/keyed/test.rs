@@ -1,6 +1,6 @@
 use std::cmp::max;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::iter;
@@ -10,8 +10,8 @@ use scc::{HashMap, HashSet};
 use tokio::runtime::Builder;
 use tokio::time::sleep;
 
-use crate::consumer::Keyed;
 use crate::consumer::partition::keyed::KeyManager;
+use crate::consumer::Keyed;
 
 #[derive(Clone, Debug)]
 struct Messages(Vec<u8>);

@@ -5,15 +5,15 @@ use std::hash::Hash;
 use std::time::Duration;
 
 use ahash::RandomState;
-use futures::{pin_mut, Stream, StreamExt};
 use futures::stream::FuturesUnordered;
+use futures::{pin_mut, Stream, StreamExt};
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
 use tokio::time::sleep;
 use tracing::warn;
 
-use crate::consumer::Keyed;
 use crate::consumer::partition::util::WithValue;
+use crate::consumer::Keyed;
 
 #[cfg(test)]
 mod test;

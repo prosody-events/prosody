@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;
@@ -52,7 +52,7 @@ enum Operation {
 
 impl OffsetTracker {
     pub fn new(max_uncommitted: usize, watermark_version: Arc<CachePadded<AtomicUsize>>) -> Self {
-        let (action_tx, action_rx) = channel(max_uncommitted);
+        let (action_tx, action_rx) = channel(max_uncommitted + 1);
         let watermark = Arc::new(CachePadded::new(AtomicI64::new(-1)));
 
         let handle = Arc::new(Mutex::new(Some(spawn(track_watermark(

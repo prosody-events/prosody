@@ -1,9 +1,9 @@
 use educe::Educe;
 use tracing::{debug, Span};
 
-use crate::{Key, Offset, Partition, Payload, Topic};
-use crate::consumer::Keyed;
 use crate::consumer::partition::offsets::UncommittedOffset;
+use crate::consumer::Keyed;
+use crate::{Key, Offset, Partition, Payload, Topic};
 
 #[derive(Educe)]
 #[educe(Debug)]

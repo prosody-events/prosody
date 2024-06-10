@@ -1,14 +1,17 @@
 use std::collections::hash_map::Entry;
+use std::future::ready;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rdkafka::ClientContext;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use rdkafka::consumer::{ConsumerContext, Rebalance};
+use rdkafka::ClientContext;
 use tokio::runtime::Handle;
 use tracing::{error, warn};
 
-use crate::consumer::{ConsumerConfiguration, Managers, MessageHandler, WatermarkVersion};
 use crate::consumer::partition::PartitionManager;
+use crate::consumer::{ConsumerConfiguration, Managers, MessageHandler, WatermarkVersion};
 use crate::Topic;
 
 pub struct Context<T> {
@@ -90,6 +93,7 @@ where
             return;
         }
 
+        let shutdown_futures = FuturesUnordered::new();
         for element in partitions.elements() {
             let topic = Topic::from(element.topic());
             let partition = element.partition();
@@ -97,7 +101,9 @@ where
                 error!("cannot revoke topic {topic} partition {partition}; not assigned");
                 continue;
             };
-            Handle::current().block_on(manager.shutdown());
+            shutdown_futures.push(manager.shutdown());
         }
+
+        Handle::current().block_on(shutdown_futures.for_each(|_| ready(())));
     }
 }

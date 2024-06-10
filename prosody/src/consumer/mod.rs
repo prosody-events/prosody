@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::future::Future;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::HashMap;
@@ -10,22 +10,22 @@ use confique::Config;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use parking_lot::Mutex;
-use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
+use rdkafka::ClientConfig;
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::error;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
-use crate::{Partition, Topic};
 use crate::consumer::context::Context;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
+use crate::{Partition, Topic};
 
 mod context;
 mod extractor;
@@ -66,7 +66,7 @@ pub struct ConsumerConfiguration {
     pub subscribed_topics: Vec<String>,
 
     #[config(env = "PROSODY_MAX_UNCOMMITTED", default = 32)]
-    #[validate(range(min = 2))]
+    #[validate(range(min = 1))]
     pub max_uncommitted: usize,
 
     #[config(env = "PROSODY_MAX_ENQUEUED_PER_KEY", default = 8)]
