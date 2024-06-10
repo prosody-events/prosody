@@ -8,11 +8,12 @@ use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info_span, instrument, Instrument};
 
-use crate::consumer::message::UntrackedMessage;
+use crate::consumer::message::{MessageContext, UntrackedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::MessageHandler;
@@ -107,7 +108,7 @@ async fn handle_messages<T>(
 ) where
     T: MessageHandler,
 {
-    let process = |received: UntrackedMessage| {
+    let process = |received: UntrackedMessage, shutdown_rx: watch::Receiver<bool>| {
         let parent_span = received.span.clone();
         let span = info_span!(parent: &parent_span, "process-message",);
 
@@ -123,7 +124,8 @@ async fn handle_messages<T>(
                 }
             };
 
-            if let Err(error) = message_handler.handle(message).await {
+            let mut context = MessageContext::new(shutdown_rx);
+            if let Err(error) = message_handler.handle(&mut context, message).await {
                 error!("message handler returned an error: {error:#}");
             }
         }

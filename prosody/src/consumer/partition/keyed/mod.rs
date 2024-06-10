@@ -9,6 +9,7 @@ use futures::stream::FuturesUnordered;
 use futures::{pin_mut, Stream, StreamExt};
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
+use tokio::sync::watch::{channel, Receiver, Sender};
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -27,11 +28,14 @@ pub struct KeyManager<M, F, Fut> {
     busy: IntSet<HashValue>,
     enqueued: IntMap<HashValue, VecDeque<M>>,
     hash_state: RandomState,
+    shutdown_tx: Sender<bool>,
+    shutdown_rx: Receiver<bool>,
 }
 
 impl<M, F, Fut> KeyManager<M, F, Fut> {
     pub fn new(process: F, max_enqueued_per_key: usize) -> Self {
         debug_assert!(max_enqueued_per_key > 0);
+        let (shutdown_tx, shutdown_rx) = channel(false);
 
         Self {
             max_enqueued_per_key,
@@ -40,6 +44,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             busy: IntSet::default(),
             enqueued: IntMap::default(),
             hash_state: RandomState::default(),
+            shutdown_tx,
+            shutdown_rx,
         }
     }
 
@@ -48,7 +54,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         S: Stream<Item = M>,
         M: Keyed,
         M::Key: Hash,
-        F: FnMut(M) -> Fut,
+        F: FnMut(M, Receiver<bool>) -> Fut,
         Fut: Future,
     {
         pin_mut!(messages);
@@ -77,6 +83,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             return;
         };
 
+        let _ = self.shutdown_tx.send(true);
         let deadline = sleep(timeout);
         pin_mut!(deadline);
 
@@ -104,7 +111,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     where
         M: Keyed,
         M::Key: Hash,
-        F: FnMut(M) -> Fut,
+        F: FnMut(M, Receiver<bool>) -> Fut,
         Fut: Future,
     {
         let key = message.key();
@@ -119,7 +126,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
 
     fn handle_completion(&mut self, hash_value: HashValue)
     where
-        F: FnMut(M) -> Fut,
+        F: FnMut(M, Receiver<bool>) -> Fut,
     {
         self.busy.remove(&hash_value);
 
@@ -137,7 +144,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
 
     async fn enqueue_message(&mut self, message: M, hash_value: HashValue)
     where
-        F: FnMut(M) -> Fut,
+        F: FnMut(M, Receiver<bool>) -> Fut,
         Fut: Future,
     {
         let queue_len = self
@@ -164,9 +171,12 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
 
     fn process_message(&mut self, message: M, hash_value: HashValue)
     where
-        F: FnMut(M) -> Fut,
+        F: FnMut(M, Receiver<bool>) -> Fut,
     {
-        let future = WithValue::new(hash_value, (self.process)(message));
+        let future = WithValue::new(
+            hash_value,
+            (self.process)(message, self.shutdown_rx.clone()),
+        );
         self.busy.insert(hash_value);
         self.executing.push(future);
     }

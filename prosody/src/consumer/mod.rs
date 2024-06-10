@@ -22,7 +22,7 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::context::Context;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::{Partition, Topic};
@@ -47,6 +47,7 @@ pub trait MessageHandler {
 
     fn handle(
         &self,
+        context: &mut MessageContext,
         message: ConsumerMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

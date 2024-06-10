@@ -8,6 +8,7 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use scc::{HashMap, HashSet};
 use tokio::runtime::Builder;
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::consumer::partition::keyed::KeyManager;
@@ -45,7 +46,7 @@ async fn prevents_concurrent_key_execution_impl(
     let failed = Arc::new(AtomicBool::new(false));
     let active_keys = Arc::new(HashSet::with_capacity(messages.len()));
 
-    let process_fn = |key: u8| {
+    let process_fn = |key: u8, _: watch::Receiver<bool>| {
         let failed = failed.clone();
         let active_keys = active_keys.clone();
 
@@ -79,7 +80,7 @@ async fn processes_all_messages_impl(messages: Vec<u8>, max_enqueued: u8) -> Tes
         *expected.entry_async(*message).await.or_default().get_mut() += 1;
     }
 
-    let process_fn = |key: u8| {
+    let process_fn = |key: u8, _: watch::Receiver<bool>| {
         let processed = actual.clone();
         async move {
             *processed.entry_async(key).await.or_default().get_mut() += 1;

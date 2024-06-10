@@ -1,9 +1,26 @@
 use educe::Educe;
+use tokio::sync::watch::Receiver;
 use tracing::{debug, Span};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::Keyed;
 use crate::{Key, Offset, Partition, Payload, Topic};
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct MessageContext {
+    shutdown_rx: Receiver<bool>,
+}
+
+impl MessageContext {
+    pub(crate) fn new(shutdown_rx: Receiver<bool>) -> Self {
+        Self { shutdown_rx }
+    }
+
+    pub async fn wait_for_shutdown(&mut self) {
+        let _ = self.shutdown_rx.wait_for(|&is_shutdown| is_shutdown).await;
+    }
+}
 
 #[derive(Educe)]
 #[educe(Debug)]
