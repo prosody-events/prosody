@@ -14,7 +14,7 @@ use serde_json::{to_vec, Value};
 use thiserror::Error;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use validator::Validate;
+use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::producer::injector::RecordInjector;
@@ -29,6 +29,7 @@ pub struct ProducerConfiguration {
     #[validate(length(min = 1))]
     pub bootstrap_servers: Vec<String>,
 
+    #[config(env = "PROSODY_SEND_TIMEOUT")]
     #[serde(with = "humantime_serde", default = "default_send_timeout")]
     pub send_timeout: Option<Duration>,
 }
@@ -57,6 +58,8 @@ impl Clone for Producer {
 
 impl Producer {
     pub fn new(config: ProducerConfiguration) -> Result<Self, ProducerError> {
+        config.validate()?;
+
         let send_timeout = match config.send_timeout {
             None => Timeout::Never,
             Some(duration) => Timeout::After(duration),
@@ -100,6 +103,9 @@ impl Producer {
 
 #[derive(Debug, Error)]
 pub enum ProducerError {
+    #[error("invalid producer configuration: {0:#}")]
+    Configuration(#[from] ValidationErrors),
+
     #[error("failed to serialize payload: {0:#}")]
     Serialization(#[from] serde_json::Error),
 
