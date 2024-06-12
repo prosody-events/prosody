@@ -1,23 +1,23 @@
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use thiserror::Error;
 use tokio::spawn;
-use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info_span, instrument, Instrument};
 
+use crate::{Offset, Partition};
 use crate::consumer::message::{MessageContext, UntrackedMessage};
+use crate::consumer::MessageHandler;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::MessageHandler;
-use crate::{Offset, Partition};
 
 mod keyed;
 pub mod offsets;
@@ -78,8 +78,7 @@ impl PartitionManager {
         self.message_tx
             .try_send(message)
             .map_err(|error| match error {
-                TrySendError::Full(message) => message,
-                TrySendError::Closed(message) => message,
+                TrySendError::Closed(message) | TrySendError::Full(message) => message,
             })
     }
 

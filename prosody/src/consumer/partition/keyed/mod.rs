@@ -5,16 +5,16 @@ use std::hash::Hash;
 use std::time::Duration;
 
 use ahash::RandomState;
-use futures::stream::FuturesUnordered;
 use futures::{pin_mut, Stream, StreamExt};
+use futures::stream::FuturesUnordered;
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
 use tokio::sync::watch::{channel, Receiver, Sender};
 use tokio::time::sleep;
 use tracing::warn;
 
-use crate::consumer::partition::util::WithValue;
 use crate::consumer::Keyed;
+use crate::consumer::partition::util::WithValue;
 
 #[cfg(test)]
 mod test;
@@ -34,7 +34,10 @@ pub struct KeyManager<M, F, Fut> {
 
 impl<M, F, Fut> KeyManager<M, F, Fut> {
     pub fn new(process: F, max_enqueued_per_key: usize) -> Self {
-        debug_assert!(max_enqueued_per_key > 0);
+        debug_assert!(
+            max_enqueued_per_key > 0,
+            "max_enqueued_per_key cannot be zero"
+        );
         let (shutdown_tx, shutdown_rx) = channel(false);
 
         Self {
@@ -91,7 +94,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             select! {
                 biased;
 
-                _ = &mut deadline => {
+                () = &mut deadline => {
                     let count = self.executing.len();
                     warn!("shutdown timeout reached with {count} tasks in progress");
                     break;

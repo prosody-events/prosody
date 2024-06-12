@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ahash::HashMap;
@@ -10,22 +10,22 @@ use confique::Config;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use parking_lot::Mutex;
+use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
-use rdkafka::ClientConfig;
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::task::{spawn_blocking, JoinHandle};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::error;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
+use crate::{Partition, Topic};
 use crate::consumer::context::Context;
 use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
-use crate::{Partition, Topic};
 
 mod context;
 mod extractor;
@@ -55,23 +55,23 @@ pub trait MessageHandler {
 #[derive(Config, Deserialize, Validate)]
 pub struct ConsumerConfiguration {
     #[config(env = "PROSODY_BOOTSTRAP_SERVERS")]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     #[config(env = "PROSODY_GROUP_ID")]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub group_id: String,
 
     #[config(env = "PROSODY_SUBSCRIBED_TOPICS")]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub subscribed_topics: Vec<String>,
 
     #[config(env = "PROSODY_MAX_UNCOMMITTED", default = 32)]
-    #[validate(range(min = 1))]
+    #[validate(range(min = 1_usize))]
     pub max_uncommitted: usize,
 
     #[config(env = "PROSODY_MAX_ENQUEUED_PER_KEY", default = 8)]
-    #[validate(range(min = 1))]
+    #[validate(range(min = 1_usize))]
     pub max_enqueued_per_key: usize,
 
     #[config(env = "PROSODY_PARTITION_SHUTDOWN_TIMEOUT")]
@@ -138,11 +138,11 @@ impl KafkaConsumer {
             poll(
                 config.poll_interval,
                 config.commit_interval,
-                consumer,
-                watermark_version,
-                managers,
-                cloned_shutdown,
-            )
+                &consumer,
+                &watermark_version,
+                &managers,
+                &cloned_shutdown,
+            );
         }))));
 
         Ok(Self { shutdown, handle })
@@ -173,6 +173,7 @@ pub enum ConsumerError {
     Kafka(#[from] KafkaError),
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn default_partition_timeout() -> Option<Duration> {
     Some(Duration::from_secs(5))
 }

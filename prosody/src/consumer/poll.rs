@@ -1,35 +1,34 @@
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use internment::Intern;
 use opentelemetry::propagation::TextMapPropagator;
+use rdkafka::{Message, TopicPartitionList};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::util::Timeout;
-use rdkafka::{Message, TopicPartitionList};
 use thiserror::Error;
-use tracing::field::Empty;
 use tracing::{error, info_span, warn};
+use tracing::field::Empty;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::consumer::{Managers, MessageHandler, WatermarkVersion};
 use crate::consumer::context::Context;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::UntrackedMessage;
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{Managers, MessageHandler, WatermarkVersion};
-use crate::propagator::new_propagator;
 use crate::Key;
+use crate::propagator::new_propagator;
 
 pub fn poll<T>(
     poll_interval: Duration,
     commit_interval: Duration,
-    consumer: BaseConsumer<Context<T>>,
-    watermark_version: Arc<WatermarkVersion>,
-    managers: Arc<Managers>,
-    shutdown: Arc<AtomicBool>,
+    consumer: &BaseConsumer<Context<T>>,
+    watermark_version: &WatermarkVersion,
+    managers: &Managers,
+    shutdown: &AtomicBool,
 ) where
     T: MessageHandler + Clone + Send + Sync + 'static,
 {
@@ -41,14 +40,14 @@ pub fn poll<T>(
     while !shutdown.load(Ordering::Relaxed) {
         commit_watermarks(
             &commit_interval,
-            &consumer,
-            &watermark_version,
-            &managers,
+            consumer,
+            watermark_version,
+            managers,
             &mut last_version,
             &mut last_commit,
         );
 
-        if let Err(error) = pause_busy_partitions(&mut is_paused, &consumer, &managers) {
+        if let Err(error) = pause_busy_partitions(&mut is_paused, consumer, managers) {
             error!("error pausing busy partitions: {error:#}; retrying");
             sleep(poll_interval);
             continue;
@@ -119,7 +118,7 @@ pub fn poll<T>(
         };
 
         loop {
-            let Err(error) = dispatch_message(message, &managers) else {
+            let Err(error) = dispatch_message(message, managers) else {
                 break;
             };
 

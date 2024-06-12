@@ -32,3 +32,6 @@ quickcheck.workspace = true
 quickcheck_macros.workspace = true
 scc.workspace = true
 tokio = { workspace = true, features = ["rt"] }
+
+[lints]
+workspace = true

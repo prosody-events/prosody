@@ -26,7 +26,7 @@ mod injector;
 #[derive(Clone, Config, Deserialize, Validate)]
 pub struct ProducerConfiguration {
     #[config(env = "PROSODY_BOOTSTRAP_SERVERS")]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     #[config(env = "PROSODY_SEND_TIMEOUT")]
@@ -57,7 +57,7 @@ impl Clone for Producer {
 }
 
 impl Producer {
-    pub fn new(config: ProducerConfiguration) -> Result<Self, ProducerError> {
+    pub fn new(config: &ProducerConfiguration) -> Result<Self, ProducerError> {
         config.validate()?;
 
         let send_timeout = match config.send_timeout {
@@ -119,6 +119,7 @@ pub enum ProducerError {
     Kafka(#[from] KafkaError),
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn default_send_timeout() -> Option<Duration> {
     Some(Duration::from_secs(1))
 }

@@ -2,9 +2,9 @@ use educe::Educe;
 use tokio::sync::watch::Receiver;
 use tracing::{debug, Span};
 
-use crate::consumer::partition::offsets::UncommittedOffset;
-use crate::consumer::Keyed;
 use crate::{Key, Offset, Partition, Payload, Topic};
+use crate::consumer::Keyed;
+use crate::consumer::partition::offsets::UncommittedOffset;
 
 #[derive(Educe)]
 #[educe(Debug)]
@@ -41,26 +41,27 @@ pub struct ConsumerMessage {
 }
 
 impl ConsumerMessage {
+    #[must_use]
     pub fn topic(&self) -> &'static str {
         self.topic.as_ref()
     }
 
+    #[must_use]
     pub fn partition(&self) -> Partition {
         self.partition
     }
 
+    #[must_use]
     pub fn offset(&self) -> Offset {
         self.offset
     }
 
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
+    #[must_use]
     pub fn payload(&self) -> &Payload {
         &self.payload
     }
 
+    #[must_use]
     pub fn span(&self) -> &Span {
         &self.span
     }
