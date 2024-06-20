@@ -28,9 +28,10 @@ prosody = { git = "https://github.com/RealGeeks/prosody.git" }
 use prosody::Topic;
 use prosody::producer::{ProducerConfiguration, Producer};
 use serde_json::json;
+use std::error::Error;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let config = ProducerConfiguration {
         bootstrap_servers: vec!["localhost:9092".to_string()],
         send_timeout: Some(std::time::Duration::from_secs(5)),
@@ -51,6 +52,7 @@ use prosody::consumer::message::{ConsumerMessage, MessageContext};
 use prosody::consumer::{ConsumerConfiguration, KafkaConsumer, MessageHandler};
 use prosody::Topic;
 use std::time::Duration;
+use std::error::Error;
 
 #[derive(Clone)]
 struct MyMessageHandler;
@@ -70,7 +72,7 @@ impl MessageHandler for MyMessageHandler {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let config = ConsumerConfiguration {
         bootstrap_servers: vec!["localhost:9092".to_string()],
         group_id: "my-group".to_string(),
@@ -96,8 +98,13 @@ Prosody can be configured through environment variables. Both `ConsumerConfigura
 loaded from environment variables using the following pattern:
 
 ```rust
-let consumer_config = ConsumerConfiguration::builder().env().load() ?;
-let producer_config = ProducerConfiguration::builder().env().load() ?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let consumer_config = ConsumerConfiguration::builder().env().load()?;
+    let producer_config = ProducerConfiguration::builder().env().load()?;
+    
+    // ...
+}
 ```
 
 The following table lists the available configuration options and their associated environment variables:
