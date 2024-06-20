@@ -1,4 +1,4 @@
-//! Manages and synchronizes offset handling in distributed systems, allowing
+//! Manages and synchronizes offset handling in Kafka, allowing
 //! for concurrent processing while ensuring offsets are committed in order. The
 //! module provides mechanisms to reserve and commit offsets, and
 //! maintains a watermark to track the latest contiguous committed offset.
