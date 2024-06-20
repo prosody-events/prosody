@@ -135,7 +135,7 @@ with the same key. Here's an overview of its architecture:
 The consumer in Prosody is built around the concept of partition-level parallelism and key-based ordering.
 
 ```mermaid
-graph LR
+graph TD
     A[Kafka Topics] --> B[Prosody KafkaConsumer]
     B --> C[Partition Manager: Topic A, Partition 0]
     B --> D[Partition Manager: Topic A, Partition 1]
