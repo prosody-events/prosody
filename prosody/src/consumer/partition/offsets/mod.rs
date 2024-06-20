@@ -4,8 +4,8 @@
 //! maintains a watermark to track the latest contiguous committed offset.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;

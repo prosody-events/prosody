@@ -13,13 +13,13 @@ use std::time::Duration;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use rdkafka::ClientContext;
 use rdkafka::consumer::{ConsumerContext, Rebalance};
+use rdkafka::ClientContext;
 use tokio::runtime::Handle;
 use tracing::{error, warn};
 
-use crate::consumer::{ConsumerConfiguration, Managers, MessageHandler, WatermarkVersion};
 use crate::consumer::partition::PartitionManager;
+use crate::consumer::{ConsumerConfiguration, Managers, MessageHandler, WatermarkVersion};
 use crate::Topic;
 
 /// Context holds the operational settings and components required for managing

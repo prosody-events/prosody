@@ -8,22 +8,22 @@ use std::time::{Duration, Instant};
 
 use internment::Intern;
 use opentelemetry::propagation::TextMapPropagator;
-use rdkafka::{Message, TopicPartitionList};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::util::Timeout;
+use rdkafka::{Message, TopicPartitionList};
 use thiserror::Error;
-use tracing::{error, info_span, warn};
 use tracing::field::Empty;
+use tracing::{error, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::consumer::{Managers, MessageHandler, WatermarkVersion};
 use crate::consumer::context::Context;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::UntrackedMessage;
 use crate::consumer::partition::PartitionManager;
-use crate::Key;
+use crate::consumer::{Managers, MessageHandler, WatermarkVersion};
 use crate::propagator::new_propagator;
+use crate::Key;
 
 /// Polls messages from Kafka, processes them, and handles partition management.
 ///

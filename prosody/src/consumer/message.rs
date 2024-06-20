@@ -8,9 +8,9 @@ use educe::Educe;
 use tokio::sync::watch::Receiver;
 use tracing::{debug, Span};
 
-use crate::{Key, Offset, Partition, Payload, Topic};
-use crate::consumer::Keyed;
 use crate::consumer::partition::offsets::UncommittedOffset;
+use crate::consumer::Keyed;
+use crate::{Key, Offset, Partition, Payload, Topic};
 
 /// Represents the context for a message within a consumer, handling shutdown
 /// notifications.
