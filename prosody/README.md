@@ -109,7 +109,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_SUBSCRIBED_TOPICS`          | Comma-separated list of topics to subscribe to  | -       | ✓        |          |
 | `PROSODY_MAX_UNCOMMITTED`            | Maximum number of uncommitted messages          | 32      | ✓        |          |
 | `PROSODY_MAX_ENQUEUED_PER_KEY`       | Maximum number of enqueued messages per key     | 8       | ✓        |          |
-| `PROSODY_PARTITION_SHUTDOWN_TIMEOUT` | Timeout for partition shutdown                  | -       | ✓        |          |
+| `PROSODY_PARTITION_SHUTDOWN_TIMEOUT` | Timeout for partition shutdown                  | 5s      | ✓        |          |
 | `PROSODY_POLL_INTERVAL`              | Interval between poll operations                | 100ms   | ✓        |          |
 | `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations              | 1s      | ✓        |          |
 | `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | -       |          | ✓        |
