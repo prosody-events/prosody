@@ -9,7 +9,7 @@ keywords = [
     "opentelemetry",
     "tracing",
 ]
-license = "All rights reserved"
+license = "All Rights Reserved"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/RealGeeks/prosody"
