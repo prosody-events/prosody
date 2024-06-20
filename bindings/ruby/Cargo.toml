@@ -5,7 +5,7 @@ version = "0.1.0"
 
 [lib]
 crate-type = ["cdylib"]
-name = "prosody"
+name = "prosody_ruby"
 
 [dependencies]
 magnus.workspace = true
