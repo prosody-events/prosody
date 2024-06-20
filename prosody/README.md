@@ -12,6 +12,7 @@ integrated OpenTelemetry support for distributed tracing.
 - **Configurable**: Flexible configuration through environment variables.
 - **Asynchronous**: Built on top of Tokio for high-performance asynchronous operations.
 - **Backpressure Management**: Intelligent partition pausing to handle processing backlogs.
+- **Mocking Support**: Ability to use mock Kafka brokers for testing purposes.
 
 ## Usage
 
@@ -35,6 +36,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = ProducerConfiguration {
         bootstrap_servers: vec!["localhost:9092".to_string()],
         send_timeout: Some(std::time::Duration::from_secs(5)),
+        mock: false,
     };
     let producer = Producer::new(&config)?;
 
@@ -82,6 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         partition_shutdown_timeout: Some(Duration::from_secs(30)),
         poll_interval: Duration::from_millis(100),
         commit_interval: Duration::from_secs(5),
+        mock: false,
     };
     let consumer = KafkaConsumer::new(config, MyMessageHandler)?;
 
@@ -102,7 +105,7 @@ loaded from environment variables using the following pattern:
 async fn main() -> Result<(), Box<dyn Error>> {
     let consumer_config = ConsumerConfiguration::builder().env().load()?;
     let producer_config = ProducerConfiguration::builder().env().load()?;
-    
+
     // ...
 }
 ```
@@ -119,7 +122,8 @@ The following table lists the available configuration options and their associat
 | `PROSODY_PARTITION_SHUTDOWN_TIMEOUT` | Timeout for partition shutdown                  | 5s      | ✓        |          |
 | `PROSODY_POLL_INTERVAL`              | Interval between poll operations                | 100ms   | ✓        |          |
 | `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations              | 1s      | ✓        |          |
-| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | -       |          | ✓        |
+| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | 1s      |          | ✓        |
+| `PROSODY_MOCK`                       | Use mock Kafka brokers for testing              | false   | ✓        | ✓        |
 
 ## Architecture
 
@@ -131,7 +135,7 @@ with the same key. Here's an overview of its architecture:
 The consumer in Prosody is built around the concept of partition-level parallelism and key-based ordering.
 
 ```mermaid
-graph TD
+graph LR
     A[Kafka Topics] --> B[Prosody KafkaConsumer]
     B --> C[Partition Manager: Topic A, Partition 0]
     B --> D[Partition Manager: Topic A, Partition 1]

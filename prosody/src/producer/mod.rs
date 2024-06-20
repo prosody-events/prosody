@@ -41,6 +41,10 @@ pub struct ProducerConfiguration {
     #[config(env = "PROSODY_SEND_TIMEOUT")]
     #[serde(with = "humantime_serde", default = "default_send_timeout")]
     pub send_timeout: Option<Duration>,
+
+    /// Use a mock producer.
+    #[config(env = "PROSODY_MOCK", default = "false")]
+    pub mock: bool,
 }
 
 /// High-level Kafka producer implementation.
@@ -97,17 +101,21 @@ impl Producer {
         };
 
         // Create and configure the Kafka producer
-        let producer: FutureProducer = ClientConfig::new()
+        let mut client_config = ClientConfig::new();
+        client_config
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", hostname()?)
             .set("compression.codec", "lz4")
             .set("enable.idempotence", "true")
-            .set_log_level(RDKafkaLogLevel::Error)
-            .create()?;
+            .set_log_level(RDKafkaLogLevel::Error);
+
+        if config.mock {
+            client_config.set("test.mock.num.brokers", "3");
+        }
 
         Ok(Self {
             send_timeout,
-            producer,
+            producer: client_config.create()?,
             propagator: new_propagator(),
         })
     }

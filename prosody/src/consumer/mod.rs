@@ -169,6 +169,10 @@ pub struct ConsumerConfiguration {
     #[config(env = "PROSODY_COMMIT_INTERVAL", default = "1s")]
     #[serde(with = "humantime_serde")]
     pub commit_interval: Duration,
+
+    /// Use a mock consumer.
+    #[config(env = "PROSODY_MOCK", default = "false")]
+    pub mock: bool,
 }
 
 /// High-level Kafka consumer implementation.
@@ -223,15 +227,21 @@ impl KafkaConsumer {
         );
 
         // Configure and create the Kafka consumer
-        let consumer: BaseConsumer<_> = ClientConfig::new()
+        let mut client_config = ClientConfig::new();
+        client_config
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", hostname()?)
             .set("group.id", config.group_id)
             .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
             .set("partition.assignment.strategy", "cooperative-sticky")
-            .set_log_level(RDKafkaLogLevel::Error)
-            .create_with_context(context)?;
+            .set_log_level(RDKafkaLogLevel::Error);
+
+        if config.mock {
+            client_config.set("test.mock.num.brokers", "3");
+        }
+
+        let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
 
         // Subscribe to the specified topics
         let topics: Vec<&str> = config
