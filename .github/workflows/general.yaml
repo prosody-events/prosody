@@ -7,7 +7,7 @@ env:
 
 jobs:
   test:
-    name: Test
+    name: Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -64,7 +64,7 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc
 
   coverage:
-    name: Code coverage
+    name: Code Coverage
     runs-on: ubuntu-latest
     container:
       image: xd009642/tarpaulin
