@@ -17,13 +17,14 @@
 //!   operations.
 //! - **Backpressure Management**: Intelligent partition pausing to handle
 //!   processing backlogs.
-//! - **Mocking Support**: Ability to use mock Kafka brokers for testing purposes.
+//! - **Mocking Support**: Ability to use mock Kafka brokers for testing
+//!   purposes.
 //!
 //! # Examples
 //!
 //! ## Producer Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use prosody::Topic;
 //! use prosody::producer::{ProducerConfiguration, Producer};
 //! use serde_json::json;
@@ -33,7 +34,7 @@
 //!     let config = ProducerConfiguration {
 //!         bootstrap_servers: vec!["localhost:9092".to_string()],
 //!         send_timeout: Some(std::time::Duration::from_secs(5)),
-//!         mock: false,
+//!         mock: true, // use mock producer for example
 //!     };
 //!     let producer = Producer::new(&config)?;
 //!
@@ -46,7 +47,7 @@
 //!
 //! ## Consumer Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use prosody::consumer::message::{ConsumerMessage, MessageContext};
 //! use prosody::consumer::{ConsumerConfiguration, KafkaConsumer, MessageHandler};
 //! use prosody::Topic;
@@ -80,7 +81,7 @@
 //!         partition_shutdown_timeout: Some(Duration::from_secs(30)),
 //!         poll_interval: Duration::from_millis(100),
 //!         commit_interval: Duration::from_secs(5),
-//!         mock: false,
+//!         mock: true, // use mock consumer for example
 //!     };
 //!     let consumer = KafkaConsumer::new(config, MyMessageHandler)?;
 //!
@@ -158,11 +159,11 @@
 //! ## Mocking Support
 //!
 //! Prosody provides mocking support for both consumers and producers, allowing
-//! for easier testing of Kafka-dependent components. When the `mock` configuration
-//! option is set to `true`, Prosody will use mock Kafka brokers instead of
-//! connecting to real ones. This feature is particularly useful for unit testing
-//! and continuous integration environments where setting up a real Kafka cluster
-//! might be impractical.
+//! for easier testing of Kafka-dependent components. When the `mock`
+//! configuration option is set to `true`, Prosody will use mock Kafka brokers
+//! instead of connecting to real ones. This feature is particularly useful for
+//! unit testing and continuous integration environments where setting up a real
+//! Kafka cluster might be impractical.
 
 #![allow(clippy::multiple_crate_versions)]
 
