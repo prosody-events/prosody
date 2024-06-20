@@ -1,3 +1,6 @@
+//! Consumer module for polling and processing Kafka messages with distributed
+//! tracing support.
+
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
@@ -22,6 +25,15 @@ use crate::consumer::partition::PartitionManager;
 use crate::Key;
 use crate::propagator::new_propagator;
 
+/// Polls messages from Kafka, processes them, and handles partition management.
+///
+/// # Arguments
+/// - `poll_interval`: Duration to wait between polling attempts.
+/// - `commit_interval`: Duration to wait between offset commits.
+/// - `consumer`: Kafka consumer instance.
+/// - `watermark_version`: Current watermark version for offset tracking.
+/// - `managers`: Manager collection for handling partitions.
+/// - `shutdown`: Atomic boolean to signal shutdown.
 pub fn poll<T>(
     poll_interval: Duration,
     commit_interval: Duration,
@@ -38,6 +50,7 @@ pub fn poll<T>(
     let mut is_paused = false;
 
     while !shutdown.load(Ordering::Relaxed) {
+        // Commit offsets periodically
         commit_watermarks(
             &commit_interval,
             consumer,
@@ -47,6 +60,7 @@ pub fn poll<T>(
             &mut last_commit,
         );
 
+        // Manage busy partitions by pausing/resuming them
         if let Err(error) = pause_busy_partitions(&mut is_paused, consumer, managers) {
             error!("error pausing busy partitions: {error:#}; retrying");
             sleep(poll_interval);
@@ -69,6 +83,7 @@ pub fn poll<T>(
         let partition = message.partition();
         let offset = message.offset();
 
+        // Extract context for tracing
         let context = propagator.extract(&MessageExtractor::new(&message));
         let span = info_span!(
             "receive-message",
@@ -117,6 +132,7 @@ pub fn poll<T>(
             span: span.clone(),
         };
 
+        // Dispatch message to appropriate handler
         loop {
             let Err(error) = dispatch_message(message, managers) else {
                 break;
@@ -137,6 +153,15 @@ pub fn poll<T>(
     }
 }
 
+/// Commits the current offsets for all managed partitions if necessary.
+///
+/// # Arguments
+/// - `commit_interval`: Interval between offset commits.
+/// - `consumer`: Kafka consumer instance.
+/// - `watermark_version`: Current watermark version for offset tracking.
+/// - `managers`: Manager collection for handling partitions.
+/// - `last_version`: Last committed watermark version.
+/// - `last_commit`: Time of the last commit attempt.
 fn commit_watermarks<T>(
     commit_interval: &Duration,
     consumer: &BaseConsumer<Context<T>>,
@@ -177,6 +202,15 @@ fn commit_watermarks<T>(
     }
 }
 
+/// Pauses or resumes partitions based on their capacity status.
+///
+/// # Arguments
+/// - `is_paused`: Indicates if any partitions are currently paused.
+/// - `consumer`: Kafka consumer instance.
+/// - `managers`: Manager collection for handling partitions.
+///
+/// # Errors
+/// Returns `KafkaError` if there is an error pausing or resuming partitions.
 fn pause_busy_partitions<T>(
     is_paused: &mut bool,
     consumer: &BaseConsumer<Context<T>>,
@@ -216,6 +250,14 @@ where
     Ok(())
 }
 
+/// Dispatches a message to the appropriate partition manager.
+///
+/// # Arguments
+/// - `message`: The message to dispatch.
+/// - `managers`: Manager collection for handling partitions.
+///
+/// # Returns
+/// Returns a `DispatchError` if dispatch fails.
 fn dispatch_message(message: UntrackedMessage, managers: &Managers) -> Result<(), DispatchError> {
     let managers = managers.lock();
     let Some(manager) = managers.get(&(message.topic, message.partition)) else {
@@ -229,6 +271,7 @@ fn dispatch_message(message: UntrackedMessage, managers: &Managers) -> Result<()
     Err(DispatchError::Busy(message))
 }
 
+/// Errors that can occur during message dispatch.
 #[derive(Debug, Error)]
 enum DispatchError {
     #[error("message sent to unassigned partition")]

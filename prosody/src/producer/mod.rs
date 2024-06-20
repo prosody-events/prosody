@@ -1,3 +1,9 @@
+//! Kafka producer implementation with support for distributed tracing.
+//!
+//! This module provides a high-level abstraction for producing messages to
+//! Kafka topics. It handles configuration, message serialization, and injection
+//! of OpenTelemetry context for distributed tracing.
+
 use std::io;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
@@ -23,25 +29,32 @@ use crate::Topic;
 
 mod injector;
 
+/// Configuration for the Kafka producer.
 #[derive(Clone, Config, Deserialize, Validate)]
 pub struct ProducerConfiguration {
+    /// List of Kafka bootstrap servers.
     #[config(env = "PROSODY_BOOTSTRAP_SERVERS")]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
+    /// Timeout for send operations.
     #[config(env = "PROSODY_SEND_TIMEOUT")]
     #[serde(with = "humantime_serde", default = "default_send_timeout")]
     pub send_timeout: Option<Duration>,
 }
 
+/// High-level Kafka producer implementation.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct Producer {
+    /// Timeout for send operations.
     send_timeout: Timeout,
 
+    /// Underlying Kafka producer.
     #[educe(Debug(ignore))]
     producer: FutureProducer,
 
+    /// OpenTelemetry context propagator.
     #[educe(Debug(ignore))]
     propagator: TextMapCompositePropagator,
 }
@@ -57,14 +70,33 @@ impl Clone for Producer {
 }
 
 impl Producer {
+    /// Creates a new `Producer` instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The producer configuration.
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the new Producer instance or a `ProducerError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProducerError` if:
+    /// - The configuration is invalid
+    /// - The hostname cannot be retrieved
+    /// - The Kafka producer cannot be created
     pub fn new(config: &ProducerConfiguration) -> Result<Self, ProducerError> {
+        // Validate the configuration
         config.validate()?;
 
+        // Set the send timeout
         let send_timeout = match config.send_timeout {
             None => Timeout::Never,
             Some(duration) => Timeout::After(duration),
         };
 
+        // Create and configure the Kafka producer
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", hostname()?)
@@ -80,18 +112,41 @@ impl Producer {
         })
     }
 
+    /// Sends a message to a Kafka topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to send the message to.
+    /// * `key` - The message key.
+    /// * `payload` - The message payload as a JSON Value.
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or failure of the send operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProducerError` if:
+    /// - The payload cannot be serialized
+    /// - The system time cannot be retrieved
+    /// - The Kafka send operation fails
     pub async fn send(&self, topic: Topic, key: &str, payload: Value) -> Result<(), ProducerError> {
+        // Serialize the payload
         let serialized = to_vec(&payload)?;
+
+        // Create the record with timestamp
         let mut record = FutureRecord::to(&topic)
             .key(key)
             .payload(&serialized)
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 
+        // Inject OpenTelemetry context into the record headers
         self.propagator.inject_context(
             &Span::current().context(),
             &mut RecordInjector::new(&mut record),
         );
 
+        // Send the record
         self.producer
             .send(record, self.send_timeout)
             .await
@@ -101,24 +156,35 @@ impl Producer {
     }
 }
 
+/// Errors that can occur during producer operations.
 #[derive(Debug, Error)]
 pub enum ProducerError {
+    /// Indicates invalid producer configuration.
     #[error("invalid producer configuration: {0:#}")]
     Configuration(#[from] ValidationErrors),
 
+    /// Indicates a failure to serialize the payload.
     #[error("failed to serialize payload: {0:#}")]
     Serialization(#[from] serde_json::Error),
 
+    /// Indicates a failure to set the message timestamp.
     #[error("failed to set timestamp: {0:#}")]
     SystemTime(#[from] SystemTimeError),
 
+    /// Indicates a failure to retrieve the hostname.
     #[error("failed to get hostname: {0:#}")]
     Hostname(#[from] io::Error),
 
+    /// Indicates a Kafka operation failure.
     #[error("Kafka error: {0:#}")]
     Kafka(#[from] KafkaError),
 }
 
+/// Provides the default send timeout.
+///
+/// # Returns
+///
+/// An Option containing a Duration of 1 second.
 #[allow(clippy::unnecessary_wraps)]
 fn default_send_timeout() -> Option<Duration> {
     Some(Duration::from_secs(1))

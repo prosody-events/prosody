@@ -1,6 +1,18 @@
 [package]
+categories = ["asynchronous", "network-programming"]
+description = "A high-level Kafka client library with OpenTelemetry integration for distributed tracing"
 edition = "2021"
+keywords = [
+    "distributed-systems",
+    "kafka",
+    "messaging",
+    "opentelemetry",
+    "tracing",
+]
+license = "All Rights Reserved"
 name = "prosody"
+readme = "README.md"
+repository = "https://github.com/RealGeeks/prosody"
 version = "0.1.0"
 
 [dependencies]
@@ -31,7 +43,7 @@ whoami.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
 scc.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true
