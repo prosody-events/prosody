@@ -91,17 +91,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Configuration
 
-Prosody can be configured through environment variables:
+Prosody can be configured through environment variables. Both `ConsumerConfiguration` and `ProducerConfiguration` can be
+loaded from environment variables using the following pattern:
 
-- `PROSODY_BOOTSTRAP_SERVERS`: Comma-separated list of Kafka bootstrap servers
-- `PROSODY_GROUP_ID`: Consumer group ID
-- `PROSODY_SUBSCRIBED_TOPICS`: Comma-separated list of topics to subscribe to
-- `PROSODY_MAX_UNCOMMITTED`: Maximum number of uncommitted messages (default: 32)
-- `PROSODY_MAX_ENQUEUED_PER_KEY`: Maximum number of enqueued messages per key (default: 8)
-- `PROSODY_PARTITION_SHUTDOWN_TIMEOUT`: Timeout for partition shutdown
-- `PROSODY_POLL_INTERVAL`: Interval between poll operations (default: 100ms)
-- `PROSODY_COMMIT_INTERVAL`: Interval between commit operations (default: 1s)
-- `PROSODY_SEND_TIMEOUT`: Timeout for send operations in the producer
+```rust
+let consumer_config = ConsumerConfiguration::builder().env().load() ?;
+let producer_config = ProducerConfiguration::builder().env().load() ?;
+```
+
+The following table lists the available configuration options and their associated environment variables:
+
+| Environment Variable                 | Description                                     | Default | Consumer | Producer |
+|--------------------------------------|-------------------------------------------------|---------|----------|----------|
+| `PROSODY_BOOTSTRAP_SERVERS`          | Comma-separated list of Kafka bootstrap servers | -       | ✓        | ✓        |
+| `PROSODY_GROUP_ID`                   | Consumer group ID                               | -       | ✓        |          |
+| `PROSODY_SUBSCRIBED_TOPICS`          | Comma-separated list of topics to subscribe to  | -       | ✓        |          |
+| `PROSODY_MAX_UNCOMMITTED`            | Maximum number of uncommitted messages          | 32      | ✓        |          |
+| `PROSODY_MAX_ENQUEUED_PER_KEY`       | Maximum number of enqueued messages per key     | 8       | ✓        |          |
+| `PROSODY_PARTITION_SHUTDOWN_TIMEOUT` | Timeout for partition shutdown                  | -       | ✓        |          |
+| `PROSODY_POLL_INTERVAL`              | Interval between poll operations                | 100ms   | ✓        |          |
+| `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations              | 1s      | ✓        |          |
+| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | -       |          | ✓        |
 
 ## Architecture
 
@@ -163,7 +173,8 @@ sequenceDiagram
 1. The Prosody `KafkaConsumer` polls messages from Kafka Brokers.
 2. Messages are dispatched to the appropriate `PartitionManager` based on their topic and partition.
 3. The `PartitionManager` enqueues the message in the correct key-based queue according to the message key (e.g., User
-   ID, Product ID).
+   ID,
+   Product ID).
 4. Messages are processed sequentially from each key queue, invoking the user-provided `MessageHandler`.
 5. After processing, the latest processed offset for the key is updated.
 6. Periodically, the `PartitionManager` collects the latest processed offsets from all its key queues.
