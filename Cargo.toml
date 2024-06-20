@@ -1,7 +1,10 @@
 [workspace]
 resolver = "2"
 
-members = ["bindings/nodejs", "bindings/python", "bindings/ruby", "prosody"]
+members = [
+    # "bindings/nodejs", "bindings/python", "bindings/ruby",
+    "prosody",
+]
 
 [workspace.dependencies]
 ahash = "0.8"
