@@ -15,6 +15,8 @@
 //! - **Configurable**: Flexible configuration through environment variables.
 //! - **Asynchronous**: Built on top of Tokio for high-performance asynchronous
 //!   operations.
+//! - **Backpressure Management**: Intelligent partition pausing to handle
+//!   processing backlogs.
 //!
 //! # Examples
 //!
@@ -118,6 +120,11 @@
 //! 5. **Polling Mechanism**: The `KafkaConsumer` uses a polling mechanism to
 //!    efficiently fetch messages from Kafka brokers.
 //!
+//! 6. **Partition Pausing**: If a partition becomes backed up (i.e., its queues
+//!    are full), Prosody will pause consumption from that specific partition.
+//!    Other partitions continue to make progress, ensuring that a slowdown in
+//!    one partition doesn't affect the entire consumer.
+//!
 //! ## Message Flow
 //!
 //! 1. The Prosody `KafkaConsumer` polls messages from Kafka Brokers.
@@ -132,6 +139,8 @@
 //!    offsets from all its key queues.
 //! 7. The Prosody Consumer commits these offsets back to Kafka, ensuring
 //!    at-least-once message processing semantics.
+//! 8. If a partition's queues become full, that specific partition is paused
+//!    until the backlog is processed.
 //!
 //! Throughout this flow, OpenTelemetry is used to create and propagate
 //! distributed traces, allowing for end-to-end visibility of message processing
@@ -141,7 +150,7 @@
 //! different partitions and keys concurrently, while still maintaining strict
 //! ordering for messages with the same key. It also provides backpressure
 //! management by limiting the number of in-flight messages per key and
-//! partition through bounded queues.
+//! partition through bounded queues and selective partition pausing.
 
 #![allow(clippy::multiple_crate_versions)]
 

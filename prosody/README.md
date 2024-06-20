@@ -11,6 +11,7 @@ integrated OpenTelemetry support for distributed tracing.
   architectures.
 - **Configurable**: Flexible configuration through environment variables.
 - **Asynchronous**: Built on top of Tokio for high-performance asynchronous operations.
+- **Backpressure Management**: Intelligent partition pausing to handle processing backlogs.
 
 ## Usage
 
@@ -123,7 +124,7 @@ with the same key. Here's an overview of its architecture:
 The consumer in Prosody is built around the concept of partition-level parallelism and key-based ordering.
 
 ```mermaid
-graph TD
+graph LR
     A[Kafka Topics] --> B[Prosody KafkaConsumer]
     B --> C[Partition Manager: Topic A, Partition 0]
     B --> D[Partition Manager: Topic A, Partition 1]
@@ -150,6 +151,10 @@ graph TD
    ordered processing for each key.
 
 5. **Polling Mechanism**: The `KafkaConsumer` uses a polling mechanism to efficiently fetch messages from Kafka brokers.
+
+6. **Partition Pausing**: If a partition becomes backed up (i.e., its queues are full), Prosody will pause consumption
+   from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in one partition
+   doesn't affect the entire consumer.
 
 ### Message Flow
 
@@ -179,10 +184,11 @@ sequenceDiagram
 5. After processing, the latest processed offset for the key is updated.
 6. Periodically, the `PartitionManager` collects the latest processed offsets from all its key queues.
 7. The Prosody Consumer commits these offsets back to Kafka, ensuring at-least-once message processing semantics.
+8. If a partition's queues become full, that specific partition is paused until the backlog is processed.
 
 Throughout this flow, OpenTelemetry is used to create and propagate distributed traces, allowing for end-to-end
 visibility of message processing across different services.
 
 This architecture allows Prosody to achieve high throughput by processing different partitions and keys concurrently,
 while still maintaining strict ordering for messages with the same key. It also provides backpressure management by
-limiting the number of in-flight messages per key and partition through bounded queues.
+limiting the number of in-flight messages per key and partition through bounded queues and selective partition pausing.
