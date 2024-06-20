@@ -53,6 +53,16 @@ jobs:
       - name: Run cargo udeps
         run: cargo +nightly udeps
 
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc
+
   coverage:
     name: Code coverage
     runs-on: ubuntu-latest
