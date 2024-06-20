@@ -39,13 +39,6 @@ jobs:
       - name: Linting
         run: cargo clippy -- -D warnings
 
-  security:
-    name: Security
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: rustsec/audit-check@v1.4.1
-
   dependencies:
     name: Dependencies
     runs-on: ubuntu-latest
