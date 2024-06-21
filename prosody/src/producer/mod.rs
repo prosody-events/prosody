@@ -38,16 +38,24 @@ mod injector;
 pub struct ProducerConfiguration {
     /// List of Kafka bootstrap servers.
     ///
-    /// Defaults to the value of the `PROSODY_BOOTSTRAP_SERVERS` environment
-    /// variable.
+    /// Environment variable: `PROSODY_BOOTSTRAP_SERVERS`
+    /// Default: None (must be specified)
+    ///
+    /// At least one server must be specified.
     #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Timeout for send operations.
     ///
-    /// Defaults to the value of the `PROSODY_SEND_TIMEOUT` environment
-    /// variable, or 1 second if not set.
+    /// Environment variable: `PROSODY_SEND_TIMEOUT`
+    /// Default: 1 second
+    ///
+    /// If set to None (or if the environment variable is set to "none"), the
+    /// sender will retry indefinitely and never timeout. This may be an
+    /// appropriate setting for consumers that produce to topics, as the
+    /// consumed message may not be marked as complete until the message is
+    /// produced.
     #[builder(
         default = "from_option_duration_env_with_fallback(\"PROSODY_SEND_TIMEOUT\", \
                    Duration::from_secs(1))?",
@@ -57,8 +65,8 @@ pub struct ProducerConfiguration {
 
     /// Use a mock producer for testing purposes.
     ///
-    /// Defaults to the value of the `PROSODY_MOCK` environment variable, or
-    /// false if not set.
+    /// Environment variable: `PROSODY_MOCK`
+    /// Default: false
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?",
         setter(into)

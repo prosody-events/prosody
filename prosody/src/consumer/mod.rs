@@ -115,24 +115,48 @@ pub trait MessageHandler {
 }
 
 /// Configuration for the Kafka consumer.
+///
+/// This struct holds all the necessary configuration options for creating a
+/// Kafka consumer. It uses the Builder pattern for flexible initialization and
+/// supports loading values from environment variables.
 #[derive(Builder, Clone, Validate)]
 pub struct ConsumerConfiguration {
     /// List of Kafka bootstrap servers.
+    ///
+    /// Environment variable: `PROSODY_BOOTSTRAP_SERVERS`
+    /// Default: None (must be specified)
+    ///
+    /// At least one server must be specified.
     #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Consumer group ID.
+    ///
+    /// Environment variable: `PROSODY_GROUP_ID`
+    /// Default: None (must be specified)
+    ///
+    /// The group ID must be a non-empty string and should be unique for each
+    /// logically separate consumer application. Consumers with the same group
+    /// ID will form a consumer group and share the load of consuming topics.
     #[builder(default = "from_env(\"PROSODY_GROUP_ID\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub group_id: String,
 
     /// List of topics to subscribe to.
+    ///
+    /// Environment variable: `PROSODY_SUBSCRIBED_TOPICS`
+    /// Default: None (must be specified)
+    ///
+    /// At least one topic must be specified.
     #[builder(default = "from_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub subscribed_topics: Vec<String>,
 
     /// Maximum number of uncommitted messages.
+    ///
+    /// Environment variable: `PROSODY_MAX_UNCOMMITTED`
+    /// Default: 32
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 32)?",
         setter(into)
@@ -141,6 +165,9 @@ pub struct ConsumerConfiguration {
     pub max_uncommitted: usize,
 
     /// Maximum number of enqueued messages per key.
+    ///
+    /// Environment variable: `PROSODY_MAX_ENQUEUED_PER_KEY`
+    /// Default: 8
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?",
         setter(into)
@@ -149,6 +176,13 @@ pub struct ConsumerConfiguration {
     pub max_enqueued_per_key: usize,
 
     /// Timeout for partition shutdown.
+    ///
+    /// Environment variable: `PROSODY_PARTITION_SHUTDOWN_TIMEOUT`
+    /// Default: 5 seconds
+    ///
+    /// If set to None (or if the environment variable is set to "none"), the
+    /// partition will immediately be shutdown without waiting for in-flight
+    /// tasks to complete.
     #[builder(
         default = "from_option_duration_env_with_fallback(\"PROSODY_PARTITION_SHUTDOWN_TIMEOUT\", \
                    Duration::from_secs(5))?",
@@ -157,6 +191,9 @@ pub struct ConsumerConfiguration {
     pub partition_shutdown_timeout: Option<Duration>,
 
     /// Interval between poll operations.
+    ///
+    /// Environment variable: `PROSODY_POLL_INTERVAL`
+    /// Default: 100 milliseconds
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_POLL_INTERVAL\", \
                    Duration::from_millis(100))?",
@@ -165,6 +202,9 @@ pub struct ConsumerConfiguration {
     pub poll_interval: Duration,
 
     /// Interval between commit operations.
+    ///
+    /// Environment variable: `PROSODY_COMMIT_INTERVAL`
+    /// Default: 1 second
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_COMMIT_INTERVAL\", \
                    Duration::from_secs(1))?",
@@ -172,7 +212,10 @@ pub struct ConsumerConfiguration {
     )]
     pub commit_interval: Duration,
 
-    /// Use a mock consumer for testing.
+    /// Use a mock consumer for testing purposes.
+    ///
+    /// Environment variable: `PROSODY_MOCK`
+    /// Default: false
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?",
         setter(into)
