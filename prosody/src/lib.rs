@@ -31,11 +31,11 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ProducerConfiguration {
-//!         bootstrap_servers: vec!["localhost:9092".to_string()],
-//!         send_timeout: Some(std::time::Duration::from_secs(5)),
-//!         mock: true, // use mock producer for example
-//!     };
+//!     let config = ProducerConfiguration::builder()
+//!         .bootstrap_servers(["localhost:9092".to_string()])
+//!         .mock(true) // use mock producer for example
+//!         .build()?;
+//!
 //!     let producer = Producer::new(&config)?;
 //!
 //!     let topic: Topic = "my-topic".into();
@@ -72,17 +72,13 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ConsumerConfiguration {
-//!         bootstrap_servers: vec!["localhost:9092".to_string()],
-//!         group_id: "my-group".to_string(),
-//!         subscribed_topics: vec!["my-topic".to_string()],
-//!         max_uncommitted: 1000,
-//!         max_enqueued_per_key: 100,
-//!         partition_shutdown_timeout: Some(Duration::from_secs(30)),
-//!         poll_interval: Duration::from_millis(100),
-//!         commit_interval: Duration::from_secs(5),
-//!         mock: true, // use mock consumer for example
-//!     };
+//!     let config = ConsumerConfiguration::builder()
+//!         .bootstrap_servers(["localhost:9092".to_string()])
+//!         .group_id("my-group")
+//!         .subscribed_topics(["my-topic".to_string()])
+//!         .mock(true) // use mock consumer for example
+//!         .build()?;
+//!
 //!     let consumer = KafkaConsumer::new(config, MyMessageHandler)?;
 //!
 //!     // Run your application logic here
@@ -174,6 +170,7 @@ pub mod consumer;
 pub mod producer;
 mod propagator;
 mod util;
+
 /// A Kafka topic name.
 ///
 /// This type uses string interning for efficient storage and comparison of

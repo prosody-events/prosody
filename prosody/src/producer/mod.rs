@@ -30,26 +30,51 @@ use crate::Topic;
 mod injector;
 
 /// Configuration for the Kafka producer.
+///
+/// This struct holds all the necessary configuration options for creating a
+/// Kafka producer. It uses the Builder pattern for flexible initialization and
+/// supports loading values from environment variables.
 #[derive(Builder, Clone, Validate)]
 pub struct ProducerConfiguration {
     /// List of Kafka bootstrap servers.
-    #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?")]
+    ///
+    /// Defaults to the value of the `PROSODY_BOOTSTRAP_SERVERS` environment
+    /// variable.
+    #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Timeout for send operations.
+    ///
+    /// Defaults to the value of the `PROSODY_SEND_TIMEOUT` environment
+    /// variable, or 1 second if not set.
     #[builder(
         default = "from_option_duration_env_with_fallback(\"PROSODY_SEND_TIMEOUT\", \
-                   Duration::from_secs(1))?"
+                   Duration::from_secs(1))?",
+        setter(into)
     )]
     pub send_timeout: Option<Duration>,
 
-    /// Use a mock producer.
-    #[builder(default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?")]
+    /// Use a mock producer for testing purposes.
+    ///
+    /// Defaults to the value of the `PROSODY_MOCK` environment variable, or
+    /// false if not set.
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?",
+        setter(into)
+    )]
     pub mock: bool,
 }
 
 impl ProducerConfiguration {
+    /// Creates a new `ProducerConfigurationBuilder`.
+    ///
+    /// This method is a convenient way to start building a
+    /// `ProducerConfiguration`.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `ProducerConfigurationBuilder`.
     #[must_use]
     pub fn builder() -> ProducerConfigurationBuilder {
         ProducerConfigurationBuilder::default()
@@ -57,6 +82,9 @@ impl ProducerConfiguration {
 }
 
 /// High-level Kafka producer implementation.
+///
+/// This struct encapsulates the Kafka producer functionality, including
+/// message sending and OpenTelemetry context propagation.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct Producer {
@@ -91,7 +119,7 @@ impl Producer {
     ///
     /// # Returns
     ///
-    /// A Result containing the new Producer instance or a `ProducerError`.
+    /// A `Result` containing the new `Producer` instance or a `ProducerError`.
     ///
     /// # Errors
     ///
@@ -118,6 +146,7 @@ impl Producer {
             .set("enable.idempotence", "true")
             .set_log_level(RDKafkaLogLevel::Error);
 
+        // Set up mock broker if configured
         if config.mock {
             client_config.set("test.mock.num.brokers", "3");
         }
@@ -131,6 +160,9 @@ impl Producer {
 
     /// Sends a message to a Kafka topic.
     ///
+    /// This method serializes the payload, injects OpenTelemetry context,
+    /// and sends the message to the specified Kafka topic.
+    ///
     /// # Arguments
     ///
     /// * `topic` - The topic to send the message to.
@@ -139,7 +171,7 @@ impl Producer {
     ///
     /// # Returns
     ///
-    /// A Result indicating success or failure of the send operation.
+    /// A `Result` indicating success or failure of the send operation.
     ///
     /// # Errors
     ///

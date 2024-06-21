@@ -17,28 +17,19 @@
 //! - Distributed tracing: Integrating with OpenTelemetry for tracing message
 //!   flow across distributed systems.
 //!
-//! The module is composed of several submodules:
+//! The module consists of several submodules:
 //!
-//! - `context`: Manages Kafka partition assignments and revocations,
-//!   integrating with Kafka's rebalance callbacks.
-//! - `extractor`: Provides functionality for extracting metadata from Kafka
-//!   messages, particularly for distributed tracing purposes.
-//! - `message`: Defines structures for managing message contexts and consumer
-//!   messages, including tracking shutdown signals and committing messages
-//!   after processing.
+//! - `context`: Manages Kafka partition assignments and revocations.
+//! - `extractor`: Extracts metadata from Kafka messages for distributed
+//!   tracing.
+//! - `message`: Defines structures for message contexts and consumer messages.
 //! - `partition`: Handles partition-specific operations and state management.
-//! - `poll`: Implements the core message polling and processing loop, including
-//!   offset commits and partition management.
+//! - `poll`: Implements the core message polling and processing loop.
 //!
-//! The main entry point for using this module is the [`KafkaConsumer`] struct,
-//! which is configured using the [`ConsumerConfiguration`] struct. Users should
-//! implement the [`MessageHandler`] trait to define custom message processing
-//! logic.
-//!
-//! This module is designed to provide a high-level, ergonomic interface for
-//! consuming and processing Kafka messages while handling complex scenarios
-//! such as consumer group re-balancing, offset management, and distributed
-//! tracing.
+//! Users should primarily interact with the [`KafkaConsumer`] struct,
+//! configured via [`ConsumerConfiguration`]. Custom message processing logic is
+//! defined by implementing the [`MessageHandler`] trait.
+
 use std::error::Error;
 use std::future::Future;
 use std::io;
@@ -77,21 +68,14 @@ pub mod message;
 mod partition;
 mod poll;
 
-/// Thread-safe, cache-padded atomic usize used to detect changes in partition
-/// watermarks.
+/// Atomic counter for tracking changes in partition watermarks.
 ///
-/// This type is used as a simple mechanism to notify the poll loop when
-/// partition watermarks have changed, indicating that offsets should be
-/// committed. The value is incremented each time a watermark changes, allowing
-/// the poll loop to detect changes efficiently without checking individual
-/// partition watermarks.
+/// Used to efficiently notify the poll loop when offsets should be committed.
 type WatermarkVersion = CachePadded<AtomicUsize>;
 
-/// Thread-safe hash map of partition managers.
+/// Thread-safe storage for partition managers.
 ///
-/// This type maps topic-partition pairs to their respective
-/// [`PartitionManager`]s. It's used to track and manage the state of each
-/// assigned partition, including message buffers and offset information.
+/// Maps topic-partition pairs to their respective [`PartitionManager`]s.
 type Managers = Mutex<HashMap<(Topic, Partition), PartitionManager>>;
 
 /// Defines a type with an associated key.
@@ -134,55 +118,77 @@ pub trait MessageHandler {
 #[derive(Builder, Clone, Validate)]
 pub struct ConsumerConfiguration {
     /// List of Kafka bootstrap servers.
-    #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?")]
+    #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Consumer group ID.
-    #[builder(default = "from_env(\"PROSODY_GROUP_ID\")?")]
+    #[builder(default = "from_env(\"PROSODY_GROUP_ID\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub group_id: String,
 
     /// List of topics to subscribe to.
-    #[builder(default = "from_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?")]
+    #[builder(default = "from_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub subscribed_topics: Vec<String>,
 
     /// Maximum number of uncommitted messages.
-    #[builder(default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 32)?")]
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 32)?",
+        setter(into)
+    )]
     #[validate(range(min = 1_usize))]
     pub max_uncommitted: usize,
 
     /// Maximum number of enqueued messages per key.
-    #[builder(default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?")]
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?",
+        setter(into)
+    )]
     #[validate(range(min = 1_usize))]
     pub max_enqueued_per_key: usize,
 
     /// Timeout for partition shutdown.
-    #[builder(default = "from_option_duration_env_with_fallback(\"\
-                         PROSODY_PARTITION_SHUTDOWN_TIMEOUT\", Duration::from_secs(5))?")]
+    #[builder(
+        default = "from_option_duration_env_with_fallback(\"PROSODY_PARTITION_SHUTDOWN_TIMEOUT\", \
+                   Duration::from_secs(5))?",
+        setter(into)
+    )]
     pub partition_shutdown_timeout: Option<Duration>,
 
     /// Interval between poll operations.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_POLL_INTERVAL\", \
-                   Duration::from_millis(100))?"
+                   Duration::from_millis(100))?",
+        setter(into)
     )]
     pub poll_interval: Duration,
 
     /// Interval between commit operations.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_COMMIT_INTERVAL\", \
-                   Duration::from_secs(1))?"
+                   Duration::from_secs(1))?",
+        setter(into)
     )]
     pub commit_interval: Duration,
 
-    /// Use a mock consumer.
-    #[builder(default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?")]
+    /// Use a mock consumer for testing.
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?",
+        setter(into)
+    )]
     pub mock: bool,
 }
 
 impl ConsumerConfiguration {
+    /// Creates a new `ConsumerConfigurationBuilder`.
+    ///
+    /// This method is a convenient way to start building a
+    /// `ConsumerConfiguration`.
+    ///
+    /// # Returns
+    ///
+    /// A default `ConsumerConfigurationBuilder` instance.
     #[must_use]
     pub fn builder() -> ConsumerConfigurationBuilder {
         ConsumerConfigurationBuilder::default()
@@ -251,6 +257,7 @@ impl KafkaConsumer {
             .set("partition.assignment.strategy", "cooperative-sticky")
             .set_log_level(RDKafkaLogLevel::Error);
 
+        // Set up mock broker if configured
         if config.mock {
             client_config.set("test.mock.num.brokers", "3");
         }

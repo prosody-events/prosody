@@ -33,11 +33,10 @@ use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let config = ProducerConfiguration {
-        bootstrap_servers: vec!["localhost:9092".to_string()],
-        send_timeout: Some(std::time::Duration::from_secs(5)),
-        mock: false,
-    };
+    let config = ProducerConfiguration::builder()
+        .bootstrap_servers(["localhost:9092".to_string()])
+        .build()?;
+
     let producer = Producer::new(&config)?;
 
     let topic: Topic = "my-topic".into();
@@ -75,17 +74,12 @@ impl MessageHandler for MyMessageHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let config = ConsumerConfiguration {
-        bootstrap_servers: vec!["localhost:9092".to_string()],
-        group_id: "my-group".to_string(),
-        subscribed_topics: vec!["my-topic".to_string()],
-        max_uncommitted: 1000,
-        max_enqueued_per_key: 100,
-        partition_shutdown_timeout: Some(Duration::from_secs(30)),
-        poll_interval: Duration::from_millis(100),
-        commit_interval: Duration::from_secs(5),
-        mock: false,
-    };
+    let config = ConsumerConfiguration::builder()
+        .bootstrap_servers(["localhost:9092".to_string()])
+        .group_id("my-group")
+        .subscribed_topics(["my-topic".to_string()])
+        .build()?;
+
     let consumer = KafkaConsumer::new(config, MyMessageHandler)?;
 
     // Run your application logic here
