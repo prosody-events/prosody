@@ -182,7 +182,10 @@ pub struct ConsumerConfiguration {
     ///
     /// If set to None (or if the environment variable is set to "none"), the
     /// partition will immediately be shutdown without waiting for in-flight
-    /// tasks to complete.
+    /// tasks to complete. As these tasks will not be committed, they will be
+    /// retried when the partition is rebalanced to a new node. This may be
+    /// appropriate when performing user-facing processing where delays due to
+    /// rebalancing must be minimized.
     #[builder(
         default = "from_option_duration_env_with_fallback(\"PROSODY_PARTITION_SHUTDOWN_TIMEOUT\", \
                    Duration::from_secs(5))?",
