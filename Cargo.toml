@@ -8,11 +8,11 @@ members = [
 
 [workspace.dependencies]
 ahash = "0.8"
-confique = "0.2"
 crossbeam-utils = "0.8"
+derive_builder = "0.20"
 educe = "0.6"
 futures = "0.3"
-humantime-serde = "1.1"
+humantime = "2.1"
 internment = "0.8"
 magnus = "0.6"
 neon = "1.0"

@@ -47,15 +47,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::HashMap;
-use confique::Config;
 use crossbeam_utils::CachePadded;
+use derive_builder::Builder;
 use educe::Educe;
 use parking_lot::Mutex;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::ClientConfig;
-use serde::Deserialize;
 use thiserror::Error;
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::error;
@@ -66,6 +65,10 @@ use crate::consumer::context::Context;
 use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
+use crate::util::{
+    from_duration_env_with_fallback, from_env, from_env_with_fallback,
+    from_option_duration_env_with_fallback, from_vec_env,
+};
 use crate::{Partition, Topic};
 
 mod context;
@@ -128,51 +131,62 @@ pub trait MessageHandler {
 }
 
 /// Configuration for the Kafka consumer.
-#[derive(Config, Deserialize, Validate)]
+#[derive(Builder, Clone, Validate)]
 pub struct ConsumerConfiguration {
     /// List of Kafka bootstrap servers.
-    #[config(env = "PROSODY_BOOTSTRAP_SERVERS")]
+    #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?")]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Consumer group ID.
-    #[config(env = "PROSODY_GROUP_ID")]
+    #[builder(default = "from_env(\"PROSODY_GROUP_ID\")?")]
     #[validate(length(min = 1_u64))]
     pub group_id: String,
 
     /// List of topics to subscribe to.
-    #[config(env = "PROSODY_SUBSCRIBED_TOPICS")]
+    #[builder(default = "from_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?")]
     #[validate(length(min = 1_u64))]
     pub subscribed_topics: Vec<String>,
 
     /// Maximum number of uncommitted messages.
-    #[config(env = "PROSODY_MAX_UNCOMMITTED", default = 32)]
+    #[builder(default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 32)?")]
     #[validate(range(min = 1_usize))]
     pub max_uncommitted: usize,
 
     /// Maximum number of enqueued messages per key.
-    #[config(env = "PROSODY_MAX_ENQUEUED_PER_KEY", default = 8)]
+    #[builder(default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?")]
     #[validate(range(min = 1_usize))]
     pub max_enqueued_per_key: usize,
 
     /// Timeout for partition shutdown.
-    #[config(env = "PROSODY_PARTITION_SHUTDOWN_TIMEOUT")]
-    #[serde(with = "humantime_serde", default = "default_partition_timeout")]
+    #[builder(default = "from_option_duration_env_with_fallback(\"\
+                         PROSODY_PARTITION_SHUTDOWN_TIMEOUT\", Duration::from_secs(5))?")]
     pub partition_shutdown_timeout: Option<Duration>,
 
     /// Interval between poll operations.
-    #[config(env = "PROSODY_POLL_INTERVAL", default = "100ms")]
-    #[serde(with = "humantime_serde")]
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_POLL_INTERVAL\", \
+                   Duration::from_millis(100))?"
+    )]
     pub poll_interval: Duration,
 
     /// Interval between commit operations.
-    #[config(env = "PROSODY_COMMIT_INTERVAL", default = "1s")]
-    #[serde(with = "humantime_serde")]
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_COMMIT_INTERVAL\", \
+                   Duration::from_secs(1))?"
+    )]
     pub commit_interval: Duration,
 
     /// Use a mock consumer.
-    #[config(env = "PROSODY_MOCK", default = "false")]
+    #[builder(default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?")]
     pub mock: bool,
+}
+
+impl ConsumerConfiguration {
+    #[must_use]
+    pub fn builder() -> ConsumerConfigurationBuilder {
+        ConsumerConfigurationBuilder::default()
+    }
 }
 
 /// High-level Kafka consumer implementation.
@@ -303,14 +317,4 @@ pub enum ConsumerError {
     /// Indicates a Kafka operation failure.
     #[error("Kafka operation failed: {0:#}")]
     Kafka(#[from] KafkaError),
-}
-
-/// Provides the default partition shutdown timeout.
-///
-/// # Returns
-///
-/// An Option containing a Duration of 5 seconds.
-#[allow(clippy::unnecessary_wraps)]
-fn default_partition_timeout() -> Option<Duration> {
-    Some(Duration::from_secs(5))
 }

@@ -17,11 +17,11 @@ version = "0.1.0"
 
 [dependencies]
 ahash.workspace = true
-confique.workspace = true
 crossbeam-utils.workspace = true
+derive_builder.workspace = true
 educe.workspace = true
 futures.workspace = true
-humantime-serde.workspace = true
+humantime.workspace = true
 internment.workspace = true
 nohash-hasher.workspace = true
 opentelemetry.workspace = true

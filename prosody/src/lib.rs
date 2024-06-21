@@ -173,7 +173,7 @@ use serde_json::Value;
 pub mod consumer;
 pub mod producer;
 mod propagator;
-
+mod util;
 /// A Kafka topic name.
 ///
 /// This type uses string interning for efficient storage and comparison of

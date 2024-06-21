@@ -7,7 +7,7 @@
 use std::io;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use confique::Config;
+use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use rdkafka::config::RDKafkaLogLevel;
@@ -15,7 +15,6 @@ use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
-use serde::Deserialize;
 use serde_json::{to_vec, Value};
 use thiserror::Error;
 use tracing::Span;
@@ -25,26 +24,36 @@ use whoami::fallible::hostname;
 
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
+use crate::util::{from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env};
 use crate::Topic;
 
 mod injector;
 
 /// Configuration for the Kafka producer.
-#[derive(Clone, Config, Deserialize, Validate)]
+#[derive(Builder, Clone, Validate)]
 pub struct ProducerConfiguration {
     /// List of Kafka bootstrap servers.
-    #[config(env = "PROSODY_BOOTSTRAP_SERVERS")]
+    #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?")]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Timeout for send operations.
-    #[config(env = "PROSODY_SEND_TIMEOUT")]
-    #[serde(with = "humantime_serde", default = "default_send_timeout")]
+    #[builder(
+        default = "from_option_duration_env_with_fallback(\"PROSODY_SEND_TIMEOUT\", \
+                   Duration::from_secs(1))?"
+    )]
     pub send_timeout: Option<Duration>,
 
     /// Use a mock producer.
-    #[config(env = "PROSODY_MOCK", default = "false")]
+    #[builder(default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?")]
     pub mock: bool,
+}
+
+impl ProducerConfiguration {
+    #[must_use]
+    pub fn builder() -> ProducerConfigurationBuilder {
+        ProducerConfigurationBuilder::default()
+    }
 }
 
 /// High-level Kafka producer implementation.
@@ -186,14 +195,4 @@ pub enum ProducerError {
     /// Indicates a Kafka operation failure.
     #[error("Kafka error: {0:#}")]
     Kafka(#[from] KafkaError),
-}
-
-/// Provides the default send timeout.
-///
-/// # Returns
-///
-/// An Option containing a Duration of 1 second.
-#[allow(clippy::unnecessary_wraps)]
-fn default_send_timeout() -> Option<Duration> {
-    Some(Duration::from_secs(1))
 }
