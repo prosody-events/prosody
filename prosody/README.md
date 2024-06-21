@@ -91,18 +91,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ## Configuration
 
-Prosody can be configured through environment variables. Both `ConsumerConfiguration` and `ProducerConfiguration` can be
-loaded from environment variables using the following pattern:
-
-```rust
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let consumer_config = ConsumerConfiguration::builder().env().load()?;
-    let producer_config = ProducerConfiguration::builder().env().load()?;
-
-    // ...
-}
-```
+Prosody can be configured through environment variables or programmatically using the builder pattern. Both
+`ConsumerConfiguration` and `ProducerConfiguration` use this approach. The builder pattern automatically falls back to
+environment variables for any unspecified field. This means you can mix and match programmatic configuration with
+environment variables, giving you flexibility in how you set up your Kafka clients.
 
 The following table lists the available configuration options and their associated environment variables:
 
