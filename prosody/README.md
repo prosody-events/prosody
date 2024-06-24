@@ -179,8 +179,9 @@ sequenceDiagram
    Product ID).
 4. Messages are processed sequentially from each key queue, invoking the user-provided `MessageHandler`.
 5. After processing, the latest processed offset for the key is updated.
-6. Periodically, the `PartitionManager` collects the latest processed offsets from all its key queues.
-7. The Prosody Consumer commits these offsets back to Kafka, ensuring at-least-once message processing semantics.
+6. The `PartitionManager` tracks the partition's high watermark committed offset.
+7. The Prosody Consumer periodically commits these offsets back to Kafka, ensuring at-least-once message processing
+   semantics.
 8. If a partition's queues become full, that specific partition is paused until the backlog is processed.
 
 Throughout this flow, OpenTelemetry is used to create and propagate distributed traces, allowing for end-to-end
