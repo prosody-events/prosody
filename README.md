@@ -1,3 +1,1 @@
-# prosody
-
-Kafka-based event processing
+prosody/README.md
