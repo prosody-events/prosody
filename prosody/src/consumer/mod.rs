@@ -26,7 +26,7 @@
 //! - `partition`: Handles partition-specific operations and state management.
 //! - `poll`: Implements the core message polling and processing loop.
 //!
-//! Users should primarily interact with the [`KafkaConsumer`] struct,
+//! Users should primarily interact with the [`ProsodyConsumer`] struct,
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
 //! defined by implementing the [`MessageHandler`] trait.
 
@@ -244,7 +244,7 @@ impl ConsumerConfiguration {
 /// High-level Kafka consumer implementation.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub struct KafkaConsumer {
+pub struct ProsodyConsumer {
     #[educe(Debug(ignore))]
     shutdown: Arc<AtomicBool>,
 
@@ -252,8 +252,8 @@ pub struct KafkaConsumer {
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-impl KafkaConsumer {
-    /// Creates a new `KafkaConsumer` instance.
+impl ProsodyConsumer {
+    /// Creates a new `ProsodyConsumer` instance.
     ///
     /// # Arguments
     ///
@@ -262,7 +262,7 @@ impl KafkaConsumer {
     ///
     /// # Returns
     ///
-    /// A Result containing the new `KafkaConsumer` instance or a
+    /// A Result containing the new `ProsodyConsumer` instance or a
     /// `ConsumerError`.
     ///
     /// # Errors

@@ -26,17 +26,17 @@
 //!
 //! ```rust
 //! use prosody::Topic;
-//! use prosody::producer::{ProducerConfiguration, Producer};
+//! use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 //! use serde_json::json;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let config = ProducerConfiguration::builder()
-//!         .bootstrap_servers(["localhost:9092".to_string()])
+//!         .bootstrap_servers(["localhost:9092".to_owned()])
 //!         .mock(true) // use mock producer for example
 //!         .build()?;
 //!
-//!     let producer = Producer::new(&config)?;
+//!     let producer = ProsodyProducer::new(&config)?;
 //!
 //!     let topic: Topic = "my-topic".into();
 //!     producer.send(topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
@@ -49,7 +49,7 @@
 //!
 //! ```rust
 //! use prosody::consumer::message::{ConsumerMessage, MessageContext};
-//! use prosody::consumer::{ConsumerConfiguration, KafkaConsumer, MessageHandler};
+//! use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
 //! use prosody::Topic;
 //! use std::time::Duration;
 //!
@@ -73,13 +73,13 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let config = ConsumerConfiguration::builder()
-//!         .bootstrap_servers(["localhost:9092".to_string()])
+//!         .bootstrap_servers(["localhost:9092".to_owned()])
 //!         .group_id("my-group")
-//!         .subscribed_topics(["my-topic".to_string()])
+//!         .subscribed_topics(["my-topic".to_owned()])
 //!         .mock(true) // use mock consumer for example
 //!         .build()?;
 //!
-//!     let consumer = KafkaConsumer::new(config, MyMessageHandler)?;
+//!     let consumer = ProsodyConsumer::new(config, MyMessageHandler)?;
 //!
 //!     // Run your application logic here
 //!
@@ -117,7 +117,7 @@
 //!    sequentially from their respective queue, ensuring ordered processing for
 //!    each key.
 //!
-//! 5. **Polling Mechanism**: The `KafkaConsumer` uses a polling mechanism to
+//! 5. **Polling Mechanism**: The `ProsodyConsumer` uses a polling mechanism to
 //!    efficiently fetch messages from Kafka brokers.
 //!
 //! 6. **Partition Pausing**: If a partition becomes backed up (i.e., its queues
@@ -127,7 +127,7 @@
 //!
 //! ## Message Flow
 //!
-//! 1. The Prosody `KafkaConsumer` polls messages from Kafka Brokers.
+//! 1. The `ProsodyConsumer` polls messages from Kafka Brokers.
 //! 2. Messages are dispatched to the appropriate `PartitionManager` based on
 //!    their topic and partition.
 //! 3. The `PartitionManager` enqueues the message in the correct key-based

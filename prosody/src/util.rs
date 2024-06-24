@@ -183,7 +183,9 @@ where
 ///
 /// Returns an error if the environment variable is not set.
 fn get_env_value(env_var: &str) -> Result<String, String> {
-    env::var(env_var).map_err(|_| format!("environment variable '${env_var}' not set"))
+    env::var(env_var).map_err(|_| {
+        format!("value required and fallback environment variable '${env_var}' is not set")
+    })
 }
 
 /// Parses a string value into a `Duration`, providing a formatted error

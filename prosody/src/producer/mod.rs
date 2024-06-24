@@ -95,7 +95,7 @@ impl ProducerConfiguration {
 /// message sending and OpenTelemetry context propagation.
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct Producer {
+pub struct ProsodyProducer {
     /// Timeout for send operations.
     send_timeout: Timeout,
 
@@ -108,7 +108,7 @@ pub struct Producer {
     propagator: TextMapCompositePropagator,
 }
 
-impl Clone for Producer {
+impl Clone for ProsodyProducer {
     fn clone(&self) -> Self {
         Self {
             send_timeout: self.send_timeout,
@@ -118,8 +118,8 @@ impl Clone for Producer {
     }
 }
 
-impl Producer {
-    /// Creates a new `Producer` instance.
+impl ProsodyProducer {
+    /// Creates a new `ProsodyProducer` instance.
     ///
     /// # Arguments
     ///
@@ -127,7 +127,8 @@ impl Producer {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `Producer` instance or a `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance or a
+    /// `ProducerError`.
     ///
     /// # Errors
     ///

@@ -27,17 +27,17 @@ prosody = { git = "https://github.com/RealGeeks/prosody.git" }
 
 ```rust
 use prosody::Topic;
-use prosody::producer::{ProducerConfiguration, Producer};
+use prosody::producer::{ProducerConfiguration, Prosody};
 use serde_json::json;
 use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = ProducerConfiguration::builder()
-        .bootstrap_servers(["localhost:9092".to_string()])
+        .bootstrap_servers(["localhost:9092".to_owned()])
         .build()?;
 
-    let producer = Producer::new(&config)?;
+    let producer = ProsodyProducer::new(&config)?;
 
     let topic: Topic = "my-topic".into();
     producer.send(topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ```rust
 use prosody::consumer::message::{ConsumerMessage, MessageContext};
-use prosody::consumer::{ConsumerConfiguration, KafkaConsumer, MessageHandler};
+use prosody::consumer::{ConsumerConfiguration, ProsodyConsumer, MessageHandler};
 use prosody::Topic;
 use std::time::Duration;
 use std::error::Error;
@@ -75,12 +75,12 @@ impl MessageHandler for MyMessageHandler {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = ConsumerConfiguration::builder()
-        .bootstrap_servers(["localhost:9092".to_string()])
+        .bootstrap_servers(["localhost:9092".to_owned()])
         .group_id("my-group")
-        .subscribed_topics(["my-topic".to_string()])
+        .subscribed_topics(["my-topic".to_owned()])
         .build()?;
 
-    let consumer = KafkaConsumer::new(config, MyMessageHandler)?;
+    let consumer = ProsodyConsumer::new(config, MyMessageHandler)?;
 
     // Run your application logic here
 
@@ -122,7 +122,7 @@ The consumer in Prosody is built around the concept of partition-level paralleli
 
 ```mermaid
 graph TD
-    A[Kafka Topics] --> B[Prosody KafkaConsumer]
+    A[Kafka Topics] --> B[ProsodyConsumer]
     B --> C[Partition Manager: Topic A, Partition 0]
     B --> D[Partition Manager: Topic A, Partition 1]
     B --> E[Partition Manager: Topic B, Partition 0]
@@ -172,7 +172,7 @@ sequenceDiagram
     Prosody Consumer -->> Kafka Broker: Commit offsets to Kafka
 ```
 
-1. The Prosody `KafkaConsumer` polls messages from Kafka Brokers.
+1. The `ProsodyConsumer` polls messages from Kafka Brokers.
 2. Messages are dispatched to the appropriate `PartitionManager` based on their topic and partition.
 3. The `PartitionManager` enqueues the message in the correct key-based queue according to the message key (e.g., User
    ID,
