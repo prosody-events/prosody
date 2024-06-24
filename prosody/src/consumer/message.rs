@@ -86,6 +86,12 @@ impl ConsumerMessage {
         &self.span
     }
 
+    /// Take ownership of the key, payload, and uncommitted offset.
+    #[must_use]
+    pub fn into_inner(self) -> (Key, Payload, UncommittedOffset) {
+        (self.key, self.payload, self.uncommitted_offset)
+    }
+
     /// Commits the message, marking its offset as processed.
     pub fn commit(self) {
         debug!(%self.topic, %self.partition, %self.key, %self.offset, "committing message");
