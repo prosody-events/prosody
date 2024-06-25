@@ -167,8 +167,8 @@ sequenceDiagram
     Partition Manager ->> Key Queue: Enqueue message for specific key
     Key Queue ->> User Message Handler: Process message
     User Message Handler -->> Key Queue: Message processed
-    Key Queue -->> Partition Manager: Update latest processed offset
-    Partition Manager -->> Prosody Consumer: Periodically commit offsets
+    Key Queue -->> Partition Manager: Send commit events
+    Partition Manager -->> Prosody Consumer: Update latest processed offset
     Prosody Consumer -->> Kafka Broker: Commit offsets to Kafka
 ```
 
