@@ -2,7 +2,7 @@ use std::cmp::max;
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 
-use ahash::{HashMap, HashSet};
+use ahash::{HashMap, HashMapExt, HashSet};
 use color_eyre::eyre::{eyre, OptionExt};
 use color_eyre::{eyre, Report};
 use itertools::Itertools;
@@ -133,7 +133,7 @@ async fn receives_all_in_key_order_impl(
 
     tasks.spawn(async move {
         let mut keys: HashSet<String> = messages.keys().map(ToString::to_string).collect();
-        let mut received: HashMap<String, Vec<u64>> = HashMap::default();
+        let mut received: HashMap<String, Vec<u64>> = HashMap::with_capacity(messages.len());
 
         while let Some((key, payload)) = messages_rx.recv().await {
             let Value::Number(number) = payload else {
@@ -149,13 +149,30 @@ async fn receives_all_in_key_order_impl(
 
         shutdown_tx.send(true)?;
 
-        for (_, actual) in received {
-            let mut expected = actual.clone();
-            expected.sort_unstable();
+        let mut actual: HashMap<u64, BTreeSet<u64>> = HashMap::with_capacity(messages.len());
 
-            if actual != expected {
-                return Err(eyre!("{:?} != {:?}", actual, expected));
+        for (key, received_messages) in received {
+            actual.insert(key.parse()?, received_messages.iter().copied().collect());
+
+            let mut sorted = received_messages.clone();
+            sorted.sort_unstable();
+
+            if received_messages != sorted {
+                return Err(eyre!(
+                    "invalid order for key {}; expected: {:?} != actual: {:?}",
+                    &key,
+                    sorted,
+                    received_messages,
+                ));
             }
+        }
+
+        if messages != actual {
+            return Err(eyre!(
+                "all messages were not received; expected: {:?} != actual: {:?}",
+                messages,
+                actual
+            ));
         }
 
         Ok(())
@@ -205,7 +222,8 @@ impl SmallCount {
 
 impl Arbitrary for SmallCount {
     fn arbitrary(g: &mut Gen) -> Self {
-        Self(max(1, u8::arbitrary(g)))
+        const VALUES: [u8; 12] = const_array();
+        Self(*max(&1, g.choose(&VALUES).unwrap_or(&1)))
     }
 }
 
@@ -213,4 +231,14 @@ impl Debug for SmallCount {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.write_str(&format!("{}", self.0))
     }
+}
+
+const fn const_array<const N: usize>() -> [u8; N] {
+    let mut arr = [0; N];
+    let mut i = 0;
+    while i < N {
+        arr[i] = i as u8 + 1;
+        i += 1;
+    }
+    arr
 }
