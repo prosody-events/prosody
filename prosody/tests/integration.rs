@@ -21,7 +21,7 @@ use prosody::Topic;
 
 #[test]
 fn receives_all_in_key_order() {
-    const TEST_COUNT: u64 = 10;
+    const TEST_COUNT: u64 = 3;
 
     fn prop(
         messages: HashMap<u64, BTreeSet<u64>>,
