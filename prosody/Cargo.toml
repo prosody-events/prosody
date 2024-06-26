@@ -23,6 +23,7 @@ educe.workspace = true
 futures.workspace = true
 humantime.workspace = true
 internment.workspace = true
+itertools.workspace = true
 nohash-hasher.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

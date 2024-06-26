@@ -30,7 +30,7 @@
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
 //! defined by implementing the [`MessageHandler`] trait.
 
-use std::error::Error;
+use std::fmt::Display;
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -41,6 +41,7 @@ use ahash::HashMap;
 use crossbeam_utils::CachePadded;
 use derive_builder::Builder;
 use educe::Educe;
+use futures::executor::block_on;
 use parking_lot::Mutex;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -94,7 +95,7 @@ pub trait Keyed {
 /// Defines the behavior for handling consumed Kafka messages.
 pub trait MessageHandler {
     /// The error type returned by the handler.
-    type Error: Error;
+    type Error: Display;
 
     /// Processes a consumed message.
     ///
@@ -339,7 +340,14 @@ impl ProsodyConsumer {
     ///
     /// This method signals the consumer to stop and waits for the polling task
     /// to complete.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
+        self.execute_shutdown().await;
+    }
+
+    /// Execute a consumer shutdown.
+    ///
+    /// Used by both the public shutdown method and the drop handler.
+    async fn execute_shutdown(&mut self) {
         // Signal the consumer to shut down
         self.shutdown.store(true, Ordering::Relaxed);
 
@@ -352,6 +360,12 @@ impl ProsodyConsumer {
         if let Err(error) = handle.await {
             error!("consumer shutdown failed: {error:#}");
         }
+    }
+}
+
+impl Drop for ProsodyConsumer {
+    fn drop(&mut self) {
+        block_on(self.execute_shutdown());
     }
 }
 
