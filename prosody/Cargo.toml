@@ -23,7 +23,6 @@ educe.workspace = true
 futures.workspace = true
 humantime.workspace = true
 internment.workspace = true
-itertools.workspace = true
 nohash-hasher.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
@@ -43,6 +42,7 @@ whoami.workspace = true
 
 [dev-dependencies]
 color-eyre.workspace = true
+itertools.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
 scc.workspace = true
