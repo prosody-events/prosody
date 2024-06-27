@@ -47,6 +47,7 @@ quickcheck.workspace = true
 quickcheck_macros.workspace = true
 scc.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true

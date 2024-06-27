@@ -1,18 +1,24 @@
 use std::cmp::max;
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
+use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt, HashSet};
 use color_eyre::eyre::{eyre, OptionExt};
 use color_eyre::{eyre, Report};
 use itertools::Itertools;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use rdkafka::mocking::MockCluster;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::config::FromClientConfig;
+use rdkafka::ClientConfig;
 use serde_json::{json, Value};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tracing::{error, info};
+use tracing_subscriber::fmt;
+use uuid::Uuid;
 
 use prosody::consumer::message::{ConsumerMessage, MessageContext};
 use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
@@ -21,7 +27,7 @@ use prosody::Topic;
 
 #[test]
 fn receives_all_in_key_order() {
-    const TEST_COUNT: u64 = 3;
+    const TEST_COUNT: u64 = 10;
 
     fn prop(
         messages: HashMap<u64, BTreeSet<u64>>,
@@ -34,6 +40,12 @@ fn receives_all_in_key_order() {
             return TestResult::error("failed to initialize runtime");
         };
 
+        for key_messages in messages.values() {
+            if key_messages.is_empty() {
+                return TestResult::discard();
+            }
+        }
+
         let Err(error) = runtime.block_on(receives_all_in_key_order_impl(
             messages,
             partition_count,
@@ -44,9 +56,11 @@ fn receives_all_in_key_order() {
             return TestResult::passed();
         };
 
+        error!("test failed with error: {error:#}");
         TestResult::error(error.to_string())
     }
 
+    fmt().pretty().init();
     QuickCheck::new().tests(TEST_COUNT).quickcheck(
         prop as fn(
             HashMap<u64, BTreeSet<u64>>,
@@ -58,6 +72,7 @@ fn receives_all_in_key_order() {
     );
 }
 
+#[allow(clippy::too_many_lines)] // todo: refactor and remove
 async fn receives_all_in_key_order_impl(
     messages: HashMap<u64, BTreeSet<u64>>,
     partition_count: SmallCount,
@@ -65,16 +80,25 @@ async fn receives_all_in_key_order_impl(
     consumer_count: SmallCount,
     max_enqueued_per_key: SmallCount,
 ) -> eyre::Result<()> {
-    let mock = MockCluster::new(3)?;
-    let bootstrap: Vec<String> = mock
-        .bootstrap_servers()
-        .split(',')
-        .map(str::to_owned)
-        .collect();
+    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    let bootstrap: Vec<String> = vec!["localhost:19092".to_owned()];
 
-    let topic: Topic = "test".into();
-    mock.create_topic(&topic, partition_count.value() as i32, 3)?;
+    let mut config = ClientConfig::new();
+    config.set("bootstrap.servers", "localhost:19092");
+    let admin_options = AdminOptions::default().operation_timeout(Some(Duration::from_secs(5)));
+    let admin_client = AdminClient::from_config(&config)?;
+    admin_client
+        .create_topics(
+            &[NewTopic::new(
+                &topic,
+                partition_count.value() as i32,
+                TopicReplication::Fixed(1),
+            )],
+            &admin_options,
+        )
+        .await?;
 
+    info!("topic: {topic}");
     let message_count = messages.len();
     let producer_message_count = max(message_count / producer_count.value(), 1);
 
@@ -135,6 +159,7 @@ async fn receives_all_in_key_order_impl(
         let mut keys: HashSet<String> = messages.keys().map(ToString::to_string).collect();
         let mut received: HashMap<String, Vec<u64>> = HashMap::with_capacity(messages.len());
 
+        info!("receiving messages");
         while let Some((key, payload)) = messages_rx.recv().await {
             let Value::Number(number) = payload else {
                 keys.remove(&key);
@@ -147,10 +172,12 @@ async fn receives_all_in_key_order_impl(
             received.entry(key).or_default().push(number);
         }
 
+        info!("sending shutdown signal");
         shutdown_tx.send(true)?;
 
         let mut actual: HashMap<u64, BTreeSet<u64>> = HashMap::with_capacity(messages.len());
 
+        info!("verifying results");
         for (key, received_messages) in received {
             actual.insert(key.parse()?, received_messages.iter().copied().collect());
 
@@ -175,9 +202,15 @@ async fn receives_all_in_key_order_impl(
             ));
         }
 
+        info!("test passed");
+        // admin_client
+        //     .delete_topics(&[topic.as_ref()], &admin_options)
+        //     .await?;
+
         Ok(())
     });
 
+    info!("waiting for tasks to complete");
     while let Some(result) = tasks.join_next().await {
         result??;
     }

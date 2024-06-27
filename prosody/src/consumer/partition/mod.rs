@@ -124,6 +124,7 @@ impl PartitionManager {
 
         if let Err(error) = self.handle.await {
             error!(%self.partition, "error occurred while shutting down partition: {error:#}");
+            return None;
         }
 
         self.offsets.shutdown().await
