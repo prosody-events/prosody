@@ -27,7 +27,7 @@ pin-project = "1.1"
 pyo3 = "0.22"
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
-rdkafka = "0.36"
+rdkafka = { git = "https://github.com/fede1024/rust-rdkafka.git", rev = "bb76b5bd4010599e90f02d9d3460c2d616a55752" }
 scc = "2.1"
 serde = "1.0"
 serde_json = "1.0"

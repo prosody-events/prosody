@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use rdkafka::consumer::{ConsumerContext, Rebalance};
-use rdkafka::ClientContext;
+use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance};
+use rdkafka::{ClientContext, Offset, TopicPartitionList};
 use tokio::runtime::Handle;
 use tracing::{error, warn};
 
@@ -81,37 +81,73 @@ where
     ///
     /// # Arguments
     /// * `rebalance` - Details about the rebalance event from Kafka.
-    fn pre_rebalance(&self, rebalance: &Rebalance) {
-        let Rebalance::Assign(partitions) = rebalance else {
-            return;
-        };
+    fn pre_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
+        match rebalance {
+            Rebalance::Assign(partitions) => {
+                // see: https://github.com/fede1024/rust-rdkafka/issues/681
+                if partitions.count() == 0 {
+                    return;
+                }
 
-        // see: https://github.com/fede1024/rust-rdkafka/issues/681
-        if partitions.count() == 0 {
-            return;
-        }
+                for element in partitions.elements() {
+                    let topic = Topic::from(element.topic());
+                    let partition = element.partition();
+                    let mut managers = self.managers.lock();
 
-        for element in partitions.elements() {
-            let topic = Topic::from(element.topic());
-            let partition = element.partition();
-            let mut managers = self.managers.lock();
+                    let Entry::Vacant(vacant) = managers.entry((topic, partition)) else {
+                        warn!("topic {topic} partition {partition} was already assigned");
+                        continue;
+                    };
 
-            let Entry::Vacant(vacant) = managers.entry((topic, partition)) else {
-                warn!("topic {topic} partition {partition} was already assigned");
-                continue;
-            };
+                    let manager = PartitionManager::new(
+                        element.partition(),
+                        self.message_handler.clone(),
+                        self.buffer_size,
+                        self.max_uncommitted,
+                        self.max_enqueued_per_key,
+                        self.shutdown_timeout,
+                        self.watermark_version.clone(),
+                    );
 
-            let manager = PartitionManager::new(
-                element.partition(),
-                self.message_handler.clone(),
-                self.buffer_size,
-                self.max_uncommitted,
-                self.max_enqueued_per_key,
-                self.shutdown_timeout,
-                self.watermark_version.clone(),
-            );
+                    vacant.insert(manager);
+                }
+            }
+            Rebalance::Revoke(partitions) => {
+                // see: https://github.com/fede1024/rust-rdkafka/issues/681
+                if partitions.count() == 0 {
+                    return;
+                }
 
-            vacant.insert(manager);
+                let mut list = TopicPartitionList::with_capacity(partitions.count());
+                for element in partitions.elements() {
+                    let topic = Topic::from(element.topic());
+                    let partition = element.partition();
+
+                    let managers = self.managers.lock();
+                    let Some(manager) = managers.get(&(topic, partition)) else {
+                        error!("cannot find topic {topic} partition {partition}; not assigned");
+                        continue;
+                    };
+
+                    let Some(offset) = manager.watermark() else {
+                        continue;
+                    };
+
+                    let next_offset = Offset::Offset(offset + 1);
+                    if let Err(error) = list.add_partition_offset(&topic, partition, next_offset) {
+                        error!("failed to add offset to commit list: {error:#}");
+                    }
+                }
+
+                if list.count() == 0 {
+                    return;
+                }
+
+                if let Err(error) = consumer.commit(&list, CommitMode::Sync) {
+                    error!("failed to commit offsets before rebalance: {error:#}");
+                }
+            }
+            Rebalance::Error(_) => {}
         }
     }
 
@@ -121,7 +157,7 @@ where
     ///
     /// # Arguments
     /// * `rebalance` - Details about the partition revocation event from Kafka.
-    fn post_rebalance(&self, rebalance: &Rebalance) {
+    fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         let Rebalance::Revoke(partitions) = rebalance else {
             return;
         };
