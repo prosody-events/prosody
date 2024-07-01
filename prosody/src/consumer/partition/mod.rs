@@ -3,12 +3,14 @@
 //! concurrently, maintain a record of offset progression, and handle graceful
 //! shutdown operations.
 
+use std::future::ready;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;
+use futures::StreamExt;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
@@ -16,7 +18,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info_span, instrument, Instrument};
+use tracing::{debug, error, info_span, instrument, Instrument};
 
 use crate::consumer::message::{MessageContext, UntrackedMessage};
 use crate::consumer::partition::keyed::KeyManager;
@@ -124,6 +126,7 @@ impl PartitionManager {
 
         if let Err(error) = self.handle.await {
             error!(%self.partition, "error occurred while shutting down partition: {error:#}");
+            return None;
         }
 
         self.offsets.shutdown().await
@@ -183,8 +186,25 @@ async fn handle_messages<T>(
 
     // Create and run a KeyManager to manage concurrent message processing,
     // using the defined processing logic and managing shutdown timing.
+    let mut highest_offset_seen = -1;
     KeyManager::new(process, max_enqueued_per_key)
-        .process_messages(ReceiverStream::new(message_rx), shutdown_timeout)
+        .process_messages(
+            ReceiverStream::new(message_rx).filter(|message| {
+                // Filter out messages with offsets we've already seen. This reduces duplicates
+                // during rebalances but doesn't guarantee exactly-once processing.
+                if message.offset <= highest_offset_seen {
+                    debug!(
+                        "filtering stale partition {} offset {}",
+                        message.partition, message.offset
+                    );
+                    return ready(false);
+                }
+                // Update the highest offset seen to the current message's offset
+                highest_offset_seen = message.offset;
+                ready(true)
+            }),
+            shutdown_timeout,
+        )
         .await;
 }
 

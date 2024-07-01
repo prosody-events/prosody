@@ -17,29 +17,20 @@
 //! - Distributed tracing: Integrating with OpenTelemetry for tracing message
 //!   flow across distributed systems.
 //!
-//! The module is composed of several submodules:
+//! The module consists of several submodules:
 //!
-//! - `context`: Manages Kafka partition assignments and revocations,
-//!   integrating with Kafka's rebalance callbacks.
-//! - `extractor`: Provides functionality for extracting metadata from Kafka
-//!   messages, particularly for distributed tracing purposes.
-//! - `message`: Defines structures for managing message contexts and consumer
-//!   messages, including tracking shutdown signals and committing messages
-//!   after processing.
+//! - `context`: Manages Kafka partition assignments and revocations.
+//! - `extractor`: Extracts metadata from Kafka messages for distributed
+//!   tracing.
+//! - `message`: Defines structures for message contexts and consumer messages.
 //! - `partition`: Handles partition-specific operations and state management.
-//! - `poll`: Implements the core message polling and processing loop, including
-//!   offset commits and partition management.
+//! - `poll`: Implements the core message polling and processing loop.
 //!
-//! The main entry point for using this module is the [`KafkaConsumer`] struct,
-//! which is configured using the [`ConsumerConfiguration`] struct. Users should
-//! implement the [`MessageHandler`] trait to define custom message processing
-//! logic.
-//!
-//! This module is designed to provide a high-level, ergonomic interface for
-//! consuming and processing Kafka messages while handling complex scenarios
-//! such as consumer group re-balancing, offset management, and distributed
-//! tracing.
-use std::error::Error;
+//! Users should primarily interact with the [`ProsodyConsumer`] struct,
+//! configured via [`ConsumerConfiguration`]. Custom message processing logic is
+//! defined by implementing the [`MessageHandler`] trait.
+
+use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -47,15 +38,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::HashMap;
-use confique::Config;
 use crossbeam_utils::CachePadded;
+use derive_builder::Builder;
 use educe::Educe;
+use futures::executor::block_on;
 use parking_lot::Mutex;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::ClientConfig;
-use serde::Deserialize;
 use thiserror::Error;
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::error;
@@ -66,6 +57,10 @@ use crate::consumer::context::Context;
 use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
+use crate::util::{
+    from_duration_env_with_fallback, from_env, from_env_with_fallback,
+    from_option_duration_env_with_fallback, from_vec_env,
+};
 use crate::{Partition, Topic};
 
 mod context;
@@ -74,21 +69,14 @@ pub mod message;
 mod partition;
 mod poll;
 
-/// Thread-safe, cache-padded atomic usize used to detect changes in partition
-/// watermarks.
+/// Atomic counter for tracking changes in partition watermarks.
 ///
-/// This type is used as a simple mechanism to notify the poll loop when
-/// partition watermarks have changed, indicating that offsets should be
-/// committed. The value is incremented each time a watermark changes, allowing
-/// the poll loop to detect changes efficiently without checking individual
-/// partition watermarks.
+/// Used to efficiently notify the poll loop when offsets should be committed.
 type WatermarkVersion = CachePadded<AtomicUsize>;
 
-/// Thread-safe hash map of partition managers.
+/// Thread-safe storage for partition managers.
 ///
-/// This type maps topic-partition pairs to their respective
-/// [`PartitionManager`]s. It's used to track and manage the state of each
-/// assigned partition, including message buffers and offset information.
+/// Maps topic-partition pairs to their respective [`PartitionManager`]s.
 type Managers = Mutex<HashMap<(Topic, Partition), PartitionManager>>;
 
 /// Defines a type with an associated key.
@@ -107,7 +95,7 @@ pub trait Keyed {
 /// Defines the behavior for handling consumed Kafka messages.
 pub trait MessageHandler {
     /// The error type returned by the handler.
-    type Error: Error;
+    type Error: Display;
 
     /// Processes a consumed message.
     ///
@@ -128,53 +116,136 @@ pub trait MessageHandler {
 }
 
 /// Configuration for the Kafka consumer.
-#[derive(Config, Deserialize, Validate)]
+///
+/// This struct holds all the necessary configuration options for creating a
+/// Kafka consumer. It uses the Builder pattern for flexible initialization and
+/// supports loading values from environment variables.
+#[derive(Builder, Clone, Validate)]
 pub struct ConsumerConfiguration {
     /// List of Kafka bootstrap servers.
-    #[config(env = "PROSODY_BOOTSTRAP_SERVERS")]
+    ///
+    /// Environment variable: `PROSODY_BOOTSTRAP_SERVERS`
+    /// Default: None (must be specified)
+    ///
+    /// At least one server must be specified.
+    #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Consumer group ID.
-    #[config(env = "PROSODY_GROUP_ID")]
+    ///
+    /// Environment variable: `PROSODY_GROUP_ID`
+    /// Default: None (must be specified)
+    ///
+    /// The group ID must be a non-empty string and should be unique for each
+    /// logically separate consumer application. Consumers with the same group
+    /// ID will form a consumer group and share the load of consuming topics.
+    #[builder(default = "from_env(\"PROSODY_GROUP_ID\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub group_id: String,
 
     /// List of topics to subscribe to.
-    #[config(env = "PROSODY_SUBSCRIBED_TOPICS")]
+    ///
+    /// Environment variable: `PROSODY_SUBSCRIBED_TOPICS`
+    /// Default: None (must be specified)
+    ///
+    /// At least one topic must be specified.
+    #[builder(default = "from_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub subscribed_topics: Vec<String>,
 
     /// Maximum number of uncommitted messages.
-    #[config(env = "PROSODY_MAX_UNCOMMITTED", default = 32)]
+    ///
+    /// Environment variable: `PROSODY_MAX_UNCOMMITTED`
+    /// Default: 32
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 32)?",
+        setter(into)
+    )]
     #[validate(range(min = 1_usize))]
     pub max_uncommitted: usize,
 
     /// Maximum number of enqueued messages per key.
-    #[config(env = "PROSODY_MAX_ENQUEUED_PER_KEY", default = 8)]
+    ///
+    /// Environment variable: `PROSODY_MAX_ENQUEUED_PER_KEY`
+    /// Default: 8
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?",
+        setter(into)
+    )]
     #[validate(range(min = 1_usize))]
     pub max_enqueued_per_key: usize,
 
     /// Timeout for partition shutdown.
-    #[config(env = "PROSODY_PARTITION_SHUTDOWN_TIMEOUT")]
-    #[serde(with = "humantime_serde", default = "default_partition_timeout")]
+    ///
+    /// Environment variable: `PROSODY_PARTITION_SHUTDOWN_TIMEOUT`
+    /// Default: 5 seconds
+    ///
+    /// If set to None (or if the environment variable is set to "none"), the
+    /// partition will immediately be shutdown without waiting for in-flight
+    /// tasks to complete. As these tasks will not be committed, they will be
+    /// retried when the partition is rebalanced to a new node. This may be
+    /// appropriate when performing user-facing processing where delays due to
+    /// rebalancing must be minimized.
+    #[builder(
+        default = "from_option_duration_env_with_fallback(\"PROSODY_PARTITION_SHUTDOWN_TIMEOUT\", \
+                   Duration::from_secs(5))?",
+        setter(into)
+    )]
     pub partition_shutdown_timeout: Option<Duration>,
 
     /// Interval between poll operations.
-    #[config(env = "PROSODY_POLL_INTERVAL", default = "100ms")]
-    #[serde(with = "humantime_serde")]
+    ///
+    /// Environment variable: `PROSODY_POLL_INTERVAL`
+    /// Default: 100 milliseconds
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_POLL_INTERVAL\", \
+                   Duration::from_millis(100))?",
+        setter(into)
+    )]
     pub poll_interval: Duration,
 
     /// Interval between commit operations.
-    #[config(env = "PROSODY_COMMIT_INTERVAL", default = "1s")]
-    #[serde(with = "humantime_serde")]
+    ///
+    /// Environment variable: `PROSODY_COMMIT_INTERVAL`
+    /// Default: 1 second
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_COMMIT_INTERVAL\", \
+                   Duration::from_secs(1))?",
+        setter(into)
+    )]
     pub commit_interval: Duration,
+
+    /// Use a mock consumer for testing purposes.
+    ///
+    /// Environment variable: `PROSODY_MOCK`
+    /// Default: false
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?",
+        setter(into)
+    )]
+    pub mock: bool,
+}
+
+impl ConsumerConfiguration {
+    /// Creates a new `ConsumerConfigurationBuilder`.
+    ///
+    /// This method is a convenient way to start building a
+    /// `ConsumerConfiguration`.
+    ///
+    /// # Returns
+    ///
+    /// A default `ConsumerConfigurationBuilder` instance.
+    #[must_use]
+    pub fn builder() -> ConsumerConfigurationBuilder {
+        ConsumerConfigurationBuilder::default()
+    }
 }
 
 /// High-level Kafka consumer implementation.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub struct KafkaConsumer {
+pub struct ProsodyConsumer {
     #[educe(Debug(ignore))]
     shutdown: Arc<AtomicBool>,
 
@@ -182,8 +253,8 @@ pub struct KafkaConsumer {
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-impl KafkaConsumer {
-    /// Creates a new `KafkaConsumer` instance.
+impl ProsodyConsumer {
+    /// Creates a new `ProsodyConsumer` instance.
     ///
     /// # Arguments
     ///
@@ -192,7 +263,7 @@ impl KafkaConsumer {
     ///
     /// # Returns
     ///
-    /// A Result containing the new `KafkaConsumer` instance or a
+    /// A Result containing the new `ProsodyConsumer` instance or a
     /// `ConsumerError`.
     ///
     /// # Errors
@@ -223,15 +294,23 @@ impl KafkaConsumer {
         );
 
         // Configure and create the Kafka consumer
-        let consumer: BaseConsumer<_> = ClientConfig::new()
+        let mut client_config = ClientConfig::new();
+        client_config
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", hostname()?)
             .set("group.id", config.group_id)
+            .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
             .set("partition.assignment.strategy", "cooperative-sticky")
-            .set_log_level(RDKafkaLogLevel::Error)
-            .create_with_context(context)?;
+            .set_log_level(RDKafkaLogLevel::Error);
+
+        // Set up mock broker if configured
+        if config.mock {
+            client_config.set("test.mock.num.brokers", "3");
+        }
+
+        let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
 
         // Subscribe to the specified topics
         let topics: Vec<&str> = config
@@ -262,7 +341,14 @@ impl KafkaConsumer {
     ///
     /// This method signals the consumer to stop and waits for the polling task
     /// to complete.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
+        self.execute_shutdown().await;
+    }
+
+    /// Execute a consumer shutdown.
+    ///
+    /// Used by both the public shutdown method and the drop handler.
+    async fn execute_shutdown(&mut self) {
         // Signal the consumer to shut down
         self.shutdown.store(true, Ordering::Relaxed);
 
@@ -275,6 +361,12 @@ impl KafkaConsumer {
         if let Err(error) = handle.await {
             error!("consumer shutdown failed: {error:#}");
         }
+    }
+}
+
+impl Drop for ProsodyConsumer {
+    fn drop(&mut self) {
+        block_on(self.execute_shutdown());
     }
 }
 
@@ -293,14 +385,4 @@ pub enum ConsumerError {
     /// Indicates a Kafka operation failure.
     #[error("Kafka operation failed: {0:#}")]
     Kafka(#[from] KafkaError),
-}
-
-/// Provides the default partition shutdown timeout.
-///
-/// # Returns
-///
-/// An Option containing a Duration of 5 seconds.
-#[allow(clippy::unnecessary_wraps)]
-fn default_partition_timeout() -> Option<Duration> {
-    Some(Duration::from_secs(5))
 }

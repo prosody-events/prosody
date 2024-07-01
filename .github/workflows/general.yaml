@@ -9,12 +9,28 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    services:
+      kafka:
+        image: docker.io/bitnami/kafka:3.7
+        ports:
+          - "9094:9094"
+        env:
+          KAFKA_CFG_NODE_ID: 0
+          KAFKA_CFG_PROCESS_ROLES: controller,broker
+          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
     steps:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test
+        env:
+          PROSODY_BOOTSTRAP_SERVERS: localhost:9094
 
   fmt:
     name: Format
@@ -24,6 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: Enforce formatting
         run: cargo fmt --check
 
@@ -50,6 +67,7 @@ jobs:
         uses: baptiste0928/cargo-install@v3
         with:
           crate: cargo-udeps
+      - uses: Swatinem/rust-cache@v2
       - name: Run cargo udeps
         run: cargo +nightly udeps
 
@@ -66,12 +84,30 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-    container:
-      image: xd009642/tarpaulin
-      options: --security-opt seccomp=unconfined
+    services:
+      kafka:
+        image: docker.io/bitnami/kafka:3.7
+        ports:
+          - "9094:9094"
+        env:
+          KAFKA_CFG_NODE_ID: 0
+          KAFKA_CFG_PROCESS_ROLES: controller,broker
+          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install tarpaulin
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-tarpaulin
+      - uses: Swatinem/rust-cache@v2
       - name: Generate code coverage
-        run: |
-          cargo tarpaulin --verbose --workspace
+        run: cargo tarpaulin --workspace --skip-clean
+        env:
+          PROSODY_BOOTSTRAP_SERVERS: localhost:9094

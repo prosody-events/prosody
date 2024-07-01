@@ -17,23 +17,26 @@
 //!   operations.
 //! - **Backpressure Management**: Intelligent partition pausing to handle
 //!   processing backlogs.
+//! - **Mocking Support**: Ability to use mock Kafka brokers for testing
+//!   purposes.
 //!
 //! # Examples
 //!
 //! ## Producer Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use prosody::Topic;
-//! use prosody::producer::{ProducerConfiguration, Producer};
+//! use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 //! use serde_json::json;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ProducerConfiguration {
-//!         bootstrap_servers: vec!["localhost:9092".to_string()],
-//!         send_timeout: Some(std::time::Duration::from_secs(5)),
-//!     };
-//!     let producer = Producer::new(&config)?;
+//!     let config = ProducerConfiguration::builder()
+//!         .bootstrap_servers(["localhost:9092".to_owned()])
+//!         .mock(true) // use mock producer for example
+//!         .build()?;
+//!
+//!     let producer = ProsodyProducer::new(&config)?;
 //!
 //!     let topic: Topic = "my-topic".into();
 //!     producer.send(topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
@@ -44,9 +47,9 @@
 //!
 //! ## Consumer Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use prosody::consumer::message::{ConsumerMessage, MessageContext};
-//! use prosody::consumer::{ConsumerConfiguration, KafkaConsumer, MessageHandler};
+//! use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
 //! use prosody::Topic;
 //! use std::time::Duration;
 //!
@@ -69,17 +72,14 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ConsumerConfiguration {
-//!         bootstrap_servers: vec!["localhost:9092".to_string()],
-//!         group_id: "my-group".to_string(),
-//!         subscribed_topics: vec!["my-topic".to_string()],
-//!         max_uncommitted: 1000,
-//!         max_enqueued_per_key: 100,
-//!         partition_shutdown_timeout: Some(Duration::from_secs(30)),
-//!         poll_interval: Duration::from_millis(100),
-//!         commit_interval: Duration::from_secs(5),
-//!     };
-//!     let consumer = KafkaConsumer::new(config, MyMessageHandler)?;
+//!     let config = ConsumerConfiguration::builder()
+//!         .bootstrap_servers(["localhost:9092".to_owned()])
+//!         .group_id("my-group")
+//!         .subscribed_topics(["my-topic".to_owned()])
+//!         .mock(true) // use mock consumer for example
+//!         .build()?;
+//!
+//!     let consumer = ProsodyConsumer::new(config, MyMessageHandler)?;
 //!
 //!     // Run your application logic here
 //!
@@ -117,7 +117,7 @@
 //!    sequentially from their respective queue, ensuring ordered processing for
 //!    each key.
 //!
-//! 5. **Polling Mechanism**: The `KafkaConsumer` uses a polling mechanism to
+//! 5. **Polling Mechanism**: The `ProsodyConsumer` uses a polling mechanism to
 //!    efficiently fetch messages from Kafka brokers.
 //!
 //! 6. **Partition Pausing**: If a partition becomes backed up (i.e., its queues
@@ -127,7 +127,7 @@
 //!
 //! ## Message Flow
 //!
-//! 1. The Prosody `KafkaConsumer` polls messages from Kafka Brokers.
+//! 1. The `ProsodyConsumer` polls messages from Kafka Brokers.
 //! 2. Messages are dispatched to the appropriate `PartitionManager` based on
 //!    their topic and partition.
 //! 3. The `PartitionManager` enqueues the message in the correct key-based
@@ -135,10 +135,10 @@
 //! 4. Messages are processed sequentially from each key queue, invoking the
 //!    user-provided `MessageHandler`.
 //! 5. After processing, the latest processed offset for the key is updated.
-//! 6. Periodically, the `PartitionManager` collects the latest processed
-//!    offsets from all its key queues.
-//! 7. The Prosody Consumer commits these offsets back to Kafka, ensuring
-//!    at-least-once message processing semantics.
+//! 6. The `PartitionManager` tracks the partition's high watermark committed
+//!    offset.
+//! 7. The Prosody Consumer periodically commits these offsets back to Kafka,
+//!    ensuring at-least-once message processing semantics.
 //! 8. If a partition's queues become full, that specific partition is paused
 //!    until the backlog is processed.
 //!
@@ -151,6 +151,15 @@
 //! ordering for messages with the same key. It also provides backpressure
 //! management by limiting the number of in-flight messages per key and
 //! partition through bounded queues and selective partition pausing.
+//!
+//! ## Mocking Support
+//!
+//! Prosody provides mocking support for both consumers and producers, allowing
+//! for easier testing of Kafka-dependent components. When the `mock`
+//! configuration option is set to `true`, Prosody will use mock Kafka brokers
+//! instead of connecting to real ones. This feature is particularly useful for
+//! unit testing and continuous integration environments where setting up a real
+//! Kafka cluster might be impractical.
 
 #![allow(clippy::multiple_crate_versions)]
 
@@ -160,6 +169,7 @@ use serde_json::Value;
 pub mod consumer;
 pub mod producer;
 mod propagator;
+mod util;
 
 /// A Kafka topic name.
 ///

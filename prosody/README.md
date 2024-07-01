@@ -12,6 +12,7 @@ integrated OpenTelemetry support for distributed tracing.
 - **Configurable**: Flexible configuration through environment variables.
 - **Asynchronous**: Built on top of Tokio for high-performance asynchronous operations.
 - **Backpressure Management**: Intelligent partition pausing to handle processing backlogs.
+- **Mocking Support**: Ability to use mock Kafka brokers for testing purposes.
 
 ## Usage
 
@@ -26,17 +27,17 @@ prosody = { git = "https://github.com/RealGeeks/prosody.git" }
 
 ```rust
 use prosody::Topic;
-use prosody::producer::{ProducerConfiguration, Producer};
+use prosody::producer::{ProducerConfiguration, Prosody};
 use serde_json::json;
 use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let config = ProducerConfiguration {
-        bootstrap_servers: vec!["localhost:9092".to_string()],
-        send_timeout: Some(std::time::Duration::from_secs(5)),
-    };
-    let producer = Producer::new(&config)?;
+    let config = ProducerConfiguration::builder()
+        .bootstrap_servers(["localhost:9092".to_owned()])
+        .build()?;
+
+    let producer = ProsodyProducer::new(&config)?;
 
     let topic: Topic = "my-topic".into();
     producer.send(topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ```rust
 use prosody::consumer::message::{ConsumerMessage, MessageContext};
-use prosody::consumer::{ConsumerConfiguration, KafkaConsumer, MessageHandler};
+use prosody::consumer::{ConsumerConfiguration, ProsodyConsumer, MessageHandler};
 use prosody::Topic;
 use std::time::Duration;
 use std::error::Error;
@@ -73,17 +74,13 @@ impl MessageHandler for MyMessageHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let config = ConsumerConfiguration {
-        bootstrap_servers: vec!["localhost:9092".to_string()],
-        group_id: "my-group".to_string(),
-        subscribed_topics: vec!["my-topic".to_string()],
-        max_uncommitted: 1000,
-        max_enqueued_per_key: 100,
-        partition_shutdown_timeout: Some(Duration::from_secs(30)),
-        poll_interval: Duration::from_millis(100),
-        commit_interval: Duration::from_secs(5),
-    };
-    let consumer = KafkaConsumer::new(config, MyMessageHandler)?;
+    let config = ConsumerConfiguration::builder()
+        .bootstrap_servers(["localhost:9092".to_owned()])
+        .group_id("my-group")
+        .subscribed_topics(["my-topic".to_owned()])
+        .build()?;
+
+    let consumer = ProsodyConsumer::new(config, MyMessageHandler)?;
 
     // Run your application logic here
 
@@ -94,18 +91,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ## Configuration
 
-Prosody can be configured through environment variables. Both `ConsumerConfiguration` and `ProducerConfiguration` can be
-loaded from environment variables using the following pattern:
-
-```rust
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let consumer_config = ConsumerConfiguration::builder().env().load()?;
-    let producer_config = ProducerConfiguration::builder().env().load()?;
-    
-    // ...
-}
-```
+Prosody can be configured through environment variables or programmatically using the builder pattern. Both
+`ConsumerConfiguration` and `ProducerConfiguration` use this approach. The builder pattern automatically falls back to
+environment variables for any unspecified field. This means you can mix and match programmatic configuration with
+environment variables, giving you flexibility in how you set up your Kafka clients.
 
 The following table lists the available configuration options and their associated environment variables:
 
@@ -119,7 +108,8 @@ The following table lists the available configuration options and their associat
 | `PROSODY_PARTITION_SHUTDOWN_TIMEOUT` | Timeout for partition shutdown                  | 5s      | ✓        |          |
 | `PROSODY_POLL_INTERVAL`              | Interval between poll operations                | 100ms   | ✓        |          |
 | `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations              | 1s      | ✓        |          |
-| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | -       |          | ✓        |
+| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | 1s      |          | ✓        |
+| `PROSODY_MOCK`                       | Use mock Kafka brokers for testing              | false   | ✓        | ✓        |
 
 ## Architecture
 
@@ -132,7 +122,7 @@ The consumer in Prosody is built around the concept of partition-level paralleli
 
 ```mermaid
 graph TD
-    A[Kafka Topics] --> B[Prosody KafkaConsumer]
+    A[Kafka Topics] --> B[ProsodyConsumer]
     B --> C[Partition Manager: Topic A, Partition 0]
     B --> D[Partition Manager: Topic A, Partition 1]
     B --> E[Partition Manager: Topic B, Partition 0]
@@ -177,20 +167,21 @@ sequenceDiagram
     Partition Manager ->> Key Queue: Enqueue message for specific key
     Key Queue ->> User Message Handler: Process message
     User Message Handler -->> Key Queue: Message processed
-    Key Queue -->> Partition Manager: Update latest processed offset
-    Partition Manager -->> Prosody Consumer: Periodically commit offsets
+    Key Queue -->> Partition Manager: Send commit events
+    Partition Manager -->> Prosody Consumer: Update latest processed offset
     Prosody Consumer -->> Kafka Broker: Commit offsets to Kafka
 ```
 
-1. The Prosody `KafkaConsumer` polls messages from Kafka Brokers.
+1. The `ProsodyConsumer` polls messages from Kafka Brokers.
 2. Messages are dispatched to the appropriate `PartitionManager` based on their topic and partition.
 3. The `PartitionManager` enqueues the message in the correct key-based queue according to the message key (e.g., User
    ID,
    Product ID).
 4. Messages are processed sequentially from each key queue, invoking the user-provided `MessageHandler`.
 5. After processing, the latest processed offset for the key is updated.
-6. Periodically, the `PartitionManager` collects the latest processed offsets from all its key queues.
-7. The Prosody Consumer commits these offsets back to Kafka, ensuring at-least-once message processing semantics.
+6. The `PartitionManager` tracks the partition's high watermark committed offset.
+7. The Prosody Consumer periodically commits these offsets back to Kafka, ensuring at-least-once message processing
+   semantics.
 8. If a partition's queues become full, that specific partition is paused until the backlog is processed.
 
 Throughout this flow, OpenTelemetry is used to create and propagate distributed traces, allowing for end-to-end

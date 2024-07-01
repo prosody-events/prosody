@@ -7,7 +7,7 @@
 use std::io;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use confique::Config;
+use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use rdkafka::config::RDKafkaLogLevel;
@@ -15,7 +15,6 @@ use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
-use serde::Deserialize;
 use serde_json::{to_vec, Value};
 use thiserror::Error;
 use tracing::Span;
@@ -25,28 +24,78 @@ use whoami::fallible::hostname;
 
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
+use crate::util::{from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env};
 use crate::Topic;
 
 mod injector;
 
 /// Configuration for the Kafka producer.
-#[derive(Clone, Config, Deserialize, Validate)]
+///
+/// This struct holds all the necessary configuration options for creating a
+/// Kafka producer. It uses the Builder pattern for flexible initialization and
+/// supports loading values from environment variables.
+#[derive(Builder, Clone, Validate)]
 pub struct ProducerConfiguration {
     /// List of Kafka bootstrap servers.
-    #[config(env = "PROSODY_BOOTSTRAP_SERVERS")]
+    ///
+    /// Environment variable: `PROSODY_BOOTSTRAP_SERVERS`
+    /// Default: None (must be specified)
+    ///
+    /// At least one server must be specified.
+    #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Timeout for send operations.
-    #[config(env = "PROSODY_SEND_TIMEOUT")]
-    #[serde(with = "humantime_serde", default = "default_send_timeout")]
+    ///
+    /// Environment variable: `PROSODY_SEND_TIMEOUT`
+    /// Default: 1 second
+    ///
+    /// If set to None (or if the environment variable is set to "none"), the
+    /// sender will retry indefinitely and never timeout. This may be an
+    /// appropriate setting for consumers that produce to topics, as the
+    /// consumed message may not be marked as complete until the message is
+    /// produced.
+    #[builder(
+        default = "from_option_duration_env_with_fallback(\"PROSODY_SEND_TIMEOUT\", \
+                   Duration::from_secs(1))?",
+        setter(into)
+    )]
     pub send_timeout: Option<Duration>,
+
+    /// Use a mock producer for testing purposes.
+    ///
+    /// Environment variable: `PROSODY_MOCK`
+    /// Default: false
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?",
+        setter(into)
+    )]
+    pub mock: bool,
+}
+
+impl ProducerConfiguration {
+    /// Creates a new `ProducerConfigurationBuilder`.
+    ///
+    /// This method is a convenient way to start building a
+    /// `ProducerConfiguration`.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `ProducerConfigurationBuilder`.
+    #[must_use]
+    pub fn builder() -> ProducerConfigurationBuilder {
+        ProducerConfigurationBuilder::default()
+    }
 }
 
 /// High-level Kafka producer implementation.
+///
+/// This struct encapsulates the Kafka producer functionality, including
+/// message sending and OpenTelemetry context propagation.
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct Producer {
+pub struct ProsodyProducer {
     /// Timeout for send operations.
     send_timeout: Timeout,
 
@@ -59,7 +108,7 @@ pub struct Producer {
     propagator: TextMapCompositePropagator,
 }
 
-impl Clone for Producer {
+impl Clone for ProsodyProducer {
     fn clone(&self) -> Self {
         Self {
             send_timeout: self.send_timeout,
@@ -69,8 +118,8 @@ impl Clone for Producer {
     }
 }
 
-impl Producer {
-    /// Creates a new `Producer` instance.
+impl ProsodyProducer {
+    /// Creates a new `ProsodyProducer` instance.
     ///
     /// # Arguments
     ///
@@ -78,7 +127,8 @@ impl Producer {
     ///
     /// # Returns
     ///
-    /// A Result containing the new Producer instance or a `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance or a
+    /// `ProducerError`.
     ///
     /// # Errors
     ///
@@ -97,22 +147,30 @@ impl Producer {
         };
 
         // Create and configure the Kafka producer
-        let producer: FutureProducer = ClientConfig::new()
+        let mut client_config = ClientConfig::new();
+        client_config
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", hostname()?)
             .set("compression.codec", "lz4")
             .set("enable.idempotence", "true")
-            .set_log_level(RDKafkaLogLevel::Error)
-            .create()?;
+            .set_log_level(RDKafkaLogLevel::Error);
+
+        // Set up mock broker if configured
+        if config.mock {
+            client_config.set("test.mock.num.brokers", "3");
+        }
 
         Ok(Self {
             send_timeout,
-            producer,
+            producer: client_config.create()?,
             propagator: new_propagator(),
         })
     }
 
     /// Sends a message to a Kafka topic.
+    ///
+    /// This method serializes the payload, injects OpenTelemetry context,
+    /// and sends the message to the specified Kafka topic.
     ///
     /// # Arguments
     ///
@@ -122,7 +180,7 @@ impl Producer {
     ///
     /// # Returns
     ///
-    /// A Result indicating success or failure of the send operation.
+    /// A `Result` indicating success or failure of the send operation.
     ///
     /// # Errors
     ///
@@ -178,14 +236,4 @@ pub enum ProducerError {
     /// Indicates a Kafka operation failure.
     #[error("Kafka error: {0:#}")]
     Kafka(#[from] KafkaError),
-}
-
-/// Provides the default send timeout.
-///
-/// # Returns
-///
-/// An Option containing a Duration of 1 second.
-#[allow(clippy::unnecessary_wraps)]
-fn default_send_timeout() -> Option<Duration> {
-    Some(Duration::from_secs(1))
 }
