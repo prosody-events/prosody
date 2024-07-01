@@ -4,10 +4,10 @@ Prosody is a high-level Kafka client library for Rust, featuring robust consumer
 integrated OpenTelemetry support for distributed tracing.
 
 [![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://studious-enigma-ozyo9n3.pages.github.io/prosody)
-[![Build Status](https://github.com/RealGeeks/prosody/workflows/Check/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/general.yaml)
-[![Audit Status](https://github.com/RealGeeks/prosody/workflows/Audit/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/audit.yaml)
-[![Docs Status](https://github.com/RealGeeks/prosody/workflows/Docs/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/documentation.yaml)
-[![Quality Status](https://github.com/RealGeeks/prosody/workflows/Quality/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/quality.yaml)
+[![Build Status](https://github.com/RealGeeks/prosody/workflows/Check/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/general.yaml?query=branch%3Amain)
+[![Audit Status](https://github.com/RealGeeks/prosody/workflows/Audit/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/audit.yaml?query=branch%3Amain)
+[![Docs Status](https://github.com/RealGeeks/prosody/workflows/Docs/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/documentation.yaml?query=branch%3Amain)
+[![Quality Status](https://github.com/RealGeeks/prosody/workflows/Quality/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/quality.yaml?query=branch%3Amain)
 ![Code Coverage](https://studious-enigma-ozyo9n3.pages.github.io/coverage-badge.svg)
 
 ## Features
