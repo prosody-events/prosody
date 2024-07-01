@@ -30,18 +30,6 @@ jobs:
         run: cargo doc --no-deps
       - name: Remove lock file
         run: rm target/doc/.lock
-      - name: Download coverage badge
-        uses: dawidd6/action-download-artifact@v2
-        with:
-          name: coverage-badge
-          workflow: general.yaml
-          workflow_conclusion: success
-          branch: main
-          check_artifacts: true
-          search_artifacts: true
-          if_no_artifact_found: warn
-      - name: Move coverage badge
-        run: mv coverage-badge.svg target/doc/
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
