@@ -8,6 +8,7 @@ integrated OpenTelemetry support for distributed tracing.
 [![Audit Status](https://github.com/RealGeeks/prosody/workflows/Audit/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/audit.yaml)
 [![Docs Status](https://github.com/RealGeeks/prosody/workflows/Docs/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/documentation.yaml)
 [![Quality Status](https://github.com/RealGeeks/prosody/workflows/Quality/badge.svg)](https://github.com/RealGeeks/prosody/actions/workflows/quality.yaml)
+![Code Coverage](https://studious-enigma-ozyo9n3.pages.github.io/coverage-badge.svg)
 
 ## Features
 
