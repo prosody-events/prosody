@@ -1,7 +1,8 @@
-//! Unit tests for the KeyManager struct in the consumer partition keyed module.
+//! Unit tests for the `KeyManager` struct in the consumer partition keyed
+//! module.
 //!
 //! This module contains QuickCheck-based property tests to verify the correct
-//! functioning of the KeyManager, focusing on concurrent execution prevention
+//! functioning of the `KeyManager`, focusing on concurrent execution prevention
 //! and complete message processing.
 
 use std::cmp::max;
@@ -20,7 +21,7 @@ use tokio::time::sleep;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::Keyed;
 
-/// A simple wrapper for a vector of u8 values used in QuickCheck tests.
+/// A simple wrapper for a vector of u8 values used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
 struct SimpleMessages(Vec<u8>);
 
@@ -54,6 +55,20 @@ fn processes_all_messages(messages: Vec<u8>, max_enqueued: u8) -> TestResult {
     };
 
     runtime.block_on(processes_all_messages_impl(messages, max_enqueued))
+}
+
+/// Verifies that KeyManager processes messages for each key in order.
+///
+/// # Arguments
+/// * `messages` - A `SimpleMessages` instance containing the test messages.
+/// * `max_enqueued` - The maximum number of messages to enqueue per key.
+#[quickcheck]
+fn processes_messages_in_order(messages: SimpleMessages, max_enqueued: u8) -> TestResult {
+    let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
+        return TestResult::error("failed to initialize runtime");
+    };
+
+    runtime.block_on(processes_messages_in_order_impl(messages, max_enqueued))
 }
 
 /// Implements the test for preventing concurrent execution of messages with the
@@ -143,8 +158,57 @@ async fn processes_all_messages_impl(messages: Vec<u8>, max_enqueued: u8) -> Tes
     }
 }
 
+/// Implements the test for verifying that messages for each key are processed
+/// in order.
+///
+/// # Arguments
+/// * `messages` - A `SimpleMessages` instance containing the test messages.
+/// * `max_enqueued` - The maximum number of messages to enqueue per key.
+///
+/// # Returns
+/// A `TestResult` indicating whether the test passed or failed.
+async fn processes_messages_in_order_impl(
+    SimpleMessages(messages): SimpleMessages,
+    max_enqueued: u8,
+) -> TestResult {
+    let max_enqueued = max(max_enqueued as usize, 1);
+    let processed_order: Arc<HashMap<u8, Vec<usize>>> = Arc::default();
+
+    // Process all messages using the KeyManager
+    KeyManager::new(
+        |key, _| {
+            let order = processed_order.clone();
+            async move {
+                order
+                    .entry_async(key)
+                    .await
+                    .or_default()
+                    .get_mut()
+                    .push(key.into());
+            }
+        },
+        max_enqueued,
+    )
+    .process_messages(iter(messages.clone()), Some(Duration::from_millis(100)))
+    .await;
+
+    // Verify the order of processed messages
+    let unique_keys: ahash::HashSet<_> = messages.iter().copied().collect();
+    for key in unique_keys {
+        let Some(order) = processed_order.get(&key) else {
+            return TestResult::failed();
+        };
+
+        if !order.windows(2).all(|w| w[0] <= w[1]) {
+            return TestResult::failed();
+        }
+    }
+
+    TestResult::passed()
+}
+
 impl Arbitrary for SimpleMessages {
-    /// Generates an arbitrary `SimpleMessages` instance for QuickCheck tests.
+    /// Generates an arbitrary `SimpleMessages` instance for `QuickCheck` tests.
     ///
     /// # Arguments
     /// * `g` - A mutable reference to a `Gen` instance for random generation.
