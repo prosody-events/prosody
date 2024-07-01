@@ -108,6 +108,6 @@ jobs:
           crate: cargo-tarpaulin
       - uses: Swatinem/rust-cache@v2
       - name: Generate code coverage
-        run: cargo tarpaulin --workspace
+        run: cargo tarpaulin --workspace --skip-clean
         env:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
