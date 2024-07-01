@@ -13,9 +13,10 @@ use rdkafka::config::FromClientConfig;
 use rdkafka::ClientConfig;
 use serde_json::{json, Value};
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tracing::{error, info};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
@@ -27,7 +28,7 @@ use prosody::Topic;
 
 #[test]
 fn receives_all_in_key_order() {
-    const TEST_COUNT: u64 = 10;
+    const TEST_COUNT: u64 = 100;
 
     fn prop(
         messages: HashMap<u64, BTreeSet<u64>>,
@@ -39,6 +40,10 @@ fn receives_all_in_key_order() {
         let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
             return TestResult::error("failed to initialize runtime");
         };
+
+        if messages.is_empty() {
+            return TestResult::discard();
+        }
 
         for key_messages in messages.values() {
             if key_messages.is_empty() {
@@ -60,7 +65,7 @@ fn receives_all_in_key_order() {
         TestResult::error(error.to_string())
     }
 
-    fmt().pretty().init();
+    fmt().compact().init();
     QuickCheck::new().tests(TEST_COUNT).quickcheck(
         prop as fn(
             HashMap<u64, BTreeSet<u64>>,
@@ -81,10 +86,10 @@ async fn receives_all_in_key_order_impl(
     max_enqueued_per_key: SmallCount,
 ) -> eyre::Result<()> {
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
-    let bootstrap: Vec<String> = vec!["localhost:19092".to_owned()];
+    let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     let mut config = ClientConfig::new();
-    config.set("bootstrap.servers", "localhost:19092");
+    config.set("bootstrap.servers", "localhost:9094");
     let admin_options = AdminOptions::default().operation_timeout(Some(Duration::from_secs(5)));
     let admin_client = AdminClient::from_config(&config)?;
     admin_client
@@ -111,9 +116,11 @@ async fn receives_all_in_key_order_impl(
         .group_id("test-consumer")
         .subscribed_topics(&[topic.to_string()])
         .max_enqueued_per_key(max_enqueued_per_key.value())
+        .commit_interval(Duration::from_secs(1))
+        .partition_shutdown_timeout(Some(Duration::from_secs(60)))
         .build()?;
 
-    let (messages_tx, mut messages_rx) = unbounded_channel();
+    let (messages_tx, mut messages_rx) = channel(partition_count.value());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handler = TestHandler::new(messages_tx);
 
@@ -172,12 +179,9 @@ async fn receives_all_in_key_order_impl(
             received.entry(key).or_default().push(number);
         }
 
-        info!("sending shutdown signal");
-        shutdown_tx.send(true)?;
-
-        let mut actual: HashMap<u64, BTreeSet<u64>> = HashMap::with_capacity(messages.len());
-
         info!("verifying results");
+        let mut result = Ok(());
+        let mut actual: HashMap<u64, BTreeSet<u64>> = HashMap::with_capacity(messages.len());
         for (key, received_messages) in received {
             actual.insert(key.parse()?, received_messages.iter().copied().collect());
 
@@ -185,7 +189,7 @@ async fn receives_all_in_key_order_impl(
             sorted.sort_unstable();
 
             if received_messages != sorted {
-                return Err(eyre!(
+                result = Err(eyre!(
                     "invalid order for key {}; expected: {:?} != actual: {:?}",
                     &key,
                     sorted,
@@ -195,19 +199,20 @@ async fn receives_all_in_key_order_impl(
         }
 
         if messages != actual {
-            return Err(eyre!(
+            result = Err(eyre!(
                 "all messages were not received; expected: {:?} != actual: {:?}",
                 messages,
                 actual
             ));
         }
 
-        info!("test passed");
-        // admin_client
-        //     .delete_topics(&[topic.as_ref()], &admin_options)
-        //     .await?;
+        info!("sleeping long enough to commit");
+        sleep(Duration::from_secs(6)).await;
 
-        Ok(())
+        info!("sending shutdown signal");
+        shutdown_tx.send(true)?;
+
+        result
     });
 
     info!("waiting for tasks to complete");
@@ -215,16 +220,21 @@ async fn receives_all_in_key_order_impl(
         result??;
     }
 
+    info!("test passed");
+    // admin_client
+    //     .delete_topics(&[topic.as_ref()], &admin_options)
+    //     .await?;
+
     Ok(())
 }
 
 #[derive(Clone, Debug)]
 struct TestHandler {
-    messages_tx: UnboundedSender<(String, Value)>,
+    messages_tx: Sender<(String, Value)>,
 }
 
 impl TestHandler {
-    fn new(messages_tx: UnboundedSender<(String, Value)>) -> Self {
+    fn new(messages_tx: Sender<(String, Value)>) -> Self {
         Self { messages_tx }
     }
 }
@@ -238,8 +248,9 @@ impl MessageHandler for TestHandler {
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
         let (key, payload, uncommitted) = message.into_inner();
-        self.messages_tx.send((key.to_string(), payload))?;
+        self.messages_tx.send((key.to_string(), payload)).await?;
         uncommitted.commit();
+
         Ok(())
     }
 }

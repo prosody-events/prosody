@@ -13,10 +13,11 @@ use std::time::Duration;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use parking_lot::Mutex;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance};
 use rdkafka::{ClientContext, Offset, TopicPartitionList};
 use tokio::runtime::Handle;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{ConsumerConfiguration, Managers, MessageHandler, WatermarkVersion};
@@ -92,6 +93,8 @@ where
                 for element in partitions.elements() {
                     let topic = Topic::from(element.topic());
                     let partition = element.partition();
+                    info!("topic {topic} partition {partition} assigned");
+
                     let mut managers = self.managers.lock();
 
                     let Entry::Vacant(vacant) = managers.entry((topic, partition)) else {
@@ -113,75 +116,60 @@ where
                 }
             }
             Rebalance::Revoke(partitions) => {
+                let count = partitions.count();
                 // see: https://github.com/fede1024/rust-rdkafka/issues/681
-                if partitions.count() == 0 {
+                if count == 0 {
                     return;
                 }
 
-                let mut list = TopicPartitionList::with_capacity(partitions.count());
+                // Concurrently shutdown all partitions. Delaying shutdown will delay
+                // re-balancing and potentially lead to unacceptable processing latencies.
+                let shutdown_futures = FuturesUnordered::new();
+                let list = Arc::new(Mutex::new(TopicPartitionList::with_capacity(count)));
+
                 for element in partitions.elements() {
                     let topic = Topic::from(element.topic());
                     let partition = element.partition();
+                    info!("topic {topic} partition {partition} revoked");
 
-                    let managers = self.managers.lock();
-                    let Some(manager) = managers.get(&(topic, partition)) else {
-                        error!("cannot find topic {topic} partition {partition}; not assigned");
+                    let Some(manager) = self.managers.lock().remove(&(topic, partition)) else {
+                        error!("cannot revoke topic {topic} partition {partition}; not assigned");
                         continue;
                     };
 
-                    let Some(offset) = manager.watermark() else {
-                        continue;
-                    };
+                    let list = list.clone();
+                    shutdown_futures.push(async move {
+                        let Some(offset) = manager.shutdown().await else {
+                            return;
+                        };
 
-                    let next_offset = Offset::Offset(offset + 1);
-                    if let Err(error) = list.add_partition_offset(&topic, partition, next_offset) {
-                        error!("failed to add offset to commit list: {error:#}");
-                    }
+                        let next_offset = Offset::Offset(offset + 1);
+                        let mut list = list.lock();
+
+                        if let Err(error) =
+                            list.add_partition_offset(&topic, partition, next_offset)
+                        {
+                            error!("failed to add offset to commit list: {error:#}");
+                        }
+                    });
                 }
 
+                // Block the current thread until all shutdown tasks complete, ensuring all
+                // processing has stopped before proceeding.
+                Handle::current().block_on(shutdown_futures.for_each(|()| ready(())));
+
+                let list = list.lock();
                 if list.count() == 0 {
                     return;
                 }
 
-                if let Err(error) = consumer.commit(&list, CommitMode::Sync) {
+                debug!("committing {list:?}");
+                if let Err(error) = consumer.commit(&list, CommitMode::Async) {
                     error!("failed to commit offsets before rebalance: {error:#}");
                 }
+                debug!("final offsets committed");
             }
             Rebalance::Error(_) => {}
         }
-    }
-
-    /// Manages the orderly shutdown of partition managers when partitions are
-    /// revoked. This method ensures that resources are cleaned up properly,
-    /// preventing data loss or inconsistency.
-    ///
-    /// # Arguments
-    /// * `rebalance` - Details about the partition revocation event from Kafka.
-    fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
-        let Rebalance::Revoke(partitions) = rebalance else {
-            return;
-        };
-
-        // see: https://github.com/fede1024/rust-rdkafka/issues/681
-        if partitions.count() == 0 {
-            return;
-        }
-
-        // Concurrently shutdown all partitions. Delaying shutdown will delay
-        // re-balancing and potentially lead to unacceptable processing latencies.
-        let shutdown_futures = FuturesUnordered::new();
-        for element in partitions.elements() {
-            let topic = Topic::from(element.topic());
-            let partition = element.partition();
-            let Some(manager) = self.managers.lock().remove(&(topic, partition)) else {
-                error!("cannot revoke topic {topic} partition {partition}; not assigned");
-                continue;
-            };
-            shutdown_futures.push(manager.shutdown());
-        }
-
-        // Block the current thread until all shutdown tasks complete, ensuring all
-        // processing has stopped before proceeding.
-        Handle::current().block_on(shutdown_futures.for_each(|_| ready(())));
     }
 }
