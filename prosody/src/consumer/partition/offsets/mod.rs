@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::{channel, OwnedPermit, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tracing::{error, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
 use crate::Offset;
 
@@ -145,6 +145,7 @@ impl OffsetTracker {
     pub async fn shutdown(self) -> Option<Offset> {
         drop(self.action_tx);
         let Some(handle) = self.handle.lock().take() else {
+            warn!("offset tracker already shutdown");
             return fetch_watermark(&self.watermark);
         };
 
@@ -176,6 +177,7 @@ impl UncommittedOffset {
     /// Commits the reserved offset, finalizing its state.
     pub fn commit(mut self) {
         let Some(permit) = self.permit.take() else {
+            error!("offset {} already committed", self.offset);
             return;
         };
         permit.send(Action::commit(self.offset));
@@ -263,4 +265,6 @@ async fn track_watermark(
             watermark_version.fetch_add(1, Ordering::AcqRel);
         }
     }
+
+    debug!("watermark tracking shutdown");
 }
