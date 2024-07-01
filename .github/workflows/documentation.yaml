@@ -29,6 +29,12 @@ jobs:
         run: cargo doc --no-deps
       - name: Remove lock file
         run: rm target/doc/.lock
+      - name: Download coverage badge
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: Check
+          name: coverage-badge
+          path: target/doc
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

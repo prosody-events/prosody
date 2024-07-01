@@ -1,5 +1,4 @@
 name: Check
-
 on:
   push:
     branches:
@@ -7,10 +6,12 @@ on:
   pull_request:
     branches:
       - main
-
 env:
   CARGO_TERM_COLOR: always
-
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 jobs:
   test:
     name: Tests
@@ -113,7 +114,25 @@ jobs:
         with:
           crate: cargo-tarpaulin
       - uses: Swatinem/rust-cache@v2
-      - name: Generate code coverage
-        run: cargo tarpaulin --workspace --skip-clean
+      - name: Setup pages
+        id: pages
+        uses: actions/configure-pages@v4
+      - name: Run code coverage
+        run: |
+          cargo tarpaulin --workspace --skip-clean --out Json --output-dir coverage
+          echo "COVERAGE=$(jq -r .coverage coverage/tarpaulin-report.json)" >> $GITHUB_ENV
         env:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
+      - name: Generate coverage badge
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: 'coverage'
+          status: ${{ env.COVERAGE }}%
+          color: 'blue'
+          path: 'coverage-badge.svg'
+      - name: Upload coverage badge
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-badge
+          path: coverage-badge.svg
+          retention-days: 1
