@@ -40,6 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: Enforce formatting
         run: cargo fmt --check
 
@@ -66,6 +67,7 @@ jobs:
         uses: baptiste0928/cargo-install@v3
         with:
           crate: cargo-udeps
+      - uses: Swatinem/rust-cache@v2
       - name: Run cargo udeps
         run: cargo +nightly udeps
 
@@ -99,12 +101,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install tarpaulin
         uses: baptiste0928/cargo-install@v3
         with:
           crate: cargo-tarpaulin
+      - uses: Swatinem/rust-cache@v2
       - name: Generate code coverage
-        run: |
-          cargo tarpaulin --verbose --workspace
+        run: cargo tarpaulin --workspace
         env:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
