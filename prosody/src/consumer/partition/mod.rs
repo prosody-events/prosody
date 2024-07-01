@@ -3,12 +3,14 @@
 //! concurrently, maintain a record of offset progression, and handle graceful
 //! shutdown operations.
 
+use std::future::ready;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;
+use futures::StreamExt;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
@@ -16,7 +18,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info_span, instrument, Instrument};
+use tracing::{debug, error, info_span, instrument, Instrument};
 
 use crate::consumer::message::{MessageContext, UntrackedMessage};
 use crate::consumer::partition::keyed::KeyManager;
@@ -184,8 +186,22 @@ async fn handle_messages<T>(
 
     // Create and run a KeyManager to manage concurrent message processing,
     // using the defined processing logic and managing shutdown timing.
+    let mut highest_offset_seen = -1;
     KeyManager::new(process, max_enqueued_per_key)
-        .process_messages(ReceiverStream::new(message_rx), shutdown_timeout)
+        .process_messages(
+            ReceiverStream::new(message_rx).filter(|message| {
+                if message.offset <= highest_offset_seen {
+                    debug!(
+                        "filtering stale partition {} offset {}",
+                        message.partition, message.offset
+                    );
+                    return ready(false);
+                }
+                highest_offset_seen = message.offset;
+                ready(true)
+            }),
+            shutdown_timeout,
+        )
         .await;
 }
 
