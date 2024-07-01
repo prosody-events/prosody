@@ -52,7 +52,7 @@ async fn prevents_concurrent_key_execution_impl(
 
         async move {
             if active_keys.insert_async(key).await.is_ok() {
-                sleep(Duration::from_micros(key.saturating_mul(100) as u64)).await;
+                sleep(Duration::from_micros(key.saturating_mul(100).into())).await;
                 active_keys.remove_async(&key).await;
             } else {
                 failed.store(true, Ordering::Release);
@@ -102,7 +102,7 @@ impl Arbitrary for SimpleMessages {
     fn arbitrary(g: &mut Gen) -> Self {
         let mut messages: Vec<u8> = Vec::arbitrary(g);
         for message in &mut messages {
-            *message = *g.choose(&[1, 2, 3, 4]).unwrap();
+            *message = *g.choose(&[1, 2, 3, 4]).unwrap_or(&1);
         }
         Self(messages)
     }
