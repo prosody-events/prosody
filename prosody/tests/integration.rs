@@ -1,4 +1,70 @@
 //! Integration tests for the Prosody Kafka client library.
+//!
+//! This module contains a property-based integration test using `QuickCheck`
+//! that verifies the correct functioning of the Prosody Kafka client library,
+//! focusing on message ordering and completeness across multiple producers
+//! and consumers.
+//!
+//! ## Test Overview
+//!
+//! The test is designed as a `QuickCheck` property, which means it's run
+//! multiple times with randomly generated inputs. This approach helps to
+//! explore a wide range of scenarios and increase confidence in the library's
+//! robustness.
+//!
+//! For each run, the test simulates a scenario with multiple producers sending
+//! messages to a Kafka topic and multiple consumers reading from that topic.
+//! It verifies that:
+//! 1. All messages are received.
+//! 2. Messages for each key are received in the correct order.
+//!
+//! ## Test Parameters
+//!
+//! `QuickCheck` randomly generates the following parameters for each test run:
+//! - `messages`: A map of keys to sets of message values.
+//! - `partition_count`: The number of partitions in the Kafka topic.
+//! - `producer_count`: The number of concurrent producers.
+//! - `consumer_count`: The number of concurrent consumers.
+//! - `max_enqueued_per_key`: Maximum number of messages to enqueue per key.
+//!
+//! ## Test Procedure
+//!
+//! 1. Create a Kafka topic with the specified number of partitions.
+//! 2. Spawn multiple producer tasks, each sending a subset of the messages.
+//! 3. Spawn multiple consumer tasks to read the messages.
+//! 4. Collect and verify the received messages.
+//!
+//! ## Message Types
+//!
+//! The test uses two types of messages:
+//! 1. Regular messages: JSON-encoded numbers.
+//! 2. End-of-stream marker: A `null` value sent after all regular messages for
+//!    a key.
+//!
+//! ## Completion Detection
+//!
+//! The test knows it's complete when it has received an end-of-stream marker
+//! for every key in the input set. This ensures all messages have been
+//! processed.
+//!
+//! ## Verification
+//!
+//! The test verifies correctness by:
+//! 1. Checking that all expected messages are received.
+//! 2. Ensuring messages for each key are received in the same order they were
+//!    sent.
+//!
+//! ## Cleanup
+//!
+//! After each test run completes, it deletes the created Kafka topic to clean
+//! up resources.
+//!
+//! This property-based test ensures that the Prosody library
+//! correctly handles concurrent producers and consumers while maintaining
+//! message ordering and completeness, which are crucial for many Kafka-based
+//! applications. By using `QuickCheck`, the test can explore a wide range of
+//! scenarios, increasing confidence in the library's correctness and
+//! robustness.
 
 use std::cmp::max;
 use std::collections::BTreeSet;
