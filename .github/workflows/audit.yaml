@@ -1,5 +1,8 @@
 name: Audit
 on:
+  pull_request:
+    branches:
+      - main
   push:
     paths:
       # Run if workflow changes
@@ -17,7 +20,7 @@ on:
 
 jobs:
   audit:
-    name: Dependencies
+    name: CVEs
     runs-on: ubuntu-latest
     permissions:
       contents: read
