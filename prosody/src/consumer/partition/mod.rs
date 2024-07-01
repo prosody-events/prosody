@@ -190,6 +190,8 @@ async fn handle_messages<T>(
     KeyManager::new(process, max_enqueued_per_key)
         .process_messages(
             ReceiverStream::new(message_rx).filter(|message| {
+                // Filter out messages with offsets we've already seen. This reduces duplicates
+                // during rebalances but doesn't guarantee exactly-once processing.
                 if message.offset <= highest_offset_seen {
                     debug!(
                         "filtering stale partition {} offset {}",
@@ -197,6 +199,7 @@ async fn handle_messages<T>(
                     );
                     return ready(false);
                 }
+                // Update the highest offset seen to the current message's offset
                 highest_offset_seen = message.offset;
                 ready(true)
             }),
