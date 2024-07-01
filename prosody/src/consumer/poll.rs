@@ -1,5 +1,5 @@
-//! Consumer module for polling and processing Kafka messages with distributed
-//! tracing support.
+//! Provides functionality for polling and processing Kafka messages with
+//! distributed tracing support.
 
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,7 +50,7 @@ pub fn poll<T>(
     let mut is_paused = false;
 
     while !shutdown.load(Ordering::Relaxed) {
-        // Commit offsets periodically
+        // Periodically commit offsets and manage busy partitions
         commit_watermarks(
             &commit_interval,
             consumer,
@@ -60,13 +60,13 @@ pub fn poll<T>(
             &mut last_commit,
         );
 
-        // Manage busy partitions by pausing/resuming them
         if let Err(error) = pause_busy_partitions(&mut is_paused, consumer, managers) {
             error!("error pausing busy partitions: {error:#}; retrying");
             sleep(poll_interval);
             continue;
         }
 
+        // Poll for new messages
         let Some(result) = consumer.poll(Timeout::After(poll_interval)) else {
             continue;
         };
@@ -79,11 +79,11 @@ pub fn poll<T>(
             }
         };
 
+        // Extract message details and create tracing span
         let topic = Intern::from(message.topic());
         let partition = message.partition();
         let offset = message.offset();
 
-        // Extract context for tracing
         let context = propagator.extract(&MessageExtractor::new(&message));
         let span = info_span!(
             "receive-message",
@@ -93,6 +93,7 @@ pub fn poll<T>(
         span.set_parent(context);
         let _enter = span.enter();
 
+        // Validate message key and payload
         let Some(key_data) = message.key() else {
             error!("missing key; discarding message");
             continue;
@@ -104,6 +105,7 @@ pub fn poll<T>(
         };
         span.record("payload_size", payload_data.len());
 
+        // Parse key and payload
         let key: Key = match str::from_utf8(key_data) {
             Ok(key) => {
                 span.record("key", key);
@@ -123,6 +125,7 @@ pub fn poll<T>(
             }
         };
 
+        // Create UntrackedMessage and dispatch for processing
         let mut message = UntrackedMessage {
             topic,
             partition,
@@ -181,6 +184,7 @@ fn commit_watermarks<T>(
 
     let mut success = true;
 
+    // Prepare offset list for commit
     let managers = managers.lock();
     let mut list = TopicPartitionList::with_capacity(managers.len());
     for ((topic, partition), manager) in managers.iter() {
@@ -195,6 +199,7 @@ fn commit_watermarks<T>(
         }
     }
 
+    // Commit offsets
     if let Err(error) = consumer.commit(&list, CommitMode::Async) {
         error!("failed to add commit offsets: {error:#}");
         success = false;
@@ -225,7 +230,7 @@ where
 {
     let managers = managers.lock();
 
-    // short circuit when all partitions have capacity to avoid allocation
+    // Short circuit when all partitions have capacity to avoid allocation
     if !*is_paused && managers.values().all(PartitionManager::has_capacity) {
         return Ok(());
     }
@@ -233,6 +238,7 @@ where
     let mut paused = TopicPartitionList::with_capacity(managers.len());
     let mut resumed = TopicPartitionList::with_capacity(managers.len());
 
+    // Categorize partitions as paused or resumed based on capacity
     for ((topic, partition), manager) in managers.iter() {
         if manager.has_capacity() {
             resumed.add_partition(topic.as_ref(), *partition);
@@ -243,6 +249,7 @@ where
 
     *is_paused = paused.count() > 0;
 
+    // Apply pause and resume operations
     if *is_paused {
         consumer.pause(&paused)?;
     }
@@ -278,9 +285,11 @@ fn dispatch_message(message: UntrackedMessage, managers: &Managers) -> Result<()
 /// Errors that can occur during message dispatch.
 #[derive(Debug, Error)]
 enum DispatchError {
+    /// Message sent to an unassigned partition.
     #[error("message sent to unassigned partition")]
     PartitionNotFound(UntrackedMessage),
 
+    /// Partition is busy and cannot accept more messages.
     #[error("partition is busy")]
     Busy(UntrackedMessage),
 }
