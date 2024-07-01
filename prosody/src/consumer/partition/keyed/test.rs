@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahash::HashMapExt;
 use futures::stream::iter;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
@@ -20,6 +21,10 @@ use tokio::time::sleep;
 
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::Keyed;
+
+/// Represents a sequence of messages with keys and values for testing.
+#[derive(Clone, Debug)]
+struct Messages(Vec<(u8, u16)>);
 
 /// A simple wrapper for a vector of u8 values used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
@@ -63,7 +68,7 @@ fn processes_all_messages(messages: Vec<u8>, max_enqueued: u8) -> TestResult {
 /// * `messages` - A `SimpleMessages` instance containing the test messages.
 /// * `max_enqueued` - The maximum number of messages to enqueue per key.
 #[quickcheck]
-fn processes_messages_in_order(messages: SimpleMessages, max_enqueued: u8) -> TestResult {
+fn processes_messages_in_order(messages: Messages, max_enqueued: u8) -> TestResult {
     let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
         return TestResult::error("failed to initialize runtime");
     };
@@ -168,43 +173,54 @@ async fn processes_all_messages_impl(messages: Vec<u8>, max_enqueued: u8) -> Tes
 /// # Returns
 /// A `TestResult` indicating whether the test passed or failed.
 async fn processes_messages_in_order_impl(
-    SimpleMessages(messages): SimpleMessages,
+    Messages(messages): Messages,
     max_enqueued: u8,
 ) -> TestResult {
     let max_enqueued = max(max_enqueued as usize, 1);
-    let processed_order: Arc<HashMap<u8, Vec<usize>>> = Arc::default();
+    let processed: Arc<HashMap<u8, Vec<u16>>> = Arc::new(HashMap::new());
 
-    // Process all messages using the KeyManager
     KeyManager::new(
-        |key, _| {
-            let order = processed_order.clone();
+        |(key, value), _: watch::Receiver<bool>| {
+            let processed = processed.clone();
             async move {
-                order
-                    .entry_async(key)
-                    .await
-                    .or_default()
-                    .get_mut()
-                    .push(key.into());
+                processed.entry_async(key).await.or_default().push(value);
             }
         },
         max_enqueued,
     )
-    .process_messages(iter(messages.clone()), Some(Duration::from_millis(100)))
+    .process_messages(iter(messages.clone()), None)
     .await;
 
-    // Verify the order of processed messages
-    let unique_keys: ahash::HashSet<_> = messages.iter().copied().collect();
-    for key in unique_keys {
-        let Some(order) = processed_order.get(&key) else {
+    let mut expected = ahash::HashMap::with_capacity(messages.len());
+    for (key, value) in messages {
+        expected.entry(key).or_insert_with(Vec::new).push(value);
+    }
+
+    for (key, expected_values) in expected {
+        let Some(processed_values) = processed.get(&key) else {
             return TestResult::failed();
         };
 
-        if !order.windows(2).all(|w| w[0] <= w[1]) {
+        if processed_values.get() != &expected_values {
             return TestResult::failed();
         }
     }
 
     TestResult::passed()
+}
+
+impl Arbitrary for Messages {
+    /// Generates an arbitrary `Messages` instance for `QuickCheck` tests.
+    ///
+    /// # Arguments
+    /// * `g` - A mutable reference to a `Gen` instance for random generation.
+    fn arbitrary(g: &mut Gen) -> Self {
+        let count = g.size();
+        let messages = (0..count)
+            .map(|_| (u8::arbitrary(g), u16::arbitrary(g)))
+            .collect();
+        Self(messages)
+    }
 }
 
 impl Arbitrary for SimpleMessages {
@@ -218,6 +234,14 @@ impl Arbitrary for SimpleMessages {
             *message = *g.choose(&[1, 2, 3, 4]).unwrap_or(&1);
         }
         Self(messages)
+    }
+}
+
+impl Keyed for (u8, u16) {
+    type Key = u8;
+
+    fn key(&self) -> &Self::Key {
+        &self.0
     }
 }
 
