@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use internment::Intern;
 use opentelemetry::propagation::TextMapPropagator;
-use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::util::Timeout;
-use rdkafka::{Message, TopicPartitionList};
+use rdkafka::{Message, Offset, TopicPartitionList};
 use thiserror::Error;
 use tracing::field::Empty;
 use tracing::{error, info_span, warn};
@@ -134,16 +134,13 @@ pub fn poll<T>(
 
         // Dispatch message to appropriate handler
         loop {
-            let Err(error) = dispatch_message(message, managers) else {
-                break;
-            };
-
-            match error {
-                DispatchError::PartitionNotFound(_) => {
+            match dispatch_message(message, managers) {
+                Ok(()) => break,
+                Err(error @ DispatchError::PartitionNotFound(_)) => {
                     warn!("failed to dispatch message: {error:#}; discarding");
                     break;
                 }
-                DispatchError::Busy(failed) => {
+                Err(DispatchError::Busy(failed)) => {
                     error!("failed to dispatch message because partition is busy; retrying");
                     message = failed;
                     sleep(poll_interval);
@@ -183,17 +180,24 @@ fn commit_watermarks<T>(
     }
 
     let mut success = true;
-    let managers = managers.lock();
 
+    let managers = managers.lock();
+    let mut list = TopicPartitionList::with_capacity(managers.len());
     for ((topic, partition), manager) in managers.iter() {
         let Some(watermark) = manager.watermark() else {
             continue;
         };
 
-        if let Err(error) = consumer.store_offset(topic, *partition, watermark) {
-            error!(%topic, %partition, %watermark, "failed to commit offset: #{error:#}");
+        let next_offset = Offset::Offset(watermark + 1);
+        if let Err(error) = list.add_partition_offset(topic, *partition, next_offset) {
+            error!(%topic, %partition, %watermark, "failed to add offset to commit list: {error:#}");
             success = false;
         }
+    }
+
+    if let Err(error) = consumer.commit(&list, CommitMode::Async) {
+        error!("failed to add commit offsets: {error:#}");
+        success = false;
     }
 
     if success {

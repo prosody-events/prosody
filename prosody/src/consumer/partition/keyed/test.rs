@@ -15,31 +15,31 @@ use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::Keyed;
 
 #[derive(Clone, Debug)]
-struct Messages(Vec<u8>);
+struct SimpleMessages(Vec<u8>);
 
 #[quickcheck]
-fn prevents_concurrent_key_execution(messages: Messages, max_enqueued: u8) -> TestResult {
-    Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap()
-        .block_on(prevents_concurrent_key_execution_impl(
-            messages,
-            max_enqueued,
-        ))
+fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8) -> TestResult {
+    let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
+        return TestResult::error("failed to initialize runtime");
+    };
+
+    runtime.block_on(prevents_concurrent_key_execution_impl(
+        messages,
+        max_enqueued,
+    ))
 }
 
 #[quickcheck]
 fn processes_all_messages(messages: Vec<u8>, max_enqueued: u8) -> TestResult {
-    Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap()
-        .block_on(processes_all_messages_impl(messages, max_enqueued))
+    let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
+        return TestResult::error("failed to initialize runtime");
+    };
+
+    runtime.block_on(processes_all_messages_impl(messages, max_enqueued))
 }
 
 async fn prevents_concurrent_key_execution_impl(
-    Messages(messages): Messages,
+    SimpleMessages(messages): SimpleMessages,
     max_enqueued: u8,
 ) -> TestResult {
     let max_enqueued = max(max_enqueued as usize, 1);
@@ -98,10 +98,10 @@ async fn processes_all_messages_impl(messages: Vec<u8>, max_enqueued: u8) -> Tes
     }
 }
 
-impl Arbitrary for Messages {
+impl Arbitrary for SimpleMessages {
     fn arbitrary(g: &mut Gen) -> Self {
         let mut messages: Vec<u8> = Vec::arbitrary(g);
-        for message in messages.iter_mut() {
+        for message in &mut messages {
             *message = *g.choose(&[1, 2, 3, 4]).unwrap();
         }
         Self(messages)
