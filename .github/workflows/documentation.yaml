@@ -2,6 +2,10 @@ name: Docs
 on:
   push:
     branches: [ main ]
+  workflow_run:
+    workflows: [ "Check" ]
+    types:
+      - completed
 permissions:
   contents: read
   pages: write
@@ -33,9 +37,13 @@ jobs:
       - name: Download coverage badge
         uses: dawidd6/action-download-artifact@v2
         with:
-          workflow: Check
           name: coverage-badge
-          path: target/doc
+          workflow: Check
+          workflow_conclusion: success
+          check_artifacts: true
+          search_artifacts: true
+      - name: Move coverage badge
+        run: mv coverage-badge.svg target/doc/
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
