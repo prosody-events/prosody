@@ -42,6 +42,7 @@ whoami.workspace = true
 
 [dev-dependencies]
 color-eyre.workspace = true
+derive-quickcheck-arbitrary.workspace = true
 itertools.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true

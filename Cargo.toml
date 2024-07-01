@@ -8,6 +8,7 @@ members = [
 
 [workspace.dependencies]
 ahash = "0.8"
+derive-quickcheck-arbitrary = "0.1"
 color-eyre = "0.6"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
