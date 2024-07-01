@@ -1,0 +1,40 @@
+name: Quality
+
+on:
+  push:
+    branches: [ "main" ]
+  # Rerun periodically to pick up new advisories
+  schedule:
+    - cron: '0 0 * * *'
+  # Run manually
+  workflow_dispatch:
+
+jobs:
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install clippy-sarif from crates.io
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: clippy-sarif
+      - name: Install sarif-fmt from crates.io
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: sarif-fmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Linting
+        run:
+          cargo clippy --all-features --message-format=json -- -D warnings
+          | clippy-sarif
+          | tee results.sarif
+          | sarif-fmt
+      - name: Upload analysis results to GitHub
+        uses: github/codeql-action/upload-sarif@v1
+        with:
+          sarif_file: results.sarif
+          wait-for-processing: true
