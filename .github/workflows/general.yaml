@@ -82,9 +82,6 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-    container:
-      image: xd009642/tarpaulin
-      options: --security-opt seccomp=unconfined
     services:
       kafka:
         image: docker.io/bitnami/kafka:3.7
@@ -102,6 +99,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+      - name: Install tarpaulin
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-tarpaulin
       - name: Generate code coverage
         run: |
           cargo tarpaulin --verbose --workspace
