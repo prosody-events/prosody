@@ -193,8 +193,3 @@ pub type Payload = Value;
 
 /// A Kafka message offset.
 pub type Offset = i64;
-
-/// Test to trigger clippy
-pub fn make_clippy_angry(s: &str) -> String {
-    s.to_string()
-}
