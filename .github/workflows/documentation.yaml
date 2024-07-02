@@ -27,7 +27,7 @@ jobs:
       - name: Clean docs folder
         run: cargo clean --doc
       - name: Build docs
-        run: cargo doc --no-deps
+        run: cargo doc
       - name: Remove lock file
         run: rm target/doc/.lock
       - name: Upload artifact
