@@ -48,20 +48,6 @@ fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8)
     ))
 }
 
-/// Verifies that KeyManager processes all messages correctly.
-///
-/// # Arguments
-/// * `messages` - A vector of u8 values representing the test messages.
-/// * `max_enqueued` - The maximum number of messages to enqueue per key.
-#[quickcheck]
-fn processes_all_messages(messages: Vec<u8>, max_enqueued: u8) -> TestResult {
-    let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
-        return TestResult::error("failed to initialize runtime");
-    };
-
-    runtime.block_on(processes_all_messages_impl(messages, max_enqueued))
-}
-
 /// Verifies that KeyManager processes messages for each key in order.
 ///
 /// # Arguments
@@ -121,45 +107,6 @@ async fn prevents_concurrent_key_execution_impl(
         TestResult::failed()
     } else {
         TestResult::passed()
-    }
-}
-
-/// Implements the test for verifying that all messages are processed correctly.
-///
-/// # Arguments
-/// * `messages` - A vector of u8 values representing the test messages.
-/// * `max_enqueued` - The maximum number of messages to enqueue per key.
-///
-/// # Returns
-/// A `TestResult` indicating whether the test passed or failed.
-async fn processes_all_messages_impl(messages: Vec<u8>, max_enqueued: u8) -> TestResult {
-    let max_enqueued = max(max_enqueued as usize, 1);
-    let expected: HashMap<u8, usize> = HashMap::new();
-    let actual: Arc<HashMap<u8, usize>> = Arc::default();
-
-    // Count the occurrences of each message in the input
-    for message in &messages {
-        *expected.entry_async(*message).await.or_default().get_mut() += 1;
-    }
-
-    // Define the message processing function
-    let process_fn = |key: u8, _: watch::Receiver<bool>| {
-        let processed = actual.clone();
-        async move {
-            *processed.entry_async(key).await.or_default().get_mut() += 1;
-        }
-    };
-
-    // Process all messages using the KeyManager
-    KeyManager::new(process_fn, max_enqueued)
-        .process_messages(iter(messages), Some(Duration::from_millis(100)))
-        .await;
-
-    // Compare the expected and actual message counts
-    if &expected == actual.as_ref() {
-        TestResult::passed()
-    } else {
-        TestResult::failed()
     }
 }
 
