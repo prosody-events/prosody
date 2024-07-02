@@ -1,14 +1,16 @@
 name: Quality
-
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   # Rerun periodically to pick up new advisories
   schedule:
     - cron: '0 0 * * *'
   # Run manually
   workflow_dispatch:
-
 jobs:
   clippy:
     name: Clippy
