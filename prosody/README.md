@@ -3,7 +3,7 @@
 Prosody is a high-level Kafka client library for Rust, featuring robust consumer and producer implementations with
 integrated OpenTelemetry support for distributed tracing.
 
-[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://studious-enigma-ozyo9n3.pages.github.io/prosody)
+[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://prosody.docs.rg-infra.com/prosody)
 [![Build Status](https://github.com/RealGeeks/prosody/actions/workflows/general.yaml/badge.svg?branch=main)](https://github.com/RealGeeks/prosody/actions/workflows/general.yaml?query=branch%3Amain)
 [![Audit Status](https://github.com/RealGeeks/prosody/actions/workflows/audit.yaml/badge.svg?branch=main)](https://github.com/RealGeeks/prosody/actions/workflows/audit.yaml?query=branch%3Amain)
 [![Docs Status](https://github.com/RealGeeks/prosody/actions/workflows/documentation.yaml/badge.svg?branch=main)](https://github.com/RealGeeks/prosody/actions/workflows/documentation.yaml?query=branch%3Amain)
