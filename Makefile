@@ -46,7 +46,7 @@ test: up
 
 # Watch for changes and run tests
 test-watch: up
-	bacon test
+	INTEGRATION_TESTS=1 bacon test
 
 # Generate code coverage report
 coverage: up

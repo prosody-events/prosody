@@ -86,7 +86,7 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
 
@@ -98,14 +98,23 @@ use prosody::Topic;
 /// Runs the main integration test to verify message ordering and completeness.
 #[test]
 fn receives_all_in_key_order() {
-    const TEST_COUNT: u64 = 3;
+    // Try to load integration test count from environment variable
+    let test_count = option_env!("INTEGRATION_TESTS")
+        .and_then(|s| match s.parse::<u64>() {
+            Ok(count) => Some(count),
+            Err(error) => {
+                warn!("invalid integration test count: {error:#}; using default");
+                None
+            }
+        })
+        .unwrap_or(3);
 
     // Initialize tracing for better test output
     fmt().compact().init();
 
     // Run the QuickCheck property-based test
     QuickCheck::new()
-        .tests(TEST_COUNT)
+        .tests(test_count)
         .quickcheck(prop as fn(TestInput) -> TestResult);
 }
 
