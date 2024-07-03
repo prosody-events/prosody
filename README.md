@@ -119,6 +119,40 @@ The following table lists the available configuration options and their associat
 | `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | 1s      |          | ✓        |
 | `PROSODY_MOCK`                       | Use mock Kafka brokers for testing              | false   | ✓        | ✓        |
 
+## Common Project Tasks
+
+Prosody uses a Makefile to simplify common development tasks. Here are some useful commands:
+
+### Setup
+
+- `make bootstrap`: Install Rust and necessary development tools.
+- `make up`: Start Kafka and related services using Docker Compose.
+
+### Development
+
+- `make update`: Update project dependencies.
+- `make format`: Format Rust code and TOML files.
+- `make build`: Build the project.
+- `make check`: Check for compilation errors without building.
+- `make check-watch`: Watch for changes and check for compilation errors.
+- `make lint`: Run Clippy for linting.
+- `make lint-watch`: Watch for changes and run Clippy.
+
+### Testing
+
+- `make test`: Run tests (starts Kafka services first).
+- `make test-watch`: Watch for changes and run tests.
+- `make coverage`: Generate code coverage report.
+
+### Maintenance
+
+- `make dependencies`: Check for unused dependencies.
+- `make reset`: Stop and remove Docker containers and volumes.
+
+### Utilities
+
+- `make console`: Open the Kafka console in a web browser.
+
 ## Architecture
 
 Prosody is designed to provide efficient and parallel processing of Kafka messages while maintaining order for messages
