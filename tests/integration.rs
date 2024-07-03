@@ -98,7 +98,7 @@ use prosody::Topic;
 /// Runs the main integration test to verify message ordering and completeness.
 #[test]
 fn receives_all_in_key_order() {
-    const TEST_COUNT: u64 = 1;
+    const TEST_COUNT: u64 = 3;
 
     // Initialize tracing for better test output
     fmt().compact().init();
