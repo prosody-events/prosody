@@ -47,9 +47,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Install taplo from crates.io
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: taplo-cli
       - uses: Swatinem/rust-cache@v2
-      - name: Enforce formatting
+      - name: Enforce Rust formatting
         run: cargo fmt --check
+      - name: Enforce TOML formatting
+        run: taplo validate
 
   dependencies:
     name: Dependencies
