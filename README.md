@@ -8,7 +8,8 @@ integrated OpenTelemetry support for distributed tracing.
 [![Audit Status](https://github.com/RealGeeks/prosody/actions/workflows/audit.yaml/badge.svg?branch=main)](https://github.com/RealGeeks/prosody/actions/workflows/audit.yaml?query=branch%3Amain)
 [![Docs Status](https://github.com/RealGeeks/prosody/actions/workflows/documentation.yaml/badge.svg?branch=main)](https://github.com/RealGeeks/prosody/actions/workflows/documentation.yaml?query=branch%3Amain)
 [![Quality Status](https://github.com/RealGeeks/prosody/actions/workflows/quality.yaml/badge.svg?branch=main)](https://github.com/RealGeeks/prosody/actions/workflows/quality.yaml?query=branch%3Amain)
-![Code Coverage](../../raw/badges/main/coverage-badge.svg)
+[![Coverage Status](https://github.com/RealGeeks/prosody/actions/workflows/coverage.yaml/badge.svg?branch=main)](https://github.com/RealGeeks/prosody/actions/workflows/coverage.yaml?query=branch%3Amain)
+![Test Coverage](../../raw/badges/main/coverage-badge.svg)
 
 ## Features
 
