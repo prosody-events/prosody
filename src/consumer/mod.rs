@@ -101,7 +101,7 @@ pub trait MessageHandler {
     ///
     /// # Arguments
     ///
-    /// * `context` - Mutable reference to the message context.
+    /// * `context` - The message context.
     /// * `message` - The consumed message.
     ///
     /// # Returns
@@ -110,7 +110,7 @@ pub trait MessageHandler {
     /// message handling.
     fn handle(
         &self,
-        context: &mut MessageContext,
+        context: MessageContext,
         message: ConsumerMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
@@ -273,7 +273,7 @@ impl ProsodyConsumer {
     /// - The hostname cannot be retrieved
     /// - The Kafka consumer cannot be created
     /// - The consumer fails to subscribe to the specified topics
-    pub fn new<T>(config: ConsumerConfiguration, message_handler: T) -> Result<Self, ConsumerError>
+    pub fn new<T>(config: &ConsumerConfiguration, message_handler: T) -> Result<Self, ConsumerError>
     where
         T: MessageHandler + Clone + Send + Sync + 'static,
     {
@@ -287,7 +287,7 @@ impl ProsodyConsumer {
 
         // Create the consumer context with the message handler and shared state
         let context = Context::new(
-            &config,
+            config,
             message_handler,
             watermark_version.clone(),
             managers.clone(),
@@ -298,7 +298,7 @@ impl ProsodyConsumer {
         client_config
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", hostname()?)
-            .set("group.id", config.group_id)
+            .set("group.id", &config.group_id)
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
@@ -322,11 +322,13 @@ impl ProsodyConsumer {
         consumer.subscribe(&topics)?;
 
         // Spawn a blocking task to continuously poll for messages
+        let poll_interval = config.poll_interval;
+        let commit_interval = config.commit_interval;
         let cloned_shutdown = shutdown.clone();
         let handle = Arc::new(Mutex::new(Some(spawn_blocking(move || {
             poll(
-                config.poll_interval,
-                config.commit_interval,
+                poll_interval,
+                commit_interval,
                 &consumer,
                 &watermark_version,
                 &managers,

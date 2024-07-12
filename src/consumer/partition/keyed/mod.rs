@@ -12,7 +12,6 @@ use futures::stream::FuturesUnordered;
 use futures::{pin_mut, Stream, StreamExt};
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
-use tokio::sync::watch::{channel, Receiver, Sender};
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -42,8 +41,6 @@ type HashValue = u64;
 /// - `busy`: Set of keys currently being processed.
 /// - `enqueued`: Messages waiting to be processed, keyed by hash values.
 /// - `hash_state`: State of the random hash algorithm used for key management.
-/// - `shutdown_tx`: Sender for the shutdown signal.
-/// - `shutdown_rx`: Receiver for the shutdown signal.
 pub struct KeyManager<M, F, Fut> {
     max_enqueued_per_key: usize,
     process: F,
@@ -51,8 +48,6 @@ pub struct KeyManager<M, F, Fut> {
     busy: IntSet<HashValue>,
     enqueued: IntMap<HashValue, VecDeque<M>>,
     hash_state: RandomState,
-    shutdown_tx: Sender<bool>,
-    shutdown_rx: Receiver<bool>,
 }
 
 impl<M, F, Fut> KeyManager<M, F, Fut> {
@@ -76,7 +71,6 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             max_enqueued_per_key > 0,
             "max_enqueued_per_key cannot be zero"
         );
-        let (shutdown_tx, shutdown_rx) = channel(false);
 
         Self {
             max_enqueued_per_key,
@@ -85,8 +79,6 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             busy: IntSet::default(),
             enqueued: IntMap::default(),
             hash_state: RandomState::default(),
-            shutdown_tx,
-            shutdown_rx,
         }
     }
 
@@ -107,7 +99,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         S: Stream<Item = M>,
         M: Keyed,
         M::Key: Hash,
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
         Fut: Future,
     {
         pin_mut!(messages);
@@ -140,8 +132,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             return;
         };
 
-        // Send a shutdown signal and create the shutdown deadline future.
-        let _ = self.shutdown_tx.send(true);
+        // Create the shutdown deadline future.
         let deadline = sleep(timeout);
         pin_mut!(deadline);
 
@@ -182,7 +173,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     where
         M: Keyed,
         M::Key: Hash,
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
         Fut: Future,
     {
         // Compute a unique hash value for the message's key
@@ -209,7 +200,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// `hash_value`: `HashValue` - The hash value of the completed message.
     fn handle_completion(&mut self, hash_value: HashValue)
     where
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
     {
         // Remove the completed message's hash value from the busy set
         self.busy.remove(&hash_value);
@@ -242,7 +233,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///   to manage keying and load distribution.
     async fn enqueue_message(&mut self, message: M, hash_value: HashValue)
     where
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
         Fut: Future,
     {
         // Determine the current queue length for the hash value
@@ -284,13 +275,10 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// message.
     fn process_message(&mut self, message: M, hash_value: HashValue)
     where
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
     {
         // Create a future for processing the message
-        let future = WithValue::new(
-            hash_value,
-            (self.process)(message, self.shutdown_rx.clone()),
-        );
+        let future = WithValue::new(hash_value, (self.process)(message));
 
         // Mark the hash value as busy and add the future to the executing queue
         self.busy.insert(hash_value);

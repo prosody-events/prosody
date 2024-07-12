@@ -5,33 +5,21 @@
 //! processing.
 
 use educe::Educe;
-use tokio::sync::watch::Receiver;
 use tracing::{debug, Span};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::Keyed;
 use crate::{Key, Offset, Partition, Payload, Topic};
 
-/// Represents the context for a message within a consumer, handling shutdown
-/// notifications.
+/// Represents the context for a message within a consumer
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct MessageContext {
-    shutdown_rx: Receiver<bool>,
-}
+pub struct MessageContext;
 
 impl MessageContext {
-    /// Creates a new message context with a receiver for shutdown signals.
-    ///
-    /// # Arguments
-    /// * `shutdown_rx` - A receiver for the shutdown signal.
-    pub(crate) fn new(shutdown_rx: Receiver<bool>) -> Self {
-        Self { shutdown_rx }
-    }
-
-    /// Waits asynchronously for a shutdown signal before proceeding.
-    pub async fn wait_for_shutdown(&mut self) {
-        let _ = self.shutdown_rx.wait_for(|&is_shutdown| is_shutdown).await;
+    /// Creates a new message context
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
