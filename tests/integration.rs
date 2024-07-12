@@ -318,7 +318,7 @@ fn spawn_consumers(
         let mut shutdown_rx = shutdown_rx.clone();
 
         tasks.spawn(async move {
-            let consumer = ProsodyConsumer::new(consumer_config, handler)?;
+            let consumer = ProsodyConsumer::new(&consumer_config, handler)?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?;
             consumer.shutdown().await;
             Ok(())
@@ -440,7 +440,7 @@ impl MessageHandler for TestHandler {
     /// Returns an error if sending the message through the channel fails.
     async fn handle(
         &self,
-        _context: &mut MessageContext,
+        _context: MessageContext,
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
         let (key, payload, uncommitted) = message.into_inner();

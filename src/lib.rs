@@ -61,7 +61,7 @@
 //!
 //!     async fn handle(
 //!         &self,
-//!         context: &mut MessageContext,
+//!         context: MessageContext,
 //!         message: ConsumerMessage,
 //!     ) -> Result<(), Self::Error> {
 //!         println!("Received: {:?}", message);
@@ -79,7 +79,7 @@
 //!         .mock(true) // use mock consumer for example
 //!         .build()?;
 //!
-//!     let consumer = ProsodyConsumer::new(config, MyMessageHandler)?;
+//!     let consumer = ProsodyConsumer::new(&config, MyMessageHandler)?;
 //!
 //!     // Run your application logic here
 //!

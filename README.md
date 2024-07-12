@@ -71,7 +71,7 @@ impl MessageHandler for MyMessageHandler {
 
     async fn handle(
         &self,
-        context: &mut MessageContext,
+        context: MessageContext,
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
         println!("Received: {:?}", message);
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .subscribed_topics(["my-topic".to_owned()])
         .build()?;
 
-    let consumer = ProsodyConsumer::new(config, MyMessageHandler)?;
+    let consumer = ProsodyConsumer::new(&config, MyMessageHandler)?;
 
     // Run your application logic here
 
