@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info_span, instrument, Instrument};
 
-use crate::consumer::message::{MessageContext, UntrackedMessage};
+use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::MessageHandler;
@@ -45,7 +45,7 @@ pub struct PartitionManager {
 
     /// Channel for sending messages to be processed.
     #[educe(Debug(ignore))]
-    message_tx: Sender<UntrackedMessage>,
+    message_tx: Sender<ConsumerMessage>,
 
     /// Asynchronous handle for the message processing task.
     #[educe(Debug(ignore))]
@@ -103,7 +103,7 @@ impl PartitionManager {
 
     /// Attempts to send a message to the partition. If the partition is full or
     /// closed, the message is returned.
-    pub fn try_send(&self, message: UntrackedMessage) -> Result<(), UntrackedMessage> {
+    pub fn try_send(&self, message: ConsumerMessage) -> Result<(), ConsumerMessage> {
         self.message_tx
             .try_send(message)
             .map_err(|error| match error {
@@ -150,13 +150,13 @@ impl PartitionManager {
 async fn handle_messages<T>(
     message_handler: T,
     offsets: OffsetTracker,
-    message_rx: Receiver<UntrackedMessage>,
+    message_rx: Receiver<ConsumerMessage>,
     max_enqueued_per_key: usize,
     shutdown_timeout: Option<Duration>,
 ) where
     T: MessageHandler,
 {
-    let process = |received: UntrackedMessage| {
+    let process = |received: ConsumerMessage| {
         let parent_span = received.span.clone();
         let span = info_span!(parent: &parent_span, "process-message",);
 
@@ -164,7 +164,7 @@ async fn handle_messages<T>(
             // Attempt to take an offset for the received message, and if successful,
             // transform it into a consumer message for processing.
             let message = match offsets.take(received.offset).await {
-                Ok(uncommitted_offset) => received.into_consumer_message(uncommitted_offset),
+                Ok(uncommitted_offset) => received.into_uncommitted(uncommitted_offset),
                 Err(error) => {
                     error!(
                         ?received,
@@ -176,9 +176,7 @@ async fn handle_messages<T>(
 
             // Handle the message using the provided message handler
             let context = MessageContext::new();
-            if let Err(error) = message_handler.handle(context, message).await {
-                error!("message handler returned an error: {error:#}");
-            }
+            message_handler.handle(context, message).await;
         }
         .instrument(span)
     };
@@ -205,6 +203,8 @@ async fn handle_messages<T>(
             shutdown_timeout,
         )
         .await;
+
+    message_handler.shutdown().await;
 }
 
 /// Defines errors related to partition management, specifically during message
@@ -213,5 +213,5 @@ async fn handle_messages<T>(
 pub enum PartitionError {
     /// Error when message sending fails due to the partition being shut down.
     #[error("failed to send; partition has been shutdown")]
-    Shutdown(#[from] SendError<UntrackedMessage>),
+    Shutdown(#[from] SendError<UncommittedMessage>),
 }

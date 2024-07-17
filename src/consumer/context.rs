@@ -21,24 +21,30 @@ use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{ConsumerConfiguration, Managers, MessageHandler, WatermarkVersion};
+use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
 use crate::Topic;
 
 /// Holds operational settings and components for managing Kafka partitions.
 ///
 /// This structure provides methods to handle partition assignments and
 /// revocations through Kafka's rebalance callbacks.
-pub struct Context<T> {
+pub struct Context<T>
+where
+    T: HandlerProvider,
+{
     buffer_size: usize,
     max_uncommitted: usize,
     max_enqueued_per_key: usize,
     shutdown_timeout: Option<Duration>,
-    message_handler: T,
+    handler_provider: T,
     watermark_version: Arc<WatermarkVersion>,
     managers: Arc<Managers>,
 }
 
-impl<T> Context<T> {
+impl<T> Context<T>
+where
+    T: HandlerProvider,
+{
     /// Creates a new `Context` with provided consumer configuration and
     /// dependencies.
     ///
@@ -59,7 +65,7 @@ impl<T> Context<T> {
     /// A new `Context` instance initialized with the given parameters.
     pub fn new(
         config: &ConsumerConfiguration,
-        message_handler: T,
+        handler_provider: T,
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers>,
     ) -> Self {
@@ -68,18 +74,18 @@ impl<T> Context<T> {
             max_uncommitted: config.max_uncommitted,
             max_enqueued_per_key: config.max_enqueued_per_key,
             shutdown_timeout: config.partition_shutdown_timeout,
-            message_handler,
+            handler_provider,
             watermark_version,
             managers,
         }
     }
 }
 
-impl<T> ClientContext for Context<T> where T: Send + Sync {}
+impl<T> ClientContext for Context<T> where T: HandlerProvider {}
 
 impl<T> ConsumerContext for Context<T>
 where
-    T: MessageHandler + Clone + Send + Sync + 'static,
+    T: HandlerProvider,
 {
     /// Responds to Kafka's partition assignment events.
     ///
@@ -111,10 +117,14 @@ where
                         continue;
                     };
 
+                    let handler = self
+                        .handler_provider
+                        .handler_for_partition(topic, partition);
+
                     // Create and insert a new PartitionManager
                     let manager = PartitionManager::new(
                         element.partition(),
-                        self.message_handler.clone(),
+                        handler,
                         self.buffer_size,
                         self.max_uncommitted,
                         self.max_enqueued_per_key,

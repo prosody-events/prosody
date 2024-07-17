@@ -19,9 +19,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::consumer::context::Context;
 use crate::consumer::extractor::MessageExtractor;
-use crate::consumer::message::UntrackedMessage;
+use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{Managers, MessageHandler, WatermarkVersion};
+use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
 use crate::Key;
 
@@ -42,7 +42,7 @@ pub fn poll<T>(
     managers: &Managers,
     shutdown: &AtomicBool,
 ) where
-    T: MessageHandler + Clone + Send + Sync + 'static,
+    T: HandlerProvider,
 {
     let propagator = new_propagator();
     let mut last_version = watermark_version.load(Ordering::Acquire);
@@ -126,7 +126,7 @@ pub fn poll<T>(
         };
 
         // Create UntrackedMessage and dispatch for processing
-        let mut message = UntrackedMessage {
+        let mut message = ConsumerMessage {
             topic,
             partition,
             offset,
@@ -170,7 +170,7 @@ fn commit_watermarks<T>(
     last_version: &mut usize,
     last_commit: &mut Instant,
 ) where
-    T: MessageHandler + Clone + Send + Sync + 'static,
+    T: HandlerProvider,
 {
     let current_version = watermark_version.load(Ordering::Acquire);
     if current_version == *last_version {
@@ -226,7 +226,7 @@ fn pause_busy_partitions<T>(
     managers: &Managers,
 ) -> Result<(), KafkaError>
 where
-    T: MessageHandler + Clone + Send + Sync + 'static,
+    T: HandlerProvider,
 {
     let managers = managers.lock();
 
@@ -269,7 +269,7 @@ where
 ///
 /// # Returns
 /// Returns a `DispatchError` if dispatch fails.
-fn dispatch_message(message: UntrackedMessage, managers: &Managers) -> Result<(), DispatchError> {
+fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(), DispatchError> {
     let managers = managers.lock();
     let Some(manager) = managers.get(&(message.topic, message.partition)) else {
         return Err(DispatchError::PartitionNotFound(message));
@@ -287,9 +287,9 @@ fn dispatch_message(message: UntrackedMessage, managers: &Managers) -> Result<()
 enum DispatchError {
     /// Message sent to an unassigned partition.
     #[error("message sent to unassigned partition")]
-    PartitionNotFound(UntrackedMessage),
+    PartitionNotFound(ConsumerMessage),
 
     /// Partition is busy and cannot accept more messages.
     #[error("partition is busy")]
-    Busy(UntrackedMessage),
+    Busy(ConsumerMessage),
 }

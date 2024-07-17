@@ -27,7 +27,7 @@ impl MessageContext {
 /// state for committing.
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct ConsumerMessage {
+pub struct UncommittedMessage {
     topic: Topic,
     partition: Partition,
     offset: Offset,
@@ -43,7 +43,7 @@ pub struct ConsumerMessage {
     uncommitted_offset: UncommittedOffset,
 }
 
-impl ConsumerMessage {
+impl UncommittedMessage {
     /// Returns a reference to the message's topic.
     #[must_use]
     pub fn topic(&self) -> &'static str {
@@ -76,8 +76,17 @@ impl ConsumerMessage {
 
     /// Take ownership of the key, payload, and uncommitted offset.
     #[must_use]
-    pub fn into_inner(self) -> (Key, Payload, UncommittedOffset) {
-        (self.key, self.payload, self.uncommitted_offset)
+    pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
+        let message = ConsumerMessage {
+            topic: self.topic,
+            partition: self.partition,
+            offset: self.offset,
+            key: self.key,
+            payload: self.payload,
+            span: self.span,
+        };
+
+        (message, self.uncommitted_offset)
     }
 
     /// Commits the message, marking its offset as processed.
@@ -87,7 +96,7 @@ impl ConsumerMessage {
     }
 }
 
-impl Keyed for ConsumerMessage {
+impl Keyed for UncommittedMessage {
     type Key = Key;
 
     /// Returns a reference to the message's key.
@@ -99,31 +108,29 @@ impl Keyed for ConsumerMessage {
 /// Represents a message that is not yet being tracked for offset watermarks.
 #[derive(Educe)]
 #[educe(Debug)]
-pub(crate) struct UntrackedMessage {
-    pub(crate) topic: Topic,
-    pub(crate) partition: Partition,
-    pub(crate) offset: Offset,
-    pub(crate) key: Key,
+pub struct ConsumerMessage {
+    pub topic: Topic,
+    pub partition: Partition,
+    pub offset: Offset,
+    pub key: Key,
 
     #[educe(Debug(ignore))]
-    pub(crate) payload: Payload,
+    pub payload: Payload,
 
     #[educe(Debug(ignore))]
-    pub(crate) span: Span,
+    pub span: Span,
 }
 
-impl UntrackedMessage {
+impl ConsumerMessage {
     /// Converts an `UntrackedMessage` into a `ConsumerMessage` by adding
     /// uncommitted offset tracking.
     ///
     /// # Arguments
     /// * `uncommitted_offset` - The uncommitted offset to be associated with
     ///   the message.
-    pub(crate) fn into_consumer_message(
-        self,
-        uncommitted_offset: UncommittedOffset,
-    ) -> ConsumerMessage {
-        ConsumerMessage {
+    #[must_use]
+    pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage {
+        UncommittedMessage {
             topic: self.topic,
             partition: self.partition,
             offset: self.offset,
@@ -135,7 +142,7 @@ impl UntrackedMessage {
     }
 }
 
-impl Keyed for UntrackedMessage {
+impl Keyed for ConsumerMessage {
     type Key = Key;
 
     /// Returns a reference to the message's key.

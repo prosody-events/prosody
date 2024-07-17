@@ -30,7 +30,7 @@
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
 //! defined by implementing the [`MessageHandler`] trait.
 
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,7 +54,7 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::context::Context;
-use crate::consumer::message::{ConsumerMessage, MessageContext};
+use crate::consumer::message::{MessageContext, UncommittedMessage};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::util::{
@@ -65,6 +65,7 @@ use crate::{Partition, Topic};
 
 mod context;
 mod extractor;
+pub mod failure;
 pub mod message;
 mod partition;
 mod poll;
@@ -92,11 +93,14 @@ pub trait Keyed {
     fn key(&self) -> &Self::Key;
 }
 
+pub trait HandlerProvider: Send + Sync + 'static {
+    type Handler: MessageHandler + Send + Sync + 'static;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler;
+}
+
 /// Defines the behavior for handling consumed Kafka messages.
 pub trait MessageHandler {
-    /// The error type returned by the handler.
-    type Error: Display;
-
     /// Processes a consumed message.
     ///
     /// # Arguments
@@ -106,13 +110,37 @@ pub trait MessageHandler {
     ///
     /// # Returns
     ///
-    /// A future that resolves to a Result indicating success or failure of
-    /// message handling.
+    /// A future that resolves when the message is handled
     fn handle(
         &self,
         context: MessageContext,
-        message: ConsumerMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        message: UncommittedMessage,
+    ) -> impl Future<Output = ()> + Send;
+
+    fn shutdown(self) -> impl Future<Output = ()> + Send;
+}
+
+impl<T> HandlerProvider for T
+where
+    T: MessageHandler + Clone + Send + Sync + 'static,
+{
+    type Handler = Self;
+
+    fn handler_for_partition(&self, _: Topic, _: Partition) -> Self::Handler {
+        self.clone()
+    }
+}
+
+impl<T, Fut> MessageHandler for T
+where
+    T: Fn(MessageContext, UncommittedMessage) -> Fut + Send + Sync,
+    Fut: Future<Output = ()> + Send,
+{
+    async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
+        self(context, message).await;
+    }
+
+    async fn shutdown(self) {}
 }
 
 /// Configuration for the Kafka consumer.
@@ -273,9 +301,12 @@ impl ProsodyConsumer {
     /// - The hostname cannot be retrieved
     /// - The Kafka consumer cannot be created
     /// - The consumer fails to subscribe to the specified topics
-    pub fn new<T>(config: &ConsumerConfiguration, message_handler: T) -> Result<Self, ConsumerError>
+    pub fn new<T>(
+        config: &ConsumerConfiguration,
+        handler_provider: T,
+    ) -> Result<Self, ConsumerError>
     where
-        T: MessageHandler + Clone + Send + Sync + 'static,
+        T: HandlerProvider,
     {
         // Validate the configuration
         config.validate()?;
@@ -286,9 +317,9 @@ impl ProsodyConsumer {
         let shutdown: Arc<AtomicBool> = Arc::default();
 
         // Create the consumer context with the message handler and shared state
-        let context = Context::new(
+        let context: Context<T> = Context::new(
             config,
-            message_handler,
+            handler_provider,
             watermark_version.clone(),
             managers.clone(),
         );

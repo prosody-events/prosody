@@ -814,6 +814,7 @@ dependencies = [
  "pin-project",
  "quickcheck",
  "quickcheck_macros",
+ "rand",
  "rdkafka",
  "scc",
  "serde",

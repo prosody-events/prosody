@@ -48,26 +48,22 @@
 //! ## Consumer Example
 //!
 //! ```rust
-//! use prosody::consumer::message::{ConsumerMessage, MessageContext};
+//! use prosody::consumer::message::{MessageContext, UncommittedMessage};
 //! use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
-//! use prosody::Topic;
+//! use prosody::{Partition, Topic};
 //! use std::time::Duration;
 //!
 //! #[derive(Clone)]
 //! struct MyMessageHandler;
 //!
 //! impl MessageHandler for MyMessageHandler {
-//!     type Error = std::io::Error;
-//!
-//!     async fn handle(
-//!         &self,
-//!         context: MessageContext,
-//!         message: ConsumerMessage,
-//!     ) -> Result<(), Self::Error> {
+//!     async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
 //!         println!("Received: {:?}", message);
 //!         message.commit();
-//!         Ok(())
 //!     }
+//!
+//!     // shutdown is called whenever a partition is revoked
+//!     async fn shutdown(self) {}
 //! }
 //!
 //! #[tokio::main]
@@ -79,9 +75,9 @@
 //!         .mock(true) // use mock consumer for example
 //!         .build()?;
 //!
-//!     let consumer = ProsodyConsumer::new(&config, MyMessageHandler)?;
+//!     let consumer = ProsodyConsumer::new::<MyMessageHandler>(&config, MyMessageHandler)?;
 //!
-//!     // Run your application logic here
+//!     // Run your application logic here, waiting for shutdown
 //!
 //!     consumer.shutdown().await;
 //!     Ok(())
