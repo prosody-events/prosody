@@ -1,25 +1,53 @@
 use std::cmp::min;
-use std::sync::Arc;
 use std::time::Duration;
 
+use derive_builder::Builder;
 use humantime::format_duration;
-use rand::rngs::SmallRng;
-use rand::{thread_rng, Rng, SeedableRng};
+use rand::{thread_rng, Rng};
 use tokio::time::sleep;
 use tracing::error;
+use validator::{Validate, ValidationErrors};
 
 use crate::consumer::failure::{FailureStrategy, FallibleHandler};
 use crate::consumer::message::{MessageContext, UncommittedMessage};
 use crate::consumer::{HandlerProvider, MessageHandler};
+use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
+
+#[derive(Builder, Clone, Debug, Validate)]
+pub struct RetryConfiguration {
+    /// Exponential backoff base.
+    ///
+    /// Environment variable: `PROSODY_RETRY_BASE`
+    /// Default: 2
+    ///
+    /// Must be at least 2.
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_RETRY_BASE\", 2)?",
+        setter(into)
+    )]
+    #[validate(range(min = 2_u32))]
+    base: u32,
+
+    /// Maximum retry delay.
+    ///
+    /// Environment variable: `PROSODY_RETRY_MAX_DELAY`
+    /// Default: 1 minute
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_RETRY_MAX_DELAY\", \
+                   Duration::from_secs(60))?",
+        setter(into)
+    )]
+    max_delay: Duration,
+}
 
 #[derive(Clone, Debug)]
 pub struct RetryStrategy(RetryConfiguration);
 
-#[derive(Clone, Debug)]
-pub struct RetryConfiguration {
-    base: u32,
-    base_delay: Duration,
-    max_delay: Duration,
+impl RetryStrategy {
+    pub fn new(config: RetryConfiguration) -> Result<RetryStrategy, ValidationErrors> {
+        config.validate()?;
+        Ok(Self(config))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -49,19 +77,16 @@ where
 {
     async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
         let (message, uncommitted_offset) = message.into_inner();
-        let context = Arc::new(context);
-        let message = Arc::new(message);
-        let mut rng = SmallRng::from_rng(thread_rng()).unwrap_or_else(|_| SmallRng::from_entropy());
         let mut attempt: u32 = 0;
 
         loop {
             attempt = attempt.saturating_add(1);
-
             match self.handler.handle(context.clone(), message.clone()).await {
                 Ok(()) => break,
                 Err(error) => {
                     let exp_backoff = self.config.base.saturating_pow(attempt);
-                    let jitter = Duration::from_millis(u64::from(rng.gen_range(0..exp_backoff)));
+                    let jitter = thread_rng().gen_range(0..exp_backoff);
+                    let jitter = Duration::from_millis(u64::from(jitter));
                     let sleep_time = min(jitter, self.config.max_delay);
 
                     error!(

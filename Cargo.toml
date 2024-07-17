@@ -28,7 +28,7 @@ opentelemetry = "0.23"
 opentelemetry_sdk = "0.23"
 parking_lot = "0.12"
 pin-project = "1.1"
-rand = { version = "0.8", features = ["small_rng"] }
+rand = "0.8"
 rdkafka = { git = "https://github.com/fede1024/rust-rdkafka.git", rev = "bb76b5bd4010599e90f02d9d3460c2d616a55752", features = [
     "tracing",
 ] }

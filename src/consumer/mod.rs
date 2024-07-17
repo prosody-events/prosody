@@ -148,7 +148,7 @@ where
 /// This struct holds all the necessary configuration options for creating a
 /// Kafka consumer. It uses the Builder pattern for flexible initialization and
 /// supports loading values from environment variables.
-#[derive(Builder, Clone, Validate)]
+#[derive(Builder, Clone, Debug, Validate)]
 pub struct ConsumerConfiguration {
     /// List of Kafka bootstrap servers.
     ///

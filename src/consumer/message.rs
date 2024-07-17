@@ -12,8 +12,7 @@ use crate::consumer::Keyed;
 use crate::{Key, Offset, Partition, Payload, Topic};
 
 /// Represents the context for a message within a consumer
-#[derive(Educe)]
-#[educe(Debug)]
+#[derive(Clone, Debug)]
 pub struct MessageContext;
 
 impl MessageContext {
@@ -106,7 +105,7 @@ impl Keyed for UncommittedMessage {
 }
 
 /// Represents a message that is not yet being tracked for offset watermarks.
-#[derive(Educe)]
+#[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ConsumerMessage {
     pub topic: Topic,

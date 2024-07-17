@@ -158,7 +158,7 @@ async fn handle_messages<T>(
 {
     let process = |received: ConsumerMessage| {
         let parent_span = received.span.clone();
-        let span = info_span!(parent: &parent_span, "process-message",);
+        let span = info_span!(parent: &parent_span, "process-message");
 
         async {
             // Attempt to take an offset for the received message, and if successful,

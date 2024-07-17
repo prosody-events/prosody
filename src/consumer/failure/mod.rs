@@ -1,10 +1,10 @@
 use std::fmt::Display;
 use std::future::Future;
-use std::sync::Arc;
 
 use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::HandlerProvider;
 
+pub mod log;
 pub mod retry;
 
 pub trait FailureStrategy<T> {
@@ -18,7 +18,7 @@ pub trait FallibleHandler {
 
     fn handle(
         &self,
-        context: Arc<MessageContext>,
-        message: Arc<ConsumerMessage>,
+        context: MessageContext,
+        message: ConsumerMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
