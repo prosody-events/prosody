@@ -4,6 +4,7 @@
 //! messages, including tracking shutdown signals and committing messages after
 //! processing.
 
+use chrono::{DateTime, Utc};
 use educe::Educe;
 use tracing::{debug, Span};
 
@@ -31,6 +32,7 @@ pub struct UncommittedMessage {
     partition: Partition,
     offset: Offset,
     key: Key,
+    timestamp: DateTime<Utc>,
 
     #[educe(Debug(ignore))]
     payload: Payload,
@@ -61,6 +63,12 @@ impl UncommittedMessage {
         self.offset
     }
 
+    /// Returns the message timestamp.
+    #[must_use]
+    pub fn timestamp(&self) -> &DateTime<Utc> {
+        &self.timestamp
+    }
+
     /// Returns a reference to the message's payload.
     #[must_use]
     pub fn payload(&self) -> &Payload {
@@ -81,6 +89,7 @@ impl UncommittedMessage {
             partition: self.partition,
             offset: self.offset,
             key: self.key,
+            timestamp: self.timestamp,
             payload: self.payload,
             span: self.span,
         };
@@ -112,6 +121,7 @@ pub struct ConsumerMessage {
     pub partition: Partition,
     pub offset: Offset,
     pub key: Key,
+    pub timestamp: DateTime<Utc>,
 
     #[educe(Debug(ignore))]
     pub payload: Payload,
@@ -134,6 +144,7 @@ impl ConsumerMessage {
             partition: self.partition,
             offset: self.offset,
             key: self.key,
+            timestamp: self.timestamp,
             payload: self.payload,
             span: self.span,
             uncommitted_offset,

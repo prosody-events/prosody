@@ -17,6 +17,7 @@ version = "0.1.0"
 
 [dependencies]
 ahash = "0.8"
+chrono = "0.4"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
 educe = "0.6"

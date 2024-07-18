@@ -5,6 +5,7 @@
 //! of OpenTelemetry context for distributed tracing.
 
 use std::io;
+use std::mem::take;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use derive_builder::Builder;
@@ -12,6 +13,7 @@ use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
+use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
@@ -167,6 +169,19 @@ impl ProsodyProducer {
         })
     }
 
+    pub fn pipeline_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+        config.send_timeout = None;
+        Self::new(&config)
+    }
+
+    pub fn low_latency_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+        if config.send_timeout.is_none() {
+            config.send_timeout = Some(Duration::from_secs(1));
+        };
+
+        Self::new(&config)
+    }
+
     /// Sends a message to a Kafka topic.
     ///
     /// This method serializes the payload, injects OpenTelemetry context,
@@ -188,7 +203,16 @@ impl ProsodyProducer {
     /// - The payload cannot be serialized
     /// - The system time cannot be retrieved
     /// - The Kafka send operation fails
-    pub async fn send(&self, topic: Topic, key: &str, payload: Value) -> Result<(), ProducerError> {
+    pub async fn send<'a, H>(
+        &'a self,
+        headers: H,
+        topic: Topic,
+        key: &str,
+        payload: Value,
+    ) -> Result<(), ProducerError>
+    where
+        H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
+    {
         // Serialize the payload
         let serialized = to_vec(&payload)?;
 
@@ -197,6 +221,18 @@ impl ProsodyProducer {
             .key(key)
             .payload(&serialized)
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
+
+        let headers = headers.into_iter();
+        let owned_headers = record
+            .headers
+            .get_or_insert_with(|| OwnedHeaders::new_with_capacity(headers.len()));
+
+        for (key, value) in headers {
+            *owned_headers = take(owned_headers).insert(Header {
+                key,
+                value: Some(value.as_bytes()),
+            });
+        }
 
         // Inject OpenTelemetry context into the record headers
         self.propagator.inject_context(

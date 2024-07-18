@@ -54,9 +54,13 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::context::Context;
+use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
+use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
+use crate::consumer::failure::{FailureStrategy, FallibleHandler};
 use crate::consumer::message::{MessageContext, UncommittedMessage};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
+use crate::producer::ProsodyProducer;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_duration_env_with_fallback, from_vec_env,
@@ -368,6 +372,38 @@ impl ProsodyConsumer {
         }))));
 
         Ok(Self { shutdown, handle })
+    }
+
+    pub fn pipeline_consumer<T>(
+        consumer_config: &ConsumerConfiguration,
+        retry_config: RetryConfiguration,
+        handler: T,
+    ) -> Result<Self, ConsumerError>
+    where
+        T: FallibleHandler + Clone + Send + Sync + 'static,
+    {
+        let strategy = RetryStrategy::new(retry_config)?; // retry failures
+        let handler = strategy.with_handler(handler);
+        Self::new(consumer_config, handler)
+    }
+
+    pub fn low_latency_consumer<T>(
+        consumer_config: &ConsumerConfiguration,
+        retry_config: RetryConfiguration,
+        topic_config: FailureTopicConfiguration,
+        producer: ProsodyProducer,
+        handler: T,
+    ) -> Result<Self, ConsumerError>
+    where
+        T: FallibleHandler + Clone + Send + Sync + 'static,
+    {
+        let group_id = consumer_config.group_id.clone();
+        let strategy = RetryStrategy::new(retry_config.clone())? // retry processing up to limit
+            .and_then(FailureTopicStrategy::new(topic_config, group_id, producer)?) // write to failure topic
+            .and_then(RetryStrategy::new(retry_config)?); // retry writing to failure topic
+
+        let handler = strategy.with_handler(handler);
+        Self::new(consumer_config, handler)
     }
 
     /// Initiates a graceful shutdown of the Kafka consumer.

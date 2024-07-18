@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
 use opentelemetry::propagation::TextMapPropagator;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::util::Timeout;
-use rdkafka::{Message, Offset, TopicPartitionList};
+use rdkafka::{Message, Offset, Timestamp, TopicPartitionList};
 use thiserror::Error;
 use tracing::field::Empty;
 use tracing::{error, info_span, warn};
@@ -117,6 +118,17 @@ pub fn poll<T>(
             }
         };
 
+        let timestamp = match message.timestamp() {
+            Timestamp::NotAvailable => Utc::now(),
+            Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => {
+                match Utc.timestamp_millis_opt(millis) {
+                    MappedLocalTime::Single(timestamp) => timestamp,
+                    MappedLocalTime::Ambiguous(earliest, ..) => earliest,
+                    MappedLocalTime::None => Utc::now(),
+                }
+            }
+        };
+
         let payload = match serde_json::from_slice(payload_data) {
             Ok(payload) => payload,
             Err(error) => {
@@ -131,6 +143,7 @@ pub fn poll<T>(
             partition,
             offset,
             key,
+            timestamp,
             payload,
             span: span.clone(),
         };
