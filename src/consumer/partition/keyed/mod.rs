@@ -1,5 +1,9 @@
 //! Provides the `KeyManager` for managing and processing messages keyed by hash
 //! values.
+//!
+//! This module implements a concurrent processing system that ensures messages
+//! with the same key are processed in order while allowing parallel processing
+//! of messages with different keys.
 
 use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
@@ -21,6 +25,7 @@ use crate::consumer::Keyed;
 #[cfg(test)]
 mod test;
 
+/// Represents a hash value used for keying messages.
 type HashValue = u64;
 
 /// Manages and processes messages keyed by hash values, ensuring concurrent
@@ -32,15 +37,6 @@ type HashValue = u64;
 /// maintains several internal states like executing tasks, busy keys,
 /// and queued messages, ensuring no more than the specified number of messages
 /// per key are processed concurrently.
-///
-/// # Fields
-/// - `max_enqueued_per_key`: Maximum number of messages that can be enqueued
-///   per key before being processed.
-/// - `process`: The processing function applied to each message.
-/// - `executing`: Active futures of messages being processed.
-/// - `busy`: Set of keys currently being processed.
-/// - `enqueued`: Messages waiting to be processed, keyed by hash values.
-/// - `hash_state`: State of the random hash algorithm used for key management.
 pub struct KeyManager<M, F, Fut> {
     max_enqueued_per_key: usize,
     process: F,
@@ -56,14 +52,17 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// thread.
     ///
     /// # Arguments
-    /// - `process`: A function that defines how each message is processed.
-    /// - `max_enqueued_per_key`: The maximum number of messages allowed per key
-    ///   before blocking further enqueue.
+    ///
+    /// * `process` - A function that defines how each message is processed.
+    /// * `max_enqueued_per_key` - The maximum number of messages allowed per
+    ///   key before blocking further enqueue.
     ///
     /// # Returns
+    ///
     /// Returns a new instance of `KeyManager`.
     ///
     /// # Panics
+    ///
     /// Panics if `max_enqueued_per_key` is zero, as it would prevent any
     /// message processing.
     pub fn new(process: F, max_enqueued_per_key: usize) -> Self {
@@ -168,7 +167,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// message for later processing or to process it immediately.
     ///
     /// # Arguments
-    /// - `message`: M - The message to be handled.
+    ///
+    /// * `message` - The message to be handled.
     async fn handle_message(&mut self, message: M)
     where
         M: Keyed,
@@ -197,7 +197,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
-    /// `hash_value`: `HashValue` - The hash value of the completed message.
+    /// * `hash_value` - The hash value of the completed message.
     fn handle_completion(&mut self, hash_value: HashValue)
     where
         F: FnMut(M) -> Fut,
@@ -224,13 +224,14 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// This method is used to manage the queuing of messages for keys that are
     /// currently unable to accept new messages for processing due to
-    /// concurrency limits. It ensures that messages are from dropped and
+    /// concurrency limits. It ensures that messages are not dropped and
     /// are handled in a first-come, first-served basis per key.
     ///
     /// # Arguments
-    /// - `message`: M - The message to be enqueued.
-    /// - `hash_value`: `HashValue` - The hash value associated with the message
-    ///   to manage keying and load distribution.
+    ///
+    /// * `message` - The message to be enqueued.
+    /// * `hash_value` - The hash value associated with the message to manage
+    ///   keying and load distribution.
     async fn enqueue_message(&mut self, message: M, hash_value: HashValue)
     where
         F: FnMut(M) -> Fut,
@@ -270,9 +271,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
-    /// `message`: M - The message to process.
-    /// `hash_value`: `HashValue` - Hash value used to key and manage the
-    /// message.
+    /// * `message` - The message to process.
+    /// * `hash_value` - Hash value used to key and manage the message.
     fn process_message(&mut self, message: M, hash_value: HashValue)
     where
         F: FnMut(M) -> Fut,
