@@ -79,7 +79,7 @@ where
     S1: FailureStrategy,
     S2: FailureStrategy,
 {
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler + Clone
+    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
     where
         T: FallibleHandler,
     {
