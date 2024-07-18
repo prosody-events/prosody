@@ -48,14 +48,15 @@ where
     /// Creates a new `Context` with provided consumer configuration and
     /// dependencies.
     ///
-    /// This method is critical for initializing the management of partition
-    /// assignments and revocations.
+    /// This method initializes the management of partition assignments and
+    /// revocations.
     ///
     /// # Arguments
     ///
     /// * `config` - Consumer configuration settings such as buffer sizes and
     ///   timeouts.
-    /// * `message_handler` - Handler responsible for message processing.
+    /// * `handler_provider` - Provider responsible for creating message
+    ///   handlers.
     /// * `watermark_version` - Shared state for tracking watermark versions.
     /// * `managers` - Central storage for managing `PartitionManager`
     ///   instances.
