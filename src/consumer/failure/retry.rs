@@ -1,3 +1,8 @@
+//! Retry strategy for failure handling in message processing.
+//!
+//! This module provides a `RetryStrategy` that wraps handlers and retries
+//! failed message processing attempts with an exponential backoff.
+
 use std::cmp::min;
 use std::time::Duration;
 
@@ -13,6 +18,7 @@ use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessa
 use crate::consumer::{HandlerProvider, Keyed, MessageHandler};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 
+/// Configuration for the retry strategy.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct RetryConfiguration {
     /// Exponential backoff base.
@@ -36,7 +42,7 @@ pub struct RetryConfiguration {
     /// When composed with other retry strategies, this represents the maximum
     /// number of retries before falling back to the next retry strategy.
     #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MAX_RETRIES\", 10)?",
+        default = "from_env_with_fallback(\"PROSODY_MAX_RETRIES\", 3)?",
         setter(into)
     )]
     max_retries: u32,
@@ -53,16 +59,34 @@ pub struct RetryConfiguration {
     max_delay: Duration,
 }
 
+/// A strategy that retries failed message processing attempts.
 #[derive(Clone, Debug)]
 pub struct RetryStrategy(RetryConfiguration);
 
 impl RetryStrategy {
+    /// Creates a new `RetryStrategy` with the given configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The configuration for the retry strategy.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the new `RetryStrategy` if the configuration is
+    /// valid, or `ValidationErrors` if the configuration is invalid.
+    ///
+    /// # Errors
+    ///
+    /// This method will return a `ValidationErrors` if:
+    /// - The `base` value in the configuration is less than 2.
+    /// - Any other validation defined in the `RetryConfiguration` struct fails.
     pub fn new(config: RetryConfiguration) -> Result<Self, ValidationErrors> {
         config.validate()?;
         Ok(Self(config))
     }
 }
 
+/// A handler wrapped with retry functionality.
 #[derive(Clone, Debug)]
 struct RetryHandler<T> {
     config: RetryConfiguration,
@@ -70,6 +94,15 @@ struct RetryHandler<T> {
 }
 
 impl<T> RetryHandler<T> {
+    /// Calculates the sleep time for a given retry attempt.
+    ///
+    /// # Arguments
+    ///
+    /// * `attempt` - The current retry attempt number.
+    ///
+    /// # Returns
+    ///
+    /// The duration to sleep before the next retry attempt.
     fn sleep_time(&self, attempt: u32) -> Duration {
         let exp_backoff = self.config.base.saturating_pow(attempt);
         let jitter = thread_rng().gen_range(0..exp_backoff);
@@ -113,6 +146,7 @@ where
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     if attempt > self.config.max_retries {
+                        // Log the final failure and return the error
                         error!(
                             %topic, %partition, %key, %offset, %attempt,
                             "failed to handle message: {error:#}; maximum attempts reached"
@@ -122,6 +156,7 @@ where
 
                     let sleep_time = self.sleep_time(attempt);
 
+                    // Log the failure and retry information
                     error!(
                         %topic, %partition, %key, %offset, %attempt,
                         "failed to handle message: {error:#}; retrying after {}",
@@ -154,6 +189,7 @@ where
                 Err(error) => {
                     let sleep_time = self.sleep_time(attempt);
 
+                    // Log the failure and retry information
                     error!(
                         %topic, %partition, %key, %offset, %attempt,
                         "failed to handle message: {error:#}; retrying after {}",
@@ -168,5 +204,7 @@ where
         uncommitted_offset.commit();
     }
 
-    async fn shutdown(self) {}
+    async fn shutdown(self) {
+        // No shutdown behavior needed for retry
+    }
 }
