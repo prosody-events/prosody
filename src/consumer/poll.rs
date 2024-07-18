@@ -1,5 +1,8 @@
-//! Provides functionality for polling and processing Kafka messages with
-//! distributed tracing support.
+//! Polls and processes Kafka messages with distributed tracing support.
+//!
+//! This module implements the main polling loop for consuming messages,
+//! manages offset commits, handles partition pausing and resuming based on
+//! capacity, and dispatches messages to appropriate partition managers.
 
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,12 +32,13 @@ use crate::Key;
 /// Polls messages from Kafka, processes them, and handles partition management.
 ///
 /// # Arguments
-/// - `poll_interval`: Duration to wait between polling attempts.
-/// - `commit_interval`: Duration to wait between offset commits.
-/// - `consumer`: Kafka consumer instance.
-/// - `watermark_version`: Current watermark version for offset tracking.
-/// - `managers`: Manager collection for handling partitions.
-/// - `shutdown`: Atomic boolean to signal shutdown.
+///
+/// * `poll_interval` - Duration to wait between polling attempts.
+/// * `commit_interval` - Duration to wait between offset commits.
+/// * `consumer` - Kafka consumer instance.
+/// * `watermark_version` - Current watermark version for offset tracking.
+/// * `managers` - Manager collection for handling partitions.
+/// * `shutdown` - Atomic boolean to signal shutdown.
 pub fn poll<T>(
     poll_interval: Duration,
     commit_interval: Duration,
@@ -137,7 +141,7 @@ pub fn poll<T>(
             }
         };
 
-        // Create UntrackedMessage and dispatch for processing
+        // Create ConsumerMessage and dispatch for processing
         let mut message = ConsumerMessage {
             topic,
             partition,
@@ -169,12 +173,13 @@ pub fn poll<T>(
 /// Commits the current offsets for all managed partitions if necessary.
 ///
 /// # Arguments
-/// - `commit_interval`: Interval between offset commits.
-/// - `consumer`: Kafka consumer instance.
-/// - `watermark_version`: Current watermark version for offset tracking.
-/// - `managers`: Manager collection for handling partitions.
-/// - `last_version`: Last committed watermark version.
-/// - `last_commit`: Time of the last commit attempt.
+///
+/// * `commit_interval` - Interval between offset commits.
+/// * `consumer` - Kafka consumer instance.
+/// * `watermark_version` - Current watermark version for offset tracking.
+/// * `managers` - Manager collection for handling partitions.
+/// * `last_version` - Last committed watermark version.
+/// * `last_commit` - Time of the last commit attempt.
 fn commit_watermarks<T>(
     commit_interval: &Duration,
     consumer: &BaseConsumer<Context<T>>,
@@ -227,11 +232,13 @@ fn commit_watermarks<T>(
 /// Pauses or resumes partitions based on their capacity status.
 ///
 /// # Arguments
-/// - `is_paused`: Indicates if any partitions are currently paused.
-/// - `consumer`: Kafka consumer instance.
-/// - `managers`: Manager collection for handling partitions.
+///
+/// * `is_paused` - Indicates if any partitions are currently paused.
+/// * `consumer` - Kafka consumer instance.
+/// * `managers` - Manager collection for handling partitions.
 ///
 /// # Errors
+///
 /// Returns `KafkaError` if there is an error pausing or resuming partitions.
 fn pause_busy_partitions<T>(
     is_paused: &mut bool,
@@ -277,11 +284,14 @@ where
 /// Dispatches a message to the appropriate partition manager.
 ///
 /// # Arguments
-/// - `message`: The message to dispatch.
-/// - `managers`: Manager collection for handling partitions.
+///
+/// * `message` - The message to dispatch.
+/// * `managers` - Manager collection for handling partitions.
 ///
 /// # Returns
-/// Returns a `DispatchError` if dispatch fails.
+///
+/// Returns `Ok(())` if the dispatch is successful, or a `DispatchError` if it
+/// fails.
 fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(), DispatchError> {
     let managers = managers.lock();
     let Some(manager) = managers.get(&(message.topic, message.partition)) else {
