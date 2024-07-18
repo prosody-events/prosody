@@ -35,67 +35,94 @@ prosody = { git = "https://github.com/RealGeeks/prosody.git" }
 
 ```rust
 use prosody::Topic;
-use prosody::producer::{ProducerConfiguration, Prosody};
+use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use serde_json::json;
-use std::error::Error;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let config = ProducerConfiguration::builder()
-        .bootstrap_servers(["localhost:9092".to_owned()])
-        .build()?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+   let config = ProducerConfiguration::builder()
+     .bootstrap_servers(["localhost:9092".to_owned()])
+     .mock(true) // use mock producer for example
+     .build()?;
 
-    let producer = ProsodyProducer::new(&config)?;
+   let producer = ProsodyProducer::new(&config)?;
 
-    let topic: Topic = "my-topic".into();
-    producer.send(topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
+   let topic: Topic = "my-topic".into();
+   producer.send([], topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
 
-    Ok(())
+   Ok(())
 }
 ```
 
 ### Consumer Example
 
 ```rust
-use prosody::consumer::message::{ConsumerMessage, MessageContext};
-use prosody::consumer::{ConsumerConfiguration, ProsodyConsumer, MessageHandler};
-use prosody::Topic;
+use prosody::consumer::message::{MessageContext, UncommittedMessage};
+use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
+use prosody::{Partition, Topic};
 use std::time::Duration;
-use std::error::Error;
 
 #[derive(Clone)]
 struct MyMessageHandler;
 
 impl MessageHandler for MyMessageHandler {
-    type Error = std::io::Error;
+   async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
+      println!("Received: {:?}", message);
+      message.commit();
+   }
 
-    async fn handle(
-        &self,
-        context: MessageContext,
-        message: ConsumerMessage,
-    ) -> Result<(), Self::Error> {
-        println!("Received: {:?}", message);
-        message.commit();
-        Ok(())
-    }
+   async fn shutdown(self) {}
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let config = ConsumerConfiguration::builder()
-        .bootstrap_servers(["localhost:9092".to_owned()])
-        .group_id("my-group")
-        .subscribed_topics(["my-topic".to_owned()])
-        .build()?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+   let config = ConsumerConfiguration::builder()
+     .bootstrap_servers(["localhost:9092".to_owned()])
+     .group_id("my-group")
+     .subscribed_topics(["my-topic".to_owned()])
+     .mock(true) // use mock consumer for example
+     .build()?;
 
-    let consumer = ProsodyConsumer::new(&config, MyMessageHandler)?;
+   let consumer = ProsodyConsumer::new(&config, MyMessageHandler)?;
 
-    // Run your application logic here
+   // Run your application logic here, waiting for shutdown
 
-    consumer.shutdown().await;
-    Ok(())
+   consumer.shutdown().await;
+   Ok(())
 }
 ```
+
+## High-Level Constructors
+
+Prosody provides two high-level constructors for both consumers and producers to suit different application needs:
+
+### Pipeline Constructor
+
+The pipeline constructors are designed for applications that require all messages to be processed or sent in order.
+These constructors ensure that all messages are handled sequentially, retrying failed operations indefinitely based on
+the provided retry configuration. They're suitable for applications where message order is critical and processing or
+sending must be guaranteed.
+
+Key features:
+
+- Ensures ordered handling of all messages
+- Retries failed operations indefinitely based on the retry configuration
+- Ideal for pipeline applications where order is crucial
+
+### Low-Latency Constructor
+
+The low-latency constructors are optimized for applications that prioritize quick processing or sending and can tolerate
+occasional message failures. These constructors attempt to handle messages rapidly and, if the operation continually
+fails after retries, either send the failed messages to a designated failure topic (for consumers) or return an error (
+for producers).
+
+Key features:
+
+- Prioritizes low-latency operations
+- Implements a retry mechanism for failed operations
+- For consumers: Sends persistently failing messages to a failure topic for later analysis or reprocessing
+- For producers: Returns an error after a configurable number of retries
+- Ideal for applications where speed is crucial and failed messages can be handled separately or errors can be tolerated
 
 ## Configuration
 
@@ -118,6 +145,10 @@ The following table lists the available configuration options and their associat
 | `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations              | 1s      | ✓        |          |
 | `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | 1s      |          | ✓        |
 | `PROSODY_MOCK`                       | Use mock Kafka brokers for testing              | false   | ✓        | ✓        |
+| `PROSODY_RETRY_BASE`                 | Exponential backoff base for retries            | 2       | ✓        |          |
+| `PROSODY_MAX_RETRIES`                | Maximum number of retries                       | 3       | ✓        |          |
+| `PROSODY_RETRY_MAX_DELAY`            | Maximum retry delay                             | 1m      | ✓        |          |
+| `PROSODY_FAILURE_TOPIC`              | Topic for failed messages                       | -       | ✓        |          |
 
 ## Common Project Tasks
 
