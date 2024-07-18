@@ -1,6 +1,6 @@
 //! A high-level Kafka client library with support for distributed tracing.
 //!
-//! This crate provides abstractions for interacting with Apache Kafka,
+//! Prosody provides abstractions for interacting with Apache Kafka,
 //! offering both consumer and producer implementations. It integrates
 //! OpenTelemetry for distributed tracing, allowing for better observability
 //! in microservice architectures.
