@@ -1,6 +1,7 @@
-//! Provides core functionality for handling consumer messages within a
-//! Kafka message processing system. This module defines structures for
-//! managing message contexts and for defining the behavior of consumer
+//! Core functionality for handling consumer messages in a Kafka message
+//! processing system.
+//!
+//! This module defines structures for managing message contexts and consumer
 //! messages, including tracking shutdown signals and committing messages after
 //! processing.
 
@@ -12,19 +13,20 @@ use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::Keyed;
 use crate::{Key, Offset, Partition, Payload, Topic};
 
-/// Represents the context for a message within a consumer
+/// Represents the context for a message within a consumer.
 #[derive(Clone, Debug)]
 pub struct MessageContext;
 
 impl MessageContext {
-    /// Creates a new message context
+    /// Creates a new message context.
+    ///
+    /// This method is intended for internal use within the crate.
     pub(crate) fn new() -> Self {
         Self
     }
 }
 
-/// Represents a message consumed from a topic with associated metadata and
-/// state for committing.
+/// A message consumed from a topic with associated metadata and commit state.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct UncommittedMessage {
@@ -81,7 +83,11 @@ impl UncommittedMessage {
         &self.span
     }
 
-    /// Take ownership of the key, payload, and uncommitted offset.
+    /// Takes ownership of the key, payload, and uncommitted offset.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing a `ConsumerMessage` and an `UncommittedOffset`.
     #[must_use]
     pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
         let message = ConsumerMessage {
@@ -113,30 +119,47 @@ impl Keyed for UncommittedMessage {
     }
 }
 
-/// Represents a message that is not yet being tracked for offset watermarks.
+/// A message that is not yet being tracked for offset watermarks.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ConsumerMessage {
+    /// The topic from which the message was consumed.
     pub topic: Topic,
+
+    /// The partition from which the message was consumed.
     pub partition: Partition,
+
+    /// The offset of the message within its partition.
     pub offset: Offset,
+
+    /// The key associated with the message.
     pub key: Key,
+
+    /// The timestamp of the message.
     pub timestamp: DateTime<Utc>,
 
+    /// The payload of the message.
     #[educe(Debug(ignore))]
     pub payload: Payload,
 
+    /// The tracing span associated with this message.
     #[educe(Debug(ignore))]
     pub span: Span,
 }
 
 impl ConsumerMessage {
-    /// Converts an `UntrackedMessage` into a `ConsumerMessage` by adding
+    /// Converts a `ConsumerMessage` into an `UncommittedMessage` by adding
     /// uncommitted offset tracking.
     ///
     /// # Arguments
+    ///
     /// * `uncommitted_offset` - The uncommitted offset to be associated with
     ///   the message.
+    ///
+    /// # Returns
+    ///
+    /// An `UncommittedMessage` with the same data as the original
+    /// `ConsumerMessage`, but with added offset tracking.
     #[must_use]
     pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage {
         UncommittedMessage {
