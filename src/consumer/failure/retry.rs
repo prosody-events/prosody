@@ -59,6 +59,18 @@ pub struct RetryConfiguration {
     max_delay: Duration,
 }
 
+impl RetryConfiguration {
+    /// Creates a new `RetryConfigurationBuilder`.
+    ///
+    /// # Returns
+    ///
+    /// A `RetryConfigurationBuilder` instance.
+    #[must_use]
+    pub fn builder() -> RetryConfigurationBuilder {
+        RetryConfigurationBuilder::default()
+    }
+}
+
 /// A strategy that retries failed message processing attempts.
 #[derive(Clone, Debug)]
 pub struct RetryStrategy(RetryConfiguration);
@@ -77,7 +89,7 @@ impl RetryStrategy {
     ///
     /// # Errors
     ///
-    /// This method will return a `ValidationErrors` if:
+    /// Returns `ValidationErrors` if:
     /// - The `base` value in the configuration is less than 2.
     /// - Any other validation defined in the `RetryConfiguration` struct fails.
     pub fn new(config: RetryConfiguration) -> Result<Self, ValidationErrors> {
@@ -129,6 +141,20 @@ where
 {
     type Error = T::Error;
 
+    /// Handles a message with retry functionality.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The message context.
+    /// * `message` - The consumer message to be processed.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure of message processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying handler's error if all retry attempts fail.
     async fn handle(
         &self,
         context: MessageContext,
@@ -174,6 +200,13 @@ impl<T> MessageHandler for RetryHandler<T>
 where
     T: FallibleHandler,
 {
+    /// Handles a message with retry functionality and commits the offset upon
+    /// success.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The message context.
+    /// * `message` - The uncommitted message to be processed.
     async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
         let topic = message.topic();
         let partition = message.partition();
@@ -204,6 +237,9 @@ where
         uncommitted_offset.commit();
     }
 
+    /// Shuts down the handler.
+    ///
+    /// This implementation has no specific shutdown behavior.
     async fn shutdown(self) {
         // No shutdown behavior needed for retry
     }

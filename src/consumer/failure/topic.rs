@@ -29,6 +29,18 @@ pub struct FailureTopicConfiguration {
     failure_topic: String,
 }
 
+impl FailureTopicConfiguration {
+    /// Creates a new `FailureTopicConfigurationBuilder`.
+    ///
+    /// # Returns
+    ///
+    /// A `FailureTopicConfigurationBuilder` instance.
+    #[must_use]
+    pub fn builder() -> FailureTopicConfigurationBuilder {
+        FailureTopicConfigurationBuilder::default()
+    }
+}
+
 /// A strategy that sends failed messages to a designated failure topic.
 #[derive(Clone, Debug)]
 pub struct FailureTopicStrategy {
@@ -54,7 +66,7 @@ impl FailureTopicStrategy {
     ///
     /// # Errors
     ///
-    /// This method will return `ValidationErrors` if:
+    /// Returns `ValidationErrors` if:
     /// - The `failure_topic` in the configuration is an empty string.
     /// - Any other validation defined in the `FailureTopicConfiguration` struct
     ///   fails.
