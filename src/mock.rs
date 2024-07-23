@@ -17,7 +17,7 @@ use tokio::sync::oneshot::error::RecvError;
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct MockCluster {
-    bootstrap_servers: String,
+    bootstrap_servers: Vec<String>,
 
     #[educe(Debug(ignore))]
     shutdown: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
@@ -55,9 +55,15 @@ impl MockCluster {
             }
         });
 
+        let bootstrap_servers = result_rx
+            .blocking_recv()??
+            .split(',')
+            .map(ToOwned::to_owned)
+            .collect();
+
         // Wait for the result from the spawned thread
         Ok(Self {
-            bootstrap_servers: result_rx.blocking_recv()??,
+            bootstrap_servers,
             shutdown: Some((shutdown_tx, handle)),
         })
     }
@@ -67,7 +73,7 @@ impl MockCluster {
     /// This string can be used to configure Kafka clients to connect to the
     /// mock cluster.
     #[must_use]
-    pub fn bootstrap_servers(&self) -> &str {
+    pub fn bootstrap_servers(&self) -> &[String] {
         &self.bootstrap_servers
     }
 }
