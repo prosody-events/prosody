@@ -163,6 +163,7 @@ use internment::Intern;
 use serde_json::Value;
 
 pub mod consumer;
+pub mod mock;
 pub mod producer;
 mod propagator;
 mod util;
