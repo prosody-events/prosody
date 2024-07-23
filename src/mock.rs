@@ -38,7 +38,7 @@ impl MockCluster {
     /// Returns a `MockError` if:
     /// - The `KafkaMock` fails to initialize.
     /// - There's an error in communication between threads.
-    pub async fn new(broker_count: u8) -> Result<Self, MockError> {
+    pub fn new(broker_count: u8) -> Result<Self, MockError> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -57,7 +57,7 @@ impl MockCluster {
 
         // Wait for the result from the spawned thread
         Ok(Self {
-            bootstrap_servers: result_rx.await??,
+            bootstrap_servers: result_rx.blocking_recv()??,
             shutdown: Some((shutdown_tx, handle)),
         })
     }
