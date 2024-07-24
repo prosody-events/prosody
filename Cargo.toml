@@ -44,7 +44,7 @@ tracing-subscriber = "0.3"
 validator = { version = "0.18", features = ["derive"] }
 whoami = "1.5"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, target_arch = "aarch64"))'.dependencies]
 rdkafka = { git = "https://github.com/fede1024/rust-rdkafka.git", rev = "bb76b5bd4010599e90f02d9d3460c2d616a55752", features = [
     "cmake-build",
     "tracing",
