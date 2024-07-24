@@ -137,6 +137,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.50"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31c789563b815f77f4250caee12365734369f942439b7defd71e18a48197130"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "color-eyre"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -973,6 +982,7 @@ name = "rdkafka-sys"
 version = "4.7.0+2.3.0"
 source = "git+https://github.com/fede1024/rust-rdkafka.git?rev=bb76b5bd4010599e90f02d9d3460c2d616a55752#bb76b5bd4010599e90f02d9d3460c2d616a55752"
 dependencies = [
+ "cmake",
  "libc",
  "libz-sys",
  "num_enum",
