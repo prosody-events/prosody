@@ -164,7 +164,7 @@ use serde_json::Value;
 
 pub mod consumer;
 pub mod producer;
-mod propagator;
+pub mod propagator;
 mod util;
 
 /// A Kafka topic name.
