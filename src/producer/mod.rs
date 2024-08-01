@@ -19,7 +19,7 @@ use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
 use serde_json::{to_vec, Value};
 use thiserror::Error;
-use tracing::Span;
+use tracing::{instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
@@ -220,6 +220,7 @@ impl ProsodyProducer {
     /// - The payload cannot be serialized
     /// - The system time cannot be retrieved
     /// - The Kafka send operation fails
+    #[instrument(skip(self, headers, payload), err)]
     pub async fn send<'a, H>(
         &'a self,
         headers: H,
