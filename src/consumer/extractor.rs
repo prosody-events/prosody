@@ -37,10 +37,14 @@ impl<'a> Extractor for MessageExtractor<'a> {
     /// # Returns
     /// An option containing the header value if found, otherwise `None`.
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
+        let value = self
+            .0
             .headers()?
             .iter()
-            .find_map(|header| (header.key == key).then_some(header.key))
+            .find(|header| header.key == key)?
+            .value?;
+
+        str::from_utf8(value).ok()
     }
 
     /// Returns a collection of all header keys present in the Kafka message.

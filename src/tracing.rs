@@ -3,27 +3,20 @@
 //! This module sets up OpenTelemetry with OTLP exporter and integrates it
 //! with the tracing subscriber.
 
-use opentelemetry::global;
-use opentelemetry::trace::TraceError;
+use opentelemetry::trace::{TraceError, TracerProvider};
 use opentelemetry_otlp::{new_exporter, new_pipeline};
 use opentelemetry_sdk::runtime::Tokio;
 use thiserror::Error;
 use tonic::transport::ClientTlsConfig;
-use tracing::dispatcher::SetGlobalDefaultError;
-use tracing::subscriber::set_global_default;
+use tracing::subscriber::{set_global_default, SetGlobalDefaultError};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::Registry;
 
 /// Initializes the tracing system with OpenTelemetry and OTLP exporter.
 ///
 /// This function sets up the OpenTelemetry tracer with OTLP exporter,
-/// configures it as the global tracer, and sets up a tracing subscriber
-/// with an OpenTelemetry layer. It uses `EnvFilter` for filtering, which
-/// is applied to the OpenTelemetry layer. Finally, it sets the configured
-/// subscriber as the global default.
-///
-/// The `EnvFilter` is configured with a default level of "info" and can be
-/// overridden using the `RUST_LOG` environment variable.
+/// creates a tracing subscriber with the OpenTelemetry layer, and sets
+/// it as the global default subscriber.
 ///
 /// # Returns
 ///
@@ -32,10 +25,11 @@ use tracing_subscriber::{EnvFilter, Layer};
 ///
 /// # Errors
 ///
-/// This function can return a `TracingError` if the trace exporter
-/// initialization fails or if setting the global subscriber fails.
+/// This function can return a `TracingError` in the following cases:
+/// - If the trace exporter initialization fails
+/// - If setting the global default subscriber fails
 pub fn initialize_tracing() -> Result<(), TracingError> {
-    // Create the OpenTelemetry tracer
+    // Create and install the OpenTelemetry tracer
     let tracer = new_pipeline()
         .tracing()
         .with_exporter(
@@ -43,19 +37,12 @@ pub fn initialize_tracing() -> Result<(), TracingError> {
                 .tonic()
                 .with_tls_config(ClientTlsConfig::default().with_native_roots()),
         )
-        .install_batch(Tokio)?;
+        .install_batch(Tokio)?
+        .tracer("prosody");
 
-    // Set the tracer as the global default
-    global::set_tracer_provider(tracer);
-
-    // Create an EnvFilter with a default "info" level, overridable by RUST_LOG
-    let env_filter = EnvFilter::builder()
-        .with_default_directive(tracing::Level::INFO.into())
-        .from_env_lossy();
-
-    // Set up the subscriber with OpenTelemetry and filtering
-    let subscriber =
-        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_filter(env_filter));
+    // Create a tracing subscriber with OpenTelemetry layer
+    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+    let subscriber = Registry::default().with(telemetry);
 
     // Set the subscriber as the global default
     set_global_default(subscriber)?;
@@ -73,8 +60,4 @@ pub enum TracingError {
     /// Indicates a failure to set the default tracing subscriber.
     #[error("failed to set default tracing subscriber: {0:#}")]
     SetDefault(#[from] SetGlobalDefaultError),
-
-    /// Indicates a failure to initialize the tracing subscriber.
-    #[error("Failed to initialize the tracing subscriber: {0}")]
-    SubscriberInit(#[from] tracing_subscriber::util::TryInitError),
 }
