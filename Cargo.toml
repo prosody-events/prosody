@@ -26,7 +26,11 @@ humantime = "2.1"
 internment = "0.8"
 nohash-hasher = "0.2"
 opentelemetry = "0.24"
-opentelemetry-otlp = { version = "0.17", features = ["gzip-tonic"] }
+opentelemetry-otlp = { version = "0.17", features = [
+    "gzip-tonic",
+    "tls",
+    "tls-roots",
+] }
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
 parking_lot = "0.12"
 pin-project = "1.1"
