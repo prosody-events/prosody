@@ -73,7 +73,6 @@ use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt, HashSet};
 use color_eyre::eyre::{eyre, OptionExt, Result};
-use color_eyre::Report;
 use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
@@ -90,7 +89,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-use prosody::consumer::message::{ConsumerMessage, MessageContext};
+use prosody::consumer::message::{MessageContext, UncommittedMessage};
 use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::Topic;
@@ -163,7 +162,6 @@ async fn run_test(input: TestInput) -> Result<()> {
 
     let (messages_tx, messages_rx) = channel(input.partition_count.value());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handler = TestHandler::new(messages_tx);
 
     let mut tasks = JoinSet::new();
 
@@ -172,7 +170,7 @@ async fn run_test(input: TestInput) -> Result<()> {
         &mut tasks,
         input.consumer_count,
         &consumer_config,
-        &handler,
+        &messages_tx,
         &shutdown_rx,
     );
     spawn_message_verifier(&mut tasks, messages_rx, shutdown_tx, input.messages);
@@ -288,9 +286,9 @@ fn spawn_producers(
             for (key, messages) in producer_messages {
                 let key = key.to_string();
                 for message in messages {
-                    producer.send(topic, &key, json!(message)).await?;
+                    producer.send([], topic, &key, json!(message)).await?;
                 }
-                producer.send(topic, &key, Value::Null).await?;
+                producer.send([], topic, &key, Value::Null).await?;
             }
             Ok(())
         });
@@ -309,16 +307,18 @@ fn spawn_consumers(
     tasks: &mut JoinSet<Result<()>>,
     consumer_count: SmallCount,
     consumer_config: &ConsumerConfiguration,
-    handler: &TestHandler,
+    messages_tx: &Sender<(String, Value)>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
     for _ in 0..consumer_count.value() {
         let consumer_config = consumer_config.clone();
-        let handler = handler.clone();
+        let messages_tx = messages_tx.clone();
         let mut shutdown_rx = shutdown_rx.clone();
 
+        let handler = TestHandler { messages_tx };
+
         tasks.spawn(async move {
-            let consumer = ProsodyConsumer::new(consumer_config, handler)?;
+            let consumer = ProsodyConsumer::new::<TestHandler>(&consumer_config, handler)?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?;
             consumer.shutdown().await;
             Ok(())
@@ -414,19 +414,7 @@ struct TestHandler {
     messages_tx: Sender<(String, Value)>,
 }
 
-impl TestHandler {
-    /// Creates a new `TestHandler` instance.
-    ///
-    /// # Arguments
-    /// * `messages_tx` - A channel sender for passing received messages.
-    fn new(messages_tx: Sender<(String, Value)>) -> Self {
-        Self { messages_tx }
-    }
-}
-
 impl MessageHandler for TestHandler {
-    type Error = Report;
-
     /// Handles a received message by sending it through the channel.
     ///
     /// # Arguments
@@ -434,19 +422,22 @@ impl MessageHandler for TestHandler {
     /// * `message` - The received consumer message.
     ///
     /// # Returns
-    /// A Result indicating success or failure of the message handling.
-    ///
-    /// # Errors
-    /// Returns an error if sending the message through the channel fails.
-    async fn handle(
-        &self,
-        _context: &mut MessageContext,
-        message: ConsumerMessage,
-    ) -> Result<(), Self::Error> {
-        let (key, payload, uncommitted) = message.into_inner();
-        self.messages_tx.send((key.to_string(), payload)).await?;
+    /// A Future that completes when the message is handled.
+    async fn handle(&self, _context: MessageContext, message: UncommittedMessage) {
+        let (message, uncommitted) = message.into_inner();
+        if let Err(error) = self
+            .messages_tx
+            .send((message.key.to_string(), message.payload))
+            .await
+        {
+            error!("failed to send message: {error:#}");
+        }
+
         uncommitted.commit();
-        Ok(())
+    }
+
+    async fn shutdown(self) {
+        info!("partition shutdown");
     }
 }
 

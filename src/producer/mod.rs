@@ -5,6 +5,7 @@
 //! of OpenTelemetry context for distributed tracing.
 
 use std::io;
+use std::mem::take;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use derive_builder::Builder;
@@ -12,12 +13,13 @@ use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
+use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
 use serde_json::{to_vec, Value};
 use thiserror::Error;
-use tracing::Span;
+use tracing::{instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
@@ -30,11 +32,7 @@ use crate::Topic;
 mod injector;
 
 /// Configuration for the Kafka producer.
-///
-/// This struct holds all the necessary configuration options for creating a
-/// Kafka producer. It uses the Builder pattern for flexible initialization and
-/// supports loading values from environment variables.
-#[derive(Builder, Clone, Validate)]
+#[derive(Builder, Clone, Debug, Validate)]
 pub struct ProducerConfiguration {
     /// List of Kafka bootstrap servers.
     ///
@@ -52,10 +50,9 @@ pub struct ProducerConfiguration {
     /// Default: 1 second
     ///
     /// If set to None (or if the environment variable is set to "none"), the
-    /// sender will retry indefinitely and never timeout. This may be an
-    /// appropriate setting for consumers that produce to topics, as the
-    /// consumed message may not be marked as complete until the message is
-    /// produced.
+    /// sender will retry indefinitely and never timeout. This may be
+    /// appropriate for consumers that produce to topics, as the consumed
+    /// message may not be marked as complete until the message is produced.
     #[builder(
         default = "from_option_duration_env_with_fallback(\"PROSODY_SEND_TIMEOUT\", \
                    Duration::from_secs(1))?",
@@ -77,9 +74,6 @@ pub struct ProducerConfiguration {
 impl ProducerConfiguration {
     /// Creates a new `ProducerConfigurationBuilder`.
     ///
-    /// This method is a convenient way to start building a
-    /// `ProducerConfiguration`.
-    ///
     /// # Returns
     ///
     /// A new instance of `ProducerConfigurationBuilder`.
@@ -90,9 +84,6 @@ impl ProducerConfiguration {
 }
 
 /// High-level Kafka producer implementation.
-///
-/// This struct encapsulates the Kafka producer functionality, including
-/// message sending and OpenTelemetry context propagation.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct ProsodyProducer {
@@ -137,16 +128,13 @@ impl ProsodyProducer {
     /// - The hostname cannot be retrieved
     /// - The Kafka producer cannot be created
     pub fn new(config: &ProducerConfiguration) -> Result<Self, ProducerError> {
-        // Validate the configuration
         config.validate()?;
 
-        // Set the send timeout
         let send_timeout = match config.send_timeout {
             None => Timeout::Never,
             Some(duration) => Timeout::After(duration),
         };
 
-        // Create and configure the Kafka producer
         let mut client_config = ClientConfig::new();
         client_config
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
@@ -155,7 +143,6 @@ impl ProsodyProducer {
             .set("enable.idempotence", "true")
             .set_log_level(RDKafkaLogLevel::Error);
 
-        // Set up mock broker if configured
         if config.mock {
             client_config.set("test.mock.num.brokers", "3");
         }
@@ -167,13 +154,58 @@ impl ProsodyProducer {
         })
     }
 
-    /// Sends a message to a Kafka topic.
+    /// Creates a new `ProsodyProducer` instance for pipeline processing.
     ///
-    /// This method serializes the payload, injects OpenTelemetry context,
-    /// and sends the message to the specified Kafka topic.
+    /// This configuration sets the send timeout to None, allowing for
+    /// indefinite retries.
     ///
     /// # Arguments
     ///
+    /// * `config` - The producer configuration.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the new `ProsodyProducer` instance or a
+    /// `ProducerError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProducerError` if the producer creation fails.
+    pub fn pipeline_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+        config.send_timeout = None;
+        Self::new(&config)
+    }
+
+    /// Creates a new `ProsodyProducer` instance optimized for low latency.
+    ///
+    /// This configuration ensures a send timeout is set, defaulting to 1 second
+    /// if not specified.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The producer configuration.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the new `ProsodyProducer` instance or a
+    /// `ProducerError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProducerError` if the producer creation fails.
+    pub fn low_latency_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+        if config.send_timeout.is_none() {
+            config.send_timeout = Some(Duration::from_secs(1));
+        };
+
+        Self::new(&config)
+    }
+
+    /// Sends a message to a Kafka topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `headers` - An iterator of key-value pairs to be added as headers.
     /// * `topic` - The topic to send the message to.
     /// * `key` - The message key.
     /// * `payload` - The message payload as a JSON Value.
@@ -188,27 +220,55 @@ impl ProsodyProducer {
     /// - The payload cannot be serialized
     /// - The system time cannot be retrieved
     /// - The Kafka send operation fails
-    pub async fn send(&self, topic: Topic, key: &str, payload: Value) -> Result<(), ProducerError> {
-        // Serialize the payload
+    #[instrument(
+        skip(self, headers, payload),
+        fields(payload_size, partition, offset),
+        err
+    )]
+    pub async fn send<'a, H>(
+        &'a self,
+        headers: H,
+        topic: Topic,
+        key: &str,
+        payload: Value,
+    ) -> Result<(), ProducerError>
+    where
+        H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
+    {
         let serialized = to_vec(&payload)?;
+        Span::current().record("payload_size", serialized.len());
 
-        // Create the record with timestamp
         let mut record = FutureRecord::to(&topic)
             .key(key)
             .payload(&serialized)
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 
-        // Inject OpenTelemetry context into the record headers
+        let headers = headers.into_iter();
+        let owned_headers = record
+            .headers
+            .get_or_insert_with(|| OwnedHeaders::new_with_capacity(headers.len()));
+
+        for (key, value) in headers {
+            *owned_headers = take(owned_headers).insert(Header {
+                key,
+                value: Some(value.as_bytes()),
+            });
+        }
+
         self.propagator.inject_context(
             &Span::current().context(),
             &mut RecordInjector::new(&mut record),
         );
 
-        // Send the record
-        self.producer
+        let (partition, offset) = self
+            .producer
             .send(record, self.send_timeout)
             .await
             .map_err(|(error, _)| ProducerError::Kafka(error))?;
+
+        Span::current()
+            .record("partition", partition)
+            .record("offset", offset);
 
         Ok(())
     }

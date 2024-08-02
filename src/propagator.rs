@@ -19,6 +19,7 @@ use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 ///
 /// A `TextMapCompositePropagator` configured with baggage and trace context
 /// propagators.
+#[must_use]
 pub fn new_propagator() -> TextMapCompositePropagator {
     TextMapCompositePropagator::new(vec![
         // Include BaggagePropagator for propagating key-value pairs

@@ -1,6 +1,6 @@
 //! A high-level Kafka client library with support for distributed tracing.
 //!
-//! This crate provides abstractions for interacting with Apache Kafka,
+//! Prosody provides abstractions for interacting with Apache Kafka,
 //! offering both consumer and producer implementations. It integrates
 //! OpenTelemetry for distributed tracing, allowing for better observability
 //! in microservice architectures.
@@ -39,7 +39,7 @@
 //!     let producer = ProsodyProducer::new(&config)?;
 //!
 //!     let topic: Topic = "my-topic".into();
-//!     producer.send(topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
+//!     producer.send([], topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
 //!
 //!     Ok(())
 //! }
@@ -48,26 +48,22 @@
 //! ## Consumer Example
 //!
 //! ```rust
-//! use prosody::consumer::message::{ConsumerMessage, MessageContext};
+//! use prosody::consumer::message::{MessageContext, UncommittedMessage};
 //! use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
-//! use prosody::Topic;
+//! use prosody::{Partition, Topic};
 //! use std::time::Duration;
 //!
 //! #[derive(Clone)]
 //! struct MyMessageHandler;
 //!
 //! impl MessageHandler for MyMessageHandler {
-//!     type Error = std::io::Error;
-//!
-//!     async fn handle(
-//!         &self,
-//!         context: &mut MessageContext,
-//!         message: ConsumerMessage,
-//!     ) -> Result<(), Self::Error> {
+//!     async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
 //!         println!("Received: {:?}", message);
 //!         message.commit();
-//!         Ok(())
 //!     }
+//!
+//!     // shutdown is called whenever a partition is revoked
+//!     async fn shutdown(self) {}
 //! }
 //!
 //! #[tokio::main]
@@ -79,9 +75,9 @@
 //!         .mock(true) // use mock consumer for example
 //!         .build()?;
 //!
-//!     let consumer = ProsodyConsumer::new(config, MyMessageHandler)?;
+//!     let consumer = ProsodyConsumer::new::<MyMessageHandler>(&config, MyMessageHandler)?;
 //!
-//!     // Run your application logic here
+//!     // Run your application logic here, waiting for shutdown
 //!
 //!     consumer.shutdown().await;
 //!     Ok(())
@@ -168,7 +164,8 @@ use serde_json::Value;
 
 pub mod consumer;
 pub mod producer;
-mod propagator;
+pub mod propagator;
+pub mod tracing;
 mod util;
 
 /// A Kafka topic name.

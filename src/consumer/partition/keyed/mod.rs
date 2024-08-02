@@ -1,5 +1,9 @@
 //! Provides the `KeyManager` for managing and processing messages keyed by hash
 //! values.
+//!
+//! This module implements a concurrent processing system that ensures messages
+//! with the same key are processed in order while allowing parallel processing
+//! of messages with different keys.
 
 use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
@@ -12,7 +16,6 @@ use futures::stream::FuturesUnordered;
 use futures::{pin_mut, Stream, StreamExt};
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
-use tokio::sync::watch::{channel, Receiver, Sender};
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -22,6 +25,7 @@ use crate::consumer::Keyed;
 #[cfg(test)]
 mod test;
 
+/// Represents a hash value used for keying messages.
 type HashValue = u64;
 
 /// Manages and processes messages keyed by hash values, ensuring concurrent
@@ -33,17 +37,6 @@ type HashValue = u64;
 /// maintains several internal states like executing tasks, busy keys,
 /// and queued messages, ensuring no more than the specified number of messages
 /// per key are processed concurrently.
-///
-/// # Fields
-/// - `max_enqueued_per_key`: Maximum number of messages that can be enqueued
-///   per key before being processed.
-/// - `process`: The processing function applied to each message.
-/// - `executing`: Active futures of messages being processed.
-/// - `busy`: Set of keys currently being processed.
-/// - `enqueued`: Messages waiting to be processed, keyed by hash values.
-/// - `hash_state`: State of the random hash algorithm used for key management.
-/// - `shutdown_tx`: Sender for the shutdown signal.
-/// - `shutdown_rx`: Receiver for the shutdown signal.
 pub struct KeyManager<M, F, Fut> {
     max_enqueued_per_key: usize,
     process: F,
@@ -51,8 +44,6 @@ pub struct KeyManager<M, F, Fut> {
     busy: IntSet<HashValue>,
     enqueued: IntMap<HashValue, VecDeque<M>>,
     hash_state: RandomState,
-    shutdown_tx: Sender<bool>,
-    shutdown_rx: Receiver<bool>,
 }
 
 impl<M, F, Fut> KeyManager<M, F, Fut> {
@@ -61,14 +52,17 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// thread.
     ///
     /// # Arguments
-    /// - `process`: A function that defines how each message is processed.
-    /// - `max_enqueued_per_key`: The maximum number of messages allowed per key
-    ///   before blocking further enqueue.
+    ///
+    /// * `process` - A function that defines how each message is processed.
+    /// * `max_enqueued_per_key` - The maximum number of messages allowed per
+    ///   key before blocking further enqueue.
     ///
     /// # Returns
+    ///
     /// Returns a new instance of `KeyManager`.
     ///
     /// # Panics
+    ///
     /// Panics if `max_enqueued_per_key` is zero, as it would prevent any
     /// message processing.
     pub fn new(process: F, max_enqueued_per_key: usize) -> Self {
@@ -76,7 +70,6 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             max_enqueued_per_key > 0,
             "max_enqueued_per_key cannot be zero"
         );
-        let (shutdown_tx, shutdown_rx) = channel(false);
 
         Self {
             max_enqueued_per_key,
@@ -85,8 +78,6 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             busy: IntSet::default(),
             enqueued: IntMap::default(),
             hash_state: RandomState::default(),
-            shutdown_tx,
-            shutdown_rx,
         }
     }
 
@@ -107,7 +98,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         S: Stream<Item = M>,
         M: Keyed,
         M::Key: Hash,
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
         Fut: Future,
     {
         pin_mut!(messages);
@@ -140,8 +131,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             return;
         };
 
-        // Send a shutdown signal and create the shutdown deadline future.
-        let _ = self.shutdown_tx.send(true);
+        // Create the shutdown deadline future.
         let deadline = sleep(timeout);
         pin_mut!(deadline);
 
@@ -177,12 +167,13 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// message for later processing or to process it immediately.
     ///
     /// # Arguments
-    /// - `message`: M - The message to be handled.
+    ///
+    /// * `message` - The message to be handled.
     async fn handle_message(&mut self, message: M)
     where
         M: Keyed,
         M::Key: Hash,
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
         Fut: Future,
     {
         // Compute a unique hash value for the message's key
@@ -206,10 +197,10 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
-    /// `hash_value`: `HashValue` - The hash value of the completed message.
+    /// * `hash_value` - The hash value of the completed message.
     fn handle_completion(&mut self, hash_value: HashValue)
     where
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
     {
         // Remove the completed message's hash value from the busy set
         self.busy.remove(&hash_value);
@@ -233,16 +224,17 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// This method is used to manage the queuing of messages for keys that are
     /// currently unable to accept new messages for processing due to
-    /// concurrency limits. It ensures that messages are from dropped and
+    /// concurrency limits. It ensures that messages are not dropped and
     /// are handled in a first-come, first-served basis per key.
     ///
     /// # Arguments
-    /// - `message`: M - The message to be enqueued.
-    /// - `hash_value`: `HashValue` - The hash value associated with the message
-    ///   to manage keying and load distribution.
+    ///
+    /// * `message` - The message to be enqueued.
+    /// * `hash_value` - The hash value associated with the message to manage
+    ///   keying and load distribution.
     async fn enqueue_message(&mut self, message: M, hash_value: HashValue)
     where
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
         Fut: Future,
     {
         // Determine the current queue length for the hash value
@@ -279,18 +271,14 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
-    /// `message`: M - The message to process.
-    /// `hash_value`: `HashValue` - Hash value used to key and manage the
-    /// message.
+    /// * `message` - The message to process.
+    /// * `hash_value` - Hash value used to key and manage the message.
     fn process_message(&mut self, message: M, hash_value: HashValue)
     where
-        F: FnMut(M, Receiver<bool>) -> Fut,
+        F: FnMut(M) -> Fut,
     {
         // Create a future for processing the message
-        let future = WithValue::new(
-            hash_value,
-            (self.process)(message, self.shutdown_rx.clone()),
-        );
+        let future = WithValue::new(hash_value, (self.process)(message));
 
         // Mark the hash value as busy and add the future to the executing queue
         self.busy.insert(hash_value);

@@ -16,7 +16,6 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use scc::{HashMap, HashSet};
 use tokio::runtime::Builder;
-use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::consumer::partition::keyed::KeyManager;
@@ -80,7 +79,7 @@ async fn prevents_concurrent_key_execution_impl(
     let active_keys = Arc::new(HashSet::with_capacity(messages.len()));
 
     // Define the message processing function
-    let process_fn = |key: u8, _: watch::Receiver<bool>| {
+    let process_fn = |key: u8| {
         let failed = failed.clone();
         let active_keys = active_keys.clone();
 
@@ -127,7 +126,7 @@ async fn processes_messages_in_order_impl(
     let processed: Arc<HashMap<u8, Vec<u16>>> = Arc::new(HashMap::new());
 
     KeyManager::new(
-        |(key, value), _: watch::Receiver<bool>| {
+        |(key, value)| {
             let processed = processed.clone();
             async move {
                 processed.entry_async(key).await.or_default().push(value);

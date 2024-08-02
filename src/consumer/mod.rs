@@ -2,20 +2,14 @@
 //! processing.
 //!
 //! This module provides a robust abstraction for consuming messages from Kafka
-//! topics, handling complex operations such as:
+//! topics, handling:
 //!
-//! - Offset management: Tracking and committing message offsets to ensure
-//!   at-least-once message processing semantics.
-//! - Consumer group coordination: Participating in consumer groups for load
-//!   balancing across multiple consumer instances.
-//! - Message deserialization: Converting raw Kafka messages into typed Rust
-//!   structures for easier processing.
-//! - Backpressure management: Limiting the number of in-flight messages to
-//!   prevent overwhelming downstream systems.
-//! - Error handling and recovery: Gracefully handling various error scenarios
-//!   and attempting to recover when possible.
-//! - Distributed tracing: Integrating with OpenTelemetry for tracing message
-//!   flow across distributed systems.
+//! - Offset management
+//! - Consumer group coordination
+//! - Message deserialization
+//! - Backpressure management
+//! - Error handling and recovery
+//! - Distributed tracing
 //!
 //! The module consists of several submodules:
 //!
@@ -30,7 +24,7 @@
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
 //! defined by implementing the [`MessageHandler`] trait.
 
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,9 +48,13 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::context::Context;
-use crate::consumer::message::{ConsumerMessage, MessageContext};
+use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
+use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
+use crate::consumer::failure::{FailureStrategy, FallibleHandler};
+use crate::consumer::message::{MessageContext, UncommittedMessage};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
+use crate::producer::ProsodyProducer;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_duration_env_with_fallback, from_vec_env,
@@ -65,18 +63,15 @@ use crate::{Partition, Topic};
 
 mod context;
 mod extractor;
+pub mod failure;
 pub mod message;
 mod partition;
 mod poll;
 
 /// Atomic counter for tracking changes in partition watermarks.
-///
-/// Used to efficiently notify the poll loop when offsets should be committed.
 type WatermarkVersion = CachePadded<AtomicUsize>;
 
 /// Thread-safe storage for partition managers.
-///
-/// Maps topic-partition pairs to their respective [`PartitionManager`]s.
 type Managers = Mutex<HashMap<(Topic, Partition), PartitionManager>>;
 
 /// Defines a type with an associated key.
@@ -92,27 +87,71 @@ pub trait Keyed {
     fn key(&self) -> &Self::Key;
 }
 
+/// Provides handlers for processing messages from specific partitions.
+pub trait HandlerProvider: Send + Sync + 'static {
+    /// The type of message handler provided.
+    type Handler: MessageHandler + Send + Sync + 'static;
+
+    /// Creates a handler for a specific topic and partition.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic of the partition.
+    /// * `partition` - The partition number.
+    ///
+    /// # Returns
+    ///
+    /// A handler for the specified topic and partition.
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler;
+}
+
 /// Defines the behavior for handling consumed Kafka messages.
 pub trait MessageHandler {
-    /// The error type returned by the handler.
-    type Error: Display;
-
     /// Processes a consumed message.
     ///
     /// # Arguments
     ///
-    /// * `context` - Mutable reference to the message context.
+    /// * `context` - The message context.
     /// * `message` - The consumed message.
     ///
     /// # Returns
     ///
-    /// A future that resolves to a Result indicating success or failure of
-    /// message handling.
+    /// A future that resolves when the message is handled.
     fn handle(
         &self,
-        context: &mut MessageContext,
-        message: ConsumerMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        context: MessageContext,
+        message: UncommittedMessage,
+    ) -> impl Future<Output = ()> + Send;
+
+    /// Shuts down the message handler.
+    ///
+    /// # Returns
+    ///
+    /// A future that resolves when the shutdown is complete.
+    fn shutdown(self) -> impl Future<Output = ()> + Send;
+}
+
+impl<T> HandlerProvider for T
+where
+    T: MessageHandler + Clone + Send + Sync + 'static,
+{
+    type Handler = Self;
+
+    fn handler_for_partition(&self, _: Topic, _: Partition) -> Self::Handler {
+        self.clone()
+    }
+}
+
+impl<T, Fut> MessageHandler for T
+where
+    T: Fn(MessageContext, UncommittedMessage) -> Fut + Send + Sync,
+    Fut: Future<Output = ()> + Send,
+{
+    async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
+        self(context, message).await;
+    }
+
+    async fn shutdown(self) {}
 }
 
 /// Configuration for the Kafka consumer.
@@ -120,7 +159,7 @@ pub trait MessageHandler {
 /// This struct holds all the necessary configuration options for creating a
 /// Kafka consumer. It uses the Builder pattern for flexible initialization and
 /// supports loading values from environment variables.
-#[derive(Builder, Clone, Validate)]
+#[derive(Builder, Clone, Debug, Validate)]
 pub struct ConsumerConfiguration {
     /// List of Kafka bootstrap servers.
     ///
@@ -259,7 +298,7 @@ impl ProsodyConsumer {
     /// # Arguments
     ///
     /// * `config` - The consumer configuration.
-    /// * `message_handler` - The message handler implementation.
+    /// * `handler_provider` - The message handler provider.
     ///
     /// # Returns
     ///
@@ -273,9 +312,12 @@ impl ProsodyConsumer {
     /// - The hostname cannot be retrieved
     /// - The Kafka consumer cannot be created
     /// - The consumer fails to subscribe to the specified topics
-    pub fn new<T>(config: ConsumerConfiguration, message_handler: T) -> Result<Self, ConsumerError>
+    pub fn new<T>(
+        config: &ConsumerConfiguration,
+        handler_provider: T,
+    ) -> Result<Self, ConsumerError>
     where
-        T: MessageHandler + Clone + Send + Sync + 'static,
+        T: HandlerProvider,
     {
         // Validate the configuration
         config.validate()?;
@@ -286,9 +328,9 @@ impl ProsodyConsumer {
         let shutdown: Arc<AtomicBool> = Arc::default();
 
         // Create the consumer context with the message handler and shared state
-        let context = Context::new(
-            &config,
-            message_handler,
+        let context: Context<T> = Context::new(
+            config,
+            handler_provider,
             watermark_version.clone(),
             managers.clone(),
         );
@@ -298,7 +340,7 @@ impl ProsodyConsumer {
         client_config
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", hostname()?)
-            .set("group.id", config.group_id)
+            .set("group.id", &config.group_id)
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
@@ -322,11 +364,13 @@ impl ProsodyConsumer {
         consumer.subscribe(&topics)?;
 
         // Spawn a blocking task to continuously poll for messages
+        let poll_interval = config.poll_interval;
+        let commit_interval = config.commit_interval;
         let cloned_shutdown = shutdown.clone();
         let handle = Arc::new(Mutex::new(Some(spawn_blocking(move || {
             poll(
-                config.poll_interval,
-                config.commit_interval,
+                poll_interval,
+                commit_interval,
                 &consumer,
                 &watermark_version,
                 &managers,
@@ -337,17 +381,83 @@ impl ProsodyConsumer {
         Ok(Self { shutdown, handle })
     }
 
-    /// Initiates a graceful shutdown of the Kafka consumer.
+    /// Creates a new `ProsodyConsumer` with a retry strategy for pipeline
+    /// processing.
     ///
-    /// This method signals the consumer to stop and waits for the polling task
-    /// to complete.
+    /// # Arguments
+    ///
+    /// * `consumer_config` - The consumer configuration.
+    /// * `retry_config` - The retry configuration.
+    /// * `handler` - The fallible message handler.
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the new `ProsodyConsumer` instance or a
+    /// `ConsumerError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConsumerError` if the consumer creation fails.
+    pub fn pipeline_consumer<T>(
+        consumer_config: &ConsumerConfiguration,
+        retry_config: RetryConfiguration,
+        handler: T,
+    ) -> Result<Self, ConsumerError>
+    where
+        T: FallibleHandler + Clone + Send + Sync + 'static,
+    {
+        let strategy = RetryStrategy::new(retry_config)?; // retry failures
+        let handler = strategy.with_handler(handler);
+        Self::new(consumer_config, handler)
+    }
+
+    /// Creates a new `ProsodyConsumer` with a low-latency strategy.
+    ///
+    /// # Arguments
+    ///
+    /// * `consumer_config` - The consumer configuration.
+    /// * `retry_config` - The retry configuration.
+    /// * `topic_config` - The failure topic configuration.
+    /// * `producer` - The Prosody producer for sending messages to the failure
+    ///   topic.
+    /// * `handler` - The fallible message handler.
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the new `ProsodyConsumer` instance or a
+    /// `ConsumerError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConsumerError` if the consumer creation fails.
+    pub fn low_latency_consumer<T>(
+        consumer_config: &ConsumerConfiguration,
+        retry_config: RetryConfiguration,
+        topic_config: FailureTopicConfiguration,
+        producer: ProsodyProducer,
+        handler: T,
+    ) -> Result<Self, ConsumerError>
+    where
+        T: FallibleHandler + Clone + Send + Sync + 'static,
+    {
+        let group_id = consumer_config.group_id.clone();
+        let strategy = RetryStrategy::new(retry_config.clone())? // retry processing up to limit
+            .and_then(FailureTopicStrategy::new(topic_config, group_id, producer)?) // write to failure topic
+            .and_then(RetryStrategy::new(retry_config)?); // retry writing to failure topic
+
+        let handler = strategy.with_handler(handler);
+        Self::new(consumer_config, handler)
+    }
+
+    /// Initiates a graceful shutdown of the Kafka consumer.
     pub async fn shutdown(mut self) {
         self.execute_shutdown().await;
     }
 
-    /// Execute a consumer shutdown.
+    /// Executes the consumer shutdown process.
     ///
-    /// Used by both the public shutdown method and the drop handler.
+    /// This method is used by both the public shutdown method and the drop
+    /// handler.
     async fn execute_shutdown(&mut self) {
         // Signal the consumer to shut down
         self.shutdown.store(true, Ordering::Relaxed);
