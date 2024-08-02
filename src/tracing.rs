@@ -7,6 +7,7 @@ use opentelemetry::trace::{TraceError, TracerProvider};
 use opentelemetry_otlp::{new_exporter, new_pipeline};
 use opentelemetry_sdk::runtime::Tokio;
 use thiserror::Error;
+use tonic::transport::ClientTlsConfig;
 use tracing::dispatcher::SetGlobalDefaultError;
 use tracing::subscriber::set_global_default;
 use tracing_subscriber::layer::SubscriberExt;
@@ -32,7 +33,11 @@ pub fn initialize_tracing() -> Result<(), TracingError> {
     // Create and install the OpenTelemetry tracer
     let tracer = new_pipeline()
         .tracing()
-        .with_exporter(new_exporter().tonic())
+        .with_exporter(
+            new_exporter()
+                .tonic()
+                .with_tls_config(ClientTlsConfig::default().with_native_roots()),
+        )
         .install_batch(Tokio)?
         .tracer("prosody");
 

@@ -44,6 +44,7 @@ serde_json = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["macros", "sync"] }
 tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["gzip", "tls", "tls-roots"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-opentelemetry = "0.25"
 tracing-subscriber = "0.3"
