@@ -8,9 +8,10 @@ use opentelemetry_otlp::{new_exporter, new_pipeline};
 use opentelemetry_sdk::runtime::Tokio;
 use thiserror::Error;
 use tonic::transport::ClientTlsConfig;
+use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{set_global_default, SetGlobalDefaultError};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::Registry;
+use tracing_subscriber::{EnvFilter, Registry};
 
 /// Initializes the tracing system with OpenTelemetry and OTLP exporter.
 ///
@@ -40,9 +41,15 @@ pub fn initialize_tracing() -> Result<(), TracingError> {
         .install_batch(Tokio)?
         .tracer("prosody");
 
+    // Filter traces using an environment variable directive
+    let env_filter = EnvFilter::builder()
+        .with_env_var("PROSODY_LOG")
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+
     // Create a tracing subscriber with OpenTelemetry layer
     let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-    let subscriber = Registry::default().with(telemetry);
+    let subscriber = Registry::default().with(telemetry).with(env_filter);
 
     // Set the subscriber as the global default
     set_global_default(subscriber)?;

@@ -220,7 +220,11 @@ impl ProsodyProducer {
     /// - The payload cannot be serialized
     /// - The system time cannot be retrieved
     /// - The Kafka send operation fails
-    #[instrument(skip(self, headers, payload), err)]
+    #[instrument(
+        skip(self, headers, payload),
+        fields(payload_size, partition, offset),
+        err
+    )]
     pub async fn send<'a, H>(
         &'a self,
         headers: H,
@@ -232,6 +236,7 @@ impl ProsodyProducer {
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
     {
         let serialized = to_vec(&payload)?;
+        Span::current().record("payload_size", serialized.len());
 
         let mut record = FutureRecord::to(&topic)
             .key(key)
@@ -255,10 +260,15 @@ impl ProsodyProducer {
             &mut RecordInjector::new(&mut record),
         );
 
-        self.producer
+        let (partition, offset) = self
+            .producer
             .send(record, self.send_timeout)
             .await
             .map_err(|(error, _)| ProducerError::Kafka(error))?;
+
+        Span::current()
+            .record("partition", partition)
+            .record("offset", offset);
 
         Ok(())
     }

@@ -91,7 +91,7 @@ pub fn poll<T>(
 
         let context = propagator.extract(&MessageExtractor::new(&message));
         let span = info_span!(
-            "receive-message",
+            "receive",
             %topic, %partition, %offset, key = Empty, payload_size = Empty
         );
 

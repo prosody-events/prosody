@@ -156,29 +156,23 @@ async fn handle_messages<T>(
 ) where
     T: MessageHandler,
 {
-    let process = |received: ConsumerMessage| {
-        let parent_span = received.span.clone();
-        let span = info_span!(parent: &parent_span, "process-message");
+    let process = |received: ConsumerMessage| async {
+        // Attempt to take an offset for the received message, and if successful,
+        // transform it into a consumer message for processing.
+        let message = match offsets.take(received.offset).await {
+            Ok(uncommitted_offset) => received.into_uncommitted(uncommitted_offset),
+            Err(error) => {
+                error!(
+                    ?received,
+                    "unable to take uncommitted offset: {error:#}; discarding message"
+                );
+                return;
+            }
+        };
 
-        async {
-            // Attempt to take an offset for the received message, and if successful,
-            // transform it into a consumer message for processing.
-            let message = match offsets.take(received.offset).await {
-                Ok(uncommitted_offset) => received.into_uncommitted(uncommitted_offset),
-                Err(error) => {
-                    error!(
-                        ?received,
-                        "unable to take uncommitted offset: {error:#}; discarding message"
-                    );
-                    return;
-                }
-            };
-
-            // Handle the message using the provided message handler
-            let context = MessageContext::new();
-            message_handler.handle(context, message).await;
-        }
-        .instrument(span)
+        // Handle the message using the provided message handler
+        let context = MessageContext::new();
+        message_handler.handle(context, message).await;
     };
 
     // Create and run a KeyManager to manage concurrent message processing,
