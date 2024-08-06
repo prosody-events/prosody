@@ -15,9 +15,10 @@ use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info_span, instrument, Instrument};
+use tracing::{debug, error, instrument};
 
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
@@ -156,6 +157,7 @@ async fn handle_messages<T>(
 ) where
     T: MessageHandler,
 {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let process = |received: ConsumerMessage| async {
         // Attempt to take an offset for the received message, and if successful,
         // transform it into a consumer message for processing.
@@ -171,7 +173,7 @@ async fn handle_messages<T>(
         };
 
         // Handle the message using the provided message handler
-        let context = MessageContext::new();
+        let context = MessageContext::new(shutdown_rx.clone());
         message_handler.handle(context, message).await;
     };
 
@@ -194,6 +196,7 @@ async fn handle_messages<T>(
                 highest_offset_seen = message.offset;
                 ready(true)
             }),
+            shutdown_tx,
             shutdown_timeout,
         )
         .await;

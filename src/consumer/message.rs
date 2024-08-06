@@ -7,7 +7,8 @@
 
 use chrono::{DateTime, Utc};
 use educe::Educe;
-use tracing::{debug, Span};
+use tokio::sync::watch;
+use tracing::{debug, error, Span};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::Keyed;
@@ -15,14 +16,27 @@ use crate::{Key, Offset, Partition, Payload, Topic};
 
 /// Represents the context for a message within a consumer.
 #[derive(Clone, Debug)]
-pub struct MessageContext;
+pub struct MessageContext {
+    shutdown_rx: watch::Receiver<bool>,
+}
 
 impl MessageContext {
     /// Creates a new message context.
     ///
     /// This method is intended for internal use within the crate.
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(shutdown_rx: watch::Receiver<bool>) -> Self {
+        Self { shutdown_rx }
+    }
+
+    pub async fn on_shutdown(&self) {
+        if let Err(error) = self
+            .shutdown_rx
+            .clone()
+            .wait_for(|is_shutdown| *is_shutdown)
+            .await
+        {
+            error!("shutdown hook failed: {error:#}");
+        }
     }
 }
 

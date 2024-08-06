@@ -16,8 +16,9 @@ use futures::stream::FuturesUnordered;
 use futures::{pin_mut, Stream, StreamExt};
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
+use tokio::sync::watch;
 use tokio::time::sleep;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::consumer::partition::util::WithValue;
 use crate::consumer::Keyed;
@@ -93,8 +94,12 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// This function will return an error if the processing function returns an
     /// error.
-    pub async fn process_messages<S>(mut self, messages: S, shutdown_timeout: Option<Duration>)
-    where
+    pub async fn process_messages<S>(
+        mut self,
+        messages: S,
+        shutdown_tx: watch::Sender<bool>,
+        shutdown_timeout: Option<Duration>,
+    ) where
         S: Stream<Item = M>,
         M: Keyed,
         M::Key: Hash,
@@ -118,6 +123,10 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                     Some(message) => self.handle_message(message).await,
                 },
             }
+        }
+
+        if let Err(error) = shutdown_tx.send(true) {
+            error!("failed to send shutdown signal: {error:#}");
         }
 
         // Shutdown handling: proceed if a timeout is specified, otherwise immediately
