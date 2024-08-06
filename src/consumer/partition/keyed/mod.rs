@@ -87,6 +87,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// # Arguments
     ///
     /// * `messages` - Stream of incoming messages.
+    /// * `shutdown_tx` - Sender for shutdown signal.
     /// * `shutdown_timeout` - Optional duration to wait before forcefully
     ///   shutting down.
     ///

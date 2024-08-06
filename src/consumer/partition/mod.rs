@@ -1,5 +1,7 @@
 //! Manages a partition in a consumer system, handling messages and managing
-//! offsets. This module provides functionality to enqueue and process messages
+//! offsets.
+//!
+//! This module provides functionality to enqueue and process messages
 //! concurrently, maintain a record of offset progression, and handle graceful
 //! shutdown operations.
 
@@ -31,8 +33,10 @@ pub mod offsets;
 mod util;
 
 /// Manages a single partition with associated message processing and offset
-/// management. It ensures message processing is queued and handled efficiently,
-/// tracking the offset progress and handling partition-specific actions such as
+/// management.
+///
+/// This struct ensures message processing is queued and handled efficiently,
+/// tracks the offset progress, and handles partition-specific actions such as
 /// shutdown.
 #[derive(Educe)]
 #[educe(Debug)]
@@ -58,6 +62,7 @@ impl PartitionManager {
     /// message handling and offset management.
     ///
     /// # Arguments
+    ///
     /// * `partition` - The partition identifier.
     /// * `message_handler` - Handler responsible for processing messages.
     /// * `buffer_size` - Capacity of the message channel.
@@ -98,12 +103,25 @@ impl PartitionManager {
     }
 
     /// Checks if the partition can accept more messages.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the partition has capacity for more messages, `false`
+    /// otherwise.
     pub fn has_capacity(&self) -> bool {
         self.message_tx.capacity() > 0
     }
 
-    /// Attempts to send a message to the partition. If the partition is full or
-    /// closed, the message is returned.
+    /// Attempts to send a message to the partition.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - The message to be sent.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the message was sent successfully, or `Err(ConsumerMessage)`
+    /// containing the original message if the partition is full or closed.
     pub fn try_send(&self, message: ConsumerMessage) -> Result<(), ConsumerMessage> {
         self.message_tx
             .try_send(message)
@@ -114,33 +132,48 @@ impl PartitionManager {
 
     /// Retrieves the current watermark, indicating the progress of committed
     /// offsets.
+    ///
+    /// # Returns
+    ///
+    /// An `Option<Offset>` containing the current watermark if available, or
+    /// `None` if not set.
     pub fn watermark(&self) -> Option<Offset> {
         self.offsets.watermark()
     }
 
     /// Initiates the shutdown of the partition, waiting for the completion of
     /// all tasks.
+    ///
+    /// # Returns
+    ///
+    /// An `Option<Offset>` containing the final watermark if shutdown was
+    /// successful, or `None` if an error occurred during shutdown.
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
+        // Close the message channel to signal shutdown
         drop(self.message_tx);
 
+        // Wait for the message processing task to complete
         if let Err(error) = self.handle.await {
             error!(%self.partition, "error occurred while shutting down partition: {error:#}");
             return None;
         }
 
+        // Perform final shutdown operations and return the last watermark
         self.offsets.shutdown().await
     }
 }
 
-/// Asynchronously handles incoming messages by processing them according to the
-/// provided message handler. It uses a `KeyManager` to manage the queuing and
-/// processing of messages based on keys derived from the messages, facilitating
-/// concurrent processing within the constraints of maximum queue sizes per key.
+/// Asynchronously handles incoming messages for a partition.
+///
+/// This function processes messages according to the provided message handler,
+/// using a `KeyManager` to manage queuing and processing of messages based on
+/// their keys. It facilitates concurrent processing within the constraints of
+/// maximum queue sizes per key.
 ///
 /// # Arguments
-/// * `message_handler` - The handler responsible for the business logic of
-///   processing messages.
+///
+/// * `message_handler` - The handler responsible for processing messages.
 /// * `offsets` - An `OffsetTracker` managing the commitment of message offsets.
 /// * `message_rx` - A receiver channel from which messages are received for
 ///   processing.
@@ -159,8 +192,7 @@ async fn handle_messages<T>(
 {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let process = |received: ConsumerMessage| async {
-        // Attempt to take an offset for the received message, and if successful,
-        // transform it into a consumer message for processing.
+        // Attempt to take an offset for the received message
         let message = match offsets.take(received.offset).await {
             Ok(uncommitted_offset) => received.into_uncommitted(uncommitted_offset),
             Err(error) => {
@@ -172,19 +204,17 @@ async fn handle_messages<T>(
             }
         };
 
-        // Handle the message using the provided message handler
+        // Process the message using the provided message handler
         let context = MessageContext::new(shutdown_rx.clone());
         message_handler.handle(context, message).await;
     };
 
-    // Create and run a KeyManager to manage concurrent message processing,
-    // using the defined processing logic and managing shutdown timing.
+    // Create and run a KeyManager to manage concurrent message processing
     let mut highest_offset_seen = -1;
     KeyManager::new(process, max_enqueued_per_key)
         .process_messages(
             ReceiverStream::new(message_rx).filter(|message| {
-                // Filter out messages with offsets we've already seen. This reduces duplicates
-                // during rebalances but doesn't guarantee exactly-once processing.
+                // Filter out messages with offsets we've already seen
                 if message.offset <= highest_offset_seen {
                     debug!(
                         "filtering stale partition {} offset {}",
@@ -192,7 +222,6 @@ async fn handle_messages<T>(
                     );
                     return ready(false);
                 }
-                // Update the highest offset seen to the current message's offset
                 highest_offset_seen = message.offset;
                 ready(true)
             }),
@@ -204,8 +233,7 @@ async fn handle_messages<T>(
     message_handler.shutdown().await;
 }
 
-/// Defines errors related to partition management, specifically during message
-/// sending.
+/// Defines errors related to partition management.
 #[derive(Debug, Error)]
 pub enum PartitionError {
     /// Error when message sending fails due to the partition being shut down.

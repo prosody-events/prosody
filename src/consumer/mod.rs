@@ -19,6 +19,8 @@
 //! - `message`: Defines structures for message contexts and consumer messages.
 //! - `partition`: Handles partition-specific operations and state management.
 //! - `poll`: Implements the core message polling and processing loop.
+//! - `failure`: Handles error handling, retry strategies, and failure topic
+//!   management.
 //!
 //! Users should primarily interact with the [`ProsodyConsumer`] struct,
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is

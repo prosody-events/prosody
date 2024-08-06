@@ -24,10 +24,22 @@ impl MessageContext {
     /// Creates a new message context.
     ///
     /// This method is intended for internal use within the crate.
+    ///
+    /// # Arguments
+    ///
+    /// * `shutdown_rx` - A receiver for shutdown signals.
     pub(crate) fn new(shutdown_rx: watch::Receiver<bool>) -> Self {
         Self { shutdown_rx }
     }
 
+    /// Waits for a shutdown signal.
+    ///
+    /// This method returns a future that is ready when a partition shutdown
+    /// signal is received or an error occurs.
+    ///
+    /// # Errors
+    ///
+    /// Logs an error message if the shutdown hook fails.
     pub async fn on_shutdown(&self) {
         if let Err(error) = self
             .shutdown_rx
