@@ -5,6 +5,8 @@
 //! messages, including tracking shutdown signals and committing messages after
 //! processing.
 
+use std::future::Future;
+
 use chrono::{DateTime, Utc};
 use educe::Educe;
 use tokio::sync::watch;
@@ -40,14 +42,12 @@ impl MessageContext {
     /// # Errors
     ///
     /// Logs an error message if the shutdown hook fails.
-    pub async fn on_shutdown(&self) {
-        if let Err(error) = self
-            .shutdown_rx
-            .clone()
-            .wait_for(|is_shutdown| *is_shutdown)
-            .await
-        {
-            error!("shutdown hook failed: {error:#}");
+    pub fn on_shutdown(&self) -> impl Future + Send + 'static {
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        async move {
+            if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
+                error!("shutdown hook failed: {error:#}");
+            }
         }
     }
 }
