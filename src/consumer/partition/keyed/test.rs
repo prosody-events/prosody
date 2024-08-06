@@ -16,6 +16,7 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use scc::{HashMap, HashSet};
 use tokio::runtime::Builder;
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::consumer::partition::keyed::KeyManager;
@@ -77,6 +78,7 @@ async fn prevents_concurrent_key_execution_impl(
     let max_enqueued = max(max_enqueued as usize, 1);
     let failed = Arc::new(AtomicBool::new(false));
     let active_keys = Arc::new(HashSet::with_capacity(messages.len()));
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
     // Define the message processing function
     let process_fn = |key: u8| {
@@ -98,7 +100,11 @@ async fn prevents_concurrent_key_execution_impl(
 
     // Process all messages using the KeyManager
     KeyManager::new(process_fn, max_enqueued)
-        .process_messages(iter(messages), Some(Duration::from_millis(100)))
+        .process_messages(
+            iter(messages),
+            shutdown_tx,
+            Some(Duration::from_millis(100)),
+        )
         .await;
 
     // Check if any concurrent execution was detected
@@ -124,6 +130,7 @@ async fn processes_messages_in_order_impl(
 ) -> TestResult {
     let max_enqueued = max(max_enqueued as usize, 1);
     let processed: Arc<HashMap<u8, Vec<u16>>> = Arc::new(HashMap::new());
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
     KeyManager::new(
         |(key, value)| {
@@ -134,7 +141,7 @@ async fn processes_messages_in_order_impl(
         },
         max_enqueued,
     )
-    .process_messages(iter(messages.clone()), None)
+    .process_messages(iter(messages.clone()), shutdown_tx, None)
     .await;
 
     let mut expected = ahash::HashMap::with_capacity(messages.len());
