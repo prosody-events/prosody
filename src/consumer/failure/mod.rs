@@ -14,6 +14,37 @@ pub mod log;
 pub mod retry;
 pub mod topic;
 
+/// Categorizes errors in message processing.
+#[derive(Debug)]
+pub enum ErrorCategory {
+    /// Error is temporary and recovery is possible
+    Transient,
+    /// Error is permanent and irrecoverable
+    Permanent,
+    /// Error is due to partition shutdown
+    Terminal,
+}
+
+/// Defines methods for classifying errors.
+pub trait ClassifyError {
+    /// Classifies the error into a specific `ErrorCategory`.
+    ///
+    /// # Returns
+    ///
+    /// An `ErrorCategory` indicating the nature of the error.
+    fn classify_error(&self) -> ErrorCategory;
+
+    /// Determines if the error is recoverable.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the error is classified as `ErrorCategory::Transient`, `false`
+    /// otherwise.
+    fn is_recoverable(&self) -> bool {
+        matches!(self.classify_error(), ErrorCategory::Transient)
+    }
+}
+
 /// Defines a failure handling strategy for message processing.
 pub trait FailureStrategy {
     /// Wraps a handler with this failure strategy.
@@ -50,7 +81,7 @@ pub trait FailureStrategy {
 /// Defines a handler that can fail during message processing.
 pub trait FallibleHandler: Clone + Send + Sync + 'static {
     /// The error type returned by this handler.
-    type Error: Display + Send;
+    type Error: ClassifyError + Display + Send;
 
     /// Handles a message, potentially returning an error.
     ///
@@ -70,7 +101,7 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Represents a composition of two failure strategies.
+/// A composition of two failure strategies.
 #[derive(Clone, Debug)]
 pub struct ComposedStrategy<S1, S2>(S1, S2);
 

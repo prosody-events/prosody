@@ -5,10 +5,11 @@
 
 use chrono::SecondsFormat;
 use derive_builder::Builder;
-use tracing::error;
+use thiserror::Error;
+use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
-use crate::consumer::failure::{FailureStrategy, FallibleHandler};
+use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::{HandlerProvider, MessageHandler};
 use crate::producer::{ProducerError, ProsodyProducer};
@@ -111,7 +112,7 @@ impl<T> FallibleHandler for FailureTopicHandler<T>
 where
     T: FallibleHandler,
 {
-    type Error = ProducerError;
+    type Error = FailureTopicError<T::Error>;
 
     /// Handles a message, attempting to process it with the wrapped handler.
     /// If processing fails, sends the message to the failure topic.
@@ -124,8 +125,14 @@ where
     /// # Returns
     ///
     /// A `Result` that is `Ok(())` if the message was processed successfully or
-    /// sent to the failure topic, or an `Err` containing a `ProducerError`
-    /// if sending to the failure topic failed.
+    /// sent to the failure topic, or an `Err` containing a `FailureTopicError`
+    /// if processing or sending to the failure topic failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `FailureTopicError::Handler` if the wrapped handler fails with
+    /// a terminal error. Returns a `FailureTopicError::Producer` if sending
+    /// to the failure topic fails.
     async fn handle(
         &self,
         context: MessageContext,
@@ -144,6 +151,15 @@ where
         let Err(error) = self.handler.handle(context, message.clone()).await else {
             return Ok(());
         };
+
+        // Handle terminal errors by aborting
+        if matches!(error.classify_error(), ErrorCategory::Terminal) {
+            info!(
+                %topic, %partition, %key, %offset,
+                "terminal condition encountered while handling message: {error:#}; aborting"
+            );
+            return Err(FailureTopicError::Handler(error));
+        }
 
         // Log the error and prepare to send to failure topic
         error!(
@@ -164,7 +180,9 @@ where
         // Send the failed message to the failure topic
         self.producer
             .send(headers, self.topic, &key, message.payload)
-            .await
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -187,13 +205,39 @@ where
             return;
         };
 
-        // Log the error if sending to the failure topic failed
-        error!("failed to send message to failure topic: {error:#}; discarding message");
-        uncommitted_offset.commit();
+        // Commit or abort the offset based on the error category
+        match error.classify_error() {
+            ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted_offset.commit(),
+            ErrorCategory::Terminal => uncommitted_offset.abort(),
+        }
     }
 
     /// Shuts down the handler.
     ///
     /// This method is currently a no-op for `FailureTopicHandler`.
     async fn shutdown(self) {}
+}
+
+/// Errors that can occur during failure topic handling.
+#[derive(Debug, Error)]
+pub enum FailureTopicError<E> {
+    /// Error from the wrapped handler.
+    #[error(transparent)]
+    Handler(E),
+
+    /// Error from the producer when sending to the failure topic.
+    #[error(transparent)]
+    Producer(#[from] ProducerError),
+}
+
+impl<E> ClassifyError for FailureTopicError<E>
+where
+    E: ClassifyError,
+{
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            FailureTopicError::Handler(error) => error.classify_error(),
+            FailureTopicError::Producer(_) => ErrorCategory::Transient,
+        }
+    }
 }

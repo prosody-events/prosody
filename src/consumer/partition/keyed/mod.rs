@@ -1,5 +1,4 @@
-//! Provides the `KeyManager` for managing and processing messages keyed by hash
-//! values.
+//! Manages and processes messages keyed by hash values.
 //!
 //! This module implements a concurrent processing system that ensures messages
 //! with the same key are processed in order while allowing parallel processing
@@ -7,6 +6,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
 use std::time::Duration;
@@ -16,8 +16,10 @@ use futures::stream::FuturesUnordered;
 use futures::{pin_mut, Stream, StreamExt};
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::warn;
+use tracing::{debug, instrument};
 
 use crate::consumer::partition::util::WithValue;
 use crate::consumer::Keyed;
@@ -25,14 +27,14 @@ use crate::consumer::Keyed;
 #[cfg(test)]
 mod test;
 
-/// Represents a hash value used for keying messages.
+/// A hash value used for keying messages.
 type HashValue = u64;
 
 /// Manages and processes messages keyed by hash values, ensuring concurrent
 /// processing constraints within the same thread.
 ///
 /// This manager tracks the state of each key and manages a queue of messages
-/// awaiting processing in a single thread, using a combination of
+/// awaiting processing in a single thread. It uses a combination of
 /// `FuturesUnordered` to execute and manage message processing concurrently. It
 /// maintains several internal states like executing tasks, busy keys,
 /// and queued messages, ensuring no more than the specified number of messages
@@ -59,7 +61,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Returns
     ///
-    /// Returns a new instance of `KeyManager`.
+    /// A new instance of `KeyManager`.
     ///
     /// # Panics
     ///
@@ -86,22 +88,23 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// # Arguments
     ///
     /// * `messages` - Stream of incoming messages.
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `shutdown_timeout` - Optional duration to wait before forcefully
     ///   shutting down.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if the processing function returns an
-    /// error.
-    pub async fn process_messages<S>(mut self, messages: S, shutdown_timeout: Option<Duration>)
-    where
+    pub async fn process_messages<S>(
+        mut self,
+        messages: S,
+        mut shutdown_rx: watch::Receiver<bool>,
+        shutdown_timeout: Option<Duration>,
+    ) where
         S: Stream<Item = M>,
-        M: Keyed,
+        M: Keyed + Debug,
         M::Key: Hash,
         F: FnMut(M) -> Fut,
         Fut: Future,
     {
         pin_mut!(messages);
+        let shutdown_rx = &mut shutdown_rx;
 
         loop {
             select! {
@@ -109,13 +112,20 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
 
                 // Process the next available message from the executing queue.
                 Some(hash_value) = self.executing.next() => {
-                    self.handle_completion(hash_value);
+                    self.handle_completion(shutdown_rx, hash_value);
+                }
+
+                // Wait for shutdown signal
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                 }
 
                 // Fetch the next message from the stream and handle it.
                 maybe_message = messages.next() => match maybe_message {
                     None => break,
-                    Some(message) => self.handle_message(message).await,
+                    Some(message) => self.dispatch_message(shutdown_rx, message).await,
                 },
             }
         }
@@ -150,16 +160,16 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                 maybe_hash_value = self.executing.next() => {
                     match maybe_hash_value {
                         None => break,
-                        Some(hash_value) => self.handle_completion(hash_value),
+                        Some(hash_value) => self.handle_completion(shutdown_rx, hash_value),
                     };
                 }
             }
         }
     }
 
-    /// Handles a new incoming message by determining its hash value and either
-    /// queuing or directly processing it based on the current system load
-    /// and key status.
+    /// Dispatches a new incoming message by determining its hash value and
+    /// either queuing or directly processing it based on the current system
+    /// load and key status.
     ///
     /// This function is a primary entry point for messages into the
     /// `KeyManager`. It computes the hash value for the message, checks the
@@ -168,10 +178,12 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `message` - The message to be handled.
-    async fn handle_message(&mut self, message: M)
+    #[instrument(level = "debug", skip(self, shutdown_rx))]
+    async fn dispatch_message(&mut self, shutdown_rx: &mut watch::Receiver<bool>, message: M)
     where
-        M: Keyed,
+        M: Keyed + Debug,
         M::Key: Hash,
         F: FnMut(M) -> Fut,
         Fut: Future,
@@ -183,9 +195,9 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         // Decide whether to enqueue the message or process it immediately based on
         // key's current status
         if self.busy.contains(&hash_value) {
-            self.enqueue_message(message, hash_value).await;
+            self.enqueue_message(shutdown_rx, message, hash_value).await;
         } else {
-            self.process_message(message, hash_value);
+            self.process_message(shutdown_rx, message, hash_value);
         }
     }
 
@@ -197,10 +209,13 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `hash_value` - The hash value of the completed message.
-    fn handle_completion(&mut self, hash_value: HashValue)
+    #[instrument(level = "debug", skip(self, shutdown_rx))]
+    fn handle_completion(&mut self, shutdown_rx: &mut watch::Receiver<bool>, hash_value: HashValue)
     where
         F: FnMut(M) -> Fut,
+        M: Debug,
     {
         // Remove the completed message's hash value from the busy set
         self.busy.remove(&hash_value);
@@ -215,7 +230,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             return;
         };
 
-        self.process_message(message, hash_value);
+        self.process_message(shutdown_rx, message, hash_value);
     }
 
     /// Enqueues a message associated with a specific hash value into the
@@ -229,13 +244,20 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `message` - The message to be enqueued.
     /// * `hash_value` - The hash value associated with the message to manage
     ///   keying and load distribution.
-    async fn enqueue_message(&mut self, message: M, hash_value: HashValue)
-    where
+    #[instrument(level = "debug", skip(self, shutdown_rx))]
+    async fn enqueue_message(
+        &mut self,
+        shutdown_rx: &mut watch::Receiver<bool>,
+        message: M,
+        hash_value: HashValue,
+    ) where
         F: FnMut(M) -> Fut,
         Fut: Future,
+        M: Debug,
     {
         // Determine the current queue length for the hash value
         let queue_len = self
@@ -246,10 +268,12 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
 
         // Wait until space is available in the queue if it's full
         if queue_len >= self.max_enqueued_per_key {
+            debug!("queue {hash_value} is full with {queue_len} items; processing paused");
             while let Some(value) = self.executing.next().await {
-                self.handle_completion(value);
+                self.handle_completion(shutdown_rx, value);
 
                 if value == hash_value {
+                    debug!("queue {hash_value} is no longer full");
                     break;
                 }
             }
@@ -271,12 +295,24 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `message` - The message to process.
     /// * `hash_value` - Hash value used to key and manage the message.
-    fn process_message(&mut self, message: M, hash_value: HashValue)
-    where
+    #[instrument(level = "debug", skip(self, shutdown_rx))]
+    fn process_message(
+        &mut self,
+        shutdown_rx: &mut watch::Receiver<bool>,
+        message: M,
+        hash_value: HashValue,
+    ) where
         F: FnMut(M) -> Fut,
+        M: Debug,
     {
+        if *shutdown_rx.borrow() {
+            debug!(?message, "aborting message processing due to shutdown");
+            return;
+        }
+
         // Create a future for processing the message
         let future = WithValue::new(hash_value, (self.process)(message));
 

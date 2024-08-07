@@ -16,16 +16,17 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use scc::{HashMap, HashSet};
 use tokio::runtime::Builder;
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::Keyed;
 
-/// Represents a sequence of messages with keys and values for testing.
+/// A sequence of messages with keys and values for testing.
 #[derive(Clone, Debug)]
 struct Messages(Vec<(u8, u16)>);
 
-/// A simple wrapper for a vector of u8 values used in `QuickCheck` tests.
+/// A wrapper for a vector of u8 values used in QuickCheck tests.
 #[derive(Clone, Debug)]
 struct SimpleMessages(Vec<u8>);
 
@@ -33,8 +34,13 @@ struct SimpleMessages(Vec<u8>);
 /// same key.
 ///
 /// # Arguments
+///
 /// * `messages` - A `SimpleMessages` instance containing the test messages.
 /// * `max_enqueued` - The maximum number of messages to enqueue per key.
+///
+/// # Returns
+///
+/// A `TestResult` indicating whether the test passed or failed.
 #[quickcheck]
 fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8) -> TestResult {
     let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
@@ -50,8 +56,13 @@ fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8)
 /// Verifies that KeyManager processes messages for each key in order.
 ///
 /// # Arguments
-/// * `messages` - A `SimpleMessages` instance containing the test messages.
+///
+/// * `messages` - A `Messages` instance containing the test messages.
 /// * `max_enqueued` - The maximum number of messages to enqueue per key.
+///
+/// # Returns
+///
+/// A `TestResult` indicating whether the test passed or failed.
 #[quickcheck]
 fn processes_messages_in_order(messages: Messages, max_enqueued: u8) -> TestResult {
     let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
@@ -65,10 +76,12 @@ fn processes_messages_in_order(messages: Messages, max_enqueued: u8) -> TestResu
 /// same key.
 ///
 /// # Arguments
+///
 /// * `messages` - A `SimpleMessages` instance containing the test messages.
 /// * `max_enqueued` - The maximum number of messages to enqueue per key.
 ///
 /// # Returns
+///
 /// A `TestResult` indicating whether the test passed or failed.
 async fn prevents_concurrent_key_execution_impl(
     SimpleMessages(messages): SimpleMessages,
@@ -77,6 +90,7 @@ async fn prevents_concurrent_key_execution_impl(
     let max_enqueued = max(max_enqueued as usize, 1);
     let failed = Arc::new(AtomicBool::new(false));
     let active_keys = Arc::new(HashSet::with_capacity(messages.len()));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Define the message processing function
     let process_fn = |key: u8| {
@@ -98,7 +112,11 @@ async fn prevents_concurrent_key_execution_impl(
 
     // Process all messages using the KeyManager
     KeyManager::new(process_fn, max_enqueued)
-        .process_messages(iter(messages), Some(Duration::from_millis(100)))
+        .process_messages(
+            iter(messages),
+            shutdown_rx,
+            Some(Duration::from_millis(100)),
+        )
         .await;
 
     // Check if any concurrent execution was detected
@@ -113,10 +131,12 @@ async fn prevents_concurrent_key_execution_impl(
 /// in order.
 ///
 /// # Arguments
-/// * `messages` - A `SimpleMessages` instance containing the test messages.
+///
+/// * `messages` - A `Messages` instance containing the test messages.
 /// * `max_enqueued` - The maximum number of messages to enqueue per key.
 ///
 /// # Returns
+///
 /// A `TestResult` indicating whether the test passed or failed.
 async fn processes_messages_in_order_impl(
     Messages(messages): Messages,
@@ -124,6 +144,7 @@ async fn processes_messages_in_order_impl(
 ) -> TestResult {
     let max_enqueued = max(max_enqueued as usize, 1);
     let processed: Arc<HashMap<u8, Vec<u16>>> = Arc::new(HashMap::new());
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     KeyManager::new(
         |(key, value)| {
@@ -134,7 +155,7 @@ async fn processes_messages_in_order_impl(
         },
         max_enqueued,
     )
-    .process_messages(iter(messages.clone()), None)
+    .process_messages(iter(messages.clone()), shutdown_rx, None)
     .await;
 
     let mut expected = ahash::HashMap::with_capacity(messages.len());
@@ -156,9 +177,10 @@ async fn processes_messages_in_order_impl(
 }
 
 impl Arbitrary for Messages {
-    /// Generates an arbitrary `Messages` instance for `QuickCheck` tests.
+    /// Generates an arbitrary `Messages` instance for QuickCheck tests.
     ///
     /// # Arguments
+    ///
     /// * `g` - A mutable reference to a `Gen` instance for random generation.
     fn arbitrary(g: &mut Gen) -> Self {
         let count = g.size();
@@ -170,9 +192,10 @@ impl Arbitrary for Messages {
 }
 
 impl Arbitrary for SimpleMessages {
-    /// Generates an arbitrary `SimpleMessages` instance for `QuickCheck` tests.
+    /// Generates an arbitrary `SimpleMessages` instance for QuickCheck tests.
     ///
     /// # Arguments
+    ///
     /// * `g` - A mutable reference to a `Gen` instance for random generation.
     fn arbitrary(g: &mut Gen) -> Self {
         let mut messages: Vec<u8> = Vec::arbitrary(g);
@@ -194,7 +217,6 @@ impl Keyed for (u8, u16) {
 impl Keyed for u8 {
     type Key = u8;
 
-    /// Returns a reference to the key, which is the u8 value itself.
     fn key(&self) -> &Self::Key {
         self
     }

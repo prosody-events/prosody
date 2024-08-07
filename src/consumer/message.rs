@@ -5,9 +5,12 @@
 //! messages, including tracking shutdown signals and committing messages after
 //! processing.
 
+use std::future::Future;
+
 use chrono::{DateTime, Utc};
 use educe::Educe;
-use tracing::{debug, Span};
+use tokio::sync::watch;
+use tracing::{debug, error, Span};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::Keyed;
@@ -15,14 +18,37 @@ use crate::{Key, Offset, Partition, Payload, Topic};
 
 /// Represents the context for a message within a consumer.
 #[derive(Clone, Debug)]
-pub struct MessageContext;
+pub struct MessageContext {
+    shutdown_rx: watch::Receiver<bool>,
+}
 
 impl MessageContext {
     /// Creates a new message context.
     ///
     /// This method is intended for internal use within the crate.
-    pub(crate) fn new() -> Self {
-        Self
+    ///
+    /// # Arguments
+    ///
+    /// * `shutdown_rx` - A receiver for shutdown signals.
+    pub(crate) fn new(shutdown_rx: watch::Receiver<bool>) -> Self {
+        Self { shutdown_rx }
+    }
+
+    /// Waits for a shutdown signal.
+    ///
+    /// This method returns a future that completes when a partition shutdown
+    /// signal is received or an error occurs.
+    ///
+    /// # Errors
+    ///
+    /// Logs an error message if the shutdown hook fails.
+    pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send {
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        async move {
+            if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
+                error!("shutdown hook failed: {error:#}");
+            }
+        }
     }
 }
 
@@ -83,7 +109,7 @@ impl UncommittedMessage {
         &self.span
     }
 
-    /// Takes ownership of the key, payload, and uncommitted offset.
+    /// Takes ownership of the message and returns its components.
     ///
     /// # Returns
     ///
