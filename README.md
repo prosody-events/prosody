@@ -145,7 +145,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations              | 1s      | ✓        |          |
 | `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the producer     | 1s      |          | ✓        |
 | `PROSODY_MOCK`                       | Use mock Kafka brokers for testing              | false   | ✓        | ✓        |
-| `PROSODY_RETRY_BASE`                 | Exponential backoff base for retries            | 2       | ✓        |          |
+| `PROSODY_RETRY_BASE`                 | Base exponential backoff delay                  | 20ms    | ✓        |          |
 | `PROSODY_MAX_RETRIES`                | Maximum number of retries                       | 3       | ✓        |          |
 | `PROSODY_RETRY_MAX_DELAY`            | Maximum retry delay                             | 1m      | ✓        |          |
 | `PROSODY_FAILURE_TOPIC`              | Topic for failed messages                       | -       | ✓        |          |

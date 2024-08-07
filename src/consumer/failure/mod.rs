@@ -7,12 +7,31 @@
 use std::fmt::Display;
 use std::future::Future;
 
-use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::HandlerProvider;
+use crate::consumer::message::{ConsumerMessage, MessageContext};
 
 pub mod log;
 pub mod retry;
 pub mod topic;
+
+pub enum ErrorCategory {
+    // error is temporary and recovery is possible
+    Transient,
+
+    // error is permanent and irrecoverable
+    Permanent,
+    
+    // error is due to system shutdown
+    Terminal,
+}
+
+pub trait ClassifyError {
+    fn classify_error(&self) -> ErrorCategory;
+
+    fn is_recoverable(&self) -> bool {
+        matches!(self.classify_error(), ErrorCategory::Transient)
+    }
+}
 
 /// Defines a failure handling strategy for message processing.
 pub trait FailureStrategy {
@@ -50,7 +69,7 @@ pub trait FailureStrategy {
 /// Defines a handler that can fail during message processing.
 pub trait FallibleHandler: Clone + Send + Sync + 'static {
     /// The error type returned by this handler.
-    type Error: Display + Send;
+    type Error: ClassifyError + Display + Send;
 
     /// Handles a message, potentially returning an error.
     ///

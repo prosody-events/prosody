@@ -10,10 +10,10 @@ use derive_builder::Builder;
 use humantime::format_duration;
 use rand::{thread_rng, Rng};
 use tokio::time::sleep;
-use tracing::error;
+use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
-use crate::consumer::failure::{FailureStrategy, FallibleHandler};
+use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::{HandlerProvider, Keyed, MessageHandler};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
@@ -21,18 +21,16 @@ use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 /// Configuration for the retry strategy.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct RetryConfiguration {
-    /// Exponential backoff base.
+    /// Base exponential backoff delay.
     ///
     /// Environment variable: `PROSODY_RETRY_BASE`
-    /// Default: 2
-    ///
-    /// Must be at least 2.
+    /// Default: 20 ms
     #[builder(
-        default = "from_env_with_fallback(\"PROSODY_RETRY_BASE\", 2)?",
+        default = "from_duration_env_with_fallback(\"PROSODY_RETRY_BASE\", \
+                   Duration::from_millis(20))?",
         setter(into)
     )]
-    #[validate(range(min = 2_u8))]
-    base: u8,
+    base: Duration,
 
     /// Maximum number of retries.
     ///
@@ -101,7 +99,9 @@ impl RetryStrategy {
 /// A handler wrapped with retry functionality.
 #[derive(Clone, Debug)]
 struct RetryHandler<T> {
-    config: RetryConfiguration,
+    base_delay_millis: u64,
+    max_delay_millis: u64,
+    max_retries: u32,
     handler: T,
 }
 
@@ -116,10 +116,14 @@ impl<T> RetryHandler<T> {
     ///
     /// The duration to sleep before the next retry attempt.
     fn sleep_time(&self, attempt: u32) -> Duration {
-        let exp_backoff = self.config.base.saturating_pow(attempt);
+        let exp_backoff = min(
+            2u64.saturating_pow(attempt)
+                .saturating_mul(self.base_delay_millis),
+            self.max_delay_millis,
+        );
+
         let jitter = thread_rng().gen_range(0..exp_backoff);
-        let jitter = Duration::from_millis(u64::from(jitter));
-        min(jitter, self.config.max_delay)
+        Duration::from_millis(jitter)
     }
 }
 
@@ -129,7 +133,9 @@ impl FailureStrategy for RetryStrategy {
         T: FallibleHandler,
     {
         RetryHandler {
-            config: self.0.clone(),
+            base_delay_millis: self.0.base.as_millis() as u64,
+            max_delay_millis: self.0.max_delay.as_millis() as u64,
+            max_retries: self.0.max_retries,
             handler,
         }
     }
@@ -168,10 +174,13 @@ where
 
         loop {
             attempt = attempt.saturating_add(1);
-            match self.handler.handle(context.clone(), message.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    if attempt > self.config.max_retries {
+            let Err(error) = self.handler.handle(context.clone(), message.clone()).await else {
+                return Ok(());
+            };
+
+            match error.classify_error() {
+                ErrorCategory::Transient => {
+                    if attempt > self.max_retries {
                         // Log the final failure and return the error
                         error!(
                             %topic, %partition, %key, %offset, %attempt,
@@ -190,6 +199,20 @@ where
                     );
 
                     sleep(sleep_time).await;
+                }
+                ErrorCategory::Permanent => {
+                    error!(
+                        %topic, %partition, %key, %offset, %attempt,
+                        "permanently failed to handle message: {error:#}"
+                    );
+                    return Err(error);
+                }
+                ErrorCategory::Terminal => {
+                    info!(
+                        %topic, %partition, %key, %offset, %attempt,
+                        "terminal condition encountered while handling message: {error:#}; aborting"
+                    );
+                    return Err(error);
                 }
             }
         }
@@ -217,24 +240,39 @@ where
 
         loop {
             attempt = attempt.saturating_add(1);
-            match self.handler.handle(context.clone(), message.clone()).await {
-                Ok(()) => break,
-                Err(error) => {
-                    let sleep_time = self.sleep_time(attempt);
+            let Err(error) = self.handler.handle(context.clone(), message.clone()).await else {
+                uncommitted_offset.commit();
+                break;
+            };
 
-                    // Log the failure and retry information
+            match error.classify_error() {
+                ErrorCategory::Transient => {
+                    let sleep_time = self.sleep_time(attempt);
                     error!(
                         %topic, %partition, %key, %offset, %attempt,
                         "failed to handle message: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
-
                     sleep(sleep_time).await;
+                }
+                ErrorCategory::Permanent => {
+                    error!(
+                        %topic, %partition, %key, %offset, %attempt,
+                        "permanently failed to handle message: {error:#}; discarding message"
+                    );
+                    uncommitted_offset.commit();
+                    break;
+                }
+                ErrorCategory::Terminal => {
+                    info!(
+                        %topic, %partition, %key, %offset, %attempt,
+                        "terminal condition encountered while handling message: {error:#}; aborting"
+                    );
+                    uncommitted_offset.abort();
+                    break;
                 }
             }
         }
-
-        uncommitted_offset.commit();
     }
 
     /// Shuts down the handler.

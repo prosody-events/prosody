@@ -174,13 +174,23 @@ pub enum OffsetTrackerError {
 }
 
 impl UncommittedOffset {
-    /// Commits the reserved offset, finalizing its state.
+    /// Commits the offset.
     pub fn commit(mut self) {
         let Some(permit) = self.permit.take() else {
             error!("offset {} already committed", self.offset);
             return;
         };
         permit.send(Action::commit(self.offset));
+    }
+
+    /// Aborts committing the offset.
+    pub fn abort(mut self) {
+        let Some(_) = self.permit.take() else {
+            error!("offset {} already committed", self.offset);
+            return;
+        };
+
+        warn!(%self.offset, "commit aborted");
     }
 }
 

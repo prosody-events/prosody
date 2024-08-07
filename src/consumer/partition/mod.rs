@@ -52,6 +52,10 @@ pub struct PartitionManager {
     #[educe(Debug(ignore))]
     message_tx: Sender<ConsumerMessage>,
 
+    /// Watch for sending shutdown a signal to handlers
+    #[educe(Debug(ignore))]
+    shutdown_tx: watch::Sender<bool>,
+
     /// Asynchronous handle for the message processing task.
     #[educe(Debug(ignore))]
     handle: JoinHandle<()>,
@@ -78,6 +82,7 @@ impl PartitionManager {
         max_uncommitted: usize,
         max_enqueued_per_key: usize,
         shutdown_timeout: Option<Duration>,
+
         watermark_version: Arc<CachePadded<AtomicUsize>>,
     ) -> Self
     where
@@ -85,12 +90,14 @@ impl PartitionManager {
     {
         let offsets = OffsetTracker::new(max_uncommitted, watermark_version);
         let (message_tx, message_rx) = channel(buffer_size);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let handle = spawn(handle_messages(
             message_handler,
             offsets.clone(),
             message_rx,
             max_enqueued_per_key,
+            shutdown_rx,
             shutdown_timeout,
         ));
 
@@ -98,6 +105,7 @@ impl PartitionManager {
             partition,
             offsets,
             message_tx,
+            shutdown_tx,
             handle,
         }
     }
@@ -150,8 +158,13 @@ impl PartitionManager {
     /// successful, or `None` if an error occurred during shutdown.
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
-        // Close the message channel to signal shutdown
+        // Close the message channel
         drop(self.message_tx);
+
+        // Send shutdown signal
+        if let Err(error) = self.shutdown_tx.send(true) {
+            error!(%self.partition, "failed to send shutdown signal to handlers: {error:#}");
+        }
 
         // Wait for the message processing task to complete
         if let Err(error) = self.handle.await {
@@ -186,11 +199,11 @@ async fn handle_messages<T>(
     offsets: OffsetTracker,
     message_rx: Receiver<ConsumerMessage>,
     max_enqueued_per_key: usize,
+    shutdown_rx: watch::Receiver<bool>,
     shutdown_timeout: Option<Duration>,
 ) where
     T: MessageHandler,
 {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let process = |received: ConsumerMessage| async {
         // Attempt to take an offset for the received message
         let message = match offsets.take(received.offset).await {
@@ -225,7 +238,7 @@ async fn handle_messages<T>(
                 highest_offset_seen = message.offset;
                 ready(true)
             }),
-            shutdown_tx,
+            shutdown_rx.clone(),
             shutdown_timeout,
         )
         .await;

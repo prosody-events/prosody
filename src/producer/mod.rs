@@ -24,6 +24,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
+use crate::consumer::failure::{ClassifyError, ErrorCategory};
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::util::{from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env};
@@ -296,4 +297,14 @@ pub enum ProducerError {
     /// Indicates a Kafka operation failure.
     #[error("Kafka error: {0:#}")]
     Kafka(#[from] KafkaError),
+}
+
+impl ClassifyError for ProducerError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            ProducerError::Configuration(_) | ProducerError::Hostname(_) => ErrorCategory::Terminal,
+            ProducerError::Serialization(_) => ErrorCategory::Permanent,
+            ProducerError::SystemTime(_) | ProducerError::Kafka(_) => ErrorCategory::Transient,
+        }
+    }
 }
