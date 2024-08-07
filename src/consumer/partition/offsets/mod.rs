@@ -1,7 +1,7 @@
-//! Manages and synchronizes offset handling in Kafka, allowing
-//! for concurrent processing while ensuring offsets are committed in order. The
-//! module provides mechanisms to reserve and commit offsets, and
-//! maintains a watermark to track the latest contiguous committed offset.
+//! Manages and synchronizes offset handling in Kafka, enabling concurrent
+//! processing while ensuring ordered offset commitment. This module offers
+//! mechanisms to reserve and commit offsets, and maintains a watermark to track
+//! the latest contiguous committed offset.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -22,9 +22,10 @@ use crate::Offset;
 mod test;
 
 /// Manages uncommitted offsets and tracks the highest successfully committed
-/// offset. Utilizes atomic operations and a mutex-guarded task handle for
-/// managing background operations that update the watermark based on committed
-/// offsets.
+/// offset.
+///
+/// Uses atomic operations and a mutex-guarded task handle for managing
+/// background operations that update the watermark based on committed offsets.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct OffsetTracker {
@@ -41,8 +42,9 @@ pub struct OffsetTracker {
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-/// Holds an offset that has been reserved but not yet committed, with
-/// mechanisms to commit the offset.
+/// Holds an offset that has been reserved but not yet committed.
+///
+/// Provides mechanisms to commit or abort the offset.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct UncommittedOffset {
@@ -54,15 +56,14 @@ pub struct UncommittedOffset {
     permit: Option<OwnedPermit<Action>>,
 }
 
-/// Describes an operation to be performed on an offset, such as reserving or
-/// committing it.
+/// Describes an operation to be performed on an offset.
 #[derive(Clone, Debug)]
 struct Action {
     offset: Offset,
     operation: Operation,
 }
 
-/// Defines possible operations on offsets
+/// Defines possible operations on offsets.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Operation {
     Take,
@@ -70,11 +71,14 @@ enum Operation {
 }
 
 impl OffsetTracker {
-    /// Initializes a new `OffsetTracker` with the specified capacity for
-    /// uncommitted offsets. Spawns a background task to monitor and commit
-    /// offsets, updating the watermark accordingly.
+    /// Creates a new `OffsetTracker` with the specified capacity for
+    /// uncommitted offsets.
+    ///
+    /// Spawns a background task to monitor and commit offsets, updating the
+    /// watermark accordingly.
     ///
     /// # Arguments
+    ///
     /// * `max_uncommitted` - Maximum number of uncommitted offsets allowed.
     /// * `watermark_version` - Shared atomic variable to track changes in the
     ///   watermark.
@@ -95,17 +99,19 @@ impl OffsetTracker {
         }
     }
 
-    /// Reserves an offset for potential future commitment. Provides an
-    /// UncommittedOffset that can be committed or rolled back.
+    /// Reserves an offset for potential future commitment.
     ///
     /// # Arguments
+    ///
     /// * `offset` - The offset to reserve.
     ///
     /// # Returns
-    /// A Result containing either an UncommittedOffset or an
-    /// OffsetTrackerError.
+    ///
+    /// A `Result` containing either an `UncommittedOffset` or an
+    /// `OffsetTrackerError`.
     ///
     /// # Errors
+    ///
     /// Returns `OffsetTrackerError::Shutdown` if the system is shutting down
     /// and cannot accept new reservations.
     #[instrument(level = "debug")]
@@ -127,20 +133,22 @@ impl OffsetTracker {
     }
 
     /// Fetches the current watermark, representing the highest committed
-    /// offset, if available.
+    /// offset.
     ///
     /// # Returns
-    /// An Option containing the current watermark if it is valid.
+    ///
+    /// An `Option` containing the current watermark if it is valid.
     pub fn watermark(&self) -> Option<Offset> {
         fetch_watermark(&self.watermark)
     }
 
-    /// Shuts down the OffsetTracker, closing the action channel and awaiting
-    /// the completion of the background task to ensure all pending actions
-    /// are resolved.
+    /// Shuts down the `OffsetTracker`, closing the action channel and awaiting
+    /// the completion of the background task to ensure all pending actions are
+    /// resolved.
     ///
     /// # Returns
-    /// An Option containing the last known valid watermark if available.
+    ///
+    /// An `Option` containing the last known valid watermark if available.
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
         drop(self.action_tx);
@@ -157,8 +165,13 @@ impl OffsetTracker {
 /// Fetches the watermark from an atomic variable, ensuring it reflects
 /// committed data.
 ///
+/// # Arguments
+///
+/// * `watermark` - The atomic variable containing the watermark.
+///
 /// # Returns
-/// An Option containing the watermark if it represents a committed offset.
+///
+/// An `Option` containing the watermark if it represents a committed offset.
 fn fetch_watermark(watermark: &CachePadded<AtomicI64>) -> Option<Offset> {
     let watermark = watermark.load(Ordering::Acquire);
     (watermark >= 0).then_some(watermark)
@@ -195,8 +208,6 @@ impl UncommittedOffset {
 }
 
 impl Drop for UncommittedOffset {
-    /// Logs a warning if an offset is dropped without being committed,
-    /// indicating potential data loss.
     fn drop(&mut self) {
         let Some(_) = self.permit.take() else {
             return;
@@ -225,13 +236,16 @@ impl Action {
 }
 
 /// Processes actions from a receiver to update the watermark based on committed
-/// offsets. This background task adjusts the watermark to reflect the highest
-/// contiguous committed offset. It maintains a sorted map of offsets and
-/// updates the watermark whenever it can extend the contiguous sequence of
-/// committed offsets. The process continues until the action channel closes
-/// during system shutdown.
+/// offsets.
+///
+/// This background task adjusts the watermark to reflect the highest contiguous
+/// committed offset. It maintains a sorted map of offsets and updates the
+/// watermark whenever it can extend the contiguous sequence of committed
+/// offsets. The process continues until the action channel closes during system
+/// shutdown.
 ///
 /// # Arguments
+///
 /// * `action_rx` - Receiver for offset actions, each either reserving or
 ///   committing an offset.
 /// * `watermark` - Shared atomic variable tracking the highest committed
@@ -255,8 +269,7 @@ async fn track_watermark(
 
         // Attempt to update the watermark based on the lowest available offsets.
         // This loop checks each entry, advancing the watermark when contiguous
-        // committed offsets are found and removing them to keep the dataset
-        // minimal.
+        // committed offsets are found and removing them to keep the dataset minimal.
         while let Some(entry) = watermarks.first_entry() {
             // If the lowest offset in the map is committed, update the watermark.
             if *entry.get() == Operation::Commit {

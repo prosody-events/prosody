@@ -87,9 +87,8 @@ impl RetryStrategy {
     ///
     /// # Errors
     ///
-    /// Returns `ValidationErrors` if:
-    /// - The `base` value in the configuration is less than 2.
-    /// - Any other validation defined in the `RetryConfiguration` struct fails.
+    /// Returns `ValidationErrors` if any validation defined in the
+    /// `RetryConfiguration` struct fails.
     pub fn new(config: RetryConfiguration) -> Result<Self, ValidationErrors> {
         config.validate()?;
         Ok(Self(config))
@@ -178,6 +177,7 @@ where
                 return Ok(());
             };
 
+            // Handle different error categories
             match error.classify_error() {
                 ErrorCategory::Transient => {
                     if attempt > self.max_retries {
@@ -197,7 +197,6 @@ where
                         "failed to handle message: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
-
                     sleep(sleep_time).await;
                 }
                 ErrorCategory::Permanent => {
@@ -245,6 +244,7 @@ where
                 break;
             };
 
+            // Handle different error categories
             match error.classify_error() {
                 ErrorCategory::Transient => {
                     let sleep_time = self.sleep_time(attempt);
@@ -275,9 +275,9 @@ where
         }
     }
 
-    /// Shuts down the handler.
+    /// Performs any necessary shutdown operations for the handler.
     ///
-    /// This implementation has no specific shutdown behavior.
+    /// This implementation does not require any specific shutdown behavior.
     async fn shutdown(self) {
         // No shutdown behavior needed for retry
     }

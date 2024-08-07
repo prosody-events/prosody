@@ -36,7 +36,7 @@ impl MessageContext {
 
     /// Waits for a shutdown signal.
     ///
-    /// This method returns a future that is ready when a partition shutdown
+    /// This method returns a future that completes when a partition shutdown
     /// signal is received or an error occurs.
     ///
     /// # Errors
@@ -109,7 +109,7 @@ impl UncommittedMessage {
         &self.span
     }
 
-    /// Takes ownership of the key, payload, and uncommitted offset.
+    /// Takes ownership of the message and returns its components.
     ///
     /// # Returns
     ///

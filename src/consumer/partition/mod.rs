@@ -1,9 +1,10 @@
-//! Manages a partition in a consumer system, handling messages and managing
-//! offsets.
+//! Manages a partition in a consumer system, handling messages and offset
+//! tracking.
 //!
 //! This module provides functionality to enqueue and process messages
 //! concurrently, maintain a record of offset progression, and handle graceful
-//! shutdown operations.
+//! shutdown operations. It uses a key-based approach to manage message
+//! processing and ensures efficient handling of offsets.
 
 use std::future::ready;
 use std::sync::atomic::AtomicUsize;
@@ -35,9 +36,9 @@ mod util;
 /// Manages a single partition with associated message processing and offset
 /// management.
 ///
-/// This struct ensures message processing is queued and handled efficiently,
-/// tracks the offset progress, and handles partition-specific actions such as
-/// shutdown.
+/// This struct ensures efficient message processing by queuing and handling
+/// messages, tracking offset progress, and managing partition-specific actions
+/// such as shutdown.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct PartitionManager {
@@ -52,7 +53,7 @@ pub struct PartitionManager {
     #[educe(Debug(ignore))]
     message_tx: Sender<ConsumerMessage>,
 
-    /// Watch for sending shutdown a signal to handlers
+    /// Watch channel for sending shutdown signals to handlers.
     #[educe(Debug(ignore))]
     shutdown_tx: watch::Sender<bool>,
 
@@ -62,8 +63,7 @@ pub struct PartitionManager {
 }
 
 impl PartitionManager {
-    /// Creates a new `PartitionManager` with specified configurations for
-    /// message handling and offset management.
+    /// Creates a new `PartitionManager` with specified configurations.
     ///
     /// # Arguments
     ///
@@ -75,6 +75,10 @@ impl PartitionManager {
     /// * `shutdown_timeout` - Optional duration to wait before forcefully
     ///   shutting down.
     /// * `watermark_version` - Shared variable to track watermark updates.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `PartitionManager`.
     pub fn new<T>(
         partition: Partition,
         message_handler: T,
@@ -82,7 +86,6 @@ impl PartitionManager {
         max_uncommitted: usize,
         max_enqueued_per_key: usize,
         shutdown_timeout: Option<Duration>,
-
         watermark_version: Arc<CachePadded<AtomicUsize>>,
     ) -> Self
     where
@@ -192,6 +195,7 @@ impl PartitionManager {
 ///   processing.
 /// * `max_enqueued_per_key` - The maximum number of messages that can be queued
 ///   per key before blocking.
+/// * `shutdown_rx` - A receiver for shutdown signals.
 /// * `shutdown_timeout` - Optional timeout for how long to wait on shutdown
 ///   before forcefully stopping message processing.
 async fn handle_messages<T>(

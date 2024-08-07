@@ -14,20 +14,32 @@ pub mod log;
 pub mod retry;
 pub mod topic;
 
+/// Categorizes errors in message processing.
+#[derive(Debug)]
 pub enum ErrorCategory {
-    // error is temporary and recovery is possible
+    /// Error is temporary and recovery is possible
     Transient,
-
-    // error is permanent and irrecoverable
+    /// Error is permanent and irrecoverable
     Permanent,
-
-    // error is due to system shutdown
+    /// Error is due to partition shutdown
     Terminal,
 }
 
+/// Defines methods for classifying errors.
 pub trait ClassifyError {
+    /// Classifies the error into a specific `ErrorCategory`.
+    ///
+    /// # Returns
+    ///
+    /// An `ErrorCategory` indicating the nature of the error.
     fn classify_error(&self) -> ErrorCategory;
 
+    /// Determines if the error is recoverable.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the error is classified as `ErrorCategory::Transient`, `false`
+    /// otherwise.
     fn is_recoverable(&self) -> bool {
         matches!(self.classify_error(), ErrorCategory::Transient)
     }
@@ -89,7 +101,7 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Represents a composition of two failure strategies.
+/// A composition of two failure strategies.
 #[derive(Clone, Debug)]
 pub struct ComposedStrategy<S1, S2>(S1, S2);
 

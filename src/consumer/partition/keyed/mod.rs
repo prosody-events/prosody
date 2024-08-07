@@ -1,5 +1,4 @@
-//! Provides the `KeyManager` for managing and processing messages keyed by hash
-//! values.
+//! Manages and processes messages keyed by hash values.
 //!
 //! This module implements a concurrent processing system that ensures messages
 //! with the same key are processed in order while allowing parallel processing
@@ -28,14 +27,14 @@ use crate::consumer::Keyed;
 #[cfg(test)]
 mod test;
 
-/// Represents a hash value used for keying messages.
+/// A hash value used for keying messages.
 type HashValue = u64;
 
 /// Manages and processes messages keyed by hash values, ensuring concurrent
 /// processing constraints within the same thread.
 ///
 /// This manager tracks the state of each key and manages a queue of messages
-/// awaiting processing in a single thread, using a combination of
+/// awaiting processing in a single thread. It uses a combination of
 /// `FuturesUnordered` to execute and manage message processing concurrently. It
 /// maintains several internal states like executing tasks, busy keys,
 /// and queued messages, ensuring no more than the specified number of messages
@@ -62,7 +61,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Returns
     ///
-    /// Returns a new instance of `KeyManager`.
+    /// A new instance of `KeyManager`.
     ///
     /// # Panics
     ///
@@ -89,14 +88,9 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// # Arguments
     ///
     /// * `messages` - Stream of incoming messages.
-    /// * `shutdown_tx` - Sender for shutdown signal.
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `shutdown_timeout` - Optional duration to wait before forcefully
     ///   shutting down.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if the processing function returns an
-    /// error.
     pub async fn process_messages<S>(
         mut self,
         messages: S,
@@ -184,6 +178,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `message` - The message to be handled.
     #[instrument(level = "debug", skip(self, shutdown_rx))]
     async fn dispatch_message(&mut self, shutdown_rx: &mut watch::Receiver<bool>, message: M)
@@ -214,6 +209,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `hash_value` - The hash value of the completed message.
     #[instrument(level = "debug", skip(self, shutdown_rx))]
     fn handle_completion(&mut self, shutdown_rx: &mut watch::Receiver<bool>, hash_value: HashValue)
@@ -248,6 +244,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `message` - The message to be enqueued.
     /// * `hash_value` - The hash value associated with the message to manage
     ///   keying and load distribution.
@@ -298,6 +295,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// # Arguments
     ///
+    /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `message` - The message to process.
     /// * `hash_value` - Hash value used to key and manage the message.
     #[instrument(level = "debug", skip(self, shutdown_rx))]
