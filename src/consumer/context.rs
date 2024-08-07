@@ -108,13 +108,13 @@ where
                 for element in partitions.elements() {
                     let topic = Topic::from(element.topic());
                     let partition = element.partition();
-                    info!("topic {topic} partition {partition} assigned");
+                    info!("assigning {topic}:{partition}");
 
                     let mut managers = self.managers.lock();
 
                     // Check if the partition is already assigned
                     let Entry::Vacant(vacant) = managers.entry((topic, partition)) else {
-                        warn!("topic {topic} partition {partition} was already assigned");
+                        warn!("{topic}:{partition} was already assigned");
                         continue;
                     };
 
@@ -150,11 +150,11 @@ where
                 for element in partitions.elements() {
                     let topic = Topic::from(element.topic());
                     let partition = element.partition();
-                    info!("topic {topic} partition {partition} revoked");
+                    info!("revoking {topic}:{partition}");
 
                     // Remove the PartitionManager for the revoked partition
                     let Some(manager) = self.managers.lock().remove(&(topic, partition)) else {
-                        error!("cannot revoke topic {topic} partition {partition}; not assigned");
+                        error!("cannot revoke {topic}:{partition}; not assigned");
                         continue;
                     };
 

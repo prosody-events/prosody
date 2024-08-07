@@ -7,8 +7,8 @@
 use std::fmt::Display;
 use std::future::Future;
 
-use crate::consumer::HandlerProvider;
 use crate::consumer::message::{ConsumerMessage, MessageContext};
+use crate::consumer::HandlerProvider;
 
 pub mod log;
 pub mod retry;
@@ -20,7 +20,7 @@ pub enum ErrorCategory {
 
     // error is permanent and irrecoverable
     Permanent,
-    
+
     // error is due to system shutdown
     Terminal,
 }
