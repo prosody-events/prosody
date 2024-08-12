@@ -24,7 +24,7 @@
 //!
 //! Users should primarily interact with the [`ProsodyConsumer`] struct,
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
-//! defined by implementing the [`MessageHandler`] trait.
+//! defined by implementing the [`EventHandler`] trait.
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -92,7 +92,7 @@ pub trait Keyed {
 /// Provides handlers for processing messages from specific partitions.
 pub trait HandlerProvider: Send + Sync + 'static {
     /// The type of message handler provided.
-    type Handler: MessageHandler + Send + Sync + 'static;
+    type Handler: EventHandler + Send + Sync + 'static;
 
     /// Creates a handler for a specific topic and partition.
     ///
@@ -108,7 +108,7 @@ pub trait HandlerProvider: Send + Sync + 'static {
 }
 
 /// Defines the behavior for handling consumed Kafka messages.
-pub trait MessageHandler {
+pub trait EventHandler {
     /// Processes a consumed message.
     ///
     /// # Arguments
@@ -135,7 +135,7 @@ pub trait MessageHandler {
 
 impl<T> HandlerProvider for T
 where
-    T: MessageHandler + Clone + Send + Sync + 'static,
+    T: EventHandler + Clone + Send + Sync + 'static,
 {
     type Handler = Self;
 
@@ -144,7 +144,7 @@ where
     }
 }
 
-impl<T, Fut> MessageHandler for T
+impl<T, Fut> EventHandler for T
 where
     T: Fn(MessageContext, UncommittedMessage) -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send,

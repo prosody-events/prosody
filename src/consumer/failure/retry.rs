@@ -15,7 +15,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
-use crate::consumer::{HandlerProvider, Keyed, MessageHandler};
+use crate::consumer::{EventHandler, HandlerProvider, Keyed};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 
 /// Configuration for the retry strategy.
@@ -222,7 +222,7 @@ where
     }
 }
 
-impl<T> MessageHandler for RetryHandler<T>
+impl<T> EventHandler for RetryHandler<T>
 where
     T: FallibleHandler,
 {

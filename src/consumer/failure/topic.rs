@@ -11,7 +11,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
-use crate::consumer::{HandlerProvider, MessageHandler};
+use crate::consumer::{EventHandler, HandlerProvider};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::util::from_env;
 use crate::Topic;
@@ -186,7 +186,7 @@ where
     }
 }
 
-impl<T> MessageHandler for FailureTopicHandler<T>
+impl<T> EventHandler for FailureTopicHandler<T>
 where
     T: FallibleHandler,
 {

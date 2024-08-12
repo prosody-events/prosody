@@ -90,7 +90,7 @@ use tracing_subscriber::fmt;
 use uuid::Uuid;
 
 use prosody::consumer::message::{MessageContext, UncommittedMessage};
-use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
+use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::Topic;
 
@@ -408,13 +408,13 @@ fn verify_results(
     Ok(())
 }
 
-/// A test implementation of the `MessageHandler` trait.
+/// A test implementation of the `EventHandler` trait.
 #[derive(Clone, Debug)]
 struct TestHandler {
     messages_tx: Sender<(String, Value)>,
 }
 
-impl MessageHandler for TestHandler {
+impl EventHandler for TestHandler {
     /// Handles a received message by sending it through the channel.
     ///
     /// # Arguments
