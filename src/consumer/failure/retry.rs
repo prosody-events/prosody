@@ -165,10 +165,10 @@ where
         context: MessageContext,
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
-        let topic = message.topic;
-        let partition = message.partition;
-        let key = message.key.clone();
-        let offset = message.offset;
+        let topic = message.topic();
+        let partition = message.partition();
+        let key = message.key();
+        let offset = message.offset();
         let mut attempt: u32 = 0;
 
         loop {

@@ -5,7 +5,9 @@
 //! messages, including tracking shutdown signals and committing messages after
 //! processing.
 
+use std::fmt::Debug;
 use std::future::Future;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use educe::Educe;
@@ -36,8 +38,8 @@ impl MessageContext {
 
     /// Waits for a shutdown signal.
     ///
-    /// This method returns a future that completes when a partition shutdown
-    /// signal is received or an error occurs.
+    /// Returns a future that completes when a partition shutdown signal is
+    /// received.
     ///
     /// # Errors
     ///
@@ -56,57 +58,47 @@ impl MessageContext {
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct UncommittedMessage {
-    topic: Topic,
-    partition: Partition,
-    offset: Offset,
-    key: Key,
-    timestamp: DateTime<Utc>,
-
-    #[educe(Debug(ignore))]
-    payload: Payload,
-
-    #[educe(Debug(ignore))]
-    span: Span,
+    inner: ConsumerMessage,
 
     #[educe(Debug(ignore))]
     uncommitted_offset: UncommittedOffset,
 }
 
 impl UncommittedMessage {
-    /// Returns a reference to the message's topic.
+    /// Returns the message's topic.
     #[must_use]
-    pub fn topic(&self) -> &'static str {
-        self.topic.as_ref()
+    pub fn topic(&self) -> Topic {
+        self.inner.topic()
     }
 
     /// Returns the partition of the message.
     #[must_use]
     pub fn partition(&self) -> Partition {
-        self.partition
+        self.inner.partition()
     }
 
     /// Returns the offset of the message.
     #[must_use]
     pub fn offset(&self) -> Offset {
-        self.offset
+        self.inner.offset()
     }
 
     /// Returns the message timestamp.
     #[must_use]
     pub fn timestamp(&self) -> &DateTime<Utc> {
-        &self.timestamp
+        self.inner.timestamp()
     }
 
     /// Returns a reference to the message's payload.
     #[must_use]
     pub fn payload(&self) -> &Payload {
-        &self.payload
+        self.inner.payload()
     }
 
     /// Returns a reference to the associated span for tracing.
     #[must_use]
     pub fn span(&self) -> &Span {
-        &self.span
+        self.inner.span()
     }
 
     /// Takes ownership of the message and returns its components.
@@ -116,22 +108,18 @@ impl UncommittedMessage {
     /// A tuple containing a `ConsumerMessage` and an `UncommittedOffset`.
     #[must_use]
     pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
-        let message = ConsumerMessage {
-            topic: self.topic,
-            partition: self.partition,
-            offset: self.offset,
-            key: self.key,
-            timestamp: self.timestamp,
-            payload: self.payload,
-            span: self.span,
-        };
-
-        (message, self.uncommitted_offset)
+        (self.inner, self.uncommitted_offset)
     }
 
     /// Commits the message, marking its offset as processed.
     pub fn commit(self) {
-        debug!(%self.topic, %self.partition, %self.key, %self.offset, "committing message");
+        debug!(
+            topic = %self.topic().as_ref(),
+            partition = %self.partition(),
+            key = %self.key(),
+            offset = %self.offset(),
+            "committing message"
+        );
         self.uncommitted_offset.commit();
     }
 }
@@ -141,14 +129,18 @@ impl Keyed for UncommittedMessage {
 
     /// Returns a reference to the message's key.
     fn key(&self) -> &Self::Key {
-        &self.key
+        self.inner.key()
     }
 }
 
-/// A message that is not yet being tracked for offset watermarks.
+/// A message that is cheap to clone and which does not track offset commits
+#[derive(Clone, Debug)]
+pub struct ConsumerMessage(Arc<ConsumerMessageValue>);
+
+/// Contains the actual message data and metadata.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub struct ConsumerMessage {
+pub struct ConsumerMessageValue {
     /// The topic from which the message was consumed.
     pub topic: Topic,
 
@@ -174,6 +166,74 @@ pub struct ConsumerMessage {
 }
 
 impl ConsumerMessage {
+    /// Creates a new `ConsumerMessage`.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic from which the message was consumed.
+    /// * `partition` - The partition from which the message was consumed.
+    /// * `offset` - The offset of the message within its partition.
+    /// * `key` - The key associated with the message.
+    /// * `timestamp` - The timestamp of the message.
+    /// * `payload` - The payload of the message.
+    /// * `span` - The tracing span associated with this message.
+    #[must_use]
+    pub fn new(
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+        key: Key,
+        timestamp: DateTime<Utc>,
+        payload: Payload,
+        span: Span,
+    ) -> Self {
+        Self(Arc::new(ConsumerMessageValue {
+            topic,
+            partition,
+            offset,
+            key,
+            timestamp,
+            payload,
+            span,
+        }))
+    }
+
+    /// Returns the message's topic.
+    #[must_use]
+    pub fn topic(&self) -> Topic {
+        self.0.topic
+    }
+
+    /// Returns the partition of the message.
+    #[must_use]
+    pub fn partition(&self) -> Partition {
+        self.0.partition
+    }
+
+    /// Returns the offset of the message.
+    #[must_use]
+    pub fn offset(&self) -> Offset {
+        self.0.offset
+    }
+
+    /// Returns the message timestamp.
+    #[must_use]
+    pub fn timestamp(&self) -> &DateTime<Utc> {
+        &self.0.timestamp
+    }
+
+    /// Returns a reference to the message's payload.
+    #[must_use]
+    pub fn payload(&self) -> &Payload {
+        &self.0.payload
+    }
+
+    /// Returns a reference to the associated span for tracing.
+    #[must_use]
+    pub fn span(&self) -> &Span {
+        &self.0.span
+    }
+
     /// Converts a `ConsumerMessage` into an `UncommittedMessage` by adding
     /// uncommitted offset tracking.
     ///
@@ -189,15 +249,15 @@ impl ConsumerMessage {
     #[must_use]
     pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage {
         UncommittedMessage {
-            topic: self.topic,
-            partition: self.partition,
-            offset: self.offset,
-            key: self.key,
-            timestamp: self.timestamp,
-            payload: self.payload,
-            span: self.span,
+            inner: self,
             uncommitted_offset,
         }
+    }
+
+    /// Converts a `ConsumerMessage` into a `ConsumerMessageValue`.
+    #[must_use]
+    pub fn into_value(self) -> ConsumerMessageValue {
+        Arc::unwrap_or_clone(self.0)
     }
 }
 
@@ -206,6 +266,6 @@ impl Keyed for ConsumerMessage {
 
     /// Returns a reference to the message's key.
     fn key(&self) -> &Self::Key {
-        &self.key
+        &self.0.key
     }
 }

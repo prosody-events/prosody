@@ -11,7 +11,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider};
+use crate::consumer::{EventHandler, HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::util::from_env;
 use crate::Topic;
@@ -138,13 +138,13 @@ where
         context: MessageContext,
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
-        let topic = message.topic;
-        let partition = message.partition;
-        let key = message.key.clone();
-        let offset = message.offset;
+        let topic = message.topic().as_ref();
+        let partition = message.partition();
+        let key = message.key();
+        let offset = message.offset();
 
         let timestamp = message
-            .timestamp
+            .timestamp()
             .to_rfc3339_opts(SecondsFormat::AutoSi, true);
 
         // Attempt to process the message with the wrapped handler
@@ -170,7 +170,7 @@ where
 
         // Prepare headers for the failure message
         let headers = [
-            ("source-topic", topic.as_ref()),
+            ("source-topic", topic),
             ("source-partition", &partition.to_string()),
             ("source-offset", &offset.to_string()),
             ("source-timestamp", &timestamp),
@@ -179,7 +179,7 @@ where
 
         // Send the failed message to the failure topic
         self.producer
-            .send(headers, self.topic, &key, message.payload)
+            .send(headers, self.topic, key, message.payload())
             .await?;
 
         Ok(())

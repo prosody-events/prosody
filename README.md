@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
    let producer = ProsodyProducer::new(&config)?;
 
    let topic: Topic = "my-topic".into();
-   producer.send([], topic, "message-key", json!({"value": "Hello, Kafka!"})).await?;
+   producer.send([], topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
 
    Ok(())
 }
