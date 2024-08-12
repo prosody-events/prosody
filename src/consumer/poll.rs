@@ -142,15 +142,15 @@ pub fn poll<T>(
         };
 
         // Create ConsumerMessage and dispatch for processing
-        let mut message = ConsumerMessage {
+        let mut message = ConsumerMessage::new(
             topic,
             partition,
             offset,
             key,
             timestamp,
             payload,
-            span: span.clone(),
-        };
+            span.clone(),
+        );
 
         // Dispatch message to appropriate handler
         loop {
@@ -294,7 +294,7 @@ where
 /// fails.
 fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(), DispatchError> {
     let managers = managers.lock();
-    let Some(manager) = managers.get(&(message.topic, message.partition)) else {
+    let Some(manager) = managers.get(&(message.topic(), message.partition())) else {
         return Err(DispatchError::PartitionNotFound(message));
     };
 

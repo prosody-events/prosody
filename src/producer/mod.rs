@@ -230,7 +230,7 @@ impl ProsodyProducer {
         headers: H,
         topic: Topic,
         key: &str,
-        payload: Value,
+        payload: &Value,
     ) -> Result<(), ProducerError>
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,

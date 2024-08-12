@@ -210,7 +210,7 @@ async fn handle_messages<T>(
 {
     let process = |received: ConsumerMessage| async {
         // Attempt to take an offset for the received message
-        let message = match offsets.take(received.offset).await {
+        let message = match offsets.take(received.offset()).await {
             Ok(uncommitted_offset) => received.into_uncommitted(uncommitted_offset),
             Err(error) => {
                 error!(
@@ -231,15 +231,15 @@ async fn handle_messages<T>(
     KeyManager::new(process, max_enqueued_per_key)
         .process_messages(
             ReceiverStream::new(message_rx).filter(|message| {
+                let partition = message.partition();
+                let offset = message.offset();
+
                 // Filter out messages with offsets we've already seen
-                if message.offset <= highest_offset_seen {
-                    debug!(
-                        "filtering stale partition {} offset {}",
-                        message.partition, message.offset
-                    );
+                if offset <= highest_offset_seen {
+                    debug!("filtering stale partition {} offset {}", partition, offset);
                     return ready(false);
                 }
-                highest_offset_seen = message.offset;
+                highest_offset_seen = offset;
                 ready(true)
             }),
             shutdown_rx.clone(),

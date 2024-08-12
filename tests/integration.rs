@@ -286,9 +286,9 @@ fn spawn_producers(
             for (key, messages) in producer_messages {
                 let key = key.to_string();
                 for message in messages {
-                    producer.send([], topic, &key, json!(message)).await?;
+                    producer.send([], topic, &key, &json!(message)).await?;
                 }
-                producer.send([], topic, &key, Value::Null).await?;
+                producer.send([], topic, &key, &Value::Null).await?;
             }
             Ok(())
         });
@@ -425,6 +425,8 @@ impl EventHandler for TestHandler {
     /// A Future that completes when the message is handled.
     async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
         let (message, uncommitted) = message.into_inner();
+        let message = message.into_value();
+
         if let Err(error) = self
             .messages_tx
             .send((message.key.to_string(), message.payload))
