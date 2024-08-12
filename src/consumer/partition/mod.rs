@@ -26,7 +26,7 @@ use tracing::{debug, error, instrument};
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::MessageHandler;
+use crate::consumer::EventHandler;
 use crate::{Offset, Partition};
 
 mod keyed;
@@ -89,7 +89,7 @@ impl PartitionManager {
         watermark_version: Arc<CachePadded<AtomicUsize>>,
     ) -> Self
     where
-        T: MessageHandler + Send + Sync + 'static,
+        T: EventHandler + Send + Sync + 'static,
     {
         let offsets = OffsetTracker::new(max_uncommitted, watermark_version);
         let (message_tx, message_rx) = channel(buffer_size);
@@ -206,7 +206,7 @@ async fn handle_messages<T>(
     shutdown_rx: watch::Receiver<bool>,
     shutdown_timeout: Option<Duration>,
 ) where
-    T: MessageHandler,
+    T: EventHandler,
 {
     let process = |received: ConsumerMessage| async {
         // Attempt to take an offset for the received message

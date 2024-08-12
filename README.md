@@ -58,14 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use prosody::consumer::message::{MessageContext, UncommittedMessage};
-use prosody::consumer::{ConsumerConfiguration, MessageHandler, ProsodyConsumer};
+use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
 use prosody::{Partition, Topic};
 use std::time::Duration;
 
 #[derive(Clone)]
-struct MyMessageHandler;
+struct MyEventHandler;
 
-impl MessageHandler for MyMessageHandler {
+impl EventHandler for MyEventHandler {
    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
       println!("Received: {:?}", message);
       message.commit();
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
      .mock(true) // use mock consumer for example
      .build()?;
 
-   let consumer = ProsodyConsumer::new(&config, MyMessageHandler)?;
+   let consumer = ProsodyConsumer::new(&config, MyEventHandler)?;
 
    // Run your application logic here, waiting for shutdown
 
@@ -250,7 +250,7 @@ sequenceDiagram
 3. The `PartitionManager` enqueues the message in the correct key-based queue according to the message key (e.g., User
    ID,
    Product ID).
-4. Messages are processed sequentially from each key queue, invoking the user-provided `MessageHandler`.
+4. Messages are processed sequentially from each key queue, invoking the user-provided `EventHandler`.
 5. After processing, the latest processed offset for the key is updated.
 6. The `PartitionManager` tracks the partition's high watermark committed offset.
 7. The Prosody Consumer periodically commits these offsets back to Kafka, ensuring at-least-once message processing
