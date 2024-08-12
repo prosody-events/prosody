@@ -160,7 +160,7 @@ where
     /// # Errors
     ///
     /// Returns the underlying handler's error if all retry attempts fail.
-    async fn handle(
+    async fn on_message(
         &self,
         context: MessageContext,
         message: ConsumerMessage,
@@ -173,7 +173,11 @@ where
 
         loop {
             attempt = attempt.saturating_add(1);
-            let Err(error) = self.handler.handle(context.clone(), message.clone()).await else {
+            let Err(error) = self
+                .handler
+                .on_message(context.clone(), message.clone())
+                .await
+            else {
                 return Ok(());
             };
 
@@ -229,7 +233,7 @@ where
     ///
     /// * `context` - The message context.
     /// * `message` - The uncommitted message to be processed.
-    async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
         let topic = message.topic();
         let partition = message.partition();
         let key = message.key().to_owned();
@@ -239,7 +243,11 @@ where
 
         loop {
             attempt = attempt.saturating_add(1);
-            let Err(error) = self.handler.handle(context.clone(), message.clone()).await else {
+            let Err(error) = self
+                .handler
+                .on_message(context.clone(), message.clone())
+                .await
+            else {
                 uncommitted_offset.commit();
                 break;
             };

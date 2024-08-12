@@ -133,7 +133,7 @@ where
     /// Returns a `FailureTopicError::Handler` if the wrapped handler fails with
     /// a terminal error. Returns a `FailureTopicError::Producer` if sending
     /// to the failure topic fails.
-    async fn handle(
+    async fn on_message(
         &self,
         context: MessageContext,
         message: ConsumerMessage,
@@ -148,7 +148,7 @@ where
             .to_rfc3339_opts(SecondsFormat::AutoSi, true);
 
         // Attempt to process the message with the wrapped handler
-        let Err(error) = self.handler.handle(context, message.clone()).await else {
+        let Err(error) = self.handler.on_message(context, message.clone()).await else {
             return Ok(());
         };
 
@@ -196,11 +196,11 @@ where
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The uncommitted message to be processed.
-    async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
         let (message, uncommitted_offset) = message.into_inner();
 
         // Attempt to handle the message and send to failure topic if it fails
-        let Err(error) = FallibleHandler::handle(self, context, message).await else {
+        let Err(error) = FallibleHandler::on_message(self, context, message).await else {
             uncommitted_offset.commit();
             return;
         };

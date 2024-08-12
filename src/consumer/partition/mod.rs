@@ -223,7 +223,7 @@ async fn handle_messages<T>(
 
         // Process the message using the provided message handler
         let context = MessageContext::new(shutdown_rx.clone());
-        message_handler.handle(context, message).await;
+        message_handler.on_message(context, message).await;
     };
 
     // Create and run a KeyManager to manage concurrent message processing

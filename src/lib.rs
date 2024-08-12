@@ -57,7 +57,7 @@
 //! struct MyMessageHandler;
 //!
 //! impl MessageHandler for MyMessageHandler {
-//!     async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
+//!     async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
 //!         println!("Received: {:?}", message);
 //!         message.commit();
 //!     }
