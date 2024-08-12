@@ -119,7 +119,7 @@ pub trait MessageHandler {
     /// # Returns
     ///
     /// A future that resolves when the message is handled.
-    fn handle(
+    fn on_message(
         &self,
         context: MessageContext,
         message: UncommittedMessage,
@@ -149,7 +149,7 @@ where
     T: Fn(MessageContext, UncommittedMessage) -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send,
 {
-    async fn handle(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
         self(context, message).await;
     }
 

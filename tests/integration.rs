@@ -423,7 +423,7 @@ impl MessageHandler for TestHandler {
     ///
     /// # Returns
     /// A Future that completes when the message is handled.
-    async fn handle(&self, _context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
         let (message, uncommitted) = message.into_inner();
         if let Err(error) = self
             .messages_tx

@@ -10,7 +10,6 @@ use std::future::Future;
 use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::HandlerProvider;
 
-pub mod log;
 pub mod retry;
 pub mod topic;
 
@@ -94,7 +93,7 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     ///
     /// A `Future` that resolves to `Ok(())` if the message was processed
     /// successfully, or an `Err` containing the error if processing failed.
-    fn handle(
+    fn on_message(
         &self,
         context: MessageContext,
         message: ConsumerMessage,
