@@ -56,6 +56,31 @@ impl<T> ConsumerState<T> {
             .map(ConsumerState::Configured)
             .unwrap_or_default()
     }
+
+    /// Retrieves a reference to the `ModeConfiguration` if available.
+    ///
+    /// This method provides access to the mode configuration of the consumer,
+    /// which contains details about the operational mode and associated
+    /// settings.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing:
+    /// - `Ok(&ModeConfiguration)` if the consumer is in the `Configured` or
+    ///   `Running` state.
+    /// - `Err(ConsumerStateError::UnconfiguredConsumer)` if the consumer is in
+    ///   the `Unconfigured` state.
+    ///
+    /// # Errors
+    ///
+    /// This method will return `ConsumerStateError::UnconfiguredConsumer` if
+    /// the consumer has not been configured yet.
+    pub fn mode_configuration(&self) -> Result<&ModeConfiguration, ConsumerStateError> {
+        match &self {
+            ConsumerState::Unconfigured => Err(ConsumerStateError::UnconfiguredConsumer),
+            ConsumerState::Configured(config) | ConsumerState::Running { config, .. } => Ok(config),
+        }
+    }
 }
 
 impl<T> Display for ConsumerState<T> {
@@ -81,4 +106,8 @@ impl<T> Display for ConsumerState<T> {
 
 /// Errors that can occur during consumer state operations.
 #[derive(Debug, Error)]
-pub enum ConsumerStateError {}
+pub enum ConsumerStateError {
+    /// Error when attempting to use an unconfigured consumer.
+    #[error("unconfigured consumer; create a client with a valid consumer configuration")]
+    UnconfiguredConsumer,
+}

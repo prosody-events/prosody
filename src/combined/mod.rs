@@ -16,7 +16,7 @@ use crate::producer::{
     ProducerError, ProsodyProducer,
 };
 use crate::propagator::new_propagator;
-use crate::{Key, Payload, Topic};
+use crate::{Payload, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
 use thiserror::Error;
@@ -113,7 +113,7 @@ impl<T> CombinedClient<T> {
     pub async fn send(
         &self,
         topic: Topic,
-        key: &Key,
+        key: &str,
         payload: &Payload,
     ) -> Result<(), CombinedClientError> {
         self.producer.send([], topic, key, payload).await?;
