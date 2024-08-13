@@ -100,7 +100,7 @@ impl ModeConfiguration {
     ///
     /// A reference to the `ConsumerConfiguration` for this mode.
     #[must_use]
-    pub fn consumer(&self) -> &ConsumerConfiguration {
+    pub fn consumer_config(&self) -> &ConsumerConfiguration {
         match self {
             ModeConfiguration::Pipeline { consumer, .. }
             | ModeConfiguration::LowLatency { consumer, .. } => consumer,
