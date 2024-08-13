@@ -14,7 +14,7 @@ use std::fmt::{Display, Formatter};
 use thiserror::Error;
 
 /// Current state of the consumer.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub enum ConsumerState<T> {
     /// The consumer is not yet configured.
     #[default]

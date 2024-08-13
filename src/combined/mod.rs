@@ -15,7 +15,9 @@ use crate::producer::{
     ProducerConfiguration, ProducerConfigurationBuilder, ProducerConfigurationBuilderError,
     ProducerError, ProsodyProducer,
 };
+use crate::propagator::new_propagator;
 use crate::{Key, Payload, Topic};
+use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
 use thiserror::Error;
 use tracing::info;
@@ -25,10 +27,12 @@ pub mod mode;
 pub mod state;
 
 /// A combined client that manages both producer and consumer operations.
+#[derive(Debug)]
 pub struct CombinedClient<T> {
     producer: ProsodyProducer,
     producer_config: ProducerConfiguration,
     consumer: ConsumerState<T>,
+    propagator: TextMapCompositePropagator,
 }
 
 impl<T> CombinedClient<T> {
@@ -45,6 +49,11 @@ impl<T> CombinedClient<T> {
     /// Returns a reference to the current consumer state.
     pub fn consumer_state(&self) -> &ConsumerState<T> {
         &self.consumer
+    }
+
+    /// Returns a reference to an OpenTelemetry propagator.
+    pub fn propagator(&self) -> &TextMapCompositePropagator {
+        &self.propagator
     }
 
     /// Creates a new `CombinedClient` with the specified configurations.
@@ -82,6 +91,7 @@ impl<T> CombinedClient<T> {
             producer,
             producer_config,
             consumer,
+            propagator: new_propagator(),
         })
     }
 
