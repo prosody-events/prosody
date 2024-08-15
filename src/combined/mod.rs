@@ -6,7 +6,7 @@
 
 use crate::combined::config::ModeConfiguration;
 use crate::combined::mode::Mode;
-use crate::combined::state::ConsumerState;
+use crate::combined::state::{ConsumerState, ConsumerStateView};
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::failure::FallibleHandler;
@@ -18,6 +18,7 @@ use crate::producer::{
 use crate::propagator::new_propagator;
 use crate::{Payload, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
+use parking_lot::Mutex;
 use std::mem::take;
 use thiserror::Error;
 use tracing::info;
@@ -31,7 +32,7 @@ pub mod state;
 pub struct CombinedClient<T> {
     producer: ProsodyProducer,
     producer_config: ProducerConfiguration,
-    consumer: ConsumerState<T>,
+    consumer: Mutex<ConsumerState<T>>,
     propagator: TextMapCompositePropagator,
 }
 
@@ -47,8 +48,8 @@ impl<T> CombinedClient<T> {
     }
 
     /// Returns a reference to the current consumer state.
-    pub fn consumer_state(&self) -> &ConsumerState<T> {
-        &self.consumer
+    pub fn consumer_state(&self) -> ConsumerStateView<T> {
+        ConsumerStateView(self.consumer.lock())
     }
 
     /// Returns a reference to an OpenTelemetry propagator.
@@ -68,13 +69,13 @@ impl<T> CombinedClient<T> {
     ///
     /// # Returns
     ///
-    /// Returns a `Result` containing the new `CombinedClient` if successful,
-    /// or a `CombinedClientError` if initialization fails.
+    /// A new `CombinedClient` if successful.
     ///
     /// # Errors
     ///
-    /// This function will return an error if any of the configuration builds
-    /// fail or if the producer initialization fails.
+    /// Returns a `CombinedClientError` if:
+    /// - Any of the configuration builds fail.
+    /// - Producer initialization fails.
     pub fn new(
         mode: Mode,
         producer_builder: &ProducerConfigurationBuilder,
@@ -84,8 +85,12 @@ impl<T> CombinedClient<T> {
     ) -> Result<Self, CombinedClientError> {
         let producer_config = producer_builder.build()?;
         let producer = ProsodyProducer::new(&producer_config)?;
-        let consumer =
-            ConsumerState::build(mode, consumer_builder, retry_builder, failure_topic_builder);
+        let consumer = Mutex::new(ConsumerState::build(
+            mode,
+            consumer_builder,
+            retry_builder,
+            failure_topic_builder,
+        ));
 
         Ok(Self {
             producer,
@@ -103,13 +108,9 @@ impl<T> CombinedClient<T> {
     /// * `key` - The key associated with the message.
     /// * `payload` - The payload of the message.
     ///
-    /// # Returns
-    ///
-    /// Returns a `Result` indicating success or failure of the send operation.
-    ///
     /// # Errors
     ///
-    /// This function will return an error if the send operation fails.
+    /// Returns a `CombinedClientError` if the send operation fails.
     pub async fn send(
         &self,
         topic: Topic,
@@ -126,29 +127,29 @@ impl<T> CombinedClient<T> {
     ///
     /// * `handler` - The handler to process consumed messages.
     ///
-    /// # Returns
-    ///
-    /// Returns a `Result` indicating success or failure of the subscription.
-    ///
     /// # Errors
     ///
-    /// This function will return an error if:
-    /// - The consumer is unconfigured
-    /// - The consumer is already subscribed
-    /// - The consumer initialization fails
-    pub fn subscribe(&mut self, handler: T) -> Result<(), CombinedClientError>
+    /// Returns a `CombinedClientError` if:
+    /// - The consumer is unconfigured.
+    /// - The consumer is already subscribed.
+    /// - Consumer initialization fails.
+    pub fn subscribe(&self, handler: T) -> Result<(), CombinedClientError>
     where
         T: FallibleHandler,
     {
-        let config = match take(&mut self.consumer) {
+        let mut guard = self.consumer.lock();
+        let consumer_ref = &mut *guard;
+
+        let config = match take(consumer_ref) {
             ConsumerState::Unconfigured => return Err(CombinedClientError::UnconfiguredConsumer),
             ConsumerState::Configured(config) => config,
             running @ ConsumerState::Running { .. } => {
-                self.consumer = running;
+                *consumer_ref = running;
                 return Err(CombinedClientError::AlreadySubscribed);
             }
         };
 
+        // Initialize the consumer based on the mode configuration
         let consumer = match &config {
             ModeConfiguration::Pipeline { consumer, retry } => {
                 ProsodyConsumer::pipeline_consumer(consumer, retry.clone(), handler.clone())?
@@ -166,7 +167,7 @@ impl<T> CombinedClient<T> {
             )?,
         };
 
-        self.consumer = ConsumerState::Running {
+        *consumer_ref = ConsumerState::Running {
             consumer,
             config,
             handler,
@@ -177,25 +178,26 @@ impl<T> CombinedClient<T> {
 
     /// Unsubscribes the consumer.
     ///
-    /// # Returns
-    ///
-    /// Returns a `Result` indicating success or failure of the unsubscription.
-    ///
     /// # Errors
     ///
-    /// This function will return an error if the consumer is not currently
+    /// Returns a `CombinedClientError` if the consumer is not currently
     /// subscribed.
-    pub async fn unsubscribe(&mut self) -> Result<(), CombinedClientError> {
-        let consumer = match take(&mut self.consumer) {
-            state @ (ConsumerState::Unconfigured | ConsumerState::Configured(_)) => {
-                self.consumer = state;
-                return Err(CombinedClientError::NotSubscribed);
-            }
-            ConsumerState::Running {
-                consumer, config, ..
-            } => {
-                self.consumer = ConsumerState::Configured(config);
-                consumer
+    pub async fn unsubscribe(&self) -> Result<(), CombinedClientError> {
+        let consumer = {
+            let mut guard = self.consumer.lock();
+            let consumer_ref = &mut *guard;
+
+            match take(consumer_ref) {
+                state @ (ConsumerState::Unconfigured | ConsumerState::Configured(_)) => {
+                    *consumer_ref = state;
+                    return Err(CombinedClientError::NotSubscribed);
+                }
+                ConsumerState::Running {
+                    consumer, config, ..
+                } => {
+                    *consumer_ref = ConsumerState::Configured(config);
+                    consumer
+                }
             }
         };
 

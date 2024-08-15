@@ -9,11 +9,27 @@ use crate::combined::mode::Mode;
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ProsodyConsumer};
+use parking_lot::MutexGuard;
 use std::fmt;
 use std::fmt::{Display, Formatter};
+use std::ops::Deref;
 use thiserror::Error;
 
-/// Current state of the consumer.
+/// A wrapper around a mutex guard for `ConsumerState`.
+///
+/// This type provides a view into the current state of the consumer,
+/// allowing read-only access to the underlying `ConsumerState`.
+pub struct ConsumerStateView<'a, T>(pub(crate) MutexGuard<'a, ConsumerState<T>>);
+
+impl<'a, T> Deref for ConsumerStateView<'a, T> {
+    type Target = ConsumerState<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Represents the current state of the consumer.
 #[derive(Debug, Default)]
 pub enum ConsumerState<T> {
     /// The consumer is not yet configured.
@@ -65,18 +81,15 @@ impl<T> ConsumerState<T> {
     ///
     /// # Returns
     ///
-    /// Returns a `Result` containing:
-    /// - `Ok(&ModeConfiguration)` if the consumer is in the `Configured` or
-    ///   `Running` state.
-    /// - `Err(ConsumerStateError::UnconfiguredConsumer)` if the consumer is in
-    ///   the `Unconfigured` state.
+    /// A reference to the `ModeConfiguration` if the consumer is in the
+    /// `Configured` or `Running` state.
     ///
     /// # Errors
     ///
-    /// This method will return `ConsumerStateError::UnconfiguredConsumer` if
-    /// the consumer has not been configured yet.
+    /// Returns `ConsumerStateError::UnconfiguredConsumer` if the consumer is in
+    /// the `Unconfigured` state.
     pub fn mode_configuration(&self) -> Result<&ModeConfiguration, ConsumerStateError> {
-        match &self {
+        match self {
             ConsumerState::Unconfigured => Err(ConsumerStateError::UnconfiguredConsumer),
             ConsumerState::Configured(config) | ConsumerState::Running { config, .. } => Ok(config),
         }
@@ -107,7 +120,7 @@ impl<T> Display for ConsumerState<T> {
 /// Errors that can occur during consumer state operations.
 #[derive(Debug, Error)]
 pub enum ConsumerStateError {
-    /// Error when attempting to use an unconfigured consumer.
+    /// Attempted to use an unconfigured consumer.
     #[error("unconfigured consumer; create a client with a valid consumer configuration")]
     UnconfiguredConsumer,
 }
