@@ -1,7 +1,8 @@
 //! Initializes and configures distributed tracing for the application.
 //!
-//! This module sets up OpenTelemetry with OTLP exporter and integrates it
-//! with the tracing subscriber.
+//! This module sets up OpenTelemetry with an OTLP exporter and integrates it
+//! with the tracing subscriber. It provides functionality to create a
+//! customizable tracing setup with optional additional layers.
 
 use opentelemetry::trace::{TraceError, TracerProvider};
 use opentelemetry_otlp::{new_exporter, new_pipeline};
@@ -20,7 +21,13 @@ use tracing_subscriber::{EnvFilter, Layer, Registry};
 ///
 /// This function sets up the OpenTelemetry tracer with OTLP exporter,
 /// creates a tracing subscriber with the OpenTelemetry layer, and sets
-/// it as the global default subscriber.
+/// it as the global default subscriber. It also allows for an optional
+/// additional layer to be added to the tracing subscriber.
+///
+/// # Arguments
+///
+/// * `layer` - An optional additional layer to be added to the tracing
+///   subscriber. Use Identity for T if layer is None.
 ///
 /// # Returns
 ///
@@ -32,8 +39,6 @@ use tracing_subscriber::{EnvFilter, Layer, Registry};
 /// This function can return a `TracingError` in the following cases:
 /// - If the trace exporter initialization fails
 /// - If setting the global default subscriber fails
-///
-/// Note: set T = Identity if layer is None
 pub fn initialize_tracing<T>(layer: Option<T>) -> Result<(), TracingError>
 where
     T: Layer<Layered<Option<OpenTelemetryLayer<Registry, Tracer>>, Registry>> + Send + Sync,
@@ -57,7 +62,23 @@ where
     Ok(())
 }
 
+/// Builds the OpenTelemetry layer for the tracing subscriber.
+///
+/// This function creates an OpenTelemetry tracer with an OTLP exporter
+/// and wraps it in a `tracing_opentelemetry::Layer`.
+///
+/// # Returns
+///
+/// Returns `Ok(OpenTelemetryLayer<Registry, Tracer>)` if successful,
+/// or a `TracingError` if an error occurs during the process.
+///
+/// # Errors
+///
+/// This function can return a `TracingError` in the following cases:
+/// - If the OTLP endpoint is not configured (`MissingOtlpEndpoint`)
+/// - If the trace exporter initialization fails (Exporter)
 fn build_telemetry_layer() -> Result<OpenTelemetryLayer<Registry, Tracer>, TracingError> {
+    // Check if the OTLP endpoint is configured
     if env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
         return Err(TracingError::MissingOtlpEndpoint);
     }
