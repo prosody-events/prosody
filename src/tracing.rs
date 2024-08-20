@@ -6,12 +6,15 @@
 use opentelemetry::trace::{TraceError, TracerProvider};
 use opentelemetry_otlp::{new_exporter, new_pipeline};
 use opentelemetry_sdk::runtime::Tokio;
+use opentelemetry_sdk::trace::Tracer;
+use std::env;
 use thiserror::Error;
 use tonic::transport::ClientTlsConfig;
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{set_global_default, SetGlobalDefaultError};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::layer::{Layered, SubscriberExt};
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// Initializes the tracing system with OpenTelemetry and OTLP exporter.
 ///
@@ -29,7 +32,36 @@ use tracing_subscriber::{EnvFilter, Registry};
 /// This function can return a `TracingError` in the following cases:
 /// - If the trace exporter initialization fails
 /// - If setting the global default subscriber fails
-pub fn initialize_tracing() -> Result<(), TracingError> {
+///
+/// Note: set T = Identity if layer is None
+pub fn initialize_tracing<T>(layer: Option<T>) -> Result<(), TracingError>
+where
+    T: Layer<Layered<Option<OpenTelemetryLayer<Registry, Tracer>>, Registry>> + Send + Sync,
+{
+    // Filter traces using an environment variable directive
+    let env_filter = EnvFilter::builder()
+        .with_env_var("PROSODY_LOG")
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+
+    // Create a tracing subscriber with OpenTelemetry layer
+    let telemetry = build_telemetry_layer().ok();
+    let subscriber = Registry::default()
+        .with(telemetry)
+        .with(layer)
+        .with(env_filter);
+
+    // Set the subscriber as the global default
+    set_global_default(subscriber)?;
+
+    Ok(())
+}
+
+fn build_telemetry_layer() -> Result<OpenTelemetryLayer<Registry, Tracer>, TracingError> {
+    if env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
+        return Err(TracingError::MissingOtlpEndpoint);
+    }
+
     // Create and install the OpenTelemetry tracer
     let tracer = new_pipeline()
         .tracing()
@@ -41,25 +73,16 @@ pub fn initialize_tracing() -> Result<(), TracingError> {
         .install_batch(Tokio)?
         .tracer("prosody");
 
-    // Filter traces using an environment variable directive
-    let env_filter = EnvFilter::builder()
-        .with_env_var("PROSODY_LOG")
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
-
-    // Create a tracing subscriber with OpenTelemetry layer
-    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-    let subscriber = Registry::default().with(telemetry).with(env_filter);
-
-    // Set the subscriber as the global default
-    set_global_default(subscriber)?;
-
-    Ok(())
+    Ok(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
 /// Errors that can occur during tracing initialization.
 #[derive(Debug, Error)]
 pub enum TracingError {
+    /// OTLP exporter could not be configured because no endpoint was configured
+    #[error("missing OTEL_EXPORTER_OTLP_ENDPOINT environment variable; can't initialize tracing")]
+    MissingOtlpEndpoint,
+
     /// Indicates a failure to initialize the trace exporter.
     #[error("failed to initialize the trace exporter: {0:#}")]
     Exporter(#[from] TraceError),
