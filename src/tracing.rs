@@ -17,6 +17,9 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
+/// A layer that does nothing
+pub type Identity = tracing_subscriber::layer::Identity;
+
 /// Initializes the tracing system with OpenTelemetry and OTLP exporter.
 ///
 /// This function sets up the OpenTelemetry tracer with OTLP exporter,
