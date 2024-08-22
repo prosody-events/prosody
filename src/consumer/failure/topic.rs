@@ -175,6 +175,7 @@ where
             ("source-offset", &offset.to_string()),
             ("source-timestamp", &timestamp),
             ("source-group-id", &self.group_id),
+            ("source-error", &error.to_string()),
         ];
 
         // Send the failed message to the failure topic
@@ -213,8 +214,6 @@ where
     }
 
     /// Shuts down the handler.
-    ///
-    /// This method is currently a no-op for `FailureTopicHandler`.
     async fn shutdown(self) {}
 }
 

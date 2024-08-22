@@ -284,9 +284,5 @@ where
     }
 
     /// Performs any necessary shutdown operations for the handler.
-    ///
-    /// This implementation does not require any specific shutdown behavior.
-    async fn shutdown(self) {
-        // No shutdown behavior needed for retry
-    }
+    async fn shutdown(self) {}
 }

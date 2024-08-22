@@ -52,6 +52,16 @@ impl MessageContext {
             }
         }
     }
+
+    /// Checks if a shutdown signal has been received.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a shutdown signal has been received, `false` otherwise.
+    #[must_use]
+    pub fn should_shutdown(&self) -> bool {
+        *self.shutdown_rx.borrow()
+    }
 }
 
 /// A message consumed from a topic with associated metadata and commit state.
@@ -121,6 +131,19 @@ impl UncommittedMessage {
             "committing message"
         );
         self.uncommitted_offset.commit();
+    }
+
+    /// Aborts the message, halting any further progress on this partition. This
+    /// should only be called during shutdown.
+    pub fn abort(self) {
+        debug!(
+            topic = %self.topic().as_ref(),
+            partition = %self.partition(),
+            key = %self.key(),
+            offset = %self.offset(),
+            "aborting message"
+        );
+        self.uncommitted_offset.abort();
     }
 }
 

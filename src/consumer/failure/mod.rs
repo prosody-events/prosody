@@ -11,6 +11,7 @@ use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::HandlerProvider;
 
 pub mod retry;
+pub mod shutdown;
 pub mod topic;
 
 /// Categorizes errors in message processing.
