@@ -214,8 +214,6 @@ where
     }
 
     /// Shuts down the handler.
-    ///
-    /// This method is currently a no-op for `FailureTopicHandler`.
     async fn shutdown(self) {}
 }
 

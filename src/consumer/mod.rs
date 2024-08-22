@@ -51,6 +51,7 @@ use whoami::fallible::hostname;
 
 use crate::consumer::context::Context;
 use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
+use crate::consumer::failure::shutdown::ShutdownStrategy;
 use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
 use crate::consumer::failure::{FailureStrategy, FallibleHandler};
 use crate::consumer::message::{MessageContext, UncommittedMessage};
@@ -408,7 +409,8 @@ impl ProsodyConsumer {
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let strategy = RetryStrategy::new(retry_config)?; // retry failures
+        let retry_strategy = RetryStrategy::new(retry_config)?; // retry failures
+        let strategy = ShutdownStrategy.and_then(retry_strategy);
         let handler = strategy.with_handler(handler);
         Self::new(consumer_config, handler)
     }
@@ -443,9 +445,14 @@ impl ProsodyConsumer {
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         let group_id = consumer_config.group_id.clone();
-        let strategy = RetryStrategy::new(retry_config.clone())? // retry processing up to limit
-            .and_then(FailureTopicStrategy::new(topic_config, group_id, producer)?) // write to failure topic
-            .and_then(RetryStrategy::new(retry_config)?); // retry writing to failure topic
+
+        let retry_strategy = RetryStrategy::new(retry_config)?;
+        let topic_strategy = FailureTopicStrategy::new(topic_config, group_id, producer)?;
+
+        let strategy = ShutdownStrategy // stop processing if shutting down partition
+            .and_then(retry_strategy.clone()) // retry processing up to limit
+            .and_then(topic_strategy) // write to failure topic
+            .and_then(retry_strategy); // retry writing to failure topic
 
         let handler = strategy.with_handler(handler);
         Self::new(consumer_config, handler)
