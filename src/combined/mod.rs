@@ -84,7 +84,12 @@ impl<T> CombinedClient<T> {
         failure_topic_builder: &FailureTopicConfigurationBuilder,
     ) -> Result<Self, CombinedClientError> {
         let producer_config = producer_builder.build()?;
-        let producer = ProsodyProducer::new(&producer_config)?;
+        let cloned_config = producer_config.clone();
+        let producer = match mode {
+            Mode::Pipeline => ProsodyProducer::pipeline_producer(cloned_config),
+            Mode::LowLatency => ProsodyProducer::low_latency_producer(cloned_config),
+        }?;
+
         let consumer = Mutex::new(ConsumerState::build(
             mode,
             consumer_builder,
