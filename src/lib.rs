@@ -200,7 +200,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use internment::Intern;
-use simd_json::owned::Value;
+use serde_json::Value;
 
 pub mod admin;
 pub mod consumer;

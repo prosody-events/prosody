@@ -15,7 +15,6 @@ use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
-use simd_json::owned::Value;
 use simd_json::to_vec;
 use std::io;
 use std::mem::take;
@@ -29,7 +28,7 @@ use whoami::fallible::hostname;
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::util::{from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env};
-use crate::Topic;
+use crate::{Payload, Topic};
 
 mod injector;
 
@@ -223,7 +222,7 @@ impl ProsodyProducer {
         headers: H,
         topic: Topic,
         key: &str,
-        payload: &Value,
+        payload: &Payload,
     ) -> Result<(), ProducerError>
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,

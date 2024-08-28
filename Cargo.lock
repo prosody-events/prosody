@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "prosody"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ahash",
  "chrono",
@@ -1307,6 +1307,7 @@ dependencies = [
  "rdkafka",
  "scc",
  "serde",
+ "serde_json",
  "simd-json",
  "thiserror",
  "tokio",
