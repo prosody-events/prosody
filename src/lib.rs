@@ -34,7 +34,7 @@
 //! use prosody::high_level::mode::Mode;
 //! use prosody::high_level::{HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
-//! use simd_json::json;
+//! use serde_json::json;
 //! use std::convert::Infallible;
 //! use std::error::Error;
 //!

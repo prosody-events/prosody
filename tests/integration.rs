@@ -72,7 +72,7 @@ use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt, HashSet};
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{eyre, OptionExt, Result};
 use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
@@ -80,10 +80,7 @@ use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::FromClientConfig;
 use rdkafka::ClientConfig;
-use simd_json::base::ValueAsScalar;
-use simd_json::derived::TypedScalarValue;
-use simd_json::owned::Value;
-use simd_json::{json, ValueBuilder};
+use serde_json::{json, Value};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::watch;
@@ -291,7 +288,7 @@ fn spawn_producers(
                 for message in messages {
                     producer.send([], topic, &key, &json!(message)).await?;
                 }
-                producer.send([], topic, &key, &Value::null()).await?;
+                producer.send([], topic, &key, &Value::Null).await?;
             }
             Ok(())
         });
@@ -349,15 +346,18 @@ fn spawn_message_verifier(
 
         info!("receiving messages");
         while let Some((key, payload)) = messages_rx.recv().await {
-            if let Some(number) = payload.as_u64() {
-                received.entry(key).or_default().push(number);
-            } else if payload.is_null() {
-                keys.remove(&key);
-                if keys.is_empty() {
-                    break;
+            match payload {
+                Value::Number(number) => {
+                    let number = number.as_u64().ok_or_eyre("invalid number")?;
+                    received.entry(key).or_default().push(number);
                 }
-            } else {
-                return Err(eyre!("unexpected payload type"));
+                Value::Null => {
+                    keys.remove(&key);
+                    if keys.is_empty() {
+                        break;
+                    }
+                }
+                _ => return Err(eyre!("unexpected payload type")),
             }
         }
 
