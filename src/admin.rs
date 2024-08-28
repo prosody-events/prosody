@@ -1,5 +1,4 @@
-//! This module provides functionality for administrative operations on Kafka
-//! topics.
+//! Provides functionality for administrative operations on Kafka topics.
 
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -10,6 +9,7 @@ use thiserror::Error;
 /// A client for performing administrative operations on Kafka topics.
 pub struct ProsodyAdminClient {
     client: AdminClient<DefaultClientContext>,
+    options: AdminOptions,
 }
 
 impl ProsodyAdminClient {
@@ -28,6 +28,7 @@ impl ProsodyAdminClient {
 
         Ok(Self {
             client: client_config.create()?,
+            options: AdminOptions::default(),
         })
     }
 
@@ -52,9 +53,23 @@ impl ProsodyAdminClient {
         let new_topic = NewTopic::new(name, i32::from(partition_count), replication);
 
         self.client
-            .create_topics([&new_topic], &AdminOptions::default())
+            .create_topics([&new_topic], &self.options)
             .await?;
 
+        Ok(())
+    }
+
+    /// Deletes a Kafka topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the topic to delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProsodyAdminClientError` if the topic deletion fails.
+    pub async fn delete_topic(&self, name: &str) -> Result<(), ProsodyAdminClientError> {
+        self.client.delete_topics(&[name], &self.options).await?;
         Ok(())
     }
 }

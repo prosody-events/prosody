@@ -75,11 +75,12 @@ use ahash::{HashMap, HashMapExt, HashSet};
 use color_eyre::eyre::{eyre, OptionExt, Result};
 use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
+use prosody::admin::ProsodyAdminClient;
+use prosody::consumer::message::{MessageContext, UncommittedMessage};
+use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
+use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::Topic;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::client::DefaultClientContext;
-use rdkafka::config::FromClientConfig;
-use rdkafka::ClientConfig;
 use serde_json::{json, Value};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{channel, Sender};
@@ -88,11 +89,6 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
-
-use prosody::consumer::message::{MessageContext, UncommittedMessage};
-use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
-use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::Topic;
 
 /// Runs the main integration test to verify message ordering and completeness.
 #[test]
@@ -183,10 +179,7 @@ async fn run_test(input: TestInput) -> Result<()> {
     info!("test passed");
 
     // Delete the test topic
-    let admin_options = AdminOptions::default().operation_timeout(Some(Duration::from_secs(5)));
-    admin_client
-        .delete_topics(&[topic.as_ref()], &admin_options)
-        .await?;
+    admin_client.delete_topic(&topic).await?;
 
     info!("deleted test topic: {topic}");
 
@@ -200,25 +193,12 @@ async fn run_test(input: TestInput) -> Result<()> {
 ///
 /// # Errors
 /// Returns an error if topic creation fails.
-async fn create_test_topic(
-    partition_count: SmallCount,
-) -> Result<(Topic, AdminClient<DefaultClientContext>)> {
+async fn create_test_topic(partition_count: SmallCount) -> Result<(Topic, ProsodyAdminClient)> {
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
-    let mut config = ClientConfig::new();
-    config.set("bootstrap.servers", "localhost:9094");
-
-    let admin_options = AdminOptions::default().operation_timeout(Some(Duration::from_secs(5)));
-    let admin_client = AdminClient::from_config(&config)?;
+    let admin_client = ProsodyAdminClient::new(&["localhost:9094"])?;
 
     admin_client
-        .create_topics(
-            &[NewTopic::new(
-                &topic,
-                partition_count.value() as i32,
-                TopicReplication::Fixed(1),
-            )],
-            &admin_options,
-        )
+        .create_topic(&topic, partition_count.value() as u16, 1)
         .await?;
 
     info!("created topic: {topic}");
