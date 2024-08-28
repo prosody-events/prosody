@@ -227,7 +227,8 @@ fn check_topic_existence<S>(
     }
 }
 
-/// Identifies which topics from the given list are missing in the Kafka cluster.
+/// Identifies which topics from the given list are missing in the Kafka
+/// cluster.
 fn missing_topics(
     producer: &ProsodyProducer,
     mut topics: Vec<Topic>,

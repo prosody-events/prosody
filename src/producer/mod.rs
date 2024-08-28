@@ -114,7 +114,8 @@ impl ProsodyProducer {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance or a
+    /// `ProducerError`.
     ///
     /// # Errors
     ///
@@ -148,7 +149,8 @@ impl ProsodyProducer {
 
     /// Creates a new `ProsodyProducer` instance for pipeline processing.
     ///
-    /// This configuration sets the send timeout to `None`, allowing for indefinite retries.
+    /// This configuration sets the send timeout to `None`, allowing for
+    /// indefinite retries.
     ///
     /// # Arguments
     ///
@@ -156,7 +158,8 @@ impl ProsodyProducer {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance or a
+    /// `ProducerError`.
     ///
     /// # Errors
     ///
@@ -168,7 +171,8 @@ impl ProsodyProducer {
 
     /// Creates a new `ProsodyProducer` instance optimized for low latency.
     ///
-    /// This configuration ensures a send timeout is set, defaulting to 1 second if not specified.
+    /// This configuration ensures a send timeout is set, defaulting to 1 second
+    /// if not specified.
     ///
     /// # Arguments
     ///
@@ -176,7 +180,8 @@ impl ProsodyProducer {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance or a
+    /// `ProducerError`.
     ///
     /// # Errors
     ///

@@ -15,12 +15,13 @@ integrated OpenTelemetry support for distributed tracing.
 
 - **Kafka Consumer**: Efficiently consume messages with support for offset management and consumer groups.
 - **Kafka Producer**: Reliably produce messages with idempotent delivery.
-- **Distributed Tracing**: Seamless integration with OpenTelemetry for enhanced observability in microservice
-  architectures.
+- **Distributed Tracing**: Seamless integration with OpenTelemetry for enhanced observability in microservice architectures.
 - **Configurable**: Flexible configuration through environment variables.
 - **Asynchronous**: Built on top of Tokio for high-performance asynchronous operations.
 - **Backpressure Management**: Intelligent partition pausing to handle processing backlogs.
 - **Mocking Support**: Ability to use mock Kafka brokers for testing purposes.
+- **High-Level Client**: Unified management of producer and consumer operations.
+- **Failure Handling**: Configurable strategies for handling message processing failures.
 
 ## Usage
 
@@ -31,98 +32,85 @@ Add Prosody to your `Cargo.toml`:
 prosody = { git = "https://github.com/RealGeeks/prosody.git" }
 ```
 
-### Producer Example
+### High-Level Client Example
 
 ```rust
-use prosody::Topic;
-use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use serde_json::json;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-   let config = ProducerConfiguration::builder()
-     .bootstrap_servers(["localhost:9092".to_owned()])
-     .mock(true) // use mock producer for example
-     .build()?;
-
-   let producer = ProsodyProducer::new(&config)?;
-
-   let topic: Topic = "my-topic".into();
-   producer.send([], topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
-
-   Ok(())
-}
-```
-
-### Consumer Example
-
-```rust
+use prosody::high_level::{HighLevelClient, ModeConfiguration};
+use prosody::consumer::failure::FallibleHandler;
+use prosody::producer::ProducerConfiguration;
+use prosody::consumer::ConsumerConfiguration;
+use prosody::consumer::failure::retry::RetryConfiguration;
+use prosody::high_level::mode::Mode;
 use prosody::consumer::message::{MessageContext, UncommittedMessage};
-use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
-use prosody::{Partition, Topic};
-use std::time::Duration;
+use prosody::consumer::failure::FailureTopicConfigurationBuilder;
+use serde_json::json;
+use std::error::Error;
 
 #[derive(Clone)]
-struct MyEventHandler;
+struct MyHandler;
 
-impl EventHandler for MyEventHandler {
-   async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
-      println!("Received: {:?}", message);
-      message.commit();
-   }
+impl FallibleHandler for MyHandler {
+    type Error = Box<dyn Error + Send + Sync>;
 
-   async fn shutdown(self) {}
+    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) -> Result<(), Self::Error> {
+        println!("Received: {message:?}");
+        Ok(())
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-   let config = ConsumerConfiguration::builder()
-     .bootstrap_servers(["localhost:9092".to_owned()])
-     .group_id("my-group")
-     .subscribed_topics(["my-topic".to_owned()])
-     .mock(true) // use mock consumer for example
-     .build()?;
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(["localhost:9092".to_owned()])
+        .build()?;
 
-   let consumer = ProsodyConsumer::new(&config, MyEventHandler)?;
+    let consumer_config = ConsumerConfiguration::builder()
+        .bootstrap_servers(["localhost:9092".to_owned()])
+        .group_id("my-group")
+        .subscribed_topics(["my-topic".to_owned()])
+        .build()?;
 
-   // Run your application logic here, waiting for shutdown
+    let retry_config = RetryConfiguration::builder().build()?;
 
-   consumer.shutdown().await;
-   Ok(())
+    let client = HighLevelClient::new(
+        Mode::Pipeline,
+        &producer_config,
+        &consumer_config,
+        &retry_config,
+        &FailureTopicConfigurationBuilder::default().build()?,
+    )?;
+
+    client.subscribe(MyHandler)?;
+
+    let topic = "my-topic".into();
+    client.send([], topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
+
+    // Run your application logic here
+
+    client.unsubscribe().await?;
+    Ok(())
 }
 ```
 
-## High-Level Constructors
+## High-Level Client Modes
 
-Prosody provides two high-level constructors for both consumers and producers to suit different application needs:
+Prosody's `HighLevelClient` supports two operational modes:
 
-### Pipeline Constructor
+### Pipeline Mode
 
-The pipeline constructors are designed for applications that require all messages to be processed or sent in order.
-These constructors ensure that all messages are handled sequentially, retrying failed operations indefinitely based on
-the provided retry configuration. They're suitable for applications where message order is critical and processing or
-sending must be guaranteed.
-
-Key features:
-
-- Ensures ordered handling of all messages
-- Retries failed operations indefinitely based on the retry configuration
+Designed for applications that require all messages to be processed or sent in order. It ensures:
+- Ordered handling of all messages
+- Indefinite retries for failed operations based on the retry configuration
 - Ideal for pipeline applications where order is crucial
 
-### Low-Latency Constructor
+### Low-Latency Mode
 
-The low-latency constructors are optimized for applications that prioritize quick processing or sending and can tolerate
-occasional message failures. These constructors attempt to handle messages rapidly and, if the operation continually
-fails after retries, either send the failed messages to a designated failure topic (for consumers) or return an error (
-for producers).
-
-Key features:
-
-- Prioritizes low-latency operations
-- Implements a retry mechanism for failed operations
-- For consumers: Sends persistently failing messages to a failure topic for later analysis or reprocessing
+Optimized for applications prioritizing quick processing or sending, tolerating occasional message failures. It features:
+- Low-latency operations
+- A retry mechanism for failed operations
+- For consumers: Sends persistently failing messages to a failure topic
 - For producers: Returns an error after a configurable number of retries
-- Ideal for applications where speed is crucial and failed messages can be handled separately or errors can be tolerated
+- Ideal for applications where speed is crucial and failed messages can be handled separately
 
 ## Configuration
 

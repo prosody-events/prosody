@@ -1,11 +1,10 @@
-//! A high-level Kafka client library with support for distributed tracing.
+//! # Prosody
 //!
-//! Prosody provides abstractions for interacting with Apache Kafka,
-//! offering both consumer and producer implementations. It integrates
-//! OpenTelemetry for distributed tracing, allowing for better observability
-//! in microservice architectures.
+//! Prosody is a high-level Kafka client library for Rust, featuring robust
+//! consumer and producer implementations with integrated OpenTelemetry support
+//! for distributed tracing.
 //!
-//! # Features
+//! ## Features
 //!
 //! - **Kafka Consumer**: Efficiently consume messages with support for offset
 //!   management and consumer groups.
@@ -19,70 +18,111 @@
 //!   processing backlogs.
 //! - **Mocking Support**: Ability to use mock Kafka brokers for testing
 //!   purposes.
+//! - **High-Level Client**: Unified management of producer and consumer
+//!   operations.
+//! - **Failure Handling**: Configurable strategies for handling message
+//!   processing failures.
 //!
-//! # Examples
+//! ## High-Level Client Example
 //!
-//! ## Producer Example
-//!
-//! ```rust
-//! use prosody::Topic;
-//! use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+//! ```no_run
+//! use prosody::consumer::ConsumerConfiguration;
+//! use prosody::consumer::failure::retry::RetryConfiguration;
+//! use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
+//! use prosody::consumer::failure::{FallibleHandler, ClassifyError};
+//! use prosody::consumer::message::{ConsumerMessage, MessageContext};
+//! use prosody::high_level::mode::Mode;
+//! use prosody::high_level::{HighLevelClient};
+//! use prosody::producer::ProducerConfiguration;
 //! use serde_json::json;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ProducerConfiguration::builder()
-//!         .bootstrap_servers(["localhost:9092".to_owned()])
-//!         .mock(true) // use mock producer for example
-//!         .build()?;
-//!
-//!     let producer = ProsodyProducer::new(&config)?;
-//!
-//!     let topic: Topic = "my-topic".into();
-//!     producer.send([], topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Consumer Example
-//!
-//! ```rust
-//! use prosody::consumer::message::{MessageContext, UncommittedMessage};
-//! use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
-//! use prosody::{Partition, Topic};
-//! use std::time::Duration;
+//! use std::convert::Infallible;
+//! use std::error::Error;
 //!
 //! #[derive(Clone)]
-//! struct MyEventHandler;
+//! struct MyHandler;
 //!
-//! impl EventHandler for MyEventHandler {
-//!     async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
-//!         println!("Received: {:?}", message);
-//!         message.commit();
+//! impl FallibleHandler for MyHandler {
+//!     type Error = Infallible;
+//!
+//!     async fn on_message(
+//!         &self,
+//!         context: MessageContext,
+//!         message: ConsumerMessage
+//!     ) -> Result<(), Self::Error> {
+//!         println!("Received: {message:?}");
+//!         Ok(())
 //!     }
-//!
-//!     // shutdown is called whenever a partition is revoked
-//!     async fn shutdown(self) {}
 //! }
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ConsumerConfiguration::builder()
-//!         .bootstrap_servers(["localhost:9092".to_owned()])
+//!     let bootstrap_servers = ["localhost:9092".to_owned()];
+//!
+//!     let mut producer_config = ProducerConfiguration::builder();
+//!     producer_config.bootstrap_servers(bootstrap_servers.clone());
+//!
+//!     let mut consumer_config = ConsumerConfiguration::builder();
+//!     consumer_config.bootstrap_servers(bootstrap_servers)
 //!         .group_id("my-group")
-//!         .subscribed_topics(["my-topic".to_owned()])
-//!         .mock(true) // use mock consumer for example
-//!         .build()?;
+//!         .subscribed_topics(["my-topic".to_owned()]);
 //!
-//!     let consumer = ProsodyConsumer::new::<MyEventHandler>(&config, MyEventHandler)?;
+//!     let retry_config = RetryConfiguration::builder();
 //!
-//!     // Run your application logic here, waiting for shutdown
+//!     let client = HighLevelClient::new(
+//!         Mode::Pipeline,
+//!         &producer_config,
+//!         &consumer_config,
+//!         &retry_config,
+//!         &FailureTopicConfigurationBuilder::default(),
+//!     )?;
 //!
-//!     consumer.shutdown().await;
+//!     client.subscribe(MyHandler)?;
+//!
+//!     let topic = "my-topic".into();
+//!     client.send(topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
+//!
+//!     // Run your application logic here
+//!
+//!     client.unsubscribe().await?;
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## High-Level Client Modes
+//!
+//! Prosody's `HighLevelClient` supports two operational modes:
+//!
+//! ### Pipeline Mode
+//!
+//! Designed for applications that require all messages to be processed or sent
+//! in order. It ensures:
+//! - Ordered handling of all messages
+//! - Indefinite retries for failed operations based on the retry configuration
+//! - Ideal for pipeline applications where order is crucial
+//!
+//! ### Low-Latency Mode
+//!
+//! Optimized for applications prioritizing quick processing or sending,
+//! tolerating occasional message failures. It features:
+//! - Low-latency operations
+//! - A retry mechanism for failed operations
+//! - For consumers: Sends persistently failing messages to a failure topic
+//! - For producers: Returns an error after a configurable number of retries
+//! - Ideal for applications where speed is crucial and failed messages can be
+//!   handled separately
+//!
+//! ## Configuration
+//!
+//! Prosody can be configured through environment variables or programmatically
+//! using the builder pattern. Both `ConsumerConfiguration` and
+//! `ProducerConfiguration` use this approach. The builder pattern automatically
+//! falls back to environment variables for any unspecified field. This means
+//! you can mix and match programmatic configuration with environment variables,
+//! giving you flexibility in how you set up your Kafka clients.
+//!
+//! For a full list of configuration options and their associated environment
+//! variables, please refer to the README.
+//!
 //!
 //! # Architecture
 //!
