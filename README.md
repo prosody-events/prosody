@@ -35,24 +35,29 @@ prosody = { git = "https://github.com/RealGeeks/prosody.git" }
 ### High-Level Client Example
 
 ```rust
-use prosody::high_level::{HighLevelClient, ModeConfiguration};
-use prosody::consumer::failure::FallibleHandler;
-use prosody::producer::ProducerConfiguration;
 use prosody::consumer::ConsumerConfiguration;
 use prosody::consumer::failure::retry::RetryConfiguration;
+use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
+use prosody::consumer::failure::{FallibleHandler, ClassifyError};
+use prosody::consumer::message::{ConsumerMessage, MessageContext};
 use prosody::high_level::mode::Mode;
-use prosody::consumer::message::{MessageContext, UncommittedMessage};
-use prosody::consumer::failure::FailureTopicConfigurationBuilder;
+use prosody::high_level::{HighLevelClient};
+use prosody::producer::ProducerConfiguration;
 use serde_json::json;
+use std::convert::Infallible;
 use std::error::Error;
 
 #[derive(Clone)]
 struct MyHandler;
 
 impl FallibleHandler for MyHandler {
-    type Error = Box<dyn Error + Send + Sync>;
+    type Error = Infallible;
 
-    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) -> Result<(), Self::Error> {
+    async fn on_message(
+        &self,
+        context: MessageContext,
+        message: ConsumerMessage
+    ) -> Result<(), Self::Error> {
         println!("Received: {message:?}");
         Ok(())
     }
@@ -60,30 +65,30 @@ impl FallibleHandler for MyHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let producer_config = ProducerConfiguration::builder()
-        .bootstrap_servers(["localhost:9092".to_owned()])
-        .build()?;
+    let bootstrap_servers = ["localhost:9092".to_owned()];
 
-    let consumer_config = ConsumerConfiguration::builder()
-        .bootstrap_servers(["localhost:9092".to_owned()])
+    let mut producer_config = ProducerConfiguration::builder();
+    producer_config.bootstrap_servers(bootstrap_servers.clone());
+
+    let mut consumer_config = ConsumerConfiguration::builder();
+    consumer_config.bootstrap_servers(bootstrap_servers)
         .group_id("my-group")
-        .subscribed_topics(["my-topic".to_owned()])
-        .build()?;
+        .subscribed_topics(["my-topic".to_owned()]);
 
-    let retry_config = RetryConfiguration::builder().build()?;
+    let retry_config = RetryConfiguration::builder();
 
     let client = HighLevelClient::new(
         Mode::Pipeline,
         &producer_config,
         &consumer_config,
         &retry_config,
-        &FailureTopicConfigurationBuilder::default().build()?,
+        &FailureTopicConfigurationBuilder::default(),
     )?;
 
     client.subscribe(MyHandler)?;
 
     let topic = "my-topic".into();
-    client.send([], topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
+    client.send(topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
 
     // Run your application logic here
 
