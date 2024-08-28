@@ -4,6 +4,7 @@
 //! and composing failure handling strategies in asynchronous
 //! message processing systems.
 
+use std::convert::Infallible;
 use std::fmt::Display;
 use std::future::Future;
 
@@ -116,5 +117,11 @@ where
     {
         // Apply the second strategy to the result of applying the first strategy
         self.1.with_handler(self.0.with_handler(handler))
+    }
+}
+
+impl ClassifyError for Infallible {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Terminal
     }
 }

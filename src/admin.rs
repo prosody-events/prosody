@@ -1,4 +1,5 @@
-//! This module provides functionality for administrative operations on Kafka topics.
+//! This module provides functionality for administrative operations on Kafka
+//! topics.
 
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
