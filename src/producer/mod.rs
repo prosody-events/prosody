@@ -4,20 +4,21 @@
 //! Kafka topics. It handles configuration, message serialization, and injection
 //! of OpenTelemetry context for distributed tracing.
 
-use std::io;
-use std::mem::take;
-use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
-
 use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
+use rdkafka::client::{Client, DefaultClientContext};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, OwnedHeaders};
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::future_producer::FutureProducerContext;
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
 use serde_json::{to_vec, Value};
+use std::io;
+use std::mem::take;
+use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -38,8 +39,6 @@ pub struct ProducerConfiguration {
     ///
     /// Environment variable: `PROSODY_BOOTSTRAP_SERVERS`
     /// Default: None (must be specified)
-    ///
-    /// At least one server must be specified.
     #[builder(default = "from_vec_env(\"PROSODY_BOOTSTRAP_SERVERS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
@@ -49,10 +48,7 @@ pub struct ProducerConfiguration {
     /// Environment variable: `PROSODY_SEND_TIMEOUT`
     /// Default: 1 second
     ///
-    /// If set to None (or if the environment variable is set to "none"), the
-    /// sender will retry indefinitely and never timeout. This may be
-    /// appropriate for consumers that produce to topics, as the consumed
-    /// message may not be marked as complete until the message is produced.
+    /// If set to `None`, the sender will retry indefinitely.
     #[builder(
         default = "from_option_duration_env_with_fallback(\"PROSODY_SEND_TIMEOUT\", \
                    Duration::from_secs(1))?",
@@ -118,8 +114,7 @@ impl ProsodyProducer {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance or a `ProducerError`.
     ///
     /// # Errors
     ///
@@ -130,10 +125,7 @@ impl ProsodyProducer {
     pub fn new(config: &ProducerConfiguration) -> Result<Self, ProducerError> {
         config.validate()?;
 
-        let send_timeout = match config.send_timeout {
-            None => Timeout::Never,
-            Some(duration) => Timeout::After(duration),
-        };
+        let send_timeout = config.send_timeout.map_or(Timeout::Never, Timeout::After);
 
         let mut client_config = ClientConfig::new();
         client_config
@@ -156,8 +148,7 @@ impl ProsodyProducer {
 
     /// Creates a new `ProsodyProducer` instance for pipeline processing.
     ///
-    /// This configuration sets the send timeout to None, allowing for
-    /// indefinite retries.
+    /// This configuration sets the send timeout to `None`, allowing for indefinite retries.
     ///
     /// # Arguments
     ///
@@ -165,8 +156,7 @@ impl ProsodyProducer {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance or a `ProducerError`.
     ///
     /// # Errors
     ///
@@ -178,8 +168,7 @@ impl ProsodyProducer {
 
     /// Creates a new `ProsodyProducer` instance optimized for low latency.
     ///
-    /// This configuration ensures a send timeout is set, defaulting to 1 second
-    /// if not specified.
+    /// This configuration ensures a send timeout is set, defaulting to 1 second if not specified.
     ///
     /// # Arguments
     ///
@@ -187,8 +176,7 @@ impl ProsodyProducer {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance or a `ProducerError`.
     ///
     /// # Errors
     ///
@@ -196,8 +184,7 @@ impl ProsodyProducer {
     pub fn low_latency_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
-        };
-
+        }
         Self::new(&config)
     }
 
@@ -271,6 +258,13 @@ impl ProsodyProducer {
             .record("offset", offset);
 
         Ok(())
+    }
+
+    /// Retrieves the underlying Kafka client.
+    ///
+    /// This method is primarily used for internal purposes.
+    pub(crate) fn kafka_client(&self) -> &Client<FutureProducerContext<DefaultClientContext>> {
+        self.producer.client()
     }
 }
 

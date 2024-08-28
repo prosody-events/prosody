@@ -5,7 +5,6 @@
 //! methods for building and accessing configuration details. It also includes a
 //! custom error type for handling configuration-related errors.
 
-use crate::combined::mode::Mode;
 use crate::consumer::failure::retry::{
     RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
 };
@@ -16,6 +15,8 @@ use crate::consumer::failure::topic::{
 use crate::consumer::{
     ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerConfigurationBuilderError,
 };
+use crate::high_level::mode::Mode;
+use crate::Topic;
 use thiserror::Error;
 
 /// Configuration for different operational modes of the Prosody client.
@@ -52,13 +53,12 @@ impl ModeConfiguration {
     ///
     /// # Returns
     ///
-    /// Returns a `Result` containing the built `ModeConfiguration` if
-    /// successful, or a `ModeConfigurationError` if any of the builds fail.
+    /// A `Result` containing the built `ModeConfiguration` if successful, or a
+    /// `ModeConfigurationError` if any of the builds fail.
     ///
     /// # Errors
     ///
-    /// This function will return an error if any of the configuration builds
-    /// fail.
+    /// Returns an error if any of the configuration builds fail.
     pub(crate) fn build(
         mode: Mode,
         consumer_builder: &ConsumerConfigurationBuilder,
@@ -79,6 +79,28 @@ impl ModeConfiguration {
                 }
             }
         })
+    }
+
+    /// Returns topics mentioned in the configuration.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `Topic`s configured for the current mode.
+    #[must_use]
+    pub fn configured_topics(&self) -> Vec<Topic> {
+        match self {
+            Self::Pipeline { consumer, .. } => subscription(consumer).collect(),
+            Self::LowLatency {
+                consumer,
+                failure_topic,
+                ..
+            } => {
+                let mut topics = Vec::with_capacity(consumer.subscribed_topics.len() + 1);
+                topics.extend(subscription(consumer));
+                topics.push(failure_topic.failure_topic.as_str().into());
+                topics
+            }
+        }
     }
 
     /// Returns the mode of the configuration.
@@ -122,4 +144,21 @@ pub enum ModeConfigurationError {
     /// Error when the failure topic configuration is invalid.
     #[error("invalid failure topic configuration: {0:#}")]
     FailureTopic(#[from] FailureTopicConfigurationBuilderError),
+}
+
+/// Creates an iterator over the subscribed topics in a consumer configuration.
+///
+/// # Arguments
+///
+/// * `consumer` - The consumer configuration to extract topics from.
+///
+/// # Returns
+///
+/// An iterator that yields `Topic`s from the consumer's subscribed topics.
+fn subscription(consumer: &ConsumerConfiguration) -> impl Iterator<Item = Topic> + '_ {
+    consumer
+        .subscribed_topics
+        .iter()
+        .map(AsRef::as_ref)
+        .map(Topic::from)
 }

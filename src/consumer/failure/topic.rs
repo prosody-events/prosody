@@ -27,7 +27,7 @@ pub struct FailureTopicConfiguration {
     /// The topic to which messages that have failed processing will be sent.
     #[builder(default = "from_env(\"PROSODY_FAILURE_TOPIC\")?", setter(into))]
     #[validate(length(min = 1_u64))]
-    failure_topic: String,
+    pub failure_topic: String,
 }
 
 impl FailureTopicConfiguration {

@@ -162,8 +162,9 @@
 use internment::Intern;
 use serde_json::Value;
 
-pub mod combined;
+pub mod admin;
 pub mod consumer;
+pub mod high_level;
 pub mod producer;
 pub mod propagator;
 pub mod tracing;

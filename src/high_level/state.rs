@@ -4,11 +4,11 @@
 //! of the consumer, along with methods for building and displaying the state.
 //! It also includes a custom error type for handling state-related errors.
 
-use crate::combined::config::ModeConfiguration;
-use crate::combined::mode::Mode;
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ProsodyConsumer};
+use crate::high_level::config::ModeConfiguration;
+use crate::high_level::mode::Mode;
 use parking_lot::MutexGuard;
 use std::fmt;
 use std::fmt::{Display, Formatter};
@@ -75,10 +75,6 @@ impl<T> ConsumerState<T> {
 
     /// Retrieves a reference to the `ModeConfiguration` if available.
     ///
-    /// This method provides access to the mode configuration of the consumer,
-    /// which contains details about the operational mode and associated
-    /// settings.
-    ///
     /// # Returns
     ///
     /// A reference to the `ModeConfiguration` if the consumer is in the
@@ -97,15 +93,6 @@ impl<T> ConsumerState<T> {
 }
 
 impl<T> Display for ConsumerState<T> {
-    /// Formats the `ConsumerState` as a human-readable string.
-    ///
-    /// # Arguments
-    ///
-    /// * `f` - A mutable reference to the `Formatter`.
-    ///
-    /// # Returns
-    ///
-    /// A `fmt::Result` indicating whether the operation was successful.
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let state = match self {
             ConsumerState::Unconfigured => "unconfigured",
