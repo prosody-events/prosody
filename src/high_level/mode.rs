@@ -55,13 +55,11 @@ impl FromStr for Mode {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the parsed `Mode` or a `ModeError` if parsing
-    /// fails.
+    /// A `Result` containing the parsed `Mode` or a `ModeError` if parsing fails.
     ///
     /// # Errors
     ///
-    /// Returns a `ModeError::UnknownMode` if the input string is not a valid
-    /// mode.
+    /// Returns a `ModeError::UnknownMode` if the input string is not a valid mode.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             PIPELINE_MODE => Ok(Mode::Pipeline),

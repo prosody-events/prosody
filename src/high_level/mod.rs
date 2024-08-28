@@ -1,16 +1,16 @@
-//! Combined client module for managing both producer and consumer operations.
+//! High-level client module for managing both producer and consumer operations.
 //!
-//! This module provides a `CombinedClient` struct that encapsulates both
+//! This module provides a `HighLevelClient` struct that encapsulates both
 //! producer and consumer functionality, allowing for unified management of
 //! message production and consumption in various operational modes.
 
-use crate::combined::config::ModeConfiguration;
-use crate::combined::mode::Mode;
-use crate::combined::state::{ConsumerState, ConsumerStateView};
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::failure::FallibleHandler;
 use crate::consumer::{ConsumerConfigurationBuilder, ConsumerError, ProsodyConsumer};
+use crate::high_level::config::ModeConfiguration;
+use crate::high_level::mode::Mode;
+use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::producer::{
     ProducerConfiguration, ProducerConfigurationBuilder, ProducerConfigurationBuilderError,
     ProducerError, ProsodyProducer,
@@ -20,6 +20,7 @@ use crate::{Payload, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use parking_lot::Mutex;
 use std::mem::take;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::info;
 
@@ -29,14 +30,14 @@ pub mod state;
 
 /// A combined client that manages both producer and consumer operations.
 #[derive(Debug)]
-pub struct CombinedClient<T> {
+pub struct HighLevelClient<T> {
     producer: ProsodyProducer,
     producer_config: ProducerConfiguration,
     consumer: Mutex<ConsumerState<T>>,
     propagator: TextMapCompositePropagator,
 }
 
-impl<T> CombinedClient<T> {
+impl<T> HighLevelClient<T> {
     /// Returns a reference to the internal `ProsodyProducer`.
     pub fn producer(&self) -> &ProsodyProducer {
         &self.producer
@@ -47,17 +48,17 @@ impl<T> CombinedClient<T> {
         &self.producer_config
     }
 
-    /// Returns a reference to the current consumer state.
+    /// Returns a view of the current consumer state.
     pub fn consumer_state(&self) -> ConsumerStateView<T> {
         ConsumerStateView(self.consumer.lock())
     }
 
-    /// Returns a reference to an OpenTelemetry propagator.
+    /// Returns a reference to the OpenTelemetry propagator.
     pub fn propagator(&self) -> &TextMapCompositePropagator {
         &self.propagator
     }
 
-    /// Creates a new `CombinedClient` with the specified configurations.
+    /// Creates a new `HighLevelClient` with the specified configurations.
     ///
     /// # Arguments
     ///
@@ -67,22 +68,19 @@ impl<T> CombinedClient<T> {
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
     ///
-    /// # Returns
-    ///
-    /// A new `CombinedClient` if successful.
-    ///
     /// # Errors
     ///
-    /// Returns a `CombinedClientError` if:
+    /// Returns a `HighLevelClientError` if:
     /// - Any of the configuration builds fail.
     /// - Producer initialization fails.
+    /// - Required topics are not found.
     pub fn new(
         mode: Mode,
         producer_builder: &ProducerConfigurationBuilder,
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
-    ) -> Result<Self, CombinedClientError> {
+    ) -> Result<Self, HighLevelClientError> {
         let producer_config = producer_builder.build()?;
         let cloned_config = producer_config.clone();
         let producer = match mode {
@@ -90,12 +88,12 @@ impl<T> CombinedClient<T> {
             Mode::LowLatency => ProsodyProducer::low_latency_producer(cloned_config),
         }?;
 
-        let consumer = Mutex::new(ConsumerState::build(
-            mode,
-            consumer_builder,
-            retry_builder,
-            failure_topic_builder,
-        ));
+        let consumer_state =
+            ConsumerState::build(mode, consumer_builder, retry_builder, failure_topic_builder);
+
+        check_topic_existence(&producer, &consumer_state)?;
+
+        let consumer = Mutex::new(consumer_state);
 
         Ok(Self {
             producer,
@@ -115,13 +113,13 @@ impl<T> CombinedClient<T> {
     ///
     /// # Errors
     ///
-    /// Returns a `CombinedClientError` if the send operation fails.
+    /// Returns a `HighLevelClientError` if the send operation fails.
     pub async fn send(
         &self,
         topic: Topic,
         key: &str,
         payload: &Payload,
-    ) -> Result<(), CombinedClientError> {
+    ) -> Result<(), HighLevelClientError> {
         self.producer.send([], topic, key, payload).await?;
         Ok(())
     }
@@ -134,11 +132,11 @@ impl<T> CombinedClient<T> {
     ///
     /// # Errors
     ///
-    /// Returns a `CombinedClientError` if:
+    /// Returns a `HighLevelClientError` if:
     /// - The consumer is unconfigured.
     /// - The consumer is already subscribed.
     /// - Consumer initialization fails.
-    pub fn subscribe(&self, handler: T) -> Result<(), CombinedClientError>
+    pub fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
     where
         T: FallibleHandler,
     {
@@ -146,11 +144,11 @@ impl<T> CombinedClient<T> {
         let consumer_ref = &mut *guard;
 
         let config = match take(consumer_ref) {
-            ConsumerState::Unconfigured => return Err(CombinedClientError::UnconfiguredConsumer),
+            ConsumerState::Unconfigured => return Err(HighLevelClientError::UnconfiguredConsumer),
             ConsumerState::Configured(config) => config,
             running @ ConsumerState::Running { .. } => {
                 *consumer_ref = running;
-                return Err(CombinedClientError::AlreadySubscribed);
+                return Err(HighLevelClientError::AlreadySubscribed);
             }
         };
 
@@ -185,9 +183,9 @@ impl<T> CombinedClient<T> {
     ///
     /// # Errors
     ///
-    /// Returns a `CombinedClientError` if the consumer is not currently
+    /// Returns a `HighLevelClientError` if the consumer is not currently
     /// subscribed.
-    pub async fn unsubscribe(&self) -> Result<(), CombinedClientError> {
+    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError> {
         let consumer = {
             let mut guard = self.consumer.lock();
             let consumer_ref = &mut *guard;
@@ -195,7 +193,7 @@ impl<T> CombinedClient<T> {
             match take(consumer_ref) {
                 state @ (ConsumerState::Unconfigured | ConsumerState::Configured(_)) => {
                     *consumer_ref = state;
-                    return Err(CombinedClientError::NotSubscribed);
+                    return Err(HighLevelClientError::NotSubscribed);
                 }
                 ConsumerState::Running {
                     consumer, config, ..
@@ -212,9 +210,52 @@ impl<T> CombinedClient<T> {
     }
 }
 
-/// Errors that can occur in the `CombinedClient` operations.
+/// Checks if all required topics exist for the given consumer state.
+fn check_topic_existence<S>(
+    producer: &ProsodyProducer,
+    consumer_state: &ConsumerState<S>,
+) -> Result<(), HighLevelClientError> {
+    let ConsumerState::Configured(mode_config) = &consumer_state else {
+        return Ok(());
+    };
+
+    let missing_topics = missing_topics(producer, mode_config.configured_topics())?;
+    if missing_topics.is_empty() {
+        Ok(())
+    } else {
+        Err(HighLevelClientError::TopicsNotFound(missing_topics))
+    }
+}
+
+/// Identifies which topics from the given list are missing in the Kafka cluster.
+fn missing_topics(
+    producer: &ProsodyProducer,
+    mut topics: Vec<Topic>,
+) -> Result<Vec<Topic>, ProducerError> {
+    const TIMEOUT: Duration = Duration::from_secs(60);
+    let metadata = producer.kafka_client().fetch_metadata(None, TIMEOUT)?;
+
+    topics.sort_unstable();
+    topics.dedup();
+
+    for metadata_topic in metadata.topics() {
+        let topic_name = metadata_topic.name();
+        let Some(position) = topics.iter().position(|topic| topic.as_ref() == topic_name) else {
+            continue;
+        };
+
+        topics.swap_remove(position);
+        if topics.is_empty() {
+            return Ok(topics);
+        }
+    }
+
+    Ok(topics)
+}
+
+/// Errors that can occur in the `HighLevelClient` operations.
 #[derive(Debug, Error)]
-pub enum CombinedClientError {
+pub enum HighLevelClientError {
     /// Error when the producer configuration is invalid.
     #[error("invalid producer configuration: {0:#}")]
     ProducerConfiguration(#[from] ProducerConfigurationBuilderError),
@@ -238,4 +279,8 @@ pub enum CombinedClientError {
     /// Error when attempting to unsubscribe a not subscribed consumer.
     #[error("consumer is not subscribed")]
     NotSubscribed,
+
+    /// Error when required topics are not found in the Kafka cluster.
+    #[error("topics not found: {}", .0.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(", "))]
+    TopicsNotFound(Vec<Topic>),
 }
