@@ -15,7 +15,8 @@ use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
-use serde_json::{to_vec, Value};
+use simd_json::owned::Value;
+use simd_json::to_vec;
 use std::io;
 use std::mem::take;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
@@ -282,7 +283,7 @@ pub enum ProducerError {
 
     /// Indicates a failure to serialize the payload.
     #[error("failed to serialize payload: {0:#}")]
-    Serialization(#[from] serde_json::Error),
+    Serialization(#[from] simd_json::Error),
 
     /// Indicates a failure to set the message timestamp.
     #[error("failed to set timestamp: {0:#}")]

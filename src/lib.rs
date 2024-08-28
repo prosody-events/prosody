@@ -34,7 +34,7 @@
 //! use prosody::high_level::mode::Mode;
 //! use prosody::high_level::{HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
-//! use serde_json::json;
+//! use simd_json::json;
 //! use std::convert::Infallible;
 //! use std::error::Error;
 //!
@@ -200,7 +200,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use internment::Intern;
-use serde_json::Value;
+use simd_json::owned::Value;
 
 pub mod admin;
 pub mod consumer;

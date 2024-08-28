@@ -16,6 +16,8 @@ use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::util::Timeout;
 use rdkafka::{Message, Offset, Timestamp, TopicPartitionList};
+use simd_json::serde::from_reader_with_buffers;
+use simd_json::Buffers;
 use thiserror::Error;
 use tracing::field::Empty;
 use tracing::{error, info_span, warn};
@@ -50,6 +52,7 @@ pub fn poll<T>(
     T: HandlerProvider,
 {
     let propagator = new_propagator();
+    let mut buffers = Buffers::default();
     let mut last_version = watermark_version.load(Ordering::Acquire);
     let mut last_commit = Instant::now();
     let mut is_paused = false;
@@ -133,7 +136,7 @@ pub fn poll<T>(
             }
         };
 
-        let payload = match serde_json::from_slice(payload_data) {
+        let payload = match from_reader_with_buffers(payload_data, &mut buffers) {
             Ok(payload) => payload,
             Err(error) => {
                 error!("invalid payload: {error:#}; discarding message");
