@@ -91,7 +91,9 @@ impl<T> HighLevelClient<T> {
         let consumer_state =
             ConsumerState::build(mode, consumer_builder, retry_builder, failure_topic_builder);
 
-        check_topic_existence(&producer, &consumer_state)?;
+        if !producer_config.mock {
+            check_topic_existence(&producer, &consumer_state)?;
+        }
 
         let consumer = Mutex::new(consumer_state);
 
