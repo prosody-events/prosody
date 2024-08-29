@@ -22,9 +22,19 @@ impl ProsodyAdminClient {
     /// # Errors
     ///
     /// Returns a `ProsodyAdminClientError` if the client creation fails.
-    pub fn new(bootstrap_servers: &[&str]) -> Result<ProsodyAdminClient, ProsodyAdminClientError> {
+    pub fn new<T>(bootstrap_servers: &[T]) -> Result<ProsodyAdminClient, ProsodyAdminClientError>
+    where
+        T: AsRef<str>,
+    {
         let mut client_config = ClientConfig::new();
-        client_config.set("bootstrap.servers", bootstrap_servers.join(","));
+        client_config.set(
+            "bootstrap.servers",
+            bootstrap_servers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
 
         Ok(Self {
             client: client_config.create()?,
