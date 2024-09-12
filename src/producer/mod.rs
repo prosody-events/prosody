@@ -15,7 +15,6 @@ use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
-use simd_json::to_vec;
 use std::io;
 use std::mem::take;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
@@ -29,6 +28,12 @@ use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::util::{from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env};
 use crate::{Payload, Topic};
+
+#[cfg(target_arch = "arm")]
+use serde_json as json;
+
+#[cfg(not(target_arch = "arm"))]
+use simd_json as json;
 
 mod injector;
 
@@ -227,7 +232,7 @@ impl ProsodyProducer {
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
     {
-        let serialized = to_vec(&payload)?;
+        let serialized = json::to_vec(&payload)?;
         Span::current().record("payload_size", serialized.len());
 
         let mut record = FutureRecord::to(&topic)
@@ -282,7 +287,7 @@ pub enum ProducerError {
 
     /// Indicates a failure to serialize the payload.
     #[error("failed to serialize payload: {0:#}")]
-    Serialization(#[from] simd_json::Error),
+    Serialization(#[from] json::Error),
 
     /// Indicates a failure to set the message timestamp.
     #[error("failed to set timestamp: {0:#}")]
