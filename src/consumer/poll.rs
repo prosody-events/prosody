@@ -144,7 +144,7 @@ pub fn poll<T>(
         };
 
         #[cfg(target_arch = "arm")]
-        let payload = serde_json::from_slice::<crate::Payload>(payload_data);
+        let payload = serde_json::from_slice(payload_data);
 
         #[cfg(not(target_arch = "arm"))]
         let payload = from_reader_with_buffers(payload_data, &mut buffers);
