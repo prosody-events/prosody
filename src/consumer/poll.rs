@@ -16,8 +16,6 @@ use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::util::Timeout;
 use rdkafka::{Message, Offset, Timestamp, TopicPartitionList};
-use simd_json::serde::from_reader_with_buffers;
-use simd_json::Buffers;
 use thiserror::Error;
 use tracing::field::Empty;
 use tracing::{error, info_span, warn};
@@ -31,6 +29,12 @@ use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
 use crate::Key;
 
+#[cfg(not(target_arch = "arm"))]
+use simd_json::serde::from_reader_with_buffers;
+
+#[cfg(not(target_arch = "arm"))]
+use simd_json::Buffers;
+
 /// Polls messages from Kafka, processes them, and handles partition management.
 ///
 /// # Arguments
@@ -41,6 +45,7 @@ use crate::Key;
 /// * `watermark_version` - Current watermark version for offset tracking.
 /// * `managers` - Manager collection for handling partitions.
 /// * `shutdown` - Atomic boolean to signal shutdown.
+#[allow(clippy::too_many_lines)]
 pub fn poll<T>(
     poll_interval: Duration,
     commit_interval: Duration,
@@ -51,8 +56,10 @@ pub fn poll<T>(
 ) where
     T: HandlerProvider,
 {
-    let propagator = new_propagator();
+    #[cfg(not(target_arch = "arm"))]
     let mut buffers = Buffers::default();
+
+    let propagator = new_propagator();
     let mut last_version = watermark_version.load(Ordering::Acquire);
     let mut last_commit = Instant::now();
     let mut is_paused = false;
@@ -136,7 +143,13 @@ pub fn poll<T>(
             }
         };
 
-        let payload = match from_reader_with_buffers(payload_data, &mut buffers) {
+        #[cfg(target_arch = "arm")]
+        let payload = serde_json::from_slice::<crate::Payload>(payload_data);
+
+        #[cfg(not(target_arch = "arm"))]
+        let payload = from_reader_with_buffers(payload_data, &mut buffers);
+
+        let payload = match payload {
             Ok(payload) => payload,
             Err(error) => {
                 error!("invalid payload: {error:#}; discarding message");
