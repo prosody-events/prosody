@@ -17,6 +17,7 @@ use crate::producer::{
 };
 use crate::propagator::new_propagator;
 use crate::{Payload, Topic};
+use internment::Intern;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use parking_lot::Mutex;
 use std::mem::take;
@@ -243,7 +244,10 @@ fn missing_topics(
 
     for metadata_topic in metadata.topics() {
         let topic_name = metadata_topic.name();
-        let Some(position) = topics.iter().position(|topic| topic.as_ref() == topic_name) else {
+        let Some(position) = topics
+            .iter()
+            .position(|&topic| Intern::as_ref(topic) == topic_name)
+        else {
             continue;
         };
 
