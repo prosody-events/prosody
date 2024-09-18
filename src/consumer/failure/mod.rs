@@ -16,7 +16,7 @@ pub mod shutdown;
 pub mod topic;
 
 /// Categorizes errors in message processing.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub enum ErrorCategory {
     /// Error is temporary and recovery is possible
     Transient,
