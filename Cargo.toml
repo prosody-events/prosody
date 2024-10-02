@@ -41,7 +41,7 @@ rdkafka = { git = "https://github.com/fede1024/rust-rdkafka.git", rev = "bb76b5b
 ] }
 serde = "1.0"
 serde_json = "1.0"
-simd-json = { version = "0.13", features = ["serde_impl"], optional = true }
+simd-json = { version = "0.14", features = ["serde_impl"], optional = true }
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["macros", "sync"] }
 tokio-stream = "0.1"
@@ -53,7 +53,7 @@ validator = { version = "0.18", features = ["derive"] }
 whoami = "1.5"
 
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
-simd-json = { version = "0.13", features = ["serde_impl"] }
+simd-json = { version = "0.14", features = ["serde_impl"] }
 
 [dev-dependencies]
 color-eyre = "0.6"
