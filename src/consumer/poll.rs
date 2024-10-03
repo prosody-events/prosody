@@ -27,7 +27,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
-use crate::Key;
+use crate::{Key, Topic};
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_reader_with_buffers;
@@ -95,14 +95,18 @@ pub fn poll<T>(
         };
 
         // Extract message details and create tracing span
-        let topic = Intern::from(message.topic());
+        let topic: Topic = Intern::from(message.topic());
         let partition = message.partition();
         let offset = message.offset();
 
         let context = propagator.extract(&MessageExtractor::new(&message));
         let span = info_span!(
             "receive",
-            %topic, %partition, %offset, key = Empty, payload_size = Empty
+            partition,
+            offset,
+            topic = topic.as_ref(),
+            key = Empty,
+            payload_size = Empty
         );
 
         span.set_parent(context);
@@ -228,7 +232,11 @@ fn commit_watermarks<T>(
 
         let next_offset = Offset::Offset(watermark + 1);
         if let Err(error) = list.add_partition_offset(topic, *partition, next_offset) {
-            error!(%topic, %partition, %watermark, "failed to add offset to commit list: {error:#}");
+            error!(
+                topic = Topic::as_ref(*topic),
+                partition, watermark, "failed to add offset to commit list: {error:#}"
+            );
+
             success = false;
         }
     }

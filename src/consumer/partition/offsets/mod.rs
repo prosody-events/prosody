@@ -203,7 +203,7 @@ impl UncommittedOffset {
             return;
         };
 
-        warn!(%self.offset, "commit aborted");
+        warn!(self.offset, "commit aborted");
     }
 }
 
@@ -213,7 +213,7 @@ impl Drop for UncommittedOffset {
             return;
         };
 
-        warn!(%self.offset, "offset was dropped without committing");
+        warn!(self.offset, "offset was dropped without committing");
     }
 }
 

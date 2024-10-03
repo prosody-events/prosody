@@ -166,12 +166,18 @@ impl PartitionManager {
 
         // Send shutdown signal
         if let Err(error) = self.shutdown_tx.send(true) {
-            error!(%self.partition, "failed to send shutdown signal to handlers: {error:#}");
+            error!(
+                partition = self.partition,
+                "failed to send shutdown signal to handlers: {error:#}"
+            );
         }
 
         // Wait for the message processing task to complete
         if let Err(error) = self.handle.await {
-            error!(%self.partition, "error occurred while shutting down partition: {error:#}");
+            error!(
+                partition = self.partition,
+                "error occurred while shutting down partition: {error:#}"
+            );
             return None;
         }
 
