@@ -155,7 +155,10 @@ where
         // Handle terminal errors by aborting
         if matches!(error.classify_error(), ErrorCategory::Terminal) {
             info!(
-                %topic, %partition, %key, %offset,
+                topic,
+                partition,
+                key,
+                offset,
                 "terminal condition encountered while handling message: {error:#}; aborting"
             );
             return Err(FailureTopicError::Handler(error));
@@ -163,7 +166,10 @@ where
 
         // Log the error and prepare to send to failure topic
         error!(
-            %topic, %partition, %key, %offset,
+            topic,
+            partition,
+            key,
+            offset,
             "failed to process message: {error:#}; sending to {}",
             self.topic
         );

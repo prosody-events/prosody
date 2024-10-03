@@ -218,8 +218,8 @@ impl ProsodyProducer {
     /// - The system time cannot be retrieved
     /// - The Kafka send operation fails
     #[instrument(
-        skip(self, headers, payload),
-        fields(payload_size, partition, offset),
+        skip(self, topic, headers, payload),
+        fields(topic = topic.as_ref(), payload_size, partition, offset),
         err
     )]
     pub async fn send<'a, H>(

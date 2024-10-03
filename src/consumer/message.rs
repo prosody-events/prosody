@@ -124,10 +124,10 @@ impl UncommittedMessage {
     /// Commits the message, marking its offset as processed.
     pub fn commit(self) {
         debug!(
-            topic = %self.topic().as_ref(),
-            partition = %self.partition(),
-            key = %self.key(),
-            offset = %self.offset(),
+            topic = self.topic().as_ref(),
+            partition = self.partition(),
+            key = self.key(),
+            offset = self.offset(),
             "committing message"
         );
         self.uncommitted_offset.commit();
@@ -137,10 +137,10 @@ impl UncommittedMessage {
     /// should only be called during shutdown.
     pub fn abort(self) {
         debug!(
-            topic = %self.topic().as_ref(),
-            partition = %self.partition(),
-            key = %self.key(),
-            offset = %self.offset(),
+            topic = self.topic().as_ref(),
+            partition = self.partition(),
+            key = self.key(),
+            offset = self.offset(),
             "aborting message"
         );
         self.uncommitted_offset.abort();

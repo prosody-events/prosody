@@ -187,7 +187,11 @@ where
                     if attempt > self.max_retries {
                         // Log the final failure and return the error
                         error!(
-                            %topic, %partition, %key, %offset, %attempt,
+                            partition,
+                            key,
+                            offset,
+                            attempt,
+                            topic = topic.as_ref(),
                             "failed to handle message: {error:#}; maximum attempts reached"
                         );
                         return Err(error);
@@ -197,7 +201,11 @@ where
 
                     // Log the failure and retry information
                     error!(
-                        %topic, %partition, %key, %offset, %attempt,
+                        partition,
+                        key,
+                        offset,
+                        attempt,
+                        topic = topic.as_ref(),
                         "failed to handle message: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
@@ -205,15 +213,24 @@ where
                 }
                 ErrorCategory::Permanent => {
                     error!(
-                        %topic, %partition, %key, %offset, %attempt,
+                        partition,
+                        key,
+                        offset,
+                        attempt,
+                        topic = topic.as_ref(),
                         "permanently failed to handle message: {error:#}"
                     );
                     return Err(error);
                 }
                 ErrorCategory::Terminal => {
                     info!(
-                        %topic, %partition, %key, %offset, %attempt,
-                        "terminal condition encountered while handling message: {error:#}; aborting"
+                        partition,
+                        key,
+                        offset,
+                        attempt,
+                        topic = topic.as_ref(),
+                        "terminal condition encountered while handling message: {error:#}; \
+                         aborting"
                     );
                     return Err(error);
                 }
@@ -257,7 +274,11 @@ where
                 ErrorCategory::Transient => {
                     let sleep_time = self.sleep_time(attempt);
                     error!(
-                        %topic, %partition, %key, %offset, %attempt,
+                        partition,
+                        key,
+                        offset,
+                        attempt,
+                        topic = topic.as_ref(),
                         "failed to handle message: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
@@ -265,7 +286,11 @@ where
                 }
                 ErrorCategory::Permanent => {
                     error!(
-                        %topic, %partition, %key, %offset, %attempt,
+                        partition,
+                        key,
+                        offset,
+                        attempt,
+                        topic = topic.as_ref(),
                         "permanently failed to handle message: {error:#}; discarding message"
                     );
                     uncommitted_offset.commit();
@@ -273,8 +298,13 @@ where
                 }
                 ErrorCategory::Terminal => {
                     info!(
-                        %topic, %partition, %key, %offset, %attempt,
-                        "terminal condition encountered while handling message: {error:#}; aborting"
+                        partition,
+                        key,
+                        offset,
+                        attempt,
+                        topic = topic.as_ref(),
+                        "terminal condition encountered while handling message: {error:#}; \
+                         aborting"
                     );
                     uncommitted_offset.abort();
                     break;
