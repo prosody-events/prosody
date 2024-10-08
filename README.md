@@ -129,7 +129,7 @@ The following table lists the available configuration options and their associat
 | Environment Variable                 | Description                                                                                        | Default | Consumer | Producer |
 |--------------------------------------|----------------------------------------------------------------------------------------------------|---------|----------|----------|
 | `PROSODY_BOOTSTRAP_SERVERS`          | Comma-separated list of Kafka bootstrap servers                                                    | -       | ✓        | ✓        |
-| `PROSODY_GROUP_ID`                   | Consumer group ID                                                                                  | -       | ✓        |          |
+| `PROSODY_GROUP_ID`                   | Consumer group identifier                                                                          | -       | ✓        |          |
 | `PROSODY_SUBSCRIBED_TOPICS`          | Comma-separated list of topics to subscribe to                                                     | -       | ✓        |          |
 | `PROSODY_MAX_UNCOMMITTED`            | Maximum number of uncommitted messages per partition (max partition parallelism)                   | 32      | ✓        |          |
 | `PROSODY_MAX_ENQUEUED_PER_KEY`       | Maximum number of enqueued messages per key (additional messages backpressure)                     | 8       | ✓        |          |
