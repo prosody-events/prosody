@@ -130,22 +130,22 @@ environment variables, giving you flexibility in how you set up your Kafka clien
 
 The following table lists the available configuration options and their associated environment variables:
 
-| Environment Variable                 | Description                                                                      | Default | Consumer | Producer |
-|--------------------------------------|----------------------------------------------------------------------------------|---------|----------|----------|
-| `PROSODY_BOOTSTRAP_SERVERS`          | Comma-separated list of Kafka bootstrap servers                                  | -       | ✓        | ✓        |
-| `PROSODY_GROUP_ID`                   | Consumer group identifier                                                        | -       | ✓        |          |
-| `PROSODY_SUBSCRIBED_TOPICS`          | Comma-separated list of topics to subscribe to                                   | -       | ✓        |          |
-| `PROSODY_MAX_UNCOMMITTED`            | Maximum number of uncommitted messages per partition (max partition parallelism) | 32      | ✓        |          |
-| `PROSODY_MAX_ENQUEUED_PER_KEY`       | Maximum number of enqueued messages per key (additional messages backpressure)   | 8       | ✓        |          |
-| `PROSODY_PARTITION_SHUTDOWN_TIMEOUT` | Timeout for partition shutdown                                                   | 5s      | ✓        |          |
-| `PROSODY_POLL_INTERVAL`              | Maximum interval between poll operations                                         | 100ms   | ✓        |          |
-| `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations                                               | 1s      | ✓        |          |
-| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the low-latency mode producer                     | 1s      |          | ✓        |
-| `PROSODY_MOCK`                       | Use mock Kafka brokers for testing                                               | false   | ✓        | ✓        |
-| `PROSODY_RETRY_BASE`                 | Base retry exponential backoff delay                                             | 20ms    | ✓        |          |
-| `PROSODY_MAX_RETRIES`                | Maximum number of retries in low-latency mode                                    | 3       | ✓        |          |
-| `PROSODY_RETRY_MAX_DELAY`            | Maximum retry delay                                                              | 1m      | ✓        |          |
-| `PROSODY_FAILURE_TOPIC`              | Topic for failed messages in low-latency mode                                    | -       | ✓        |          |
+| Environment Variable                 | Description                                                                    | Default | Consumer | Producer |
+|--------------------------------------|--------------------------------------------------------------------------------|---------|----------|----------|
+| `PROSODY_BOOTSTRAP_SERVERS`          | Comma-separated list of Kafka bootstrap servers                                | -       | ✓        | ✓        |
+| `PROSODY_GROUP_ID`                   | Consumer group identifier                                                      | -       | ✓        |          |
+| `PROSODY_SUBSCRIBED_TOPICS`          | Comma-separated list of topics to subscribe to                                 | -       | ✓        |          |
+| `PROSODY_MAX_UNCOMMITTED`            | Maximum number of uncommitted messages per partition (partition concurrency)   | 32      | ✓        |          |
+| `PROSODY_MAX_ENQUEUED_PER_KEY`       | Maximum number of enqueued messages per key (additional messages backpressure) | 8       | ✓        |          |
+| `PROSODY_PARTITION_SHUTDOWN_TIMEOUT` | Timeout for partition shutdown                                                 | 5s      | ✓        |          |
+| `PROSODY_POLL_INTERVAL`              | Maximum interval between poll operations                                       | 100ms   | ✓        |          |
+| `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations                                             | 1s      | ✓        |          |
+| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the low-latency mode producer                   | 1s      |          | ✓        |
+| `PROSODY_MOCK`                       | Use mock Kafka brokers for testing                                             | false   | ✓        | ✓        |
+| `PROSODY_RETRY_BASE`                 | Base retry exponential backoff delay                                           | 20ms    | ✓        |          |
+| `PROSODY_MAX_RETRIES`                | Maximum number of retries in low-latency mode                                  | 3       | ✓        |          |
+| `PROSODY_RETRY_MAX_DELAY`            | Maximum retry delay                                                            | 1m      | ✓        |          |
+| `PROSODY_FAILURE_TOPIC`              | Topic for failed messages in low-latency mode                                  | -       | ✓        |          |
 
 ## Common Project Tasks
 
