@@ -25,13 +25,13 @@ futures = "0.3"
 humantime = "2.1"
 internment = "0.8"
 nohash-hasher = "0.2"
-opentelemetry = "0.25"
-opentelemetry-otlp = { version = "0.25", features = [
+opentelemetry = "0.26"
+opentelemetry-otlp = { version = "0.26", features = [
     "gzip-tonic",
     "tls",
     "tls-roots",
 ] }
-opentelemetry_sdk = { version = "0.25", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
 parking_lot = "0.12"
 pin-project = "1.1"
 rand = "0.8"
@@ -43,11 +43,11 @@ serde = "1.0"
 serde_json = "1.0"
 simd-json = { version = "0.14", features = ["serde_impl"], optional = true }
 thiserror = "1.0"
-tokio = { version = "1.38", features = ["macros", "sync"] }
+tokio = { version = "1.40", features = ["macros", "sync"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["gzip", "tls", "tls-roots"] }
 tracing = { version = "0.1", features = ["log"] }
-tracing-opentelemetry = "0.26"
+tracing-opentelemetry = "0.27"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 validator = { version = "0.18", features = ["derive"] }
 whoami = "1.5"
