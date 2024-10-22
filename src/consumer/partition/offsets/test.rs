@@ -4,6 +4,8 @@
 //! functioning of the `OffsetTracker`, focusing on watermark tracking and
 //! committing.
 
+use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation};
+use crate::Offset;
 use ahash::{HashMap, HashMapExt, HashSet};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
@@ -11,9 +13,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
-
-use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation};
-use crate::Offset;
 
 /// A wrapper for a vector of Actions used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
