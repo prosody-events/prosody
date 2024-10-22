@@ -223,21 +223,23 @@ pub struct ConsumerConfiguration {
 
     /// Timeout for partition shutdown.
     ///
-    /// Environment variable: `PROSODY_PARTITION_SHUTDOWN_TIMEOUT`
-    /// Default: 5 seconds
+    /// Environment variable: `PROSODY_STALL_THRESHOLD`
+    /// Default: 15 seconds
     ///
-    /// If set to None (or if the environment variable is set to "none"), the
-    /// partition will immediately be shutdown without waiting for in-flight
-    /// tasks to complete. As these tasks will not be committed, they will be
-    /// retried when the partition is rebalanced to a new node. This may be
-    /// appropriate when performing user-facing processing where delays due to
-    /// rebalancing must be minimized.
+    /// This duration serves two purposes:
+    /// 1. It determines how long to wait for in-flight tasks to complete
+    ///    during partition shutdown. After this threshold is reached, any
+    ///    remaining tasks will be aborted.
+    /// 2. It is used by the liveness probe to determine if a partition's
+    ///    processing has stalled. If message processing takes longer than
+    ///    this duration, the partition is considered stalled, and the
+    ///    liveness probe will report an unhealthy status.
     #[builder(
-        default = "from_duration_env_with_fallback(\"PROSODY_PARTITION_SHUTDOWN_TIMEOUT\", \
-                   Duration::from_secs(5))?",
+        default = "from_duration_env_with_fallback(\"PROSODY_STALL_THRESHOLD\", \
+                   Duration::from_secs(15))?",
         setter(into)
     )]
-    pub partition_shutdown_timeout: Duration,
+    pub stall_threshold: Duration,
 
     /// Interval between poll operations.
     ///

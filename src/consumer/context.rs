@@ -74,7 +74,7 @@ where
             buffer_size: config.max_uncommitted,
             max_uncommitted: config.max_uncommitted,
             max_enqueued_per_key: config.max_enqueued_per_key,
-            shutdown_timeout: config.partition_shutdown_timeout,
+            shutdown_timeout: config.stall_threshold,
             handler_provider,
             watermark_version,
             managers,

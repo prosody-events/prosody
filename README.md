@@ -133,19 +133,51 @@ The following table lists the available configuration options and their associat
 | Environment Variable                 | Description                                                                    | Default | Consumer | Producer |
 |--------------------------------------|--------------------------------------------------------------------------------|---------|----------|----------|
 | `PROSODY_BOOTSTRAP_SERVERS`          | Comma-separated list of Kafka bootstrap servers                                | -       | ✓        | ✓        |
-| `PROSODY_GROUP_ID`                   | Consumer group identifier                                                      | -       | ✓        |          |
-| `PROSODY_SUBSCRIBED_TOPICS`          | Comma-separated list of topics to subscribe to                                 | -       | ✓        |          |
-| `PROSODY_MAX_UNCOMMITTED`            | Maximum number of uncommitted messages per partition (partition concurrency)   | 32      | ✓        |          |
-| `PROSODY_MAX_ENQUEUED_PER_KEY`       | Maximum number of enqueued messages per key (additional messages backpressure) | 8       | ✓        |          |
-| `PROSODY_PARTITION_SHUTDOWN_TIMEOUT` | Timeout for partition shutdown                                                 | 5s      | ✓        |          |
-| `PROSODY_POLL_INTERVAL`              | Maximum interval between poll operations                                       | 100ms   | ✓        |          |
 | `PROSODY_COMMIT_INTERVAL`            | Interval between commit operations                                             | 1s      | ✓        |          |
-| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the low-latency mode producer                   | 1s      |          | ✓        |
-| `PROSODY_MOCK`                       | Use mock Kafka brokers for testing                                             | false   | ✓        | ✓        |
-| `PROSODY_RETRY_BASE`                 | Base retry exponential backoff delay                                           | 20ms    | ✓        |          |
-| `PROSODY_MAX_RETRIES`                | Maximum number of retries in low-latency mode                                  | 3       | ✓        |          |
-| `PROSODY_RETRY_MAX_DELAY`            | Maximum retry delay                                                            | 1m      | ✓        |          |
 | `PROSODY_FAILURE_TOPIC`              | Topic for failed messages in low-latency mode                                  | -       | ✓        |          |
+| `PROSODY_GROUP_ID`                   | Consumer group identifier                                                      | -       | ✓        |          |
+| `PROSODY_MAX_ENQUEUED_PER_KEY`       | Maximum number of enqueued messages per key (additional messages backpressure) | 8       | ✓        |          |
+| `PROSODY_MAX_RETRIES`                | Maximum number of retries in low-latency mode                                  | 3       | ✓        |          |
+| `PROSODY_MAX_UNCOMMITTED`            | Maximum number of uncommitted messages per partition (partition concurrency)   | 32      | ✓        |          |
+| `PROSODY_MOCK`                       | Use mock Kafka brokers for testing                                             | false   | ✓        | ✓        |
+| `PROSODY_POLL_INTERVAL`              | Maximum interval between poll operations                                       | 100ms   | ✓        |          |
+| `PROSODY_PROBE_PORT`                 | Port for the probe server (health checks). Set to 'none' to disable.           | 8000    | ✓        |          |
+| `PROSODY_RETRY_BASE`                 | Base retry exponential backoff delay                                           | 20ms    | ✓        |          |
+| `PROSODY_RETRY_MAX_DELAY`            | Maximum retry delay                                                            | 1m      | ✓        |          |
+| `PROSODY_SEND_TIMEOUT`               | Timeout for send operations in the low-latency mode producer                   | 1s      |          | ✓        |
+| `PROSODY_STALL_THRESHOLD`            | Duration after which processing is considered stalled                          | 15s     | ✓        |          |
+| `PROSODY_SUBSCRIBED_TOPICS`          | Comma-separated list of topics to subscribe to                                 | -       | ✓        |          |
+
+## Liveness and Readiness Probes
+
+Prosody includes a built-in probe server that provides health check endpoints for consumer-based applications. The probe
+server is tied to the consumer's lifecycle and offers two main endpoints:
+
+1. `/readyz`: A readiness probe that checks if any partitions are assigned to the consumer. It returns a success status
+   only when the consumer has at least one partition assigned, indicating it's ready to process messages.
+2. `/livez`: A liveness probe that checks if any partitions have stalled.
+
+A partition is considered "stalled" if it has not processed a message within a specified time threshold. This threshold
+is determined by the `PROSODY_STALL_THRESHOLD` configuration. By default, this is set to 15 seconds, but it
+can be customized to suit your application's needs. If a partition is detected as stalled, the liveness probe will fail,
+potentially triggering a restart of the application by the orchestration system.
+
+To configure the probe server:
+
+- Set the `PROSODY_PROBE_PORT` environment variable to a valid port number to enable the server. By default, it uses
+  port 8000.
+- To disable the probe server, set `PROSODY_PROBE_PORT` to 'none'.
+- Adjust the `PROSODY_STALL_THRESHOLD` to change the stall detection threshold. For example, setting it to
+  "30s" would consider a partition stalled if it hasn't processed a message in 30 seconds.
+- If the probe server is enabled, it will start when the consumer is subscribed and stop when it is unsubscribed.
+
+Note: It's important to set the `PROSODY_STALL_THRESHOLD` to a value that's appropriate for your application's
+message processing latency. Setting it too low might result in false positives for stalled partitions, while setting it
+too high could delay the detection of actual issues.
+
+These endpoints can be integrated with container orchestration systems like Kubernetes to manage the lifecycle of your
+application based on its health and readiness status. They provide valuable information about the consumer's state,
+helping to ensure robust and responsive Kafka-based applications.
 
 ## Common Project Tasks
 
