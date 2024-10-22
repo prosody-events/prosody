@@ -227,13 +227,13 @@ pub struct ConsumerConfiguration {
     /// Default: 15 seconds
     ///
     /// This duration serves two purposes:
-    /// 1. It determines how long to wait for in-flight tasks to complete
-    ///    during partition shutdown. After this threshold is reached, any
-    ///    remaining tasks will be aborted.
+    /// 1. It determines how long to wait for in-flight tasks to complete during
+    ///    partition shutdown. After this threshold is reached, any remaining
+    ///    tasks will be aborted.
     /// 2. It is used by the liveness probe to determine if a partition's
-    ///    processing has stalled. If message processing takes longer than
-    ///    this duration, the partition is considered stalled, and the
-    ///    liveness probe will report an unhealthy status.
+    ///    processing has stalled. If message processing takes longer than this
+    ///    duration, the partition is considered stalled, and the liveness probe
+    ///    will report an unhealthy status.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_STALL_THRESHOLD\", \
                    Duration::from_secs(15))?",
