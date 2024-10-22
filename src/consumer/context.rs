@@ -35,7 +35,7 @@ where
     buffer_size: usize,
     max_uncommitted: usize,
     max_enqueued_per_key: usize,
-    shutdown_timeout: Option<Duration>,
+    shutdown_timeout: Duration,
     handler_provider: T,
     watermark_version: Arc<WatermarkVersion>,
     managers: Arc<Managers>,
@@ -110,7 +110,7 @@ where
                     let partition = element.partition();
                     info!("assigning {topic}:{partition}");
 
-                    let mut managers = self.managers.lock();
+                    let mut managers = self.managers.write();
 
                     // Check if the partition is already assigned
                     let Entry::Vacant(vacant) = managers.entry((topic, partition)) else {
@@ -124,6 +124,7 @@ where
 
                     // Create and insert a new PartitionManager
                     let manager = PartitionManager::new(
+                        topic,
                         element.partition(),
                         handler,
                         self.buffer_size,
@@ -153,7 +154,7 @@ where
                     info!("revoking {topic}:{partition}");
 
                     // Remove the PartitionManager for the revoked partition
-                    let Some(manager) = self.managers.lock().remove(&(topic, partition)) else {
+                    let Some(manager) = self.managers.write().remove(&(topic, partition)) else {
                         error!("cannot revoke {topic}:{partition}; not assigned");
                         continue;
                     };

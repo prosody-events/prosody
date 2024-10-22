@@ -32,6 +32,22 @@ where
     parse_with_error(env_var, &value_str)
 }
 
+pub fn from_option_env_with_fallback<T>(env_var: &str, fallback: T) -> Result<Option<T>, String>
+where
+    T: FromStr<Err: Display>,
+{
+    let Ok(value_str) = env::var(env_var) else {
+        return Ok(Some(fallback));
+    };
+
+    // Check if the value is "none" (case-insensitive) to return None
+    if value_str.trim().eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+
+    Ok(Some(parse_with_error(env_var, &value_str)?))
+}
+
 /// Retrieves and parses an environment variable with a fallback value.
 ///
 /// # Arguments
@@ -137,7 +153,7 @@ pub fn from_option_duration_env_with_fallback(
     };
 
     // Check if the value is "none" (case-insensitive) to return None
-    if value_str.eq_ignore_ascii_case("none") {
+    if value_str.trim().eq_ignore_ascii_case("none") {
         return Ok(None);
     }
 

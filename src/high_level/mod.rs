@@ -211,6 +211,22 @@ impl<T> HighLevelClient<T> {
         consumer.shutdown().await;
         Ok(())
     }
+
+    pub fn assigned_partition_count(&self) -> u32 {
+        let ConsumerState::Running { ref consumer, .. } = *self.consumer_state() else {
+            return 0;
+        };
+
+        consumer.assigned_partition_count()
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        let ConsumerState::Running { ref consumer, .. } = *self.consumer_state() else {
+            return false;
+        };
+
+        consumer.is_stalled()
+    }
 }
 
 /// Checks if all required topics exist for the given consumer state.

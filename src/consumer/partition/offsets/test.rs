@@ -4,12 +4,12 @@
 //! functioning of the `OffsetTracker`, focusing on watermark tracking and
 //! committing.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
 use ahash::{HashMap, HashMapExt, HashSet};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
 
 use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation};
@@ -41,14 +41,21 @@ fn tracks_commit_watermark(actions: Actions) -> TestResult {
 /// A `TestResult` indicating whether the test passed or failed.
 async fn tracks_commit_watermark_impl(Actions(actions): Actions) -> TestResult {
     let version = Arc::default();
-    let tracker = OffsetTracker::new(actions.len() + 1, version);
+    let tracker = OffsetTracker::new(
+        "test-topic".into(),
+        0,
+        actions.len() + 1,
+        Duration::from_secs(300),
+        version,
+    );
+
     let mut test_offsets = BTreeMap::default();
     let mut commits = HashMap::with_capacity(actions.len());
 
     // Process each action
     for action in &actions {
         match action.operation {
-            Operation::Take => {
+            Operation::Take(_) => {
                 // Take an offset from the tracker
                 let commit = match tracker.take(action.offset).await {
                     Ok(offset) => offset,
@@ -105,7 +112,7 @@ impl Arbitrary for Actions {
                 let gap = *g.choose(&gaps).unwrap_or(&0);
                 offset += gap as Offset;
                 action.offset = offset;
-                action.operation = Operation::Take;
+                action.operation = Operation::Take(Instant::now());
                 takes.insert(offset);
                 offset += 1;
             } else {
@@ -145,7 +152,7 @@ impl Arbitrary for Operation {
     /// * `g` - A mutable reference to a `Gen` instance for random generation.
     fn arbitrary(g: &mut Gen) -> Self {
         if bool::arbitrary(g) {
-            Operation::Take
+            Operation::Take(Instant::now())
         } else {
             Operation::Commit
         }

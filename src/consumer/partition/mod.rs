@@ -27,7 +27,7 @@ use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessa
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::EventHandler;
-use crate::{Offset, Partition};
+use crate::{Offset, Partition, Topic};
 
 mod keyed;
 pub mod offsets;
@@ -79,19 +79,28 @@ impl PartitionManager {
     /// # Returns
     ///
     /// A new instance of `PartitionManager`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<T>(
+        topic: Topic,
         partition: Partition,
         message_handler: T,
         buffer_size: usize,
         max_uncommitted: usize,
         max_enqueued_per_key: usize,
-        shutdown_timeout: Option<Duration>,
+        shutdown_timeout: Duration,
         watermark_version: Arc<CachePadded<AtomicUsize>>,
     ) -> Self
     where
         T: EventHandler + Send + Sync + 'static,
     {
-        let offsets = OffsetTracker::new(max_uncommitted, watermark_version);
+        let offsets = OffsetTracker::new(
+            topic,
+            partition,
+            max_uncommitted,
+            shutdown_timeout,
+            watermark_version,
+        );
+
         let (message_tx, message_rx) = channel(buffer_size);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -152,6 +161,10 @@ impl PartitionManager {
         self.offsets.watermark()
     }
 
+    pub fn is_stalled(&self) -> bool {
+        self.offsets.is_stalled()
+    }
+
     /// Initiates the shutdown of the partition, waiting for the completion of
     /// all tasks.
     ///
@@ -210,7 +223,7 @@ async fn handle_messages<T>(
     message_rx: Receiver<ConsumerMessage>,
     max_enqueued_per_key: usize,
     shutdown_rx: watch::Receiver<bool>,
-    shutdown_timeout: Option<Duration>,
+    shutdown_timeout: Duration,
 ) where
     T: EventHandler,
 {

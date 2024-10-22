@@ -131,7 +131,11 @@ fn prop(input: TestInput) -> TestResult {
     }
 
     // Initialize the runtime for async operations
-    let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
+    let Ok(runtime) = Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+    else {
         return TestResult::error("failed to initialize runtime");
     };
 
@@ -228,7 +232,8 @@ fn create_configs(
         .subscribed_topics(&[topic.to_string()])
         .max_enqueued_per_key(max_enqueued_per_key.value())
         .commit_interval(Duration::from_secs(1))
-        .partition_shutdown_timeout(Some(Duration::from_secs(60)))
+        .partition_shutdown_timeout(Duration::from_secs(60))
+        .probe_port(None)
         .build()?;
 
     Ok((producer_config, consumer_config))

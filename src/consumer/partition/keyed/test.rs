@@ -112,11 +112,7 @@ async fn prevents_concurrent_key_execution_impl(
 
     // Process all messages using the KeyManager
     KeyManager::new(process_fn, max_enqueued)
-        .process_messages(
-            iter(messages),
-            shutdown_rx,
-            Some(Duration::from_millis(100)),
-        )
+        .process_messages(iter(messages), shutdown_rx, Duration::from_millis(100))
         .await;
 
     // Check if any concurrent execution was detected
@@ -155,7 +151,11 @@ async fn processes_messages_in_order_impl(
         },
         max_enqueued,
     )
-    .process_messages(iter(messages.clone()), shutdown_rx, None)
+    .process_messages(
+        iter(messages.clone()),
+        shutdown_rx,
+        Duration::from_millis(100),
+    )
     .await;
 
     let mut expected = ahash::HashMap::with_capacity(messages.len());
