@@ -21,6 +21,7 @@
 //! - `poll`: Implements the core message polling and processing loop.
 //! - `failure`: Handles error handling, retry strategies, and failure topic
 //!   management.
+//! - `probes`: Implements a probe server for health and readiness checks.
 //!
 //! Users should primarily interact with the [`ProsodyConsumer`] struct,
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
@@ -46,7 +47,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::ClientConfig;
 use thiserror::Error;
 use tokio::task::{spawn_blocking, JoinHandle};
-use tracing::{error, info};
+use tracing::error;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
@@ -270,6 +271,10 @@ pub struct ConsumerConfiguration {
     )]
     pub mock: bool,
 
+    /// Port for the probe server.
+    ///
+    /// Environment variable: `PROSODY_PROBE_PORT`
+    /// Default: Some(8000)
     #[builder(
         default = "from_option_env_with_fallback(\"PROSODY_PROBE_PORT\", 8000)?",
         setter(into)
@@ -292,8 +297,11 @@ impl ConsumerConfiguration {
     }
 }
 
+/// Holds the runtime state of the consumer.
 struct RuntimeState {
+    /// Handle to the polling task.
     poll_handle: JoinHandle<()>,
+    /// Optional probe server for health and readiness checks.
     probe_server: Option<ProbeServer>,
 }
 
@@ -301,12 +309,15 @@ struct RuntimeState {
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ProsodyConsumer {
+    /// Flag to signal consumer shutdown.
     #[educe(Debug(ignore))]
     shutdown: Arc<AtomicBool>,
 
+    /// Thread-safe storage for partition managers.
     #[educe(Debug(ignore))]
     managers: Arc<Managers>,
 
+    /// Runtime state of the consumer.
     #[educe(Debug(ignore))]
     runtime_state: Arc<Mutex<Option<RuntimeState>>>,
 }
@@ -398,10 +409,10 @@ impl ProsodyConsumer {
             );
         });
 
-        let probe_server = match config.probe_port {
-            Some(port) => Some(ProbeServer::new(port, managers.clone())?),
-            None => None,
-        };
+        let probe_server = config
+            .probe_port
+            .map(|port| ProbeServer::new(port, managers.clone()))
+            .transpose()?;
 
         let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
             poll_handle,
@@ -440,7 +451,7 @@ impl ProsodyConsumer {
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let retry_strategy = RetryStrategy::new(retry_config)?; // retry failures
+        let retry_strategy = RetryStrategy::new(retry_config)?;
         let strategy = ShutdownStrategy.and_then(retry_strategy);
         let handler = strategy.with_handler(handler);
         Self::new(consumer_config, handler)
@@ -488,11 +499,21 @@ impl ProsodyConsumer {
         Self::new(consumer_config, handler)
     }
 
+    /// Returns the number of currently assigned partitions.
+    ///
+    /// # Returns
+    ///
+    /// The number of partitions currently assigned to this consumer.
     #[must_use]
     pub fn assigned_partition_count(&self) -> u32 {
         get_assigned_partition_count(&self.managers)
     }
 
+    /// Checks if any assigned partition is stalled.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any partition is stalled, `false` otherwise.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
         get_is_stalled(&self.managers)
@@ -525,7 +546,7 @@ impl ProsodyConsumer {
             error!("consumer shutdown failed: {error:#}");
         }
 
-        // Shutdown probe server
+        // Shutdown probe server if it exists
         if let Some(probe_server) = probe_server {
             probe_server.shutdown().await;
         }
@@ -538,10 +559,28 @@ impl Drop for ProsodyConsumer {
     }
 }
 
+/// Returns the number of assigned partitions.
+///
+/// # Arguments
+///
+/// * `managers` - The map of partition managers.
+///
+/// # Returns
+///
+/// The number of assigned partitions.
 fn get_assigned_partition_count(managers: &Managers) -> u32 {
     managers.read().len() as u32
 }
 
+/// Checks if any partition is stalled.
+///
+/// # Arguments
+///
+/// * `managers` - The map of partition managers.
+///
+/// # Returns
+///
+/// `true` if any partition is stalled, `false` otherwise.
 fn get_is_stalled(managers: &Managers) -> bool {
     managers.read().values().any(PartitionManager::is_stalled)
 }
@@ -554,7 +593,7 @@ pub enum ConsumerError {
     #[error("invalid consumer configuration: {0:#}")]
     Configuration(#[from] ValidationErrors),
 
-    /// Indicates an IO failure
+    /// Indicates an IO failure.
     #[error("IO error: {0:#}")]
     Io(#[from] io::Error),
 

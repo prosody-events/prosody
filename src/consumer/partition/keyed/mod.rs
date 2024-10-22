@@ -89,8 +89,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// * `messages` - Stream of incoming messages.
     /// * `shutdown_rx` - Receiver for shutdown signal.
-    /// * `shutdown_timeout` - Optional duration to wait before forcefully
-    ///   shutting down.
+    /// * `shutdown_timeout` - Duration to wait before forcefully shutting down.
     pub async fn process_messages<S>(
         mut self,
         messages: S,

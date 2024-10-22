@@ -67,13 +67,13 @@ impl PartitionManager {
     ///
     /// # Arguments
     ///
+    /// * `topic` - The Kafka topic associated with this partition.
     /// * `partition` - The partition identifier.
     /// * `message_handler` - Handler responsible for processing messages.
     /// * `buffer_size` - Capacity of the message channel.
     /// * `max_uncommitted` - Maximum number of uncommitted offsets.
     /// * `max_enqueued_per_key` - Maximum number of messages to hold per key.
-    /// * `shutdown_timeout` - Optional duration to wait before forcefully
-    ///   shutting down.
+    /// * `shutdown_timeout` - Duration to wait before forcefully shutting down.
     /// * `watermark_version` - Shared variable to track watermark updates.
     ///
     /// # Returns
@@ -161,6 +161,11 @@ impl PartitionManager {
         self.offsets.watermark()
     }
 
+    /// Checks if message processing for this partition has stalled.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the partition is stalled, `false` otherwise.
     pub fn is_stalled(&self) -> bool {
         self.offsets.is_stalled()
     }
@@ -269,7 +274,7 @@ async fn handle_messages<T>(
     message_handler.shutdown().await;
 }
 
-/// Defines errors related to partition management.
+/// Errors that can occur during partition management operations.
 #[derive(Debug, Error)]
 pub enum PartitionError {
     /// Error when message sending fails due to the partition being shut down.

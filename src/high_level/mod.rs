@@ -1,8 +1,8 @@
 //! High-level client module for managing both producer and consumer operations.
 //!
-//! This module provides a `HighLevelClient` struct that encapsulates both
-//! producer and consumer functionality, allowing for unified management of
-//! message production and consumption in various operational modes.
+//! This module provides a unified interface for message production and
+//! consumption in various operational modes through the `HighLevelClient`
+//! struct.
 
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
@@ -92,6 +92,7 @@ impl<T> HighLevelClient<T> {
         let consumer_state =
             ConsumerState::build(mode, consumer_builder, retry_builder, failure_topic_builder);
 
+        // Check for topic existence only if not in mock mode
         if !producer_config.mock {
             check_topic_existence(&producer, &consumer_state)?;
         }
@@ -212,6 +213,9 @@ impl<T> HighLevelClient<T> {
         Ok(())
     }
 
+    /// Returns the number of partitions assigned to the consumer.
+    ///
+    /// Returns 0 if the consumer is not in the Running state.
     pub fn assigned_partition_count(&self) -> u32 {
         let ConsumerState::Running { ref consumer, .. } = *self.consumer_state() else {
             return 0;
@@ -220,6 +224,9 @@ impl<T> HighLevelClient<T> {
         consumer.assigned_partition_count()
     }
 
+    /// Checks if the consumer is stalled.
+    ///
+    /// Returns `false` if the consumer is not in the Running state.
     pub fn is_stalled(&self) -> bool {
         let ConsumerState::Running { ref consumer, .. } = *self.consumer_state() else {
             return false;
@@ -230,6 +237,15 @@ impl<T> HighLevelClient<T> {
 }
 
 /// Checks if all required topics exist for the given consumer state.
+///
+/// # Arguments
+///
+/// * `producer` - The producer used to fetch metadata.
+/// * `consumer_state` - The current state of the consumer.
+///
+/// # Errors
+///
+/// Returns a `HighLevelClientError` if any required topics are missing.
 fn check_topic_existence<S>(
     producer: &ProsodyProducer,
     consumer_state: &ConsumerState<S>,
@@ -248,6 +264,15 @@ fn check_topic_existence<S>(
 
 /// Identifies which topics from the given list are missing in the Kafka
 /// cluster.
+///
+/// # Arguments
+///
+/// * `producer` - The producer used to fetch metadata.
+/// * `topics` - A list of topics to check for existence.
+///
+/// # Errors
+///
+/// Returns a `ProducerError` if metadata fetching fails.
 fn missing_topics(
     producer: &ProsodyProducer,
     mut topics: Vec<Topic>,
