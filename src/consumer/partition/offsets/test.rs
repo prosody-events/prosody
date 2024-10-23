@@ -163,7 +163,10 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
             version,
         );
 
-        let mut uncommitted_offsets: HashMap<Offset, (UncommittedOffset, Instant)> = HashMap::new();
+        let mut uncommitted_offsets: BTreeMap<Offset, (UncommittedOffset, Instant)> =
+            BTreeMap::new();
+        let mut committed_offsets: HashSet<Offset> = HashSet::new();
+        let mut watermark: Offset = -1; // Start with initial watermark value
 
         for action in actions {
             match action {
@@ -178,6 +181,7 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
                 StallAction::Commit(offset) => {
                     if let Some((uncommitted_offset, _)) = uncommitted_offsets.remove(&offset) {
                         uncommitted_offset.commit();
+                        committed_offsets.insert(offset);
                     }
                 }
                 StallAction::Wait(duration) => {
@@ -188,10 +192,26 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
                 }
             }
 
+            // Simulate watermark advancement
+            while committed_offsets.contains(&(watermark + 1)) {
+                watermark += 1;
+            }
+
             // After each action, check for stalls
-            let expected_stall = uncommitted_offsets
-                .values()
-                .any(|&(_, take_time)| Instant::now().duration_since(take_time) >= stall_threshold);
+            let now = Instant::now();
+
+            let stalled_offsets: Vec<_> = uncommitted_offsets
+                .iter()
+                .filter_map(|(&offset, &(_, take_time))| {
+                    if offset > watermark && now.duration_since(take_time) >= stall_threshold {
+                        Some(offset)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let expected_stall = !stalled_offsets.is_empty();
 
             // Allow background tasks to run
             tokio::task::yield_now().await;
@@ -199,9 +219,13 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
             // Check if the stall state matches our expectation
             if expected_stall != tracker.is_stalled() {
                 return TestResult::error(format!(
-                    "Stall detection mismatch during actions. Expected: {}, Actual: {}",
+                    "Stall detection mismatch during actions.\nExpected: {}, Actual: {}\nStalled \
+                     Offsets: {:?}\nWatermark: {}\nAction: {:?}",
                     expected_stall,
-                    tracker.is_stalled()
+                    tracker.is_stalled(),
+                    stalled_offsets,
+                    watermark,
+                    action,
                 ));
             }
         }
@@ -212,9 +236,20 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
         tokio::task::yield_now().await;
 
         // Recompute expected_stall after advancing time
-        let expected_stall = uncommitted_offsets
-            .values()
-            .any(|&(_, take_time)| Instant::now().duration_since(take_time) >= stall_threshold);
+        let now = Instant::now();
+
+        let stalled_offsets: Vec<_> = uncommitted_offsets
+            .iter()
+            .filter_map(|(&offset, &(_, take_time))| {
+                if offset > watermark && now.duration_since(take_time) >= stall_threshold {
+                    Some(offset)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let expected_stall = !stalled_offsets.is_empty();
 
         // Allow background tasks to run
         tokio::task::yield_now().await;
@@ -224,9 +259,12 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
             TestResult::passed()
         } else {
             TestResult::error(format!(
-                "Stall detection mismatch after advancing time. Expected: {}, Actual: {}",
+                "Stall detection mismatch after advancing time.\nExpected: {}, Actual: \
+                 {}\nStalled Offsets: {:?}\nWatermark: {}",
                 expected_stall,
-                tracker.is_stalled()
+                tracker.is_stalled(),
+                stalled_offsets,
+                watermark,
             ))
         }
     })
@@ -271,15 +309,21 @@ impl Arbitrary for StallTestCase {
         let mut actions = Vec::new();
         let mut taken_offsets = HashSet::new();
         let mut offset_counter = 0;
+        let max_gap = 2; // Maximum gap between offsets
+
         // Use smaller stall threshold for faster tests
         let stall_threshold = Duration::from_millis(10 + u64::arbitrary(g) % 20);
 
         for _ in 0..10 {
             match u8::arbitrary(g) % 3 {
                 0 => {
-                    // Generate contiguous offsets
+                    // Generate offsets with possible small gaps
+                    let gap = u8::arbitrary(g) % max_gap;
+                    offset_counter += gap as Offset;
+
                     let offset = offset_counter;
                     offset_counter += 1;
+
                     actions.push(StallAction::Take(offset));
                     taken_offsets.insert(offset);
                 }
