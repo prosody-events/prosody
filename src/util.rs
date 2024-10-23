@@ -1,8 +1,8 @@
 //! Utility functions for environment variable parsing and handling.
 //!
-//! This module provides a set of functions to parse environment variables
-//! into various types, including vectors and durations. It also includes
-//! functions for handling fallback values and optional durations.
+//! This module provides functions to parse environment variables into various
+//! types, including vectors and durations. It also includes functions for
+//! handling fallback values and optional durations.
 
 use std::env;
 use std::fmt::Display;
@@ -30,6 +30,39 @@ where
 {
     let value_str = get_env_value(env_var)?;
     parse_with_error(env_var, &value_str)
+}
+
+/// Retrieves and parses an optional environment variable with a fallback value.
+///
+/// # Arguments
+///
+/// * `env_var` - The name of the environment variable to retrieve.
+/// * `fallback` - The fallback value to use if the environment variable is not
+///   set.
+///
+/// # Returns
+///
+/// A `Result` containing an `Option<T>` with the parsed value, fallback, or
+/// `None`.
+///
+/// # Errors
+///
+/// Returns an error if the environment variable is set but cannot be parsed
+/// into the specified type.
+pub fn from_option_env_with_fallback<T>(env_var: &str, fallback: T) -> Result<Option<T>, String>
+where
+    T: FromStr<Err: Display>,
+{
+    let Ok(value_str) = env::var(env_var) else {
+        return Ok(Some(fallback));
+    };
+
+    // Return None if the value is "none" (case-insensitive)
+    if value_str.trim().eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+
+    Ok(Some(parse_with_error(env_var, &value_str)?))
 }
 
 /// Retrieves and parses an environment variable with a fallback value.
@@ -136,8 +169,8 @@ pub fn from_option_duration_env_with_fallback(
         return Ok(Some(fallback));
     };
 
-    // Check if the value is "none" (case-insensitive) to return None
-    if value_str.eq_ignore_ascii_case("none") {
+    // Return None if the value is "none" (case-insensitive)
+    if value_str.trim().eq_ignore_ascii_case("none") {
         return Ok(None);
     }
 

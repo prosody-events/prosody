@@ -89,13 +89,12 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// * `messages` - Stream of incoming messages.
     /// * `shutdown_rx` - Receiver for shutdown signal.
-    /// * `shutdown_timeout` - Optional duration to wait before forcefully
-    ///   shutting down.
+    /// * `shutdown_timeout` - Duration to wait before forcefully shutting down.
     pub async fn process_messages<S>(
         mut self,
         messages: S,
         mut shutdown_rx: watch::Receiver<bool>,
-        shutdown_timeout: Option<Duration>,
+        shutdown_timeout: Duration,
     ) where
         S: Stream<Item = M>,
         M: Keyed + Debug,
@@ -130,19 +129,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
             }
         }
 
-        // Shutdown handling: proceed if a timeout is specified, otherwise immediately
-        // return.
-        let Some(timeout) = shutdown_timeout else {
-            let count = self.executing.len();
-            if count > 0 {
-                warn!("shutting down with {count} tasks in progress");
-            };
-
-            return;
-        };
-
         // Create the shutdown deadline future.
-        let deadline = sleep(timeout);
+        let deadline = sleep(shutdown_timeout);
         pin_mut!(deadline);
 
         loop {

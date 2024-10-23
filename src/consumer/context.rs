@@ -1,11 +1,10 @@
-//! Manages Kafka partition assignments and revocations for a consumer
-//! application.
+//! Manages Kafka consumer partition assignments and revocations.
 //!
-//! This module integrates Kafka's rebalance callbacks with internal partition
-//! management logic, ensuring dynamic partition management in response to
-//! consumer group changes. It encapsulates configuration and state management
-//! for partitions, connecting processing logic with the consumer's behavior
-//! during rebalance events.
+//! This module integrates with Kafka's consumer group rebalancing protocol to:
+//! - Handle dynamic partition assignments as consumers join or leave the group
+//! - Create and manage `PartitionManager` instances for processing messages
+//! - Ensure proper cleanup and offset commitment during partition revocation
+//! - Coordinate graceful shutdown of partition processing
 
 use std::collections::hash_map::Entry;
 use std::future::ready;
@@ -24,10 +23,17 @@ use crate::consumer::partition::PartitionManager;
 use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
 use crate::Topic;
 
-/// Holds operational settings and components for managing Kafka partitions.
+/// Manages Kafka partition assignments and message processing for a consumer.
 ///
-/// This structure provides methods to handle partition assignments and
-/// revocations through Kafka's rebalance callbacks.
+/// `Context` implements Kafka's rebalance callbacks and maintains
+/// `PartitionManager` instances for each assigned partition. It coordinates
+/// partition assignment, revocation, and graceful shutdown of message
+/// processing.
+///
+/// # Type Parameters
+///
+/// * `T` - A type implementing `HandlerProvider` that creates message handlers
+///   for newly assigned partitions
 pub struct Context<T>
 where
     T: HandlerProvider,
@@ -35,7 +41,7 @@ where
     buffer_size: usize,
     max_uncommitted: usize,
     max_enqueued_per_key: usize,
-    shutdown_timeout: Option<Duration>,
+    shutdown_timeout: Duration,
     handler_provider: T,
     watermark_version: Arc<WatermarkVersion>,
     managers: Arc<Managers>,
@@ -45,25 +51,19 @@ impl<T> Context<T>
 where
     T: HandlerProvider,
 {
-    /// Creates a new `Context` with provided consumer configuration and
-    /// dependencies.
-    ///
-    /// This method initializes the management of partition assignments and
-    /// revocations.
+    /// Creates a new consumer context with the specified configuration.
     ///
     /// # Arguments
     ///
-    /// * `config` - Consumer configuration settings such as buffer sizes and
-    ///   timeouts.
-    /// * `handler_provider` - Provider responsible for creating message
-    ///   handlers.
-    /// * `watermark_version` - Shared state for tracking watermark versions.
-    /// * `managers` - Central storage for managing `PartitionManager`
-    ///   instances.
+    /// * `config` - Consumer configuration including buffer sizes and timeouts
+    /// * `handler_provider` - Provider that creates message handlers for
+    ///   partitions
+    /// * `watermark_version` - Shared state for tracking message watermarks
+    /// * `managers` - Shared storage for partition manager instances
     ///
     /// # Returns
     ///
-    /// A new `Context` instance initialized with the given parameters.
+    /// A new `Context` instance initialized with the given parameters
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
@@ -74,7 +74,7 @@ where
             buffer_size: config.max_uncommitted,
             max_uncommitted: config.max_uncommitted,
             max_enqueued_per_key: config.max_enqueued_per_key,
-            shutdown_timeout: config.partition_shutdown_timeout,
+            shutdown_timeout: config.stall_threshold,
             handler_provider,
             watermark_version,
             managers,
@@ -88,19 +88,21 @@ impl<T> ConsumerContext for Context<T>
 where
     T: HandlerProvider,
 {
-    /// Responds to Kafka's partition assignment events.
+    /// Handles Kafka partition assignments and revocations during rebalancing.
     ///
-    /// This method initializes `PartitionManager` instances for newly assigned
-    /// partitions and handles partition revocations.
+    /// This callback creates new `PartitionManager` instances for assigned
+    /// partitions, shuts down and removes managers for revoked partitions,
+    /// and commits final offsets before partitions are revoked.
     ///
     /// # Arguments
     ///
-    /// * `consumer` - The base consumer instance.
-    /// * `rebalance` - Details about the rebalance event from Kafka.
+    /// * `consumer` - The Kafka consumer instance
+    /// * `rebalance` - Details about the rebalance event
+    ///   (assignments/revocations)
     fn pre_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         match rebalance {
             Rebalance::Assign(partitions) => {
-                // Handle empty partition assignments
+                // Skip processing for empty assignments
                 if partitions.count() == 0 {
                     return;
                 }
@@ -110,9 +112,9 @@ where
                     let partition = element.partition();
                     info!("assigning {topic}:{partition}");
 
-                    let mut managers = self.managers.lock();
+                    let mut managers = self.managers.write();
 
-                    // Check if the partition is already assigned
+                    // Verify partition isn't already assigned
                     let Entry::Vacant(vacant) = managers.entry((topic, partition)) else {
                         warn!("{topic}:{partition} was already assigned");
                         continue;
@@ -122,8 +124,9 @@ where
                         .handler_provider
                         .handler_for_partition(topic, partition);
 
-                    // Create and insert a new PartitionManager
+                    // Initialize new partition manager
                     let manager = PartitionManager::new(
+                        topic,
                         element.partition(),
                         handler,
                         self.buffer_size,
@@ -138,7 +141,6 @@ where
             }
             Rebalance::Revoke(partitions) => {
                 let count = partitions.count();
-                // Handle empty partition revocations
                 if count == 0 {
                     return;
                 }
@@ -152,13 +154,13 @@ where
                     let partition = element.partition();
                     info!("revoking {topic}:{partition}");
 
-                    // Remove the PartitionManager for the revoked partition
-                    let Some(manager) = self.managers.lock().remove(&(topic, partition)) else {
+                    // Remove partition manager
+                    let Some(manager) = self.managers.write().remove(&(topic, partition)) else {
                         error!("cannot revoke {topic}:{partition}; not assigned");
                         continue;
                     };
 
-                    // Prepare shutdown future for the partition
+                    // Queue shutdown task
                     let list = list.clone();
                     shutdown_futures.push(async move {
                         let Some(offset) = manager.shutdown().await else {
@@ -168,7 +170,7 @@ where
                         let next_offset = Offset::Offset(offset + 1);
                         let mut list = list.lock();
 
-                        // Add the next offset to the commit list
+                        // Record final offset
                         if let Err(error) =
                             list.add_partition_offset(&topic, partition, next_offset)
                         {
@@ -177,7 +179,7 @@ where
                     });
                 }
 
-                // Wait for all shutdown tasks to complete
+                // Wait for all shutdowns to complete
                 Handle::current().block_on(shutdown_futures.for_each(|()| ready(())));
 
                 let list = list.lock();

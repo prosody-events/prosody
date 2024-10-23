@@ -21,11 +21,13 @@
 //! - `poll`: Implements the core message polling and processing loop.
 //! - `failure`: Handles error handling, retry strategies, and failure topic
 //!   management.
+//! - `probes`: Implements a probe server for health and readiness checks.
 //!
 //! Users should primarily interact with the [`ProsodyConsumer`] struct,
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
 //! defined by implementing the [`EventHandler`] trait.
 
+use crate::consumer::probes::ProbeServer;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io;
@@ -38,7 +40,7 @@ use crossbeam_utils::CachePadded;
 use derive_builder::Builder;
 use educe::Educe;
 use futures::executor::block_on;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
@@ -60,7 +62,7 @@ use crate::consumer::poll::poll;
 use crate::producer::ProsodyProducer;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
-    from_option_duration_env_with_fallback, from_vec_env,
+    from_option_env_with_fallback, from_vec_env,
 };
 use crate::{Partition, Topic};
 
@@ -70,12 +72,13 @@ pub mod failure;
 pub mod message;
 mod partition;
 mod poll;
+mod probes;
 
 /// Atomic counter for tracking changes in partition watermarks.
 type WatermarkVersion = CachePadded<AtomicUsize>;
 
 /// Thread-safe storage for partition managers.
-type Managers = Mutex<HashMap<(Topic, Partition), PartitionManager>>;
+type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
 
 /// Defines a type with an associated key.
 pub trait Keyed {
@@ -220,21 +223,23 @@ pub struct ConsumerConfiguration {
 
     /// Timeout for partition shutdown.
     ///
-    /// Environment variable: `PROSODY_PARTITION_SHUTDOWN_TIMEOUT`
-    /// Default: 5 seconds
+    /// Environment variable: `PROSODY_STALL_THRESHOLD`
+    /// Default: 15 seconds
     ///
-    /// If set to None (or if the environment variable is set to "none"), the
-    /// partition will immediately be shutdown without waiting for in-flight
-    /// tasks to complete. As these tasks will not be committed, they will be
-    /// retried when the partition is rebalanced to a new node. This may be
-    /// appropriate when performing user-facing processing where delays due to
-    /// rebalancing must be minimized.
+    /// This duration serves two purposes:
+    /// 1. It determines how long to wait for in-flight tasks to complete during
+    ///    partition shutdown. After this threshold is reached, any remaining
+    ///    tasks will be aborted.
+    /// 2. It is used by the liveness probe to determine if a partition's
+    ///    processing has stalled. If message processing takes longer than this
+    ///    duration, the partition is considered stalled, and the liveness probe
+    ///    will report an unhealthy status.
     #[builder(
-        default = "from_option_duration_env_with_fallback(\"PROSODY_PARTITION_SHUTDOWN_TIMEOUT\", \
-                   Duration::from_secs(5))?",
+        default = "from_duration_env_with_fallback(\"PROSODY_STALL_THRESHOLD\", \
+                   Duration::from_secs(15))?",
         setter(into)
     )]
-    pub partition_shutdown_timeout: Option<Duration>,
+    pub stall_threshold: Duration,
 
     /// Interval between poll operations.
     ///
@@ -267,6 +272,16 @@ pub struct ConsumerConfiguration {
         setter(into)
     )]
     pub mock: bool,
+
+    /// Port for the probe server.
+    ///
+    /// Environment variable: `PROSODY_PROBE_PORT`
+    /// Default: Some(8000)
+    #[builder(
+        default = "from_option_env_with_fallback(\"PROSODY_PROBE_PORT\", 8000)?",
+        setter(into)
+    )]
+    pub probe_port: Option<u16>,
 }
 
 impl ConsumerConfiguration {
@@ -284,15 +299,29 @@ impl ConsumerConfiguration {
     }
 }
 
+/// Holds the runtime state of the consumer.
+struct RuntimeState {
+    /// Handle to the polling task.
+    poll_handle: JoinHandle<()>,
+    /// Optional probe server for health and readiness checks.
+    probe_server: Option<ProbeServer>,
+}
+
 /// High-level Kafka consumer implementation.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ProsodyConsumer {
+    /// Flag to signal consumer shutdown.
     #[educe(Debug(ignore))]
     shutdown: Arc<AtomicBool>,
 
+    /// Thread-safe storage for partition managers.
     #[educe(Debug(ignore))]
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    managers: Arc<Managers>,
+
+    /// Runtime state of the consumer.
+    #[educe(Debug(ignore))]
+    runtime_state: Arc<Mutex<Option<RuntimeState>>>,
 }
 
 impl ProsodyConsumer {
@@ -369,19 +398,34 @@ impl ProsodyConsumer {
         // Spawn a blocking task to continuously poll for messages
         let poll_interval = config.poll_interval;
         let commit_interval = config.commit_interval;
+        let cloned_managers = managers.clone();
         let cloned_shutdown = shutdown.clone();
-        let handle = Arc::new(Mutex::new(Some(spawn_blocking(move || {
+        let poll_handle = spawn_blocking(move || {
             poll(
                 poll_interval,
                 commit_interval,
                 &consumer,
                 &watermark_version,
-                &managers,
+                &cloned_managers,
                 &cloned_shutdown,
             );
-        }))));
+        });
 
-        Ok(Self { shutdown, handle })
+        let probe_server = config
+            .probe_port
+            .map(|port| ProbeServer::new(port, managers.clone()))
+            .transpose()?;
+
+        let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
+            poll_handle,
+            probe_server,
+        })));
+
+        Ok(Self {
+            shutdown,
+            managers,
+            runtime_state,
+        })
     }
 
     /// Creates a new `ProsodyConsumer` with a retry strategy for pipeline
@@ -409,7 +453,7 @@ impl ProsodyConsumer {
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let retry_strategy = RetryStrategy::new(retry_config)?; // retry failures
+        let retry_strategy = RetryStrategy::new(retry_config)?;
         let strategy = ShutdownStrategy.and_then(retry_strategy);
         let handler = strategy.with_handler(handler);
         Self::new(consumer_config, handler)
@@ -445,7 +489,6 @@ impl ProsodyConsumer {
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         let group_id = consumer_config.group_id.clone();
-
         let retry_strategy = RetryStrategy::new(retry_config)?;
         let topic_strategy = FailureTopicStrategy::new(topic_config, group_id, producer)?;
 
@@ -456,6 +499,26 @@ impl ProsodyConsumer {
 
         let handler = strategy.with_handler(handler);
         Self::new(consumer_config, handler)
+    }
+
+    /// Returns the number of currently assigned partitions.
+    ///
+    /// # Returns
+    ///
+    /// The number of partitions currently assigned to this consumer.
+    #[must_use]
+    pub fn assigned_partition_count(&self) -> u32 {
+        get_assigned_partition_count(&self.managers)
+    }
+
+    /// Checks if any assigned partition is stalled.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any partition is stalled, `false` otherwise.
+    #[must_use]
+    pub fn is_stalled(&self) -> bool {
+        get_is_stalled(&self.managers)
     }
 
     /// Initiates a graceful shutdown of the Kafka consumer.
@@ -472,13 +535,22 @@ impl ProsodyConsumer {
         self.shutdown.store(true, Ordering::Relaxed);
 
         // Attempt to take the handle from the mutex
-        let Some(handle) = self.handle.lock().take() else {
+        let Some(RuntimeState {
+            poll_handle,
+            probe_server,
+        }) = self.runtime_state.lock().take()
+        else {
             return;
         };
 
         // Wait for the polling task to complete
-        if let Err(error) = handle.await {
+        if let Err(error) = poll_handle.await {
             error!("consumer shutdown failed: {error:#}");
+        }
+
+        // Shutdown probe server if it exists
+        if let Some(probe_server) = probe_server {
+            probe_server.shutdown().await;
         }
     }
 }
@@ -489,6 +561,32 @@ impl Drop for ProsodyConsumer {
     }
 }
 
+/// Returns the number of assigned partitions.
+///
+/// # Arguments
+///
+/// * `managers` - The map of partition managers.
+///
+/// # Returns
+///
+/// The number of assigned partitions.
+fn get_assigned_partition_count(managers: &Managers) -> u32 {
+    managers.read().len() as u32
+}
+
+/// Checks if any partition is stalled.
+///
+/// # Arguments
+///
+/// * `managers` - The map of partition managers.
+///
+/// # Returns
+///
+/// `true` if any partition is stalled, `false` otherwise.
+fn get_is_stalled(managers: &Managers) -> bool {
+    managers.read().values().any(PartitionManager::is_stalled)
+}
+
 /// Errors that can occur during consumer operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -497,9 +595,9 @@ pub enum ConsumerError {
     #[error("invalid consumer configuration: {0:#}")]
     Configuration(#[from] ValidationErrors),
 
-    /// Indicates a failure to retrieve the hostname.
-    #[error("failed to retrieve hostname: {0:#}")]
-    Hostname(#[from] io::Error),
+    /// Indicates an IO failure.
+    #[error("IO error: {0:#}")]
+    Io(#[from] io::Error),
 
     /// Indicates a Kafka operation failure.
     #[error("Kafka operation failed: {0:#}")]

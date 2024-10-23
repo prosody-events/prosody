@@ -223,7 +223,7 @@ fn commit_watermarks<T>(
     let mut success = true;
 
     // Prepare offset list for commit
-    let managers = managers.lock();
+    let managers = managers.read();
     let mut list = TopicPartitionList::with_capacity(managers.len());
     for ((topic, partition), manager) in managers.iter() {
         let Some(watermark) = manager.watermark() else {
@@ -272,7 +272,7 @@ fn pause_busy_partitions<T>(
 where
     T: HandlerProvider,
 {
-    let managers = managers.lock();
+    let managers = managers.read();
 
     // Short circuit when all partitions have capacity to avoid allocation
     if !*is_paused && managers.values().all(PartitionManager::has_capacity) {
@@ -317,7 +317,7 @@ where
 /// Returns `Ok(())` if the dispatch is successful, or a `DispatchError` if it
 /// fails.
 fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(), DispatchError> {
-    let managers = managers.lock();
+    let managers = managers.read();
     let Some(manager) = managers.get(&(message.topic(), message.partition())) else {
         return Err(DispatchError::PartitionNotFound(message));
     };

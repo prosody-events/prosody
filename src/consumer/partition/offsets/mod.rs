@@ -1,119 +1,113 @@
-//! Manages and synchronizes offset handling in Kafka, enabling concurrent
-//! processing while ensuring ordered offset commitment. This module offers
-//! mechanisms to reserve and commit offsets, and maintains a watermark to track
-//! the latest contiguous committed offset.
-
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::Arc;
+//! Manages Kafka message offset tracking and commitment.
+//!
+//! This module provides concurrent offset management that:
+//! - Tracks reserved and committed message offsets
+//! - Maintains a watermark of the highest contiguous committed offset
+//! - Detects and reports stalled message processing
+//! - Ensures ordered offset commitment while enabling concurrent processing
+//!
+//! The core type is [`OffsetTracker`], which coordinates offset reservations,
+//! commitments, and watermark updates through a background task.
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;
+use humantime::format_duration;
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::spawn;
 use tokio::sync::mpsc::{channel, OwnedPermit, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, instrument, warn};
+use tokio::time::{sleep_until, Instant};
+use tokio::{select, spawn};
+use tracing::{debug, error, info, instrument, warn};
 
-use crate::Offset;
+use crate::{Offset, Partition, Topic};
 
 #[cfg(test)]
 mod test;
 
-/// Manages uncommitted offsets and tracks the highest successfully committed
-/// offset.
+/// Manages offset tracking and commitment for a Kafka partition.
 ///
-/// Uses atomic operations and a mutex-guarded task handle for managing
-/// background operations that update the watermark based on committed offsets.
+/// Coordinates offset reservations, commitments, and watermark updates through
+/// a background task. Detects stalled message processing and maintains the
+/// highest contiguous committed offset.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct OffsetTracker {
-    /// Channel to transmit actions related to offset management.
+    /// Channel for sending offset management actions
     #[educe(Debug(ignore))]
     action_tx: Sender<Action>,
 
-    /// Stores the highest committed offset in an atomic variable.
+    /// Highest contiguous committed offset
     #[educe(Debug(ignore))]
     watermark: Arc<CachePadded<AtomicI64>>,
 
-    /// Manages the background task for watermark updates.
+    /// Indicates if message processing has stalled
+    #[educe(Debug(ignore))]
+    is_stalled: Arc<CachePadded<AtomicBool>>,
+
+    /// Background task handle for watermark updates
     #[educe(Debug(ignore))]
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-/// Holds an offset that has been reserved but not yet committed.
-///
-/// Provides mechanisms to commit or abort the offset.
-#[derive(Educe)]
-#[educe(Debug)]
-pub struct UncommittedOffset {
-    /// The specific offset that has been taken and awaits commitment.
-    offset: Offset,
-
-    /// Permit to send the offset commit message.
-    #[educe(Debug(ignore))]
-    permit: Option<OwnedPermit<Action>>,
-}
-
-/// Describes an operation to be performed on an offset.
-#[derive(Clone, Debug)]
-struct Action {
-    offset: Offset,
-    operation: Operation,
-}
-
-/// Defines possible operations on offsets.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Operation {
-    Take,
-    Commit,
-}
-
 impl OffsetTracker {
-    /// Creates a new `OffsetTracker` with the specified capacity for
-    /// uncommitted offsets.
-    ///
-    /// Spawns a background task to monitor and commit offsets, updating the
-    /// watermark accordingly.
+    /// Creates a new offset tracker.
     ///
     /// # Arguments
     ///
-    /// * `max_uncommitted` - Maximum number of uncommitted offsets allowed.
-    /// * `watermark_version` - Shared atomic variable to track changes in the
-    ///   watermark.
-    pub fn new(max_uncommitted: usize, watermark_version: Arc<CachePadded<AtomicUsize>>) -> Self {
+    /// * `topic` - The Kafka topic
+    /// * `partition` - The topic partition
+    /// * `max_uncommitted` - Maximum number of uncommitted offsets allowed
+    /// * `stall_threshold` - Duration after which processing is considered
+    ///   stalled
+    /// * `watermark_version` - Shared counter tracking watermark changes
+    pub fn new(
+        topic: Topic,
+        partition: Partition,
+        max_uncommitted: usize,
+        stall_threshold: Duration,
+        watermark_version: Arc<CachePadded<AtomicUsize>>,
+    ) -> Self {
+        // Create channel with space for all uncommitted offsets plus one
         let (action_tx, action_rx) = channel(max_uncommitted + 1);
         let watermark = Arc::new(CachePadded::new(AtomicI64::new(-1)));
+        let is_stalled = Arc::new(CachePadded::new(AtomicBool::new(false)));
 
         let handle = Arc::new(Mutex::new(Some(spawn(track_watermark(
+            topic,
+            partition,
             action_rx,
             watermark.clone(),
             watermark_version,
+            stall_threshold,
+            is_stalled.clone(),
         )))));
 
         Self {
             action_tx,
             watermark,
+            is_stalled,
             handle,
         }
     }
 
-    /// Reserves an offset for potential future commitment.
+    /// Reserves an offset for future commitment.
     ///
     /// # Arguments
     ///
-    /// * `offset` - The offset to reserve.
+    /// * `offset` - The offset to reserve
     ///
     /// # Returns
     ///
-    /// A `Result` containing either an `UncommittedOffset` or an
-    /// `OffsetTrackerError`.
+    /// The reserved offset handle if successful
     ///
     /// # Errors
     ///
-    /// Returns `OffsetTrackerError::Shutdown` if the system is shutting down
-    /// and cannot accept new reservations.
+    /// Returns `OffsetTrackerError::Shutdown` if the tracker is shutting down
     #[instrument(level = "debug")]
     pub async fn take(&self, offset: Offset) -> Result<UncommittedOffset, OffsetTrackerError> {
         let permit = Some(
@@ -132,23 +126,31 @@ impl OffsetTracker {
         Ok(UncommittedOffset { offset, permit })
     }
 
-    /// Fetches the current watermark, representing the highest committed
-    /// offset.
+    /// Returns the current highest contiguous committed offset.
     ///
     /// # Returns
     ///
-    /// An `Option` containing the current watermark if it is valid.
+    /// The current watermark if any offsets have been committed
     pub fn watermark(&self) -> Option<Offset> {
         fetch_watermark(&self.watermark)
     }
 
-    /// Shuts down the `OffsetTracker`, closing the action channel and awaiting
-    /// the completion of the background task to ensure all pending actions are
-    /// resolved.
+    /// Checks if message processing has stalled.
     ///
     /// # Returns
     ///
-    /// An `Option` containing the last known valid watermark if available.
+    /// `true` if processing has stalled, `false` otherwise
+    pub fn is_stalled(&self) -> bool {
+        self.is_stalled.load(Ordering::Acquire)
+    }
+
+    /// Shuts down the offset tracker.
+    ///
+    /// Closes the action channel and waits for the background task to complete.
+    ///
+    /// # Returns
+    ///
+    /// The final watermark value if any offsets were committed
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
         drop(self.action_tx);
@@ -162,32 +164,23 @@ impl OffsetTracker {
     }
 }
 
-/// Fetches the watermark from an atomic variable, ensuring it reflects
-/// committed data.
+/// A reserved offset pending commitment.
 ///
-/// # Arguments
-///
-/// * `watermark` - The atomic variable containing the watermark.
-///
-/// # Returns
-///
-/// An `Option` containing the watermark if it represents a committed offset.
-fn fetch_watermark(watermark: &CachePadded<AtomicI64>) -> Option<Offset> {
-    let watermark = watermark.load(Ordering::Acquire);
-    (watermark >= 0).then_some(watermark)
-}
+/// Provides methods to commit or abort the offset reservation.
+/// Automatically aborts the reservation if dropped without commitment.
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct UncommittedOffset {
+    /// The reserved offset value
+    offset: Offset,
 
-/// Enumerates potential errors that can occur during offset management.
-#[derive(Debug, Error)]
-pub enum OffsetTrackerError {
-    /// Indicates a failure due to the system shutting down, preventing
-    /// operation completion.
-    #[error("operation failed: shutdown")]
-    Shutdown,
+    /// Channel permit for sending the commit action
+    #[educe(Debug(ignore))]
+    permit: Option<OwnedPermit<Action>>,
 }
 
 impl UncommittedOffset {
-    /// Commits the offset.
+    /// Commits this offset.
     pub fn commit(mut self) {
         let Some(permit) = self.permit.take() else {
             error!("offset {} already committed", self.offset);
@@ -196,7 +189,7 @@ impl UncommittedOffset {
         permit.send(Action::commit(self.offset));
     }
 
-    /// Aborts committing the offset.
+    /// Aborts committing this offset.
     pub fn abort(mut self) {
         let Some(_) = self.permit.take() else {
             error!("offset {} already committed", self.offset);
@@ -217,16 +210,23 @@ impl Drop for UncommittedOffset {
     }
 }
 
+/// An offset management action.
+#[derive(Clone, Debug)]
+struct Action {
+    offset: Offset,
+    operation: Operation,
+}
+
 impl Action {
-    /// Creates a Take action for a specific offset.
+    /// Creates a new Take action.
     fn take(offset: Offset) -> Self {
         Self {
             offset,
-            operation: Operation::Take,
+            operation: Operation::Take(Instant::now()),
         }
     }
 
-    /// Creates a Commit action for a specific offset.
+    /// Creates a new Commit action.
     fn commit(offset: Offset) -> Self {
         Self {
             offset,
@@ -235,59 +235,152 @@ impl Action {
     }
 }
 
-/// Processes actions from a receiver to update the watermark based on committed
-/// offsets.
-///
-/// This background task adjusts the watermark to reflect the highest contiguous
-/// committed offset. It maintains a sorted map of offsets and updates the
-/// watermark whenever it can extend the contiguous sequence of committed
-/// offsets. The process continues until the action channel closes during system
-/// shutdown.
+/// Available offset operations.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Operation {
+    /// Reserve an offset with timestamp
+    Take(Instant),
+    /// Commit a previously reserved offset
+    Commit,
+}
+
+/// Errors that may occur during offset tracking.
+#[derive(Debug, Error)]
+pub enum OffsetTrackerError {
+    /// The tracker is shutting down and cannot process the request
+    #[error("operation failed: shutdown")]
+    Shutdown,
+}
+
+/// Retrieves the current watermark value.
 ///
 /// # Arguments
 ///
-/// * `action_rx` - Receiver for offset actions, each either reserving or
-///   committing an offset.
-/// * `watermark` - Shared atomic variable tracking the highest committed
-///   offset.
-/// * `watermark_version` - Atomic variable to track watermark updates.
+/// * `watermark` - The atomic watermark value
+///
+/// # Returns
+///
+/// The watermark if it contains a valid offset
+fn fetch_watermark(watermark: &CachePadded<AtomicI64>) -> Option<Offset> {
+    let watermark = watermark.load(Ordering::Acquire);
+    (watermark >= 0).then_some(watermark)
+}
+
+/// Background task that processes offset actions and updates the watermark.
+///
+/// Maintains an ordered map of offset operations and advances the watermark
+/// when contiguous ranges of offsets are committed. Also monitors for stalled
+/// message processing.
+///
+/// # Arguments
+///
+/// * `topic` - The Kafka topic
+/// * `partition` - The topic partition
+/// * `action_rx` - Channel receiving offset actions
+/// * `watermark` - The shared watermark value
+/// * `watermark_version` - Counter tracking watermark changes
+/// * `stall_threshold` - Duration after which processing is considered stalled
+/// * `is_stalled` - Flag indicating stalled processing
 async fn track_watermark(
+    topic: Topic,
+    partition: Partition,
     mut action_rx: Receiver<Action>,
     watermark: Arc<CachePadded<AtomicI64>>,
     watermark_version: Arc<CachePadded<AtomicUsize>>,
+    stall_threshold: Duration,
+    is_stalled: Arc<CachePadded<AtomicBool>>,
 ) {
-    // Map to keep track of offset actions.
+    let topic = topic.as_ref();
+
+    // Track offset operations in order
     let mut watermarks = BTreeMap::new();
 
-    // Process actions from the receiver until the channel is closed.
-    while let Some(action) = action_rx.recv().await {
-        // Insert action into the map.
-        watermarks.insert(action.offset, action.operation);
+    loop {
+        let stall_future = wait_for_stall(stall_threshold, &is_stalled, &watermarks);
 
-        // Initialize a placeholder for potentially updating the watermark.
-        let mut new_watermark = None;
-
-        // Attempt to update the watermark based on the lowest available offsets.
-        // This loop checks each entry, advancing the watermark when contiguous
-        // committed offsets are found and removing them to keep the dataset minimal.
-        while let Some(entry) = watermarks.first_entry() {
-            // If the lowest offset in the map is committed, update the watermark.
-            if *entry.get() == Operation::Commit {
-                let (offset, _) = entry.remove_entry();
-                new_watermark = Some(offset);
-            } else {
-                break;
+        select! {
+            // Handle stalled processing detection
+            Some((offset, take_time)) = stall_future => {
+                is_stalled.store(true, Ordering::Release);
+                warn!(
+                    "{topic}:{partition} has stalled at offset {offset} \
+                    for {}, which exceeded the stall threshold of {}",
+                    format_duration(take_time.elapsed()),
+                    format_duration(stall_threshold),
+                );
             }
-        }
 
-        // Update the shared watermark if a new one was established.
-        if let Some(new_offset) = new_watermark {
-            watermark.store(new_offset, Ordering::Release);
+            // Process incoming offset actions
+            maybe_action = action_rx.recv() => {
+                let Some(action) = maybe_action else {
+                    break;
+                };
 
-            // Increment the version to indicate a change.
-            watermark_version.fetch_add(1, Ordering::AcqRel);
+                watermarks.insert(action.offset, action.operation);
+
+                let mut new_watermark = None;
+
+                // Update watermark by finding contiguous committed offsets
+                while let Some(entry) = watermarks.first_entry() {
+                    if *entry.get() == Operation::Commit {
+                        let (offset, _) = entry.remove_entry();
+                        new_watermark = Some(offset);
+                    } else {
+                        break;
+                    }
+                }
+
+                // Apply watermark update if found
+                if let Some(new_offset) = new_watermark {
+                    watermark.store(new_offset, Ordering::Release);
+                    watermark_version.fetch_add(1, Ordering::AcqRel);
+
+                    // Clear stalled state if it was set
+                    if is_stalled.load(Ordering::Acquire) {
+                        info!("{topic}:{partition} is no longer stalled");
+                    }
+
+                    is_stalled.store(false, Ordering::Release);
+                }
+            }
         }
     }
 
     debug!("watermark tracking shutdown");
+}
+
+/// Monitors for stalled message processing.
+///
+/// # Arguments
+///
+/// * `stall_threshold` - Duration after which processing is considered stalled
+/// * `is_stalled` - Flag indicating stalled processing
+/// * `watermarks` - Current offset operations map
+///
+/// # Returns
+///
+/// The stalled offset and its take timestamp if stalled
+async fn wait_for_stall(
+    stall_threshold: Duration,
+    is_stalled: &AtomicBool,
+    watermarks: &BTreeMap<Offset, Operation>,
+) -> Option<(Offset, Instant)> {
+    // Skip if already stalled
+    if is_stalled.load(Ordering::Acquire) {
+        return None;
+    }
+
+    // Find oldest uncommitted offset
+    let (offset, take_time) = watermarks.iter().find_map(|(offset, operation)| {
+        let Operation::Take(take_time) = operation else {
+            return None;
+        };
+        Some((*offset, *take_time))
+    })?;
+
+    // Wait until stall threshold is exceeded
+    let expiration = take_time + stall_threshold;
+    sleep_until(expiration).await;
+
+    Some((offset, take_time))
 }
