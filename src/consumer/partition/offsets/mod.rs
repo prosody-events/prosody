@@ -16,11 +16,11 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, OwnedPermit, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tokio::time::sleep_until;
+use tokio::time::{sleep_until, Instant};
 use tokio::{select, spawn};
 use tracing::{debug, error, info, instrument, warn};
 
@@ -380,7 +380,7 @@ async fn wait_for_stall(
 
     // Wait until stall threshold is exceeded
     let expiration = take_time + stall_threshold;
-    sleep_until(expiration.into()).await;
+    sleep_until(expiration).await;
 
     Some((offset, take_time))
 }

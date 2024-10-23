@@ -4,15 +4,18 @@
 //! functioning of the `OffsetTracker`, focusing on watermark tracking and
 //! committing.
 
-use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation};
+use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation, UncommittedOffset};
 use crate::Offset;
-use ahash::{HashMap, HashMapExt, HashSet};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use crossbeam_utils::CachePadded;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::runtime::Builder;
+use tokio::time::Instant;
 
 /// A wrapper for a vector of Actions used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
@@ -131,6 +134,104 @@ impl Arbitrary for Actions {
     }
 }
 
+// Add this new struct for our stall detection test
+#[derive(Clone, Debug)]
+struct StallTestCase {
+    actions: Vec<StallAction>,
+    stall_threshold: Duration,
+}
+
+#[quickcheck]
+fn detects_stalls(test_case: StallTestCase) -> TestResult {
+    let runtime = Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .expect("Failed to build runtime");
+
+    runtime.block_on(async {
+        let StallTestCase {
+            actions,
+            stall_threshold,
+        } = test_case;
+        let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+        let tracker = OffsetTracker::new(
+            "test-topic".into(),
+            0,
+            actions.len() + 1,
+            stall_threshold,
+            version,
+        );
+
+        let mut uncommitted_offsets: HashMap<Offset, (UncommittedOffset, Instant)> = HashMap::new();
+
+        for action in actions {
+            match action {
+                StallAction::Take(offset) => {
+                    if let Ok(uncommitted_offset) = tracker.take(offset).await {
+                        let take_time = Instant::now();
+                        uncommitted_offsets.insert(offset, (uncommitted_offset, take_time));
+                    } else {
+                        return TestResult::error("Failed to take offset");
+                    }
+                }
+                StallAction::Commit(offset) => {
+                    if let Some((uncommitted_offset, _)) = uncommitted_offsets.remove(&offset) {
+                        uncommitted_offset.commit();
+                    }
+                }
+                StallAction::Wait(duration) => {
+                    // Advance the simulated time
+                    tokio::time::advance(duration).await;
+                    // Yield to allow background tasks to run
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            // After each action, check for stalls
+            let expected_stall = uncommitted_offsets
+                .values()
+                .any(|&(_, take_time)| Instant::now().duration_since(take_time) >= stall_threshold);
+
+            // Allow background tasks to run
+            tokio::task::yield_now().await;
+
+            // Check if the stall state matches our expectation
+            if expected_stall != tracker.is_stalled() {
+                return TestResult::error(format!(
+                    "Stall detection mismatch during actions. Expected: {}, Actual: {}",
+                    expected_stall,
+                    tracker.is_stalled()
+                ));
+            }
+        }
+
+        // Advance time to trigger stall detection if necessary
+        let additional_time = stall_threshold + Duration::from_millis(1);
+        tokio::time::advance(additional_time).await;
+        tokio::task::yield_now().await;
+
+        // Recompute expected_stall after advancing time
+        let expected_stall = uncommitted_offsets
+            .values()
+            .any(|&(_, take_time)| Instant::now().duration_since(take_time) >= stall_threshold);
+
+        // Allow background tasks to run
+        tokio::task::yield_now().await;
+
+        // Check if the stall state matches our expectation
+        if expected_stall == tracker.is_stalled() {
+            TestResult::passed()
+        } else {
+            TestResult::error(format!(
+                "Stall detection mismatch after advancing time. Expected: {}, Actual: {}",
+                expected_stall,
+                tracker.is_stalled()
+            ))
+        }
+    })
+}
+
 impl Arbitrary for Action {
     /// Generates an arbitrary `Action` for `QuickCheck` tests.
     ///
@@ -154,6 +255,50 @@ impl Arbitrary for Operation {
             Operation::Take(Instant::now())
         } else {
             Operation::Commit
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum StallAction {
+    Take(Offset),
+    Commit(Offset),
+    Wait(Duration),
+}
+
+impl Arbitrary for StallTestCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let mut actions = Vec::new();
+        let mut taken_offsets = HashSet::new();
+        let mut offset_counter = 0;
+        // Use smaller stall threshold for faster tests
+        let stall_threshold = Duration::from_millis(10 + u64::arbitrary(g) % 20);
+
+        for _ in 0..10 {
+            match u8::arbitrary(g) % 3 {
+                0 => {
+                    // Generate contiguous offsets
+                    let offset = offset_counter;
+                    offset_counter += 1;
+                    actions.push(StallAction::Take(offset));
+                    taken_offsets.insert(offset);
+                }
+                1 if !taken_offsets.is_empty() => {
+                    let offset = **g.choose(&taken_offsets.iter().collect::<Vec<_>>()).unwrap();
+                    actions.push(StallAction::Commit(offset));
+                    taken_offsets.remove(&offset);
+                }
+                _ => {
+                    // Use smaller wait times
+                    let wait_time = Duration::from_millis(u64::arbitrary(g) % 10);
+                    actions.push(StallAction::Wait(wait_time));
+                }
+            }
+        }
+
+        StallTestCase {
+            actions,
+            stall_threshold,
         }
     }
 }
