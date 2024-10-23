@@ -151,7 +151,7 @@ mod tests {
     use reqwest::Client;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout};
 
     #[tokio::test]
     async fn test_probe_server_endpoints_respond() {
@@ -166,7 +166,7 @@ mod tests {
         let client = Client::new();
 
         // Give the server a moment to start up
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(100)).await;
 
         let readyz_result = check_endpoint(&client, address, "/readyz").await;
         let livez_result = check_endpoint(&client, address, "/livez").await;
