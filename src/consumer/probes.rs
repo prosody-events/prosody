@@ -80,6 +80,8 @@ impl ProbeServer {
         })
     }
 
+    #[cfg(test)]
+    /// Server bind address
     pub fn local_addr(&self) -> SocketAddr {
         self.address
     }
