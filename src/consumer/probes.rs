@@ -11,9 +11,10 @@ use axum::routing::get;
 use axum::Router;
 use axum_extra::routing::RouterExt;
 use educe::Educe;
+use futures::executor::block_on;
 use std::borrow::Cow;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::spawn;
@@ -25,6 +26,8 @@ use tracing::{debug, error, info};
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct ProbeServer {
+    address: SocketAddr,
+
     #[educe(Debug(ignore))]
     shutdown_tx: oneshot::Sender<()>,
 
@@ -51,8 +54,7 @@ impl ProbeServer {
             .with_state(managers);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
-        let listener = TcpListener::from_std(listener)?;
+        let listener = block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await })?;
         let address = listener.local_addr()?;
 
         let handle = spawn(async move {
@@ -72,9 +74,14 @@ impl ProbeServer {
         });
 
         Ok(Self {
+            address,
             shutdown_tx,
             handle,
         })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
     }
 
     /// Gracefully shuts down the probe server.
@@ -135,5 +142,56 @@ async fn liveness_probe(State(managers): State<Arc<Managers>>) -> (StatusCode, &
         )
     } else {
         (StatusCode::OK, "no stalled partitions")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::Client;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn test_probe_server_endpoints_respond() {
+        // Create a mock Managers instance
+        let managers = Arc::default();
+
+        // Create a ProbeServer instance
+        let server = ProbeServer::new(0, managers).expect("Failed to create ProbeServer");
+        let address = server.local_addr();
+
+        // Create a reqwest Client
+        let client = Client::new();
+
+        // Give the server a moment to start up
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let readyz_result = check_endpoint(&client, address, "/readyz").await;
+        let livez_result = check_endpoint(&client, address, "/livez").await;
+
+        // Shutdown the server
+        server.shutdown().await;
+
+        // Assert after shutdown to ensure we always shutdown even if assertions fail
+        assert!(readyz_result, "Readiness probe did not respond");
+        assert!(livez_result, "Liveness probe did not respond");
+    }
+
+    // Helper function to check if an endpoint responds
+    async fn check_endpoint(client: &Client, address: SocketAddr, path: &str) -> bool {
+        let url = format!("http://localhost:{}{}", address.port(), path);
+        match timeout(Duration::from_secs(5), client.get(&url).send()).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                println!("Error sending request to {}: {:?}", path, e);
+                false
+            }
+            Err(_) => {
+                println!("Timeout sending request to {}", path);
+                false
+            }
+        }
     }
 }

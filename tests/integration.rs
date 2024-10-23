@@ -309,14 +309,14 @@ fn spawn_consumers(
                 0,
                 "Initial assigned partition count should be 0"
             );
-            
+
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?;
             assert_ne!(
                 consumer.assigned_partition_count(),
                 0,
                 "Initial assigned partition count should be greater than zero"
             );
-            
+
             consumer.shutdown().await;
             Ok(())
         });
