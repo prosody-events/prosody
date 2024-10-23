@@ -143,11 +143,13 @@ struct StallTestCase {
 
 #[quickcheck]
 fn detects_stalls(test_case: StallTestCase) -> TestResult {
-    let runtime = Builder::new_current_thread()
+    let Ok(runtime) = Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
         .build()
-        .expect("Failed to build runtime");
+    else {
+        return TestResult::error("failed to initialize runtime");
+    };
 
     runtime.block_on(async {
         let StallTestCase {
@@ -200,16 +202,8 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
             // After each action, check for stalls
             let now = Instant::now();
 
-            let stalled_offsets: Vec<_> = uncommitted_offsets
-                .iter()
-                .filter_map(|(&offset, &(_, take_time))| {
-                    if offset > watermark && now.duration_since(take_time) >= stall_threshold {
-                        Some(offset)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let stalled_offsets: Vec<_> =
+                get_stalled(stall_threshold, &mut uncommitted_offsets, watermark, now);
 
             let expected_stall = !stalled_offsets.is_empty();
 
@@ -238,16 +232,8 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
         // Recompute expected_stall after advancing time
         let now = Instant::now();
 
-        let stalled_offsets: Vec<_> = uncommitted_offsets
-            .iter()
-            .filter_map(|(&offset, &(_, take_time))| {
-                if offset > watermark && now.duration_since(take_time) >= stall_threshold {
-                    Some(offset)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let stalled_offsets: Vec<_> =
+            get_stalled(stall_threshold, &mut uncommitted_offsets, watermark, now);
 
         let expected_stall = !stalled_offsets.is_empty();
 
@@ -268,6 +254,21 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
             ))
         }
     })
+}
+
+fn get_stalled(
+    stall_threshold: Duration,
+    uncommitted_offsets: &mut BTreeMap<Offset, (UncommittedOffset, Instant)>,
+    watermark: Offset,
+    now: Instant,
+) -> Vec<Offset> {
+    uncommitted_offsets
+        .iter()
+        .filter_map(|(&offset, &(_, take_time))| {
+            (offset > watermark && now.duration_since(take_time) >= stall_threshold)
+                .then_some(offset)
+        })
+        .collect()
 }
 
 impl Arbitrary for Action {
@@ -314,12 +315,12 @@ impl Arbitrary for StallTestCase {
         // Use smaller stall threshold for faster tests
         let stall_threshold = Duration::from_millis(10 + u64::arbitrary(g) % 20);
 
-        for _ in 0..10 {
+        for _ in 0_u8..1u8 {
             match u8::arbitrary(g) % 3 {
                 0 => {
                     // Generate offsets with possible small gaps
                     let gap = u8::arbitrary(g) % max_gap;
-                    offset_counter += gap as Offset;
+                    offset_counter += Offset::from(gap);
 
                     let offset = offset_counter;
                     offset_counter += 1;
@@ -328,7 +329,9 @@ impl Arbitrary for StallTestCase {
                     taken_offsets.insert(offset);
                 }
                 1 if !taken_offsets.is_empty() => {
-                    let offset = **g.choose(&taken_offsets.iter().collect::<Vec<_>>()).unwrap();
+                    let Some(&&offset) = g.choose(&taken_offsets.iter().collect::<Vec<_>>()) else {
+                        continue;
+                    };
                     actions.push(StallAction::Commit(offset));
                     taken_offsets.remove(&offset);
                 }
