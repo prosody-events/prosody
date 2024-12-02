@@ -5,7 +5,6 @@ integrated OpenTelemetry support for distributed tracing.
 
 [![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://prosody.docs.rg-infra.com/prosody)
 [![Build Status](https://github.com/cincpro/prosody/actions/workflows/general.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/general.yaml?query=branch%3Amain)
-[![Audit Status](https://github.com/cincpro/prosody/actions/workflows/audit.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/audit.yaml?query=branch%3Amain)
 [![Docs Status](https://github.com/cincpro/prosody/actions/workflows/documentation.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/documentation.yaml?query=branch%3Amain)
 [![Quality Status](https://github.com/cincpro/prosody/actions/workflows/quality.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/quality.yaml?query=branch%3Amain)
 [![Coverage Status](https://github.com/cincpro/prosody/actions/workflows/coverage.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/coverage.yaml?query=branch%3Amain)
