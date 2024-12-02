@@ -31,13 +31,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Linting
         run:
-          cargo clippy --all-features --message-format=json -- -D warnings
-          | clippy-sarif
-          | tee results.sarif
-          | sarif-fmt
-        continue-on-error: true
-      - name: Upload analysis results to GitHub
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: results.sarif
-          wait-for-processing: true
+          cargo clippy --all-features -- -D warnings
+#          cargo clippy --all-features --message-format=json -- -D warnings
+#          | clippy-sarif
+#          | tee results.sarif
+#          | sarif-fmt
+#        continue-on-error: true
+#      - name: Upload analysis results to GitHub
+#        uses: github/codeql-action/upload-sarif@v3
+#        with:
+#          sarif_file: results.sarif
+#          wait-for-processing: true
