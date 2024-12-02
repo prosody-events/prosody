@@ -27,7 +27,7 @@ use whoami::fallible::hostname;
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::util::{from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env};
-use crate::{Payload, Topic};
+use crate::{Payload, Topic, MOCK_CLUSTER_BOOTSTRAP};
 
 #[cfg(target_arch = "arm")]
 use serde_json as json;
@@ -133,17 +133,19 @@ impl ProsodyProducer {
 
         let send_timeout = config.send_timeout.map_or(Timeout::Never, Timeout::After);
 
+        let bootstrap = if config.mock {
+            MOCK_CLUSTER_BOOTSTRAP.clone()
+        } else {
+            config.bootstrap_servers.join(",")
+        };
+
         let mut client_config = ClientConfig::new();
         client_config
-            .set("bootstrap.servers", config.bootstrap_servers.join(","))
+            .set("bootstrap.servers", bootstrap)
             .set("client.id", hostname()?)
             .set("compression.codec", "lz4")
             .set("enable.idempotence", "true")
             .set_log_level(RDKafkaLogLevel::Error);
-
-        if config.mock {
-            client_config.set("test.mock.num.brokers", "3");
-        }
 
         Ok(Self {
             send_timeout,

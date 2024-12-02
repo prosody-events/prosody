@@ -199,8 +199,12 @@
 
 #![allow(clippy::multiple_crate_versions)]
 
+use ::tracing::info;
 use internment::Intern;
+use rdkafka::mocking::MockCluster;
 use serde_json::Value;
+use std::mem::forget;
+use std::sync::LazyLock;
 
 pub mod admin;
 pub mod consumer;
@@ -209,6 +213,24 @@ pub mod producer;
 pub mod propagator;
 pub mod tracing;
 mod util;
+
+/// Lazily initialized mock Kafka cluster
+///
+/// Only one cluster is used across all clients to facilitate cross-client
+/// communication
+#[allow(clippy::unwrap_used)]
+static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
+    let cluster = MockCluster::new(3).unwrap();
+    let bootstrap = cluster.bootstrap_servers();
+
+    cluster.create_topic("test-topic", 3, 3).unwrap();
+
+    // Run the mock cluster in the background without running its destructor
+    forget(cluster);
+
+    info!("started mock cluster on {bootstrap}");
+    bootstrap
+});
 
 /// A Kafka topic name.
 ///
