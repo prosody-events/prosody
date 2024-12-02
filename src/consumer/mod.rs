@@ -64,7 +64,7 @@ use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_vec_env,
 };
-use crate::{Partition, Topic};
+use crate::{Partition, Topic, MOCK_CLUSTER_BOOTSTRAP};
 
 mod context;
 mod extractor;
@@ -367,10 +367,16 @@ impl ProsodyConsumer {
             managers.clone(),
         );
 
+        let bootstrap = if config.mock {
+            MOCK_CLUSTER_BOOTSTRAP.clone()
+        } else {
+            config.bootstrap_servers.join(",")
+        };
+
         // Configure and create the Kafka consumer
         let mut client_config = ClientConfig::new();
         client_config
-            .set("bootstrap.servers", config.bootstrap_servers.join(","))
+            .set("bootstrap.servers", bootstrap)
             .set("client.id", hostname()?)
             .set("group.id", &config.group_id)
             .set("enable.auto.commit", "false")
@@ -378,11 +384,6 @@ impl ProsodyConsumer {
             .set("auto.offset.reset", "earliest")
             .set("partition.assignment.strategy", "cooperative-sticky")
             .set_log_level(RDKafkaLogLevel::Error);
-
-        // Set up mock broker if configured
-        if config.mock {
-            client_config.set("test.mock.num.brokers", "3");
-        }
 
         let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
 
