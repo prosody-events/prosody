@@ -5,7 +5,7 @@
 //! customizable tracing setup with optional additional layers.
 
 use opentelemetry::trace::{TraceError, TracerProvider};
-use opentelemetry_otlp::{new_exporter, new_pipeline};
+use opentelemetry_otlp::{SpanExporter, WithTonicConfig};
 use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::trace::Tracer;
 use std::env;
@@ -87,14 +87,15 @@ fn build_telemetry_layer() -> Result<OpenTelemetryLayer<Registry, Tracer>, Traci
     }
 
     // Create and install the OpenTelemetry tracer
-    let tracer = new_pipeline()
-        .tracing()
-        .with_exporter(
-            new_exporter()
-                .tonic()
-                .with_tls_config(ClientTlsConfig::default().with_native_roots()),
+    let tracer = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_batch_exporter(
+            SpanExporter::builder()
+                .with_tonic()
+                .with_tls_config(ClientTlsConfig::default().with_native_roots())
+                .build()?,
+            Tokio,
         )
-        .install_batch(Tokio)?
+        .build()
         .tracer("prosody");
 
     Ok(tracing_opentelemetry::layer().with_tracer(tracer))

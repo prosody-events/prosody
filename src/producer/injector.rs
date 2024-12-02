@@ -42,7 +42,7 @@ where
     }
 }
 
-impl<'a, 'b, K, P> Injector for RecordInjector<'a, 'b, K, P>
+impl<K, P> Injector for RecordInjector<'_, '_, K, P>
 where
     K: ToBytes + ?Sized,
     P: ToBytes + ?Sized,

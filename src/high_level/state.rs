@@ -21,7 +21,7 @@ use thiserror::Error;
 /// allowing read-only access to the underlying `ConsumerState`.
 pub struct ConsumerStateView<'a, T>(pub(crate) MutexGuard<'a, ConsumerState<T>>);
 
-impl<'a, T> Deref for ConsumerStateView<'a, T> {
+impl<T> Deref for ConsumerStateView<'_, T> {
     type Target = ConsumerState<T>;
 
     fn deref(&self) -> &Self::Target {
