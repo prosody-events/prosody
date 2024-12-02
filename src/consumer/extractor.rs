@@ -28,7 +28,7 @@ impl<'a> MessageExtractor<'a> {
     }
 }
 
-impl<'a> Extractor for MessageExtractor<'a> {
+impl Extractor for MessageExtractor<'_> {
     /// Retrieves the value of a header associated with the given key.
     ///
     /// # Arguments
