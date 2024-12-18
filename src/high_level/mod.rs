@@ -87,6 +87,7 @@ impl<T> HighLevelClient<T> {
         let producer = match mode {
             Mode::Pipeline => ProsodyProducer::pipeline_producer(cloned_config),
             Mode::LowLatency => ProsodyProducer::low_latency_producer(cloned_config),
+            Mode::BestEffort => ProsodyProducer::best_effort_producer(cloned_config),
         }?;
 
         let consumer_state =
@@ -172,6 +173,9 @@ impl<T> HighLevelClient<T> {
                 self.producer.clone(),
                 handler.clone(),
             )?,
+            ModeConfiguration::BestEffort { consumer, .. } => {
+                ProsodyConsumer::best_effort_consumer(consumer, handler.clone())?
+            }
         };
 
         *consumer_ref = ConsumerState::Running {

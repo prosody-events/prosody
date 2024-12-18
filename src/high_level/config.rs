@@ -38,6 +38,11 @@ pub enum ModeConfiguration {
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
     },
+    /// Configuration for Best-Effort mode.
+    BestEffort {
+        /// The consumer configuration.
+        consumer: ConsumerConfiguration,
+    },
 }
 
 impl ModeConfiguration {
@@ -78,6 +83,7 @@ impl ModeConfiguration {
                     failure_topic,
                 }
             }
+            Mode::BestEffort => Self::BestEffort { consumer },
         })
     }
 
@@ -89,7 +95,9 @@ impl ModeConfiguration {
     #[must_use]
     pub fn configured_topics(&self) -> Vec<Topic> {
         match self {
-            Self::Pipeline { consumer, .. } => subscription(consumer).collect(),
+            Self::Pipeline { consumer, .. } | ModeConfiguration::BestEffort { consumer } => {
+                subscription(consumer).collect()
+            }
             Self::LowLatency {
                 consumer,
                 failure_topic,
@@ -113,6 +121,7 @@ impl ModeConfiguration {
         match self {
             ModeConfiguration::Pipeline { .. } => Mode::Pipeline,
             ModeConfiguration::LowLatency { .. } => Mode::LowLatency,
+            ModeConfiguration::BestEffort { .. } => Mode::BestEffort,
         }
     }
 
@@ -125,7 +134,8 @@ impl ModeConfiguration {
     pub fn consumer_config(&self) -> &ConsumerConfiguration {
         match self {
             ModeConfiguration::Pipeline { consumer, .. }
-            | ModeConfiguration::LowLatency { consumer, .. } => consumer,
+            | ModeConfiguration::LowLatency { consumer, .. }
+            | ModeConfiguration::BestEffort { consumer } => consumer,
         }
     }
 }

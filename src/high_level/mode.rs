@@ -16,6 +16,9 @@ pub const PIPELINE_MODE: &str = "pipeline";
 /// String constant for low-latency mode.
 pub const LOW_LATENCY_MODE: &str = "low-latency";
 
+/// String constant for best-effort mode.
+pub const BEST_EFFORT_MODE: &str = "best-effort";
+
 /// Operational modes for the Prosody client.
 #[derive(Copy, Clone, Debug, Default)]
 pub enum Mode {
@@ -24,6 +27,9 @@ pub enum Mode {
     Pipeline,
     /// Low-latency mode for faster processing with potential trade-offs.
     LowLatency,
+    /// Best-effort mode for development or when messages can be discarded when
+    /// processing fails.
+    BestEffort,
 }
 
 impl Display for Mode {
@@ -40,6 +46,7 @@ impl Display for Mode {
         match self {
             Mode::Pipeline => f.write_str(PIPELINE_MODE),
             Mode::LowLatency => f.write_str(LOW_LATENCY_MODE),
+            Mode::BestEffort => f.write_str(BEST_EFFORT_MODE),
         }
     }
 }
@@ -66,6 +73,7 @@ impl FromStr for Mode {
         match s {
             PIPELINE_MODE => Ok(Mode::Pipeline),
             LOW_LATENCY_MODE => Ok(Mode::LowLatency),
+            BEST_EFFORT_MODE => Ok(Mode::BestEffort),
             unknown => Err(ModeError::UnknownMode(unknown.to_owned())),
         }
     }

@@ -89,6 +89,7 @@ where
 
         // Process the message and handle potential errors
         let Err(error) = self.0.on_message(context, message).await else {
+            uncommitted_offset.commit();
             return;
         };
 
