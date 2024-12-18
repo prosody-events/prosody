@@ -200,6 +200,30 @@ impl ProsodyProducer {
         Self::new(&config)
     }
 
+    /// Creates a new `ProsodyProducer` instance optimized for best-effort.
+    ///
+    /// This configuration ensures a send timeout is set, defaulting to 1 second
+    /// if not specified.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The producer configuration.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the new `ProsodyProducer` instance or a
+    /// `ProducerError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProducerError` if the producer creation fails.
+    pub fn best_effort_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+        if config.send_timeout.is_none() {
+            config.send_timeout = Some(Duration::from_secs(1));
+        }
+        Self::new(&config)
+    }
+
     /// Sends a message to a Kafka topic.
     ///
     /// # Arguments

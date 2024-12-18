@@ -52,6 +52,7 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::context::Context;
+use crate::consumer::failure::log::LogStrategy;
 use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
 use crate::consumer::failure::shutdown::ShutdownStrategy;
 use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
@@ -500,6 +501,34 @@ impl ProsodyConsumer {
 
         let handler = strategy.with_handler(handler);
         Self::new(consumer_config, handler)
+    }
+
+    /// Creates a new `ProsodyConsumer` with a logging strategy for failure
+    /// handling. This should generally only be used in development or
+    /// best-effort services where processing failures are acceptable.
+    ///
+    /// # Arguments
+    ///
+    /// * `consumer_config` - The consumer configuration.
+    /// * `handler` - The fallible message handler.
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the new `ProsodyConsumer` instance or a
+    /// `ConsumerError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConsumerError` if the consumer creation fails.
+    pub fn best_effort_consumer<T>(
+        consumer_config: &ConsumerConfiguration,
+        handler: T,
+    ) -> Result<Self, ConsumerError>
+    where
+        T: FallibleHandler + Clone + Send + Sync + 'static,
+    {
+        let strategy = ShutdownStrategy.and_then(LogStrategy);
+        Self::new(consumer_config, strategy.with_handler(handler))
     }
 
     /// Returns the number of currently assigned partitions.

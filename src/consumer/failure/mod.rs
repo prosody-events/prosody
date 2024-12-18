@@ -11,6 +11,7 @@ use std::future::Future;
 use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::HandlerProvider;
 
+pub mod log;
 pub mod retry;
 pub mod shutdown;
 pub mod topic;

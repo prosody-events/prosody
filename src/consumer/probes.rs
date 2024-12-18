@@ -155,6 +155,7 @@ mod tests {
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
+    #[allow(clippy::expect_used)]
     #[tokio::test]
     async fn test_probe_server_endpoints_respond() {
         // Create a mock Managers instance
