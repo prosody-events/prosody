@@ -1,24 +1,32 @@
-//! Core functionality for handling consumer messages in a Kafka message
-//! processing system.
+//! Core message types and processing for Kafka consumers.
 //!
-//! This module defines structures for managing message contexts and consumer
-//! messages, including tracking shutdown signals and committing messages after
-//! processing.
-
-use std::fmt::Debug;
-use std::future::Future;
-use std::sync::Arc;
+//! This module defines the message types and contexts used for processing Kafka
+//! messages:
+//!
+//! - `MessageContext` - Provides shutdown notification capabilities
+//! - `UncommittedMessage` - A message with uncommitted offset tracking
+//! - `ConsumerMessage` - A message container optimized for cloning
+//! - `ConsumerMessageValue` - The raw message data and metadata
+//!
+//! The types work together to provide message lifecycle management, offset
+//! tracking, and shutdown coordination.
 
 use chrono::{DateTime, Utc};
 use educe::Educe;
+use serde_json::Value;
+use std::fmt::Debug;
+use std::future::Future;
+use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, error, Span};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
-use crate::consumer::Keyed;
-use crate::{Key, Offset, Partition, Payload, Topic};
+use crate::consumer::{EventIdentity, Keyed};
+use crate::{BorrowedEventId, EventId, Key, Offset, Partition, Payload, Topic};
 
-/// Represents the context for a message within a consumer.
+/// The context for message processing within a consumer.
+///
+/// Provides shutdown notification capabilities to coordinate graceful shutdown.
 #[derive(Clone, Debug)]
 pub struct MessageContext {
     shutdown_rx: watch::Receiver<bool>,
@@ -27,11 +35,9 @@ pub struct MessageContext {
 impl MessageContext {
     /// Creates a new message context.
     ///
-    /// This method is intended for internal use within the crate.
-    ///
     /// # Arguments
     ///
-    /// * `shutdown_rx` - A receiver for shutdown signals.
+    /// * `shutdown_rx` - Receiver for shutdown signals
     pub(crate) fn new(shutdown_rx: watch::Receiver<bool>) -> Self {
         Self { shutdown_rx }
     }
@@ -43,7 +49,7 @@ impl MessageContext {
     ///
     /// # Errors
     ///
-    /// Logs an error message if the shutdown hook fails.
+    /// Logs an error if the shutdown hook fails.
     pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send {
         let mut shutdown_rx = self.shutdown_rx.clone();
         async move {
@@ -57,14 +63,16 @@ impl MessageContext {
     ///
     /// # Returns
     ///
-    /// `true` if a shutdown signal has been received, `false` otherwise.
+    /// `true` if shutdown was signaled, `false` otherwise.
     #[must_use]
     pub fn should_shutdown(&self) -> bool {
         *self.shutdown_rx.borrow()
     }
 }
 
-/// A message consumed from a topic with associated metadata and commit state.
+/// A message with uncommitted offset tracking.
+///
+/// Wraps a `ConsumerMessage` and tracks its offset commitment state.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct UncommittedMessage {
@@ -81,65 +89,66 @@ impl UncommittedMessage {
         self.inner.topic()
     }
 
-    /// Returns the partition of the message.
+    /// Returns the message's partition.
     #[must_use]
     pub fn partition(&self) -> Partition {
         self.inner.partition()
     }
 
-    /// Returns the offset of the message.
+    /// Returns the message's offset.
     #[must_use]
     pub fn offset(&self) -> Offset {
         self.inner.offset()
     }
 
-    /// Returns the message timestamp.
+    /// Returns the message's timestamp.
     #[must_use]
     pub fn timestamp(&self) -> &DateTime<Utc> {
         self.inner.timestamp()
     }
 
-    /// Returns a reference to the message's payload.
+    /// Returns the message's payload.
     #[must_use]
     pub fn payload(&self) -> &Payload {
         self.inner.payload()
     }
 
-    /// Returns a reference to the associated span for tracing.
+    /// Returns the message's tracing span.
     #[must_use]
     pub fn span(&self) -> &Span {
         self.inner.span()
     }
 
-    /// Takes ownership of the message and returns its components.
+    /// Decomposes the message into its parts.
     ///
     /// # Returns
     ///
-    /// A tuple containing a `ConsumerMessage` and an `UncommittedOffset`.
+    /// A tuple containing the inner `ConsumerMessage` and `UncommittedOffset`.
     #[must_use]
     pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
         (self.inner, self.uncommitted_offset)
     }
 
-    /// Commits the message, marking its offset as processed.
+    /// Commits the message's offset.
     pub fn commit(self) {
         debug!(
             topic = self.topic().as_ref(),
             partition = self.partition(),
-            key = self.key(),
+            key = self.key().as_str(),
             offset = self.offset(),
             "committing message"
         );
         self.uncommitted_offset.commit();
     }
 
-    /// Aborts the message, halting any further progress on this partition. This
-    /// should only be called during shutdown.
+    /// Aborts processing for this message's partition.
+    ///
+    /// Should only be called during shutdown to stop processing cleanly.
     pub fn abort(self) {
         debug!(
             topic = self.topic().as_ref(),
             partition = self.partition(),
-            key = self.key(),
+            key = self.key().as_str(),
             offset = self.offset(),
             "aborting message"
         );
@@ -150,9 +159,17 @@ impl UncommittedMessage {
 impl Keyed for UncommittedMessage {
     type Key = Key;
 
-    /// Returns a reference to the message's key.
     fn key(&self) -> &Self::Key {
         self.inner.key()
+    }
+}
+
+impl EventIdentity for UncommittedMessage {
+    type BorrowedEventId = BorrowedEventId;
+    type EventId = EventId;
+
+    fn event_id(&self) -> Option<&Self::BorrowedEventId> {
+        get_event_id(self.payload())
     }
 }
 
@@ -160,46 +177,46 @@ impl Keyed for UncommittedMessage {
 #[derive(Clone, Debug)]
 pub struct ConsumerMessage(Arc<ConsumerMessageValue>);
 
-/// Contains the actual message data and metadata.
+/// The raw message data and metadata.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ConsumerMessageValue {
-    /// The topic from which the message was consumed.
+    /// The message's topic
     pub topic: Topic,
 
-    /// The partition from which the message was consumed.
+    /// The message's partition
     pub partition: Partition,
 
-    /// The offset of the message within its partition.
+    /// The message's offset in its partition
     pub offset: Offset,
 
-    /// The key associated with the message.
+    /// The message's key
     pub key: Key,
 
-    /// The timestamp of the message.
+    /// The message's timestamp
     pub timestamp: DateTime<Utc>,
 
-    /// The payload of the message.
+    /// The message's payload
     #[educe(Debug(ignore))]
     pub payload: Payload,
 
-    /// The tracing span associated with this message.
+    /// The message's tracing span
     #[educe(Debug(ignore))]
     pub span: Span,
 }
 
 impl ConsumerMessage {
-    /// Creates a new `ConsumerMessage`.
+    /// Creates a new consumer message.
     ///
     /// # Arguments
     ///
-    /// * `topic` - The topic from which the message was consumed.
-    /// * `partition` - The partition from which the message was consumed.
-    /// * `offset` - The offset of the message within its partition.
-    /// * `key` - The key associated with the message.
-    /// * `timestamp` - The timestamp of the message.
-    /// * `payload` - The payload of the message.
-    /// * `span` - The tracing span associated with this message.
+    /// * `topic` - The message's topic
+    /// * `partition` - The message's partition
+    /// * `offset` - The message's offset
+    /// * `key` - The message's key
+    /// * `timestamp` - The message's timestamp
+    /// * `payload` - The message's payload
+    /// * `span` - The message's tracing span
     #[must_use]
     pub fn new(
         topic: Topic,
@@ -227,48 +244,45 @@ impl ConsumerMessage {
         self.0.topic
     }
 
-    /// Returns the partition of the message.
+    /// Returns the message's partition.
     #[must_use]
     pub fn partition(&self) -> Partition {
         self.0.partition
     }
 
-    /// Returns the offset of the message.
+    /// Returns the message's offset.
     #[must_use]
     pub fn offset(&self) -> Offset {
         self.0.offset
     }
 
-    /// Returns the message timestamp.
+    /// Returns the message's timestamp.
     #[must_use]
     pub fn timestamp(&self) -> &DateTime<Utc> {
         &self.0.timestamp
     }
 
-    /// Returns a reference to the message's payload.
+    /// Returns the message's payload.
     #[must_use]
     pub fn payload(&self) -> &Payload {
         &self.0.payload
     }
 
-    /// Returns a reference to the associated span for tracing.
+    /// Returns the message's tracing span.
     #[must_use]
     pub fn span(&self) -> &Span {
         &self.0.span
     }
 
-    /// Converts a `ConsumerMessage` into an `UncommittedMessage` by adding
-    /// uncommitted offset tracking.
+    /// Converts this message to an uncommitted message.
     ///
     /// # Arguments
     ///
-    /// * `uncommitted_offset` - The uncommitted offset to be associated with
-    ///   the message.
+    /// * `uncommitted_offset` - The offset tracking state to attach
     ///
     /// # Returns
     ///
-    /// An `UncommittedMessage` with the same data as the original
-    /// `ConsumerMessage`, but with added offset tracking.
+    /// A new `UncommittedMessage` containing this message and the offset state.
     #[must_use]
     pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage {
         UncommittedMessage {
@@ -277,7 +291,11 @@ impl ConsumerMessage {
         }
     }
 
-    /// Converts a `ConsumerMessage` into a `ConsumerMessageValue`.
+    /// Extracts the inner message value.
+    ///
+    /// # Returns
+    ///
+    /// The contained `ConsumerMessageValue`.
     #[must_use]
     pub fn into_value(self) -> ConsumerMessageValue {
         Arc::unwrap_or_clone(self.0)
@@ -287,8 +305,32 @@ impl ConsumerMessage {
 impl Keyed for ConsumerMessage {
     type Key = Key;
 
-    /// Returns a reference to the message's key.
     fn key(&self) -> &Self::Key {
         &self.0.key
+    }
+}
+
+impl EventIdentity for ConsumerMessage {
+    type BorrowedEventId = BorrowedEventId;
+    type EventId = EventId;
+
+    fn event_id(&self) -> Option<&Self::BorrowedEventId> {
+        get_event_id(self.payload())
+    }
+}
+
+/// Extracts an event ID from a message payload if present.
+///
+/// # Arguments
+///
+/// * `payload` - The message payload to extract from
+///
+/// # Returns
+///
+/// The event ID string if found in the payload, `None` otherwise.
+fn get_event_id(payload: &Payload) -> Option<&str> {
+    match payload.as_object()?.get("id")? {
+        Value::String(value) => Some(value.as_str()),
+        _ => None,
     }
 }

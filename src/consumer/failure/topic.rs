@@ -157,7 +157,7 @@ where
             info!(
                 topic,
                 partition,
-                key,
+                key = key.as_str(),
                 offset,
                 "terminal condition encountered while handling message: {error:#}; aborting"
             );
@@ -168,7 +168,7 @@ where
         error!(
             topic,
             partition,
-            key,
+            key = key.as_str(),
             offset,
             "failed to process message: {error:#}; sending to {}",
             self.topic

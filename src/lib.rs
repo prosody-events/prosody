@@ -200,6 +200,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use ::tracing::info;
+use fixedstr::Flexstr;
 use internment::Intern;
 use rdkafka::mocking::MockCluster;
 use serde_json::Value;
@@ -214,10 +215,12 @@ pub mod propagator;
 pub mod tracing;
 mod util;
 
-/// Lazily initialized mock Kafka cluster
+/// A lazily initialized mock Kafka cluster for testing.
 ///
-/// Only one cluster is used across all clients to facilitate cross-client
-/// communication
+/// Creates a single shared mock cluster with 3 brokers and a test topic to
+/// facilitate testing without requiring a real Kafka cluster. The cluster is
+/// initialized the first time it's accessed and persists for the duration of
+/// the program.
 #[allow(clippy::unwrap_used)]
 static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
     let cluster = MockCluster::new(3).unwrap();
@@ -225,32 +228,45 @@ static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
 
     cluster.create_topic("test-topic", 3, 3).unwrap();
 
-    // Run the mock cluster in the background without running its destructor
+    // Keep cluster alive for program duration
     forget(cluster);
 
     info!("started mock cluster on {bootstrap}");
     bootstrap
 });
 
-/// A Kafka topic name.
+/// An interned string representing a Kafka topic name.
 ///
-/// This type uses string interning for efficient storage and comparison of
-/// topic names.
+/// Using string interning provides efficient storage and comparison of topic
+/// names by maintaining a single copy of each unique topic name.
 pub type Topic = Intern<str>;
 
-/// A Kafka partition number.
+/// A partition identifier within a Kafka topic.
 pub type Partition = i32;
 
-/// A Kafka message key.
-///
-/// This type uses `Box<str>` for efficient storage of variable-length strings.
-pub type Key = Box<str>;
+/// The length of a UUID string (36 characters).
+const UUID_STR_LEN: usize = 36;
 
-/// A Kafka message payload.
+/// A compact string optimized for UUID-length keys.
 ///
-/// The payload is stored as a JSON Value, allowing for flexible message
-/// content.
+/// Uses `Flexstr` to efficiently store message keys up to UUID length without
+/// heap allocation.
+pub type Key = Flexstr<UUID_STR_LEN>;
+
+/// A JSON value containing a Kafka message's content.
+///
+/// Stores message payloads as arbitrary JSON to support flexible message
+/// formats.
 pub type Payload = Value;
 
-/// A Kafka message offset.
+/// An offset position within a Kafka partition.
 pub type Offset = i64;
+
+/// A compact string for storing event identifiers.
+///
+/// Uses `Flexstr` to efficiently store event IDs up to UUID length without heap
+/// allocation.
+pub type EventId = Flexstr<UUID_STR_LEN>;
+
+/// A borrowed string slice for event identifiers.
+pub type BorrowedEventId = str;
