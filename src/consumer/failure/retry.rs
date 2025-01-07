@@ -9,6 +9,7 @@ use std::time::Duration;
 use derive_builder::Builder;
 use humantime::format_duration;
 use rand::{thread_rng, Rng};
+use tokio::select;
 use tokio::time::sleep;
 use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
@@ -48,10 +49,10 @@ pub struct RetryConfiguration {
     /// Maximum retry delay.
     ///
     /// Environment variable: `PROSODY_RETRY_MAX_DELAY`
-    /// Default: 1 minute
+    /// Default: 5 minutes
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_RETRY_MAX_DELAY\", \
-                   Duration::from_secs(60))?",
+                   Duration::from_secs(5 * 60))?",
         setter(into)
     )]
     max_delay: Duration,
@@ -209,7 +210,13 @@ where
                         "failed to handle message: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
-                    sleep(sleep_time).await;
+
+                    select! {
+                        () = sleep(sleep_time) => {}
+                        () = context.on_shutdown() => {
+                            return Err(error);
+                        }
+                    }
                 }
                 ErrorCategory::Permanent => {
                     error!(
@@ -282,7 +289,14 @@ where
                         "failed to handle message: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
-                    sleep(sleep_time).await;
+
+                    select! {
+                        () = sleep(sleep_time) => {}
+                        () = context.on_shutdown() => {
+                            uncommitted_offset.abort();
+                            break;
+                        }
+                    }
                 }
                 ErrorCategory::Permanent => {
                     error!(

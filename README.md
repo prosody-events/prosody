@@ -156,7 +156,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                       | 100ms   | ✓        |          |
 | `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.           | 8000    | ✓        |          |
 | `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                           | 20ms    | ✓        |          |
-| `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                            | 1m      | ✓        |          |
+| `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                            | 5m      | ✓        |          |
 | `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                   | 1s      |          | ✓        |
 | `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m      | ✓        |          |
 | `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -       | ✓        |          |
