@@ -244,8 +244,8 @@ pub type Topic = Intern<str>;
 /// A partition identifier within a Kafka topic.
 pub type Partition = i32;
 
-/// The length of a UUID string (36 characters).
-const UUID_STR_LEN: usize = 36;
+/// The length of a UUID string (36 characters) plus one byte for length.
+const UUID_STR_LEN: usize = 36 + 1;
 
 /// A compact string optimized for UUID-length keys.
 ///
