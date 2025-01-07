@@ -39,6 +39,9 @@ mod keyed;
 pub mod offsets;
 mod util;
 
+#[cfg(test)]
+mod test;
+
 /// Manages message processing and offset tracking for a single Kafka partition.
 ///
 /// Coordinates concurrent message processing by:
