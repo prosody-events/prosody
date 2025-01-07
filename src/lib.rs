@@ -209,6 +209,7 @@ use std::sync::LazyLock;
 
 pub mod admin;
 pub mod consumer;
+mod deduplication;
 pub mod high_level;
 pub mod producer;
 pub mod propagator;
@@ -270,3 +271,38 @@ pub type EventId = Flexstr<UUID_STR_LEN>;
 
 /// A borrowed string slice for event identifiers.
 pub type BorrowedEventId = str;
+
+/// Defines event identity behavior for messages that contain unique
+/// identifiers.
+///
+/// This trait enables idempotent message processing by providing access to
+/// event identifiers that can be used to deduplicate messages.
+pub trait EventIdentity {
+    /// The type used to represent the event ID when owned.
+    /// Must implement `AsRef<Self::BorrowedEventId>` and be constructible from
+    /// a borrowed event ID.
+    type EventId: AsRef<Self::BorrowedEventId> + for<'a> From<&'a Self::BorrowedEventId>;
+
+    /// The type used to represent a borrowed event ID.
+    type BorrowedEventId: ?Sized;
+
+    /// Returns a reference to this event's identifier if one exists.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(&BorrowedEventId)` if the event has an identifier
+    /// - `None` if the event has no identifier
+    fn event_id(&self) -> Option<&Self::BorrowedEventId>;
+}
+
+impl EventIdentity for Payload {
+    type BorrowedEventId = str;
+    type EventId = EventId;
+
+    fn event_id(&self) -> Option<&Self::BorrowedEventId> {
+        match self.as_object()?.get("id")? {
+            Value::String(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+}

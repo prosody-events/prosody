@@ -9,6 +9,7 @@
 use super::*;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{EventHandler, Keyed, MessageContext};
+use crate::Key;
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use std::future::Future;

@@ -65,7 +65,7 @@ use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_vec_env,
 };
-use crate::{BorrowedEventId, Partition, Topic, MOCK_CLUSTER_BOOTSTRAP};
+use crate::{Partition, Topic, MOCK_CLUSTER_BOOTSTRAP};
 
 mod context;
 mod extractor;
@@ -92,29 +92,6 @@ pub trait Keyed {
     ///
     /// A reference to the key.
     fn key(&self) -> &Self::Key;
-}
-
-/// Defines event identity behavior for messages that contain unique
-/// identifiers.
-///
-/// This trait enables idempotent message processing by providing access to
-/// event identifiers that can be used to deduplicate messages.
-pub trait EventIdentity {
-    /// The type used to represent the event ID when owned.
-    /// Must implement `AsRef<BorrowedEventId>` and be constructible from a
-    /// borrowed event ID.
-    type EventId: AsRef<BorrowedEventId> + for<'a> From<&'a BorrowedEventId>;
-
-    /// The type used to represent a borrowed event ID.
-    type BorrowedEventId: ?Sized;
-
-    /// Returns a reference to this event's identifier if one exists.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(&BorrowedEventId)` if the event has an identifier
-    /// - `None` if the event has no identifier
-    fn event_id(&self) -> Option<&Self::BorrowedEventId>;
 }
 
 /// Provides handlers for processing messages from specific partitions.

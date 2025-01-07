@@ -7,6 +7,7 @@
 use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
+use parking_lot::Mutex;
 use rdkafka::client::{Client, DefaultClientContext};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
@@ -17,13 +18,15 @@ use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
 use std::io;
 use std::mem::take;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{instrument, Span};
+use tracing::{instrument, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
+use crate::deduplication::IdempotenceCache;
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::util::{from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env};
@@ -61,6 +64,18 @@ pub struct ProducerConfiguration {
     )]
     pub send_timeout: Option<Duration>,
 
+    /// Idempotence cache size.
+    ///
+    /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
+    /// Default: 4096
+    ///
+    /// Set to 0 to disable the producer idempotence cache.
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", 4096)?",
+        setter(into)
+    )]
+    pub idempotence_cache_size: usize,
+
     /// Use a mock producer for testing purposes.
     ///
     /// Environment variable: `PROSODY_MOCK`
@@ -95,6 +110,9 @@ pub struct ProsodyProducer {
     #[educe(Debug(ignore))]
     producer: FutureProducer,
 
+    /// Idempotence cache
+    idempotence_cache: Arc<Mutex<IdempotenceCache>>,
+
     /// OpenTelemetry context propagator.
     #[educe(Debug(ignore))]
     propagator: TextMapCompositePropagator,
@@ -105,6 +123,7 @@ impl Clone for ProsodyProducer {
         Self {
             send_timeout: self.send_timeout,
             producer: self.producer.clone(),
+            idempotence_cache: self.idempotence_cache.clone(),
             propagator: new_propagator(),
         }
     }
@@ -150,6 +169,9 @@ impl ProsodyProducer {
         Ok(Self {
             send_timeout,
             producer: client_config.create()?,
+            idempotence_cache: Arc::new(Mutex::new(IdempotenceCache::new(
+                config.idempotence_cache_size,
+            ))),
             propagator: new_propagator(),
         })
     }
@@ -258,6 +280,16 @@ impl ProsodyProducer {
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
     {
+        // Skip messages with duplicate event IDs
+        if let Some(event_id) = self
+            .idempotence_cache
+            .lock()
+            .check_duplicate(&key.into(), payload)
+        {
+            warn!("message with key {key} and id {event_id} already produced; skipping",);
+            return Ok(());
+        }
+
         let serialized = json::to_vec(&payload)?;
         Span::current().record("payload_size", serialized.len());
 

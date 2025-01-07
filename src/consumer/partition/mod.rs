@@ -10,13 +10,10 @@
 //! - Managing message queue backpressure
 //! - Deduplicating messages using idempotency identifiers
 
-use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::StreamExt;
-use lru::LruCache;
 use std::future::ready;
-use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,13 +24,14 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, info, instrument};
 
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{EventHandler, EventIdentity, Keyed};
-use crate::{EventId, Key, Offset, Partition, Topic};
+use crate::consumer::{EventHandler, Keyed};
+use crate::deduplication::IdempotenceCache;
+use crate::{Offset, Partition, Topic};
 
 mod keyed;
 pub mod offsets;
@@ -254,9 +252,7 @@ async fn handle_messages<T>(
     T: EventHandler,
 {
     let mut highest_offset_seen = -1;
-    let mut idempotence_cache: Option<LruCache<Key, EventId, RandomState>> =
-        NonZeroUsize::new(idempotence_cache_size)
-            .map(|cache_size| LruCache::with_hasher(cache_size, RandomState::default()));
+    let mut idempotence_cache = IdempotenceCache::new(idempotence_cache_size);
 
     // Filter out duplicate and out-of-order messages
     let stream = ReceiverStream::new(message_rx).filter(|message| {
@@ -271,26 +267,13 @@ async fn handle_messages<T>(
         highest_offset_seen = offset;
 
         // Skip messages with duplicate event IDs
-        if let Some(cache) = &mut idempotence_cache {
-            let key = message.key();
-            match message.event_id() {
-                None => {
-                    cache.pop(key);
-                }
-
-                Some(event_id) => {
-                    let matches_event_id = cache
-                        .get(key)
-                        .map_or(false, |cached| cached.as_ref() == event_id);
-
-                    if matches_event_id {
-                        debug!("message with key {key} already processed; skipping");
-                        return ready(false);
-                    }
-
-                    cache.put(key.clone(), event_id.into());
-                }
-            }
+        if let Some(event_id) = idempotence_cache.check_duplicate(message.key(), message.payload())
+        {
+            info!(
+                "message with key {} and id {event_id} already processed; skipping",
+                message.key()
+            );
+            return ready(false);
         }
 
         ready(true)
