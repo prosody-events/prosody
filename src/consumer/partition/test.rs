@@ -20,7 +20,8 @@ use tracing::Span;
 
 /// This trait is used to indicate that a handler has processed offsets
 /// and provides a notification mechanism. It is primarily utilized in test
-/// handlers to facilitate tracking of processed offsets and sending notifications.
+/// handlers to facilitate tracking of processed offsets and sending
+/// notifications.
 trait HasProcessedOffsets {
     /// Returns a shared reference to the processed offsets.
     fn processed_offsets(&self) -> &Arc<Mutex<Vec<Offset>>>;
@@ -209,8 +210,8 @@ async fn test_partition_manager_max_uncommitted() {
         handler.clone(),
         10, // buffer_size
         max_uncommitted,
-        1,  // max_enqueued_per_key
-        0,  // idempotence_cache_size
+        1, // max_enqueued_per_key
+        0, // idempotence_cache_size
         Duration::from_secs(1),
         watermark_version,
     );
@@ -258,7 +259,7 @@ async fn test_partition_manager_is_stalled() {
             &self,
             _context: MessageContext,
             message: UncommittedMessage,
-        ) -> impl Future<Output=()> + Send {
+        ) -> impl Future<Output = ()> + Send {
             let offset = message.offset();
             let processed_offsets = Arc::clone(&self.processed_offsets);
             let notify = Arc::clone(&self.notify);
@@ -491,7 +492,7 @@ impl EventHandler for TestHandler {
         &self,
         _context: MessageContext,
         message: UncommittedMessage,
-    ) -> impl Future<Output=()> + Send {
+    ) -> impl Future<Output = ()> + Send {
         let key = message.key().clone();
         let offset = message.offset();
         let processed_offsets = Arc::clone(&self.processed_offsets);
@@ -558,7 +559,8 @@ fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
 }
 
 /// Helper function to create a `ConsumerMessage` with an event ID for testing
-/// deduplication. This allows testing if messages with the same event ID are avoided.
+/// deduplication. This allows testing if messages with the same event ID are
+/// avoided.
 fn create_test_message_with_event_id(
     offset: Offset,
     key: &str,
