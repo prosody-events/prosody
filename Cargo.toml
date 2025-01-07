@@ -13,19 +13,21 @@ license = "UNLICENSED"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/cincpro/prosody"
-version = "0.5.4"
+version = "0.5.5"
 
 [dependencies]
 ahash = "0.8"
-axum = { version = "0.7", features = ["http2"] }
-axum-extra = "0.9"
+axum = { version = "0.8", features = ["http2"] }
+axum-extra = "0.10"
 chrono = "0.4"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
 educe = "0.6"
+fixedstr = { version = "0.5", features = ["flex-str"] }
 futures = "0.3"
 humantime = "2.1"
 internment = "0.8"
+lru = "0.12"
 nohash-hasher = "0.2"
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = [
@@ -57,7 +59,7 @@ simd-json = { version = "0.14", features = ["serde_impl"] }
 [dev-dependencies]
 color-eyre = "0.6"
 derive-quickcheck-arbitrary = "0.1"
-itertools = "0.13"
+itertools = "0.14"
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
 reqwest = "0.12"
