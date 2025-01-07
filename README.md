@@ -158,7 +158,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                           | 20ms    | ✓        |          |
 | `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                            | 1m      | ✓        |          |
 | `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                   | 1s      |          | ✓        |
-| `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 15s     | ✓        |          |
+| `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m      | ✓        |          |
 | `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -       | ✓        |          |
 
 ## Idempotence and Message Deduplication
@@ -183,7 +183,7 @@ server is tied to the consumer's lifecycle and offers two main endpoints:
 2. `/livez`: A liveness probe that checks if any partitions have stalled.
 
 A partition is considered "stalled" if it has not processed a message within a specified time threshold. This threshold
-is determined by the `PROSODY_STALL_THRESHOLD` configuration. By default, this is set to 15 seconds, but it
+is determined by the `PROSODY_STALL_THRESHOLD` configuration. By default, this is set to 5 minutes, but it
 can be customized to suit your application's needs. If a partition is detected as stalled, the liveness probe will fail,
 potentially triggering a restart of the application by the orchestration system.
 

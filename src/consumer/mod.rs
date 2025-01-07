@@ -260,7 +260,7 @@ pub struct ConsumerConfiguration {
     /// Timeout for partition shutdown.
     ///
     /// Environment variable: `PROSODY_STALL_THRESHOLD`
-    /// Default: 15 seconds
+    /// Default: 5 minutes
     ///
     /// This duration serves two purposes:
     /// 1. It determines how long to wait for in-flight tasks to complete during
@@ -272,7 +272,7 @@ pub struct ConsumerConfiguration {
     ///    will report an unhealthy status.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_STALL_THRESHOLD\", \
-                   Duration::from_secs(15))?",
+                   Duration::from_secs(5 * 60))?",
         setter(into)
     )]
     pub stall_threshold: Duration,
