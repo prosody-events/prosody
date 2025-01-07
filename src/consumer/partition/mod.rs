@@ -203,9 +203,9 @@ impl PartitionManager {
 
         // Signal handlers to shut down
         if let Err(error) = self.shutdown_tx.send(true) {
-            error!(
+            debug!(
                 partition = self.partition,
-                "failed to send shutdown signal to handlers: {error:#}"
+                "did not send shutdown signal to handlers: {error:#}"
             );
         }
 
