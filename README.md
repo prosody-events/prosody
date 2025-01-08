@@ -163,13 +163,13 @@ The following table lists the available configuration options and their associat
 
 ## Idempotence and Message Deduplication
 
-Prosody can deduplicate messages using an LRU cache that tracks message IDs per partition. When a message contains an
-`id` field in its JSON payload, Prosody checks if it matches the last seen ID for that message key. If it matches, the
-message is skipped as a duplicate.
+Prosody can deduplicate messages using an LRU cache that tracks message IDs per partition and per producer. When a
+message contains an `id` string field in its JSON payload, Prosody checks if it matches the last seen ID for that
+message key. If it matches, the message is skipped as a duplicate.
 
 Configure with `PROSODY_IDEMPOTENCE_CACHE_SIZE`:
 
-- Default: 4096 entries per partition (~400KB memory each)
+- Default: 4096 entries per partition and producer (~400KB memory each)
 - Set to 0 to disable deduplication
 - Entries are removed when the cache is full (LRU) or a key receives a message without an ID
 

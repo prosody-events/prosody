@@ -13,7 +13,6 @@
 
 use chrono::{DateTime, Utc};
 use educe::Educe;
-use serde_json::Value;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
@@ -21,8 +20,8 @@ use tokio::sync::watch;
 use tracing::{debug, error, Span};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
-use crate::consumer::{EventIdentity, Keyed};
-use crate::{BorrowedEventId, EventId, Key, Offset, Partition, Payload, Topic};
+use crate::consumer::Keyed;
+use crate::{BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, Topic};
 
 /// The context for message processing within a consumer.
 ///
@@ -169,7 +168,7 @@ impl EventIdentity for UncommittedMessage {
     type EventId = EventId;
 
     fn event_id(&self) -> Option<&Self::BorrowedEventId> {
-        get_event_id(self.payload())
+        self.payload().event_id()
     }
 }
 
@@ -307,30 +306,5 @@ impl Keyed for ConsumerMessage {
 
     fn key(&self) -> &Self::Key {
         &self.0.key
-    }
-}
-
-impl EventIdentity for ConsumerMessage {
-    type BorrowedEventId = BorrowedEventId;
-    type EventId = EventId;
-
-    fn event_id(&self) -> Option<&Self::BorrowedEventId> {
-        get_event_id(self.payload())
-    }
-}
-
-/// Extracts an event ID from a message payload if present.
-///
-/// # Arguments
-///
-/// * `payload` - The message payload to extract from
-///
-/// # Returns
-///
-/// The event ID string if found in the payload, `None` otherwise.
-fn get_event_id(payload: &Payload) -> Option<&str> {
-    match payload.as_object()?.get("id")? {
-        Value::String(value) => Some(value.as_str()),
-        _ => None,
     }
 }
