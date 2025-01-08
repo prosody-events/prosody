@@ -208,10 +208,13 @@ where
                 debug!("committing {list:?}");
                 if let Err(error) = consumer.commit(&list, CommitMode::Async) {
                     error!("failed to commit offsets before rebalance: {error:#}");
+                } else {
+                    debug!("final offsets committed");
                 }
-                debug!("final offsets committed");
             }
-            Rebalance::Error(_) => {}
+            Rebalance::Error(error) => {
+                error!("unexpected rebalance error: {error:#}");
+            }
         }
     }
 }
