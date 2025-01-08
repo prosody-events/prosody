@@ -148,7 +148,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                             | 1s      | ✓        |          |
 | `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                  | -       | ✓        |          |
 | `PROSODY_GROUP_ID`               | Consumer group identifier                                                      | -       | ✓        |          |
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU cache for tracking message IDs. Set to 0 to disable.               | 4096    | ✓        |          |
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.            | 4096    | ✓        |          |
 | `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure) | 8       | ✓        |          |
 | `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                  | 3       | ✓        |          |
 | `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition (partition concurrency)   | 32      | ✓        |          |
