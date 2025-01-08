@@ -286,7 +286,7 @@ impl ProsodyProducer {
             .lock()
             .check_duplicate(&key.into(), payload)
         {
-            warn!("message with key {key} and id {event_id} already produced; skipping",);
+            warn!("message with id {event_id} already produced; skipping",);
             return Ok(());
         }
 

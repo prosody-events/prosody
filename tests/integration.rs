@@ -105,7 +105,7 @@ fn receives_all_in_key_order() {
         .unwrap_or(3);
 
     // Initialize tracing for better test output
-    fmt().compact().init();
+    let _ = fmt().compact().try_init();
 
     // Run the QuickCheck property-based test
     QuickCheck::new()
@@ -151,6 +151,9 @@ fn prop(input: TestInput) -> TestResult {
 
 #[tokio::test]
 async fn test_deduplication_of_same_event_id() -> Result<()> {
+    // Initialize tracing for better test output
+    let _ = fmt().compact().try_init();
+
     // Create a unique topic for the test
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];

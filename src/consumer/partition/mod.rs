@@ -269,10 +269,7 @@ async fn handle_messages<T>(
         // Skip messages with duplicate event IDs
         if let Some(event_id) = idempotence_cache.check_duplicate(message.key(), message.payload())
         {
-            info!(
-                "message with key {} and id {event_id} already processed; skipping",
-                message.key()
-            );
+            info!("message with id {event_id} already processed; skipping");
             return ready(false);
         }
 
