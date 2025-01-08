@@ -149,6 +149,88 @@ fn prop(input: TestInput) -> TestResult {
     }
 }
 
+#[tokio::test]
+async fn test_deduplication_of_same_event_id() -> Result<()> {
+    // Create a unique topic for the test
+    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
+    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
+    admin_client.create_topic(&topic, 1, 1).await?;
+
+    // Create producer configuration
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .build()?;
+
+    // Create consumer configuration
+    let consumer_config = ConsumerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .group_id("test-deduplication-consumer")
+        .subscribed_topics(&[topic.to_string()])
+        .build()?;
+
+    // Create a channel to collect received messages
+    let (messages_tx, mut messages_rx) = channel(10);
+
+    // Create a producer
+    let producer = ProsodyProducer::new(&producer_config)?;
+
+    // Create a test handler for the consumer
+    let handler = TestHandler { messages_tx };
+
+    // Start the consumer in a background task
+    let consumer = ProsodyConsumer::new::<TestHandler>(&consumer_config, handler.clone())?;
+
+    // Send multiple messages with the same key and same event_id
+    let key = "test-key";
+    let event_id = "event-123";
+    let payload = json!({ "id": event_id, "value": "first message" });
+    let payload_duplicate = json!({ "id": event_id, "value": "duplicate message" });
+
+    // Send the first message
+    producer.send([], topic, key, &payload).await?;
+    // Send the duplicate message
+    producer.send([], topic, key, &payload_duplicate).await?;
+
+    // Collect received messages
+    let mut received_messages = Vec::new();
+
+    // Wait for messages to be received with a timeout
+    let start = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(5);
+    while start.elapsed() < timeout {
+        if let Some((received_key, received_payload)) = messages_rx.recv().await {
+            received_messages.push((received_key, received_payload));
+            // Break if we have received any messages
+            if !received_messages.is_empty() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Shutdown the consumer
+    consumer.shutdown().await;
+
+    // Assert that only one message was received
+    assert_eq!(
+        received_messages.len(),
+        1,
+        "Expected only one message due to deduplication"
+    );
+
+    // Optionally, check the content of the message
+    let (recv_key, recv_payload) = &received_messages[0];
+    assert_eq!(recv_key, key);
+    assert_eq!(recv_payload, &payload);
+
+    // Clean up: delete the topic
+    admin_client.delete_topic(&topic).await?;
+
+    Ok(())
+}
+
 /// Runs the core logic of the integration test.
 ///
 /// # Arguments
