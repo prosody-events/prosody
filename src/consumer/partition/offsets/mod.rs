@@ -336,11 +336,9 @@ async fn track_watermark(
                     watermark_version.fetch_add(1, Ordering::AcqRel);
 
                     // Clear stalled state if it was set
-                    if is_stalled.load(Ordering::Acquire) {
+                    if is_stalled.fetch_and(false, Ordering::AcqRel) {
                         info!("{topic}:{partition} is no longer stalled");
                     }
-
-                    is_stalled.store(false, Ordering::Release);
                 }
             }
         }
