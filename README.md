@@ -317,3 +317,74 @@ visibility of message processing across different services.
 This architecture allows Prosody to achieve high throughput by processing different partitions and keys concurrently,
 while still maintaining strict ordering for messages with the same key. It also provides backpressure management by
 limiting the number of in-flight messages per key and partition through bounded queues and selective partition pausing.
+
+### Component Organization
+```mermaid
+flowchart TD
+    classDef subgraphStyle fill:#f5f5f5,stroke:#666
+    
+    HLC["<a href='https://github.com/cincpro/prosody/tree/main/src/high_level/mod.rs'>HighLevelClient</a>"] --> Producer["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/mod.rs'>ProsodyProducer</a>"]
+    HLC --> ConsumerMain["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/mod.rs'>ProsodyConsumer</a>"]
+
+    subgraph ProducerComponents["Producer Components"]
+        Producer --> KafkaProducer["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/mod.rs'>Kafka Producer</a>"]
+        Producer --> ICache["<a href='https://github.com/cincpro/prosody/tree/main/src/deduplication.rs'>Idempotence Cache</a>"]
+        Producer --> PropP["<a href='https://github.com/cincpro/prosody/tree/main/src/propagator.rs'>OpenTelemetry Propagator</a>"]
+    end
+
+    subgraph ConsumerComponents["Consumer Components"]
+        ConsumerMain --> Context["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/context.rs'>ConsumerContext</a>"]
+        ConsumerMain --> PollLoop["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/poll.rs'>Poll Loop</a>"]
+        ConsumerMain --> ProbeServer["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/probes.rs'>Probe Server</a>"]
+        
+        Context --> PMgr
+        PollLoop --> PMgr
+    end
+
+    subgraph PartitionComponents["Partition Processing"]
+        PMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/mod.rs'>Partition Manager</a>"] --> KeyMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/keyed/mod.rs'>Key Manager</a>"]
+        PMgr --> OTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Offset Tracker</a>"]
+        PMgr --> ICache2["<a href='https://github.com/cincpro/prosody/tree/main/src/deduplication.rs'>Idempotence Cache</a>"]
+        
+        KeyMgr --> EHandler["Event Handler"]
+        OTracker --> WTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Watermark Tracker</a>"]
+    end
+
+    subgraph FailureHandling["Failure Strategies"]
+        RetryS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/retry.rs'>Retry Strategy</a>"]
+        LogS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/log.rs'>Log Strategy</a>"]
+        ShutdownS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/shutdown.rs'>Shutdown Strategy</a>"]
+        TopicS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/topic.rs'>Failure Topic Strategy</a>"]
+    end
+
+    ConsumerMain -..-> RetryS
+    ConsumerMain -..-> LogS
+    ConsumerMain -..-> ShutdownS
+    ConsumerMain -..-> TopicS
+
+    TopicS --> FTopic["Failure Topic"]
+    Producer --> FTopic
+
+    subgraph TracingSystem["OpenTelemetry Integration"]
+        OTel["<a href='https://github.com/cincpro/prosody/tree/main/src/tracing.rs'>OpenTelemetry Core</a>"]
+        Prop["<a href='https://github.com/cincpro/prosody/tree/main/src/propagator.rs'>Propagator</a>"]
+        MExtract["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/extractor.rs'>Message Extractor</a>"]
+        RInject["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/injector.rs'>Record Injector</a>"]
+        
+        OTel --> Prop
+        Prop --> MExtract
+        Prop --> RInject
+    end
+
+    ConsumerMain -..-> OTel
+    Producer -..-> OTel
+
+    %% External edges
+    EHandler --> RetryS
+    EHandler --> LogS
+    EHandler --> ShutdownS
+    EHandler --> TopicS
+
+    %% Styling
+    class ProducerComponents,ConsumerComponents,PartitionComponents,FailureHandling,TracingSystem subgraphStyle
+```
