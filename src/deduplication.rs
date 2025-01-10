@@ -78,7 +78,7 @@ impl IdempotenceCache {
             // Check if the cache already contains the same event ID for the key.
             if cache
                 .get(key)
-                .map_or(false, |cached| cached.as_ref() == event_id)
+                .is_some_and(|cached| cached.as_ref() == event_id)
             {
                 // Duplicate message detected.
                 return Some(event_id);
