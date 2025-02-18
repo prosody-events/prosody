@@ -96,18 +96,6 @@ pub fn poll<T>(
             }
         };
 
-        if message
-            .headers()
-            .into_iter()
-            .flat_map(|headers| headers.iter())
-            .any(|header| {
-                header.key == SOURCE_SYSTEM_HEADER && header.value == Some(group_id.as_bytes())
-            })
-        {
-            debug!("skipping message because source system header matches the group identifier");
-            continue;
-        }
-
         // Extract message details and create tracing span
         let topic: Topic = Intern::from(message.topic());
         let partition = message.partition();
@@ -120,11 +108,27 @@ pub fn poll<T>(
             offset,
             topic = topic.as_ref(),
             key = Empty,
-            payload_size = Empty
+            payload_size = Empty,
+            skipped = Empty,
         );
 
         span.set_parent(context);
         let _enter = span.enter();
+
+        if message
+            .headers()
+            .into_iter()
+            .flat_map(|headers| headers.iter())
+            .any(|header| {
+                header.key == SOURCE_SYSTEM_HEADER && header.value == Some(group_id.as_bytes())
+            })
+        {
+            span.record("skipped", true);
+            debug!("skipping message because source system header matches the group identifier");
+            continue;
+        }
+
+        span.record("skipped", false);
 
         // Validate message key and payload
         let Some(key_data) = message.key() else {
