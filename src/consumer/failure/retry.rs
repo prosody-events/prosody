@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use derive_builder::Builder;
 use humantime::format_duration;
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 use tokio::select;
 use tokio::time::sleep;
 use tracing::{error, info};
@@ -122,7 +122,7 @@ impl<T> RetryHandler<T> {
             self.max_delay_millis,
         );
 
-        let jitter = thread_rng().gen_range(0..exp_backoff);
+        let jitter = rng().random_range(0..exp_backoff);
         Duration::from_millis(jitter)
     }
 }
