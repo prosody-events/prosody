@@ -320,6 +320,18 @@ struct RuntimeState {
     probe_server: Option<ProbeServer>,
 }
 
+impl ConsumerConfigurationBuilder {
+    /// Currently configured consumer group
+    ///
+    /// # Returns
+    ///
+    /// An option containing the consumer group if configured
+    #[must_use]
+    pub fn configured_consumer_group(&self) -> Option<&str> {
+        self.group_id.as_deref()
+    }
+}
+
 /// High-level Kafka consumer implementation.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
@@ -412,12 +424,14 @@ impl ProsodyConsumer {
         // Spawn a blocking task to continuously poll for messages
         let poll_interval = config.poll_interval;
         let commit_interval = config.commit_interval;
+        let group_id = config.group_id.clone();
         let cloned_managers = managers.clone();
         let cloned_shutdown = shutdown.clone();
         let poll_handle = spawn_blocking(move || {
             poll(
                 poll_interval,
                 commit_interval,
+                &group_id,
                 &consumer,
                 &watermark_version,
                 &cloned_managers,

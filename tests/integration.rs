@@ -163,6 +163,7 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
     // Create producer configuration
     let producer_config = ProducerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
         .build()?;
 
     // Create consumer configuration
@@ -309,6 +310,7 @@ fn create_configs(
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
     let producer_config = ProducerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
         .build()?;
 
     let consumer_config = ConsumerConfiguration::builder()

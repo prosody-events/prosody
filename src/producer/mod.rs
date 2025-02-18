@@ -29,8 +29,10 @@ use whoami::fallible::hostname;
 use crate::deduplication::IdempotenceCache;
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
-use crate::util::{from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env};
-use crate::{Payload, Topic, MOCK_CLUSTER_BOOTSTRAP};
+use crate::util::{
+    from_env, from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env,
+};
+use crate::{Payload, Topic, MOCK_CLUSTER_BOOTSTRAP, SOURCE_SYSTEM_HEADER};
 
 #[cfg(target_arch = "arm")]
 use serde_json as json;
@@ -76,6 +78,14 @@ pub struct ProducerConfiguration {
     )]
     pub idempotence_cache_size: usize,
 
+    /// Name of producing system.
+    ///
+    /// Environment variable: `PROSODY_SOURCE_SYSTEM`
+    /// Default: None (must be specified)
+    #[builder(default = "from_env(\"PROSODY_SOURCE_SYSTEM\")?", setter(into))]
+    #[validate(length(min = 1_u64))]
+    pub source_system: String,
+
     /// Use a mock producer for testing purposes.
     ///
     /// Environment variable: `PROSODY_MOCK`
@@ -85,6 +95,18 @@ pub struct ProducerConfiguration {
         setter(into)
     )]
     pub mock: bool,
+}
+
+impl ProducerConfigurationBuilder {
+    /// Currently configured source system
+    ///
+    /// # Returns
+    ///
+    /// An option containing the source system if configured
+    #[must_use]
+    pub fn configured_source_system(&self) -> Option<&str> {
+        self.source_system.as_deref()
+    }
 }
 
 impl ProducerConfiguration {
@@ -106,6 +128,9 @@ pub struct ProsodyProducer {
     /// Timeout for send operations.
     send_timeout: Timeout,
 
+    /// Name of producing system.
+    source_system: Box<str>,
+
     /// Underlying Kafka producer.
     #[educe(Debug(ignore))]
     producer: FutureProducer,
@@ -122,6 +147,7 @@ impl Clone for ProsodyProducer {
     fn clone(&self) -> Self {
         Self {
             send_timeout: self.send_timeout,
+            source_system: self.source_system.clone(),
             producer: self.producer.clone(),
             idempotence_cache: self.idempotence_cache.clone(),
             propagator: new_propagator(),
@@ -168,6 +194,7 @@ impl ProsodyProducer {
 
         Ok(Self {
             send_timeout,
+            source_system: config.source_system.clone().into_boxed_str(),
             producer: client_config.create()?,
             idempotence_cache: Arc::new(Mutex::new(IdempotenceCache::new(
                 config.idempotence_cache_size,
@@ -298,10 +325,20 @@ impl ProsodyProducer {
             .payload(&serialized)
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 
+        self.propagator.inject_context(
+            &Span::current().context(),
+            &mut RecordInjector::new(&mut record),
+        );
+
         let headers = headers.into_iter();
         let owned_headers = record
             .headers
-            .get_or_insert_with(|| OwnedHeaders::new_with_capacity(headers.len()));
+            .get_or_insert_with(|| OwnedHeaders::new_with_capacity(headers.len() + 1));
+
+        *owned_headers = take(owned_headers).insert(Header {
+            key: SOURCE_SYSTEM_HEADER,
+            value: Some(self.source_system.as_bytes()),
+        });
 
         for (key, value) in headers {
             *owned_headers = take(owned_headers).insert(Header {
@@ -309,11 +346,6 @@ impl ProsodyProducer {
                 value: Some(value.as_bytes()),
             });
         }
-
-        self.propagator.inject_context(
-            &Span::current().context(),
-            &mut RecordInjector::new(&mut record),
-        );
 
         let (partition, offset) = self
             .producer

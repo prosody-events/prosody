@@ -4,21 +4,21 @@
 //! manages offset commits, handles partition pausing and resuming based on
 //! capacity, and dispatches messages to appropriate partition managers.
 
-use std::str;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
-
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
 use opentelemetry::propagation::TextMapPropagator;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::KafkaError;
+use rdkafka::message::Headers;
 use rdkafka::util::Timeout;
 use rdkafka::{Message, Offset, Timestamp, TopicPartitionList};
+use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::field::Empty;
-use tracing::{error, info_span, warn};
+use tracing::{debug, error, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::consumer::context::Context;
@@ -27,7 +27,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
-use crate::{Key, Topic};
+use crate::{Key, Topic, SOURCE_SYSTEM_HEADER};
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_reader_with_buffers;
@@ -41,6 +41,7 @@ use simd_json::Buffers;
 ///
 /// * `poll_interval` - Duration to wait between polling attempts.
 /// * `commit_interval` - Duration to wait between offset commits.
+/// * `group_id` - Consumer group identifier.
 /// * `consumer` - Kafka consumer instance.
 /// * `watermark_version` - Current watermark version for offset tracking.
 /// * `managers` - Manager collection for handling partitions.
@@ -49,6 +50,7 @@ use simd_json::Buffers;
 pub fn poll<T>(
     poll_interval: Duration,
     commit_interval: Duration,
+    group_id: &str,
     consumer: &BaseConsumer<Context<T>>,
     watermark_version: &WatermarkVersion,
     managers: &Managers,
@@ -93,6 +95,18 @@ pub fn poll<T>(
                 continue;
             }
         };
+
+        if message
+            .headers()
+            .into_iter()
+            .flat_map(|headers| headers.iter())
+            .any(|header| {
+                header.key == SOURCE_SYSTEM_HEADER && header.value == Some(group_id.as_bytes())
+            })
+        {
+            debug!("skipping message because source system header matches the group identifier");
+            continue;
+        }
 
         // Extract message details and create tracing span
         let topic: Topic = Intern::from(message.topic());
