@@ -142,36 +142,65 @@ environment variables, giving you flexibility in how you set up your Kafka clien
 
 The following table lists the available configuration options and their associated environment variables:
 
-| Environment Variable             | Description                                                                    | Default | Consumer | Producer |
-|----------------------------------|--------------------------------------------------------------------------------|---------|----------|----------|
-| `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                | -       | ✓        | ✓        |
-| `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                             | 1s      | ✓        |          |
-| `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                  | -       | ✓        |          |
-| `PROSODY_GROUP_ID`               | Consumer group identifier                                                      | -       | ✓        |          |
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.            | 4096    | ✓        |          |
-| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure) | 8       | ✓        |          |
-| `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                  | 3       | ✓        |          |
-| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition (partition concurrency)   | 32      | ✓        |          |
-| `PROSODY_MOCK`                   | Use mock Kafka brokers for testing                                             | false   | ✓        | ✓        |
-| `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                       | 100ms   | ✓        |          |
-| `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.           | 8000    | ✓        |          |
-| `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                           | 20ms    | ✓        |          |
-| `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                            | 5m      | ✓        |          |
-| `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                   | 1s      |          | ✓        |
-| `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m      | ✓        |          |
-| `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -       | ✓        |          |
+| Environment Variable             | Description                                                                    | Default      | Consumer | Producer |
+|----------------------------------|--------------------------------------------------------------------------------|--------------|----------|----------|
+| `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                | -            | ✓        | ✓        |
+| `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                             | 1s           | ✓        |          |
+| `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                  | -            | ✓        |          |
+| `PROSODY_GROUP_ID`               | Consumer group identifier                                                      | -            | ✓        |          |
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.            | 4096         | ✓        |          |
+| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure) | 8            | ✓        |          |
+| `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                  | 3            | ✓        |          |
+| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition (partition concurrency)   | 32           | ✓        |          |
+| `PROSODY_MOCK`                   | Use mock Kafka brokers for testing                                             | false        | ✓        | ✓        |
+| `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                       | 100ms        | ✓        |          |
+| `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.           | 8000         | ✓        |          |
+| `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                           | 20ms         | ✓        |          |
+| `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                            | 5m           | ✓        |          |
+| `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                   | 1s           |          | ✓        |
+| `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                           | `<group id>` |          | ✓        |
+| `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m           | ✓        |          |
+| `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -            | ✓        |          |
 
-## Idempotence and Message Deduplication
+## Message Deduplication
 
-Prosody can deduplicate messages using an LRU cache that tracks message IDs per partition and per producer. When a
-message contains an `id` string field in its JSON payload, Prosody checks if it matches the last seen ID for that
-message key. If it matches, the message is skipped as a duplicate.
+Prosody prevents duplicate message processing using two mechanisms: **source system deduplication** and **idempotence
+deduplication**.
 
-Configure with `PROSODY_IDEMPOTENCE_CACHE_SIZE`:
+### Source System Deduplication
 
-- Default: 4096 entries per partition and producer (~400KB memory each)
-- Set to 0 to disable deduplication
-- Entries are removed when the cache is full (LRU) or a key receives a message without an ID
+Prosody introduces the `source-system` header to prevent processing loops caused by messages being reprocessed by the
+same system that produced them. This behavior is configured automatically:
+
+- **Producers** automatically add a `source-system` header to all outgoing messages.
+- **Consumers** check incoming messages for the `source-system` header.
+- If a message's `source-system` header matches the consumer group, the message is skipped.
+
+This ensures that messages re-emitted by a consumer (e.g., for retry or forwarding purposes) do not create infinite
+processing loops.
+
+To explicitly set the producer's source system identifier, configure:
+
+```sh
+export PROSODY_SOURCE_SYSTEM="my-service"
+```
+
+Prosody will inherit the consumer group ID as the `source-system` if the value is not explicitly provided.
+
+### Idempotence Deduplication
+
+Prosody also supports deduplication based on unique message identifiers. When a message contains an `id` field in its
+JSON payload, Prosody tracks the last seen ID for each key within a partition. If the same ID appears again, the message
+is considered a duplicate and is ignored.
+
+This behavior is controlled by `PROSODY_IDEMPOTENCE_CACHE_SIZE`:
+
+- Default: `4096` entries per partition and producer (~400KB memory per partition).
+- Set to `0` to disable deduplication.
+- Oldest entries are evicted when the cache reaches capacity.
+
+This approach ensures exactly-once semantics within the limits of the configured cache size, reducing unnecessary
+processing and network overhead.
 
 ## Liveness and Readiness Probes
 
@@ -319,6 +348,7 @@ while still maintaining strict ordering for messages with the same key. It also 
 limiting the number of in-flight messages per key and partition through bounded queues and selective partition pausing.
 
 ### Component Organization
+
 ```mermaid
 flowchart TD
     classDef subgraphStyle fill:#f5f5f5,stroke:#666

@@ -13,7 +13,7 @@ license = "UNLICENSED"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/cincpro/prosody"
-version = "0.6.1"
+version = "0.7.0"
 
 [dependencies]
 ahash = "0.8"
@@ -27,18 +27,19 @@ fixedstr = { version = "0.5", features = ["flex-str"] }
 futures = "0.3"
 humantime = "2.1"
 internment = "0.8"
-lru = { version = "0.12", features = ["hashbrown"] }
+lru = { version = "0.13", features = ["hashbrown"] }
 nohash-hasher = "0.2"
-opentelemetry = "0.27"
-opentelemetry-otlp = { version = "0.27", features = [
+opentelemetry = "0.28"
+opentelemetry-otlp = { version = "0.28", features = [
+    "grpc-tonic",
     "gzip-tonic",
     "tls",
     "tls-roots",
 ] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
 pin-project = "1.1"
-rand = "0.8"
+rand = "0.9"
 rdkafka = { version = "0.37", features = ["cmake-build", "tracing"] }
 serde = "1.0"
 serde_json = "1.0"
@@ -48,9 +49,9 @@ tokio = { version = "1.41", features = ["macros", "sync"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["gzip", "tls", "tls-roots"] }
 tracing = { version = "0.1", features = ["log"] }
-tracing-opentelemetry = "0.28"
+tracing-opentelemetry = "0.29"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-validator = { version = "0.19", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 whoami = "1.5"
 
 [target.'cfg(not(target_arch = "arm"))'.dependencies]

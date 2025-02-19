@@ -70,7 +70,7 @@
 //!
 //!     let client = HighLevelClient::new(
 //!         Mode::Pipeline,
-//!         &producer_config,
+//!         &mut producer_config,
 //!         &consumer_config,
 //!         &retry_config,
 //!         &FailureTopicConfigurationBuilder::default(),
@@ -271,6 +271,9 @@ pub type EventId = Flexstr<UUID_STR_LEN>;
 
 /// A borrowed string slice for event identifiers.
 pub type BorrowedEventId = str;
+
+/// Source system header used to prevent processing loops
+const SOURCE_SYSTEM_HEADER: &str = "source-system";
 
 /// Defines event identity behavior for messages that contain unique
 /// identifiers.

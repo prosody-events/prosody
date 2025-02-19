@@ -77,11 +77,19 @@ impl<T> HighLevelClient<T> {
     /// - Required topics are not found.
     pub fn new(
         mode: Mode,
-        producer_builder: &ProducerConfigurationBuilder,
+        producer_builder: &mut ProducerConfigurationBuilder,
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
     ) -> Result<Self, HighLevelClientError> {
+        // Set the producer source system to the consumer group if unspecified
+        if let (None, Some(group_id)) = (
+            producer_builder.configured_source_system(),
+            consumer_builder.configured_consumer_group(),
+        ) {
+            producer_builder.source_system(group_id);
+        }
+
         let producer_config = producer_builder.build()?;
         let cloned_config = producer_config.clone();
         let producer = match mode {

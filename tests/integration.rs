@@ -163,6 +163,7 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
     // Create producer configuration
     let producer_config = ProducerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
         .build()?;
 
     // Create consumer configuration
@@ -231,6 +232,100 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
     // Clean up: delete the topic
     admin_client.delete_topic(&topic).await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_source_system_filtering() -> Result<()> {
+    let _ = fmt().compact().try_init();
+    let timeout_duration = Duration::from_secs(5);
+
+    // Scenario 1: When producer and consumer share the same identifier,
+    // no messages should be received.
+    run_scenario("filter-test", "filter-test", false, "1", timeout_duration).await?;
+
+    // Scenario 2: When producer and consumer have different identifiers,
+    // messages should be delivered.
+    run_scenario(
+        "filter-test",
+        "different-group",
+        true,
+        "2",
+        timeout_duration,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn run_scenario(
+    source_system: &'static str,
+    group_id: &'static str,
+    expect_messages: bool,
+    event_suffix: &'static str,
+    timeout_duration: Duration,
+) -> Result<()> {
+    // Create a unique topic.
+    let topic_string = Uuid::new_v4().to_string();
+    // Topic::from requires a &str.
+    let topic: Topic = topic_string.as_str().into();
+    let bootstrap = vec!["localhost:9094".to_owned()];
+    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
+    admin_client.create_topic(&topic, 1, 1).await?;
+
+    // Build producer and consumer configurations.
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .source_system(source_system)
+        .build()?;
+    let consumer_config = ConsumerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .group_id(group_id)
+        .subscribed_topics(&[topic.to_string()])
+        .build()?;
+
+    // Create a channel and start the consumer.
+    let (tx, mut rx) = channel(10);
+    let consumer =
+        ProsodyConsumer::new::<TestHandler>(&consumer_config, TestHandler { messages_tx: tx })?;
+    let producer = ProsodyProducer::new(&producer_config)?;
+
+    // Send a regular message (with a unique event id) and an end-of-stream marker.
+    let key = "test-key";
+    let event_id = format!("unique-event-{event_suffix}");
+    let payload = json!({ "id": event_id, "value": "test message" });
+    producer.send([], topic, key, &payload).await?;
+    producer.send([], topic, key, &Value::Null).await?;
+
+    if expect_messages {
+        // Wait for the regular message.
+        let recv_result = tokio::time::timeout(timeout_duration, rx.recv()).await;
+        let recv_opt = recv_result.map_err(|_| eyre!("timeout waiting for regular message"))?;
+        let (recv_key, recv_payload) =
+            recv_opt.ok_or_else(|| eyre!("Did not receive the regular message"))?;
+        assert_eq!(recv_key, key, "keys did not match");
+        assert_eq!(recv_payload, payload, "payloads did not match");
+
+        // Wait for the end-of-stream marker.
+        let recv_result = tokio::time::timeout(timeout_duration, rx.recv()).await;
+        let recv_opt =
+            recv_result.map_err(|_| eyre!("timeout waiting for end-of-stream marker"))?;
+        match recv_opt {
+            Some((_k, Value::Null)) => { /* expected */ }
+            _ => return Err(eyre!("Did not receive expected end-of-stream marker")),
+        }
+    } else {
+        // Ensure no message is received.
+        let recv = tokio::time::timeout(timeout_duration, rx.recv()).await;
+        if let Ok(Some((k, v))) = recv {
+            consumer.shutdown().await;
+            admin_client.delete_topic(&topic).await?;
+            return Err(eyre!("Unexpected message received: key: {k}, payload: {v}"));
+        }
+    }
+
+    consumer.shutdown().await;
+    admin_client.delete_topic(&topic).await?;
     Ok(())
 }
 
@@ -309,6 +404,7 @@ fn create_configs(
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
     let producer_config = ProducerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
         .build()?;
 
     let consumer_config = ConsumerConfiguration::builder()

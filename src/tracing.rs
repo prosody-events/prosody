@@ -6,7 +6,6 @@
 
 use opentelemetry::trace::{TraceError, TracerProvider};
 use opentelemetry_otlp::{SpanExporter, WithTonicConfig};
-use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::trace::Tracer;
 use std::env;
 use thiserror::Error;
@@ -87,13 +86,12 @@ fn build_telemetry_layer() -> Result<OpenTelemetryLayer<Registry, Tracer>, Traci
     }
 
     // Create and install the OpenTelemetry tracer
-    let tracer = opentelemetry_sdk::trace::TracerProvider::builder()
+    let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(
             SpanExporter::builder()
                 .with_tonic()
                 .with_tls_config(ClientTlsConfig::default().with_native_roots())
                 .build()?,
-            Tokio,
         )
         .build()
         .tracer("prosody");
