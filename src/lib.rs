@@ -273,7 +273,7 @@ pub type EventId = Flexstr<UUID_STR_LEN>;
 pub type BorrowedEventId = str;
 
 /// Source system header used to prevent processing loops
-const SOURCE_SYSTEM_HEADER: &str = "source_system";
+const SOURCE_SYSTEM_HEADER: &str = "source-system";
 
 /// Defines event identity behavior for messages that contain unique
 /// identifiers.

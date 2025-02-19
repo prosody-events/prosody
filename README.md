@@ -169,12 +169,12 @@ deduplication**.
 
 ### Source System Deduplication
 
-Prosody introduces the `source_system` header to prevent processing loops caused by messages being reprocessed by the
+Prosody introduces the `source-system` header to prevent processing loops caused by messages being reprocessed by the
 same system that produced them. This behavior is configured automatically:
 
-- **Producers** automatically add a `source_system` header to all outgoing messages.
-- **Consumers** check incoming messages for the `source_system` header.
-- If a message's `source_system` header matches the consumer group, the message is skipped.
+- **Producers** automatically add a `source-system` header to all outgoing messages.
+- **Consumers** check incoming messages for the `source-system` header.
+- If a message's `source-system` header matches the consumer group, the message is skipped.
 
 This ensures that messages re-emitted by a consumer (e.g., for retry or forwarding purposes) do not create infinite
 processing loops.
@@ -185,7 +185,7 @@ To explicitly set the producer's source system identifier, configure:
 export PROSODY_SOURCE_SYSTEM="my-service"
 ```
 
-Prosody will inherit the consumer group ID as the `source_system` if the value is not explicitly provided.
+Prosody will inherit the consumer group ID as the `source-system` if the value is not explicitly provided.
 
 ### Idempotence Deduplication
 
