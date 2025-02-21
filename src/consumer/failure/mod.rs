@@ -8,8 +8,8 @@ use std::convert::Infallible;
 use std::fmt::Display;
 use std::future::Future;
 
-use crate::consumer::message::{ConsumerMessage, MessageContext};
 use crate::consumer::HandlerProvider;
+use crate::consumer::message::{ConsumerMessage, MessageContext};
 
 pub mod log;
 pub mod retry;

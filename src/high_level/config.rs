@@ -5,6 +5,7 @@
 //! methods for building and accessing configuration details. It also includes a
 //! custom error type for handling configuration-related errors.
 
+use crate::Topic;
 use crate::consumer::failure::retry::{
     RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
 };
@@ -16,7 +17,6 @@ use crate::consumer::{
     ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerConfigurationBuilderError,
 };
 use crate::high_level::mode::Mode;
-use crate::Topic;
 use thiserror::Error;
 
 /// Configuration for different operational modes of the Prosody client.

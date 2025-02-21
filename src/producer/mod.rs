@@ -8,6 +8,7 @@ use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use parking_lot::Mutex;
+use rdkafka::ClientConfig;
 use rdkafka::client::{Client, DefaultClientContext};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
@@ -15,13 +16,12 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
-use rdkafka::ClientConfig;
 use std::io;
 use std::mem::take;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{instrument, warn, Span};
+use tracing::{Span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
@@ -32,7 +32,7 @@ use crate::propagator::new_propagator;
 use crate::util::{
     from_env, from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env,
 };
-use crate::{Payload, Topic, MOCK_CLUSTER_BOOTSTRAP, SOURCE_SYSTEM_HEADER};
+use crate::{MOCK_CLUSTER_BOOTSTRAP, Payload, SOURCE_SYSTEM_HEADER, Topic};
 
 #[cfg(target_arch = "arm")]
 use serde_json as json;

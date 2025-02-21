@@ -4,9 +4,9 @@
 //! consumption in various operational modes through the `HighLevelClient`
 //! struct.
 
+use crate::consumer::failure::FallibleHandler;
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
-use crate::consumer::failure::FallibleHandler;
 use crate::consumer::{ConsumerConfigurationBuilder, ConsumerError, ProsodyConsumer};
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::mode::Mode;

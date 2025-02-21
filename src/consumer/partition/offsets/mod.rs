@@ -14,13 +14,13 @@ use educe::Educe;
 use humantime::format_duration;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc::{channel, OwnedPermit, Receiver, Sender};
+use tokio::sync::mpsc::{OwnedPermit, Receiver, Sender, channel};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep_until, Instant};
+use tokio::time::{Instant, sleep_until};
 use tokio::{select, spawn};
 use tracing::{debug, error, info, instrument, warn};
 

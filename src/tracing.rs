@@ -11,7 +11,7 @@ use std::env;
 use thiserror::Error;
 use tonic::transport::ClientTlsConfig;
 use tracing::level_filters::LevelFilter;
-use tracing::subscriber::{set_global_default, SetGlobalDefaultError};
+use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Layer, Registry};

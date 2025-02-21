@@ -9,12 +9,12 @@ use thiserror::Error;
 use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
+use crate::Topic;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::util::from_env;
-use crate::Topic;
 
 /// Configuration for the failure topic strategy.
 #[derive(Builder, Clone, Debug, Validate)]

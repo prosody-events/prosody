@@ -1,9 +1,9 @@
 //! Provides functionality for administrative operations on Kafka topics.
 
+use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::error::KafkaError;
-use rdkafka::ClientConfig;
 use thiserror::Error;
 
 /// A client for performing administrative operations on Kafka topics.

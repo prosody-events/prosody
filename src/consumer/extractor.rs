@@ -6,8 +6,8 @@
 use std::str;
 
 use opentelemetry::propagation::Extractor;
-use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::Message;
+use rdkafka::message::{BorrowedMessage, Headers};
 
 /// A wrapper around a Kafka `BorrowedMessage` that implements the `Extractor`
 /// trait, enabling the extraction of trace context information from the message

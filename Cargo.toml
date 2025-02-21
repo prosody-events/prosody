@@ -1,7 +1,7 @@
 [package]
 categories = ["asynchronous", "network-programming"]
 description = "A high-level Kafka client library with OpenTelemetry integration for distributed tracing"
-edition = "2021"
+edition = "2024"
 keywords = [
     "distributed-systems",
     "kafka",

@@ -29,7 +29,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
-use crate::{Key, Payload, Topic, SOURCE_SYSTEM_HEADER};
+use crate::{Key, Payload, SOURCE_SYSTEM_HEADER, Topic};
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_reader_with_buffers;
@@ -49,12 +49,12 @@ use simd_json::Buffers;
 /// * `watermark_version` - Current watermark version for offset tracking.
 /// * `managers` - Manager collection for handling partitions.
 /// * `shutdown` - Atomic boolean to signal shutdown.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn poll<T>(
     poll_interval: Duration,
     commit_interval: Duration,
     group_id: &str,
-    allowed_events: Option<AhoCorasick>,
+    allowed_events: Option<&AhoCorasick>,
     consumer: &BaseConsumer<Context<T>>,
     watermark_version: &WatermarkVersion,
     managers: &Managers,

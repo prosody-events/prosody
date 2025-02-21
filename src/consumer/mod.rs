@@ -31,8 +31,8 @@ use crate::consumer::probes::ProbeServer;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ahash::HashMap;
@@ -42,12 +42,12 @@ use derive_builder::Builder;
 use educe::Educe;
 use futures::executor::block_on;
 use parking_lot::{Mutex, RwLock};
+use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
-use rdkafka::ClientConfig;
 use thiserror::Error;
-use tokio::task::{spawn_blocking, JoinHandle};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::error;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
@@ -66,7 +66,7 @@ use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
-use crate::{Partition, Topic, MOCK_CLUSTER_BOOTSTRAP};
+use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 
 mod context;
 mod extractor;
@@ -452,7 +452,7 @@ impl ProsodyConsumer {
                 poll_interval,
                 commit_interval,
                 &group_id,
-                allowed_events,
+                allowed_events.as_ref(),
                 &consumer,
                 &watermark_version,
                 &cloned_managers,
