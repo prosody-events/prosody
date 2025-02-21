@@ -212,6 +212,7 @@ pub struct ConsumerConfiguration {
         default = "from_optional_vec_env(\"PROSODY_ALLOWED_EVENTS\")?",
         setter(into)
     )]
+    #[validate(length(min = 1_u64))]
     pub allowed_events: Option<Vec<String>>,
 
     /// Maximum number of uncommitted messages.
