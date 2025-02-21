@@ -27,6 +27,7 @@
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
 //! defined by implementing the [`EventHandler`] trait.
 
+use crate::consumer::poll::PollConfig;
 use crate::consumer::probes::ProbeServer;
 use std::fmt::Debug;
 use std::future::Future;
@@ -448,16 +449,16 @@ impl ProsodyConsumer {
         let cloned_managers = managers.clone();
         let cloned_shutdown = shutdown.clone();
         let poll_handle = spawn_blocking(move || {
-            poll(
+            poll(PollConfig {
                 poll_interval,
                 commit_interval,
-                &group_id,
-                allowed_events.as_ref(),
-                &consumer,
-                &watermark_version,
-                &cloned_managers,
-                &cloned_shutdown,
-            );
+                group_id,
+                allowed_events,
+                consumer,
+                watermark_version: &watermark_version,
+                managers: &cloned_managers,
+                shutdown: &cloned_shutdown,
+            });
         });
 
         let probe_server = config
