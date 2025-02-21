@@ -229,42 +229,12 @@ fn process_message(
         return None;
     }
 
-    // Ensure the message has a key.
-    let Some(key_data) = message.key() else {
-        error!("missing key; discarding message");
-        return None;
-    };
-
     // Ensure the message has a payload.
     let Some(payload_data) = message.payload() else {
         error!("missing payload; discarding message");
         return None;
     };
     span.record("payload_size", payload_data.len());
-
-    // Parse the key as a UTF-8 string.
-    let key = match str::from_utf8(key_data) {
-        Ok(key_str) => {
-            span.record("key", key_str);
-            key_str.into()
-        }
-        Err(error) => {
-            error!("invalid key encoding: {error:#}; discarding message");
-            return None;
-        }
-    };
-
-    // Determine the message timestamp using available metadata.
-    let timestamp = match message.timestamp() {
-        Timestamp::NotAvailable => Utc::now(),
-        Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => {
-            match Utc.timestamp_millis_opt(millis) {
-                MappedLocalTime::Single(ts) => ts,
-                MappedLocalTime::Ambiguous(earliest, ..) => earliest,
-                MappedLocalTime::None => Utc::now(),
-            }
-        }
-    };
 
     // Parse the payload from JSON. Use simd_json on non-ARM platforms.
     #[cfg(target_arch = "arm")]
@@ -291,6 +261,36 @@ fn process_message(
             return None;
         }
     }
+
+    // Ensure the message has a key.
+    let Some(key_data) = message.key() else {
+        error!("missing key; discarding message");
+        return None;
+    };
+
+    // Parse the key as a UTF-8 string.
+    let key = match str::from_utf8(key_data) {
+        Ok(key_str) => {
+            span.record("key", key_str);
+            key_str.into()
+        }
+        Err(error) => {
+            error!("invalid key encoding: {error:#}; discarding message");
+            return None;
+        }
+    };
+
+    // Determine the message timestamp using available metadata.
+    let timestamp = match message.timestamp() {
+        Timestamp::NotAvailable => Utc::now(),
+        Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => {
+            match Utc.timestamp_millis_opt(millis) {
+                MappedLocalTime::Single(ts) => ts,
+                MappedLocalTime::Ambiguous(earliest, ..) => earliest,
+                MappedLocalTime::None => Utc::now(),
+            }
+        }
+    };
 
     // Return a new ConsumerMessage with tracing instrumentation.
     Some(ConsumerMessage::new(
