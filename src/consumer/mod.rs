@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ahash::HashMap;
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, StartKind};
 use crossbeam_utils::CachePadded;
 use derive_builder::Builder;
 use educe::Educe;
@@ -437,7 +437,11 @@ impl ProsodyConsumer {
         let allowed_events = config
             .allowed_events
             .as_ref()
-            .map(AhoCorasick::new)
+            .map(|prefixes| {
+                AhoCorasick::builder()
+                    .start_kind(StartKind::Anchored)
+                    .build(prefixes)
+            })
             .transpose()?;
 
         consumer.subscribe(&topics)?;

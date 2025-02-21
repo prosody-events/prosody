@@ -331,6 +331,89 @@ async fn run_scenario(
     Ok(())
 }
 
+#[tokio::test]
+async fn test_allowed_events_filtering() -> color_eyre::eyre::Result<()> {
+    use prosody::Topic;
+    use prosody::admin::ProsodyAdminClient;
+    use prosody::consumer::{ConsumerConfiguration, ProsodyConsumer};
+    use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::sync::mpsc::channel;
+    use tokio::time::timeout;
+    use tracing_subscriber::fmt;
+    use uuid::Uuid;
+
+    // Initialize tracing (ignore error if already initialized)
+    let _ = fmt().compact().try_init();
+
+    // Create a unique topic for the test.
+    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    let bootstrap = vec!["localhost:9094".to_owned()];
+    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
+    admin_client.create_topic(&topic, 1, 1).await?;
+
+    // Configure the consumer with probe_port set to None and allow only event types
+    // starting with "allowed".
+    let consumer_config = ConsumerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .group_id("test-allowed-events-consumer")
+        .probe_port(None)
+        .subscribed_topics(&[topic.to_string()])
+        .allowed_events(vec!["allowed".to_owned()])
+        .build()?;
+
+    // Configure the producer.
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
+        .build()?;
+
+    // Create a channel to collect delivered messages.
+    let (messages_tx, mut messages_rx) = channel(10);
+
+    // Use the existing TestHandler which forwards messages to the channel.
+    let handler = TestHandler { messages_tx };
+
+    // Start the consumer.
+    let consumer = ProsodyConsumer::new::<TestHandler>(&consumer_config, handler)?;
+    // Create the producer.
+    let producer = ProsodyProducer::new(&producer_config)?;
+
+    let key = "test-key";
+    // Build two payloads:
+    // - One with a disallowed event type ("disallowed") that should be filtered.
+    // - One with an allowed event type ("allowed_event") that should be delivered.
+    let payload_filtered = json!({
+        "type": "disallowed",
+        "content": "this message should be filtered"
+    });
+    let payload_allowed = json!({
+        "type": "allowed_event",
+        "content": "this message should be delivered"
+    });
+
+    // Send both messages.
+    producer.send([], topic, key, &payload_filtered).await?;
+    producer.send([], topic, key, &payload_allowed).await?;
+
+    // Wait up to 5 seconds for a delivered message.
+    let received = timeout(Duration::from_secs(5), messages_rx.recv()).await?;
+    let (received_key, received_payload) = received
+        .ok_or_else(|| color_eyre::eyre::eyre!("Timeout waiting for a delivered message"))?;
+
+    // Shutdown the consumer.
+    consumer.shutdown().await;
+
+    // Verify that the received message is the allowed one.
+    assert_eq!(received_key, key);
+    assert_eq!(received_payload, payload_allowed);
+
+    // Clean up the test topic.
+    admin_client.delete_topic(&topic).await?;
+    Ok(())
+}
+
 /// Runs the core logic of the integration test.
 ///
 /// # Arguments

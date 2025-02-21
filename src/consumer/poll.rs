@@ -10,7 +10,7 @@
 //! All functionality is scaffolded through the [`PollConfig`] type and a set of
 //! functions that operate on Kafka messages.
 
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, Anchored, Input};
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
 use opentelemetry::propagation::TextMapPropagator;
@@ -35,12 +35,12 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
-use crate::{Topic, SOURCE_SYSTEM_HEADER};
+use crate::{SOURCE_SYSTEM_HEADER, Topic};
 
 #[cfg(not(target_arch = "arm"))]
-use simd_json::serde::from_reader_with_buffers;
-#[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
+#[cfg(not(target_arch = "arm"))]
+use simd_json::serde::from_reader_with_buffers;
 
 /// Bundles all parameters necessary for polling Kafka messages.
 ///
@@ -282,10 +282,10 @@ fn process_message(
     // Apply filtering based on allowed event types if provided.
     if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
         span.record("event_type", event_type);
-        if allowed_events
-            .as_ref()
-            .is_some_and(|pattern| !pattern.is_match(event_type))
-        {
+        if allowed_events.as_ref().is_some_and(|pattern| {
+            let input = Input::new(event_type).anchored(Anchored::Yes);
+            pattern.find(input).is_none()
+        }) {
             span.record("skipped", true);
             debug!("skipping message because {event_type} is not an allowed event type");
             return None;
@@ -369,7 +369,7 @@ fn commit_watermarks<T>(
     let mut success = true;
     let managers = managers.read();
     let mut list = TopicPartitionList::with_capacity(managers.len());
-    
+
     // Build a commit list from each partition manager's watermark.
     for ((topic, partition), manager) in managers.iter() {
         let Some(watermark) = manager.watermark() else {
