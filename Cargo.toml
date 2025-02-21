@@ -13,10 +13,11 @@ license = "UNLICENSED"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/cincpro/prosody"
-version = "0.7.0"
+version = "0.8.0"
 
 [dependencies]
 ahash = "0.8"
+aho-corasick = "1.1"
 axum = { version = "0.8", features = ["http2"] }
 axum-extra = "0.10"
 chrono = "0.4"

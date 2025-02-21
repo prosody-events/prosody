@@ -4,6 +4,7 @@
 //! manages offset commits, handles partition pausing and resuming based on
 //! capacity, and dispatches messages to appropriate partition managers.
 
+use aho_corasick::AhoCorasick;
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
 use opentelemetry::propagation::TextMapPropagator;
@@ -12,6 +13,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::Headers;
 use rdkafka::util::Timeout;
 use rdkafka::{Message, Offset, Timestamp, TopicPartitionList};
+use serde_json::Value;
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
@@ -27,7 +29,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
-use crate::{Key, Topic, SOURCE_SYSTEM_HEADER};
+use crate::{Key, Payload, Topic, SOURCE_SYSTEM_HEADER};
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_reader_with_buffers;
@@ -42,6 +44,7 @@ use simd_json::Buffers;
 /// * `poll_interval` - Duration to wait between polling attempts.
 /// * `commit_interval` - Duration to wait between offset commits.
 /// * `group_id` - Consumer group identifier.
+/// * `allowed_events` - Allowed event type search automaton.
 /// * `consumer` - Kafka consumer instance.
 /// * `watermark_version` - Current watermark version for offset tracking.
 /// * `managers` - Manager collection for handling partitions.
@@ -51,6 +54,7 @@ pub fn poll<T>(
     poll_interval: Duration,
     commit_interval: Duration,
     group_id: &str,
+    allowed_events: Option<AhoCorasick>,
     consumer: &BaseConsumer<Context<T>>,
     watermark_version: &WatermarkVersion,
     managers: &Managers,
@@ -110,6 +114,7 @@ pub fn poll<T>(
             key = Empty,
             payload_size = Empty,
             skipped = Empty,
+            event_type = Empty,
         );
 
         span.set_parent(context);
@@ -127,8 +132,6 @@ pub fn poll<T>(
             debug!("skipping message because source system header matches the group identifier");
             continue;
         }
-
-        span.record("skipped", false);
 
         // Validate message key and payload
         let Some(key_data) = message.key() else {
@@ -171,13 +174,27 @@ pub fn poll<T>(
         #[cfg(not(target_arch = "arm"))]
         let payload = from_reader_with_buffers(payload_data, &mut buffers);
 
-        let payload = match payload {
+        let payload: Payload = match payload {
             Ok(payload) => payload,
             Err(error) => {
                 error!("invalid payload: {error:#}; discarding message");
                 continue;
             }
         };
+
+        // Skip events that aren't of an allowed type
+        if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
+            span.record("event_type", event_type);
+
+            if allowed_events
+                .as_ref()
+                .is_some_and(|pattern| !pattern.is_match(event_type))
+            {
+                span.record("skipped", true);
+                debug!("skipping message because {event_type} is not an allowed event type");
+                continue;
+            }
+        }
 
         // Create ConsumerMessage and dispatch for processing
         let mut message = ConsumerMessage::new(
@@ -191,6 +208,7 @@ pub fn poll<T>(
         );
 
         // Dispatch message to appropriate handler
+        span.record("skipped", false);
         loop {
             match dispatch_message(message, managers) {
                 Ok(()) => break,

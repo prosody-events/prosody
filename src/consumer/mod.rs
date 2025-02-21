@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::HashMap;
+use aho_corasick::AhoCorasick;
 use crossbeam_utils::CachePadded;
 use derive_builder::Builder;
 use educe::Educe;
@@ -63,7 +64,7 @@ use crate::consumer::poll::poll;
 use crate::producer::ProsodyProducer;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
-    from_option_env_with_fallback, from_vec_env,
+    from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
 use crate::{Partition, Topic, MOCK_CLUSTER_BOOTSTRAP};
 
@@ -199,6 +200,18 @@ pub struct ConsumerConfiguration {
     #[builder(default = "from_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub subscribed_topics: Vec<String>,
+
+    /// Allowed event types.
+    ///
+    /// Environment variable: `PROSODY_ALLOWED_EVENTS`
+    /// Default: None
+    ///
+    /// If no event types are specified, all events are allowed.
+    #[builder(
+        default = "from_optional_vec_env(\"PROSODY_ALLOWED_EVENTS\")?",
+        setter(into)
+    )]
+    pub allowed_events: Option<Vec<String>>,
 
     /// Maximum number of uncommitted messages.
     ///
@@ -419,6 +432,13 @@ impl ProsodyConsumer {
             .map(String::as_str)
             .collect();
 
+        // Build event type search automaton
+        let allowed_events = config
+            .allowed_events
+            .as_ref()
+            .map(AhoCorasick::new)
+            .transpose()?;
+
         consumer.subscribe(&topics)?;
 
         // Spawn a blocking task to continuously poll for messages
@@ -432,6 +452,7 @@ impl ProsodyConsumer {
                 poll_interval,
                 commit_interval,
                 &group_id,
+                allowed_events,
                 &consumer,
                 &watermark_version,
                 &cloned_managers,
@@ -650,6 +671,10 @@ pub enum ConsumerError {
     /// Indicates invalid consumer configuration.
     #[error("invalid consumer configuration: {0:#}")]
     Configuration(#[from] ValidationErrors),
+
+    /// Indicates an invalid event type pattern
+    #[error("invalid allowed events pattern: {0:#}")]
+    AllowedEventsPattern(#[from] aho_corasick::BuildError),
 
     /// Indicates an IO failure.
     #[error("IO error: {0:#}")]

@@ -303,7 +303,7 @@ impl EventIdentity for Payload {
     type EventId = EventId;
 
     fn event_id(&self) -> Option<&Self::BorrowedEventId> {
-        match self.as_object()?.get("id")? {
+        match self.get("id")? {
             Value::String(value) => Some(value.as_str()),
             _ => None,
         }

@@ -170,6 +170,7 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
     let consumer_config = ConsumerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
         .group_id("test-deduplication-consumer")
+        .probe_port(None)
         .subscribed_topics(&[topic.to_string()])
         .build()?;
 
@@ -281,6 +282,7 @@ async fn run_scenario(
     let consumer_config = ConsumerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
         .group_id(group_id)
+        .probe_port(None)
         .subscribed_topics(&[topic.to_string()])
         .build()?;
 
