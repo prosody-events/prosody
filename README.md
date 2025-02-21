@@ -144,6 +144,7 @@ The following table lists the available configuration options and their associat
 
 | Environment Variable             | Description                                                                    | Default      | Consumer | Producer |
 |----------------------------------|--------------------------------------------------------------------------------|--------------|----------|----------|
+| `PROSODY_ALLOWED_EVENTS`         | Allowed event type prefixes (comma-separated). All allowed if unset.           | -            | ✓        |          |
 | `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                | -            | ✓        | ✓        |
 | `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                             | 1s           | ✓        |          |
 | `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                  | -            | ✓        |          |
