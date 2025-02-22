@@ -85,11 +85,6 @@ where
 /// # Arguments
 ///
 /// * `config`: A [`PollConfig`] instance with all the necessary configuration.
-///
-/// # Panics
-///
-/// This function does not explicitly panic unless an underlying dependency
-/// (like sleep or consumer functions) panics.
 pub fn poll<T>(config: PollConfig<T>)
 where
     T: HandlerProvider,

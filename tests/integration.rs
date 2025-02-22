@@ -332,7 +332,7 @@ async fn run_scenario(
 }
 
 #[tokio::test]
-async fn test_allowed_events_filtering() -> color_eyre::eyre::Result<()> {
+async fn test_allowed_events_filtering() -> Result<()> {
     use prosody::Topic;
     use prosody::admin::ProsodyAdminClient;
     use prosody::consumer::{ConsumerConfiguration, ProsodyConsumer};
