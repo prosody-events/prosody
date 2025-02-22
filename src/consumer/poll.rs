@@ -13,7 +13,7 @@
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
-use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Headers};
@@ -187,7 +187,7 @@ fn process_message(
     message: &BorrowedMessage,
     group_id: &str,
     allowed_events: Option<&AhoCorasick>,
-    propagator: &impl TextMapPropagator,
+    propagator: &TextMapCompositePropagator,
     #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
 ) -> Option<ConsumerMessage> {
     // Derive the topic and partition from the message.
