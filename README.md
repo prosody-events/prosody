@@ -163,6 +163,41 @@ The following table lists the available configuration options and their associat
 | `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m           | ✓        |          |
 | `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -            | ✓        |          |
 
+## Event Type Filtering
+
+Prosody supports filtering messages based on exact event type prefixes, configured via `PROSODY_ALLOWED_EVENTS` or the
+`ConsumerConfiguration` builder.
+
+### Configuration
+
+```sh
+# Allow only events starting with exactly 'user.' or 'account.'
+export PROSODY_ALLOWED_EVENTS=user.,account.
+```
+
+```rust,ignore
+let config = ConsumerConfiguration::builder()
+    .allowed_events(vec!["user.".to_owned()])
+    .build()?;
+```
+
+### Matching Behavior
+
+Prefixes must match exactly from the start of the event type:
+
+✓ Matches:
+
+- `{"type": "user.created"}` matches prefix `user.`
+- `{"type": "account.deleted"}` matches prefix `account.`
+
+✗ No Match:
+
+- `{"type": "admin.user.created"}` doesn't match `user.`
+- `{"type": "my.account.deleted"}` doesn't match `account.`
+- `{"type": "notification"}` doesn't match any prefix
+
+If no prefixes are configured, all messages are processed. Messages without a `type` field are always processed.
+
 ## Message Deduplication
 
 Prosody prevents duplicate message processing using two mechanisms: **source system deduplication** and **idempotence
