@@ -172,7 +172,7 @@ where
 /// * `message`: A borrowed Kafka message to process.
 /// * `group_id`: Identifier of the consuming group used to skip messages
 ///   originating from ourselves.
-/// * `allowed_events`: Optional pattern filter that restricts processing to
+/// * `allowed_events`: Optional automaton filter that restricts processing to
 ///   allowed event types.
 /// * `propagator`: A distributed tracing propagator to extract context from
 ///   message headers.
@@ -247,9 +247,10 @@ fn process_message(
     // Apply filtering based on allowed event types if provided.
     if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
         span.record("event_type", event_type);
-        if allowed_events.as_ref().is_some_and(|pattern| {
+
+        if allowed_events.as_ref().is_some_and(|automaton| {
             let input = Input::new(event_type).anchored(Anchored::Yes);
-            pattern.find(input).is_none()
+            automaton.find(input).is_none()
         }) {
             span.record("skipped", true);
             debug!("skipping message because {event_type} is not an allowed event type");
