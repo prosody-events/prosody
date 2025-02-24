@@ -67,8 +67,11 @@ impl FallibleHandler for MyHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_servers = ["localhost:9092".to_owned()];
 
+    // to allow loopbacks, source_system must be different than group_id
     let mut producer_config = ProducerConfiguration::builder();
-    producer_config.bootstrap_servers(bootstrap_servers.clone());
+    producer_config
+        .bootstrap_servers(bootstrap_servers.clone())
+        .source_system("my-source");
 
     let mut consumer_config = ConsumerConfiguration::builder();
     consumer_config.bootstrap_servers(bootstrap_servers)
