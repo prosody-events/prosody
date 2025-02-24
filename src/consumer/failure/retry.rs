@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use derive_builder::Builder;
 use humantime::format_duration;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use tokio::select;
 use tokio::time::sleep;
 use tracing::{error, info};

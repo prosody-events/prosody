@@ -67,8 +67,12 @@ impl FallibleHandler for MyHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_servers = ["localhost:9092".to_owned()];
 
+    // To allow loopbacks, the source_system must be different from the group_id.
+    // Normally, the source_system would be left unspecified, which would default to the group_id.
     let mut producer_config = ProducerConfiguration::builder();
-    producer_config.bootstrap_servers(bootstrap_servers.clone());
+    producer_config
+        .bootstrap_servers(bootstrap_servers.clone())
+        .source_system("my-source");
 
     let mut consumer_config = ConsumerConfiguration::builder();
     consumer_config.bootstrap_servers(bootstrap_servers)
@@ -144,6 +148,7 @@ The following table lists the available configuration options and their associat
 
 | Environment Variable             | Description                                                                    | Default      | Consumer | Producer |
 |----------------------------------|--------------------------------------------------------------------------------|--------------|----------|----------|
+| `PROSODY_ALLOWED_EVENTS`         | Allowed event type prefixes (comma-separated). All allowed if unset.           | -            | ✓        |          |
 | `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                | -            | ✓        | ✓        |
 | `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                             | 1s           | ✓        |          |
 | `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                  | -            | ✓        |          |
@@ -161,6 +166,41 @@ The following table lists the available configuration options and their associat
 | `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                           | `<group id>` |          | ✓        |
 | `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m           | ✓        |          |
 | `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -            | ✓        |          |
+
+## Event Type Filtering
+
+Prosody supports filtering messages based on exact event type prefixes, configured via `PROSODY_ALLOWED_EVENTS` or the
+`ConsumerConfiguration` builder.
+
+### Configuration
+
+```sh
+# Allow only events starting with exactly 'user.' or 'account.'
+export PROSODY_ALLOWED_EVENTS=user.,account.
+```
+
+```rust,ignore
+let config = ConsumerConfiguration::builder()
+    .allowed_events(vec!["user.".to_owned()])
+    .build()?;
+```
+
+### Matching Behavior
+
+Prefixes must match exactly from the start of the event type:
+
+✓ Matches:
+
+- `{"type": "user.created"}` matches prefix `user.`
+- `{"type": "account.deleted"}` matches prefix `account.`
+
+✗ No Match:
+
+- `{"type": "admin.user.created"}` doesn't match `user.`
+- `{"type": "my.account.deleted"}` doesn't match `account.`
+- `{"type": "notification"}` doesn't match any prefix
+
+If no prefixes are configured, all messages are processed. Messages without a `type` field are always processed.
 
 ## Message Deduplication
 

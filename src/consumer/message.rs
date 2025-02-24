@@ -17,10 +17,10 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{debug, error, Span};
+use tracing::{Span, debug, error};
 
-use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::Keyed;
+use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::{BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, Topic};
 
 /// The context for message processing within a consumer.

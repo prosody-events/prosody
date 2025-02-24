@@ -12,17 +12,17 @@ use std::future::ready;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance};
 use rdkafka::{ClientContext, Offset, TopicPartitionList};
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
+use crate::Topic;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
-use crate::Topic;
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///

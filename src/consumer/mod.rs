@@ -27,26 +27,28 @@
 //! configured via [`ConsumerConfiguration`]. Custom message processing logic is
 //! defined by implementing the [`EventHandler`] trait.
 
+use crate::consumer::poll::PollConfig;
 use crate::consumer::probes::ProbeServer;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ahash::HashMap;
+use aho_corasick::{AhoCorasick, StartKind};
 use crossbeam_utils::CachePadded;
 use derive_builder::Builder;
 use educe::Educe;
 use futures::executor::block_on;
 use parking_lot::{Mutex, RwLock};
+use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
-use rdkafka::ClientConfig;
 use thiserror::Error;
-use tokio::task::{spawn_blocking, JoinHandle};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::error;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
@@ -63,9 +65,9 @@ use crate::consumer::poll::poll;
 use crate::producer::ProsodyProducer;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
-    from_option_env_with_fallback, from_vec_env,
+    from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
-use crate::{Partition, Topic, MOCK_CLUSTER_BOOTSTRAP};
+use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 
 mod context;
 mod extractor;
@@ -199,6 +201,19 @@ pub struct ConsumerConfiguration {
     #[builder(default = "from_vec_env(\"PROSODY_SUBSCRIBED_TOPICS\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub subscribed_topics: Vec<String>,
+
+    /// Allowed event type prefixes.
+    ///
+    /// Environment variable: `PROSODY_ALLOWED_EVENTS`
+    /// Default: None
+    ///
+    /// If no event types are specified, all events are allowed.
+    #[builder(
+        default = "from_optional_vec_env(\"PROSODY_ALLOWED_EVENTS\")?",
+        setter(into)
+    )]
+    #[validate(length(min = 1_u64))]
+    pub allowed_events: Option<Vec<String>>,
 
     /// Maximum number of uncommitted messages.
     ///
@@ -419,6 +434,17 @@ impl ProsodyConsumer {
             .map(String::as_str)
             .collect();
 
+        // Build event type search automaton
+        let allowed_events = config
+            .allowed_events
+            .as_ref()
+            .map(|prefixes| {
+                AhoCorasick::builder()
+                    .start_kind(StartKind::Anchored)
+                    .build(prefixes)
+            })
+            .transpose()?;
+
         consumer.subscribe(&topics)?;
 
         // Spawn a blocking task to continuously poll for messages
@@ -428,15 +454,16 @@ impl ProsodyConsumer {
         let cloned_managers = managers.clone();
         let cloned_shutdown = shutdown.clone();
         let poll_handle = spawn_blocking(move || {
-            poll(
+            poll(PollConfig {
                 poll_interval,
                 commit_interval,
-                &group_id,
-                &consumer,
-                &watermark_version,
-                &cloned_managers,
-                &cloned_shutdown,
-            );
+                group_id,
+                allowed_events,
+                consumer,
+                watermark_version: &watermark_version,
+                managers: &cloned_managers,
+                shutdown: &cloned_shutdown,
+            });
         });
 
         let probe_server = config
@@ -650,6 +677,10 @@ pub enum ConsumerError {
     /// Indicates invalid consumer configuration.
     #[error("invalid consumer configuration: {0:#}")]
     Configuration(#[from] ValidationErrors),
+
+    /// Indicates an invalid event type pattern
+    #[error("invalid allowed events pattern: {0:#}")]
+    AllowedEventsPattern(#[from] aho_corasick::BuildError),
 
     /// Indicates an IO failure.
     #[error("IO error: {0:#}")]

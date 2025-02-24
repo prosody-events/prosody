@@ -58,8 +58,12 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let bootstrap_servers = ["localhost:9092".to_owned()];
 //!
+//!     // To allow loopbacks, the source_system must be different from the group_id.
+//!     // Normally, the source_system would be left unspecified, which would default to the group_id.
 //!     let mut producer_config = ProducerConfiguration::builder();
-//!     producer_config.bootstrap_servers(bootstrap_servers.clone());
+//!     producer_config
+//!         .bootstrap_servers(bootstrap_servers.clone())
+//!         .source_system("my-source");
 //!
 //!     let mut consumer_config = ConsumerConfiguration::builder();
 //!     consumer_config.bootstrap_servers(bootstrap_servers)
@@ -303,7 +307,7 @@ impl EventIdentity for Payload {
     type EventId = EventId;
 
     fn event_id(&self) -> Option<&Self::BorrowedEventId> {
-        match self.as_object()?.get("id")? {
+        match self.get("id")? {
             Value::String(value) => Some(value.as_str()),
             _ => None,
         }

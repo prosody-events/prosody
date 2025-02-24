@@ -4,11 +4,11 @@
 //! probes, which are commonly used in containerized environments to determine
 //! if a service is ready to accept traffic and if it's functioning correctly.
 
-use crate::consumer::{get_assigned_partition_count, get_is_stalled, Managers};
+use crate::consumer::{Managers, get_assigned_partition_count, get_is_stalled};
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
-use axum::Router;
 use axum_extra::routing::RouterExt;
 use educe::Educe;
 use futures::executor::block_on;

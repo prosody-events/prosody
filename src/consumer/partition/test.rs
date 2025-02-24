@@ -7,14 +7,14 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
+use crate::Key;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{EventHandler, Keyed, MessageContext};
-use crate::Key;
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use std::future::Future;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tracing::Span;

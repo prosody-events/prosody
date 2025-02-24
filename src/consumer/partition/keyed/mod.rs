@@ -4,8 +4,8 @@
 //! with the same key are processed in order while allowing parallel processing
 //! of messages with different keys.
 
-use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use ahash::RandomState;
 use futures::stream::FuturesUnordered;
-use futures::{pin_mut, Stream, StreamExt};
+use futures::{Stream, StreamExt, pin_mut};
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
 use tokio::sync::watch;
@@ -21,8 +21,8 @@ use tokio::time::sleep;
 use tracing::warn;
 use tracing::{debug, instrument};
 
-use crate::consumer::partition::util::WithValue;
 use crate::consumer::Keyed;
+use crate::consumer::partition::util::WithValue;
 
 #[cfg(test)]
 mod test;

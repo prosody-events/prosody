@@ -4,15 +4,15 @@
 //! functioning of the `OffsetTracker`, focusing on watermark tracking and
 //! committing.
 
-use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation, UncommittedOffset};
 use crate::Offset;
+use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation, UncommittedOffset};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use crossbeam_utils::CachePadded;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::time::Instant;
@@ -82,7 +82,7 @@ async fn tracks_commit_watermark_impl(Actions(actions): Actions) -> TestResult {
     // Determine the expected watermark
     let expected = test_offsets
         .iter()
-        .take_while(|(_, &action)| action == Operation::Commit)
+        .take_while(|(_, action)| **action == Operation::Commit)
         .last()
         .map(|(&offset, _)| offset);
 

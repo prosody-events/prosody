@@ -6,8 +6,8 @@
 //! and complete message processing.
 
 use std::cmp::max;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ahash::HashMapExt;
@@ -19,8 +19,8 @@ use tokio::runtime::Builder;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
-use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::Keyed;
+use crate::consumer::partition::keyed::KeyManager;
 
 /// A sequence of messages with keys and values for testing.
 #[derive(Clone, Debug)]

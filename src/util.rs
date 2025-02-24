@@ -113,8 +113,44 @@ where
 {
     get_env_value(env_var)?
         .split(',')
-        .map(|value_str| parse_with_error(env_var, value_str))
+        .map(|value_str| parse_with_error(env_var, value_str.trim()))
         .collect()
+}
+
+/// Retrieves and parses an optional comma-separated environment variable into a
+/// vector.
+///
+/// If the environment variable is not set, this function returns `Ok(None)`.
+/// Otherwise, it attempts to parse each comma-separated value into type `T`. If
+/// any value fails to parse, an error is returned.
+///
+/// # Arguments
+///
+/// * `env_var` - The name of the environment variable to retrieve.
+///
+/// # Returns
+///
+/// A `Result` containing an `Option<Vec<T>>`:
+/// - `Ok(Some(vec))` if the variable is set and all values are parsed
+///   successfully.
+/// - `Ok(None)` if the variable is not set.
+/// - `Err(String)` if any parsing error occurs.
+pub fn from_optional_vec_env<T>(env_var: &str) -> Result<Option<Vec<T>>, String>
+where
+    T: FromStr,
+    <T as FromStr>::Err: Display,
+{
+    // Return Ok(None) if the environment variable is not set.
+    let Ok(value_str) = env::var(env_var) else {
+        return Ok(None);
+    };
+
+    // Split on commas, trim each part, and parse each element.
+    value_str
+        .split(',')
+        .map(|s| parse_with_error(env_var, s.trim()))
+        .collect::<Result<Vec<T>, String>>()
+        .map(Some)
 }
 
 /// Retrieves and parses a duration environment variable with a fallback value.
