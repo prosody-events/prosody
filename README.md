@@ -67,7 +67,8 @@ impl FallibleHandler for MyHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_servers = ["localhost:9092".to_owned()];
 
-    // to allow loopbacks, source_system must be different than group_id
+    // To allow loopbacks, the source_system must be different from the group_id.
+    // Normally, the source_system would be left unspecified, which would default to the group_id.
     let mut producer_config = ProducerConfiguration::builder();
     producer_config
         .bootstrap_servers(bootstrap_servers.clone())
