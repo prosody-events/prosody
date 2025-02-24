@@ -202,7 +202,7 @@ pub struct ConsumerConfiguration {
     #[validate(length(min = 1_u64))]
     pub subscribed_topics: Vec<String>,
 
-    /// Allowed event types.
+    /// Allowed event type prefixes.
     ///
     /// Environment variable: `PROSODY_ALLOWED_EVENTS`
     /// Default: None
