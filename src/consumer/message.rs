@@ -49,7 +49,7 @@ impl MessageContext {
     /// # Errors
     ///
     /// Logs an error if the shutdown hook fails.
-    pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send {
+    pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send + use<> {
         let mut shutdown_rx = self.shutdown_rx.clone();
         async move {
             if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
