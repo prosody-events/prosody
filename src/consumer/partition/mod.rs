@@ -242,6 +242,7 @@ impl PartitionManager {
 /// * `shutdown_rx` - Channel receiving shutdown signal
 /// * `shutdown_timeout` - How long to wait for processing to complete during
 ///   shutdown
+#[allow(clippy::too_many_arguments)]
 async fn handle_messages<T>(
     message_handler: T,
     offsets: OffsetTracker,
