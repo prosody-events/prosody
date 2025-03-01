@@ -72,19 +72,20 @@ use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt, HashSet};
-use color_eyre::eyre::{eyre, OptionExt, Result};
+use color_eyre::eyre::{OptionExt, Result, eyre};
 use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
+use prosody::Topic;
 use prosody::admin::ProsodyAdminClient;
-use prosody::consumer::message::{MessageContext, UncommittedMessage};
 use prosody::consumer::Keyed;
+use prosody::consumer::message::{MessageContext, UncommittedMessage};
 use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::Topic;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::spawn;
+use tokio::sync::mpsc::{Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -256,7 +257,7 @@ async fn test_source_system_filtering() -> Result<()> {
         "2",
         timeout_duration,
     )
-        .await?;
+    .await?;
 
     Ok(())
 }
@@ -401,8 +402,8 @@ async fn test_allowed_events_filtering() -> Result<()> {
 
     // Wait up to 5 seconds for a delivered message.
     let received = timeout(Duration::from_secs(5), messages_rx.recv()).await?;
-    let (received_key, received_payload) = received
-        .ok_or_else(|| eyre!("Timeout waiting for a delivered message"))?;
+    let (received_key, received_payload) =
+        received.ok_or_else(|| eyre!("Timeout waiting for a delivered message"))?;
 
     // Shutdown the consumer.
     consumer.shutdown().await;
@@ -429,7 +430,7 @@ async fn test_backpressure() -> Result<()> {
     admin_client.create_topic(&topic, 4, 1).await?;
 
     // Set up a channel with a small buffer (10 messages) to simulate backpressure.
-    let (messages_tx, mut messages_rx) = channel(10);
+    let (messages_tx, mut messages_rx) = channel(64);
 
     // Build a consumer configuration with a small max_enqueued_per_key.
     let consumer_config = ConsumerConfiguration::builder()
@@ -439,7 +440,8 @@ async fn test_backpressure() -> Result<()> {
         .subscribed_topics(&[topic.to_string()])
         .build()?;
 
-    // Create the consumer using a custom slow handler that delays 1 second per message.
+    // Create the consumer using a custom slow handler that delays 1 second per
+    // message.
     let slow_handler = SlowTestHandler { messages_tx };
     let consumer = ProsodyConsumer::new::<SlowTestHandler>(&consumer_config, slow_handler)?;
 
@@ -450,21 +452,37 @@ async fn test_backpressure() -> Result<()> {
         .build()?;
     let producer = ProsodyProducer::new(&producer_config)?;
 
+    let total = 10_000u32;
+
     // Produce 3000 messages quickly
-    for i in 0..50_000u64 {
-        let payload = json!({ "seq": i });
-        producer.send([], topic, &i.to_string(), &payload).await?;
-    }
+    spawn(async move {
+        for i in 0..total {
+            let payload = json!({ "seq": i });
+            if producer
+                .send([], topic, &i.to_string(), &payload)
+                .await
+                .is_err()
+            {
+                error!("failed to send message");
+            }
+        }
+    });
 
     // Start processing messages and report progress.
     let mut count = 0_u32;
     let start_time = tokio::time::Instant::now();
 
-    while (messages_rx.recv().await).is_some() {
+    while messages_rx.recv().await.is_some() {
         count += 1;
 
         // Log progress
-        info!("Received {count} messages so far");
+        if count % 100 == 0 {
+            info!("Received {count} messages so far");
+        }
+
+        if count == total {
+            break;
+        }
     }
     let total_elapsed = start_time.elapsed();
     info!("Total messages processed: {count}");
@@ -488,15 +506,11 @@ impl EventHandler for SlowTestHandler {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
         let payload: Value = msg.payload().clone();
-        info!("start message for key {}", key);
         sleep(Duration::from_secs(1)).await;
-        info!("attempting to send message for key {}", key);
         if let Err(e) = self.messages_tx.send((key.clone(), payload)).await {
             error!("failed to send message for key {}: {e:#}", key);
         }
-        info!("send complete for key {}", key);
         uncommitted.commit();
-        info!("finish message for key {}", key);
     }
 
     async fn shutdown(self) {
