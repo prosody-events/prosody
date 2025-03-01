@@ -123,6 +123,7 @@ impl PartitionManager {
             offsets.clone(),
             message_rx,
             max_enqueued_per_key,
+            max_uncommitted,
             idempotence_cache_size,
             shutdown_rx,
             shutdown_timeout,
@@ -235,6 +236,7 @@ impl PartitionManager {
 /// * `offsets` - Tracks offset commits and processing progress
 /// * `message_rx` - Channel receiving messages to process
 /// * `max_enqueued_per_key` - Maximum number of pending messages per key
+/// * `max_concurrency` - Maximum number of concurrent tasks executing.
 /// * `idempotence_cache_size` - Size of cache for deduplicating messages by
 ///   event ID
 /// * `shutdown_rx` - Channel receiving shutdown signal
@@ -245,6 +247,7 @@ async fn handle_messages<T>(
     offsets: OffsetTracker,
     message_rx: Receiver<ConsumerMessage>,
     max_enqueued_per_key: usize,
+    max_concurrency: usize,
     idempotence_cache_size: usize,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_timeout: Duration,
@@ -297,7 +300,12 @@ async fn handle_messages<T>(
 
     // Create key manager to handle concurrent processing
     KeyManager::new(process, max_enqueued_per_key)
-        .process_messages(stream, shutdown_rx.clone(), shutdown_timeout)
+        .process_messages(
+            stream,
+            shutdown_rx.clone(),
+            max_concurrency,
+            shutdown_timeout,
+        )
         .await;
 
     message_handler.shutdown().await;

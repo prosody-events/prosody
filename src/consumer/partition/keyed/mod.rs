@@ -89,11 +89,13 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// * `messages` - Stream of incoming messages.
     /// * `shutdown_rx` - Receiver for shutdown signal.
+    /// * `max_concurrency` - Maximum number of concurrent tasks executing.
     /// * `shutdown_timeout` - Duration to wait before forcefully shutting down.
     pub async fn process_messages<S>(
         mut self,
         messages: S,
         mut shutdown_rx: watch::Receiver<bool>,
+        max_concurrency: usize,
         shutdown_timeout: Duration,
     ) where
         S: Stream<Item = M>,
@@ -102,11 +104,13 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         F: FnMut(M) -> Fut,
         Fut: Future,
     {
+        debug_assert!(max_concurrency > 0, "max_concurrency cannot be zero");
+
         pin_mut!(messages);
         let shutdown_rx = &mut shutdown_rx;
 
         loop {
-            if self.executing.len() < 16 {
+            if self.executing.len() < max_concurrency {
                 debug!("below concurrency limit; resuming message consumption");
                 select! {
                     // Process the next available message from the executing queue.
