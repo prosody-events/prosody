@@ -441,10 +441,12 @@ where
 
     // Apply pause and resume operations
     if *is_paused {
+        debug!("pausing: {paused:?}");
         consumer.pause(&paused)?;
     }
 
     if resumed.count() > 0 {
+        debug!("resuming: {resumed:?}");
         consumer.resume(&resumed)?;
     }
 
