@@ -106,26 +106,42 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         let shutdown_rx = &mut shutdown_rx;
 
         loop {
-            select! {
-                biased;
+            if self.executing.len() < 16 {
+                debug!("below concurrency limit; resuming message consumption");
+                select! {
+                    // Process the next available message from the executing queue.
+                    Some(hash_value) = self.executing.next() => {
+                        self.handle_completion(shutdown_rx, hash_value);
+                    }
 
-                // Process the next available message from the executing queue.
-                Some(hash_value) = self.executing.next() => {
-                    self.handle_completion(shutdown_rx, hash_value);
+                    // Wait for shutdown signal
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+
+                    // Fetch the next message from the stream and handle it.
+                    maybe_message = messages.next() => match maybe_message {
+                        None => break,
+                        Some(message) => self.dispatch_message(shutdown_rx, message).await,
+                    },
                 }
+            } else {
+                debug!("concurrency limit reached; skipping message consumption");
+                select! {
+                    // Process the next available message from the executing queue.
+                    Some(hash_value) = self.executing.next() => {
+                        self.handle_completion(shutdown_rx, hash_value);
+                    }
 
-                // Wait for shutdown signal
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        break;
+                    // Wait for shutdown signal
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
                     }
                 }
-
-                // Fetch the next message from the stream and handle it.
-                maybe_message = messages.next() => match maybe_message {
-                    None => break,
-                    Some(message) => self.dispatch_message(shutdown_rx, message).await,
-                },
             }
         }
 

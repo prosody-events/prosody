@@ -454,7 +454,7 @@ async fn test_backpressure() -> Result<()> {
 
     let total = 10_000u32;
 
-    // Produce 3000 messages quickly
+    // Produce messages quickly
     spawn(async move {
         for i in 0..total {
             let payload = json!({ "seq": i });
