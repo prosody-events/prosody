@@ -72,21 +72,23 @@ use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt, HashSet};
-use color_eyre::eyre::{OptionExt, Result, eyre};
+use color_eyre::eyre::{eyre, OptionExt, Result};
 use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
-use prosody::Topic;
 use prosody::admin::ProsodyAdminClient;
 use prosody::consumer::message::{MessageContext, UncommittedMessage};
+use prosody::consumer::Keyed;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::Topic;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tokio::time::sleep;
+use tracing::{error, info, instrument, warn};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
 
@@ -254,7 +256,7 @@ async fn test_source_system_filtering() -> Result<()> {
         "2",
         timeout_duration,
     )
-    .await?;
+        .await?;
 
     Ok(())
 }
@@ -400,7 +402,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     // Wait up to 5 seconds for a delivered message.
     let received = timeout(Duration::from_secs(5), messages_rx.recv()).await?;
     let (received_key, received_payload) = received
-        .ok_or_else(|| color_eyre::eyre::eyre!("Timeout waiting for a delivered message"))?;
+        .ok_or_else(|| eyre!("Timeout waiting for a delivered message"))?;
 
     // Shutdown the consumer.
     consumer.shutdown().await;
@@ -412,6 +414,94 @@ async fn test_allowed_events_filtering() -> Result<()> {
     // Clean up the test topic.
     admin_client.delete_topic(&topic).await?;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore] // this test intentionally runs very slowly to demonstrate backpressure
+async fn test_backpressure() -> Result<()> {
+    // Initialize tracing for better test output.
+    let _ = fmt().compact().try_init();
+
+    // Create a unique topic.
+    let topic: Topic = Uuid::new_v4().to_string().as_str().into();
+    let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
+    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
+    admin_client.create_topic(&topic, 4, 1).await?;
+
+    // Set up a channel with a small buffer (10 messages) to simulate backpressure.
+    let (messages_tx, mut messages_rx) = channel(10);
+
+    // Build a consumer configuration with a small max_enqueued_per_key.
+    let consumer_config = ConsumerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .group_id(Uuid::new_v4().to_string().as_str())
+        .probe_port(None)
+        .subscribed_topics(&[topic.to_string()])
+        .build()?;
+
+    // Create the consumer using a custom slow handler that delays 1 second per message.
+    let slow_handler = SlowTestHandler { messages_tx };
+    let consumer = ProsodyConsumer::new::<SlowTestHandler>(&consumer_config, slow_handler)?;
+
+    // Build a producer configuration and create a producer.
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
+        .build()?;
+    let producer = ProsodyProducer::new(&producer_config)?;
+
+    // Produce 3000 messages quickly
+    for i in 0..50_000u64 {
+        let payload = json!({ "seq": i });
+        producer.send([], topic, &i.to_string(), &payload).await?;
+    }
+
+    // Start processing messages and report progress.
+    let mut count = 0_u32;
+    let start_time = tokio::time::Instant::now();
+
+    while (messages_rx.recv().await).is_some() {
+        count += 1;
+
+        // Log progress
+        info!("Received {count} messages so far");
+    }
+    let total_elapsed = start_time.elapsed();
+    info!("Total messages processed: {count}");
+    info!("Total processing time: {total_elapsed:?}");
+
+    consumer.shutdown().await;
+    admin_client.delete_topic(&topic).await?;
+    Ok(())
+}
+
+/// A slow test implementation of the `EventHandler` trait which introduces
+/// a 1-second delay per message to simulate backpressure.
+#[derive(Clone, Debug)]
+struct SlowTestHandler {
+    messages_tx: Sender<(String, Value)>,
+}
+
+impl EventHandler for SlowTestHandler {
+    #[instrument(skip(self, _context))]
+    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
+        let (msg, uncommitted) = message.into_inner();
+        let key = msg.key().to_string();
+        let payload: Value = msg.payload().clone();
+        info!("start message for key {}", key);
+        sleep(Duration::from_secs(1)).await;
+        info!("attempting to send message for key {}", key);
+        if let Err(e) = self.messages_tx.send((key.clone(), payload)).await {
+            error!("failed to send message for key {}: {e:#}", key);
+        }
+        info!("send complete for key {}", key);
+        uncommitted.commit();
+        info!("finish message for key {}", key);
+    }
+
+    async fn shutdown(self) {
+        info!("SlowTestHandler shutdown");
+    }
 }
 
 /// Runs the core logic of the integration test.
