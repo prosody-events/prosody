@@ -3,7 +3,7 @@
 //! received in the order they were produced per key, utilizing integration
 //! tests with Kafka, via the Prosody library.
 
-use crate::common::{run_test, TestInput};
+use crate::common::{TestInput, run_test};
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use tokio::runtime::Builder;
@@ -13,8 +13,8 @@ use tracing_subscriber::fmt;
 mod common;
 
 /// Tests that messages are received in the order they were produced for each
-/// key. This function leverages property-based testing using `QuickCheck`, which
-/// generates various input scenarios to ensure correct order. It supports
+/// key. This function leverages property-based testing using `QuickCheck`,
+/// which generates various input scenarios to ensure correct order. It supports
 /// integration testing with Kafka through the Prosody library.
 #[test]
 fn receives_all_in_key_order() {

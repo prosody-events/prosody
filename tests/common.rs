@@ -1,8 +1,10 @@
 //! Common utilities and types for Prosody tests.
 //!
-//! This module provides shared structures, functions, and test handlers used across various test cases
-//! for the Prosody system. It includes utility functions for setting up topics and configurations, managing
-//! producer and consumer tasks, and verifying message integrity and order in property-based tests.
+//! This module provides shared structures, functions, and test handlers used
+//! across various test cases for the Prosody system. It includes utility
+//! functions for setting up topics and configurations, managing producer and
+//! consumer tasks, and verifying message integrity and order in property-based
+//! tests.
 
 #![allow(dead_code)]
 
@@ -12,17 +14,17 @@ use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt};
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{Result, eyre};
 use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
+use prosody::Topic;
 use prosody::admin::ProsodyAdminClient;
 use prosody::consumer::message::{MessageContext, UncommittedMessage};
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::Topic;
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
-use serde_json::{json, Value};
-use tokio::sync::mpsc::{channel, Sender};
+use serde_json::{Value, json};
+use tokio::sync::mpsc::{Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -95,7 +97,8 @@ pub struct TestInput {
 ///
 /// * `partition_count` - The number of partitions for the test topic.
 ///
-/// Returns a tuple containing the created topic and an admin client for cleanup tasks.
+/// Returns a tuple containing the created topic and an admin client for cleanup
+/// tasks.
 ///
 /// # Errors
 ///
@@ -325,7 +328,8 @@ pub fn verify_results(
 ///
 /// # Errors
 ///
-/// Returns an error if any part of the test setup, execution, or verification fails.
+/// Returns an error if any part of the test setup, execution, or verification
+/// fails.
 pub async fn run_test(input: TestInput) -> Result<()> {
     // Create test topic and configuration settings
     let (topic, admin_client) = create_test_topic(input.partition_count).await?;
@@ -362,7 +366,8 @@ pub async fn run_test(input: TestInput) -> Result<()> {
     Ok(())
 }
 
-/// A simple test implementation of the `EventHandler` trait that forwards messages to a channel.
+/// A simple test implementation of the `EventHandler` trait that forwards
+/// messages to a channel.
 #[derive(Clone, Debug)]
 pub struct TestHandler {
     /// A channel for transmitting received messages.
@@ -391,7 +396,8 @@ impl EventHandler for TestHandler {
     }
 }
 
-/// A handler implementation that simulates backpressure by introducing a delay in processing.
+/// A handler implementation that simulates backpressure by introducing a delay
+/// in processing.
 #[derive(Clone, Debug)]
 pub struct SlowTestHandler {
     /// A channel for transmitting received messages.

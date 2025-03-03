@@ -7,10 +7,10 @@
 use crate::common::SlowTestHandler;
 use color_eyre::eyre::Result;
 use prosody::{
+    Topic,
     admin::ProsodyAdminClient,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
-    Topic,
 };
 use serde_json::json;
 use tokio::spawn;
