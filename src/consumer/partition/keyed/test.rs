@@ -112,7 +112,7 @@ async fn prevents_concurrent_key_execution_impl(
 
     // Process all messages using the KeyManager
     KeyManager::new(process_fn, max_enqueued)
-        .process_messages(iter(messages), shutdown_rx, Duration::from_millis(100))
+        .process_messages(iter(messages), shutdown_rx, 64, Duration::from_millis(100))
         .await;
 
     // Check if any concurrent execution was detected
@@ -154,6 +154,7 @@ async fn processes_messages_in_order_impl(
     .process_messages(
         iter(messages.clone()),
         shutdown_rx,
+        64,
         Duration::from_millis(100),
     )
     .await;

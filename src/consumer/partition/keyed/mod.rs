@@ -89,11 +89,13 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// * `messages` - Stream of incoming messages.
     /// * `shutdown_rx` - Receiver for shutdown signal.
+    /// * `max_concurrency` - Maximum number of concurrent tasks executing.
     /// * `shutdown_timeout` - Duration to wait before forcefully shutting down.
     pub async fn process_messages<S>(
         mut self,
         messages: S,
         mut shutdown_rx: watch::Receiver<bool>,
+        max_concurrency: usize,
         shutdown_timeout: Duration,
     ) where
         S: Stream<Item = M>,
@@ -102,30 +104,55 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         F: FnMut(M) -> Fut,
         Fut: Future,
     {
+        debug_assert!(max_concurrency > 0, "max_concurrency cannot be zero");
+
         pin_mut!(messages);
         let shutdown_rx = &mut shutdown_rx;
 
         loop {
-            select! {
-                biased;
+            let execution_count = self.executing.len();
+            if execution_count < max_concurrency {
+                debug!(
+                    %execution_count, %max_concurrency,
+                    "waiting for new message or existing execution to complete"
+                );
+                select! {
+                    // Process the next available message from the executing queue.
+                    Some(hash_value) = self.executing.next() => {
+                        self.handle_completion(shutdown_rx, hash_value);
+                    }
 
-                // Process the next available message from the executing queue.
-                Some(hash_value) = self.executing.next() => {
-                    self.handle_completion(shutdown_rx, hash_value);
+                    // Wait for shutdown signal
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+
+                    // Fetch the next message from the stream and handle it.
+                    maybe_message = messages.next() => match maybe_message {
+                        None => break,
+                        Some(message) => self.dispatch_message(shutdown_rx, message).await,
+                    },
                 }
+            } else {
+                debug!(
+                    %execution_count, %max_concurrency,
+                    "concurrency limit reached; waiting for existing executions to complete"
+                );
+                select! {
+                    // Process the next available message from the executing queue.
+                    Some(hash_value) = self.executing.next() => {
+                        self.handle_completion(shutdown_rx, hash_value);
+                    }
 
-                // Wait for shutdown signal
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        break;
+                    // Wait for shutdown signal
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
                     }
                 }
-
-                // Fetch the next message from the stream and handle it.
-                maybe_message = messages.next() => match maybe_message {
-                    None => break,
-                    Some(message) => self.dispatch_message(shutdown_rx, message).await,
-                },
             }
         }
 
