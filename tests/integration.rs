@@ -417,6 +417,31 @@ async fn test_allowed_events_filtering() -> Result<()> {
     Ok(())
 }
 
+/// Tests the backpressure handling capabilities of the messaging system.
+///
+/// This test verifies that the system properly handles backpressure when a
+/// consumer processes uniquely-keyed messages significantly slower than they
+/// are produced. It creates a producer that quickly sends messages and a
+/// consumer that deliberately processes each message slowly, introducing a
+/// 1-second delay per message.
+///
+/// The test monitors how the system manages this imbalance and ensures that:
+/// 1. All messages are eventually processed despite the speed mismatch
+/// 2. The messaging system doesn't collapse under load
+/// 3. Backpressure is properly propagated through the system
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Topic creation fails
+/// - Consumer or producer configuration is invalid
+/// - Message sending fails
+/// - Topic deletion fails
+///
+/// # Note
+///
+/// This test is intentionally marked with `#[ignore]` because it runs very
+/// slowly due to the deliberate processing delays introduced.
 #[tokio::test]
 #[ignore] // this test intentionally runs very slowly to demonstrate backpressure
 async fn test_backpressure() -> Result<()> {
@@ -429,10 +454,13 @@ async fn test_backpressure() -> Result<()> {
     let admin_client = ProsodyAdminClient::new(&bootstrap)?;
     admin_client.create_topic(&topic, 4, 1).await?;
 
-    // Set up a channel with a small buffer (10 messages) to simulate backpressure.
+    // Set up a channel with a buffer capacity of 64 messages for communication
+    // between the message handler and test harness.
     let (messages_tx, mut messages_rx) = channel(64);
 
-    // Build a consumer configuration with a small max_enqueued_per_key.
+    // Build a consumer configuration with default buffer settings.
+    // The backpressure will be simulated by the slow handler, not by the
+    // consumer configuration itself.
     let consumer_config = ConsumerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
         .group_id(Uuid::new_v4().to_string().as_str())
@@ -454,7 +482,9 @@ async fn test_backpressure() -> Result<()> {
 
     let total = 10_000u32;
 
-    // Produce messages quickly
+    // Spawn a task that produces uniquely-keyed messages quickly without waiting
+    // for confirmation of delivery, to test how the system handles the high
+    // throughput.
     spawn(async move {
         for i in 0..total {
             let payload = json!({ "seq": i });
@@ -468,14 +498,16 @@ async fn test_backpressure() -> Result<()> {
         }
     });
 
-    // Start processing messages and report progress.
+    // Start processing messages and periodically report progress.
+    // This will receive messages at the rate determined by the slow handler.
     let mut count = 0_u32;
     let start_time = tokio::time::Instant::now();
 
     while messages_rx.recv().await.is_some() {
         count += 1;
 
-        // Log progress
+        // Log progress every 100 messages to provide visibility
+        // into the processing rate.
         if count % 100 == 0 {
             info!("Received {count} messages so far");
         }
@@ -488,19 +520,48 @@ async fn test_backpressure() -> Result<()> {
     info!("Total messages processed: {count}");
     info!("Total processing time: {total_elapsed:?}");
 
+    // Clean up resources
     consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
     Ok(())
 }
 
-/// A slow test implementation of the `EventHandler` trait which introduces
-/// a 1-second delay per message to simulate backpressure.
+/// A test implementation of the `EventHandler` trait that processes messages
+/// slowly to simulate backpressure conditions.
+///
+/// This handler introduces a deliberate 1-second delay for each message it
+/// processes, allowing the test to verify how the system handles situations
+/// where messages are produced faster than they can be consumed.
+///
+/// # Fields
+///
+/// * `messages_tx` - A channel sender used to notify the test harness about
+///   processed messages.
 #[derive(Clone, Debug)]
 struct SlowTestHandler {
     messages_tx: Sender<(String, Value)>,
 }
 
 impl EventHandler for SlowTestHandler {
+    /// Processes an incoming message with a deliberate delay to simulate slow
+    /// processing.
+    ///
+    /// This method:
+    /// 1. Extracts the message key and payload
+    /// 2. Introduces a 1-second delay to simulate slow processing
+    /// 3. Forwards the processed message to the test harness through a channel
+    /// 4. Commits the message to acknowledge successful processing
+    ///
+    /// # Arguments
+    ///
+    /// * `_context` - Message context information (unused in this
+    ///   implementation)
+    /// * `message` - The uncommitted message to be processed
+    ///
+    /// # Note
+    ///
+    /// The artificial delay is the key component that creates backpressure in
+    /// the system.
     #[instrument(skip(self, _context))]
     async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
         let (msg, uncommitted) = message.into_inner();
@@ -513,6 +574,11 @@ impl EventHandler for SlowTestHandler {
         uncommitted.commit();
     }
 
+    /// Performs cleanup when the handler is being shut down.
+    ///
+    /// # Arguments
+    ///
+    /// None
     async fn shutdown(self) {
         info!("SlowTestHandler shutdown");
     }
