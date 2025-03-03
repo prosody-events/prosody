@@ -110,8 +110,12 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         let shutdown_rx = &mut shutdown_rx;
 
         loop {
-            if self.executing.len() < max_concurrency {
-                debug!("below concurrency limit; resuming message consumption");
+            let execution_count = self.executing.len();
+            if execution_count < max_concurrency {
+                debug!(
+                    %execution_count, %max_concurrency,
+                    "waiting for new message or existing execution to complete"
+                );
                 select! {
                     // Process the next available message from the executing queue.
                     Some(hash_value) = self.executing.next() => {
@@ -132,7 +136,10 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                     },
                 }
             } else {
-                debug!("concurrency limit reached; skipping message consumption");
+                debug!(
+                    %execution_count, %max_concurrency,
+                    "concurrency limit reached; waiting for existing executions to complete"
+                );
                 select! {
                     // Process the next available message from the executing queue.
                     Some(hash_value) = self.executing.next() => {
