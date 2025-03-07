@@ -13,7 +13,7 @@ license = "UNLICENSED"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/cincpro/prosody"
-version = "0.8.0"
+version = "0.8.1"
 
 [dependencies]
 ahash = "0.8"
