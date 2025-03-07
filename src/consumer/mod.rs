@@ -29,6 +29,7 @@
 
 use crate::consumer::poll::PollConfig;
 use crate::consumer::probes::ProbeServer;
+use std::env::var;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io;
@@ -82,6 +83,8 @@ type WatermarkVersion = CachePadded<AtomicUsize>;
 
 /// Thread-safe storage for partition managers.
 type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
+
+const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 
 /// Defines a type with an associated key.
 pub trait Keyed {
@@ -188,7 +191,7 @@ pub struct ConsumerConfiguration {
     /// The group ID must be a non-empty string and should be unique for each
     /// logically separate consumer application. Consumers with the same group
     /// ID will form a consumer group and share the load of consuming topics.
-    #[builder(default = "from_env(\"PROSODY_GROUP_ID\")?", setter(into))]
+    #[builder(default = "from_env(PROSODY_GROUP_ID)?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub group_id: String,
 
@@ -342,8 +345,8 @@ impl ConsumerConfigurationBuilder {
     ///
     /// An option containing the consumer group if configured
     #[must_use]
-    pub fn configured_consumer_group(&self) -> Option<&str> {
-        self.group_id.as_deref()
+    pub fn configured_consumer_group(&self) -> Option<String> {
+        self.group_id.clone().or_else(|| var(PROSODY_GROUP_ID).ok())
     }
 }
 
