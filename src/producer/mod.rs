@@ -16,6 +16,7 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
+use std::env::var;
 use std::io;
 use std::mem::take;
 use std::sync::Arc;
@@ -41,6 +42,8 @@ use serde_json as json;
 use simd_json as json;
 
 mod injector;
+
+const PROSODY_SOURCE_SYSTEM: &str = "PROSODY_SOURCE_SYSTEM";
 
 /// Configuration for the Kafka producer.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -82,7 +85,7 @@ pub struct ProducerConfiguration {
     ///
     /// Environment variable: `PROSODY_SOURCE_SYSTEM`
     /// Default: None (must be specified)
-    #[builder(default = "from_env(\"PROSODY_SOURCE_SYSTEM\")?", setter(into))]
+    #[builder(default = "from_env(PROSODY_SOURCE_SYSTEM)?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub source_system: String,
 
@@ -107,7 +110,7 @@ impl ProducerConfigurationBuilder {
     pub fn configured_source_system(&self) -> Option<String> {
         self.source_system
             .clone()
-            .or_else(|| Self::default().source_system)
+            .or_else(|| var(PROSODY_SOURCE_SYSTEM).ok())
     }
 }
 
