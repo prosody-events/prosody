@@ -104,8 +104,10 @@ impl ProducerConfigurationBuilder {
     ///
     /// An option containing the source system if configured
     #[must_use]
-    pub fn configured_source_system(&self) -> Option<&str> {
-        self.source_system.as_deref()
+    pub fn configured_source_system(&self) -> Option<String> {
+        self.source_system
+            .clone()
+            .or_else(|| Self::default().source_system)
     }
 }
 

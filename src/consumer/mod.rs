@@ -342,8 +342,8 @@ impl ConsumerConfigurationBuilder {
     ///
     /// An option containing the consumer group if configured
     #[must_use]
-    pub fn configured_consumer_group(&self) -> Option<&str> {
-        self.group_id.as_deref()
+    pub fn configured_consumer_group(&self) -> Option<String> {
+        self.group_id.clone().or_else(|| Self::default().group_id)
     }
 }
 
