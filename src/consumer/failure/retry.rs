@@ -182,6 +182,10 @@ where
                 return Ok(());
             };
 
+            if context.should_shutdown() {
+                return Err(error);
+            }
+
             // Handle different error categories
             match error.classify_error() {
                 ErrorCategory::Transient => {
@@ -275,6 +279,11 @@ where
                 uncommitted_offset.commit();
                 break;
             };
+
+            if context.should_shutdown() {
+                uncommitted_offset.abort();
+                break;
+            }
 
             // Handle different error categories
             match error.classify_error() {
