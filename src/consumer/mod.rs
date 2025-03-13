@@ -252,25 +252,36 @@ pub struct ConsumerConfiguration {
     )]
     pub idempotence_cache_size: usize,
 
-    /// Timeout for partition shutdown.
+    /// Duration of inactivity allowed before considering a partition stalled.
     ///
     /// Environment variable: `PROSODY_STALL_THRESHOLD`
     /// Default: 5 minutes
     ///
-    /// This duration serves two purposes:
-    /// 1. It determines how long to wait for in-flight tasks to complete during
-    ///    partition shutdown. After this threshold is reached, any remaining
-    ///    tasks will be aborted.
-    /// 2. It is used by the liveness probe to determine if a partition's
-    ///    processing has stalled. If message processing takes longer than this
-    ///    duration, the partition is considered stalled, and the liveness probe
-    ///    will report an unhealthy status.
+    /// Used by the liveness probe to determine if a partition's processing has
+    /// stalled. If message processing takes longer than this duration, the
+    /// partition is considered stalled, and the liveness probe will report an
+    /// unhealthy status.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_STALL_THRESHOLD\", \
                    Duration::from_secs(5 * 60))?",
         setter(into)
     )]
     pub stall_threshold: Duration,
+
+    /// Timeout for partition shutdown.
+    ///
+    /// Environment variable: `PROSODY_SHUTDOWN_TIMEOUT`
+    /// Default: 30 seconds
+    ///
+    /// Determines how long to wait for in-flight tasks to complete during
+    /// partition shutdown. After this threshold is reached, any remaining
+    /// tasks will be aborted.
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_SHUTDOWN_TIMEOUT\", \
+                   Duration::from_secs(30))?",
+        setter(into)
+    )]
+    pub shutdown_timeout: Duration,
 
     /// Interval between poll operations.
     ///
