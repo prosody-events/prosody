@@ -86,7 +86,7 @@ where
             max_uncommitted: config.max_uncommitted,
             max_enqueued_per_key: config.max_enqueued_per_key,
             idempotence_cache_size: config.idempotence_cache_size,
-            shutdown_timeout: config.stall_threshold,
+            shutdown_timeout: config.shutdown_timeout,
             handler_provider,
             watermark_version,
             managers,

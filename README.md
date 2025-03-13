@@ -163,6 +163,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                           | 20ms         | ✓        |          |
 | `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                            | 5m           | ✓        |          |
 | `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                   | 1s           |          | ✓        |
+| `PROSODY_SHUTDOWN_TIMEOUT`       | Timeout to wait for in-flight tasks to complete during partition shutdown      | 30s          | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                           | `<group id>` |          | ✓        |
 | `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m           | ✓        |          |
 | `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -            | ✓        |          |
