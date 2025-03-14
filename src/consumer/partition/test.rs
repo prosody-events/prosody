@@ -48,6 +48,7 @@ async fn test_partition_manager_capacity() {
         1,  // max_enqueued_per_key
         0,  // idempotence_cache_size
         Duration::from_secs(1),
+        Duration::from_secs(1),
         watermark_version,
     );
 
@@ -84,6 +85,7 @@ async fn test_partition_manager_ordering() {
         10, // max_uncommitted
         2,  // max_enqueued_per_key
         0,  // idempotence_cache_size
+        Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version,
     );
@@ -129,6 +131,7 @@ async fn test_partition_manager_concurrent_processing() {
         1,  // max_enqueued_per_key
         0,  // idempotence_cache_size
         Duration::from_secs(1),
+        Duration::from_secs(1),
         watermark_version,
     );
 
@@ -173,6 +176,7 @@ async fn test_partition_manager_watermark() {
         1,  // max_enqueued_per_key
         0,  // idempotence_cache_size
         Duration::from_secs(1),
+        Duration::from_secs(1),
         watermark_version.clone(),
     );
 
@@ -213,6 +217,7 @@ async fn test_partition_manager_max_uncommitted() {
         max_uncommitted,
         1, // max_enqueued_per_key
         0, // idempotence_cache_size
+        Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version,
     );
@@ -297,11 +302,12 @@ async fn test_partition_manager_is_stalled() {
         "test-topic".into(),
         0,
         handler.clone(),
-        10,              // buffer_size
-        10,              // max_uncommitted
-        1,               // max_enqueued_per_key
-        0,               // idempotence_cache_size
-        stall_threshold, // stall_threshold
+        10,                     // buffer_size
+        10,                     // max_uncommitted
+        1,                      // max_enqueued_per_key
+        0,                      // idempotence_cache_size
+        Duration::from_secs(1), // shutdown timeout
+        stall_threshold,        // stall_threshold
         watermark_version,
     );
 
@@ -350,6 +356,7 @@ async fn test_partition_manager_deduplication() {
         10, // max_uncommitted
         1,  // max_enqueued_per_key
         idempotence_cache_size,
+        Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version,
     );

@@ -86,6 +86,8 @@ impl PartitionManager {
     ///   messages. Set to 0 to disable.
     /// * `shutdown_timeout` - How long to wait for message processing to
     ///   complete during shutdown
+    /// * `stall_threshold` - Duration of inactivity allowed before considering
+    ///   a partition stalled
     /// * `watermark_version` - Counter tracking changes to committed offset
     ///   watermarks
     ///
@@ -102,6 +104,7 @@ impl PartitionManager {
         max_enqueued_per_key: usize,
         idempotence_cache_size: usize,
         shutdown_timeout: Duration,
+        stall_threshold: Duration,
         watermark_version: Arc<CachePadded<AtomicUsize>>,
     ) -> Self
     where
@@ -111,7 +114,7 @@ impl PartitionManager {
             topic,
             partition,
             max_uncommitted,
-            shutdown_timeout,
+            stall_threshold,
             watermark_version,
         );
 
