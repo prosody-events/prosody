@@ -50,6 +50,9 @@ where
     /// Size of idempotence cache
     idempotence_cache_size: usize,
 
+    /// Duration of inactivity allowed before considering a partition stalled
+    stall_threshold: Duration,
+
     /// Timeout duration for shutdown operations
     shutdown_timeout: Duration,
 
@@ -86,6 +89,7 @@ where
             max_uncommitted: config.max_uncommitted,
             max_enqueued_per_key: config.max_enqueued_per_key,
             idempotence_cache_size: config.idempotence_cache_size,
+            stall_threshold: config.stall_threshold,
             shutdown_timeout: config.shutdown_timeout,
             handler_provider,
             watermark_version,
@@ -150,6 +154,7 @@ where
                         self.max_enqueued_per_key,
                         self.idempotence_cache_size,
                         self.shutdown_timeout,
+                        self.stall_threshold,
                         self.watermark_version.clone(),
                     );
 
