@@ -41,6 +41,9 @@ pub struct Context<T>
 where
     T: HandlerProvider,
 {
+    /// Consumer group identifier
+    group_id: Arc<str>,
+
     /// Maximum size of message buffers
     buffer_size: usize,
 
@@ -96,6 +99,7 @@ where
         managers: Arc<Managers>,
     ) -> Self {
         Self {
+            group_id: Arc::from(config.group_id.as_str()),
             buffer_size: config.max_uncommitted,
             max_uncommitted: config.max_uncommitted,
             max_enqueued_per_key: config.max_enqueued_per_key,
@@ -163,6 +167,7 @@ where
 
                     // Initialize new partition manager
                     let manager = PartitionManager::new(
+                        self.group_id.clone(),
                         topic,
                         element.partition(),
                         handler,

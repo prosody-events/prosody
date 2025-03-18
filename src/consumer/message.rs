@@ -21,7 +21,9 @@ use tracing::{Span, debug, error};
 
 use crate::consumer::Keyed;
 use crate::consumer::partition::offsets::UncommittedOffset;
-use crate::{BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, Topic};
+use crate::{
+    BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem, Topic,
+};
 
 /// The context for message processing within a consumer.
 ///
@@ -82,6 +84,12 @@ pub struct UncommittedMessage {
 }
 
 impl UncommittedMessage {
+    /// Returns the message's source system, if present.
+    #[must_use]
+    pub fn source_system(&self) -> Option<&SourceSystem> {
+        self.inner.source_system()
+    }
+
     /// Returns the message's topic.
     #[must_use]
     pub fn topic(&self) -> Topic {
@@ -180,6 +188,9 @@ pub struct ConsumerMessage(Arc<ConsumerMessageValue>);
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ConsumerMessageValue {
+    /// The system originating the message
+    pub source_system: Option<SourceSystem>,
+
     /// The message's topic
     pub topic: Topic,
 
@@ -209,6 +220,7 @@ impl ConsumerMessage {
     ///
     /// # Arguments
     ///
+    /// * `source_system` - The system originating the message
     /// * `topic` - The message's topic
     /// * `partition` - The message's partition
     /// * `offset` - The message's offset
@@ -216,8 +228,10 @@ impl ConsumerMessage {
     /// * `timestamp` - The message's timestamp
     /// * `payload` - The message's payload
     /// * `span` - The message's tracing span
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
+        source_system: Option<SourceSystem>,
         topic: Topic,
         partition: Partition,
         offset: Offset,
@@ -227,6 +241,7 @@ impl ConsumerMessage {
         span: Span,
     ) -> Self {
         Self(Arc::new(ConsumerMessageValue {
+            source_system,
             topic,
             partition,
             offset,
@@ -235,6 +250,12 @@ impl ConsumerMessage {
             payload,
             span,
         }))
+    }
+
+    /// Returns the message's source system, if present.
+    #[must_use]
+    pub fn source_system(&self) -> Option<&SourceSystem> {
+        self.0.source_system.as_ref()
     }
 
     /// Returns the message's topic.

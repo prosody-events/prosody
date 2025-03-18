@@ -97,6 +97,7 @@ impl PartitionManager {
     /// A new `PartitionManager` instance
     #[allow(clippy::too_many_arguments)]
     pub fn new<T>(
+        group_id: Arc<str>,
         topic: Topic,
         partition: Partition,
         message_handler: T,
@@ -129,6 +130,7 @@ impl PartitionManager {
             message_rx,
             max_enqueued_per_key,
             max_uncommitted,
+            group_id,
             idempotence_cache_size,
             global_limit,
             shutdown_rx,
@@ -256,6 +258,7 @@ async fn handle_messages<T>(
     message_rx: Receiver<ConsumerMessage>,
     max_enqueued_per_key: usize,
     max_concurrency: usize,
+    group_id: Arc<str>,
     idempotence_cache_size: usize,
     global_limit: Arc<Semaphore>,
     shutdown_rx: watch::Receiver<bool>,
@@ -292,6 +295,21 @@ async fn handle_messages<T>(
                 }
             },
         )
+        // Filter out messages where the source system matches the group identifier
+        .filter_map(|message| {
+            if message
+                .source_system()
+                .is_some_and(|source_system| source_system.as_str() == group_id.as_ref())
+            {
+                debug!(
+                    "skipping message because source system header matches the group identifier"
+                );
+                message.commit();
+                return ready(None);
+            }
+
+            ready(Some(message))
+        })
         // Filter out duplicate messages
         .filter_map(|message| {
             // Skip messages with duplicate event IDs

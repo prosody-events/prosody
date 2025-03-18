@@ -55,7 +55,7 @@
 //! }
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> Result<(), Box<dyn Error>> {
 //!     let bootstrap_servers = ["localhost:9092".to_owned()];
 //!
 //!     // To allow loopbacks, the source_system must be different from the group_id.
@@ -240,6 +240,12 @@ static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
     bootstrap
 });
 
+/// The length of a UUID string (36 characters) plus one byte for length.
+const UUID_STR_LEN: usize = 36 + 1;
+
+/// The system originating a message
+pub type SourceSystem = Flexstr<UUID_STR_LEN>;
+
 /// An interned string representing a Kafka topic name.
 ///
 /// Using string interning provides efficient storage and comparison of topic
@@ -248,9 +254,6 @@ pub type Topic = Intern<str>;
 
 /// A partition identifier within a Kafka topic.
 pub type Partition = i32;
-
-/// The length of a UUID string (36 characters) plus one byte for length.
-const UUID_STR_LEN: usize = 36 + 1;
 
 /// A compact string optimized for UUID-length keys.
 ///

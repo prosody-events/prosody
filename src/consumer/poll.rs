@@ -35,7 +35,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, RebalanceGuard, WatermarkVersion};
 use crate::propagator::new_propagator;
-use crate::{SOURCE_SYSTEM_HEADER, Topic};
+use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
@@ -53,7 +53,6 @@ use simd_json::serde::from_reader_with_buffers;
 ///
 /// * `poll_interval`: Duration between consecutive poll attempts.
 /// * `commit_interval`: Duration between offset commit attempts.
-/// * `group_id`: Identifier for the Kafka consumer group.
 /// * `allowed_events`: Optional filter that permits only allowed event types.
 /// * `consumer`: The Kafka consumer instance with the appropriate context.
 /// * `watermark_version`: Atomic watermark version for tracking offset updates.
@@ -66,7 +65,6 @@ where
 {
     pub poll_interval: Duration,
     pub commit_interval: Duration,
-    pub group_id: String,
     pub allowed_events: Option<AhoCorasick>,
     pub consumer: BaseConsumer<Context<T>>,
     pub watermark_version: &'a WatermarkVersion,
@@ -99,7 +97,6 @@ where
     let PollConfig {
         poll_interval,
         commit_interval,
-        group_id,
         allowed_events,
         consumer,
         watermark_version,
@@ -155,7 +152,6 @@ where
         // Extract and validate the Kafka message.
         let maybe_msg = process_message(
             &message,
-            &group_id,
             allowed_events.as_ref(),
             &propagator,
             #[cfg(not(target_arch = "arm"))]
@@ -182,9 +178,8 @@ where
 ///
 /// # Arguments
 ///
-/// * `message`: A borrowed Kafka message to process.
-/// * `group_id`: Identifier of the consuming group used to skip messages
-///   originating from ourselves.
+/// * `message`: A borrowed Kafka message to process. originating from
+///   ourselves.
 /// * `allowed_events`: Optional automaton filter that restricts processing to
 ///   allowed event types.
 /// * `propagator`: A distributed tracing propagator to extract context from
@@ -198,7 +193,6 @@ where
 /// `None` if the message should be discarded.
 fn process_message(
     message: &BorrowedMessage,
-    group_id: &str,
     allowed_events: Option<&AhoCorasick>,
     propagator: &TextMapCompositePropagator,
     #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
@@ -228,19 +222,21 @@ fn process_message(
     span.set_parent(context);
     let _enter = span.enter();
 
-    // Skip messages that originate from our own source as indicated in headers.
-    if message
+    let source_system = match message
         .headers()
         .into_iter()
         .flat_map(|headers| headers.iter())
-        .any(|header| {
-            header.key == SOURCE_SYSTEM_HEADER && header.value == Some(group_id.as_bytes())
-        })
+        .find(|header| header.key == SOURCE_SYSTEM_HEADER)
+        .and_then(|header| header.value)
+        .map(str::from_utf8)
+        .transpose()
     {
-        span.record("skipped", true);
-        debug!("skipping message because source system header matches the group identifier");
-        return None;
-    }
+        Ok(source_system) => source_system.map(SourceSystem::from),
+        Err(error) => {
+            error!("invalid source system encoding: {error:#}; ignoring");
+            None
+        }
+    };
 
     // Ensure the message has a payload.
     let Some(payload_data) = message.payload() else {
@@ -308,6 +304,7 @@ fn process_message(
 
     // Return a new ConsumerMessage with tracing instrumentation.
     Some(ConsumerMessage::new(
+        source_system,
         topic,
         partition,
         offset,
