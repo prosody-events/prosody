@@ -40,6 +40,7 @@ async fn test_partition_manager_capacity() {
     let watermark_version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
     let buffer_size = 5_usize;
     let partition_manager = PartitionManager::new(
+        "test-group".into(),
         "test-topic".into(),
         0,
         handler.clone(),
@@ -79,6 +80,7 @@ async fn test_partition_manager_ordering() {
     let handler = TestHandler::new();
     let watermark_version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
     let partition_manager = PartitionManager::new(
+        "test-group".into(),
         "test-topic".into(),
         0,
         handler.clone(),
@@ -125,6 +127,7 @@ async fn test_partition_manager_concurrent_processing() {
     let handler = TestHandler::new();
     let watermark_version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
     let partition_manager = PartitionManager::new(
+        "test-group".into(),
         "test-topic".into(),
         0,
         handler.clone(),
@@ -171,6 +174,7 @@ async fn test_partition_manager_watermark() {
     let handler = TestHandler::new();
     let watermark_version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
     let partition_manager = PartitionManager::new(
+        "test-group".into(),
         "test-topic".into(),
         0,
         handler.clone(),
@@ -214,6 +218,7 @@ async fn test_partition_manager_max_uncommitted() {
     let max_uncommitted = 5;
     let watermark_version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
     let partition_manager = PartitionManager::new(
+        "test-group".into(),
         "test-topic".into(),
         0,
         handler.clone(),
@@ -304,6 +309,7 @@ async fn test_partition_manager_is_stalled() {
     let stall_threshold = Duration::from_millis(100);
     let watermark_version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
     let partition_manager = PartitionManager::new(
+        "test-group".into(),
         "test-topic".into(),
         0,
         handler.clone(),
@@ -355,6 +361,7 @@ async fn test_partition_manager_deduplication() {
     let watermark_version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
     let idempotence_cache_size = 100; // Enable deduplication cache
     let partition_manager = PartitionManager::new(
+        "test-group".into(),
         "test-topic".into(),
         0,
         handler.clone(),
@@ -563,6 +570,7 @@ impl HasProcessedOffsets for TestHandler {
 /// It simplifies the creation of test messages with given offsets and keys.
 fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
     ConsumerMessage::new(
+        None,
         "test-topic".into(),
         0,
         offset,
@@ -588,6 +596,7 @@ fn create_test_message_with_event_id(
         json!({})
     };
     ConsumerMessage::new(
+        None,
         "test-topic".into(),
         0,
         offset,
