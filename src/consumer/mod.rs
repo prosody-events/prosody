@@ -81,6 +81,10 @@ mod probes;
 /// Atomic counter for tracking changes in partition watermarks.
 type WatermarkVersion = CachePadded<AtomicUsize>;
 
+/// Atomic bool used to pause commits during rebalances
+/// See: <https://github.com/confluentinc/librdkafka/issues/4059>
+type RebalanceGuard = CachePadded<AtomicBool>;
+
 /// Thread-safe storage for partition managers.
 type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
 
@@ -410,6 +414,7 @@ impl ProsodyConsumer {
 
         // Initialize shared state
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
+        let rebalance_guard: Arc<RebalanceGuard> = Arc::default();
         let managers: Arc<Managers> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
 
@@ -418,6 +423,7 @@ impl ProsodyConsumer {
             config,
             handler_provider,
             watermark_version.clone(),
+            rebalance_guard.clone(),
             managers.clone(),
         );
 
@@ -475,6 +481,7 @@ impl ProsodyConsumer {
                 allowed_events,
                 consumer,
                 watermark_version: &watermark_version,
+                rebalance_guard: &rebalance_guard,
                 managers: &cloned_managers,
                 shutdown: &cloned_shutdown,
             });

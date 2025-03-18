@@ -33,7 +33,7 @@ use crate::consumer::context::Context;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
+use crate::consumer::{HandlerProvider, Managers, RebalanceGuard, WatermarkVersion};
 use crate::propagator::new_propagator;
 use crate::{SOURCE_SYSTEM_HEADER, Topic};
 
@@ -57,6 +57,7 @@ use simd_json::serde::from_reader_with_buffers;
 /// * `allowed_events`: Optional filter that permits only allowed event types.
 /// * `consumer`: The Kafka consumer instance with the appropriate context.
 /// * `watermark_version`: Atomic watermark version for tracking offset updates.
+/// * `rebalance_guard` - Shared flag tracking if rebalance is in progress.
 /// * `managers`: Shared partition managers handling messages per partition.
 /// * `shutdown`: Atomic flag for graceful shutdown termination.
 pub struct PollConfig<'a, T>
@@ -69,6 +70,7 @@ where
     pub allowed_events: Option<AhoCorasick>,
     pub consumer: BaseConsumer<Context<T>>,
     pub watermark_version: &'a WatermarkVersion,
+    pub rebalance_guard: &'a RebalanceGuard,
     pub managers: &'a Managers,
     pub shutdown: &'a AtomicBool,
 }
@@ -101,6 +103,7 @@ where
         allowed_events,
         consumer,
         watermark_version,
+        rebalance_guard,
         managers,
         shutdown,
     } = config;
@@ -119,6 +122,7 @@ where
             &commit_interval,
             &consumer,
             watermark_version,
+            rebalance_guard,
             managers,
             &mut last_version,
             &mut last_commit,
@@ -351,6 +355,7 @@ fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, manage
 /// * `commit_interval`: The minimum duration between offset commit attempts.
 /// * `consumer`: The Kafka consumer instance to perform the commit.
 /// * `watermark_version`: Atomic counter tracking changes in committed offsets.
+/// * `rebalance_guard` - Shared flag tracking if rebalance is in progress
 /// * `managers`: Shared reference to all partition managers.
 /// * `last_version`: Mutable reference to store the last committed watermark
 ///   version.
@@ -359,6 +364,7 @@ fn commit_watermarks<T>(
     commit_interval: &Duration,
     consumer: &BaseConsumer<Context<T>>,
     watermark_version: &WatermarkVersion,
+    rebalance_guard: &RebalanceGuard,
     managers: &Managers,
     last_version: &mut usize,
     last_commit: &mut Instant,
@@ -373,6 +379,13 @@ fn commit_watermarks<T>(
 
     let now = Instant::now();
     if now.duration_since(*last_commit) < *commit_interval {
+        return;
+    }
+
+    // Check if rebalancing
+    let is_rebalancing = rebalance_guard.load(Ordering::Acquire);
+    if is_rebalancing {
+        debug!("pausing watermark commits during rebalancing");
         return;
     }
 
@@ -397,9 +410,9 @@ fn commit_watermarks<T>(
         }
     }
 
-    // Issue an asynchronous commit to Kafka.
+    // Issue a commit to Kafka.
     debug!("committing watermarks: {list:?}");
-    if let Err(error) = consumer.commit(&list, CommitMode::Async) {
+    if let Err(error) = consumer.commit(&list, CommitMode::Sync) {
         error!("failed to commit offsets: {error:#}");
         success = false;
     }
