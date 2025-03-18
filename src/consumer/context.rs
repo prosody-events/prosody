@@ -7,22 +7,24 @@
 //! - Ensures proper cleanup and offset commits during partition revocation
 //! - Coordinates graceful consumer shutdown
 
-use std::collections::hash_map::Entry;
-use std::future::ready;
-use std::sync::Arc;
-use std::time::Duration;
-
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance};
 use rdkafka::{ClientContext, Offset, TopicPartitionList};
+use std::collections::hash_map::Entry;
+use std::future::ready;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
+use crate::consumer::{
+    ConsumerConfiguration, HandlerProvider, Managers, RebalanceGuard, WatermarkVersion,
+};
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///
@@ -62,6 +64,9 @@ where
     /// Shared counter tracking watermark updates
     watermark_version: Arc<WatermarkVersion>,
 
+    /// Shared flag indicating if currently rebalancing; used to pause commits
+    rebalance_guard: Arc<RebalanceGuard>,
+
     /// Thread-safe storage for partition managers
     managers: Arc<Managers>,
 }
@@ -77,11 +82,13 @@ where
     /// * `config` - Consumer configuration including buffer sizes and timeouts
     /// * `handler_provider` - Creates message handlers for partitions
     /// * `watermark_version` - Shared counter tracking watermark updates
+    /// * `rebalance_guard` - Shared flag tracking if rebalance is in progress
     /// * `managers` - Thread-safe storage for partition managers
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
         watermark_version: Arc<WatermarkVersion>,
+        rebalance_guard: Arc<RebalanceGuard>,
         managers: Arc<Managers>,
     ) -> Self {
         Self {
@@ -93,6 +100,7 @@ where
             shutdown_timeout: config.shutdown_timeout,
             handler_provider,
             watermark_version,
+            rebalance_guard,
             managers,
         }
     }
@@ -120,6 +128,9 @@ where
     /// * `consumer` - The Kafka consumer instance
     /// * `rebalance` - The rebalance event details
     fn pre_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
+        // Notify that rebalance is in progress
+        self.rebalance_guard.store(true, Ordering::Release);
+
         match rebalance {
             Rebalance::Assign(partitions) => {
                 // Skip empty assignments
@@ -224,5 +235,10 @@ where
                 error!("unexpected rebalance error: {error:#}");
             }
         }
+    }
+
+    fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, _rebalance: &Rebalance) {
+        // Notify that rebalance is complete
+        self.rebalance_guard.store(false, Ordering::Release);
     }
 }
