@@ -156,7 +156,8 @@ The following table lists the available configuration options and their associat
 | `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.            | 4096         | ✓        |          |
 | `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure) | 8            | ✓        |          |
 | `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                  | 3            | ✓        |          |
-| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition (partition concurrency)   | 32           | ✓        |          |
+| `PROSODY_MAX_CONCURRENCY`        | Maximum global concurrency limit                                               | 32           | ✓        |          |
+| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition                           | 16           | ✓        |          |
 | `PROSODY_MOCK`                   | Use mock Kafka brokers for testing                                             | false        | ✓        | ✓        |
 | `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                       | 100ms        | ✓        |          |
 | `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.           | 8000         | ✓        |          |

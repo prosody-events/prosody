@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
@@ -67,6 +68,9 @@ where
     /// Shared flag indicating if currently rebalancing; used to pause commits
     rebalance_guard: Arc<RebalanceGuard>,
 
+    /// Global concurrency limit
+    global_limit: Arc<Semaphore>,
+
     /// Thread-safe storage for partition managers
     managers: Arc<Managers>,
 }
@@ -101,6 +105,7 @@ where
             handler_provider,
             watermark_version,
             rebalance_guard,
+            global_limit: Arc::new(Semaphore::new(config.max_concurrency)),
             managers,
         }
     }
@@ -168,6 +173,7 @@ where
                         self.shutdown_timeout,
                         self.stall_threshold,
                         self.watermark_version.clone(),
+                        self.global_limit.clone(),
                     );
 
                     vacant.insert(manager);
