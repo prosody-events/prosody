@@ -130,6 +130,7 @@ where
     fn pre_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         // Notify that rebalance is in progress
         self.rebalance_guard.store(true, Ordering::Release);
+        debug!("rebalance is starting");
 
         match rebalance {
             Rebalance::Assign(partitions) => {
@@ -235,10 +236,13 @@ where
                 error!("unexpected rebalance error: {error:#}");
             }
         }
+
+        debug!("pre-rebalance complete");
     }
 
     fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, _rebalance: &Rebalance) {
         // Notify that rebalance is complete
         self.rebalance_guard.store(false, Ordering::Release);
+        debug!("rebalance completed");
     }
 }
