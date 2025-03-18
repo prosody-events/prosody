@@ -9,9 +9,8 @@
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use parking_lot::Mutex;
-use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance};
-use rdkafka::{ClientContext, Offset, TopicPartitionList};
+use rdkafka::ClientContext;
+use rdkafka::consumer::{BaseConsumer, ConsumerContext, Rebalance};
 use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
@@ -130,13 +129,13 @@ where
     ///
     /// For revocations:
     /// - Shuts down `PartitionManager` instances for revoked partitions
-    /// - Commits final offsets before releasing partitions
+    /// - Does not commit final offsets before releasing partitions. See: <https://github.com/confluentinc/librdkafka/issues/4059>.
     ///
     /// # Arguments
     ///
     /// * `consumer` - The Kafka consumer instance
     /// * `rebalance` - The rebalance event details
-    fn pre_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
+    fn pre_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         // Notify that rebalance is in progress
         self.rebalance_guard.store(true, Ordering::Release);
         debug!("rebalance is starting");
