@@ -21,7 +21,7 @@ use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, instrument};
@@ -90,6 +90,7 @@ impl PartitionManager {
     ///   a partition stalled
     /// * `watermark_version` - Counter tracking changes to committed offset
     ///   watermarks
+    /// * `global_limit` - Global concurrency semaphore
     ///
     /// # Returns
     ///
@@ -106,6 +107,7 @@ impl PartitionManager {
         shutdown_timeout: Duration,
         stall_threshold: Duration,
         watermark_version: Arc<CachePadded<AtomicUsize>>,
+        global_limit: Arc<Semaphore>,
     ) -> Self
     where
         T: EventHandler + Send + Sync + 'static,
@@ -128,6 +130,7 @@ impl PartitionManager {
             max_enqueued_per_key,
             max_uncommitted,
             idempotence_cache_size,
+            global_limit,
             shutdown_rx,
             shutdown_timeout,
         ));
@@ -242,6 +245,7 @@ impl PartitionManager {
 /// * `max_concurrency` - Maximum number of concurrent tasks executing.
 /// * `idempotence_cache_size` - Size of cache for deduplicating messages by
 ///   event ID
+/// * `global_limit` - Global concurrency semaphore
 /// * `shutdown_rx` - Channel receiving shutdown signal
 /// * `shutdown_timeout` - How long to wait for processing to complete during
 ///   shutdown
@@ -253,6 +257,7 @@ async fn handle_messages<T>(
     max_enqueued_per_key: usize,
     max_concurrency: usize,
     idempotence_cache_size: usize,
+    global_limit: Arc<Semaphore>,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_timeout: Duration,
 ) where
@@ -285,6 +290,18 @@ async fn handle_messages<T>(
 
     // Process messages
     let process = |received: ConsumerMessage| async {
+        // Acquire a semaphore to bound global concurrency
+        let _permit = match global_limit.acquire().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                error!(
+                    ?received,
+                    "failed to acquire permit: {error:#}; discarding message"
+                );
+                return;
+            }
+        };
+
         // Reserve offset and create uncommitted message
         let message = match offsets.take(received.offset()).await {
             Ok(uncommitted_offset) => received.into_uncommitted(uncommitted_offset),

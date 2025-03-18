@@ -50,6 +50,7 @@ async fn test_partition_manager_capacity() {
         Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version,
+        Arc::new(Semaphore::new(10)),
     );
 
     // Send messages up to buffer capacity
@@ -88,6 +89,7 @@ async fn test_partition_manager_ordering() {
         Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version,
+        Arc::new(Semaphore::new(10)),
     );
 
     // Send messages with the same key and increasing offsets
@@ -133,6 +135,7 @@ async fn test_partition_manager_concurrent_processing() {
         Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version,
+        Arc::new(Semaphore::new(10)),
     );
 
     // Send messages with different keys
@@ -178,6 +181,7 @@ async fn test_partition_manager_watermark() {
         Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version.clone(),
+        Arc::new(Semaphore::new(10)),
     );
 
     // Send sequential messages
@@ -220,6 +224,7 @@ async fn test_partition_manager_max_uncommitted() {
         Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version,
+        Arc::new(Semaphore::new(max_uncommitted)),
     );
 
     // Send more messages than max_uncommitted
@@ -309,6 +314,7 @@ async fn test_partition_manager_is_stalled() {
         Duration::from_secs(1), // shutdown timeout
         stall_threshold,        // stall_threshold
         watermark_version,
+        Arc::new(Semaphore::new(10)),
     );
 
     // Send a message that is delayed in processing
@@ -359,6 +365,7 @@ async fn test_partition_manager_deduplication() {
         Duration::from_secs(1),
         Duration::from_secs(1),
         watermark_version,
+        Arc::new(Semaphore::new(10)),
     );
 
     // Send messages with the same key and event ID

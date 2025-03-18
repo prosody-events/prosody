@@ -222,12 +222,23 @@ pub struct ConsumerConfiguration {
     #[validate(length(min = 1_u64))]
     pub allowed_events: Option<Vec<String>>,
 
-    /// Maximum number of uncommitted messages.
+    /// Maximum global concurrency limit.
     ///
-    /// Environment variable: `PROSODY_MAX_UNCOMMITTED`
+    /// Environment variable: `PROSODY_MAX_CONCURRENCY`
     /// Default: 32
     #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 32)?",
+        default = "from_env_with_fallback(\"PROSODY_MAX_CONCURRENCY\", 32)?",
+        setter(into)
+    )]
+    #[validate(range(min = 1_usize))]
+    pub max_concurrency: usize,
+
+    /// Maximum number of uncommitted messages per partition.
+    ///
+    /// Environment variable: `PROSODY_MAX_UNCOMMITTED`
+    /// Default: 16
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 16)?",
         setter(into)
     )]
     #[validate(range(min = 1_usize))]
