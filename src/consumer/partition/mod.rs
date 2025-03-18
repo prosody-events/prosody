@@ -266,50 +266,57 @@ async fn handle_messages<T>(
     let mut highest_offset_seen = -1;
     let mut idempotence_cache = IdempotenceCache::new(idempotence_cache_size);
 
-    // Filter out duplicate and out-of-order messages
-    let stream = ReceiverStream::new(message_rx).filter(|message| {
-        let partition = message.partition();
-        let offset = message.offset();
-
+    let stream = ReceiverStream::new(message_rx)
         // Skip messages with offsets we've already seen
-        if offset <= highest_offset_seen {
-            debug!("filtering stale partition {partition} offset {offset}");
-            return ready(false);
-        }
-        highest_offset_seen = offset;
+        .filter(|message| {
+            let partition = message.partition();
+            let offset = message.offset();
 
-        // Skip messages with duplicate event IDs
-        if let Some(event_id) = idempotence_cache.check_duplicate(message.key(), message.payload())
-        {
-            info!("message with id {event_id} already processed; skipping");
-            return ready(false);
-        }
+            if offset <= highest_offset_seen {
+                debug!("filtering stale partition {partition} offset {offset}");
+                return ready(false);
+            }
+            highest_offset_seen = offset;
+            ready(true)
+        })
+        // Reserve offset and create uncommitted message
+        .filter_map(
+            async |received| match offsets.take(received.offset()).await {
+                Ok(uncommitted_offset) => Some(received.into_uncommitted(uncommitted_offset)),
+                Err(error) => {
+                    error!(
+                        ?received,
+                        "unable to take uncommitted offset: {error:#}; discarding message"
+                    );
+                    None
+                }
+            },
+        )
+        // Filter out duplicate messages
+        .filter_map(|message| {
+            // Skip messages with duplicate event IDs
+            if let Some(event_id) =
+                idempotence_cache.check_duplicate(message.key(), message.payload())
+            {
+                info!("message with id {event_id} already processed; skipping");
+                message.commit();
+                return ready(None);
+            }
 
-        ready(true)
-    });
+            ready(Some(message))
+        });
 
     // Process messages
-    let process = |received: ConsumerMessage| async {
+    let process = |message: UncommittedMessage| async {
         // Acquire a semaphore to bound global concurrency
         let _permit = match global_limit.acquire().await {
             Ok(permit) => permit,
             Err(error) => {
                 error!(
-                    ?received,
-                    "failed to acquire permit: {error:#}; discarding message"
+                    ?message,
+                    "failed to acquire permit: {error:#}; aborting message"
                 );
-                return;
-            }
-        };
-
-        // Reserve offset and create uncommitted message
-        let message = match offsets.take(received.offset()).await {
-            Ok(uncommitted_offset) => received.into_uncommitted(uncommitted_offset),
-            Err(error) => {
-                error!(
-                    ?received,
-                    "unable to take uncommitted offset: {error:#}; discarding message"
-                );
+                message.abort();
                 return;
             }
         };
