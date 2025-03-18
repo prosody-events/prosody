@@ -212,7 +212,7 @@ where
 
                 // Commit final offsets
                 debug!("committing {list:?}");
-                if let Err(error) = consumer.commit(&list, CommitMode::Async) {
+                if let Err(error) = consumer.commit(&list, CommitMode::Sync) {
                     error!("failed to commit offsets before rebalance: {error:#}");
                 } else {
                     debug!("final offsets committed");

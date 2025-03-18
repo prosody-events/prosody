@@ -397,9 +397,9 @@ fn commit_watermarks<T>(
         }
     }
 
-    // Issue an asynchronous commit to Kafka.
+    // Issue a commit to Kafka.
     debug!("committing watermarks: {list:?}");
-    if let Err(error) = consumer.commit(&list, CommitMode::Async) {
+    if let Err(error) = consumer.commit(&list, CommitMode::Sync) {
         error!("failed to commit offsets: {error:#}");
         success = false;
     }
