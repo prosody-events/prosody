@@ -193,7 +193,6 @@ where
 
                 // Prepare for concurrent partition shutdown
                 let shutdown_futures = FuturesUnordered::new();
-                let list = Arc::new(Mutex::new(TopicPartitionList::with_capacity(count)));
 
                 for element in partitions.elements() {
                     let topic = Topic::from(element.topic());
@@ -207,41 +206,11 @@ where
                     };
 
                     // Queue shutdown task
-                    let list = list.clone();
-                    shutdown_futures.push(async move {
-                        let Some(offset) = manager.shutdown().await else {
-                            return;
-                        };
-
-                        let next_offset = Offset::Offset(offset + 1);
-                        let mut list = list.lock();
-
-                        // Record final offset
-                        if let Err(error) =
-                            list.add_partition_offset(&topic, partition, next_offset)
-                        {
-                            error!("failed to add offset to commit list: {error:#}");
-                        }
-                    });
+                    shutdown_futures.push(manager.shutdown());
                 }
 
                 // Wait for all shutdowns to complete
-                Handle::current().block_on(shutdown_futures.for_each(|()| ready(())));
-
-                let list = list.lock();
-                if list.count() == 0 {
-                    return;
-                }
-
-                // Commit final offsets
-                debug!("committing {list:?}");
-                if let Err(error) = consumer.commit(&list, CommitMode::Sync) {
-                    error!("failed to commit offsets before rebalance: {error:#}");
-                } else {
-                    debug!("final offsets committed");
-                }
-
-                debug!("{list:?} revoked");
+                Handle::current().block_on(shutdown_futures.for_each(|_| ready(())));
             }
             Rebalance::Error(error) => {
                 error!("unexpected rebalance error: {error:#}");

@@ -244,7 +244,7 @@ impl PartitionManager {
 /// * `offsets` - Tracks offset commits and processing progress
 /// * `message_rx` - Channel receiving messages to process
 /// * `max_enqueued_per_key` - Maximum number of pending messages per key
-/// * `max_concurrency` - Maximum number of concurrent tasks executing.
+/// * `max_execution_count` - Maximum number of concurrent tasks executing.
 /// * `idempotence_cache_size` - Size of cache for deduplicating messages by
 ///   event ID
 /// * `global_limit` - Global concurrency semaphore
@@ -257,7 +257,7 @@ async fn handle_messages<T>(
     offsets: OffsetTracker,
     message_rx: Receiver<ConsumerMessage>,
     max_enqueued_per_key: usize,
-    max_concurrency: usize,
+    max_execution_count: usize,
     group_id: Arc<str>,
     idempotence_cache_size: usize,
     global_limit: Arc<Semaphore>,
@@ -327,6 +327,7 @@ async fn handle_messages<T>(
     // Process messages
     let process = |message: UncommittedMessage| async {
         // Acquire a semaphore to bound global concurrency
+        debug!(?message, "acquiring permit");
         let _permit = match global_limit.acquire().await {
             Ok(permit) => permit,
             Err(error) => {
@@ -340,6 +341,7 @@ async fn handle_messages<T>(
         };
 
         // Process message with handler
+        debug!(?message, "permit acquired; calling handler");
         let context = MessageContext::new(shutdown_rx.clone());
         message_handler.on_message(context, message).await;
     };
@@ -349,7 +351,7 @@ async fn handle_messages<T>(
         .process_messages(
             stream,
             shutdown_rx.clone(),
-            max_concurrency,
+            max_execution_count,
             shutdown_timeout,
         )
         .await;

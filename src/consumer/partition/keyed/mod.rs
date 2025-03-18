@@ -88,13 +88,13 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     ///
     /// * `messages` - Stream of incoming messages.
     /// * `shutdown_rx` - Receiver for shutdown signal.
-    /// * `max_concurrency` - Maximum number of concurrent tasks executing.
+    /// * `max_execution_count` - Maximum number of concurrent tasks executing.
     /// * `shutdown_timeout` - Duration to wait before forcefully shutting down.
     pub async fn process_messages<S>(
         mut self,
         messages: S,
         mut shutdown_rx: watch::Receiver<bool>,
-        max_concurrency: usize,
+        max_execution_count: usize,
         shutdown_timeout: Duration,
     ) where
         S: Stream<Item = M>,
@@ -103,16 +103,16 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         F: FnMut(M) -> Fut,
         Fut: Future,
     {
-        debug_assert!(max_concurrency > 0, "max_concurrency cannot be zero");
+        debug_assert!(max_execution_count > 0, "max_concurrency cannot be zero");
 
         pin_mut!(messages);
         let shutdown_rx = &mut shutdown_rx;
 
         loop {
             let execution_count = self.executing.len();
-            if execution_count < max_concurrency {
+            if execution_count < max_execution_count {
                 debug!(
-                    %execution_count, %max_concurrency,
+                    %execution_count, %max_execution_count,
                     "waiting for new message or existing execution to complete"
                 );
                 select! {
@@ -136,8 +136,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                 }
             } else {
                 debug!(
-                    %execution_count, %max_concurrency,
-                    "concurrency limit reached; waiting for existing executions to complete"
+                    %execution_count, %max_execution_count,
+                    "limit reached; waiting for existing executions to complete"
                 );
                 select! {
                     // Process the next available message from the executing queue.
