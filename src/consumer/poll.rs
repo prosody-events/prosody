@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::field::Empty;
+use tracing::field::{Empty, debug};
 use tracing::{debug, error, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -143,6 +143,11 @@ where
             }
         };
 
+        let topic = message.topic();
+        let partition = message.partition();
+        let offset = message.offset();
+        debug!(topic, partition, offset, "received message");
+
         // Extract and validate the Kafka message.
         let maybe_msg = process_message(
             &message,
@@ -156,7 +161,11 @@ where
             // Dispatch the message to its partition manager with retry logic.
             dispatch_with_retry(consumer_message, poll_interval, managers);
         }
+
+        debug!(topic, partition, offset, "poll complete");
     }
+
+    debug("polling stopped");
 }
 
 /// Extracts metadata from a Kafka message, validates its key and payload,
@@ -194,6 +203,11 @@ fn process_message(
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
     let offset = message.offset();
+
+    debug!(
+        topic = message.topic(),
+        partition, offset, "processing message"
+    );
 
     // Create a tracing span and attach extracted context for distributed tracing.
     let context = propagator.extract(&MessageExtractor::new(message));
@@ -384,6 +398,7 @@ fn commit_watermarks<T>(
     }
 
     // Issue an asynchronous commit to Kafka.
+    debug!("committing watermarks: {list:?}");
     if let Err(error) = consumer.commit(&list, CommitMode::Async) {
         error!("failed to commit offsets: {error:#}");
         success = false;
@@ -393,6 +408,8 @@ fn commit_watermarks<T>(
         *last_version = current_version;
         *last_commit = now;
     }
+
+    debug!("watermark commit successful: {success}");
 }
 
 /// Pauses or resumes Kafka partitions based on their processing capacity.
@@ -470,6 +487,13 @@ where
 /// * `Ok(())` if the message is successfully dispatched.
 /// * `Err(DispatchError)` specifying why dispatch failed.
 fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(), DispatchError> {
+    debug!(
+        topic = message.topic().as_ref(),
+        partition = message.partition(),
+        offset = message.offset(),
+        "dispatching message"
+    );
+
     let managers = managers.read();
     let Some(manager) = managers.get(&(message.topic(), message.partition())) else {
         return Err(DispatchError::PartitionNotFound(message));

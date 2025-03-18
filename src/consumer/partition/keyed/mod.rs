@@ -11,6 +11,8 @@ use std::future::Future;
 use std::hash::Hash;
 use std::time::Duration;
 
+use crate::consumer::Keyed;
+use crate::consumer::partition::util::WithValue;
 use ahash::RandomState;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt, pin_mut};
@@ -20,9 +22,6 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::warn;
 use tracing::{debug, instrument};
-
-use crate::consumer::Keyed;
-use crate::consumer::partition::util::WithValue;
 
 #[cfg(test)]
 mod test;
@@ -207,6 +206,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         let key = message.key();
         let hash_value = self.hash_state.hash_one(key);
 
+        debug!(hash_value, "dispatching message");
+
         // Decide whether to enqueue the message or process it immediately based on
         // key's current status
         if self.busy.contains(&hash_value) {
@@ -232,6 +233,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         F: FnMut(M) -> Fut,
         M: Debug,
     {
+        debug!(hash_value, "handling completion");
+
         // Remove the completed message's hash value from the busy set
         self.busy.remove(&hash_value);
 
@@ -274,6 +277,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         Fut: Future,
         M: Debug,
     {
+        debug!(?message, hash_value, "enqueuing message");
+
         // Determine the current queue length for the hash value
         let queue_len = self
             .enqueued
@@ -323,6 +328,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         F: FnMut(M) -> Fut,
         M: Debug,
     {
+        debug!(?message, hash_value, "processing message");
+
         if *shutdown_rx.borrow() {
             debug!(?message, "aborting message processing due to shutdown");
             return;

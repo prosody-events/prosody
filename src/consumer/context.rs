@@ -159,6 +159,7 @@ where
                     );
 
                     vacant.insert(manager);
+                    debug!("{topic}:{partition} assigned");
                 }
             }
             Rebalance::Revoke(partitions) => {
@@ -216,6 +217,8 @@ where
                 } else {
                     debug!("final offsets committed");
                 }
+
+                debug!("{list:?} revoked");
             }
             Rebalance::Error(error) => {
                 error!("unexpected rebalance error: {error:#}");
