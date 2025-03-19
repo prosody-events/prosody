@@ -407,6 +407,13 @@ fn commit_watermarks<T>(
         }
     }
 
+    // Return if there's nothing to commit
+    if list.count() == 0 {
+        debug!("nothing to commit");
+        *last_commit = now;
+        return;
+    }
+
     // Issue a commit to Kafka.
     debug!("committing watermarks: {list:?}");
     if let Err(error) = consumer.commit(&list, CommitMode::Sync) {
