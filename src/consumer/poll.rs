@@ -1,7 +1,7 @@
 //! # Kafka Polling and Message Dispatch Module
 //!
 //! This module implements the main polling loop that consumes messages from
-//! Kafka. It provides distributed tracing support, manages offset commits,
+//! Kafka. It provides distributed tracing support, manages offset storage,
 //! controls Kafka partition pausing/resuming based on capacity, and dispatches
 //! messages to the correct partition manager. It encapsulates the configuration
 //! for polling, message extraction, validation, retrying dispatches if
@@ -106,9 +106,8 @@ where
 
     // Enter main polling loop until shutdown signal is received.
     while !shutdown.load(Ordering::Relaxed) {
-        // Store offsets if new watermarks are available and commit interval has
-        // passed.
-        commit_watermarks(&consumer, watermark_version, managers, &mut last_version);
+        // Store offsets if new watermarks are available
+        store_watermarks(&consumer, watermark_version, managers, &mut last_version);
 
         // Pause/resume partitions if their capacity changes.
         if let Err(error) = pause_busy_partitions(&mut is_paused, &consumer, managers) {
@@ -327,19 +326,18 @@ fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, manage
     }
 }
 
-/// Commits offsets for all managed partitions if updated watermarks are
-/// available. It inspects each partition manager for a committed watermark,
-/// builds a new commit list, and issues an asynchronous commit to the Kafka
-/// broker if the commit interval has passed.
+/// Store offsets for all managed partitions if updated watermarks are
+/// available. It inspects each partition manager to build a new commit list and
+/// stores them for `librdkafka` to commit.
 ///
 /// # Arguments
 ///
-/// * `consumer`: The Kafka consumer instance to perform the commit.
+/// * `consumer`: The Kafka consumer instance to perform the store.
 /// * `watermark_version`: Atomic counter tracking changes in committed offsets.
 /// * `managers`: Shared reference to all partition managers.
 /// * `last_version`: Mutable reference to store the last committed watermark
 ///   version.
-fn commit_watermarks<T>(
+fn store_watermarks<T>(
     consumer: &BaseConsumer<Context<T>>,
     watermark_version: &WatermarkVersion,
     managers: &Managers,
@@ -360,7 +358,7 @@ fn commit_watermarks<T>(
     let mut success = true;
     let mut list = TopicPartitionList::with_capacity(managers.len());
 
-    // Build a commit list from each partition manager's watermark.
+    // Build an offset list from each partition manager's watermark.
     for ((topic, partition), manager) in managers.iter() {
         let Some(watermark) = manager.watermark() else {
             continue;
@@ -383,7 +381,7 @@ fn commit_watermarks<T>(
         return;
     }
 
-    // Issue a commit to Kafka.
+    // Store offset in librdkafka.
     debug!("storing watermarks for commit: {list:?}");
     if let Err(error) = consumer.store_offsets(&list) {
         error!("failed to store offsets: {error:#}");
