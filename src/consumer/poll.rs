@@ -14,7 +14,7 @@ use aho_corasick::{AhoCorasick, Anchored, Input};
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
-use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::util::Timeout;
@@ -23,7 +23,7 @@ use serde_json::Value;
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 use tracing::field::{Empty, debug};
 use tracing::{debug, error, info_span, warn};
@@ -33,7 +33,7 @@ use crate::consumer::context::Context;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{HandlerProvider, Managers, RebalanceGuard, WatermarkVersion};
+use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
@@ -52,11 +52,9 @@ use simd_json::serde::from_reader_with_buffers;
 /// # Fields
 ///
 /// * `poll_interval`: Duration between consecutive poll attempts.
-/// * `commit_interval`: Duration between offset commit attempts.
 /// * `allowed_events`: Optional filter that permits only allowed event types.
 /// * `consumer`: The Kafka consumer instance with the appropriate context.
 /// * `watermark_version`: Atomic watermark version for tracking offset updates.
-/// * `rebalance_guard` - Shared flag tracking if rebalance is in progress.
 /// * `managers`: Shared partition managers handling messages per partition.
 /// * `shutdown`: Atomic flag for graceful shutdown termination.
 pub struct PollConfig<'a, T>
@@ -64,17 +62,15 @@ where
     T: HandlerProvider,
 {
     pub poll_interval: Duration,
-    pub commit_interval: Duration,
     pub allowed_events: Option<AhoCorasick>,
     pub consumer: BaseConsumer<Context<T>>,
     pub watermark_version: &'a WatermarkVersion,
-    pub rebalance_guard: &'a RebalanceGuard,
     pub managers: &'a Managers,
     pub shutdown: &'a AtomicBool,
 }
 
 /// Starts the main polling loop which:
-/// - Commits offsets if new watermarks are available.
+/// - Stores offsets if new watermarks are available.
 /// - Pauses/resumes partitions by evaluating their capacity.
 /// - Polls Kafka for messages using the configured poll interval.
 /// - Processes each valid message by extraction and validation.
@@ -96,11 +92,9 @@ where
     // Destructure configuration for readability.
     let PollConfig {
         poll_interval,
-        commit_interval,
         allowed_events,
         consumer,
         watermark_version,
-        rebalance_guard,
         managers,
         shutdown,
     } = config;
@@ -108,22 +102,13 @@ where
     // Create a propagator for distributed tracing.
     let propagator = new_propagator();
     let mut last_version = watermark_version.load(Ordering::Acquire);
-    let mut last_commit = Instant::now();
     let mut is_paused = false;
 
     // Enter main polling loop until shutdown signal is received.
     while !shutdown.load(Ordering::Relaxed) {
-        // Commit offsets if new watermarks are available and commit interval has
+        // Store offsets if new watermarks are available and commit interval has
         // passed.
-        commit_watermarks(
-            &commit_interval,
-            &consumer,
-            watermark_version,
-            rebalance_guard,
-            managers,
-            &mut last_version,
-            &mut last_commit,
-        );
+        commit_watermarks(&consumer, watermark_version, managers, &mut last_version);
 
         // Pause/resume partitions if their capacity changes.
         if let Err(error) = pause_busy_partitions(&mut is_paused, &consumer, managers) {
@@ -349,22 +334,16 @@ fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, manage
 ///
 /// # Arguments
 ///
-/// * `commit_interval`: The minimum duration between offset commit attempts.
 /// * `consumer`: The Kafka consumer instance to perform the commit.
 /// * `watermark_version`: Atomic counter tracking changes in committed offsets.
-/// * `rebalance_guard` - Shared flag tracking if rebalance is in progress
 /// * `managers`: Shared reference to all partition managers.
 /// * `last_version`: Mutable reference to store the last committed watermark
 ///   version.
-/// * `last_commit`: Mutable reference to store the last commit timestamp.
 fn commit_watermarks<T>(
-    commit_interval: &Duration,
     consumer: &BaseConsumer<Context<T>>,
     watermark_version: &WatermarkVersion,
-    rebalance_guard: &RebalanceGuard,
     managers: &Managers,
     last_version: &mut usize,
-    last_commit: &mut Instant,
 ) where
     T: HandlerProvider,
 {
@@ -374,20 +353,11 @@ fn commit_watermarks<T>(
         return;
     }
 
-    let now = Instant::now();
-    if now.duration_since(*last_commit) < *commit_interval {
+    let Some(managers) = managers.try_read() else {
         return;
-    }
-
-    // Check if rebalancing
-    let is_rebalancing = rebalance_guard.load(Ordering::Acquire);
-    if is_rebalancing {
-        debug!("pausing watermark commits during rebalancing");
-        return;
-    }
+    };
 
     let mut success = true;
-    let managers = managers.read();
     let mut list = TopicPartitionList::with_capacity(managers.len());
 
     // Build a commit list from each partition manager's watermark.
@@ -410,23 +380,20 @@ fn commit_watermarks<T>(
     // Return if there's nothing to commit
     if list.count() == 0 {
         debug!("nothing to commit");
-        *last_commit = now;
         return;
     }
 
     // Issue a commit to Kafka.
-    debug!("committing watermarks: {list:?}");
-    if let Err(error) = consumer.commit(&list, CommitMode::Sync) {
-        error!("failed to commit offsets: {error:#}");
+    debug!("storing watermarks for commit: {list:?}");
+    if let Err(error) = consumer.store_offsets(&list) {
+        error!("failed to store offsets: {error:#}");
         success = false;
     }
 
     if success {
         *last_version = current_version;
-        *last_commit = now;
+        debug!("watermarks stored successfully");
     }
-
-    debug!("watermark commit successful: {success}");
 }
 
 /// Pauses or resumes Kafka partitions based on their processing capacity.

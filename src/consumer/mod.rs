@@ -81,10 +81,6 @@ mod probes;
 /// Atomic counter for tracking changes in partition watermarks.
 type WatermarkVersion = CachePadded<AtomicUsize>;
 
-/// Atomic bool used to pause commits during rebalances
-/// See: <https://github.com/confluentinc/librdkafka/issues/4059>
-type RebalanceGuard = CachePadded<AtomicBool>;
-
 /// Thread-safe storage for partition managers.
 type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
 
@@ -425,7 +421,6 @@ impl ProsodyConsumer {
 
         // Initialize shared state
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
-        let rebalance_guard: Arc<RebalanceGuard> = Arc::default();
         let managers: Arc<Managers> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
 
@@ -434,7 +429,6 @@ impl ProsodyConsumer {
             config,
             handler_provider,
             watermark_version.clone(),
-            rebalance_guard.clone(),
             managers.clone(),
         );
 
@@ -450,7 +444,11 @@ impl ProsodyConsumer {
             .set("bootstrap.servers", bootstrap)
             .set("client.id", hostname()?)
             .set("group.id", &config.group_id)
-            .set("enable.auto.commit", "false")
+            .set("enable.auto.commit", "true")
+            .set(
+                "auto.commit.interval.ms",
+                config.commit_interval.as_millis().to_string(),
+            )
             .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
             .set("partition.assignment.strategy", "cooperative-sticky")
@@ -480,17 +478,14 @@ impl ProsodyConsumer {
 
         // Spawn a blocking task to continuously poll for messages
         let poll_interval = config.poll_interval;
-        let commit_interval = config.commit_interval;
         let cloned_managers = managers.clone();
         let cloned_shutdown = shutdown.clone();
         let poll_handle = spawn_blocking(move || {
             poll(PollConfig {
                 poll_interval,
-                commit_interval,
                 allowed_events,
                 consumer,
                 watermark_version: &watermark_version,
-                rebalance_guard: &rebalance_guard,
                 managers: &cloned_managers,
                 shutdown: &cloned_shutdown,
             });
