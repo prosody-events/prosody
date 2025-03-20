@@ -14,7 +14,6 @@ use rdkafka::consumer::{BaseConsumer, ConsumerContext, Rebalance};
 use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
@@ -22,9 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::Topic;
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{
-    ConsumerConfiguration, HandlerProvider, Managers, RebalanceGuard, WatermarkVersion,
-};
+use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///
@@ -67,9 +64,6 @@ where
     /// Shared counter tracking watermark updates
     watermark_version: Arc<WatermarkVersion>,
 
-    /// Shared flag indicating if currently rebalancing; used to pause commits
-    rebalance_guard: Arc<RebalanceGuard>,
-
     /// Global concurrency limit
     global_limit: Arc<Semaphore>,
 
@@ -88,13 +82,11 @@ where
     /// * `config` - Consumer configuration including buffer sizes and timeouts
     /// * `handler_provider` - Creates message handlers for partitions
     /// * `watermark_version` - Shared counter tracking watermark updates
-    /// * `rebalance_guard` - Shared flag tracking if rebalance is in progress
     /// * `managers` - Thread-safe storage for partition managers
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
         watermark_version: Arc<WatermarkVersion>,
-        rebalance_guard: Arc<RebalanceGuard>,
         managers: Arc<Managers>,
     ) -> Self {
         Self {
@@ -107,7 +99,6 @@ where
             shutdown_timeout: config.shutdown_timeout,
             handler_provider,
             watermark_version,
-            rebalance_guard,
             global_limit: Arc::new(Semaphore::new(config.max_concurrency)),
             managers,
         }
@@ -137,7 +128,6 @@ where
     /// * `rebalance` - The rebalance event details
     fn pre_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         // Notify that rebalance is in progress
-        self.rebalance_guard.store(true, Ordering::Release);
         debug!("rebalance is starting");
 
         match rebalance {
@@ -221,7 +211,6 @@ where
 
     fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, _rebalance: &Rebalance) {
         // Notify that rebalance is complete
-        self.rebalance_guard.store(false, Ordering::Release);
         debug!("rebalance completed");
     }
 }
