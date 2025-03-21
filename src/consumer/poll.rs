@@ -37,6 +37,7 @@ use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
+use crate::consumer::heartbeat::Heartbeat;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
 #[cfg(not(target_arch = "arm"))]
@@ -66,6 +67,7 @@ where
     pub consumer: BaseConsumer<Context<T>>,
     pub watermark_version: &'a WatermarkVersion,
     pub managers: &'a Managers,
+    pub heartbeat: &'a Heartbeat,
     pub shutdown: &'a AtomicBool,
 }
 
@@ -96,6 +98,7 @@ where
         consumer,
         watermark_version,
         managers,
+        heartbeat,
         shutdown,
     } = config;
 
@@ -106,6 +109,9 @@ where
 
     // Enter main polling loop until shutdown signal is received.
     while !shutdown.load(Ordering::Relaxed) {
+        // Update heartbeat
+        heartbeat.beat();
+
         // Store offsets if new watermarks are available
         store_watermarks(&consumer, watermark_version, managers, &mut last_version);
 

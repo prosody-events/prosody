@@ -12,6 +12,7 @@ use std::hash::Hash;
 use std::time::Duration;
 
 use crate::consumer::Keyed;
+use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::partition::util::WithValue;
 use ahash::RandomState;
 use futures::stream::FuturesUnordered;
@@ -87,12 +88,14 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
     /// # Arguments
     ///
     /// * `messages` - Stream of incoming messages.
+    /// * `heartbeat` - Heartbeat used to detect stalled processing loop
     /// * `shutdown_rx` - Receiver for shutdown signal.
     /// * `max_execution_count` - Maximum number of concurrent tasks executing.
     /// * `shutdown_timeout` - Duration to wait before forcefully shutting down.
     pub async fn process_messages<S>(
         mut self,
         messages: S,
+        heartbeat: Heartbeat,
         mut shutdown_rx: watch::Receiver<bool>,
         max_execution_count: usize,
         shutdown_timeout: Duration,
@@ -109,6 +112,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         let shutdown_rx = &mut shutdown_rx;
 
         loop {
+            heartbeat.beat();
+
             let execution_count = self.executing.len();
             if execution_count < max_execution_count {
                 debug!(
@@ -119,6 +124,11 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                     // Process the next available message from the executing queue.
                     Some(hash_value) = self.executing.next() => {
                         self.handle_completion(shutdown_rx, hash_value);
+                    }
+
+                    // Ensure heartbeat is recorded if no events occur
+                    () = heartbeat.next() => {
+                        continue;
                     }
 
                     // Wait for shutdown signal
@@ -145,6 +155,11 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                         self.handle_completion(shutdown_rx, hash_value);
                     }
 
+                    // Ensure heartbeat is recorded if no events occur
+                    () = heartbeat.next() => {
+                        continue;
+                    }
+
                     // Wait for shutdown signal
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -160,6 +175,8 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         pin_mut!(deadline);
 
         loop {
+            heartbeat.beat();
+
             select! {
                 biased;
 
@@ -168,6 +185,11 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                     let count = self.executing.len();
                     warn!("shutdown timeout reached with {count} tasks in progress");
                     break;
+                }
+
+                // Ensure heartbeat is recorded if no events occur
+                () = heartbeat.next() => {
+                    continue;
                 }
 
                 // Continue processing remaining tasks.

@@ -60,6 +60,7 @@ use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
 use crate::consumer::failure::shutdown::ShutdownStrategy;
 use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
 use crate::consumer::failure::{FailureStrategy, FallibleHandler};
+use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::message::{MessageContext, UncommittedMessage};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
@@ -73,6 +74,7 @@ use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 mod context;
 mod extractor;
 pub mod failure;
+mod heartbeat;
 pub mod message;
 mod partition;
 mod poll;
@@ -478,7 +480,9 @@ impl ProsodyConsumer {
 
         // Spawn a blocking task to continuously poll for messages
         let poll_interval = config.poll_interval;
+        let heartbeat = Heartbeat::new("Kafka poll loop", config.stall_threshold);
         let cloned_managers = managers.clone();
+        let cloned_heartbeat = heartbeat.clone();
         let cloned_shutdown = shutdown.clone();
         let poll_handle = spawn_blocking(move || {
             poll(PollConfig {
@@ -487,13 +491,14 @@ impl ProsodyConsumer {
                 consumer,
                 watermark_version: &watermark_version,
                 managers: &cloned_managers,
+                heartbeat: &cloned_heartbeat,
                 shutdown: &cloned_shutdown,
             });
         });
 
         let probe_server = config
             .probe_port
-            .map(|port| ProbeServer::new(port, managers.clone()))
+            .map(|port| ProbeServer::new(port, managers.clone(), heartbeat))
             .transpose()?;
 
         let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {

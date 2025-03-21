@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, instrument};
 
+use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
@@ -60,6 +61,9 @@ pub struct PartitionManager {
     /// Channel for sending messages to be processed
     #[educe(Debug(ignore))]
     message_tx: Sender<ConsumerMessage>,
+
+    /// Heartbeat used to detect stalled processing loop
+    heartbeat: Heartbeat,
 
     /// Signals shutdown to message handlers
     #[educe(Debug(ignore))]
@@ -121,6 +125,8 @@ impl PartitionManager {
             watermark_version,
         );
 
+        let name = format!("{topic}/{partition} event loop");
+        let heartbeat = Heartbeat::new(name, stall_threshold);
         let (message_tx, message_rx) = channel(buffer_size);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -133,6 +139,7 @@ impl PartitionManager {
             group_id,
             idempotence_cache_size,
             global_limit,
+            heartbeat.clone(),
             shutdown_rx,
             shutdown_timeout,
         ));
@@ -141,6 +148,7 @@ impl PartitionManager {
             partition,
             offsets,
             message_tx,
+            heartbeat,
             shutdown_tx,
             handle,
         }
@@ -191,7 +199,7 @@ impl PartitionManager {
     /// `true` if messages are not being processed within the configured stall
     /// threshold, `false` otherwise
     pub fn is_stalled(&self) -> bool {
-        self.offsets.is_stalled()
+        self.offsets.is_stalled() || self.heartbeat.is_stalled()
     }
 
     /// Initiates an orderly partition shutdown.
@@ -248,6 +256,7 @@ impl PartitionManager {
 /// * `idempotence_cache_size` - Size of cache for deduplicating messages by
 ///   event ID
 /// * `global_limit` - Global concurrency semaphore
+/// * `heartbeat` - Heartbeat used to detect stalled processing loop
 /// * `shutdown_rx` - Channel receiving shutdown signal
 /// * `shutdown_timeout` - How long to wait for processing to complete during
 ///   shutdown
@@ -261,6 +270,7 @@ async fn handle_messages<T>(
     group_id: Arc<str>,
     idempotence_cache_size: usize,
     global_limit: Arc<Semaphore>,
+    heartbeat: Heartbeat,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_timeout: Duration,
 ) where
@@ -350,6 +360,7 @@ async fn handle_messages<T>(
     KeyManager::new(process, max_enqueued_per_key)
         .process_messages(
             stream,
+            heartbeat,
             shutdown_rx.clone(),
             max_execution_count,
             shutdown_timeout,

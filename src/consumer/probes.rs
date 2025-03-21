@@ -4,6 +4,7 @@
 //! probes, which are commonly used in containerized environments to determine
 //! if a service is ready to accept traffic and if it's functioning correctly.
 
+use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::{Managers, get_assigned_partition_count, get_is_stalled};
 use axum::Router;
 use axum::extract::State;
@@ -35,6 +36,12 @@ pub struct ProbeServer {
     handle: JoinHandle<()>,
 }
 
+#[derive(Clone, Debug)]
+struct ProbeState {
+    managers: Arc<Managers>,
+    poll_heartbeat: Heartbeat,
+}
+
 impl ProbeServer {
     /// Creates a new `ProbeServer` instance.
     ///
@@ -47,11 +54,20 @@ impl ProbeServer {
     ///
     /// Returns an `io::Error` if the server fails to bind to the specified
     /// port.
-    pub fn new(port: u16, managers: Arc<Managers>) -> Result<Self, io::Error> {
+    pub fn new(
+        port: u16,
+        managers: Arc<Managers>,
+        poll_heartbeat: Heartbeat,
+    ) -> Result<Self, io::Error> {
+        let state = ProbeState {
+            managers,
+            poll_heartbeat,
+        };
+
         let app = Router::new()
             .route_with_tsr("/readyz", get(readiness_probe))
             .route_with_tsr("/livez", get(liveness_probe))
-            .with_state(managers);
+            .with_state(state);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let listener = block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await })?;
@@ -108,7 +124,9 @@ impl ProbeServer {
 /// A tuple containing a `StatusCode` and a message. Returns
 /// `SERVICE_UNAVAILABLE` if no partitions are assigned, otherwise returns `OK`
 /// with the number of assigned partitions.
-async fn readiness_probe(State(managers): State<Arc<Managers>>) -> (StatusCode, Cow<'static, str>) {
+async fn readiness_probe(
+    State(ProbeState { managers, .. }): State<ProbeState>,
+) -> (StatusCode, Cow<'static, str>) {
     let assigned_count = get_assigned_partition_count(&managers);
     if assigned_count == 0 {
         (
@@ -136,8 +154,13 @@ async fn readiness_probe(State(managers): State<Arc<Managers>>) -> (StatusCode, 
 /// A tuple containing a `StatusCode` and a message. Returns
 /// `SERVICE_UNAVAILABLE` if any partitions have stalled, otherwise returns
 /// `OK`.
-async fn liveness_probe(State(managers): State<Arc<Managers>>) -> (StatusCode, &'static str) {
-    if get_is_stalled(&managers) {
+async fn liveness_probe(
+    State(ProbeState {
+        managers,
+        poll_heartbeat,
+    }): State<ProbeState>,
+) -> (StatusCode, &'static str) {
+    if poll_heartbeat.is_stalled() || get_is_stalled(&managers) {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "one or more partitions have stalled",
@@ -158,11 +181,14 @@ mod tests {
     #[allow(clippy::expect_used)]
     #[tokio::test]
     async fn test_probe_server_endpoints_respond() {
-        // Create a mock Managers instance
+        // Create a mock instances
         let managers = Arc::default();
+        let heartbeat = Heartbeat::new("test", Duration::from_secs(30));
 
         // Create a ProbeServer instance
-        let server = ProbeServer::new(0, managers).expect("Failed to create ProbeServer");
+        let server =
+            ProbeServer::new(0, managers, heartbeat).expect("Failed to create ProbeServer");
+
         let address = server.local_addr();
 
         // Create a reqwest Client
