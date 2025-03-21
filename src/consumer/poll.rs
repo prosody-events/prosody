@@ -425,8 +425,8 @@ fn store_watermarks<T>(
 /// Pauses and resumes Kafka partitions based on their buffer capacity.
 ///
 /// This function manages backpressure by pausing partitions that are at
-/// capacity and resuming partitions that have available capacity. This prevents
-/// overwhelming the system when processing capacity is limited.
+/// capacity and resuming partitions that have available capacity. This the
+/// consumer from losing its partitions due to inactivity.
 ///
 /// # Arguments
 ///

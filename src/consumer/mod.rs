@@ -1,8 +1,8 @@
 //! Kafka consumer implementation for high-level message consumption and
 //! processing.
 //!
-//! This module provides a robust abstraction for consuming messages from Kafka
-//! topics with sophisticated features:
+//! This module provides an abstraction for consuming messages from Kafka
+//! topics:
 //!
 //! - Per-key concurrency with ordered processing within keys
 //! - Automatic partition assignment and revocation handling
