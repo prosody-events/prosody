@@ -102,6 +102,12 @@ impl UncommittedMessage {
         self.inner.partition()
     }
 
+    /// Returns the message's key.
+    #[must_use]
+    pub fn key(&self) -> &Key {
+        self.inner.key()
+    }
+
     /// Returns the message's offset.
     #[must_use]
     pub fn offset(&self) -> Offset {

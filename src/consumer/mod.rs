@@ -35,6 +35,7 @@
 //! use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
 //!
 //! // Implement your message handler
+//! #[derive(Clone)]
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {

@@ -26,11 +26,11 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, instrument};
 
+use crate::consumer::EventHandler;
 use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{EventHandler, Keyed};
 use crate::deduplication::IdempotenceCache;
 use crate::{Offset, Partition, Topic};
 
