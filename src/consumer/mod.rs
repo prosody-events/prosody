@@ -2,30 +2,89 @@
 //! processing.
 //!
 //! This module provides a robust abstraction for consuming messages from Kafka
-//! topics, handling:
+//! topics with sophisticated features:
 //!
-//! - Offset management
-//! - Consumer group coordination
-//! - Message deserialization
-//! - Backpressure management
-//! - Error handling and recovery
-//! - Distributed tracing
+//! - Per-key concurrency with ordered processing within keys
+//! - Automatic partition assignment and revocation handling
+//! - Offset management with exactly-once semantics
+//! - Backpressure handling and flow control
+//! - Error handling with configurable retry strategies
+//! - Distributed tracing integration
+//! - Message deduplication
+//! - Health and readiness probes
 //!
-//! The module consists of several submodules:
+//! # Architecture
 //!
-//! - `context`: Manages Kafka partition assignments and revocations.
-//! - `extractor`: Extracts metadata from Kafka messages for distributed
-//!   tracing.
-//! - `message`: Defines structures for message contexts and consumer messages.
-//! - `partition`: Handles partition-specific operations and state management.
-//! - `poll`: Implements the core message polling and processing loop.
-//! - `failure`: Handles error handling, retry strategies, and failure topic
-//!   management.
-//! - `probes`: Implements a probe server for health and readiness checks.
+//! The consumer architecture is centered around these key components:
 //!
-//! Users should primarily interact with the [`ProsodyConsumer`] struct,
-//! configured via [`ConsumerConfiguration`]. Custom message processing logic is
-//! defined by implementing the [`EventHandler`] trait.
+//! - `ProsodyConsumer`: The main entry point that coordinates all consumer
+//!   operations
+//! - `PartitionManager`: Manages message processing for a single Kafka
+//!   partition
+//! - `EventHandler`: User-implemented trait for message processing logic
+//! - Failure strategies: Composable error handling mechanisms
+//!
+//! # Usage
+//!
+//! To use this consumer, implement the `EventHandler` trait with your message
+//! processing logic, configure the consumer through `ConsumerConfiguration`,
+//! and start processing:
+//!
+//! ```
+//! use prosody::consumer::message::{MessageContext, UncommittedMessage};
+//! use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
+//!
+//! // Implement your message handler
+//! struct MyHandler;
+//!
+//! impl EventHandler for MyHandler {
+//!     async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
+//!         // Process the message
+//!         println!("Processing message with key: {}", message.key());
+//!
+//!         // Commit the message when processing is complete
+//!         message.commit();
+//!     }
+//!
+//!     async fn shutdown(self) {
+//!         // Clean up resources
+//!     }
+//! }
+//!
+//! // Create and start the consumer
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = ConsumerConfiguration::builder()
+//!     .bootstrap_servers(vec!["kafka:9092".to_string()])
+//!     .group_id("my-consumer-group")
+//!     .subscribed_topics(vec!["my-topic".to_string()])
+//!     .build()?;
+//!
+//! let consumer = ProsodyConsumer::new(&config, MyHandler)?;
+//!
+//! // The consumer will process messages until shutdown is called
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Failure Handling
+//!
+//! The consumer supports several error handling strategies:
+//!
+//! - **Pipeline processing**: Messages that fail processing are retried with
+//!   backoff
+//! - **Low latency processing**: Failed messages are sent to a failure topic
+//! - **Best effort processing**: Failed messages are logged and discarded
+//!
+//! # Modules
+//!
+//! - `context`: Manages Kafka partition assignments and revocations
+//! - `extractor`: Extracts tracing context from Kafka message headers
+//! - `message`: Core message types for Kafka message processing
+//! - `partition`: Manages per-partition message processing
+//! - `poll`: Implements the Kafka message polling loop
+//! - `failure`: Error handling strategies for message processing
+//! - `heartbeat`: Monitoring for stalled processes
+//! - `probes`: HTTP endpoints for health and readiness checking
 
 use crate::consumer::poll::PollConfig;
 use crate::consumer::probes::ProbeServer;
@@ -81,14 +140,25 @@ mod poll;
 mod probes;
 
 /// Atomic counter for tracking changes in partition watermarks.
+///
+/// Used to efficiently determine when offsets need to be committed without
+/// requiring a full scan of all partition managers.
 type WatermarkVersion = CachePadded<AtomicUsize>;
 
 /// Thread-safe storage for partition managers.
+///
+/// Maps (Topic, Partition) pairs to their corresponding `PartitionManager`
+/// instances. Protected by a `RwLock` to allow concurrent reads with exclusive
+/// writes.
 type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
 
+/// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 
 /// Defines a type with an associated key.
+///
+/// This trait is implemented by message types that have a key field,
+/// allowing key-based message routing and processing.
 pub trait Keyed {
     /// The type of the key.
     type Key;
@@ -102,6 +172,9 @@ pub trait Keyed {
 }
 
 /// Provides handlers for processing messages from specific partitions.
+///
+/// This trait allows creating custom message handlers for each partition,
+/// enabling partition-specific processing logic if needed.
 pub trait HandlerProvider: Send + Sync + 'static {
     /// The type of message handler provided.
     type Handler: EventHandler + Send + Sync + 'static;
@@ -120,13 +193,20 @@ pub trait HandlerProvider: Send + Sync + 'static {
 }
 
 /// Defines the behavior for handling consumed Kafka messages.
+///
+/// This is the primary trait to implement for message processing logic.
+/// It provides methods for processing messages and handling shutdown.
 pub trait EventHandler {
     /// Processes a consumed message.
     ///
+    /// This method should contain the business logic for message processing.
+    /// It should commit or abort the message when processing is complete.
+    ///
     /// # Arguments
     ///
-    /// * `context` - The message context.
-    /// * `message` - The consumed message.
+    /// * `context` - The message context providing metadata and shutdown
+    ///   notification.
+    /// * `message` - The uncommitted message to process.
     ///
     /// # Returns
     ///
@@ -138,6 +218,9 @@ pub trait EventHandler {
     ) -> impl Future<Output = ()> + Send;
 
     /// Shuts down the message handler.
+    ///
+    /// This method is called when the consumer is shutting down.
+    /// It should clean up any resources used by the handler.
     ///
     /// # Returns
     ///
@@ -212,7 +295,8 @@ pub struct ConsumerConfiguration {
     /// Environment variable: `PROSODY_ALLOWED_EVENTS`
     /// Default: None
     ///
-    /// If no event types are specified, all events are allowed.
+    /// If specified, only messages with event types matching these prefixes
+    /// will be processed. If not specified, all events are allowed.
     #[builder(
         default = "from_optional_vec_env(\"PROSODY_ALLOWED_EVENTS\")?",
         setter(into)
@@ -224,6 +308,10 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_MAX_CONCURRENCY`
     /// Default: 32
+    ///
+    /// Controls the maximum number of messages that can be processed
+    /// concurrently across all partitions. This helps prevent resource
+    /// exhaustion.
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_CONCURRENCY\", 32)?",
         setter(into)
@@ -235,6 +323,9 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_MAX_UNCOMMITTED`
     /// Default: 16
+    ///
+    /// Limits the number of messages in-flight from each partition.
+    /// Also determines the buffer size for message queues.
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 16)?",
         setter(into)
@@ -246,6 +337,9 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_MAX_ENQUEUED_PER_KEY`
     /// Default: 8
+    ///
+    /// Controls how many messages with the same key can be queued before
+    /// backpressuring
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?",
         setter(into)
@@ -258,7 +352,8 @@ pub struct ConsumerConfiguration {
     /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
     /// Default: 4096
     ///
-    /// Set to 0 to disable the partition idempotence cache.
+    /// Size of the cache used to deduplicate messages with the same event ID.
+    /// Set to 0 to disable message deduplication.
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", 4096)?",
         setter(into)
@@ -300,6 +395,8 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_POLL_INTERVAL`
     /// Default: 100 milliseconds
+    ///
+    /// Controls how frequently the consumer polls Kafka for new messages.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_POLL_INTERVAL\", \
                    Duration::from_millis(100))?",
@@ -311,6 +408,8 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_COMMIT_INTERVAL`
     /// Default: 1 second
+    ///
+    /// Controls how frequently offsets are auto-committed to Kafka.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_COMMIT_INTERVAL\", \
                    Duration::from_secs(1))?",
@@ -322,6 +421,9 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_MOCK`
     /// Default: false
+    ///
+    /// When true, uses a mock Kafka cluster for testing instead of the
+    /// configured bootstrap servers.
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MOCK\", false)?",
         setter(into)
@@ -332,6 +434,9 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_PROBE_PORT`
     /// Default: Some(8000)
+    ///
+    /// If set, starts an HTTP server on this port for health and readiness
+    /// probes. Set to None to disable the probe server.
     #[builder(
         default = "from_option_env_with_fallback(\"PROSODY_PROBE_PORT\", 8000)?",
         setter(into)
@@ -342,8 +447,8 @@ pub struct ConsumerConfiguration {
 impl ConsumerConfiguration {
     /// Creates a new `ConsumerConfigurationBuilder`.
     ///
-    /// This method is a convenient way to start building a
-    /// `ConsumerConfiguration`.
+    /// This method provides a convenient way to start building a
+    /// `ConsumerConfiguration` using the builder pattern.
     ///
     /// # Returns
     ///
@@ -355,19 +460,26 @@ impl ConsumerConfiguration {
 }
 
 /// Holds the runtime state of the consumer.
+///
+/// This struct encapsulates the components that make up the running state
+/// of a `ProsodyConsumer`, allowing them to be managed together.
 struct RuntimeState {
     /// Handle to the polling task.
     poll_handle: JoinHandle<()>,
+
     /// Optional probe server for health and readiness checks.
     probe_server: Option<ProbeServer>,
 }
 
 impl ConsumerConfigurationBuilder {
-    /// Currently configured consumer group
+    /// Retrieves the currently configured consumer group.
+    ///
+    /// Checks both the explicitly configured group ID and the environment
+    /// variable.
     ///
     /// # Returns
     ///
-    /// An option containing the consumer group if configured
+    /// An option containing the consumer group if configured.
     #[must_use]
     pub fn configured_consumer_group(&self) -> Option<String> {
         self.group_id.clone().or_else(|| var(PROSODY_GROUP_ID).ok())
@@ -375,6 +487,15 @@ impl ConsumerConfigurationBuilder {
 }
 
 /// High-level Kafka consumer implementation.
+///
+/// `ProsodyConsumer` is the main entry point for consuming messages from Kafka
+/// topics. It manages partition assignments, message processing, and graceful
+/// shutdown.
+///
+/// The consumer supports different message processing strategies:
+/// - Pipeline processing with retries
+/// - Low-latency processing with failure topic
+/// - Best-effort processing with logging
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ProsodyConsumer {
@@ -393,6 +514,10 @@ pub struct ProsodyConsumer {
 
 impl ProsodyConsumer {
     /// Creates a new `ProsodyConsumer` instance.
+    ///
+    /// This is the low-level constructor that takes a custom handler provider.
+    /// For common use cases, consider using the specialized constructors like
+    /// `pipeline_consumer` or `low_latency_consumer`.
     ///
     /// # Arguments
     ///
@@ -516,6 +641,10 @@ impl ProsodyConsumer {
     /// Creates a new `ProsodyConsumer` with a retry strategy for pipeline
     /// processing.
     ///
+    /// Pipeline processing emphasizes reliability with automatic retries on
+    /// failure. Messages that fail processing will be retried indefinitely
+    /// with exponential backoff.
+    ///
     /// # Arguments
     ///
     /// * `consumer_config` - The consumer configuration.
@@ -545,6 +674,14 @@ impl ProsodyConsumer {
     }
 
     /// Creates a new `ProsodyConsumer` with a low-latency strategy.
+    ///
+    /// The low-latency strategy prioritizes throughput by quickly moving
+    /// problematic messages to a failure topic instead of retrying
+    /// indefinitely. This strategy:
+    ///
+    /// 1. First attempts to process the message with retries
+    /// 2. If processing still fails, sends the message to a failure topic
+    /// 3. Retries sending to the failure topic if that fails
     ///
     /// # Arguments
     ///
@@ -587,8 +724,12 @@ impl ProsodyConsumer {
     }
 
     /// Creates a new `ProsodyConsumer` with a logging strategy for failure
-    /// handling. This should generally only be used in development or
-    /// best-effort services where processing failures are acceptable.
+    /// handling.
+    ///
+    /// The best-effort strategy is the simplest approach - it tries to process
+    /// messages once, logs any failures, and moves on. This strategy should
+    /// only be used for development or for services where occasional
+    /// message loss is acceptable.
     ///
     /// # Arguments
     ///
@@ -616,6 +757,10 @@ impl ProsodyConsumer {
 
     /// Returns the number of currently assigned partitions.
     ///
+    /// This method is useful for monitoring how many partitions have been
+    /// assigned to this consumer instance by Kafka's partition assignment
+    /// strategy.
+    ///
     /// # Returns
     ///
     /// The number of partitions currently assigned to this consumer.
@@ -626,6 +771,9 @@ impl ProsodyConsumer {
 
     /// Checks if any assigned partition is stalled.
     ///
+    /// A partition is considered stalled if it hasn't processed messages
+    /// within the configured stall threshold duration.
+    ///
     /// # Returns
     ///
     /// `true` if any partition is stalled, `false` otherwise.
@@ -635,6 +783,9 @@ impl ProsodyConsumer {
     }
 
     /// Initiates a graceful shutdown of the Kafka consumer.
+    ///
+    /// This method stops polling for new messages and waits for any in-flight
+    /// message processing to complete or timeout.
     pub async fn shutdown(mut self) {
         self.execute_shutdown().await;
     }
@@ -642,7 +793,7 @@ impl ProsodyConsumer {
     /// Executes the consumer shutdown process.
     ///
     /// This method is used by both the public shutdown method and the drop
-    /// handler.
+    /// handler to ensure resources are properly cleaned up.
     async fn execute_shutdown(&mut self) {
         // Signal the consumer to shut down
         self.shutdown.store(true, Ordering::Relaxed);
@@ -682,12 +833,16 @@ impl Drop for ProsodyConsumer {
 ///
 /// # Returns
 ///
-/// The number of assigned partitions.
+/// The number of partitions currently assigned to this consumer.
 fn get_assigned_partition_count(managers: &Managers) -> u32 {
     managers.read().len() as u32
 }
 
 /// Checks if any partition is stalled.
+///
+/// A partition is considered stalled if it hasn't processed messages within
+/// the configured stall threshold duration or if its processing loop is
+/// blocked.
 ///
 /// # Arguments
 ///
@@ -701,6 +856,9 @@ fn get_is_stalled(managers: &Managers) -> bool {
 }
 
 /// Errors that can occur during consumer operations.
+///
+/// This enum covers various error conditions that might occur when
+/// creating, configuring, or operating a Kafka consumer.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConsumerError {
@@ -708,7 +866,7 @@ pub enum ConsumerError {
     #[error("invalid consumer configuration: {0:#}")]
     Configuration(#[from] ValidationErrors),
 
-    /// Indicates an invalid event type pattern
+    /// Indicates an invalid event type pattern.
     #[error("invalid allowed events pattern: {0:#}")]
     AllowedEventsPattern(#[from] aho_corasick::BuildError),
 

@@ -1,3 +1,8 @@
+//! Provides a mechanism to monitor and detect stalled consumer processes.
+//!
+//! This module implements a heartbeat system to track activity within consumer
+//! processes, allowing detection of stalled or unresponsive components.
+
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use humantime::format_duration;
@@ -8,8 +13,17 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{error, info};
 
+/// Additional safety margin applied to heartbeat check intervals.
+///
+/// The heartbeat check interval is calculated as the stall threshold divided by
+/// this value, resulting in more frequent checks than the threshold itself.
 const HEARTBEAT_MARGIN: u32 = 5;
 
+/// A mechanism for monitoring activity and detecting stalled processes.
+///
+/// `Heartbeat` provides a way to track the liveness of a component by regularly
+/// recording activity timestamps and checking if the component has become
+/// inactive for longer than a configured threshold.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct Heartbeat {
@@ -17,6 +31,10 @@ pub struct Heartbeat {
     inner: Arc<Inner>,
 }
 
+/// Internal state for the `Heartbeat` type.
+///
+/// Contains the shared state that is used to track heartbeat updates
+/// and determine if a component has stalled.
 #[derive(Educe)]
 #[educe(Debug)]
 struct Inner {
@@ -41,6 +59,14 @@ struct Inner {
 }
 
 impl Heartbeat {
+    /// Creates a new heartbeat monitor with the specified name and stall
+    /// threshold.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - A name identifier for this heartbeat, used in logging
+    /// * `stall_threshold` - The maximum allowed duration of inactivity before
+    ///   considering the component stalled
     pub fn new<T>(name: T, stall_threshold: Duration) -> Self
     where
         T: Into<Cow<'static, str>>,
@@ -56,6 +82,10 @@ impl Heartbeat {
         }
     }
 
+    /// Records a heartbeat, indicating that the component is active.
+    ///
+    /// This should be called regularly by the monitored component to
+    /// indicate it's functioning normally.
     pub fn beat(&self) {
         self.inner.last_heartbeat.store(
             Instant::now().duration_since(self.inner.epoch).as_millis() as u64,
@@ -63,10 +93,23 @@ impl Heartbeat {
         );
     }
 
+    /// Waits until the next heartbeat check should be performed.
+    ///
+    /// This method sleeps for a duration calculated as the stall threshold
+    /// divided by `HEARTBEAT_MARGIN`.
     pub async fn next(&self) {
         sleep(self.inner.stall_threshold / HEARTBEAT_MARGIN).await;
     }
 
+    /// Checks if the monitored component has stalled.
+    ///
+    /// Returns `true` if the time since the last heartbeat exceeds the
+    /// stall threshold. This method also logs state transitions between
+    /// stalled and active states.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the component is considered stalled, `false` otherwise
     pub fn is_stalled(&self) -> bool {
         let heartbeat_millis = self.inner.last_heartbeat.load(Ordering::Acquire);
         let heartbeat_duration = Duration::from_millis(heartbeat_millis);
