@@ -1,7 +1,7 @@
 //! A partition manager that processes messages concurrently while maintaining
 //! ordering within message groups.
 //!
-//! This module orchestrates message processing for individual Kafka partition
+//! This module orchestrates message processing for individual Kafka partitions
 //! by:
 //! - Supporting concurrent processing of messages with different keys
 //! - Preserving message order within each key
@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, instrument};
 
+use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
@@ -47,6 +48,7 @@ mod test;
 /// - Tracking and committing message offsets
 /// - Managing partition shutdown
 /// - Enforcing backpressure through queue capacity limits
+/// - Monitoring for processing stalls
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct PartitionManager {
@@ -60,6 +62,9 @@ pub struct PartitionManager {
     /// Channel for sending messages to be processed
     #[educe(Debug(ignore))]
     message_tx: Sender<ConsumerMessage>,
+
+    /// Heartbeat used to detect stalled processing loop
+    heartbeat: Heartbeat,
 
     /// Signals shutdown to message handlers
     #[educe(Debug(ignore))]
@@ -75,6 +80,7 @@ impl PartitionManager {
     ///
     /// # Arguments
     ///
+    /// * `group_id` - The consumer group identifier
     /// * `topic` - The Kafka topic this partition belongs to
     /// * `partition` - The partition number
     /// * `message_handler` - Handler that processes the messages
@@ -83,14 +89,15 @@ impl PartitionManager {
     ///   committed
     /// * `max_enqueued_per_key` - Maximum number of pending messages per key
     /// * `idempotence_cache_size` - Size of the cache for deduplicating
-    ///   messages. Set to 0 to disable.
+    ///   messages (set to 0 to disable)
     /// * `shutdown_timeout` - How long to wait for message processing to
     ///   complete during shutdown
     /// * `stall_threshold` - Duration of inactivity allowed before considering
     ///   a partition stalled
     /// * `watermark_version` - Counter tracking changes to committed offset
     ///   watermarks
-    /// * `global_limit` - Global concurrency semaphore
+    /// * `global_limit` - Global concurrency semaphore for limiting total
+    ///   concurrent message processing
     ///
     /// # Returns
     ///
@@ -113,6 +120,7 @@ impl PartitionManager {
     where
         T: EventHandler + Send + Sync + 'static,
     {
+        // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
             topic,
             partition,
@@ -121,9 +129,15 @@ impl PartitionManager {
             watermark_version,
         );
 
+        // Create descriptive name for the heartbeat
+        let name = format!("{topic}/{partition} event loop");
+
+        // Initialize heartbeat, channels, and shutdown signals
+        let heartbeat = Heartbeat::new(name, stall_threshold);
         let (message_tx, message_rx) = channel(buffer_size);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        // Spawn the background task for message handling
         let handle = spawn(handle_messages(
             message_handler,
             offsets.clone(),
@@ -133,6 +147,7 @@ impl PartitionManager {
             group_id,
             idempotence_cache_size,
             global_limit,
+            heartbeat.clone(),
             shutdown_rx,
             shutdown_timeout,
         ));
@@ -141,6 +156,7 @@ impl PartitionManager {
             partition,
             offsets,
             message_tx,
+            heartbeat,
             shutdown_tx,
             handle,
         }
@@ -176,6 +192,9 @@ impl PartitionManager {
 
     /// Gets the current committed offset watermark.
     ///
+    /// The watermark represents the highest contiguous offset that has been
+    /// successfully processed and committed.
+    ///
     /// # Returns
     ///
     /// The highest contiguous committed offset if any messages have been
@@ -186,18 +205,27 @@ impl PartitionManager {
 
     /// Checks if message processing has stalled.
     ///
+    /// A partition is considered stalled if either:
+    /// - The offset tracker detects uncommitted offsets beyond the stall
+    ///   threshold
+    /// - The message processing heartbeat hasn't been updated within the stall
+    ///   threshold
+    ///
     /// # Returns
     ///
     /// `true` if messages are not being processed within the configured stall
     /// threshold, `false` otherwise
     pub fn is_stalled(&self) -> bool {
-        self.offsets.is_stalled()
+        self.offsets.is_stalled() || self.heartbeat.is_stalled()
     }
 
     /// Initiates an orderly partition shutdown.
     ///
-    /// Closes the message channel, signals handlers to shut down, and waits for
-    /// in-flight messages to complete processing.
+    /// This method:
+    /// 1. Closes the message channel to prevent new messages
+    /// 2. Signals handlers to shut down gracefully
+    /// 3. Waits for in-flight messages to complete processing
+    /// 4. Performs final offset commits
     ///
     /// # Returns
     ///
@@ -205,7 +233,7 @@ impl PartitionManager {
     /// or `None` if an error occurs during shutdown
     #[instrument(level = "debug")]
     pub async fn shutdown(self) -> Option<Offset> {
-        // Close the message channel
+        // Close the message channel to stop accepting new messages
         drop(self.message_tx);
 
         // Signal handlers to shut down
@@ -232,11 +260,13 @@ impl PartitionManager {
 
 /// Processes messages for a partition.
 ///
-/// Coordinates message processing by:
-/// - Filtering duplicate and out-of-order messages
-/// - Managing per-key message queues
-/// - Handling offset tracking and commitment
-/// - Gracefully shutting down when requested
+/// This function:
+/// - Filters duplicate and out-of-order messages
+/// - Manages per-key message queues to preserve ordering
+/// - Handles offset tracking and commitment
+/// - Performs message deduplication
+/// - Applies backpressure when needed
+/// - Handles graceful shutdown when requested
 ///
 /// # Arguments
 ///
@@ -244,10 +274,12 @@ impl PartitionManager {
 /// * `offsets` - Tracks offset commits and processing progress
 /// * `message_rx` - Channel receiving messages to process
 /// * `max_enqueued_per_key` - Maximum number of pending messages per key
-/// * `max_execution_count` - Maximum number of concurrent tasks executing.
+/// * `max_execution_count` - Maximum number of concurrent tasks executing
+/// * `group_id` - Consumer group identifier
 /// * `idempotence_cache_size` - Size of cache for deduplicating messages by
 ///   event ID
 /// * `global_limit` - Global concurrency semaphore
+/// * `heartbeat` - Heartbeat used to detect stalled processing loop
 /// * `shutdown_rx` - Channel receiving shutdown signal
 /// * `shutdown_timeout` - How long to wait for processing to complete during
 ///   shutdown
@@ -261,6 +293,7 @@ async fn handle_messages<T>(
     group_id: Arc<str>,
     idempotence_cache_size: usize,
     global_limit: Arc<Semaphore>,
+    heartbeat: Heartbeat,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_timeout: Duration,
 ) where
@@ -269,8 +302,9 @@ async fn handle_messages<T>(
     let mut highest_offset_seen = -1;
     let mut idempotence_cache = IdempotenceCache::new(idempotence_cache_size);
 
+    // Create a processing pipeline for incoming messages
     let stream = ReceiverStream::new(message_rx)
-        // Skip messages with offsets we've already seen
+        // Skip messages with offsets we've already seen (handles duplicates from Kafka)
         .filter(|message| {
             let partition = message.partition();
             let offset = message.offset();
@@ -296,6 +330,7 @@ async fn handle_messages<T>(
             },
         )
         // Filter out messages where the source system matches the group identifier
+        // This prevents processing messages produced by this consumer group (loop avoidance)
         .filter_map(|message| {
             if message
                 .source_system()
@@ -310,7 +345,7 @@ async fn handle_messages<T>(
 
             ready(Some(message))
         })
-        // Filter out duplicate messages
+        // Filter out duplicate messages using idempotence cache
         .filter_map(|message| {
             // Skip messages with duplicate event IDs
             if let Some(event_id) =
@@ -324,7 +359,7 @@ async fn handle_messages<T>(
             ready(Some(message))
         });
 
-    // Process messages
+    // Define how to process each message
     let process = |message: UncommittedMessage| async {
         // Acquire a semaphore to bound global concurrency
         debug!(?message, "acquiring permit");
@@ -346,16 +381,19 @@ async fn handle_messages<T>(
         message_handler.on_message(context, message).await;
     };
 
-    // Create key manager to handle concurrent processing
+    // Create key manager to handle concurrent processing while maintaining key
+    // order
     KeyManager::new(process, max_enqueued_per_key)
         .process_messages(
             stream,
+            heartbeat,
             shutdown_rx.clone(),
             max_execution_count,
             shutdown_timeout,
         )
         .await;
 
+    // Clean up handler resources after processing completes
     message_handler.shutdown().await;
 }
 

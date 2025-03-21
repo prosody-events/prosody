@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::consumer::Keyed;
+use crate::consumer::heartbeat::Heartbeat;
+use crate::consumer::partition::keyed::KeyManager;
 use ahash::HashMapExt;
 use futures::stream::iter;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -18,9 +21,6 @@ use scc::{HashMap, HashSet};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
 use tokio::time::sleep;
-
-use crate::consumer::Keyed;
-use crate::consumer::partition::keyed::KeyManager;
 
 /// A sequence of messages with keys and values for testing.
 #[derive(Clone, Debug)]
@@ -112,7 +112,13 @@ async fn prevents_concurrent_key_execution_impl(
 
     // Process all messages using the KeyManager
     KeyManager::new(process_fn, max_enqueued)
-        .process_messages(iter(messages), shutdown_rx, 64, Duration::from_millis(100))
+        .process_messages(
+            iter(messages),
+            Heartbeat::new("test", Duration::from_secs(30)),
+            shutdown_rx,
+            64,
+            Duration::from_millis(100),
+        )
         .await;
 
     // Check if any concurrent execution was detected
@@ -153,6 +159,7 @@ async fn processes_messages_in_order_impl(
     )
     .process_messages(
         iter(messages.clone()),
+        Heartbeat::new("test", Duration::from_secs(30)),
         shutdown_rx,
         64,
         Duration::from_millis(100),

@@ -1,14 +1,16 @@
-//! # Kafka Polling and Message Dispatch Module
+//! Kafka message polling and processing pipeline.
 //!
-//! This module implements the main polling loop that consumes messages from
-//! Kafka. It provides distributed tracing support, manages offset commits,
-//! controls Kafka partition pausing/resuming based on capacity, and dispatches
-//! messages to the correct partition manager. It encapsulates the configuration
-//! for polling, message extraction, validation, retrying dispatches if
-//! partitions are busy, and committing watermarks.
+//! This module implements the main message consumption loop that:
+//! - Polls messages from Kafka
+//! - Extracts and validates message data
+//! - Applies event type filtering
+//! - Maintains distributed tracing contexts
+//! - Manages offset tracking and committing
+//! - Controls partition pausing/resuming based on capacity
+//! - Dispatches messages to the appropriate partition managers
 //!
-//! All functionality is scaffolded through the [`PollConfig`] type and a set of
-//! functions that operate on Kafka messages.
+//! The main entry point is the [`poll`] function, which orchestrates all these
+//! operations within a continuous loop until shutdown is signaled.
 
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use chrono::{MappedLocalTime, TimeZone, Utc};
@@ -37,90 +39,108 @@ use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::propagator::new_propagator;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
+use crate::consumer::heartbeat::Heartbeat;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_reader_with_buffers;
 
-/// Bundles all parameters necessary for polling Kafka messages.
+/// Configuration for the Kafka message polling process.
+///
+/// Bundles all parameters required to run the message polling loop, including
+/// the Kafka consumer, topic filtering options, shared state, and lifecycle
+/// management.
 ///
 /// # Type Parameters
 ///
-/// * `T`: The type that implements [`HandlerProvider`] to supply
-///   partition-specific message handlers.
-///
-/// # Fields
-///
-/// * `poll_interval`: Duration between consecutive poll attempts.
-/// * `allowed_events`: Optional filter that permits only allowed event types.
-/// * `consumer`: The Kafka consumer instance with the appropriate context.
-/// * `watermark_version`: Atomic watermark version for tracking offset updates.
-/// * `managers`: Shared partition managers handling messages per partition.
-/// * `shutdown`: Atomic flag for graceful shutdown termination.
+/// * `T` - A type implementing [`HandlerProvider`] that creates message
+///   handlers for assigned partitions.
 pub struct PollConfig<'a, T>
 where
     T: HandlerProvider,
 {
+    /// Time between consecutive poll operations
     pub poll_interval: Duration,
+
+    /// Optional automaton for filtering messages by event type
     pub allowed_events: Option<AhoCorasick>,
+
+    /// The configured Kafka consumer with context
     pub consumer: BaseConsumer<Context<T>>,
+
+    /// Reference to counter tracking watermark version changes
     pub watermark_version: &'a WatermarkVersion,
+
+    /// Reference to the collection of partition managers
     pub managers: &'a Managers,
+
+    /// Reference to heartbeat for tracking liveness
+    pub heartbeat: &'a Heartbeat,
+
+    /// Flag for signaling polling loop shutdown
     pub shutdown: &'a AtomicBool,
 }
 
-/// Starts the main polling loop which:
-/// - Stores offsets if new watermarks are available.
-/// - Pauses/resumes partitions by evaluating their capacity.
-/// - Polls Kafka for messages using the configured poll interval.
-/// - Processes each valid message by extraction and validation.
-/// - Dispatches messages with retry logic if the partition is busy.
+/// Runs the main Kafka message polling and processing loop.
 ///
-/// The loop continues until the [`shutdown`] flag becomes true.
+/// This function implements the core consumption loop that:
+/// 1. Monitors and updates heartbeats to detect stalls
+/// 2. Stores committed offsets when watermarks advance
+/// 3. Pauses partitions that have reached their capacity limit
+/// 4. Polls for new messages from Kafka
+/// 5. Processes valid messages through validation and filtering
+/// 6. Dispatches messages to their respective partition managers
+///
+/// The loop continues until the shutdown flag is set to true.
 ///
 /// # Arguments
 ///
-/// * `config`: A [`PollConfig`] instance with all the necessary configuration.
+/// * `config` - The configuration for the polling process
 pub fn poll<T>(config: PollConfig<T>)
 where
     T: HandlerProvider,
 {
-    // Create buffers for SIMD JSON parsing if supported.
+    // Create buffers for SIMD JSON parsing if on supported platforms
     #[cfg(not(target_arch = "arm"))]
     let mut buffers = Buffers::default();
 
-    // Destructure configuration for readability.
+    // Destructure configuration for cleaner access
     let PollConfig {
         poll_interval,
         allowed_events,
         consumer,
         watermark_version,
         managers,
+        heartbeat,
         shutdown,
     } = config;
 
-    // Create a propagator for distributed tracing.
+    // Initialize distributed tracing propagator for context extraction
     let propagator = new_propagator();
     let mut last_version = watermark_version.load(Ordering::Acquire);
     let mut is_paused = false;
 
-    // Enter main polling loop until shutdown signal is received.
+    // Main polling loop
     while !shutdown.load(Ordering::Relaxed) {
-        // Store offsets if new watermarks are available and commit interval has
-        // passed.
-        commit_watermarks(&consumer, watermark_version, managers, &mut last_version);
+        // Signal that the polling loop is active
+        heartbeat.beat();
 
-        // Pause/resume partitions if their capacity changes.
+        // Periodically commit watermark offsets to Kafka
+        store_watermarks(&consumer, watermark_version, managers, &mut last_version);
+
+        // Pause/resume partitions based on their buffer capacity
         if let Err(error) = pause_busy_partitions(&mut is_paused, &consumer, managers) {
             error!("error pausing busy partitions: {error:#}; retrying");
             sleep(poll_interval);
             continue;
         }
 
-        // Poll for a new Kafka message.
+        // Poll for next message with timeout
         let Some(result) = consumer.poll(Timeout::After(poll_interval)) else {
             continue;
         };
+
+        // Handle poll errors
         let message = match result {
             Ok(msg) => msg,
             Err(error) => {
@@ -134,7 +154,7 @@ where
         let offset = message.offset();
         debug!(topic, partition, offset, "received message");
 
-        // Extract and validate the Kafka message.
+        // Process message through extraction, validation, and filtering
         let maybe_msg = process_message(
             &message,
             allowed_events.as_ref(),
@@ -142,8 +162,9 @@ where
             #[cfg(not(target_arch = "arm"))]
             &mut buffers,
         );
+
+        // Dispatch valid messages to their partition manager
         if let Some(consumer_message) = maybe_msg {
-            // Dispatch the message to its partition manager with retry logic.
             dispatch_with_retry(consumer_message, poll_interval, managers);
         }
 
@@ -153,36 +174,33 @@ where
     debug("polling stopped");
 }
 
-/// Extracts metadata from a Kafka message, validates its key and payload,
-/// applies filtering on allowed events, and returns an instrumented
-/// [`ConsumerMessage`] ready for processing.
+/// Extracts and validates data from a Kafka message.
 ///
-/// This function logs errors (via tracing) and returns `None` if critical
-/// metadata is missing or if the message does not meet event type filtering
-/// criteria.
+/// This function performs several critical operations:
+/// 1. Creates a tracing span with message metadata for observability
+/// 2. Extracts distributed tracing context from message headers
+/// 3. Parses the payload and validates it as JSON
+/// 4. Filters messages based on their event type (if filtering is configured)
+/// 5. Extracts the message key and timestamp
 ///
 /// # Arguments
 ///
-/// * `message`: A borrowed Kafka message to process. originating from
-///   ourselves.
-/// * `allowed_events`: Optional automaton filter that restricts processing to
-///   allowed event types.
-/// * `propagator`: A distributed tracing propagator to extract context from
-///   message headers.
-/// * `buffers`: A mutable reference to JSON parsing buffers (only when not on
-///   ARM).
+/// * `message` - The Kafka message to process
+/// * `allowed_events` - Optional filter for permitted event types
+/// * `propagator` - Distributed tracing context propagator
+/// * `buffers` - (Non-ARM only) Buffers for SIMD JSON parsing
 ///
 /// # Returns
 ///
-/// An `Option<ConsumerMessage>` upon successful extraction and validation, or
-/// `None` if the message should be discarded.
+/// * `Some(ConsumerMessage)` - A validated, parsed message with tracing context
+/// * `None` - If the message is invalid or should be filtered out
 fn process_message(
     message: &BorrowedMessage,
     allowed_events: Option<&AhoCorasick>,
     propagator: &TextMapCompositePropagator,
     #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
 ) -> Option<ConsumerMessage> {
-    // Derive the topic and partition from the message.
+    // Extract basic message coordinates
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
     let offset = message.offset();
@@ -192,7 +210,7 @@ fn process_message(
         partition, offset, "processing message"
     );
 
-    // Create a tracing span and attach extracted context for distributed tracing.
+    // Create and configure tracing span with distributed context
     let context = propagator.extract(&MessageExtractor::new(message));
     let span = info_span!(
         "receive",
@@ -207,6 +225,7 @@ fn process_message(
     span.set_parent(context);
     let _enter = span.enter();
 
+    // Extract source system header if present
     let source_system = match message
         .headers()
         .into_iter()
@@ -223,18 +242,19 @@ fn process_message(
         }
     };
 
-    // Ensure the message has a payload.
+    // Validate message has payload
     let Some(payload_data) = message.payload() else {
         error!("missing payload; discarding message");
         return None;
     };
     span.record("payload_size", payload_data.len());
 
-    // Parse the payload from JSON. Use simd_json on non-ARM platforms.
+    // Parse payload as JSON, using platform-optimized implementations
     #[cfg(target_arch = "arm")]
     let payload = serde_json::from_slice(payload_data);
     #[cfg(not(target_arch = "arm"))]
     let payload = from_reader_with_buffers(payload_data, buffers);
+
     let payload: crate::Payload = match payload {
         Ok(p) => p,
         Err(error) => {
@@ -243,7 +263,7 @@ fn process_message(
         }
     };
 
-    // Apply filtering based on allowed event types if provided.
+    // Filter messages based on event type if filtering is enabled
     if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
         span.record("event_type", event_type);
 
@@ -257,13 +277,13 @@ fn process_message(
         }
     }
 
-    // Ensure the message has a key.
+    // Validate message has key
     let Some(key_data) = message.key() else {
         error!("missing key; discarding message");
         return None;
     };
 
-    // Parse the key as a UTF-8 string.
+    // Parse key as UTF-8 string
     let key = match str::from_utf8(key_data) {
         Ok(key_str) => {
             span.record("key", key_str);
@@ -275,7 +295,7 @@ fn process_message(
         }
     };
 
-    // Determine the message timestamp using available metadata.
+    // Determine message timestamp based on available metadata
     let timestamp = match message.timestamp() {
         Timestamp::NotAvailable => Utc::now(),
         Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => {
@@ -287,7 +307,7 @@ fn process_message(
         }
     };
 
-    // Return a new ConsumerMessage with tracing instrumentation.
+    // Create and return complete consumer message
     Some(ConsumerMessage::new(
         source_system,
         topic,
@@ -300,15 +320,17 @@ fn process_message(
     ))
 }
 
-/// Attempts to dispatch a [`ConsumerMessage`] to its assigned partition
-/// manager. Retries dispatching if the corresponding partition is currently
-/// busy, sleeping for the configured poll interval between attempts.
+/// Attempts to dispatch a message to its partition manager with retries.
+///
+/// When a partition manager is temporarily at capacity, this function retries
+/// the dispatch operation after waiting for the poll interval. If the partition
+/// is not found (which happens during rebalancing), the message is discarded.
 ///
 /// # Arguments
 ///
-/// * `message`: The consumer message to dispatch.
-/// * `poll_interval`: Duration to wait between retry attempts.
-/// * `managers`: Shared reference to the collection of partition managers.
+/// * `message` - The message to dispatch
+/// * `poll_interval` - Duration to wait between retry attempts
+/// * `managers` - Reference to the collection of partition managers
 fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, managers: &Managers) {
     let mut current_message = message;
     loop {
@@ -327,19 +349,20 @@ fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, manage
     }
 }
 
-/// Commits offsets for all managed partitions if updated watermarks are
-/// available. It inspects each partition manager for a committed watermark,
-/// builds a new commit list, and issues an asynchronous commit to the Kafka
-/// broker if the commit interval has passed.
+/// Updates offset watermarks in the Kafka consumer.
+///
+/// This function updates the stored offsets in the Kafka consumer when the
+/// watermark version changes, which indicates that new offsets have been
+/// committed by the partition managers. These stored offsets will be committed
+/// to Kafka on the next auto-commit interval.
 ///
 /// # Arguments
 ///
-/// * `consumer`: The Kafka consumer instance to perform the commit.
-/// * `watermark_version`: Atomic counter tracking changes in committed offsets.
-/// * `managers`: Shared reference to all partition managers.
-/// * `last_version`: Mutable reference to store the last committed watermark
-///   version.
-fn commit_watermarks<T>(
+/// * `consumer` - The Kafka consumer to update offsets in
+/// * `watermark_version` - Counter tracking changes to committed offsets
+/// * `managers` - Collection of partition managers that track committed offsets
+/// * `last_version` - The last processed watermark version
+fn store_watermarks<T>(
     consumer: &BaseConsumer<Context<T>>,
     watermark_version: &WatermarkVersion,
     managers: &Managers,
@@ -347,12 +370,13 @@ fn commit_watermarks<T>(
 ) where
     T: HandlerProvider,
 {
-    // Check if watermarks have been updated.
+    // Skip if no watermark updates have occurred
     let current_version = watermark_version.load(Ordering::Acquire);
     if current_version == *last_version {
         return;
     }
 
+    // Try to acquire read lock without blocking
     let Some(managers) = managers.try_read() else {
         return;
     };
@@ -360,12 +384,13 @@ fn commit_watermarks<T>(
     let mut success = true;
     let mut list = TopicPartitionList::with_capacity(managers.len());
 
-    // Build a commit list from each partition manager's watermark.
+    // Build list of offsets to commit from each partition manager
     for ((topic, partition), manager) in managers.iter() {
         let Some(watermark) = manager.watermark() else {
             continue;
         };
 
+        // Store next offset after the watermark
         let next_offset = Offset::Offset(watermark + 1);
         if let Err(error) = list.add_partition_offset(topic, *partition, next_offset) {
             error!(
@@ -377,40 +402,46 @@ fn commit_watermarks<T>(
         }
     }
 
-    // Return if there's nothing to commit
+    // Skip if no offsets to commit
     if list.count() == 0 {
         debug!("nothing to commit");
         return;
     }
 
-    // Issue a commit to Kafka.
+    // Store offsets in librdkafka for auto-commit
     debug!("storing watermarks for commit: {list:?}");
     if let Err(error) = consumer.store_offsets(&list) {
         error!("failed to store offsets: {error:#}");
         success = false;
     }
 
+    // Update version only if all operations succeeded
     if success {
         *last_version = current_version;
         debug!("watermarks stored successfully");
     }
 }
 
-/// Pauses or resumes Kafka partitions based on their processing capacity.
-/// If a partition's manager is full, it pauses that partition; otherwise, it
-/// resumes it.
+/// Pauses and resumes Kafka partitions based on their buffer capacity.
+///
+/// This function manages backpressure by pausing partitions that are at
+/// capacity and resuming partitions that have available capacity. This the
+/// consumer from losing its partitions due to inactivity.
 ///
 /// # Arguments
 ///
-/// * `is_paused`: Mutable flag indicating if partitions are currently paused.
-/// * `consumer`: The Kafka consumer instance used to pause or resume
-///   partitions.
-/// * `managers`: Shared reference to partition managers.
+/// * `is_paused` - Flag tracking whether any partitions are currently paused
+/// * `consumer` - Kafka consumer to apply pause/resume operations
+/// * `managers` - Collection of partition managers to check capacity
 ///
 /// # Returns
 ///
-/// * `Ok(())` if the pause/resume actions succeed.
-/// * `Err(KafkaError)` if any underlying Kafka operation fails.
+/// * `Ok(())` if pause/resume operations succeeded
+/// * `Err(KafkaError)` if any Kafka operation failed
+///
+/// # Errors
+///
+/// Returns any error from the underlying Kafka pause/resume operations.
 fn pause_busy_partitions<T>(
     is_paused: &mut bool,
     consumer: &BaseConsumer<Context<T>>,
@@ -421,15 +452,16 @@ where
 {
     let managers = managers.read();
 
-    // Short circuit when all partitions have capacity to avoid allocation
+    // Skip if no partitions are paused and all have capacity
     if !*is_paused && managers.values().all(PartitionManager::has_capacity) {
         return Ok(());
     }
 
+    // Prepare lists for partitions to pause and resume
     let mut paused = TopicPartitionList::with_capacity(managers.len());
     let mut resumed = TopicPartitionList::with_capacity(managers.len());
 
-    // Categorize partitions as paused or resumed based on capacity
+    // Categorize partitions based on their capacity
     for ((topic, partition), manager) in managers.iter() {
         if manager.has_capacity() {
             resumed.add_partition(topic.as_ref(), *partition);
@@ -438,9 +470,10 @@ where
         }
     }
 
+    // Update pause state
     *is_paused = paused.count() > 0;
 
-    // Apply pause and resume operations
+    // Apply pause and resume operations to the consumer
     if *is_paused {
         debug!("pausing: {paused:?}");
         consumer.pause(&paused)?;
@@ -454,22 +487,26 @@ where
     Ok(())
 }
 
-/// Dispatches a [`ConsumerMessage`] to its designated partition manager.
+/// Dispatches a message to its assigned partition manager.
 ///
-/// This function searches the managers for the partition matching the message's
-/// topic and partition and attempts to send the message. It returns an error if
-/// the partition is not found or if it is busy (i.e. its message queue is
-/// full).
+/// Looks up the appropriate partition manager for a message and attempts
+/// to send the message to it. If the partition isn't found or the manager
+/// is at capacity, appropriate errors are returned.
 ///
 /// # Arguments
 ///
-/// * `message`: The consumer message to dispatch.
-/// * `managers`: Shared reference to the collection of partition managers.
+/// * `message` - The message to dispatch
+/// * `managers` - Collection of partition managers
 ///
 /// # Returns
 ///
-/// * `Ok(())` if the message is successfully dispatched.
-/// * `Err(DispatchError)` specifying why dispatch failed.
+/// * `Ok(())` if the message was successfully dispatched
+/// * `Err(DispatchError)` describing the reason for failure
+///
+/// # Errors
+///
+/// - `DispatchError::PartitionNotFound` - The target partition is not assigned
+/// - `DispatchError::Busy` - The partition's message queue is full
 fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(), DispatchError> {
     debug!(
         topic = message.topic().as_ref(),
@@ -478,30 +515,29 @@ fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(),
         "dispatching message"
     );
 
+    // Look up partition manager
     let managers = managers.read();
     let Some(manager) = managers.get(&(message.topic(), message.partition())) else {
         return Err(DispatchError::PartitionNotFound(message));
     };
 
+    // Try to send message to the manager
     let Err(message) = manager.try_send(message) else {
         return Ok(());
     };
 
+    // Return busy error if send failed
     Err(DispatchError::Busy(message))
 }
 
-/// Enumerates possible errors that can occur during message dispatch.
-///
-/// - `PartitionNotFound`: Occurs when a message targets a partition that is not
-///   assigned.
-/// - `Busy`: Occurs when the target partition's manager is busy.
+/// Errors that can occur during message dispatch.
 #[derive(Debug, Error)]
 enum DispatchError {
-    /// The message was sent to an unassigned partition
+    /// The target partition is not assigned to this consumer
     #[error("message sent to unassigned partition")]
     PartitionNotFound(ConsumerMessage),
 
-    /// The partition is currently busy and cannot accept the message
+    /// The partition manager's buffer is full
     #[error("partition is busy")]
     Busy(ConsumerMessage),
 }
