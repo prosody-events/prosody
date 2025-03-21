@@ -32,7 +32,7 @@
 //!
 //! ```
 //! use prosody::consumer::message::{MessageContext, UncommittedMessage};
-//! use prosody::consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer};
+//! use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 //!
 //! // Implement your message handler
 //! #[derive(Clone)]
