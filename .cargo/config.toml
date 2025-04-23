@@ -1,0 +1,2 @@
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = true }
