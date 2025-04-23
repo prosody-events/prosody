@@ -161,9 +161,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                     }
 
                     // Ensure heartbeat is recorded even if nothing happens
-                    () = heartbeat.next() => {
-                        continue;
-                    }
+                    () = heartbeat.next() => {}
 
                     // Check for shutdown signal
                     _ = shutdown_rx.changed() => {
@@ -191,9 +189,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                     }
 
                     // Ensure heartbeat is recorded
-                    () = heartbeat.next() => {
-                        continue;
-                    }
+                    () = heartbeat.next() => {}
 
                     // Check for shutdown signal
                     _ = shutdown_rx.changed() => {
@@ -223,16 +219,14 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
                 }
 
                 // Ensure heartbeat is recorded
-                () = heartbeat.next() => {
-                    continue;
-                }
+                () = heartbeat.next() => {}
 
                 // Process remaining tasks
                 maybe_hash_value = self.executing.next() => {
                     match maybe_hash_value {
                         None => break, // All tasks completed
                         Some(hash_value) => self.handle_completion(shutdown_rx, hash_value),
-                    };
+                    }
                 }
             }
         }
