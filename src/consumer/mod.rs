@@ -624,6 +624,7 @@ impl ProsodyConsumer {
 
         let probe_server = config
             .probe_port
+            .filter(|_| !config.mock)
             .map(|port| ProbeServer::new(port, managers.clone(), heartbeat))
             .transpose()?;
 
