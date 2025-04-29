@@ -329,7 +329,7 @@ pub enum HighLevelClientError {
     Consumer(#[from] ConsumerError),
 
     /// Error when attempting to use an unconfigured consumer.
-    #[error("unconfigured consumer; create a client with a valid consumer configuration")]
+    #[error("unconfigured consumer; client does not have a valid consumer configuration")]
     UnconfiguredConsumer,
 
     /// Error when attempting to subscribe an already subscribed consumer.

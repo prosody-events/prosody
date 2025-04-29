@@ -14,6 +14,7 @@ use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use thiserror::Error;
+use tracing::info;
 
 /// A wrapper around a mutex guard for `ConsumerState`.
 ///
@@ -68,9 +69,14 @@ impl<T> ConsumerState<T> {
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
     ) -> Self {
-        ModeConfiguration::build(mode, consumer_builder, retry_builder, failure_topic_builder)
-            .map(ConsumerState::Configured)
-            .unwrap_or_default()
+        match ModeConfiguration::build(mode, consumer_builder, retry_builder, failure_topic_builder)
+        {
+            Ok(configuration) => Self::Configured(configuration),
+            Err(error) => {
+                info!("disabling consumer: {error:#}");
+                Self::default()
+            }
+        }
     }
 
     /// Retrieves a reference to the `ModeConfiguration` if available.
@@ -108,6 +114,6 @@ impl<T> Display for ConsumerState<T> {
 #[derive(Debug, Error)]
 pub enum ConsumerStateError {
     /// Attempted to use an unconfigured consumer.
-    #[error("unconfigured consumer; create a client with a valid consumer configuration")]
+    #[error("unconfigured consumer; client does not have a valid consumer configuration")]
     UnconfiguredConsumer,
 }
