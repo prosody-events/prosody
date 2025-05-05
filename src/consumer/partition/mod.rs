@@ -1,18 +1,22 @@
-//! A partition manager that processes messages concurrently while maintaining
-//! ordering within message groups.
+//! Manages message processing and offset tracking for individual Kafka
+//! partitions.
 //!
-//! This module orchestrates message processing for individual Kafka partitions
-//! by:
-//! - Supporting concurrent processing of messages with different keys
-//! - Preserving message order within each key
-//! - Tracking and committing message offsets
-//! - Handling graceful partition shutdown
-//! - Managing message queue backpressure
-//! - Deduplicating messages using idempotency identifiers
+//! This module orchestrates concurrent message processing while maintaining
+//! ordering guarantees within key groups:
+//!
+//! - Processes messages with different keys concurrently for high throughput
+//! - Preserves strict ordering for messages with the same key
+//! - Tracks and commits message offsets for exactly-once processing
+//! - Manages graceful shutdown of partition processing
+//! - Implements backpressure through buffer capacity limits
+//! - Deduplicates messages using event IDs
+//!
+//! The core component is `PartitionManager`, which coordinates all aspects
+//! of partition-level message processing.
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use std::future::ready;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -24,7 +28,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, debug_span, error, info, info_span, instrument};
 
 use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
@@ -44,9 +48,9 @@ mod test;
 /// Manages message processing and offset tracking for a single Kafka partition.
 ///
 /// Coordinates concurrent message processing by:
-/// - Queuing messages by key to maintain ordering within key groups
-/// - Tracking and committing message offsets
-/// - Managing partition shutdown
+/// - Queuing messages by key to maintain ordering for each key
+/// - Tracking and committing message offsets to ensure at-least-once processing
+/// - Managing graceful partition shutdown during rebalancing
 /// - Enforcing backpressure through queue capacity limits
 /// - Monitoring for processing stalls
 #[derive(Educe)]
@@ -129,7 +133,7 @@ impl PartitionManager {
             watermark_version,
         );
 
-        // Create descriptive name for the heartbeat
+        // Create descriptive name for the heartbeat monitor
         let name = format!("{topic}/{partition} event loop");
 
         // Initialize heartbeat, channels, and shutdown signals
@@ -164,6 +168,9 @@ impl PartitionManager {
 
     /// Checks if the partition can accept more messages.
     ///
+    /// This method indicates whether the internal message queue has capacity
+    /// for more messages, which is used to implement backpressure.
+    ///
     /// # Returns
     ///
     /// `true` if there is space in the message queue, `false` if the queue is
@@ -173,6 +180,10 @@ impl PartitionManager {
     }
 
     /// Attempts to enqueue a message for processing.
+    ///
+    /// This non-blocking method tries to send a message to the internal
+    /// processing queue without waiting. If the queue is full or closed,
+    /// the original message is returned.
     ///
     /// # Arguments
     ///
@@ -193,7 +204,8 @@ impl PartitionManager {
     /// Gets the current committed offset watermark.
     ///
     /// The watermark represents the highest contiguous offset that has been
-    /// successfully processed and committed.
+    /// successfully processed and committed. This is used for offset management
+    /// and reporting consumer progress.
     ///
     /// # Returns
     ///
@@ -211,6 +223,9 @@ impl PartitionManager {
     /// - The message processing heartbeat hasn't been updated within the stall
     ///   threshold
     ///
+    /// This method is used by health monitoring systems to detect processing
+    /// issues.
+    ///
     /// # Returns
     ///
     /// `true` if messages are not being processed within the configured stall
@@ -221,11 +236,13 @@ impl PartitionManager {
 
     /// Initiates an orderly partition shutdown.
     ///
-    /// This method:
+    /// This method performs a graceful shutdown sequence:
     /// 1. Closes the message channel to prevent new messages
     /// 2. Signals handlers to shut down gracefully
     /// 3. Waits for in-flight messages to complete processing
     /// 4. Performs final offset commits
+    ///
+    /// Used during consumer rebalancing or application shutdown.
     ///
     /// # Returns
     ///
@@ -253,14 +270,14 @@ impl PartitionManager {
             return None;
         }
 
-        // Perform final offset commit and get watermark
+        // Perform final offset commit and return the watermark
         self.offsets.shutdown().await
     }
 }
 
 /// Processes messages for a partition.
 ///
-/// This function:
+/// This function implements the main message processing pipeline:
 /// - Filters duplicate and out-of-order messages
 /// - Manages per-key message queues to preserve ordering
 /// - Handles offset tracking and commitment
@@ -303,61 +320,13 @@ async fn handle_messages<T>(
     let mut idempotence_cache = IdempotenceCache::new(idempotence_cache_size);
 
     // Create a processing pipeline for incoming messages
-    let stream = ReceiverStream::new(message_rx)
-        // Skip messages with offsets we've already seen (handles duplicates from Kafka)
-        .filter(|message| {
-            let partition = message.partition();
-            let offset = message.offset();
-
-            if offset <= highest_offset_seen {
-                debug!("filtering stale partition {partition} offset {offset}");
-                return ready(false);
-            }
-            highest_offset_seen = offset;
-            ready(true)
-        })
-        // Reserve offset and create uncommitted message
-        .filter_map(
-            async |received| match offsets.take(received.offset()).await {
-                Ok(uncommitted_offset) => Some(received.into_uncommitted(uncommitted_offset)),
-                Err(error) => {
-                    error!(
-                        ?received,
-                        "unable to take uncommitted offset: {error:#}; discarding message"
-                    );
-                    None
-                }
-            },
-        )
-        // Filter out messages where the source system matches the group identifier
-        // This prevents processing messages produced by this consumer group (loop avoidance)
-        .filter_map(|message| {
-            if message
-                .source_system()
-                .is_some_and(|source_system| source_system.as_str() == group_id.as_ref())
-            {
-                debug!(
-                    "skipping message because source system header matches the group identifier"
-                );
-                message.commit();
-                return ready(None);
-            }
-
-            ready(Some(message))
-        })
-        // Filter out duplicate messages using idempotence cache
-        .filter_map(|message| {
-            // Skip messages with duplicate event IDs
-            if let Some(event_id) =
-                idempotence_cache.check_duplicate(message.key(), message.payload())
-            {
-                info!("message with id {event_id} already processed; skipping");
-                message.commit();
-                return ready(None);
-            }
-
-            ready(Some(message))
-        });
+    let stream = build_stream(
+        &offsets,
+        message_rx,
+        group_id,
+        &mut highest_offset_seen,
+        &mut idempotence_cache,
+    );
 
     // Define how to process each message
     let process = |message: UncommittedMessage| async {
@@ -395,6 +364,119 @@ async fn handle_messages<T>(
 
     // Clean up handler resources after processing completes
     message_handler.shutdown().await;
+}
+
+/// Builds a message processing stream with filtering and deduplication.
+///
+/// Creates a stream that:
+/// - Filters out duplicate messages based on offsets
+/// - Reserves offsets for processing
+/// - Prevents consumer group loops by filtering messages from the same group
+/// - Deduplicates messages based on their event IDs
+///
+/// # Arguments
+///
+/// * `offsets` - Offset tracker for managing message offsets
+/// * `message_rx` - Receiver channel for incoming messages
+/// * `group_id` - Consumer group identifier
+/// * `highest_offset_seen` - Tracks the highest offset processed
+/// * `idempotence_cache` - Cache for detecting duplicate event IDs
+///
+/// # Returns
+///
+/// A stream of `UncommittedMessage` objects ready for processing
+fn build_stream(
+    offsets: &OffsetTracker,
+    message_rx: Receiver<ConsumerMessage>,
+    group_id: Arc<str>,
+    highest_offset_seen: &mut i64,
+    idempotence_cache: &mut IdempotenceCache,
+) -> impl Stream<Item = UncommittedMessage> {
+    ReceiverStream::new(message_rx)
+        // Skip messages with offsets we've already seen (handles duplicates from librdkafka)
+        .filter(|message| {
+            let partition = message.partition();
+            let offset = message.offset();
+
+            if offset <= *highest_offset_seen {
+                debug_span!(
+                    parent: message.span(),
+                    "message.filter",
+                    %partition, %offset, reason = "stale"
+                )
+                .in_scope(|| {
+                    debug!("filtering stale partition {partition} offset {offset}");
+                });
+
+                return ready(false);
+            }
+
+            *highest_offset_seen = offset;
+            ready(true)
+        })
+        // Reserve offset and create uncommitted message
+        .filter_map(async |received| {
+            let span = received.span().clone();
+            let _enter = span.enter();
+
+            match offsets.take(received.offset()).await {
+                Ok(uncommitted_offset) => Some(received.into_uncommitted(uncommitted_offset)),
+                Err(error) => {
+                    error!(
+                        ?received,
+                        "unable to take uncommitted offset: {error:#}; discarding message"
+                    );
+                    None
+                }
+            }
+        })
+        // Filter out messages where the source system matches the group identifier
+        // This prevents processing messages produced by this consumer group (loop avoidance)
+        .filter_map(move |message| {
+            if message
+                .source_system()
+                .is_some_and(|source_system| source_system.as_str() == group_id.as_ref())
+            {
+                info_span!(
+                    parent: message.span(),
+                    "message.filter",
+                    reason = "source-system-loop"
+                )
+                .in_scope(|| {
+                    debug!(
+                        "skipping message because source system header matches the group \
+                         identifier"
+                    );
+                });
+
+                message.commit();
+                return ready(None);
+            }
+
+            ready(Some(message))
+        })
+        // Filter out duplicate messages using idempotence cache
+        .filter_map(|message| {
+            // Skip messages with duplicate event IDs
+            if let Some(event_id) =
+                idempotence_cache.check_duplicate(message.key(), message.payload())
+            {
+                info_span!(
+                    parent: message.span(),
+                    "message.filter",
+                    reason = "duplicate-event-id",
+                    event_id
+                )
+                .in_scope(|| {
+                    info!("message with id {event_id} already processed; skipping");
+                });
+
+                message.commit();
+                return ready(None);
+            }
+
+            ready(Some(message))
+        })
 }
 
 /// Errors that can occur during partition operations.
