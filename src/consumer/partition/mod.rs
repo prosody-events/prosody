@@ -1,4 +1,5 @@
-//! Manages message processing and offset tracking for individual Kafka partitions.
+//! Manages message processing and offset tracking for individual Kafka
+//! partitions.
 //!
 //! This module orchestrates concurrent message processing while maintaining
 //! ordering guarantees within key groups:
@@ -410,8 +411,8 @@ fn build_stream(
 
 /// Filters out messages with offsets we've already processed.
 ///
-/// This prevents processing duplicate messages that might be delivered by Kafka,
-/// especially after consumer rebalances.
+/// This prevents processing duplicate messages that might be delivered by
+/// Kafka, especially after consumer rebalances.
 ///
 /// # Arguments
 ///
@@ -420,7 +421,8 @@ fn build_stream(
 ///
 /// # Returns
 ///
-/// `true` if the message should be processed, `false` if it should be filtered out
+/// `true` if the message should be processed, `false` if it should be filtered
+/// out
 fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Ready<bool> {
     let partition = message.partition();
     let offset = message.offset();
@@ -506,7 +508,8 @@ fn filter_loops(group_id: &str, message: UncommittedMessage) -> Ready<Option<Unc
 
 /// Filters messages based on their event type if filtering is enabled.
 ///
-/// Only messages with event types matching the allowed patterns will be processed.
+/// Only messages with event types matching the allowed patterns will be
+/// processed.
 ///
 /// # Arguments
 ///

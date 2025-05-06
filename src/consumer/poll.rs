@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::field::{Empty, debug};
+use tracing::field::Empty;
 use tracing::{debug, error, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -366,7 +366,8 @@ fn store_watermarks<T>(
             continue;
         };
 
-        // Store next offset after the watermark (Kafka commits the next expected offset)
+        // Store next offset after the watermark (Kafka commits the next expected
+        // offset)
         let next_offset = Offset::Offset(watermark + 1);
         if let Err(error) = list.add_partition_offset(topic, *partition, next_offset) {
             error!(
