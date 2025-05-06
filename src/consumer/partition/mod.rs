@@ -1,5 +1,4 @@
-//! Manages message processing and offset tracking for individual Kafka
-//! partitions.
+//! Manages message processing and offset tracking for individual Kafka partitions.
 //!
 //! This module orchestrates concurrent message processing while maintaining
 //! ordering guarantees within key groups:
@@ -47,6 +46,11 @@ mod util;
 #[cfg(test)]
 mod test;
 
+/// Configuration settings for a partition manager.
+///
+/// Contains all the parameters needed to configure message processing
+/// for a Kafka partition, including buffer sizes, concurrency limits,
+/// and filtering options.
 #[derive(Clone, Debug)]
 pub struct PartitionConfiguration {
     /// Consumer group identifier
@@ -120,6 +124,9 @@ impl PartitionManager {
     /// # Arguments
     ///
     /// * `config` - The partition configuration
+    /// * `handler` - The message handler that will process messages
+    /// * `topic` - The Kafka topic this partition belongs to
+    /// * `partition` - The partition number
     ///
     /// # Returns
     ///
@@ -292,7 +299,7 @@ impl PartitionManager {
 /// # Arguments
 ///
 /// * `config` - The partition configuration
-/// * `message_handler` - Handler that processes messages
+/// * `handler` - Handler that processes messages
 /// * `offsets` - Tracks offset commits and processing progress
 /// * `message_rx` - Channel receiving messages to process
 /// * `heartbeat` - Heartbeat used to detect stalled processing loop
@@ -401,6 +408,19 @@ fn build_stream(
         .filter_map(|message| filter_duplicate(idempotence_cache, message))
 }
 
+/// Filters out messages with offsets we've already processed.
+///
+/// This prevents processing duplicate messages that might be delivered by Kafka,
+/// especially after consumer rebalances.
+///
+/// # Arguments
+///
+/// * `highest_offset_seen` - Reference to the highest offset already processed
+/// * `message` - The message to check
+///
+/// # Returns
+///
+/// `true` if the message should be processed, `false` if it should be filtered out
 fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Ready<bool> {
     let partition = message.partition();
     let offset = message.offset();
@@ -422,6 +442,17 @@ fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Re
     ready(true)
 }
 
+/// Reserves an offset for a message and converts it to an uncommitted message.
+///
+/// # Arguments
+///
+/// * `offsets` - The offset tracker to reserve offsets from
+/// * `received` - The consumer message to process
+///
+/// # Returns
+///
+/// `Some(UncommittedMessage)` if the offset was successfully reserved,
+/// `None` if the reservation failed
 async fn reserve_offset(
     offsets: &OffsetTracker,
     received: ConsumerMessage,
@@ -441,6 +472,17 @@ async fn reserve_offset(
     }
 }
 
+/// Filters out messages produced by the same consumer group to prevent loops.
+///
+/// # Arguments
+///
+/// * `group_id` - The consumer group ID
+/// * `message` - The message to check
+///
+/// # Returns
+///
+/// `Some(message)` if the message should be processed,
+/// `None` if it should be filtered out
 fn filter_loops(group_id: &str, message: UncommittedMessage) -> Ready<Option<UncommittedMessage>> {
     if message
         .source_system()
@@ -462,6 +504,19 @@ fn filter_loops(group_id: &str, message: UncommittedMessage) -> Ready<Option<Unc
     ready(Some(message))
 }
 
+/// Filters messages based on their event type if filtering is enabled.
+///
+/// Only messages with event types matching the allowed patterns will be processed.
+///
+/// # Arguments
+///
+/// * `allowed_events` - Optional automaton defining allowed event type patterns
+/// * `message` - The message to check
+///
+/// # Returns
+///
+/// `Some(message)` if the message should be processed,
+/// `None` if it should be filtered out
 fn filter_event_type(
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage,
@@ -490,6 +545,20 @@ fn filter_event_type(
     ready(Some(message))
 }
 
+/// Filters out duplicate messages based on their event IDs.
+///
+/// Uses the idempotence cache to detect and filter messages that have already
+/// been processed, ensuring exactly-once processing semantics.
+///
+/// # Arguments
+///
+/// * `idempotence_cache` - Cache for detecting duplicate event IDs
+/// * `message` - The message to check
+///
+/// # Returns
+///
+/// `Some(message)` if the message should be processed,
+/// `None` if it should be filtered out as a duplicate
 fn filter_duplicate(
     idempotence_cache: &mut IdempotenceCache,
     message: UncommittedMessage,

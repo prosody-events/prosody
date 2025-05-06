@@ -1,7 +1,7 @@
 //! Kafka message polling and processing pipeline.
 //!
 //! This module implements the main message consumption loop that:
-//! - Polls messages from Kafka
+//! - Polls messages from Kafka brokers
 //! - Extracts and validates message data
 //! - Applies event type filtering
 //! - Maintains distributed tracing contexts
@@ -164,7 +164,7 @@ where
         debug!(topic, partition, offset, "poll complete");
     }
 
-    debug("polling stopped");
+    debug!("polling stopped");
 }
 
 /// Extracts and validates data from a Kafka message.
@@ -366,7 +366,7 @@ fn store_watermarks<T>(
             continue;
         };
 
-        // Store next offset after the watermark
+        // Store next offset after the watermark (Kafka commits the next expected offset)
         let next_offset = Offset::Offset(watermark + 1);
         if let Err(error) = list.add_partition_offset(topic, *partition, next_offset) {
             error!(
@@ -401,8 +401,8 @@ fn store_watermarks<T>(
 /// Pauses and resumes Kafka partitions based on their buffer capacity.
 ///
 /// This function manages backpressure by pausing partitions that are at
-/// capacity and resuming partitions that have available capacity. This the
-/// consumer from losing its partitions due to inactivity.
+/// capacity and resuming partitions that have available capacity. This prevents
+/// the consumer from losing its partitions due to inactivity.
 ///
 /// # Arguments
 ///

@@ -1,8 +1,8 @@
 //! Kafka consumer implementation for high-level message consumption and
 //! processing.
 //!
-//! This module provides an abstraction for consuming messages from Kafka
-//! topics:
+//! This module provides an abstraction for consuming messages from Kafka topics
+//! with support for:
 //!
 //! - Per-key concurrency with ordered processing within keys
 //! - Automatic partition assignment and revocation handling
@@ -340,7 +340,7 @@ pub struct ConsumerConfiguration {
     /// Default: 8
     ///
     /// Controls how many messages with the same key can be queued before
-    /// backpressuring
+    /// backpressuring.
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?",
         setter(into)
@@ -644,8 +644,8 @@ impl ProsodyConsumer {
     /// processing.
     ///
     /// Pipeline processing emphasizes reliability with automatic retries on
-    /// failure. Messages that fail processing will be retried indefinitely
-    /// with exponential backoff.
+    /// failure. Messages that fail processing will be retried with
+    /// exponential backoff.
     ///
     /// # Arguments
     ///
