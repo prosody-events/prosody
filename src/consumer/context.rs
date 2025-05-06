@@ -7,6 +7,7 @@
 //! - Ensures proper cleanup and offset commits during partition revocation
 //! - Coordinates graceful consumer shutdown
 
+use aho_corasick::AhoCorasick;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rdkafka::ClientContext;
@@ -52,6 +53,9 @@ where
     /// Size of idempotence cache
     idempotence_cache_size: usize,
 
+    /// Optional automaton for filtering messages by event type
+    pub allowed_events: Option<AhoCorasick>,
+
     /// Duration of inactivity allowed before considering a partition stalled
     stall_threshold: Duration,
 
@@ -83,11 +87,13 @@ where
     /// * `handler_provider` - Creates message handlers for partitions
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
+    /// * `allowed_events` - Optional filter for permitted event types
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers>,
+        allowed_events: Option<AhoCorasick>,
     ) -> Self {
         Self {
             group_id: Arc::from(config.group_id.as_str()),
@@ -95,6 +101,7 @@ where
             max_uncommitted: config.max_uncommitted,
             max_enqueued_per_key: config.max_enqueued_per_key,
             idempotence_cache_size: config.idempotence_cache_size,
+            allowed_events,
             stall_threshold: config.stall_threshold,
             shutdown_timeout: config.shutdown_timeout,
             handler_provider,
@@ -164,6 +171,7 @@ where
                         self.max_uncommitted,
                         self.max_enqueued_per_key,
                         self.idempotence_cache_size,
+                        self.allowed_events.clone(),
                         self.shutdown_timeout,
                         self.stall_threshold,
                         self.watermark_version.clone(),

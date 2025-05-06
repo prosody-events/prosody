@@ -1,4 +1,16 @@
 services:
+  lgtm:
+    image: grafana/otel-lgtm:0.8.1
+    container_name: lgtm
+    ports:
+      - "3000:3000" # Grafana UI
+      - "4317:4317" # OTLP gRPC ingest
+      - "4318:4318" # OTLP HTTP ingest
+    volumes:
+      - lgtm_data:/data
+    environment:
+      GF_PATHS_DATA: /data/grafana
+
   kafka:
     image: docker.io/bitnami/kafka:3.7
     ports:
@@ -32,4 +44,4 @@ services:
       - kafka
 volumes:
   kafka_data:
-    driver: local
+  lgtm_data:

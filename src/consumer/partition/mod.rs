@@ -14,9 +14,11 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
+use aho_corasick::{AhoCorasick, Anchored, Input};
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::{Stream, StreamExt};
+use serde_json::Value;
 use std::future::ready;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -94,6 +96,7 @@ impl PartitionManager {
     /// * `max_enqueued_per_key` - Maximum number of pending messages per key
     /// * `idempotence_cache_size` - Size of the cache for deduplicating
     ///   messages (set to 0 to disable)
+    /// * `allowed_events` - Optional filter for permitted event types
     /// * `shutdown_timeout` - How long to wait for message processing to
     ///   complete during shutdown
     /// * `stall_threshold` - Duration of inactivity allowed before considering
@@ -116,6 +119,7 @@ impl PartitionManager {
         max_uncommitted: usize,
         max_enqueued_per_key: usize,
         idempotence_cache_size: usize,
+        allowed_events: Option<AhoCorasick>,
         shutdown_timeout: Duration,
         stall_threshold: Duration,
         watermark_version: Arc<CachePadded<AtomicUsize>>,
@@ -150,6 +154,7 @@ impl PartitionManager {
             max_uncommitted,
             group_id,
             idempotence_cache_size,
+            allowed_events,
             global_limit,
             heartbeat.clone(),
             shutdown_rx,
@@ -295,6 +300,7 @@ impl PartitionManager {
 /// * `group_id` - Consumer group identifier
 /// * `idempotence_cache_size` - Size of cache for deduplicating messages by
 ///   event ID
+/// * `allowed_events` - Optional filter for permitted event types
 /// * `global_limit` - Global concurrency semaphore
 /// * `heartbeat` - Heartbeat used to detect stalled processing loop
 /// * `shutdown_rx` - Channel receiving shutdown signal
@@ -309,6 +315,7 @@ async fn handle_messages<T>(
     max_execution_count: usize,
     group_id: Arc<str>,
     idempotence_cache_size: usize,
+    allowed_events: Option<AhoCorasick>,
     global_limit: Arc<Semaphore>,
     heartbeat: Heartbeat,
     shutdown_rx: watch::Receiver<bool>,
@@ -326,6 +333,7 @@ async fn handle_messages<T>(
         group_id,
         &mut highest_offset_seen,
         &mut idempotence_cache,
+        allowed_events,
     );
 
     // Define how to process each message
@@ -372,6 +380,7 @@ async fn handle_messages<T>(
 /// - Filters out duplicate messages based on offsets
 /// - Reserves offsets for processing
 /// - Prevents consumer group loops by filtering messages from the same group
+/// - Filters messages based on their event type (if filtering is configured)
 /// - Deduplicates messages based on their event IDs
 ///
 /// # Arguments
@@ -381,6 +390,7 @@ async fn handle_messages<T>(
 /// * `group_id` - Consumer group identifier
 /// * `highest_offset_seen` - Tracks the highest offset processed
 /// * `idempotence_cache` - Cache for detecting duplicate event IDs
+/// * `allowed_events` - Optional filter for permitted event types
 ///
 /// # Returns
 ///
@@ -391,6 +401,7 @@ fn build_stream(
     group_id: Arc<str>,
     highest_offset_seen: &mut i64,
     idempotence_cache: &mut IdempotenceCache,
+    allowed_events: Option<AhoCorasick>,
 ) -> impl Stream<Item = UncommittedMessage> {
     ReceiverStream::new(message_rx)
         // Skip messages with offsets we've already seen (handles duplicates from librdkafka)
@@ -401,7 +412,7 @@ fn build_stream(
             if offset <= *highest_offset_seen {
                 debug_span!(
                     parent: message.span(),
-                    "message.filter",
+                    "message.filtered",
                     %partition, %offset, reason = "stale"
                 )
                 .in_scope(|| {
@@ -439,7 +450,7 @@ fn build_stream(
             {
                 info_span!(
                     parent: message.span(),
-                    "message.filter",
+                    "message.filtered",
                     reason = "source-system-loop"
                 )
                 .in_scope(|| {
@@ -447,6 +458,31 @@ fn build_stream(
                         "skipping message because source system header matches the group \
                          identifier"
                     );
+                });
+
+                message.commit();
+                return ready(None);
+            }
+
+            ready(Some(message))
+        })
+        // Filter messages based on event type if filtering is enabled
+        .filter_map(move |message| {
+            let Some(event_type) = message.payload().get("type").and_then(Value::as_str) else {
+                return ready(Some(message));
+            };
+
+            if allowed_events.as_ref().is_some_and(|automaton| {
+                let input = Input::new(event_type).anchored(Anchored::Yes);
+                automaton.find(input).is_none()
+            }) {
+                info_span!(
+                    parent: message.span(),
+                    "message.filtered",
+                    reason = "event-type"
+                )
+                .in_scope(|| {
+                    debug!("skipping message because {event_type} is not an allowed event type");
                 });
 
                 message.commit();
@@ -463,7 +499,7 @@ fn build_stream(
             {
                 info_span!(
                     parent: message.span(),
-                    "message.filter",
+                    "message.filtered",
                     reason = "duplicate-event-id",
                     event_id
                 )

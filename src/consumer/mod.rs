@@ -552,12 +552,24 @@ impl ProsodyConsumer {
         let managers: Arc<Managers> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
 
+        // Build event type search automaton
+        let allowed_events = config
+            .allowed_events
+            .as_ref()
+            .map(|prefixes| {
+                AhoCorasick::builder()
+                    .start_kind(StartKind::Anchored)
+                    .build(prefixes)
+            })
+            .transpose()?;
+
         // Create the consumer context with the message handler and shared state
         let context: Context<T> = Context::new(
             config,
             handler_provider,
             watermark_version.clone(),
             managers.clone(),
+            allowed_events,
         );
 
         let bootstrap = if config.mock {
@@ -591,17 +603,6 @@ impl ProsodyConsumer {
             .map(String::as_str)
             .collect();
 
-        // Build event type search automaton
-        let allowed_events = config
-            .allowed_events
-            .as_ref()
-            .map(|prefixes| {
-                AhoCorasick::builder()
-                    .start_kind(StartKind::Anchored)
-                    .build(prefixes)
-            })
-            .transpose()?;
-
         consumer.subscribe(&topics)?;
 
         // Spawn a blocking task to continuously poll for messages
@@ -613,7 +614,6 @@ impl ProsodyConsumer {
         let poll_handle = spawn_blocking(move || {
             poll(PollConfig {
                 poll_interval,
-                allowed_events,
                 consumer,
                 watermark_version: &watermark_version,
                 managers: &cloned_managers,

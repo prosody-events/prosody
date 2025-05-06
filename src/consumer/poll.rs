@@ -12,7 +12,6 @@
 //! The main entry point is the [`poll`] function, which orchestrates all these
 //! operations within a continuous loop until shutdown is signaled.
 
-use aho_corasick::{AhoCorasick, Anchored, Input};
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
@@ -21,7 +20,6 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::util::Timeout;
 use rdkafka::{Message, Offset, Timestamp, TopicPartitionList};
-use serde_json::Value;
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
@@ -61,9 +59,6 @@ where
 {
     /// Time between consecutive poll operations
     pub poll_interval: Duration,
-
-    /// Optional automaton for filtering messages by event type
-    pub allowed_events: Option<AhoCorasick>,
 
     /// The configured Kafka consumer with context
     pub consumer: BaseConsumer<Context<T>>,
@@ -107,7 +102,6 @@ where
     // Destructure configuration for cleaner access
     let PollConfig {
         poll_interval,
-        allowed_events,
         consumer,
         watermark_version,
         managers,
@@ -157,7 +151,6 @@ where
         // Process message through extraction, validation, and filtering
         let maybe_msg = process_message(
             &message,
-            allowed_events.as_ref(),
             &propagator,
             #[cfg(not(target_arch = "arm"))]
             &mut buffers,
@@ -180,13 +173,11 @@ where
 /// 1. Creates a tracing span with message metadata for observability
 /// 2. Extracts distributed tracing context from message headers
 /// 3. Parses the payload and validates it as JSON
-/// 4. Filters messages based on their event type (if filtering is configured)
-/// 5. Extracts the message key and timestamp
+/// 4. Extracts the message key and timestamp
 ///
 /// # Arguments
 ///
 /// * `message` - The Kafka message to process
-/// * `allowed_events` - Optional filter for permitted event types
 /// * `propagator` - Distributed tracing context propagator
 /// * `buffers` - (Non-ARM only) Buffers for SIMD JSON parsing
 ///
@@ -196,7 +187,6 @@ where
 /// * `None` - If the message is invalid or should be filtered out
 fn process_message(
     message: &BorrowedMessage,
-    allowed_events: Option<&AhoCorasick>,
     propagator: &TextMapCompositePropagator,
     #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
 ) -> Option<ConsumerMessage> {
@@ -262,20 +252,6 @@ fn process_message(
             return None;
         }
     };
-
-    // Filter messages based on event type if filtering is enabled
-    if let Some(event_type) = payload.get("type").and_then(Value::as_str) {
-        span.record("event_type", event_type);
-
-        if allowed_events.as_ref().is_some_and(|automaton| {
-            let input = Input::new(event_type).anchored(Anchored::Yes);
-            automaton.find(input).is_none()
-        }) {
-            span.record("skipped", true);
-            debug!("skipping message because {event_type} is not an allowed event type");
-            return None;
-        }
-    }
 
     // Validate message has key
     let Some(key_data) = message.key() else {
