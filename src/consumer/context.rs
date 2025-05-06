@@ -1,12 +1,18 @@
-//! Manages Kafka partition assignments, revocations, and consumer rebalancing.
+//! Manages Kafka partition assignments, revocations, and consumer group
+//! rebalancing.
 //!
-//! This module:
-//! - Handles dynamic partition assignments as consumers join or leave consumer
-//!   groups
-//! - Creates and manages `PartitionManager` instances for message processing
-//! - Ensures proper cleanup and offset commits during partition revocation
-//! - Coordinates graceful consumer shutdown
+//! This module implements the Kafka consumer rebalancing protocol that handles:
+//!
+//! - Dynamic partition assignment and revocation as consumers join/leave a
+//!   group
+//! - Creation and lifecycle management of `PartitionManager` instances
+//! - Concurrent shutdown of revoked partitions with proper cleanup
+//! - Coordination of partition handlers during consumer group rebalances
+//!
+//! The core component is the `Context` struct which implements Kafka's
+//! rebalance callbacks to manage partition lifecycle events.
 
+use aho_corasick::AhoCorasick;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rdkafka::ClientContext;
@@ -14,20 +20,21 @@ use rdkafka::consumer::{BaseConsumer, ConsumerContext, Rebalance};
 use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
-use crate::consumer::partition::PartitionManager;
+use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///
-/// Implements Kafka's rebalance callbacks to manage partition
-/// assignments/revocations and coordinates message processing through
-/// `PartitionManager` instances.
+/// Implements the rebalance protocol to handle dynamic partition assignments
+/// and revocations as consumers join or leave a consumer group. During
+/// assignments, it creates `PartitionManager` instances for each assigned
+/// partition. During revocations, it ensures proper cleanup and graceful
+/// shutdown of partition processing.
 ///
 /// # Type Parameters
 ///
@@ -37,35 +44,11 @@ pub struct Context<T>
 where
     T: HandlerProvider,
 {
-    /// Consumer group identifier
-    group_id: Arc<str>,
-
-    /// Maximum size of message buffers
-    buffer_size: usize,
-
-    /// Maximum number of uncommitted messages allowed
-    max_uncommitted: usize,
-
-    /// Maximum number of queued messages per key
-    max_enqueued_per_key: usize,
-
-    /// Size of idempotence cache
-    idempotence_cache_size: usize,
-
-    /// Duration of inactivity allowed before considering a partition stalled
-    stall_threshold: Duration,
-
-    /// Timeout duration for shutdown operations
-    shutdown_timeout: Duration,
+    /// Partition-level configuration settings
+    config: PartitionConfiguration,
 
     /// Creates message handlers for partitions
     handler_provider: T,
-
-    /// Shared counter tracking watermark updates
-    watermark_version: Arc<WatermarkVersion>,
-
-    /// Global concurrency limit
-    global_limit: Arc<Semaphore>,
 
     /// Thread-safe storage for partition managers
     managers: Arc<Managers>,
@@ -77,29 +60,40 @@ where
 {
     /// Creates a new consumer context with the given configuration.
     ///
+    /// Converts the consumer-level configuration into partition-level
+    /// configuration and initializes the context with the handler provider
+    /// and shared state.
+    ///
     /// # Arguments
     ///
     /// * `config` - Consumer configuration including buffer sizes and timeouts
     /// * `handler_provider` - Creates message handlers for partitions
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
+    /// * `allowed_events` - Optional filter for permitted event types
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers>,
+        allowed_events: Option<AhoCorasick>,
     ) -> Self {
-        Self {
+        let config = PartitionConfiguration {
             group_id: Arc::from(config.group_id.as_str()),
             buffer_size: config.max_uncommitted,
             max_uncommitted: config.max_uncommitted,
             max_enqueued_per_key: config.max_enqueued_per_key,
             idempotence_cache_size: config.idempotence_cache_size,
-            stall_threshold: config.stall_threshold,
+            allowed_events,
             shutdown_timeout: config.shutdown_timeout,
-            handler_provider,
+            stall_threshold: config.stall_threshold,
             watermark_version,
             global_limit: Arc::new(Semaphore::new(config.max_concurrency)),
+        };
+
+        Self {
+            config,
+            handler_provider,
             managers,
         }
     }
@@ -114,20 +108,21 @@ where
     /// Handles partition assignments and revocations during consumer group
     /// rebalancing.
     ///
-    /// For assignments:
-    /// - Creates new `PartitionManager` instances for assigned partitions
-    /// - Initializes message handlers for each partition
+    /// This method is called by librdkafka before a rebalance operation takes
+    /// place. It manages the creation and shutdown of partition managers
+    /// based on the rebalance type:
     ///
-    /// For revocations:
-    /// - Shuts down `PartitionManager` instances for revoked partitions
-    /// - Does not commit final offsets before releasing partitions. See: <https://github.com/confluentinc/librdkafka/issues/4059>.
+    /// - For assignments: Creates new `PartitionManager` instances for newly
+    ///   assigned partitions
+    /// - For revocations: Shuts down `PartitionManager` instances for revoked
+    ///   partitions
     ///
     /// # Arguments
     ///
     /// * `consumer` - The Kafka consumer instance
-    /// * `rebalance` - The rebalance event details
+    /// * `rebalance` - The rebalance event details containing partition
+    ///   assignments or revocations
     fn pre_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
-        // Notify that rebalance is in progress
         debug!("rebalance is starting");
 
         match rebalance {
@@ -150,25 +145,14 @@ where
                         continue;
                     };
 
+                    // Create a handler for this specific partition
                     let handler = self
                         .handler_provider
                         .handler_for_partition(topic, partition);
 
                     // Initialize new partition manager
-                    let manager = PartitionManager::new(
-                        self.group_id.clone(),
-                        topic,
-                        element.partition(),
-                        handler,
-                        self.buffer_size,
-                        self.max_uncommitted,
-                        self.max_enqueued_per_key,
-                        self.idempotence_cache_size,
-                        self.shutdown_timeout,
-                        self.stall_threshold,
-                        self.watermark_version.clone(),
-                        self.global_limit.clone(),
-                    );
+                    let manager =
+                        PartitionManager::new(self.config.clone(), handler, topic, partition);
 
                     vacant.insert(manager);
                     debug!("{topic}:{partition} assigned");
@@ -198,7 +182,7 @@ where
                     shutdown_futures.push(manager.shutdown());
                 }
 
-                // Wait for all shutdowns to complete
+                // Wait for all shutdowns to complete concurrently
                 Handle::current().block_on(shutdown_futures.for_each(|_| ready(())));
             }
             Rebalance::Error(error) => {
@@ -209,8 +193,17 @@ where
         debug!("pre-rebalance complete");
     }
 
+    /// Handles post-rebalance processing.
+    ///
+    /// This method is called by librdkafka after a rebalance operation has
+    /// completed. Currently, it simply logs that the rebalance has
+    /// completed.
+    ///
+    /// # Arguments
+    ///
+    /// * `consumer` - The Kafka consumer instance
+    /// * `rebalance` - The completed rebalance event details
     fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, _rebalance: &Rebalance) {
-        // Notify that rebalance is complete
         debug!("rebalance completed");
     }
 }
