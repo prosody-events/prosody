@@ -19,6 +19,7 @@ use rdkafka::util::Timeout;
 use std::env::var;
 use std::io;
 use std::mem::take;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
@@ -143,7 +144,7 @@ pub struct ProsodyProducer {
     producer: FutureProducer,
 
     /// Idempotence cache
-    idempotence_cache: Arc<Cache<Key, EventId>>,
+    idempotence_cache: Option<Arc<Cache<Key, EventId>>>,
 
     /// OpenTelemetry context propagator.
     #[educe(Debug(ignore))]
@@ -199,11 +200,14 @@ impl ProsodyProducer {
             .set("enable.idempotence", "true")
             .set_log_level(RDKafkaLogLevel::Error);
 
+        let idempotence_cache = NonZeroUsize::new(config.idempotence_cache_size)
+            .map(|size| Arc::new(Cache::new(size.into())));
+
         Ok(Self {
             send_timeout,
             source_system: config.source_system.clone().into_boxed_str(),
             producer: client_config.create()?,
-            idempotence_cache: Arc::new(Cache::new(config.idempotence_cache_size)),
+            idempotence_cache,
             propagator: new_propagator(),
         })
     }
@@ -312,25 +316,33 @@ impl ProsodyProducer {
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
     {
-        let maybe_guard = if let Some(event_id) = payload.event_id() {
-            match self
-                .idempotence_cache
-                .get_value_or_guard_async(&Key::from(key))
-                .await
-            {
-                Ok(value) if value == event_id => {
-                    let span =
-                        info_span!("message.filtered", reason = "duplicate-event-id", event_id);
-                    let _enter = span.enter();
-                    info!("message with id {event_id} already produced; skipping",);
-                    return Ok(());
+        let maybe_guard = match (&self.idempotence_cache, payload.event_id()) {
+            // 1) We have a cache and an event_id → try to get or guard
+            (Some(cache), Some(event_id)) => {
+                match cache.get_value_or_guard_async(&Key::from(key)).await {
+                    // a) it was already seen → early return
+                    Ok(prev) if prev == event_id => {
+                        let span =
+                            info_span!("message.filtered", reason = "duplicate-event-id", event_id);
+                        let _enter = span.enter();
+                        info!("message with id {event_id} already produced; skipping");
+                        return Ok(());
+                    }
+                    // b) it was a different ID → no guard
+                    Ok(_) => None,
+                    // c) we got the guard → hand it back
+                    Err(guard) => Some((guard, event_id)),
                 }
-                Ok(_) => None,
-                Err(guard) => Some((guard, event_id)),
             }
-        } else {
-            self.idempotence_cache.remove(&Key::from(key));
-            None
+
+            // 2) We have a cache but no event_id → clear any existing entry
+            (Some(cache), None) => {
+                cache.remove(&Key::from(key));
+                None
+            }
+
+            // 3) No cache → nothing to do
+            _ => None,
         };
 
         let serialized = json::to_vec(&payload)?;

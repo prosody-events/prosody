@@ -21,6 +21,7 @@ use futures::{Stream, StreamExt};
 use quick_cache::unsync::Cache;
 use serde_json::Value;
 use std::future::{Ready, ready};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -316,7 +317,9 @@ async fn handle_messages<T>(
     T: EventHandler,
 {
     let mut highest_offset_seen = -1;
-    let mut idempotence_cache = Cache::new(config.idempotence_cache_size);
+
+    let mut idempotence_cache =
+        NonZeroUsize::new(config.idempotence_cache_size).map(|size| Cache::new(size.into()));
 
     // Create a processing pipeline for incoming messages
     let stream = build_stream(
@@ -392,7 +395,7 @@ fn build_stream(
     message_rx: Receiver<ConsumerMessage>,
     group_id: &str,
     highest_offset_seen: &mut i64,
-    idempotence_cache: &mut Cache<Key, EventId>,
+    idempotence_cache: &mut Option<Cache<Key, EventId>>,
     allowed_events: Option<&AhoCorasick>,
 ) -> impl Stream<Item = UncommittedMessage> {
     ReceiverStream::new(message_rx)
@@ -557,9 +560,13 @@ fn filter_event_type(
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out as a duplicate
 fn filter_duplicate(
-    idempotence_cache: &mut Cache<Key, EventId>,
+    idempotence_cache: &mut Option<Cache<Key, EventId>>,
     message: UncommittedMessage,
 ) -> Ready<Option<UncommittedMessage>> {
+    let Some(idempotence_cache) = idempotence_cache else {
+        return ready(Some(message));
+    };
+
     let Some(event_id) = message.payload().event_id() else {
         idempotence_cache.remove(message.key());
         return ready(Some(message));
