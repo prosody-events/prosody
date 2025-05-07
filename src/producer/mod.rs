@@ -23,7 +23,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{Span, info_span, instrument, warn};
+use tracing::{Span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
@@ -331,38 +331,20 @@ impl ProsodyProducer {
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
     {
+        let maybe_event_id = payload.event_id();
+
         // Handle idempotence cache logic if enabled
-        let maybe_guard = match (&self.idempotence_cache, payload.event_id()) {
-            // If we have a cache and an event ID, check for duplicates
-            (Some(cache), Some(event_id)) => {
-                match cache.get_value_or_guard_async(&Key::from(key)).await {
-                    // If the ID already exists in the cache, skip sending
-                    Ok(prev) if prev == event_id => {
-                        let span =
-                            info_span!("message.filtered", reason = "duplicate-event-id", event_id);
-                        let _enter = span.enter();
-                        info!("message with id {event_id} already produced; skipping");
-                        return Ok(());
-                    }
-                    // If the existing ID is different, replace it with the new event_id
-                    Ok(_) => {
-                        cache.insert(Key::from(key), event_id.into());
-                        None
-                    }
-                    // Otherwise, get a guard to update the cache later
-                    Err(guard) => Some((guard, event_id)),
-                }
+        if let (Some(cache), Some(event_id)) = (&self.idempotence_cache, maybe_event_id) {
+            if matches!(
+                cache.get(&Key::from(key)),
+                Some(previous_event_id) if previous_event_id == event_id
+            ) {
+                let span = info_span!("message.filtered", reason = "duplicate-event-id", event_id);
+                let _enter = span.enter();
+                info!("message with id {event_id} already produced; skipping");
+                return Ok(());
             }
-
-            // If we have a cache but no event ID, remove any existing entry
-            (Some(cache), None) => {
-                cache.remove(&Key::from(key));
-                None
-            }
-
-            // No cache, nothing to do
-            _ => None,
-        };
+        }
 
         // Serialize the payload to JSON
         let serialized = json::to_vec(&payload)?;
@@ -413,12 +395,18 @@ impl ProsodyProducer {
             .record("offset", offset);
 
         // Update the idempotence cache if needed
-        if let Some((guard, event_id)) = maybe_guard {
-            if let Err(error) = guard.insert(event_id.into()) {
-                warn!("failed to insert message id {event_id} into idempotence cache: {error:#}");
-            }
-        }
+        let Some(cache) = &self.idempotence_cache else {
+            return Ok(());
+        };
 
+        let Some(event_id) = maybe_event_id else {
+            // If no event ID exists, remove it from the cache
+            cache.remove(&Key::from(key));
+            return Ok(());
+        };
+
+        // Insert the new event ID into the cache
+        cache.insert(Key::from(key), event_id.into());
         Ok(())
     }
 
