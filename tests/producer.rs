@@ -199,6 +199,50 @@ async fn case_reset_after_none(
     Ok(())
 }
 
+/// Tests that after switching IDs, a subsequent message with the original ID
+/// is delivered (i.e., cache updated on different ID). This catches the bug
+/// where the cache wasn’t updated when encountering a new event ID.
+async fn case_return_to_original_id(
+    producer: &ProsodyProducer,
+    topic: &Topic,
+    rx: &mut Receiver<(String, Value)>,
+    receive_timeout: Duration,
+) -> Result<()> {
+    let key = "return-key";
+    let id1 = "first_id";
+    let id2 = "second_id";
+    let m1 = Payload::from(json!({"id": id1, "value": "one"}));
+    let m2 = Payload::from(json!({"id": id2, "value": "two"}));
+    let m3 = Payload::from(json!({"id": id1, "value": "three"}));
+
+    producer.send([], *topic, key, &m1).await?;
+    producer.send([], *topic, key, &m2).await?;
+    producer.send([], *topic, key, &m3).await?;
+
+    expect_message(
+        rx,
+        receive_timeout,
+        key,
+        &json!({"id": id1, "value": "one"}),
+    )
+    .await?;
+    expect_message(
+        rx,
+        receive_timeout,
+        key,
+        &json!({"id": id2, "value": "two"}),
+    )
+    .await?;
+    expect_message(
+        rx,
+        receive_timeout,
+        key,
+        &json!({"id": id1, "value": "three"}),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Tests the message deduplication behavior of the Prosody producer.
 #[tokio::test]
 async fn test_producer_deduplication() -> Result<()> {
@@ -259,6 +303,7 @@ async fn test_producer_deduplication() -> Result<()> {
         no_message_timeout,
     )
     .await?;
+    case_return_to_original_id(&producer, &topic, &mut rx, receive_timeout).await?;
 
     // Teardown
     consumer_client.shutdown().await;

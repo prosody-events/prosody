@@ -344,8 +344,11 @@ impl ProsodyProducer {
                         info!("message with id {event_id} already produced; skipping");
                         return Ok(());
                     }
-                    // If a different ID exists, no need for a guard
-                    Ok(_) => None,
+                    // If the existing ID is different, replace it with the new event_id
+                    Ok(_) => {
+                        cache.insert(Key::from(key), event_id.into());
+                        None
+                    }
                     // Otherwise, get a guard to update the cache later
                     Err(guard) => Some((guard, event_id)),
                 }
