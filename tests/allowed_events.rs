@@ -3,7 +3,7 @@
 //! correctly filter out disallowed events and only process allowed ones.
 
 use crate::common::TestHandler;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::{
     Topic,
     admin::ProsodyAdminClient,
@@ -87,8 +87,9 @@ async fn test_allowed_events_filtering() -> Result<()> {
 
     // Shut down the consumer and assert the filtering behavior
     consumer.shutdown().await;
-    assert_eq!(received_key, key);
-    assert_eq!(received_payload, payload_allowed);
+
+    ensure!(received_key == key);
+    ensure!(received_payload == payload_allowed);
 
     // Clean up by deleting the test topic
     admin_client.delete_topic(&topic).await?;

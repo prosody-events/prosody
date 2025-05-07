@@ -7,7 +7,7 @@
 //! scenarios to validate that only expected messages are received.
 
 use crate::common::TestHandler;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::{
     Topic,
     admin::ProsodyAdminClient,
@@ -110,8 +110,8 @@ async fn run_scenario(
         let (recv_key, recv_payload) =
             recv_result.ok_or_else(|| eyre!("Did not receive the regular message"))?;
 
-        assert_eq!(recv_key, key, "keys did not match");
-        assert_eq!(recv_payload, payload, "payloads did not match");
+        ensure!(recv_key == key, "keys did not match");
+        ensure!(recv_payload == payload, "payloads did not match");
 
         // Verify the reception of the end-of-stream marker.
         let end_mark_result = timeout(timeout_duration, rx.recv()).await?;

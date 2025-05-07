@@ -3,7 +3,7 @@
 //! deduplicated correctly, so only one is processed.
 
 use crate::common::TestHandler;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, ensure};
 use prosody::{
     Topic,
     admin::ProsodyAdminClient,
@@ -95,15 +95,14 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
 
     // Verify that successful deduplication results in only the first message being
     // received
-    assert_eq!(
-        received_messages.len(),
-        1,
+    ensure!(
+        received_messages.len() == 1,
         "Expected one message due to deduplication"
     );
 
     let (recv_key, recv_payload) = &received_messages[0];
-    assert_eq!(recv_key, key);
-    assert_eq!(recv_payload, &payload);
+    ensure!(recv_key == key);
+    ensure!(recv_payload == &payload);
 
     // Clean up the test topic after verifying deduplication
     admin_client.delete_topic(&topic).await?;
