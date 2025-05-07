@@ -18,6 +18,7 @@ use aho_corasick::{AhoCorasick, Anchored, Input};
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::{Stream, StreamExt};
+use quick_cache::unsync::Cache;
 use serde_json::Value;
 use std::future::{Ready, ready};
 use std::sync::Arc;
@@ -37,8 +38,7 @@ use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessa
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Keyed};
-use crate::deduplication::IdempotenceCache;
-use crate::{Offset, Partition, Topic};
+use crate::{EventId, EventIdentity, Key, Offset, Partition, Topic};
 
 mod keyed;
 pub mod offsets;
@@ -316,7 +316,7 @@ async fn handle_messages<T>(
     T: EventHandler,
 {
     let mut highest_offset_seen = -1;
-    let mut idempotence_cache = IdempotenceCache::new(config.idempotence_cache_size);
+    let mut idempotence_cache = Cache::new(config.idempotence_cache_size);
 
     // Create a processing pipeline for incoming messages
     let stream = build_stream(
@@ -392,20 +392,14 @@ fn build_stream(
     message_rx: Receiver<ConsumerMessage>,
     group_id: &str,
     highest_offset_seen: &mut i64,
-    idempotence_cache: &mut IdempotenceCache,
+    idempotence_cache: &mut Cache<Key, EventId>,
     allowed_events: Option<&AhoCorasick>,
 ) -> impl Stream<Item = UncommittedMessage> {
     ReceiverStream::new(message_rx)
-        // Skip messages with offsets we've already seen (handles duplicates from librdkafka)
         .filter(|message| filter_rewind(highest_offset_seen, message))
-        // Reserve offset and create uncommitted message
         .filter_map(async |received| reserve_offset(offsets, received).await)
-        // Filter out messages where the source system matches the group identifier
-        // This prevents processing messages produced by this consumer group (loop avoidance)
         .filter_map(move |message| filter_loops(group_id, message))
-        // Filter messages based on event type if filtering is enabled
         .filter_map(move |message| filter_event_type(allowed_events, message))
-        // Filter out duplicate messages using idempotence cache
         .filter_map(|message| filter_duplicate(idempotence_cache, message))
 }
 
@@ -563,25 +557,48 @@ fn filter_event_type(
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out as a duplicate
 fn filter_duplicate(
-    idempotence_cache: &mut IdempotenceCache,
+    idempotence_cache: &mut Cache<Key, EventId>,
     message: UncommittedMessage,
 ) -> Ready<Option<UncommittedMessage>> {
-    if let Some(event_id) = idempotence_cache.check_duplicate(message.key(), message.payload()) {
-        info_span!(
-            parent: message.span(),
-            "message.filtered",
-            reason = "duplicate-event-id",
-            event_id
-        )
-        .in_scope(|| {
-            info!("message with id {event_id} already processed; skipping");
-        });
+    let Some(event_id) = message.payload().event_id() else {
+        idempotence_cache.remove(message.key());
+        return ready(Some(message));
+    };
 
-        message.commit();
-        return ready(None);
+    match idempotence_cache.get_mut_or_guard(message.key()) {
+        // Item is not in the cache; insert it
+        Err(guard) => {
+            guard.insert(event_id.into());
+            ready(Some(message))
+        }
+
+        // Existing item could not be retrieved; skip it
+        Ok(None) => ready(Some(message)),
+
+        // Item is in the cache
+        Ok(Some(mut value)) => {
+            // Check if the event ID in the cache matches the message's event ID
+            if value.as_str() == event_id {
+                // Record a span and skip the message
+                info_span!(
+                    parent: message.span(),
+                    "message.filtered",
+                    reason = "duplicate-event-id",
+                    event_id
+                )
+                .in_scope(|| {
+                    info!("message with id {event_id} already processed; skipping");
+                });
+
+                message.commit();
+                ready(None)
+            } else {
+                // Set the existing value to the new event ID
+                *value = event_id.into();
+                ready(Some(message))
+            }
+        }
     }
-
-    ready(Some(message))
 }
 
 /// Errors that can occur during partition operations.

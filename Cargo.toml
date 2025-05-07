@@ -28,7 +28,7 @@ fixedstr = { version = "0.5", features = ["flex-str"] }
 futures = "0.3"
 humantime = "2.2"
 internment = "0.8"
-lru = { version = "0.14", features = ["hashbrown"] }
+quick_cache = "0.6"
 nohash-hasher = "0.2"
 opentelemetry = "0.28"
 opentelemetry-otlp = { version = "0.28", features = [

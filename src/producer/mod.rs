@@ -7,7 +7,7 @@
 use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
-use parking_lot::Mutex;
+use quick_cache::sync::Cache;
 use rdkafka::ClientConfig;
 use rdkafka::client::{Client, DefaultClientContext};
 use rdkafka::config::RDKafkaLogLevel;
@@ -22,24 +22,26 @@ use std::mem::take;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{Span, instrument, warn};
+use tracing::{Span, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
-use crate::deduplication::IdempotenceCache;
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::util::{
     from_env, from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env,
 };
-use crate::{MOCK_CLUSTER_BOOTSTRAP, Payload, SOURCE_SYSTEM_HEADER, Topic};
+use crate::{
+    EventId, EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, Payload, SOURCE_SYSTEM_HEADER, Topic,
+};
 
 #[cfg(target_arch = "arm")]
 use serde_json as json;
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json as json;
+use tracing::log::info;
 
 mod injector;
 
@@ -141,7 +143,7 @@ pub struct ProsodyProducer {
     producer: FutureProducer,
 
     /// Idempotence cache
-    idempotence_cache: Arc<Mutex<IdempotenceCache>>,
+    idempotence_cache: Arc<Cache<Key, EventId>>,
 
     /// OpenTelemetry context propagator.
     #[educe(Debug(ignore))]
@@ -201,9 +203,7 @@ impl ProsodyProducer {
             send_timeout,
             source_system: config.source_system.clone().into_boxed_str(),
             producer: client_config.create()?,
-            idempotence_cache: Arc::new(Mutex::new(IdempotenceCache::new(
-                config.idempotence_cache_size,
-            ))),
+            idempotence_cache: Arc::new(Cache::new(config.idempotence_cache_size)),
             propagator: new_propagator(),
         })
     }
@@ -312,15 +312,26 @@ impl ProsodyProducer {
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
     {
-        // Skip messages with duplicate event IDs
-        if let Some(event_id) = self
-            .idempotence_cache
-            .lock()
-            .check_duplicate(&key.into(), payload)
-        {
-            warn!("message with id {event_id} already produced; skipping",);
-            return Ok(());
-        }
+        let maybe_guard = if let Some(event_id) = payload.event_id() {
+            match self
+                .idempotence_cache
+                .get_value_or_guard_async(&Key::from(key))
+                .await
+            {
+                Ok(value) if value == event_id => {
+                    let span =
+                        info_span!("message.filtered", reason = "duplicate-event-id", event_id);
+                    let _enter = span.enter();
+                    info!("message with id {event_id} already produced; skipping",);
+                    return Ok(());
+                }
+                Ok(_) => None,
+                Err(guard) => Some((guard, event_id)),
+            }
+        } else {
+            self.idempotence_cache.remove(&Key::from(key));
+            None
+        };
 
         let serialized = json::to_vec(&payload)?;
         Span::current().record("payload_size", serialized.len());
@@ -361,6 +372,15 @@ impl ProsodyProducer {
         Span::current()
             .record("partition", partition)
             .record("offset", offset);
+
+        if let Some((guard, event_id)) = maybe_guard {
+            if let Err(error) = guard.insert(event_id.into()) {
+                warn!(
+                    "failed to insert message id {event_id} into
+            idempotence cache: {error:#}"
+                );
+            }
+        }
 
         Ok(())
     }
