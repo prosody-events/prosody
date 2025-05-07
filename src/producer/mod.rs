@@ -332,11 +332,12 @@ impl ProsodyProducer {
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
     {
         let maybe_event_id = payload.event_id();
+        let key: Key = key.into();
 
         // Handle idempotence cache logic if enabled
         if let (Some(cache), Some(event_id)) = (&self.idempotence_cache, maybe_event_id) {
             if matches!(
-                cache.get(&Key::from(key)),
+                cache.get(&key),
                 Some(previous_event_id) if previous_event_id == event_id
             ) {
                 let span = info_span!("message.filtered", reason = "duplicate-event-id", event_id);
@@ -352,7 +353,7 @@ impl ProsodyProducer {
 
         // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
-            .key(key)
+            .key(key.as_str())
             .payload(&serialized)
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 
@@ -401,12 +402,12 @@ impl ProsodyProducer {
 
         let Some(event_id) = maybe_event_id else {
             // If no event ID exists, remove it from the cache
-            cache.remove(&Key::from(key));
+            cache.remove(&key);
             return Ok(());
         };
 
         // Insert the new event ID into the cache
-        cache.insert(Key::from(key), event_id.into());
+        cache.insert(key, event_id.into());
         Ok(())
     }
 
