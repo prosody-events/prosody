@@ -67,7 +67,7 @@ pub struct PartitionConfiguration {
     /// Maximum number of queued messages per key
     pub max_enqueued_per_key: usize,
 
-    /// Size of idempotence cache
+    /// Size of idempotence cache for message deduplication
     pub idempotence_cache_size: usize,
 
     /// Optional automaton for filtering messages by event type
@@ -318,6 +318,7 @@ async fn handle_messages<T>(
 {
     let mut highest_offset_seen = -1;
 
+    // Initialize idempotence cache if configured
     let mut idempotence_cache =
         NonZeroUsize::new(config.idempotence_cache_size).map(|size| Cache::new(size.into()));
 
@@ -399,6 +400,7 @@ fn build_stream(
     allowed_events: Option<&AhoCorasick>,
 ) -> impl Stream<Item = UncommittedMessage> {
     ReceiverStream::new(message_rx)
+        // Apply a series of filters in a pipeline
         .filter(|message| filter_rewind(highest_offset_seen, message))
         .filter_map(async |received| reserve_offset(offsets, received).await)
         .filter_map(move |message| filter_loops(group_id, message))
@@ -424,6 +426,7 @@ fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Re
     let partition = message.partition();
     let offset = message.offset();
 
+    // Skip messages with offsets we've already seen
     if offset <= *highest_offset_seen {
         debug_span!(
             parent: message.span(),
@@ -437,6 +440,7 @@ fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Re
         return ready(false);
     }
 
+    // Update the highest offset seen
     *highest_offset_seen = offset;
     ready(true)
 }
@@ -459,6 +463,7 @@ async fn reserve_offset(
     let span = received.span().clone();
     let _enter = span.enter();
 
+    // Attempt to reserve the offset
     match offsets.take(received.offset()).await {
         Ok(uncommitted_offset) => Some(received.into_uncommitted(uncommitted_offset)),
         Err(error) => {
@@ -483,6 +488,8 @@ async fn reserve_offset(
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
 fn filter_loops(group_id: &str, message: UncommittedMessage) -> Ready<Option<UncommittedMessage>> {
+    // Check if the message comes from the same source system as our own consumer
+    // group
     if message
         .source_system()
         .is_some_and(|source_system| source_system.as_str() == group_id)
@@ -496,6 +503,7 @@ fn filter_loops(group_id: &str, message: UncommittedMessage) -> Ready<Option<Unc
             debug!("skipping message because source system header matches the group identifier");
         });
 
+        // Commit the message and filter it out
         message.commit();
         return ready(None);
     }
@@ -521,10 +529,12 @@ fn filter_event_type(
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage,
 ) -> Ready<Option<UncommittedMessage>> {
+    // Extract event type from message payload if present
     let Some(event_type) = message.payload().get("type").and_then(Value::as_str) else {
         return ready(Some(message));
     };
 
+    // Check if the event type is allowed
     if allowed_events.as_ref().is_some_and(|automaton| {
         let input = Input::new(event_type).anchored(Anchored::Yes);
         automaton.find(input).is_none()
@@ -538,6 +548,7 @@ fn filter_event_type(
             debug!("skipping message because {event_type} is not an allowed event type");
         });
 
+        // Commit the message and filter it out
         message.commit();
         return ready(None);
     }
@@ -563,10 +574,12 @@ fn filter_duplicate(
     idempotence_cache: &mut Option<Cache<Key, EventId>>,
     message: UncommittedMessage,
 ) -> Ready<Option<UncommittedMessage>> {
+    // Skip deduplication if no cache is configured
     let Some(idempotence_cache) = idempotence_cache else {
         return ready(Some(message));
     };
 
+    // If the message has no event ID, remove any existing entry for this key
     let Some(event_id) = message.payload().event_id() else {
         idempotence_cache.remove(message.key());
         return ready(Some(message));
@@ -600,7 +613,7 @@ fn filter_duplicate(
                 message.commit();
                 ready(None)
             } else {
-                // Set the existing value to the new event ID
+                // Update the cache with the new event ID
                 *value = event_id.into();
                 ready(Some(message))
             }

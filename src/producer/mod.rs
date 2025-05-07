@@ -46,9 +46,14 @@ use tracing::log::info;
 
 mod injector;
 
+/// Environment variable name for the source system identifier.
 const PROSODY_SOURCE_SYSTEM: &str = "PROSODY_SOURCE_SYSTEM";
 
 /// Configuration for the Kafka producer.
+///
+/// This struct holds all the necessary configuration options for creating a
+/// Kafka producer. It uses the Builder pattern for flexible initialization and
+/// supports loading values from environment variables.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct ProducerConfiguration {
     /// List of Kafka bootstrap servers.
@@ -130,6 +135,15 @@ impl ProducerConfiguration {
 }
 
 /// High-level Kafka producer implementation.
+///
+/// `ProsodyProducer` handles message serialization, OpenTelemetry context
+/// propagation, and provides idempotent delivery semantics through an optional
+/// cache.
+///
+/// The producer can be configured in three operational modes:
+/// - Pipeline: Focuses on reliable delivery with indefinite retries
+/// - Low-latency: Balances speed and reliability with configurable timeouts
+/// - Best-effort: Optimized for throughput with reasonable timeout defaults
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct ProsodyProducer {
@@ -143,7 +157,7 @@ pub struct ProsodyProducer {
     #[educe(Debug(ignore))]
     producer: FutureProducer,
 
-    /// Idempotence cache
+    /// Idempotence cache for deduplicating messages.
     idempotence_cache: Option<Arc<Cache<Key, EventId>>>,
 
     /// OpenTelemetry context propagator.
@@ -172,8 +186,7 @@ impl ProsodyProducer {
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `ProsodyProducer` instance or a
-    /// `ProducerError`.
+    /// A `Result` containing the new `ProsodyProducer` instance if successful.
     ///
     /// # Errors
     ///
@@ -192,6 +205,7 @@ impl ProsodyProducer {
             config.bootstrap_servers.join(",")
         };
 
+        // Configure the Kafka client with sensible defaults
         let mut client_config = ClientConfig::new();
         client_config
             .set("bootstrap.servers", bootstrap)
@@ -200,6 +214,7 @@ impl ProsodyProducer {
             .set("enable.idempotence", "true")
             .set_log_level(RDKafkaLogLevel::Error);
 
+        // Create idempotence cache if size is non-zero
         let idempotence_cache = NonZeroUsize::new(config.idempotence_cache_size)
             .map(|size| Arc::new(Cache::new(size.into())));
 
@@ -316,11 +331,12 @@ impl ProsodyProducer {
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
     {
+        // Handle idempotence cache logic if enabled
         let maybe_guard = match (&self.idempotence_cache, payload.event_id()) {
-            // 1) We have a cache and an event_id → try to get or guard
+            // If we have a cache and an event ID, check for duplicates
             (Some(cache), Some(event_id)) => {
                 match cache.get_value_or_guard_async(&Key::from(key)).await {
-                    // a) it was already seen → early return
+                    // If the ID already exists in the cache, skip sending
                     Ok(prev) if prev == event_id => {
                         let span =
                             info_span!("message.filtered", reason = "duplicate-event-id", event_id);
@@ -328,46 +344,52 @@ impl ProsodyProducer {
                         info!("message with id {event_id} already produced; skipping");
                         return Ok(());
                     }
-                    // b) it was a different ID → no guard
+                    // If a different ID exists, no need for a guard
                     Ok(_) => None,
-                    // c) we got the guard → hand it back
+                    // Otherwise, get a guard to update the cache later
                     Err(guard) => Some((guard, event_id)),
                 }
             }
 
-            // 2) We have a cache but no event_id → clear any existing entry
+            // If we have a cache but no event ID, remove any existing entry
             (Some(cache), None) => {
                 cache.remove(&Key::from(key));
                 None
             }
 
-            // 3) No cache → nothing to do
+            // No cache, nothing to do
             _ => None,
         };
 
+        // Serialize the payload to JSON
         let serialized = json::to_vec(&payload)?;
         Span::current().record("payload_size", serialized.len());
 
+        // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
             .key(key)
             .payload(&serialized)
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 
+        // Inject OpenTelemetry context
         self.propagator.inject_context(
             &Span::current().context(),
             &mut RecordInjector::new(&mut record),
         );
 
+        // Add custom headers
         let headers = headers.into_iter();
         let owned_headers = record
             .headers
             .get_or_insert_with(|| OwnedHeaders::new_with_capacity(headers.len() + 1));
 
+        // Add source system header
         *owned_headers = take(owned_headers).insert(Header {
             key: SOURCE_SYSTEM_HEADER,
             value: Some(self.source_system.as_bytes()),
         });
 
+        // Add all custom headers
         for (key, value) in headers {
             *owned_headers = take(owned_headers).insert(Header {
                 key,
@@ -375,22 +397,22 @@ impl ProsodyProducer {
             });
         }
 
+        // Send the message to Kafka
         let (partition, offset) = self
             .producer
             .send(record, self.send_timeout)
             .await
             .map_err(|(error, _)| ProducerError::Kafka(error))?;
 
+        // Record partition and offset in the current span
         Span::current()
             .record("partition", partition)
             .record("offset", offset);
 
+        // Update the idempotence cache if needed
         if let Some((guard, event_id)) = maybe_guard {
             if let Err(error) = guard.insert(event_id.into()) {
-                warn!(
-                    "failed to insert message id {event_id} into
-            idempotence cache: {error:#}"
-                );
+                warn!("failed to insert message id {event_id} into idempotence cache: {error:#}");
             }
         }
 
@@ -399,7 +421,12 @@ impl ProsodyProducer {
 
     /// Retrieves the underlying Kafka client.
     ///
-    /// This method is primarily used for internal purposes.
+    /// This method is primarily used for internal purposes like checking topic
+    /// existence.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the underlying Kafka client.
     pub(crate) fn kafka_client(&self) -> &Client<FutureProducerContext<DefaultClientContext>> {
         self.producer.client()
     }
