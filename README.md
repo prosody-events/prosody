@@ -67,17 +67,20 @@ impl FallibleHandler for MyHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_servers = ["localhost:9092".to_owned()];
 
-    // To allow loopbacks, the source_system must be different from the group_id.
-    // Normally, the source_system would be left unspecified, which would default to the group_id.
-    let mut producer_config = ProducerConfiguration::builder();
-    producer_config
-        .bootstrap_servers(bootstrap_servers.clone())
-        .source_system("my-source");
-
+    // The group identifier is the name of your Kafka consumer group. It should be set to the name of your application.
     let mut consumer_config = ConsumerConfiguration::builder();
     consumer_config.bootstrap_servers(bootstrap_servers)
         .group_id("my-group")
         .subscribed_topics(["my-topic".to_owned()]);
+
+
+    // To allow loopbacks, the source_system must be different from the group_id.
+    // Normally, the source_system would be left unspecified and would default to the group_id if a consumer is 
+    // configured.
+    let mut producer_config = ProducerConfiguration::builder();
+    producer_config
+        .bootstrap_servers(bootstrap_servers.clone())
+        .source_system("my-source");
 
     let retry_config = RetryConfiguration::builder();
 
@@ -212,22 +215,20 @@ deduplication**.
 ### Source System Deduplication
 
 Prosody introduces the `source-system` header to prevent processing loops caused by messages being reprocessed by the
-same system that produced them. This behavior is configured automatically:
+same system that produced them:
 
-- **Producers** automatically add a `source-system` header to all outgoing messages.
+- **Producers** add a `source-system` header to all outgoing messages.
 - **Consumers** check incoming messages for the `source-system` header.
 - If a message's `source-system` header matches the consumer group, the message is skipped.
 
 This ensures that messages re-emitted by a consumer (e.g., for retry or forwarding purposes) do not create infinite
-processing loops.
-
-To explicitly set the producer's source system identifier, configure:
+processing loops. If your application is doing both consumption and production, the source system will default to your
+consumer group identifier. If your application is only producing messages and never configures a consumer, you will need
+to set the source system. To explicitly set the producer's source system identifier, configure:
 
 ```sh
 export PROSODY_SOURCE_SYSTEM="my-service"
 ```
-
-Prosody will inherit the consumer group ID as the `source-system` if the value is not explicitly provided.
 
 ### Idempotence Deduplication
 
