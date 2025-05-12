@@ -29,10 +29,9 @@ impl ActiveTriggers {
     }
 
     pub async fn key_times(&self, key: &Key) -> BTreeSet<DateTime<Utc>> {
-        let Some(entry) = self.0.get_async(key).await else {
-            return BTreeSet::default();
-        };
-
-        entry.get().clone()
+        self.0
+            .read_async(key, |_, v| v.clone())
+            .await
+            .unwrap_or_default()
     }
 }
