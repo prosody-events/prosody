@@ -1,40 +1,36 @@
 #![allow(dead_code, clippy::unused_async)]
 
 use crate::Key;
-use ahash::{HashMap, HashMapExt, HashSet};
+use crate::timers::active::ActiveTriggers;
+use crate::timers::triggers::Triggers;
 use chrono::{DateTime, OutOfRangeError, Utc};
 use futures::TryFutureExt;
-use scc::hash_map::Entry;
-use std::future::poll_fn;
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::{select, spawn};
-use tokio_util::time::{DelayQueue, delay_queue};
 use tracing::error;
+
+mod active;
+mod triggers;
 
 const BUFFER_SIZE: usize = 64;
 
-type ActiveTriggers = scc::HashMap<Key, HashSet<DateTime<Utc>>>;
-
 #[derive(Clone, Debug)]
-struct Timer {
+struct TimerManager {
     command_tx: mpsc::Sender<Command>,
-    active_triggers: Arc<ActiveTriggers>,
+    active_triggers: ActiveTriggers,
 }
 
-impl Timer {
+impl TimerManager {
     pub fn new() -> (mpsc::Receiver<Trigger>, Self) {
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
         let (triggers_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
-        let active_triggers = Arc::new(ActiveTriggers::new());
+        let triggers = Triggers::new();
+        let active_triggers = triggers.active().clone();
 
-        spawn(process_commands(
-            commands_rx,
-            triggers_tx,
-            active_triggers.clone(),
-        ));
+        spawn(process_commands(commands_rx, triggers_tx, triggers));
 
         (
             triggers_rx,
@@ -75,11 +71,8 @@ impl Timer {
         result_rx.map_err(|_| TimerError::Shutdown).await?
     }
 
-    pub async fn active_times(&self, key: &Key) -> Option<Vec<DateTime<Utc>>> {
-        let times = self.active_triggers.get_async(key).await?;
-        let mut sorted_times: Vec<DateTime<Utc>> = times.iter().copied().collect();
-        sorted_times.sort();
-        Some(sorted_times)
+    pub async fn active_times(&self, key: &Key) -> BTreeSet<DateTime<Utc>> {
+        self.active_triggers.key_times(key).await
     }
 }
 
@@ -97,7 +90,7 @@ enum CommandOperation {
     Remove,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
 struct Trigger {
     key: Key,
     time: DateTime<Utc>,
@@ -105,11 +98,9 @@ struct Trigger {
 
 async fn process_commands(
     mut commands: mpsc::Receiver<Command>,
-    triggers: mpsc::Sender<Trigger>,
-    active: Arc<ActiveTriggers>,
+    trigger_tx: mpsc::Sender<Trigger>,
+    mut triggers: Triggers,
 ) {
-    let mut queue = DelayQueue::new();
-    let mut queue_keys = HashMap::new();
     let mut trigger_to_send: Option<Trigger> = None;
 
     loop {
@@ -119,10 +110,10 @@ async fn process_commands(
                     let Some(command) = result else {
                         break;
                     };
-                    process_command(&mut queue, &mut queue_keys, &active, command).await;
+                    process_command(&mut triggers, command).await;
                 }
 
-                result = triggers.send(trigger.clone()) => {
+                result = trigger_tx.send(trigger.clone()) => {
                     trigger_to_send.take();
                     if result.is_err() {
                         break;
@@ -135,15 +126,11 @@ async fn process_commands(
                     let Some(command) = result else {
                         break;
                     };
-                    process_command(&mut queue, &mut queue_keys, &active, command).await;
+                    process_command(&mut triggers, command).await;
                 }
 
-                Some(expired) = poll_fn(|cx| queue.poll_expired(cx)) => {
-                    let (key, time) = expired.into_inner();
-                    if let Err(error) = triggers.try_send(Trigger {
-                        key,
-                        time,
-                    }) {
+                Some(trigger) = triggers.next() => {
+                    if let Err(error) = trigger_tx.try_send(trigger) {
                         match error {
                             TrySendError::Full(trigger) => trigger_to_send = Some(trigger),
                             TrySendError::Closed(_) => break
@@ -155,85 +142,43 @@ async fn process_commands(
     }
 }
 
-async fn process_command(
-    queue: &mut DelayQueue<(Key, DateTime<Utc>)>,
-    queue_keys: &mut HashMap<(Key, DateTime<Utc>), delay_queue::Key>,
-    active: &ActiveTriggers,
-    command: Command,
-) {
+async fn process_command(triggers: &mut Triggers, command: Command) {
     match command.operation {
-        CommandOperation::Add => add_time(queue, queue_keys, active, command).await,
-        CommandOperation::Remove => remove_time(queue, queue_keys, active, command).await,
+        CommandOperation::Add => add_time(triggers, command).await,
+        CommandOperation::Remove => remove_time(triggers, command).await,
     }
 }
 
 async fn add_time(
-    queue: &mut DelayQueue<(Key, DateTime<Utc>)>,
-    queue_keys: &mut HashMap<(Key, DateTime<Utc>), delay_queue::Key>,
-    active: &ActiveTriggers,
-    command: Command,
-) {
-    let time = command.time;
-    let key = command.key;
-
-    let duration = match time.signed_duration_since(Utc::now()).to_std() {
-        Ok(duration) => duration,
-        Err(error) => {
-            send_result(command.result_tx, &key, &time, Err(error.into()));
-            return;
-        }
-    };
-
-    let queue_key = queue.insert((key.clone(), time), duration);
-    queue_keys.insert((key.clone(), time), queue_key);
-
-    active
-        .entry_async(key.clone())
-        .await
-        .or_default()
-        .get_mut()
-        .insert(time);
-
-    send_result(command.result_tx, &key, &time, Ok(()));
-}
-
-async fn remove_time(
-    delay_queue: &mut DelayQueue<(Key, DateTime<Utc>)>,
-    timer_handles: &mut HashMap<(Key, DateTime<Utc>), delay_queue::Key>,
-    active_triggers: &ActiveTriggers,
-    command: Command,
-) {
-    let Command {
-        result_tx: result,
+    triggers: &mut Triggers,
+    Command {
+        result_tx,
         key,
         time,
         ..
-    } = command;
-
-    let scheduled_entry = (key, time);
-    let Some(handle) = timer_handles.remove(&scheduled_entry) else {
-        send_result(
-            result,
-            &scheduled_entry.0,
-            &scheduled_entry.1,
-            Err(TimerError::NotFound),
-        );
-
-        return;
+    }: Command,
+) {
+    let trigger = Trigger {
+        key: key.clone(),
+        time,
     };
 
-    let removed = delay_queue.remove(&handle);
-    let (expired_key, expired_time) = removed.into_inner();
+    let result = triggers.insert(trigger).await;
+    send_result(result_tx, &key, &time, result);
+}
 
-    if let Entry::Occupied(mut occ) = active_triggers.entry_async(expired_key).await {
-        let times = occ.get_mut();
-        times.remove(&expired_time);
-        if times.is_empty() {
-            let _ = occ.remove();
-        }
-    }
-
-    send_result(result, &scheduled_entry.0, &scheduled_entry.1, Ok(()));
+async fn remove_time(
+    triggers: &mut Triggers,
+    Command {
+        result_tx,
+        key,
+        time,
+        ..
+    }: Command,
+) {
+    let trigger = Trigger { key, time };
+    let result = triggers.remove(&trigger).await;
+    send_result(result_tx, &trigger.key, &trigger.time, result);
 }
 
 fn send_result(
