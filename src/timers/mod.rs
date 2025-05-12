@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::{select, spawn};
-use tracing::error;
+use tracing::{debug, error};
 
 mod active;
 mod triggers;
@@ -18,9 +18,28 @@ mod triggers;
 const BUFFER_SIZE: usize = 64;
 
 #[derive(Clone, Debug)]
-struct TimerManager {
+pub struct TimerManager {
     command_tx: mpsc::Sender<Command>,
     active_triggers: ActiveTriggers,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct Trigger {
+    key: Key,
+    time: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct Command {
+    result_tx: oneshot::Sender<Result<(), TimerError>>,
+    trigger: Trigger,
+    operation: CommandOperation,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum CommandOperation {
+    Add,
+    Remove,
 }
 
 impl TimerManager {
@@ -41,13 +60,12 @@ impl TimerManager {
         )
     }
 
-    pub async fn schedule(&self, key: Key, time: DateTime<Utc>) -> Result<(), TimerError> {
+    pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.command_tx
             .send(Command {
                 result_tx,
-                key,
-                time,
+                trigger,
                 operation: CommandOperation::Remove,
             })
             .map_err(|_| TimerError::Shutdown)
@@ -56,13 +74,12 @@ impl TimerManager {
         result_rx.map_err(|_| TimerError::Shutdown).await?
     }
 
-    pub async fn unschedule(&self, key: Key, time: DateTime<Utc>) -> Result<(), TimerError> {
+    pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.command_tx
             .send(Command {
                 result_tx,
-                key,
-                time,
+                trigger,
                 operation: CommandOperation::Remove,
             })
             .map_err(|_| TimerError::Shutdown)
@@ -74,26 +91,6 @@ impl TimerManager {
     pub async fn active_times(&self, key: &Key) -> BTreeSet<DateTime<Utc>> {
         self.active_triggers.key_times(key).await
     }
-}
-
-#[derive(Debug)]
-struct Command {
-    result_tx: oneshot::Sender<Result<(), TimerError>>,
-    key: Key,
-    time: DateTime<Utc>,
-    operation: CommandOperation,
-}
-
-#[derive(Copy, Clone, Debug)]
-enum CommandOperation {
-    Add,
-    Remove,
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
-struct Trigger {
-    key: Key,
-    time: DateTime<Utc>,
 }
 
 async fn process_commands(
@@ -142,53 +139,27 @@ async fn process_commands(
     }
 }
 
-async fn process_command(triggers: &mut Triggers, command: Command) {
-    match command.operation {
-        CommandOperation::Add => add_time(triggers, command).await,
-        CommandOperation::Remove => remove_time(triggers, command).await,
-    }
-}
-
-async fn add_time(
+async fn process_command(
     triggers: &mut Triggers,
     Command {
         result_tx,
-        key,
-        time,
-        ..
+        trigger,
+        operation,
     }: Command,
 ) {
-    let trigger = Trigger {
-        key: key.clone(),
-        time,
-    };
-
-    let result = triggers.insert(trigger).await;
-    send_result(result_tx, &key, &time, result);
-}
-
-async fn remove_time(
-    triggers: &mut Triggers,
-    Command {
-        result_tx,
-        key,
-        time,
-        ..
-    }: Command,
-) {
-    let trigger = Trigger { key, time };
-    let result = triggers.remove(&trigger).await;
-    send_result(result_tx, &trigger.key, &trigger.time, result);
-}
-
-fn send_result(
-    channel: oneshot::Sender<Result<(), TimerError>>,
-    key: &Key,
-    time: &DateTime<Utc>,
-    result: Result<(), TimerError>,
-) {
-    if let Err(result) = channel.send(result) {
-        error!(%key, ?time, ?result, "Failed to send timer result");
+    match operation {
+        CommandOperation::Add => {
+            let result = triggers.insert(trigger.clone()).await;
+            if let Err(result) = result_tx.send(result) {
+                debug!(?trigger, ?result, "Failed to send timer add result");
+            }
+        }
+        CommandOperation::Remove => {
+            let result = triggers.remove(&trigger).await;
+            if let Err(result) = result_tx.send(result) {
+                debug!(?trigger, ?result, "Failed to send timer remove result");
+            }
+        }
     }
 }
 
