@@ -3,6 +3,7 @@
 use crate::Key;
 use ahash::{HashMap, HashMapExt, HashSet};
 use chrono::{DateTime, OutOfRangeError, Utc};
+use scc::hash_map::Entry;
 use std::future::poll_fn;
 use std::sync::Arc;
 use thiserror::Error;
@@ -63,7 +64,7 @@ async fn process_commands(
                     let Some(command) = result else {
                         break;
                     };
-                    process_command(&mut queue, &mut queue_keys, active, command);
+                    process_command(&mut queue, &mut queue_keys, active, command).await;
                 }
 
                 result = triggers.send(trigger.clone()) => {
@@ -79,7 +80,7 @@ async fn process_commands(
                     let Some(command) = result else {
                         break;
                     };
-                    process_command(&mut queue, &mut queue_keys, active, command);
+                    process_command(&mut queue, &mut queue_keys, active, command).await;
                 }
 
                 Some(expired) = poll_fn(|cx| queue.poll_expired(cx)) => {
@@ -101,7 +102,7 @@ async fn process_commands(
     }
 }
 
-fn process_command(
+async fn process_command(
     queue: &mut DelayQueue<(Key, DateTime<Utc>)>,
     queue_keys: &mut HashMap<(Key, DateTime<Utc>), delay_queue::Key>,
     active: &ActiveTriggers,
@@ -109,7 +110,7 @@ fn process_command(
 ) {
     match command.operation {
         CommandOperation::Add => add_time(queue, queue_keys, command),
-        CommandOperation::Remove => remove_time(queue, queue_keys, command),
+        CommandOperation::Remove => remove_time(queue, queue_keys, active, command).await,
     }
 }
 
@@ -134,24 +135,40 @@ fn add_time(
     send_result(command.result, &key, &time, Ok(()));
 }
 
-fn remove_time(
-    queue_keys: &mut DelayQueue<(Key, DateTime<Utc>)>,
-    keys: &mut HashMap<(Key, DateTime<Utc>), delay_queue::Key>,
+async fn remove_time(
+    delay_queue: &mut DelayQueue<(Key, DateTime<Utc>)>,
+    timer_handles: &mut HashMap<(Key, DateTime<Utc>), delay_queue::Key>,
+    active_triggers: &ActiveTriggers,
     command: Command,
 ) {
-    let key = command.key;
-    let time = command.time;
+    let Command {
+        result, key, time, ..
+    } = command;
 
-    let queue_key = match keys.remove(&(key.clone(), time)) {
-        None => {
-            send_result(command.result, &key, &time, Err(TimerError::NotFound));
-            return;
-        }
-        Some(queue_key) => queue_key,
+    let scheduled_entry = (key, time);
+    let Some(handle) = timer_handles.remove(&scheduled_entry) else {
+        send_result(
+            result,
+            &scheduled_entry.0,
+            &scheduled_entry.1,
+            Err(TimerError::NotFound),
+        );
+
+        return;
     };
 
-    queue_keys.remove(&queue_key);
-    send_result(command.result, &key, &time, Ok(()));
+    let removed = delay_queue.remove(&handle);
+    let (expired_key, expired_time) = removed.into_inner();
+
+    if let Entry::Occupied(mut occ) = active_triggers.entry_async(expired_key).await {
+        let times = occ.get_mut();
+        times.remove(&expired_time);
+        if times.is_empty() {
+            let _ = occ.remove();
+        }
+    }
+
+    send_result(result, &scheduled_entry.0, &scheduled_entry.1, Ok(()));
 }
 
 fn send_result(
