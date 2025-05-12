@@ -14,11 +14,13 @@ use tracing::error;
 
 type ActiveTriggers = scc::HashMap<Key, HashSet<DateTime<Utc>>>;
 
+#[derive(Clone, Debug)]
 struct Timer {
     commands: mpsc::Sender<Command>,
     active_triggers: Arc<ActiveTriggers>,
 }
 
+#[derive(Debug)]
 struct Command {
     result: oneshot::Sender<Result<(), TimerError>>,
     key: Key,
@@ -26,17 +28,20 @@ struct Command {
     operation: CommandOperation,
 }
 
+#[derive(Copy, Clone, Debug)]
 enum CommandOperation {
     Add,
     Remove,
 }
 
+#[derive(Clone, Debug)]
 struct Trigger {
     key: Key,
     time: DateTime<Utc>,
     operation: TriggerOperation,
 }
 
+#[derive(Copy, Clone, Debug)]
 enum TriggerOperation {
     Schedule,
     Remove,
@@ -49,10 +54,10 @@ async fn process_commands(
 ) {
     let mut queue = DelayQueue::new();
     let mut queue_keys = HashMap::new();
-    let mut maybe_trigger = None;
+    let mut maybe_trigger: Option<Trigger> = None;
 
     loop {
-        if let Some(trigger) = maybe_trigger.take() {
+        if let Some(trigger) = &maybe_trigger {
             select! {
                 result = commands.recv() => {
                     let Some(command) = result else {
@@ -61,7 +66,8 @@ async fn process_commands(
                     process_command(&mut queue, &mut queue_keys, active, command);
                 }
 
-                result = triggers.send(trigger) => {
+                result = triggers.send(trigger.clone()) => {
+                    maybe_trigger.take();
                     if result.is_err() {
                         break;
                     }
