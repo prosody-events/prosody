@@ -28,6 +28,13 @@ impl ActiveTriggers {
         }
     }
 
+    pub async fn contains(&self, trigger: &Trigger) -> bool {
+        self.0
+            .read_async(&trigger.key, |_, v| v.contains(&trigger.time))
+            .await
+            .unwrap_or_default()
+    }
+
     pub async fn key_times(&self, key: &Key) -> BTreeSet<DateTime<Utc>> {
         self.0
             .read_async(key, |_, v| v.clone())

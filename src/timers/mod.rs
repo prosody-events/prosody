@@ -8,7 +8,7 @@ use futures::TryFutureExt;
 use std::collections::BTreeSet;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::{select, spawn};
 use tracing::{debug, error};
 
@@ -19,6 +19,7 @@ const BUFFER_SIZE: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct TimerManager {
+    loading_rx: watch::Receiver<bool>,
     command_tx: mpsc::Sender<Command>,
     active_triggers: ActiveTriggers,
 }
@@ -44,6 +45,7 @@ enum CommandOperation {
 
 impl TimerManager {
     pub fn new() -> (mpsc::Receiver<Trigger>, Self) {
+        let (loading_tx, loading_rx) = watch::channel(true);
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
         let (triggers_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
         let triggers = Triggers::new();
@@ -51,9 +53,12 @@ impl TimerManager {
 
         spawn(process_commands(commands_rx, triggers_tx, triggers));
 
+        // todo: spawn timer load process
+
         (
             triggers_rx,
             Self {
+                loading_rx,
                 command_tx,
                 active_triggers,
             },
@@ -76,6 +81,7 @@ impl TimerManager {
 
     pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerError> {
         let (result_tx, result_rx) = oneshot::channel();
+        self.ensure_loaded().await;
         self.command_tx
             .send(Command {
                 result_tx,
@@ -89,7 +95,23 @@ impl TimerManager {
     }
 
     pub async fn active_times(&self, key: &Key) -> BTreeSet<DateTime<Utc>> {
+        self.ensure_loaded().await;
         self.active_triggers.key_times(key).await
+    }
+
+    pub async fn is_active(&self, trigger: &Trigger) -> bool {
+        self.ensure_loaded().await;
+        self.active_triggers.contains(trigger).await
+    }
+
+    async fn ensure_loaded(&self) {
+        if *self.loading_rx.borrow() {
+            let _ = self
+                .loading_rx
+                .clone()
+                .wait_for(|is_loading| !is_loading)
+                .await;
+        }
     }
 }
 
