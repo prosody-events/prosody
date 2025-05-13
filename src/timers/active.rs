@@ -1,12 +1,12 @@
 use crate::Key;
 use crate::timers::Trigger;
-use chrono::{DateTime, Utc};
+use crate::timers::datetime::CompactDateTime;
 use scc::hash_map::Entry;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
-pub struct ActiveTriggers(Arc<scc::HashMap<Key, BTreeSet<DateTime<Utc>>>>);
+pub struct ActiveTriggers(Arc<scc::HashMap<Key, BTreeSet<CompactDateTime>>>);
 
 impl ActiveTriggers {
     pub async fn insert(&self, trigger: Trigger) {
@@ -35,9 +35,9 @@ impl ActiveTriggers {
             .unwrap_or_default()
     }
 
-    pub async fn key_times(&self, key: &Key) -> BTreeSet<DateTime<Utc>> {
+    pub async fn key_times(&self, key: Key) -> BTreeSet<CompactDateTime> {
         self.0
-            .read_async(key, |_, v| v.clone())
+            .read_async(&key, |_, v| v.clone())
             .await
             .unwrap_or_default()
     }

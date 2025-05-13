@@ -2,24 +2,24 @@
 
 use crate::Key;
 use crate::timers::active::ActiveTriggers;
+use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::triggers::Triggers;
-use chrono::{DateTime, OutOfRangeError, Utc};
+use chrono::OutOfRangeError;
 use futures::TryFutureExt;
-use std::collections::BTreeSet;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::{select, spawn};
 use tracing::{debug, error};
 
 mod active;
+mod datetime;
 mod triggers;
 
 const BUFFER_SIZE: usize = 64;
 
 #[derive(Clone, Debug)]
-pub struct TimerManager {
-    loading_rx: watch::Receiver<bool>,
+pub struct TimerRangeManager {
     command_tx: mpsc::Sender<Command>,
     active_triggers: ActiveTriggers,
 }
@@ -27,12 +27,12 @@ pub struct TimerManager {
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Trigger {
     key: Key,
-    time: DateTime<Utc>,
+    time: CompactDateTime,
 }
 
 #[derive(Debug)]
 struct Command {
-    result_tx: oneshot::Sender<Result<(), TimerError>>,
+    result_tx: oneshot::Sender<Result<(), TimerRangeError>>,
     trigger: Trigger,
     operation: CommandOperation,
 }
@@ -43,9 +43,8 @@ enum CommandOperation {
     Remove,
 }
 
-impl TimerManager {
+impl TimerRangeManager {
     pub fn new() -> (mpsc::Receiver<Trigger>, Self) {
-        let (loading_tx, loading_rx) = watch::channel(true);
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
         let (triggers_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
         let triggers = Triggers::new();
@@ -53,19 +52,16 @@ impl TimerManager {
 
         spawn(process_commands(commands_rx, triggers_tx, triggers));
 
-        // todo: spawn timer load process
-
         (
             triggers_rx,
             Self {
-                loading_rx,
                 command_tx,
                 active_triggers,
             },
         )
     }
 
-    pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerError> {
+    pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerRangeError> {
         let (result_tx, result_rx) = oneshot::channel();
         let operation = CommandOperation::Add;
 
@@ -75,15 +71,13 @@ impl TimerManager {
                 trigger,
                 operation,
             })
-            .map_err(|_| TimerError::Shutdown)
+            .map_err(|_| TimerRangeError::Shutdown)
             .await?;
 
-        result_rx.map_err(|_| TimerError::Shutdown).await?
+        result_rx.map_err(|_| TimerRangeError::Shutdown).await?
     }
 
-    pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerError> {
-        self.ensure_loaded().await;
-
+    pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerRangeError> {
         let (result_tx, result_rx) = oneshot::channel();
         let operation = CommandOperation::Remove;
 
@@ -93,30 +87,14 @@ impl TimerManager {
                 trigger,
                 operation,
             })
-            .map_err(|_| TimerError::Shutdown)
+            .map_err(|_| TimerRangeError::Shutdown)
             .await?;
 
-        result_rx.map_err(|_| TimerError::Shutdown).await?
-    }
-
-    pub async fn active_times(&self, key: &Key) -> BTreeSet<DateTime<Utc>> {
-        self.ensure_loaded().await;
-        self.active_triggers.key_times(key).await
+        result_rx.map_err(|_| TimerRangeError::Shutdown).await?
     }
 
     pub async fn is_active(&self, trigger: &Trigger) -> bool {
-        self.ensure_loaded().await;
         self.active_triggers.contains(trigger).await
-    }
-
-    async fn ensure_loaded(&self) {
-        if *self.loading_rx.borrow() {
-            let _ = self
-                .loading_rx
-                .clone()
-                .wait_for(|is_loading| !is_loading)
-                .await;
-        }
     }
 }
 
@@ -185,8 +163,11 @@ async fn process_command(
 }
 
 #[derive(Clone, Debug, Error)]
-pub enum TimerError {
-    #[error("Time must be in the future")]
+pub enum TimerRangeError {
+    #[error(transparent)]
+    DateTime(#[from] CompactDateTimeError),
+
+    #[error("Time must be in the future: {0:#}")]
     PastTime(#[from] OutOfRangeError),
 
     #[error("Time not found")]
