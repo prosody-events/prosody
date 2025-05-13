@@ -67,11 +67,13 @@ impl TimerManager {
 
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerError> {
         let (result_tx, result_rx) = oneshot::channel();
+        let operation = CommandOperation::Add;
+
         self.command_tx
             .send(Command {
                 result_tx,
                 trigger,
-                operation: CommandOperation::Remove,
+                operation,
             })
             .map_err(|_| TimerError::Shutdown)
             .await?;
@@ -80,13 +82,16 @@ impl TimerManager {
     }
 
     pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerError> {
-        let (result_tx, result_rx) = oneshot::channel();
         self.ensure_loaded().await;
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let operation = CommandOperation::Remove;
+
         self.command_tx
             .send(Command {
                 result_tx,
                 trigger,
-                operation: CommandOperation::Remove,
+                operation,
             })
             .map_err(|_| TimerError::Shutdown)
             .await?;
@@ -133,7 +138,7 @@ async fn process_commands(
                 }
 
                 result = trigger_tx.send(trigger.clone()) => {
-                    trigger_to_send.take();
+                    trigger_to_send = None;
                     if result.is_err() {
                         break;
                     }
@@ -169,19 +174,13 @@ async fn process_command(
         operation,
     }: Command,
 ) {
-    match operation {
-        CommandOperation::Add => {
-            let result = triggers.insert(trigger.clone()).await;
-            if let Err(result) = result_tx.send(result) {
-                debug!(?trigger, ?result, "Failed to send timer add result");
-            }
-        }
-        CommandOperation::Remove => {
-            let result = triggers.remove(&trigger).await;
-            if let Err(result) = result_tx.send(result) {
-                debug!(?trigger, ?result, "Failed to send timer remove result");
-            }
-        }
+    let result = match operation {
+        CommandOperation::Add => triggers.insert(trigger.clone()).await,
+        CommandOperation::Remove => triggers.remove(&trigger).await,
+    };
+
+    if let Err(result) = result_tx.send(result) {
+        debug!(?trigger, ?result, "Failed to send timer result");
     }
 }
 
