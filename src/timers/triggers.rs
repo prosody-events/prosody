@@ -1,5 +1,5 @@
 use crate::timers::active::ActiveTriggers;
-use crate::timers::{TimerRangeError, Trigger};
+use crate::timers::{TimerManagerError, Trigger};
 use ahash::HashMap;
 use std::future::poll_fn;
 use tokio_util::time::{DelayQueue, delay_queue};
@@ -23,7 +23,7 @@ impl Triggers {
         &self.active
     }
 
-    pub async fn insert(&mut self, trigger: Trigger) -> Result<(), TimerRangeError> {
+    pub async fn insert(&mut self, trigger: Trigger) -> Result<(), TimerManagerError> {
         let duration = trigger.time.duration_from_now()?;
         let queue_key = self.queue.insert(trigger.clone(), duration);
         self.queue_keys.insert(trigger.clone(), queue_key);
@@ -37,11 +37,11 @@ impl Triggers {
         Some(expired.into_inner())
     }
 
-    pub async fn remove(&mut self, trigger: &Trigger) -> Result<(), TimerRangeError> {
+    pub async fn remove(&mut self, trigger: &Trigger) -> Result<(), TimerManagerError> {
         let (trigger, queue_key) = self
             .queue_keys
             .remove_entry(trigger)
-            .ok_or(TimerRangeError::NotFound)?;
+            .ok_or(TimerManagerError::NotFound)?;
 
         self.queue.remove(&queue_key);
         self.active.remove(&trigger).await;

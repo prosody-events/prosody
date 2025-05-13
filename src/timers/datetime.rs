@@ -8,6 +8,13 @@ pub struct CompactDateTime {
 }
 
 impl CompactDateTime {
+    const MAX: Self = Self {
+        epoch_seconds: u32::MAX,
+    };
+    const MIN: Self = Self {
+        epoch_seconds: u32::MIN,
+    };
+
     pub fn now() -> Result<Self, CompactDateTimeError> {
         Self::try_from(Utc::now())
     }
@@ -24,24 +31,46 @@ impl CompactDateTime {
     pub fn duration_from_now(self) -> Result<Duration, CompactDateTimeError> {
         self.duration_since(Self::now()?)
     }
+
+    pub fn add_duration(self, duration: Duration) -> Result<Self, CompactDateTimeError> {
+        let seconds = duration.as_secs();
+        let nanos = duration.subsec_nanos();
+
+        let seconds = if nanos >= 500_000_000 {
+            seconds
+                .checked_add(1)
+                .ok_or(CompactDateTimeError::OutOfRange)?
+        } else {
+            seconds
+        };
+
+        let seconds = u32::try_from(seconds).map_err(|_| CompactDateTimeError::OutOfRange)?;
+
+        let epoch_seconds = self
+            .epoch_seconds
+            .checked_add(seconds)
+            .ok_or(CompactDateTimeError::OutOfRange)?;
+
+        Ok(Self { epoch_seconds })
+    }
 }
 
 impl TryFrom<DateTime<Utc>> for CompactDateTime {
     type Error = CompactDateTimeError;
 
     fn try_from(value: DateTime<Utc>) -> Result<Self, Self::Error> {
-        let secs = value.timestamp();
+        let seconds = value.timestamp();
         let nanos = value.timestamp_subsec_nanos();
 
-        let rounded_secs = if nanos >= 500_000_000 {
-            secs.checked_add(1)
+        let seconds = if nanos >= 500_000_000 {
+            seconds.checked_add(1)
                 .ok_or(CompactDateTimeError::OutOfRange)?
         } else {
-            secs
+            seconds
         };
 
         let epoch_seconds =
-            u32::try_from(rounded_secs).map_err(|_| CompactDateTimeError::OutOfRange)?;
+            u32::try_from(seconds).map_err(|_| CompactDateTimeError::OutOfRange)?;
 
         Ok(CompactDateTime { epoch_seconds })
     }

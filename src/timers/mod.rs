@@ -1,28 +1,21 @@
 #![allow(dead_code, clippy::unused_async)]
 
-use crate::Key;
-use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
-use crate::timers::triggers::Triggers;
+use crate::timers::range::LocalRange;
+use crate::timers::scheduler::TriggerScheduler;
+use crate::{Key, Partition, Topic};
 use chrono::OutOfRangeError;
 use futures::TryFutureExt;
 use thiserror::Error;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot};
-use tokio::{select, spawn};
-use tracing::{debug, error};
+use tokio::sync::watch;
+use tracing::error;
 
 mod active;
 mod datetime;
+mod range;
+mod scheduler;
+mod store;
 mod triggers;
-
-const BUFFER_SIZE: usize = 64;
-
-#[derive(Clone, Debug)]
-pub struct TimerRangeManager {
-    command_tx: mpsc::Sender<Command>,
-    active_triggers: ActiveTriggers,
-}
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Trigger {
@@ -30,140 +23,35 @@ pub struct Trigger {
     time: CompactDateTime,
 }
 
-#[derive(Debug)]
-struct Command {
-    result_tx: oneshot::Sender<Result<(), TimerRangeError>>,
-    trigger: Trigger,
-    operation: CommandOperation,
+#[derive(Clone, Debug)]
+pub struct TimerManager {
+    role: String,
+    topic: Topic,
+    group_id: String,
+    partition: Partition,
+    range_rx: watch::Receiver<LocalRange>,
+    scheduler: TriggerScheduler,
 }
 
-#[derive(Copy, Clone, Debug)]
-enum CommandOperation {
-    Add,
-    Remove,
-}
+impl TimerManager {
+    async fn in_range(&self, time: CompactDateTime) -> Result<bool, TimerManagerError> {
+        let mut range_rx = self.range_rx.clone();
 
-impl TimerRangeManager {
-    pub fn new() -> (mpsc::Receiver<Trigger>, Self) {
-        let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
-        let (triggers_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
-        let triggers = Triggers::new();
-        let active_triggers = triggers.active().clone();
-
-        spawn(process_commands(commands_rx, triggers_tx, triggers));
-
-        (
-            triggers_rx,
-            Self {
-                command_tx,
-                active_triggers,
-            },
-        )
-    }
-
-    pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerRangeError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let operation = CommandOperation::Add;
-
-        self.command_tx
-            .send(Command {
-                result_tx,
-                trigger,
-                operation,
-            })
-            .map_err(|_| TimerRangeError::Shutdown)
-            .await?;
-
-        result_rx.map_err(|_| TimerRangeError::Shutdown).await?
-    }
-
-    pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerRangeError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let operation = CommandOperation::Remove;
-
-        self.command_tx
-            .send(Command {
-                result_tx,
-                trigger,
-                operation,
-            })
-            .map_err(|_| TimerRangeError::Shutdown)
-            .await?;
-
-        result_rx.map_err(|_| TimerRangeError::Shutdown).await?
-    }
-
-    pub async fn is_active(&self, trigger: &Trigger) -> bool {
-        self.active_triggers.contains(trigger).await
-    }
-}
-
-async fn process_commands(
-    mut commands: mpsc::Receiver<Command>,
-    trigger_tx: mpsc::Sender<Trigger>,
-    mut triggers: Triggers,
-) {
-    let mut trigger_to_send: Option<Trigger> = None;
-
-    loop {
-        if let Some(trigger) = &trigger_to_send {
-            select! {
-                result = commands.recv() => {
-                    let Some(command) = result else {
-                        break;
-                    };
-                    process_command(&mut triggers, command).await;
-                }
-
-                result = trigger_tx.send(trigger.clone()) => {
-                    trigger_to_send = None;
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            select! {
-                result = commands.recv() => {
-                    let Some(command) = result else {
-                        break;
-                    };
-                    process_command(&mut triggers, command).await;
-                }
-
-                Some(trigger) = triggers.next() => {
-                    if let Err(error) = trigger_tx.try_send(trigger) {
-                        match error {
-                            TrySendError::Full(trigger) => trigger_to_send = Some(trigger),
-                            TrySendError::Closed(_) => break
-                        }
-                    }
-                }
-            }
+        if !range_rx.borrow().contains(time) {
+            return Ok(false);
         }
-    }
-}
 
-async fn process_command(
-    triggers: &mut Triggers,
-    Command {
-        result_tx,
-        trigger,
-        operation,
-    }: Command,
-) {
-    let result = match operation {
-        CommandOperation::Add => triggers.insert(trigger.clone()).await,
-        CommandOperation::Remove => triggers.remove(&trigger).await,
-    };
+        range_rx
+            .wait_for(|range| !range.is_loading(time))
+            .map_err(|_| TimerManagerError::Shutdown)
+            .await?;
 
-    if let Err(result) = result_tx.send(result) {
-        debug!(?trigger, ?result, "Failed to send timer result");
+        Ok(true)
     }
 }
 
 #[derive(Clone, Debug, Error)]
-pub enum TimerRangeError {
+pub enum TimerManagerError {
     #[error(transparent)]
     DateTime(#[from] CompactDateTimeError),
 
