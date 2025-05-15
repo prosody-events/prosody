@@ -17,7 +17,7 @@ mod scheduler;
 mod store;
 mod triggers;
 
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Trigger {
     key: Key,
     time: CompactDateTime,

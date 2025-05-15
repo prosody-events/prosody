@@ -19,6 +19,10 @@ impl CompactDateTime {
         Self::try_from(Utc::now())
     }
 
+    pub fn epoch_seconds(self) -> u32 {
+        self.epoch_seconds
+    }
+
     pub fn duration_since(self, other: Self) -> Result<Duration, CompactDateTimeError> {
         let seconds = self
             .epoch_seconds
@@ -63,14 +67,14 @@ impl TryFrom<DateTime<Utc>> for CompactDateTime {
         let nanos = value.timestamp_subsec_nanos();
 
         let seconds = if nanos >= 500_000_000 {
-            seconds.checked_add(1)
+            seconds
+                .checked_add(1)
                 .ok_or(CompactDateTimeError::OutOfRange)?
         } else {
             seconds
         };
 
-        let epoch_seconds =
-            u32::try_from(seconds).map_err(|_| CompactDateTimeError::OutOfRange)?;
+        let epoch_seconds = u32::try_from(seconds).map_err(|_| CompactDateTimeError::OutOfRange)?;
 
         Ok(CompactDateTime { epoch_seconds })
     }
@@ -98,9 +102,9 @@ impl From<CompactDateTime> for i32 {
 
 #[derive(Clone, Debug, Error)]
 pub enum CompactDateTimeError {
-    #[error("DateTime is out of range")]
+    #[error("Time is out of range")]
     OutOfRange,
 
-    #[error("Date time is in the past")]
+    #[error("Time is in the past")]
     PastDateTime,
 }
