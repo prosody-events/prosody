@@ -1,17 +1,19 @@
+use crate::timers::duration::CompactDuration;
 use chrono::{DateTime, Utc};
+use std::fmt::{Debug, Display, Formatter};
 use std::time::Duration;
 use thiserror::Error;
 
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct CompactDateTime {
     epoch_seconds: u32,
 }
 
 impl CompactDateTime {
-    const MAX: Self = Self {
+    pub const MAX: Self = Self {
         epoch_seconds: u32::MAX,
     };
-    const MIN: Self = Self {
+    pub const MIN: Self = Self {
         epoch_seconds: u32::MIN,
     };
 
@@ -36,23 +38,10 @@ impl CompactDateTime {
         self.duration_since(Self::now()?)
     }
 
-    pub fn add_duration(self, duration: Duration) -> Result<Self, CompactDateTimeError> {
-        let seconds = duration.as_secs();
-        let nanos = duration.subsec_nanos();
-
-        let seconds = if nanos >= 500_000_000 {
-            seconds
-                .checked_add(1)
-                .ok_or(CompactDateTimeError::OutOfRange)?
-        } else {
-            seconds
-        };
-
-        let seconds = u32::try_from(seconds).map_err(|_| CompactDateTimeError::OutOfRange)?;
-
+    pub fn add_duration(self, duration: CompactDuration) -> Result<Self, CompactDateTimeError> {
         let epoch_seconds = self
             .epoch_seconds
-            .checked_add(seconds)
+            .checked_add(duration.seconds())
             .ok_or(CompactDateTimeError::OutOfRange)?;
 
         Ok(Self { epoch_seconds })
@@ -80,9 +69,31 @@ impl TryFrom<DateTime<Utc>> for CompactDateTime {
     }
 }
 
+impl Display for CompactDateTime {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let time: DateTime<Utc> = (*self).into();
+        write!(f, "{time}")
+    }
+}
+
+impl Debug for CompactDateTime {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let time: DateTime<Utc> = (*self).into();
+        write!(f, "{time:?}")
+    }
+}
+
 impl From<CompactDateTime> for DateTime<Utc> {
     fn from(value: CompactDateTime) -> Self {
         DateTime::UNIX_EPOCH + Duration::from_secs(u64::from(value.epoch_seconds))
+    }
+}
+
+impl From<u32> for CompactDateTime {
+    fn from(value: u32) -> Self {
+        Self {
+            epoch_seconds: value,
+        }
     }
 }
 

@@ -5,22 +5,29 @@ use crate::timers::range::LocalRange;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::{Key, Partition, Topic};
 use chrono::OutOfRangeError;
+use educe::Educe;
 use futures::TryFutureExt;
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::error;
+use tracing::{Span, error};
 
 mod active;
 mod datetime;
+mod duration;
 mod range;
 mod scheduler;
+mod slab;
 mod store;
 mod triggers;
 
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Educe)]
+#[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {
     key: Key,
     time: CompactDateTime,
+
+    #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
+    span: Span,
 }
 
 #[derive(Clone, Debug)]

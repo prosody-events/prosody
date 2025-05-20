@@ -34,11 +34,4 @@ impl ActiveTriggers {
             .await
             .unwrap_or_default()
     }
-
-    pub async fn key_times(&self, key: Key) -> BTreeSet<CompactDateTime> {
-        self.0
-            .read_async(&key, |_, v| v.clone())
-            .await
-            .unwrap_or_default()
-    }
 }

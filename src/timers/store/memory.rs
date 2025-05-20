@@ -1,7 +1,8 @@
 use crate::Key;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::store::{Segment, SegmentId, Slab, SlabId, TriggerStore};
+use crate::timers::slab::{Slab, SlabId};
+use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use async_stream::try_stream;
 use futures::stream::Stream;
 use scc::HashMap;

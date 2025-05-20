@@ -1,30 +1,24 @@
 use crate::Key;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::slab::{Slab, SlabId};
 use futures::Stream;
 use std::error::Error;
 use std::time::Duration;
 use uuid::Uuid;
 
-mod memory;
+pub mod memory;
 
-type SlabId = i64;
-type SegmentId = Uuid;
+pub type SegmentId = Uuid;
 
 #[derive(Clone, Debug)]
-struct Segment {
+pub struct Segment {
     id: SegmentId,
     name: String,
     slab_size: Duration,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-struct Slab {
-    segment_id: SegmentId,
-    id: SlabId,
-}
-
-trait TriggerStore {
+pub trait TriggerStore {
     type Error: Error;
 
     // segments
