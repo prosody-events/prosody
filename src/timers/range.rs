@@ -16,3 +16,12 @@ impl LocalRange {
         self.loading.as_ref().is_some_and(|r| r.contains(&time))
     }
 }
+
+impl Default for LocalRange {
+    fn default() -> Self {
+        Self {
+            owns: CompactDateTime::MIN..CompactDateTime::MIN,
+            loading: None,
+        }
+    }
+}

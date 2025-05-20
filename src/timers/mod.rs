@@ -1,14 +1,15 @@
 #![allow(dead_code, clippy::unused_async)]
 
+use crate::Key;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::range::LocalRange;
 use crate::timers::scheduler::TriggerScheduler;
-use crate::{Key, Partition, Topic};
+use crate::timers::store::SegmentId;
 use chrono::OutOfRangeError;
 use educe::Educe;
 use futures::TryFutureExt;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{Span, error};
 
 mod active;
@@ -31,16 +32,28 @@ pub struct Trigger {
 }
 
 #[derive(Clone, Debug)]
-pub struct TimerManager {
-    role: String,
-    topic: Topic,
-    group_id: String,
-    partition: Partition,
+pub struct TimerManager<T> {
+    segment: SegmentId,
     range_rx: watch::Receiver<LocalRange>,
     scheduler: TriggerScheduler,
+    store: T,
 }
 
-impl TimerManager {
+impl<T> TimerManager<T> {
+    fn new(segment: SegmentId, store: T) -> (mpsc::Receiver<Trigger>, Self) {
+        let (range_tx, range_rx) = watch::channel(LocalRange::default());
+        let (trigger_rx, scheduler) = TriggerScheduler::new();
+
+        let manager = Self {
+            segment,
+            range_rx,
+            scheduler,
+            store,
+        };
+
+        (trigger_rx, manager)
+    }
+
     async fn in_range(&self, time: CompactDateTime) -> Result<bool, TimerManagerError> {
         let mut range_rx = self.range_rx.clone();
 
