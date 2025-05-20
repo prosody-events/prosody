@@ -61,10 +61,7 @@ impl TriggerStore for InMemoryTriggerStore {
     }
 
     // Segment slabs
-    fn get_segment_slab_ids(
-        &self,
-        segment_id: &SegmentId,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> {
+    fn get_slab(&self, segment_id: &SegmentId) -> impl Stream<Item = Result<SlabId, Self::Error>> {
         try_stream! {
             let Some(entry) = self.0.segment_slabs.get_async(segment_id).await else {
                 return;
@@ -76,7 +73,7 @@ impl TriggerStore for InMemoryTriggerStore {
         }
     }
 
-    async fn insert_segment_slab_id(
+    async fn insert_slab(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -92,7 +89,7 @@ impl TriggerStore for InMemoryTriggerStore {
         Ok(())
     }
 
-    async fn delete_segment_slab_id(
+    async fn delete_slab(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,

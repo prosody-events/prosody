@@ -24,11 +24,11 @@ mod triggers;
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {
-    key: Key,
-    time: CompactDateTime,
+    pub key: Key,
+    pub time: CompactDateTime,
 
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
-    span: Span,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -41,7 +41,7 @@ pub struct TimerManager<T> {
 
 impl<T> TimerManager<T> {
     fn new(segment: SegmentId, store: T) -> (mpsc::Receiver<Trigger>, Self) {
-        let (range_tx, range_rx) = watch::channel(LocalRange::default());
+        let (_range_tx, range_rx) = watch::channel(LocalRange::default());
         let (trigger_rx, scheduler) = TriggerScheduler::new();
 
         let manager = Self {
