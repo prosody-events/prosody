@@ -8,7 +8,7 @@ pub struct LocalRange {
 }
 
 impl LocalRange {
-    pub fn contains(&self, time: CompactDateTime) -> bool {
+    pub fn owns(&self, time: CompactDateTime) -> bool {
         self.owns.contains(&time)
     }
 

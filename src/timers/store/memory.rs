@@ -1,6 +1,7 @@
 use crate::Key;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use async_stream::try_stream;
@@ -9,7 +10,6 @@ use scc::HashMap;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::join;
 
 #[derive(Clone, Debug, Default)]
@@ -17,7 +17,7 @@ pub struct InMemoryTriggerStore(Arc<Inner>);
 
 #[derive(Debug, Default)]
 struct Inner {
-    segments: HashMap<SegmentId, (String, i64)>,
+    segments: HashMap<SegmentId, (String, CompactDuration)>,
     segment_slabs: HashMap<SegmentId, BTreeSet<SlabId>>,
     slab_triggers: HashMap<Slab, BTreeSet<Trigger>>,
     key_triggers: HashMap<(SegmentId, Key), BTreeSet<CompactDateTime>>,
@@ -34,9 +34,10 @@ impl TriggerStore for InMemoryTriggerStore {
 
     // Segments
     async fn insert_segment(&self, segment: &Segment) -> Result<(), Self::Error> {
-        *self.0.segments.entry_async(segment.id).await.or_default() =
-            (segment.name.clone(), segment.slab_size.as_secs() as i64);
-
+        self.0
+            .segments
+            .upsert_async(segment.id, (segment.name.clone(), segment.slab_size))
+            .await;
         Ok(())
     }
 
@@ -46,7 +47,7 @@ impl TriggerStore for InMemoryTriggerStore {
             Segment {
                 id: *segment_id,
                 name: name.clone(),
-                slab_size: Duration::from_secs(*slab_size as u64),
+                slab_size: *slab_size,
             }
         }))
     }

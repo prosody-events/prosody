@@ -1,7 +1,11 @@
+use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
+use crate::timers::datetime::CompactDateTimeError;
 use crate::timers::triggers::Triggers;
-use crate::timers::{TimerManagerError, Trigger};
+use chrono::OutOfRangeError;
 use futures::TryFutureExt;
+use std::fmt::Debug;
+use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::{select, spawn};
@@ -17,7 +21,7 @@ pub struct TriggerScheduler {
 
 #[derive(Debug)]
 struct Command {
-    result_tx: oneshot::Sender<Result<(), TimerManagerError>>,
+    result_tx: oneshot::Sender<Result<(), TimerSchedulerError>>,
     trigger: Trigger,
     operation: CommandOperation,
 }
@@ -46,7 +50,7 @@ impl TriggerScheduler {
         )
     }
 
-    pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerManagerError> {
+    pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
         let (result_tx, result_rx) = oneshot::channel();
         let operation = CommandOperation::Add;
 
@@ -56,13 +60,13 @@ impl TriggerScheduler {
                 trigger,
                 operation,
             })
-            .map_err(|_| TimerManagerError::Shutdown)
+            .map_err(|_| TimerSchedulerError::Shutdown)
             .await?;
 
-        result_rx.map_err(|_| TimerManagerError::Shutdown).await?
+        result_rx.map_err(|_| TimerSchedulerError::Shutdown).await?
     }
 
-    pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerManagerError> {
+    pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
         let (result_tx, result_rx) = oneshot::channel();
         let operation = CommandOperation::Remove;
 
@@ -72,14 +76,18 @@ impl TriggerScheduler {
                 trigger,
                 operation,
             })
-            .map_err(|_| TimerManagerError::Shutdown)
+            .map_err(|_| TimerSchedulerError::Shutdown)
             .await?;
 
-        result_rx.map_err(|_| TimerManagerError::Shutdown).await?
+        result_rx.map_err(|_| TimerSchedulerError::Shutdown).await?
     }
 
     pub async fn is_active(&self, trigger: &Trigger) -> bool {
         self.active_triggers.contains(trigger).await
+    }
+
+    pub async fn deactivate(&self, trigger: &Trigger) {
+        self.active_triggers.remove(trigger).await;
     }
 }
 
@@ -145,4 +153,19 @@ async fn process_command(
     if let Err(result) = result_tx.send(result) {
         debug!(?trigger, ?result, "Failed to send timer result");
     }
+}
+
+#[derive(Debug, Error)]
+pub enum TimerSchedulerError {
+    #[error(transparent)]
+    DateTime(#[from] CompactDateTimeError),
+
+    #[error("Time must be in the future: {0:#}")]
+    PastTime(#[from] OutOfRangeError),
+
+    #[error("Time not found")]
+    NotFound,
+
+    #[error("Timer has been shutdown")]
+    Shutdown,
 }

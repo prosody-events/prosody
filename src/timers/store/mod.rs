@@ -5,7 +5,6 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use futures::{Stream, TryStreamExt};
 use std::error::Error;
-use std::time::Duration;
 use tokio::try_join;
 use tracing::Span;
 use uuid::Uuid;
@@ -18,9 +17,9 @@ const DELETE_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct Segment {
-    id: SegmentId,
-    name: String,
-    slab_size: Duration,
+    pub id: SegmentId,
+    pub name: String,
+    pub slab_size: CompactDuration,
 }
 
 pub trait TriggerStore {
@@ -68,18 +67,14 @@ pub trait TriggerStore {
     async fn clear_key_triggers(&self, segment: &SegmentId, key: &Key) -> Result<(), Self::Error>;
 
     // high-level trigger operations
-    async fn add_trigger(
-        &self,
-        segment_id: &SegmentId,
-        trigger: &Trigger,
-        slab_size: CompactDuration,
-    ) -> Result<(), Self::Error> {
-        let slab = Slab::from_time(*segment_id, slab_size, trigger.time);
+    async fn add_trigger(&self, segment: &Segment, trigger: &Trigger) -> Result<(), Self::Error> {
+        let segment_id = segment.id;
+        let slab = Slab::from_time(segment_id, segment.slab_size, trigger.time);
 
         try_join!(
-            self.insert_slab(segment_id, slab.id()),
+            self.insert_slab(&segment_id, slab.id()),
             self.insert_slab_trigger(&slab, trigger),
-            self.insert_key_trigger(segment_id, trigger),
+            self.insert_key_trigger(&segment_id, trigger),
         )?;
 
         Ok(())
@@ -87,15 +82,14 @@ pub trait TriggerStore {
 
     async fn remove_trigger(
         &self,
-        segment_id: &SegmentId,
+        segment: &Segment,
         trigger: &Trigger,
-        slab_size: CompactDuration,
     ) -> Result<(), Self::Error> {
-        let slab = Slab::from_time(*segment_id, slab_size, trigger.time);
+        let slab = Slab::from_time(segment.id, segment.slab_size, trigger.time);
 
         try_join!(
             self.delete_slab_trigger(&slab, trigger),
-            self.delete_key_trigger(segment_id, trigger)
+            self.delete_key_trigger(&segment.id, trigger)
         )?;
 
         // Note: We don't remove the slab_id from segment_slabs here
