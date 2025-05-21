@@ -45,7 +45,7 @@ impl Triggers {
             .ok_or(TimerSchedulerError::NotFound)?;
 
         self.queue.remove(&queue_key);
-        self.active.remove(&trigger).await;
+        self.active.remove(&trigger.key, trigger.time).await;
 
         Ok(())
     }

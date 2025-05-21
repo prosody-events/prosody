@@ -1,4 +1,4 @@
-#![allow(dead_code, clippy::unused_async)]
+#![allow(dead_code)]
 
 use crate::Key;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
@@ -13,7 +13,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
-use tracing::{Span, error};
+use tracing::{Instrument, Span, error};
 
 mod active;
 mod datetime;
@@ -23,6 +23,8 @@ mod scheduler;
 mod slab;
 mod store;
 mod triggers;
+
+const DELETE_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,7 +85,7 @@ where
             .map_err(|_| TimerManagerError::Shutdown)?;
 
         self.store
-            .add_trigger(&self.segment, &trigger)
+            .add_trigger(&self.segment, trigger.clone())
             .await
             .map_err(TimerManagerError::Store)?;
 
@@ -94,19 +96,29 @@ where
         Ok(())
     }
 
-    pub async fn unschedule(&self, trigger: &Trigger) -> Result<(), TimerManagerError<T::Error>> {
+    pub async fn unschedule(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), TimerManagerError<T::Error>> {
         let mut range_rx = self.range_rx.clone();
         let range = range_rx
-            .wait_for(|range| !range.is_loading(trigger.time))
+            .wait_for(|range| !range.is_loading(time))
             .await
             .map_err(|_| TimerManagerError::Shutdown)?;
 
-        if range.owns(trigger.time) {
-            self.scheduler.unschedule(trigger.clone()).await?;
+        if range.owns(time) {
+            let trigger = Trigger {
+                key: key.clone(),
+                time,
+                span: Span::current(),
+            };
+
+            self.scheduler.unschedule(trigger).await?;
         }
 
         self.store
-            .remove_trigger(&self.segment, trigger)
+            .remove_trigger(&self.segment, key, time)
             .await
             .map_err(TimerManagerError::Store)
     }
@@ -115,56 +127,29 @@ where
         let span = Span::current();
 
         self.scheduled_times(key)
-            .try_for_each_concurrent(16, |time| {
-                let trigger = Trigger {
-                    key: key.clone(),
-                    time,
-                    span: span.clone(),
-                };
-
-                async move { self.unschedule(&trigger).await }
+            .try_for_each_concurrent(DELETE_CONCURRENCY, |time| {
+                self.unschedule(key, time).instrument(span.clone())
             })
             .await
     }
 
-    pub async fn is_active(&self, trigger: &Trigger) -> bool {
-        self.scheduler.is_active(trigger).await
+    pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
+        self.scheduler.is_active(key, time).await
     }
 
     pub async fn mark_complete(
         &self,
-        trigger: &Trigger,
+        key: &Key,
+        time: CompactDateTime,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        self.scheduler.deactivate(trigger).await;
+        self.scheduler.deactivate(key, time).await;
 
         self.store
-            .remove_trigger(&self.segment, trigger)
+            .remove_trigger(&self.segment, key, time)
             .await
             .map_err(TimerManagerError::Store)?;
 
         Ok(())
-    }
-
-    async fn when_owned<F, Fut>(
-        &self,
-        trigger: &Trigger,
-        f: F,
-    ) -> Result<(), TimerManagerError<T::Error>>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(), TimerManagerError<T::Error>>>,
-    {
-        let mut range_rx = self.range_rx.clone();
-        let range = range_rx
-            .wait_for(|range| !range.is_loading(trigger.time))
-            .await
-            .map_err(|_| TimerManagerError::Shutdown)?;
-
-        if range.owns(trigger.time) {
-            f().await
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -192,7 +177,7 @@ where
     };
 
     store
-        .insert_segment(&segment)
+        .insert_segment(segment.clone())
         .await
         .map_err(TimerManagerError::Store)?;
 

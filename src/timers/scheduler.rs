@@ -1,6 +1,7 @@
+use crate::Key;
 use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
-use crate::timers::datetime::CompactDateTimeError;
+use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::triggers::Triggers;
 use chrono::OutOfRangeError;
 use futures::TryFutureExt;
@@ -82,12 +83,12 @@ impl TriggerScheduler {
         result_rx.map_err(|_| TimerSchedulerError::Shutdown).await?
     }
 
-    pub async fn is_active(&self, trigger: &Trigger) -> bool {
-        self.active_triggers.contains(trigger).await
+    pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
+        self.active_triggers.contains(key, time).await
     }
 
-    pub async fn deactivate(&self, trigger: &Trigger) {
-        self.active_triggers.remove(trigger).await;
+    pub async fn deactivate(&self, key: &Key, time: CompactDateTime) {
+        self.active_triggers.remove(key, time).await;
     }
 }
 

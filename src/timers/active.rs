@@ -18,19 +18,19 @@ impl ActiveTriggers {
             .insert(trigger.time);
     }
 
-    pub async fn remove(&self, trigger: &Trigger) {
-        if let Entry::Occupied(mut occupied) = self.0.entry_async(trigger.key.clone()).await {
+    pub async fn remove(&self, key: &Key, time: CompactDateTime) {
+        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await {
             let times = occupied.get_mut();
-            times.remove(&trigger.time);
+            times.remove(&time);
             if times.is_empty() {
                 let _ = occupied.remove();
             }
         }
     }
 
-    pub async fn contains(&self, trigger: &Trigger) -> bool {
+    pub async fn contains(&self, key: &Key, time: CompactDateTime) -> bool {
         self.0
-            .read_async(&trigger.key, |_, v| v.contains(&trigger.time))
+            .read_async(key, |_, v| v.contains(&time))
             .await
             .unwrap_or_default()
     }

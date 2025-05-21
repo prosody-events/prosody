@@ -1,19 +1,16 @@
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::{DELETE_CONCURRENCY, Trigger};
 use futures::{Stream, TryStreamExt};
 use std::error::Error;
 use tokio::try_join;
-use tracing::Span;
 use uuid::Uuid;
 
 pub mod memory;
 
 pub type SegmentId = Uuid;
-
-const DELETE_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct Segment {
@@ -26,7 +23,7 @@ pub trait TriggerStore {
     type Error: Error;
 
     // segments
-    async fn insert_segment(&self, segment: &Segment) -> Result<(), Self::Error>;
+    async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error>;
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error>;
     async fn delete_segment(&self, segment_id: &SegmentId) -> Result<(), Self::Error>;
 
@@ -41,8 +38,15 @@ pub trait TriggerStore {
 
     // slab triggers
     fn get_slab_triggers(&self, slab: &Slab) -> impl Stream<Item = Result<Trigger, Self::Error>>;
-    async fn insert_slab_trigger(&self, slab: &Slab, trigger: &Trigger) -> Result<(), Self::Error>;
-    async fn delete_slab_trigger(&self, slab: &Slab, trigger: &Trigger) -> Result<(), Self::Error>;
+    async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error>;
+
+    async fn delete_slab_trigger(
+        &self,
+        slab: &Slab,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), Self::Error>;
+
     async fn clear_slab_triggers(&self, slab: &Slab) -> Result<(), Self::Error>;
 
     // key triggers
@@ -55,25 +59,26 @@ pub trait TriggerStore {
     async fn insert_key_trigger(
         &self,
         segment_id: &SegmentId,
-        trigger: &Trigger,
+        trigger: Trigger,
     ) -> Result<(), Self::Error>;
 
     async fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
-        trigger: &Trigger,
+        key: &Key,
+        time: CompactDateTime,
     ) -> Result<(), Self::Error>;
 
     async fn clear_key_triggers(&self, segment: &SegmentId, key: &Key) -> Result<(), Self::Error>;
 
     // high-level trigger operations
-    async fn add_trigger(&self, segment: &Segment, trigger: &Trigger) -> Result<(), Self::Error> {
+    async fn add_trigger(&self, segment: &Segment, trigger: Trigger) -> Result<(), Self::Error> {
         let segment_id = segment.id;
         let slab = Slab::from_time(segment_id, segment.slab_size, trigger.time);
 
         try_join!(
             self.insert_slab(&segment_id, slab.id()),
-            self.insert_slab_trigger(&slab, trigger),
+            self.insert_slab_trigger(slab, trigger.clone()),
             self.insert_key_trigger(&segment_id, trigger),
         )?;
 
@@ -83,13 +88,14 @@ pub trait TriggerStore {
     async fn remove_trigger(
         &self,
         segment: &Segment,
-        trigger: &Trigger,
+        key: &Key,
+        time: CompactDateTime,
     ) -> Result<(), Self::Error> {
-        let slab = Slab::from_time(segment.id, segment.slab_size, trigger.time);
+        let slab = Slab::from_time(segment.id, segment.slab_size, time);
 
         try_join!(
-            self.delete_slab_trigger(&slab, trigger),
-            self.delete_key_trigger(&segment.id, trigger)
+            self.delete_slab_trigger(&slab, key, time),
+            self.delete_key_trigger(&segment.id, key, time)
         )?;
 
         // Note: We don't remove the slab_id from segment_slabs here
@@ -104,14 +110,10 @@ pub trait TriggerStore {
         key: &Key,
         slab_size: CompactDuration,
     ) -> Result<(), Self::Error> {
-        let span = Span::current();
         self.get_key_triggers(segment_id, key)
             .try_for_each_concurrent(DELETE_CONCURRENCY, |time| {
-                let key = key.clone();
-                let span = span.clone();
-                let trigger = Trigger { key, time, span };
                 let slab = Slab::from_time(*segment_id, slab_size, time);
-                async move { self.delete_slab_trigger(&slab, &trigger).await }
+                async move { self.delete_slab_trigger(&slab, key, time).await }
             })
             .await?;
 
