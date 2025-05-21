@@ -8,6 +8,7 @@ use crate::timers::scheduler::{TimerSchedulerError, TriggerScheduler};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use chrono::OutOfRangeError;
 use educe::Educe;
+use futures::{Stream, TryStreamExt};
 use std::error::Error;
 use std::fmt::Debug;
 use thiserror::Error;
@@ -65,6 +66,15 @@ where
         Ok((trigger_rx, manager))
     }
 
+    pub fn scheduled_times(
+        &self,
+        key: &Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, TimerManagerError<T::Error>>> {
+        self.store
+            .get_key_triggers(&self.segment.id, key)
+            .map_err(TimerManagerError::Store)
+    }
+
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
         let mut range_rx = self.range_rx.clone();
         let range = range_rx
@@ -99,6 +109,22 @@ where
             .remove_trigger(&self.segment, trigger)
             .await
             .map_err(TimerManagerError::Store)
+    }
+
+    pub async fn unschedule_all(&self, key: &Key) -> Result<(), TimerManagerError<T::Error>> {
+        let span = Span::current();
+
+        self.scheduled_times(key)
+            .try_for_each_concurrent(16, |time| {
+                let trigger = Trigger {
+                    key: key.clone(),
+                    time,
+                    span: span.clone(),
+                };
+
+                async move { self.unschedule(&trigger).await }
+            })
+            .await
     }
 
     pub async fn is_active(&self, trigger: &Trigger) -> bool {
