@@ -26,7 +26,7 @@ use tokio::time::sleep;
 #[derive(Clone, Debug)]
 struct Messages(Vec<(u8, u16)>);
 
-/// A wrapper for a vector of u8 values used in QuickCheck tests.
+/// A wrapper for a vector of u8 values used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
 struct SimpleMessages(Vec<u8>);
 
@@ -185,7 +185,7 @@ async fn processes_messages_in_order_impl(
 }
 
 impl Arbitrary for Messages {
-    /// Generates an arbitrary `Messages` instance for QuickCheck tests.
+    /// Generates an arbitrary `Messages` instance for `QuickCheck` tests.
     ///
     /// # Arguments
     ///
@@ -200,7 +200,7 @@ impl Arbitrary for Messages {
 }
 
 impl Arbitrary for SimpleMessages {
-    /// Generates an arbitrary `SimpleMessages` instance for QuickCheck tests.
+    /// Generates an arbitrary `SimpleMessages` instance for `QuickCheck` tests.
     ///
     /// # Arguments
     ///

@@ -223,3 +223,11 @@ impl TriggerStore for InMemoryTriggerStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::timers::store::memory::InMemoryTriggerStore;
+    use crate::trigger_store_tests;
+
+    trigger_store_tests!(InMemoryTriggerStore, InMemoryTriggerStore::new());
+}

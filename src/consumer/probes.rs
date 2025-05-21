@@ -280,6 +280,7 @@ mod tests {
     /// # Returns
     ///
     /// `true` if the endpoint responds within the timeout, `false` otherwise
+    #[allow(clippy::print_stdout)]
     async fn check_endpoint(client: &Client, address: SocketAddr, path: &str) -> bool {
         let url = format!("http://localhost:{}{}", address.port(), path);
 
@@ -287,11 +288,11 @@ mod tests {
         match timeout(Duration::from_secs(5), client.get(&url).send()).await {
             Ok(Ok(_)) => true,
             Ok(Err(e)) => {
-                println!("Error sending request to {}: {:?}", path, e);
+                println!("Error sending request to {path}: {e:?}");
                 false
             }
             Err(_) => {
-                println!("Timeout sending request to {}", path);
+                println!("Timeout sending request to {path}");
                 false
             }
         }

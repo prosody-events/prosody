@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 pub mod memory;
 
+#[cfg(test)]
+pub mod tests;
+
 pub type SegmentId = Uuid;
 
 #[derive(Clone, Debug)]

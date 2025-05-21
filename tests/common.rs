@@ -6,7 +6,7 @@
 //! consumer tasks, and verifying message integrity and order in property-based
 //! tests.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::implicit_hasher)]
 
 use std::cmp::max;
 use std::collections::{BTreeSet, HashSet};
