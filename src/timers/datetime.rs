@@ -46,6 +46,18 @@ impl CompactDateTime {
 
         Ok(Self { epoch_seconds })
     }
+
+    pub fn subtract_duration(
+        self,
+        duration: CompactDuration,
+    ) -> Result<Self, CompactDateTimeError> {
+        let epoch_seconds = self
+            .epoch_seconds
+            .checked_sub(duration.seconds())
+            .ok_or(CompactDateTimeError::OutOfRange)?;
+
+        Ok(Self { epoch_seconds })
+    }
 }
 
 impl TryFrom<DateTime<Utc>> for CompactDateTime {

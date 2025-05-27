@@ -5,6 +5,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{DELETE_CONCURRENCY, Trigger};
 use futures::{Stream, TryStreamExt};
 use std::error::Error;
+use std::ops::RangeBounds;
 use tokio::try_join;
 use uuid::Uuid;
 
@@ -22,104 +23,157 @@ pub struct Segment {
     pub slab_size: CompactDuration,
 }
 
-pub trait TriggerStore {
-    type Error: Error;
+pub trait TriggerStore: Clone + Send + Sync + 'static {
+    type Error: Error + Send + Sync + 'static;
 
     // segments
-    async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error>;
-    async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error>;
-    async fn delete_segment(&self, segment_id: &SegmentId) -> Result<(), Self::Error>;
+    fn insert_segment(
+        &self,
+        segment: Segment,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn get_segment(
+        &self,
+        segment_id: &SegmentId,
+    ) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
+
+    fn delete_segment(
+        &self,
+        segment_id: &SegmentId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // segment slab identifiers
-    fn get_slab(&self, segment_id: &SegmentId) -> impl Stream<Item = Result<SlabId, Self::Error>>;
+    fn get_slabs(
+        &self,
+        segment_id: &SegmentId,
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
 
-    async fn insert_slab(&self, segment_id: &SegmentId, slab_id: SlabId)
-    -> Result<(), Self::Error>;
+    fn get_slab_range<B>(
+        &self,
+        segment_id: &SegmentId,
+        range: B,
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send
+    where
+        B: RangeBounds<SlabId> + Send;
 
-    async fn delete_slab(&self, segment_id: &SegmentId, slab_id: SlabId)
-    -> Result<(), Self::Error>;
+    fn insert_slab(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn delete_slab(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // slab triggers
-    fn get_slab_triggers(&self, slab: &Slab) -> impl Stream<Item = Result<Trigger, Self::Error>>;
-    async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error>;
+    fn get_slab_triggers(
+        &self,
+        slab: &Slab,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
-    async fn delete_slab_trigger(
+    fn insert_slab_trigger(
+        &self,
+        slab: Slab,
+        trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn delete_slab_trigger(
         &self,
         slab: &Slab,
         key: &Key,
         time: CompactDateTime,
-    ) -> Result<(), Self::Error>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    async fn clear_slab_triggers(&self, slab: &Slab) -> Result<(), Self::Error>;
+    fn clear_slab_triggers(
+        &self,
+        slab: &Slab,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // key triggers
     fn get_key_triggers(
         &self,
         segment_id: &SegmentId,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>>;
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
 
-    async fn insert_key_trigger(
+    fn insert_key_trigger(
         &self,
         segment_id: &SegmentId,
         trigger: Trigger,
-    ) -> Result<(), Self::Error>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    async fn delete_key_trigger(
+    fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
         key: &Key,
         time: CompactDateTime,
-    ) -> Result<(), Self::Error>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    async fn clear_key_triggers(&self, segment: &SegmentId, key: &Key) -> Result<(), Self::Error>;
+    fn clear_key_triggers(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // high-level trigger operations
-    async fn add_trigger(&self, segment: &Segment, trigger: Trigger) -> Result<(), Self::Error> {
-        let segment_id = segment.id;
-        let slab = Slab::from_time(segment_id, segment.slab_size, trigger.time);
-
-        try_join!(
-            self.insert_slab(&segment_id, slab.id()),
-            self.insert_slab_trigger(slab, trigger.clone()),
-            self.insert_key_trigger(&segment_id, trigger),
-        )?;
-
-        Ok(())
-    }
-
-    async fn remove_trigger(
+    // high-level helpers
+    fn add_trigger(
         &self,
         segment: &Segment,
-        key: &Key,
-        time: CompactDateTime,
-    ) -> Result<(), Self::Error> {
-        let slab = Slab::from_time(segment.id, segment.slab_size, time);
-
-        try_join!(
-            self.delete_slab_trigger(&slab, key, time),
-            self.delete_key_trigger(&segment.id, key, time)
-        )?;
-
-        // Note: We don't remove the slab_id from segment_slabs here
-        // as other triggers might still exist in that slab
-
-        Ok(())
+        slab: Slab,
+        trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let segment_id = segment.id;
+        let slab_id = slab.id();
+        async move {
+            try_join!(
+                self.insert_slab(&segment_id, slab_id),
+                self.insert_slab_trigger(slab, trigger.clone()),
+                self.insert_key_trigger(&segment_id, trigger),
+            )?;
+            Ok(())
+        }
     }
 
-    async fn clear_triggers_for_key(
+    fn remove_trigger(
+        &self,
+        segment: &Segment,
+        slab: &Slab,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            try_join!(
+                self.delete_slab_trigger(slab, key, time),
+                self.delete_key_trigger(&segment.id, key, time)
+            )?;
+            Ok(())
+        }
+    }
+
+    fn clear_triggers_for_key(
         &self,
         segment_id: &SegmentId,
         key: &Key,
         slab_size: CompactDuration,
-    ) -> Result<(), Self::Error> {
-        self.get_key_triggers(segment_id, key)
-            .try_for_each_concurrent(DELETE_CONCURRENCY, |time| {
-                let slab = Slab::from_time(*segment_id, slab_size, time);
-                async move { self.delete_slab_trigger(&slab, key, time).await }
-            })
-            .await?;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        // pull the stream, then delete per time, then final clear
+        let segment_id_copy = *segment_id;
+        let key_clone = key.clone();
+        let stream = self.get_key_triggers(segment_id, key);
 
-        self.clear_key_triggers(segment_id, key).await
+        async move {
+            stream
+                .try_for_each_concurrent(DELETE_CONCURRENCY, move |time| {
+                    let key_clone = key.clone();
+                    let slab = Slab::from_time(segment_id_copy, slab_size, time);
+                    async move { self.delete_slab_trigger(&slab, &key_clone, time).await }
+                })
+                .await?;
+
+            self.clear_key_triggers(&segment_id_copy, &key_clone).await
+        }
     }
 }

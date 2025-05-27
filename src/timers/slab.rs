@@ -58,6 +58,26 @@ impl Slab {
 
         start.into()..end.into()
     }
+
+    pub fn add(&self, number: u32) -> Option<Slab> {
+        let mut slab = self.clone();
+        slab.id = self.id.checked_add(number)?;
+        Some(slab)
+    }
+
+    pub fn sub(&self, number: u32) -> Option<Slab> {
+        let mut slab = self.clone();
+        slab.id = self.id.checked_sub(number)?;
+        Some(slab)
+    }
+
+    pub fn next(&self) -> Option<Slab> {
+        self.add(1)
+    }
+
+    pub fn previous(&self) -> Option<Slab> {
+        self.sub(1)
+    }
 }
 
 impl Debug for Slab {

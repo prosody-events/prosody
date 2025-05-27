@@ -9,6 +9,7 @@ use futures::stream::Stream;
 use scc::HashMap;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 use tokio::join;
 use tracing::Span;
@@ -64,13 +65,32 @@ impl TriggerStore for InMemoryTriggerStore {
     }
 
     // Segment slabs
-    fn get_slab(&self, segment_id: &SegmentId) -> impl Stream<Item = Result<SlabId, Self::Error>> {
+    fn get_slabs(&self, segment_id: &SegmentId) -> impl Stream<Item = Result<SlabId, Self::Error>> {
         try_stream! {
             let Some(entry) = self.0.segment_slabs.get_async(segment_id).await else {
                 return;
             };
 
             for &slab_id in entry.iter() {
+                yield slab_id;
+            }
+        }
+    }
+
+    fn get_slab_range<B>(
+        &self,
+        segment_id: &SegmentId,
+        range: B,
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>>
+    where
+        B: RangeBounds<SlabId>,
+    {
+        try_stream! {
+            let Some(entry) = self.0.segment_slabs.get_async(segment_id).await else {
+                return;
+            };
+
+            for &slab_id in entry.range(range) {
                 yield slab_id;
             }
         }

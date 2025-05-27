@@ -34,6 +34,19 @@ impl ActiveTriggers {
             .await
             .unwrap_or_default()
     }
+
+    pub async fn scan_active_times<F>(&self, mut f: F)
+    where
+        F: FnMut(CompactDateTime),
+    {
+        self.0
+            .scan_async(|_, times| {
+                for &time in times {
+                    f(time);
+                }
+            })
+            .await;
+    }
 }
 
 #[cfg(test)]

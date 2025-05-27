@@ -2,7 +2,7 @@ use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::scheduler::TimerSchedulerError;
 use ahash::HashMap;
-use std::future::poll_fn;
+use std::{future::poll_fn, time::Duration};
 use tokio_util::time::{DelayQueue, delay_queue};
 
 pub struct Triggers {
@@ -20,17 +20,15 @@ impl Triggers {
         }
     }
 
-    pub fn active(&self) -> &ActiveTriggers {
+    pub fn active_triggers(&self) -> &ActiveTriggers {
         &self.active
     }
 
-    pub async fn insert(&mut self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
-        let duration = trigger.time.duration_from_now()?;
+    pub async fn insert(&mut self, trigger: Trigger) {
+        let duration = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
         let queue_key = self.queue.insert(trigger.clone(), duration);
         self.queue_keys.insert(trigger.clone(), queue_key);
         self.active.insert(trigger).await;
-
-        Ok(())
     }
 
     pub async fn next(&mut self) -> Option<Trigger> {
@@ -78,7 +76,7 @@ mod tests {
         };
 
         // Insert the trigger
-        triggers.insert(trigger.clone()).await?;
+        triggers.insert(trigger.clone()).await;
 
         // Advance time by 1 second to simulate the trigger expiring
         advance(Duration::from_secs(1)).await;
@@ -111,13 +109,13 @@ mod tests {
         };
 
         // Insert the trigger
-        triggers.insert(trigger.clone()).await?;
+        triggers.insert(trigger.clone()).await;
 
         // Remove the trigger
         triggers.remove(&trigger).await?;
 
         // Verify the trigger is no longer active
-        assert!(!triggers.active().contains(&key, time).await);
+        assert!(!triggers.active_triggers().contains(&key, time).await);
 
         // Advance time by 5 seconds to simulate the trigger's original expiration time
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -179,8 +177,8 @@ mod tests {
         };
 
         // Insert both triggers
-        triggers.insert(trigger_first.clone()).await?;
-        triggers.insert(trigger_second.clone()).await?;
+        triggers.insert(trigger_first.clone()).await;
+        triggers.insert(trigger_second.clone()).await;
 
         // Advance time by 1 second to simulate the first trigger expiring
         advance(Duration::from_secs(1)).await;
@@ -223,16 +221,16 @@ mod tests {
         };
 
         // Insert the trigger
-        triggers.insert(trigger.clone()).await?;
+        triggers.insert(trigger.clone()).await;
 
         // Verify the trigger is active
-        assert!(triggers.active().contains(&key, time).await);
+        assert!(triggers.active_triggers().contains(&key, time).await);
 
         // Remove the trigger
         triggers.remove(&trigger).await?;
 
         // Verify the trigger is no longer active
-        assert!(!triggers.active().contains(&key, time).await);
+        assert!(!triggers.active_triggers().contains(&key, time).await);
 
         Ok(())
     }

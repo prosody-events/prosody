@@ -80,7 +80,7 @@ where
     S::Error: Debug,
 {
     store
-        .get_slab(segment_id)
+        .get_slabs(segment_id)
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -107,8 +107,9 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
+    let slab = Slab::from_time(segment.id, segment.slab_size, trigger.time);
     store
-        .add_trigger(segment, trigger.clone())
+        .add_trigger(segment, slab, trigger.clone())
         .await
         .map_err(|e| format!("Failed to add trigger: {e:?}"))?;
     Ok(())
@@ -159,8 +160,9 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
+    let slab = Slab::from_time(segment.id, segment.slab_size, time);
     store
-        .remove_trigger(segment, key, time)
+        .remove_trigger(segment, &slab, key, time)
         .await
         .map_err(|e| format!("Failed to remove trigger: {e:?}"))?;
     Ok(())

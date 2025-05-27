@@ -38,7 +38,7 @@ impl TriggerScheduler {
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
         let (triggers_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
         let triggers = Triggers::new();
-        let active_triggers = triggers.active().clone();
+        let active_triggers = triggers.active_triggers().clone();
 
         spawn(process_commands(commands_rx, triggers_tx, triggers));
 
@@ -81,6 +81,10 @@ impl TriggerScheduler {
             .await?;
 
         result_rx.map_err(|_| TimerSchedulerError::Shutdown).await?
+    }
+
+    pub fn active_triggers(&self) -> &ActiveTriggers {
+        &self.active_triggers
     }
 
     pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
@@ -147,7 +151,10 @@ async fn process_command(
     }: Command,
 ) {
     let result = match operation {
-        CommandOperation::Add => triggers.insert(trigger.clone()).await,
+        CommandOperation::Add => {
+            triggers.insert(trigger.clone()).await;
+            Ok(())
+        }
         CommandOperation::Remove => triggers.remove(&trigger).await,
     };
 
