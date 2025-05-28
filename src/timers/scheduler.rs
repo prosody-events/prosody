@@ -3,14 +3,12 @@ use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::triggers::Triggers;
-use chrono::OutOfRangeError;
 use futures::TryFutureExt;
 use std::fmt::Debug;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::{select, spawn};
-use tracing::debug;
 
 const BUFFER_SIZE: usize = 64;
 
@@ -22,7 +20,7 @@ pub struct TriggerScheduler {
 
 #[derive(Debug)]
 struct Command {
-    result_tx: oneshot::Sender<Result<(), TimerSchedulerError>>,
+    result_tx: oneshot::Sender<()>,
     trigger: Trigger,
     operation: CommandOperation,
 }
@@ -64,7 +62,7 @@ impl TriggerScheduler {
             .map_err(|_| TimerSchedulerError::Shutdown)
             .await?;
 
-        result_rx.map_err(|_| TimerSchedulerError::Shutdown).await?
+        result_rx.await.map_err(|_| TimerSchedulerError::Shutdown)
     }
 
     pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
@@ -80,7 +78,7 @@ impl TriggerScheduler {
             .map_err(|_| TimerSchedulerError::Shutdown)
             .await?;
 
-        result_rx.map_err(|_| TimerSchedulerError::Shutdown).await?
+        result_rx.await.map_err(|_| TimerSchedulerError::Shutdown)
     }
 
     pub fn active_triggers(&self) -> &ActiveTriggers {
@@ -150,29 +148,18 @@ async fn process_command(
         operation,
     }: Command,
 ) {
-    let result = match operation {
-        CommandOperation::Add => {
-            triggers.insert(trigger.clone()).await;
-            Ok(())
-        }
+    match operation {
+        CommandOperation::Add => triggers.insert(trigger.clone()).await,
         CommandOperation::Remove => triggers.remove(&trigger).await,
-    };
-
-    if let Err(result) = result_tx.send(result) {
-        debug!(?trigger, ?result, "Failed to send timer result");
     }
+
+    let _ = result_tx.send(());
 }
 
 #[derive(Debug, Error)]
 pub enum TimerSchedulerError {
     #[error(transparent)]
     DateTime(#[from] CompactDateTimeError),
-
-    #[error("Time must be in the future: {0:#}")]
-    PastTime(#[from] OutOfRangeError),
-
-    #[error("Time not found")]
-    NotFound,
 
     #[error("Timer has been shutdown")]
     Shutdown,
@@ -275,30 +262,6 @@ mod tests {
             return Err(format!(
                 "Trigger is not active after emission. Key: {key:?}, Time: {time:?}"
             ));
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_unschedule_nonexistent_trigger() -> Result<(), String> {
-        let (_, scheduler) = TriggerScheduler::new();
-
-        let key = Key::from("nonexistent-key");
-        let time = CompactDateTime::now()
-            .and_then(|t| t.add_duration(CompactDuration::new(5)))
-            .map_err(|e| format!("Failed to calculate future time: {e:?}"))?;
-        let trigger = Trigger {
-            key,
-            time,
-            span: Span::current(),
-        };
-
-        // Attempt to unschedule a nonexistent trigger
-        let result = scheduler.unschedule(trigger).await;
-
-        if !matches!(result, Err(TimerSchedulerError::NotFound)) {
-            return Err("Expected NotFound error when unscheduling nonexistent trigger".to_owned());
         }
 
         Ok(())

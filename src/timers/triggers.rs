@@ -1,7 +1,7 @@
 use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
-use crate::timers::scheduler::TimerSchedulerError;
 use ahash::HashMap;
+use std::collections::hash_map::Entry;
 use std::{future::poll_fn, time::Duration};
 use tokio_util::time::{DelayQueue, delay_queue};
 
@@ -25,36 +25,40 @@ impl Triggers {
     }
 
     pub async fn insert(&mut self, trigger: Trigger) {
+        let Entry::Vacant(vacant) = self.queue_keys.entry(trigger.clone()) else {
+            return;
+        };
+
         let duration = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
         let queue_key = self.queue.insert(trigger.clone(), duration);
-        self.queue_keys.insert(trigger.clone(), queue_key);
+        vacant.insert(queue_key);
         self.active.insert(trigger).await;
     }
 
     pub async fn next(&mut self) -> Option<Trigger> {
         let expired = poll_fn(|cx| self.queue.poll_expired(cx)).await?;
+        self.queue_keys.remove(expired.get_ref());
         Some(expired.into_inner())
     }
 
-    pub async fn remove(&mut self, trigger: &Trigger) -> Result<(), TimerSchedulerError> {
-        let (trigger, queue_key) = self
-            .queue_keys
-            .remove_entry(trigger)
-            .ok_or(TimerSchedulerError::NotFound)?;
+    pub async fn remove(&mut self, trigger: &Trigger) {
+        let Some((trigger, queue_key)) = self.queue_keys.remove_entry(trigger) else {
+            return;
+        };
 
         self.queue.remove(&queue_key);
         self.active.remove(&trigger.key, trigger.time).await;
-
-        Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::Key;
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
+    use crate::timers::scheduler::TimerSchedulerError;
     use tokio::time::{Duration, advance, pause};
     use tracing::Span;
 
@@ -82,11 +86,8 @@ mod tests {
         advance(Duration::from_secs(1)).await;
 
         // Retrieve the next expired trigger
-        if let Some(expired_trigger) = triggers.next().await {
-            assert_eq!(expired_trigger, trigger);
-        } else {
-            return Err(TimerSchedulerError::NotFound);
-        }
+        let expired_trigger = triggers.next().await.expect("No expired trigger found");
+        assert_eq!(expired_trigger, trigger);
 
         Ok(())
     }
@@ -112,7 +113,7 @@ mod tests {
         triggers.insert(trigger.clone()).await;
 
         // Remove the trigger
-        triggers.remove(&trigger).await?;
+        triggers.remove(&trigger).await;
 
         // Verify the trigger is no longer active
         assert!(!triggers.active_triggers().contains(&key, time).await);
@@ -124,28 +125,6 @@ mod tests {
         assert!(triggers.next().await.is_none());
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_remove_nonexistent_trigger() {
-        pause();
-
-        let mut triggers = Triggers::new();
-
-        let key = Key::from("nonexistent-key");
-        let time = CompactDateTime::now()
-            .and_then(|t| t.add_duration(CompactDuration::new(5)))
-            .unwrap_or(CompactDateTime::MIN); // Default to MIN if there's an error
-        let trigger = Trigger {
-            key,
-            time,
-            span: Span::current(),
-        };
-
-        // Attempt to remove a nonexistent trigger
-        let result = triggers.remove(&trigger).await;
-
-        assert!(matches!(result, Err(TimerSchedulerError::NotFound)));
     }
 
     #[tokio::test]
@@ -184,21 +163,15 @@ mod tests {
         advance(Duration::from_secs(1)).await;
 
         // Retrieve the next expired trigger
-        if let Some(expired_trigger) = triggers.next().await {
-            assert_eq!(expired_trigger, trigger_first);
-        } else {
-            return Err(TimerSchedulerError::NotFound);
-        }
+        let expired_trigger = triggers.next().await.expect("No expired trigger found");
+        assert_eq!(expired_trigger, trigger_first);
 
         // Advance time by another 1 second to simulate the second trigger expiring
         advance(Duration::from_secs(1)).await;
 
         // Retrieve the next expired trigger
-        if let Some(expired_trigger) = triggers.next().await {
-            assert_eq!(expired_trigger, trigger_second);
-        } else {
-            return Err(TimerSchedulerError::NotFound);
-        }
+        let expired_trigger = triggers.next().await.expect("No expired trigger found");
+        assert_eq!(expired_trigger, trigger_second);
 
         Ok(())
     }
@@ -227,7 +200,7 @@ mod tests {
         assert!(triggers.active_triggers().contains(&key, time).await);
 
         // Remove the trigger
-        triggers.remove(&trigger).await?;
+        triggers.remove(&trigger).await;
 
         // Verify the trigger is no longer active
         assert!(!triggers.active_triggers().contains(&key, time).await);

@@ -25,17 +25,22 @@ impl ContiguousRange {
     }
 
     pub fn start_load(&mut self, new_max: SlabId) {
-        if let Some(current_max) = self.max_owned {
-            if current_max > new_max {
-                return;
-            }
+        if self
+            .max_owned
+            .is_some_and(|current_max| current_max > new_max)
+        {
+            return;
         }
 
         self.max_loading = Some(new_max);
     }
 
     pub fn complete_load(&mut self) {
-        self.max_owned = self.max_loading.take();
+        let Some(new_max) = self.max_loading else {
+            return;
+        };
+
+        self.max_owned = Some(new_max);
     }
 
     pub fn abort_load(&mut self) {
