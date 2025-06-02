@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::Key;
+use crate::consumer::Keyed;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::duration::CompactDuration;
 use crate::timers::guards::{DeleteGuard, LoadGuard};
@@ -17,13 +18,14 @@ use std::cmp::max;
 use std::error::Error;
 use std::fmt::Debug;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::watch::{Receiver, Ref};
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
-use tracing::{Instrument, Span, debug, error};
+use tracing::{Instrument, Span, debug, error, warn};
 
 mod active;
 mod datetime;
@@ -38,14 +40,113 @@ mod triggers;
 const LOAD_CONCURRENCY: usize = 32;
 const DELETE_CONCURRENCY: usize = 16;
 
+pub struct UncommittedTimer<T> {
+    trigger: Trigger,
+    uncommitted: Option<UncommittedTrigger<T>>,
+}
+
+struct UncommittedTrigger<T> {
+    operations: Arc<TimerManager<T>>,
+    completed: bool,
+}
+
+impl<T> UncommittedTimer<T>
+where
+    T: TriggerStore,
+{
+    pub fn new(trigger: Trigger, manager: Arc<TimerManager<T>>) -> Self {
+        Self {
+            trigger,
+            uncommitted: Some(UncommittedTrigger {
+                operations: manager,
+                completed: false,
+            }),
+        }
+    }
+
+    pub fn time(&self) -> CompactDateTime {
+        self.trigger.time
+    }
+
+    pub fn span(&self) -> &Span {
+        &self.trigger.span
+    }
+
+    pub async fn is_active(&self) -> Result<bool, TimerManagerError<T::Error>> {
+        Ok(self
+            .uncommitted
+            .as_ref()
+            .ok_or(TimerManagerError::Shutdown)?
+            .is_active(&self.trigger)
+            .await)
+    }
+
+    pub async fn complete(mut self) -> Result<(), TimerManagerError<T::Error>> {
+        self.uncommitted
+            .as_mut()
+            .ok_or(TimerManagerError::Shutdown)?
+            .commit(self.trigger)
+            .await
+    }
+
+    pub fn abort(mut self) -> Result<(), TimerManagerError<T::Error>> {
+        self.uncommitted
+            .as_mut()
+            .ok_or(TimerManagerError::Shutdown)?
+            .abort();
+
+        Ok(())
+    }
+}
+
+impl<T> Keyed for UncommittedTimer<T> {
+    type Key = Key;
+
+    fn key(&self) -> &Self::Key {
+        &self.trigger.key
+    }
+}
+
+impl<T> UncommittedTrigger<T>
+where
+    T: TriggerStore,
+{
+    async fn is_active(&self, trigger: &Trigger) -> bool {
+        !self.completed && self.operations.is_active(&trigger.key, trigger.time).await
+    }
+
+    async fn commit(&mut self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
+        if self.completed {
+            return Err(TimerManagerError::AlreadyCommitted);
+        }
+
+        self.operations.complete(&trigger.key, trigger.time).await?;
+        self.completed = true;
+
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl<T> Drop for UncommittedTrigger<T> {
+    fn drop(&mut self) {
+        if !self.completed {
+            warn!("trigger was dropped without committing");
+        }
+    }
+}
+
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {
-    pub key: Key,
-    pub time: CompactDateTime,
+    key: Key,
+    time: CompactDateTime,
 
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
-    pub span: Span,
+    span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -156,7 +257,7 @@ where
         self.scheduler.is_active(key, time).await
     }
 
-    pub async fn mark_complete(
+    pub async fn complete(
         &self,
         key: &Key,
         time: CompactDateTime,
@@ -455,6 +556,9 @@ where
 
     #[error("Time not found")]
     NotFound,
+
+    #[error("Timer already committed")]
+    AlreadyCommitted,
 
     #[error("Timer has been shutdown")]
     Shutdown,
