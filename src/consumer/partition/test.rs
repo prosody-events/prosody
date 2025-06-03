@@ -4,7 +4,7 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, MessageContext};
+use crate::consumer::{EventHandler, MessageContext, Uncommitted};
 use aho_corasick::StartKind;
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
@@ -214,7 +214,7 @@ async fn test_partition_manager_is_stalled() {
                     vec.push(offset);
                 };
                 notify.notify_waiters();
-                message.commit();
+                message.commit().await;
             }
         }
 
@@ -463,7 +463,7 @@ impl EventHandler for TestHandler {
                 list.push(offset);
             };
             notify.notify_waiters();
-            message.commit();
+            message.commit().await;
         }
     }
 

@@ -19,8 +19,9 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{Span, debug, error};
 
-use crate::consumer::Keyed;
 use crate::consumer::partition::offsets::UncommittedOffset;
+use crate::consumer::{Keyed, Uncommitted};
+use crate::timers::UncommittedTimer;
 use crate::{
     BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem, Topic,
 };
@@ -68,6 +69,35 @@ impl MessageContext {
     #[must_use]
     pub fn should_shutdown(&self) -> bool {
         *self.shutdown_rx.borrow()
+    }
+}
+
+#[derive(Debug)]
+pub enum UncommittedEvent<T> {
+    Message(UncommittedMessage),
+    Timer(UncommittedTimer<T>),
+}
+
+impl<T> Keyed for UncommittedEvent<T> {
+    type Key = Key;
+
+    fn key(&self) -> &Self::Key {
+        match self {
+            Self::Message(message) => message.key(),
+            Self::Timer(timer) => timer.key(),
+        }
+    }
+}
+
+impl<T> From<UncommittedMessage> for UncommittedEvent<T> {
+    fn from(value: UncommittedMessage) -> Self {
+        Self::Message(value)
+    }
+}
+
+impl<T> From<UncommittedTimer<T>> for UncommittedEvent<T> {
+    fn from(value: UncommittedTimer<T>) -> Self {
+        Self::Timer(value)
     }
 }
 
@@ -135,9 +165,10 @@ impl UncommittedMessage {
     pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
         (self.inner, self.uncommitted_offset)
     }
+}
 
-    /// Commits the message's offset.
-    pub fn commit(self) {
+impl Uncommitted for UncommittedMessage {
+    async fn commit(self) {
         debug!(
             topic = self.topic().as_ref(),
             partition = self.partition(),
@@ -148,10 +179,7 @@ impl UncommittedMessage {
         self.uncommitted_offset.commit();
     }
 
-    /// Aborts processing for this message's partition.
-    ///
-    /// Should only be called during shutdown to stop processing cleanly.
-    pub fn abort(self) {
+    async fn abort(self) {
         debug!(
             topic = self.topic().as_ref(),
             partition = self.partition(),

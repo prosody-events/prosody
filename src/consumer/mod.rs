@@ -172,6 +172,11 @@ pub trait Keyed {
     fn key(&self) -> &Self::Key;
 }
 
+pub trait Uncommitted {
+    fn commit(self) -> impl Future<Output = ()>;
+    fn abort(self) -> impl Future<Output = ()>;
+}
+
 /// Provides handlers for processing messages from specific partitions.
 ///
 /// This trait allows creating custom message handlers for each partition,

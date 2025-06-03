@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::Key;
-use crate::consumer::Keyed;
+use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::duration::CompactDuration;
 use crate::timers::guards::{DeleteGuard, LoadGuard};
@@ -22,9 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::spawn;
+use tokio::sync::watch;
 use tokio::sync::watch::{Receiver, Ref};
-use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span, debug, error, warn};
 
 mod active;
@@ -40,13 +41,17 @@ mod triggers;
 const LOAD_CONCURRENCY: usize = 32;
 const DELETE_CONCURRENCY: usize = 16;
 
+#[derive(Educe)]
+#[educe(Debug)]
 pub struct UncommittedTimer<T> {
     trigger: Trigger,
+
+    #[educe(Debug(ignore))]
     uncommitted: Option<UncommittedTrigger<T>>,
 }
 
 struct UncommittedTrigger<T> {
-    operations: Arc<TimerManager<T>>,
+    operations: TimerManager<T>,
     completed: bool,
 }
 
@@ -54,7 +59,7 @@ impl<T> UncommittedTimer<T>
 where
     T: TriggerStore,
 {
-    pub fn new(trigger: Trigger, manager: Arc<TimerManager<T>>) -> Self {
+    pub fn new(trigger: Trigger, manager: TimerManager<T>) -> Self {
         Self {
             trigger,
             uncommitted: Some(UncommittedTrigger {
@@ -80,22 +85,30 @@ where
             .is_active(&self.trigger)
             .await)
     }
+}
 
-    pub async fn complete(mut self) -> Result<(), TimerManagerError<T::Error>> {
-        self.uncommitted
-            .as_mut()
-            .ok_or(TimerManagerError::Shutdown)?
-            .commit(self.trigger)
-            .await
+impl<T> Uncommitted for UncommittedTimer<T>
+where
+    T: TriggerStore,
+{
+    async fn commit(mut self) {
+        let Some(mut uncommitted) = self.uncommitted.take() else {
+            error!("timer already committed");
+            return;
+        };
+
+        if let Err(error) = uncommitted.commit(self.trigger).await {
+            error!("failed to commit timer: {error:#}");
+        }
     }
 
-    pub fn abort(mut self) -> Result<(), TimerManagerError<T::Error>> {
-        self.uncommitted
-            .as_mut()
-            .ok_or(TimerManagerError::Shutdown)?
-            .abort();
+    async fn abort(mut self) {
+        let Some(mut uncommitted) = self.uncommitted.take() else {
+            error!("timer already committed");
+            return;
+        };
 
-        Ok(())
+        uncommitted.abort();
     }
 }
 
@@ -150,7 +163,10 @@ pub struct Trigger {
 }
 
 #[derive(Clone, Debug)]
-pub struct TimerManager<T> {
+pub struct TimerManager<T>(Arc<TimerManagerInner<T>>);
+
+#[derive(Debug)]
+pub struct TimerManagerInner<T> {
     segment: Segment,
     range_rx: Receiver<ContiguousRange>,
     scheduler: TriggerScheduler,
@@ -166,7 +182,7 @@ where
         slab_size: CompactDuration,
         name: &str,
         store: T,
-    ) -> Result<(mpsc::Receiver<Trigger>, Self), TimerManagerError<T::Error>> {
+    ) -> Result<(impl Stream<Item = UncommittedTimer<T>>, Self), TimerManagerError<T::Error>> {
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
         let (range_tx, range_rx) = watch::channel(ContiguousRange::default());
         let (trigger_rx, scheduler) = TriggerScheduler::new();
@@ -178,39 +194,45 @@ where
             range_tx,
         ));
 
-        let manager = Self {
+        let manager = Self(Arc::new(TimerManagerInner {
             segment,
             range_rx,
             scheduler,
             store,
-        };
+        }));
 
-        Ok((trigger_rx, manager))
+        let cloned_manager = manager.clone();
+        let stream = ReceiverStream::new(trigger_rx)
+            .map(move |trigger| UncommittedTimer::new(trigger, cloned_manager.clone()));
+
+        Ok((stream, manager))
     }
 
     pub fn scheduled_times(
         &self,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, TimerManagerError<T::Error>>> {
-        self.store
-            .get_key_triggers(&self.segment.id, key)
+        self.0
+            .store
+            .get_key_triggers(&self.0.segment.id, key)
             .map_err(TimerManagerError::Store)
     }
 
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
-        let slab = Slab::from_time(self.segment.id, self.segment.slab_size, trigger.time);
+        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, trigger.time);
         let slab_id = slab.id();
 
-        let mut range_rx = self.range_rx.clone();
+        let mut range_rx = self.0.range_rx.clone();
         let range = lock_range(slab_id, &mut range_rx).await?;
 
-        self.store
-            .add_trigger(&self.segment, slab, trigger.clone())
+        self.0
+            .store
+            .add_trigger(&self.0.segment, slab, trigger.clone())
             .await
             .map_err(TimerManagerError::Store)?;
 
         if range.is_owned(slab_id) {
-            self.scheduler.schedule(trigger).await?;
+            self.0.scheduler.schedule(trigger).await?;
         }
 
         Ok(())
@@ -221,10 +243,10 @@ where
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let slab = Slab::from_time(self.segment.id, self.segment.slab_size, time);
+        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
 
-        let mut range_rx = self.range_rx.clone();
+        let mut range_rx = self.0.range_rx.clone();
         let range = lock_range(slab_id, &mut range_rx).await?;
 
         if range.is_owned(slab_id) {
@@ -234,11 +256,12 @@ where
                 span: Span::current(),
             };
 
-            self.scheduler.unschedule(trigger).await?;
+            self.0.scheduler.unschedule(trigger).await?;
         }
 
-        self.store
-            .remove_trigger(&self.segment, &slab, key, time)
+        self.0
+            .store
+            .remove_trigger(&self.0.segment, &slab, key, time)
             .await
             .map_err(TimerManagerError::Store)
     }
@@ -254,7 +277,7 @@ where
     }
 
     pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
-        self.scheduler.is_active(key, time).await
+        self.0.scheduler.is_active(key, time).await
     }
 
     pub async fn complete(
@@ -262,18 +285,19 @@ where
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let slab = Slab::from_time(self.segment.id, self.segment.slab_size, time);
+        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
 
-        let mut range_rx = self.range_rx.clone();
+        let mut range_rx = self.0.range_rx.clone();
         let range = lock_range(slab_id, &mut range_rx).await?;
 
         if range.is_owned(slab_id) {
-            self.scheduler.deactivate(key, time).await;
+            self.0.scheduler.deactivate(key, time).await;
         }
 
-        self.store
-            .remove_trigger(&self.segment, &slab, key, time)
+        self.0
+            .store
+            .remove_trigger(&self.0.segment, &slab, key, time)
             .await
             .map_err(TimerManagerError::Store)?;
 

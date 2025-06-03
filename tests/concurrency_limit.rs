@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::consumer::Uncommitted;
 use prosody::{
     Topic,
     admin::ProsodyAdminClient,
@@ -92,7 +93,7 @@ impl EventHandler for ConcurrencyTestHandler {
         // Mark processing as complete
         self.current.fetch_sub(1, Ordering::AcqRel);
         self.processed.fetch_add(1, Ordering::AcqRel);
-        message.commit();
+        message.commit().await;
 
         // If all expected messages have been processed, notify waiters
         if self.processed.load(Ordering::Acquire) == self.total {
