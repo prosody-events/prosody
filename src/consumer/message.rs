@@ -21,7 +21,8 @@ use tracing::{Span, debug, error};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
-use crate::timers::UncommittedTimer;
+use crate::timers::store::TriggerStore;
+use crate::timers::{TimerManager, UncommittedTimer};
 use crate::{
     BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem, Topic,
 };
@@ -30,18 +31,22 @@ use crate::{
 ///
 /// Provides shutdown notification capabilities to coordinate graceful shutdown.
 #[derive(Clone, Debug)]
-pub struct MessageContext {
+pub struct EventContext<T> {
     shutdown_rx: watch::Receiver<bool>,
+    timers: TimerManager<T>,
 }
 
-impl MessageContext {
+impl<T> EventContext<T> {
     /// Creates a new message context.
     ///
     /// # Arguments
     ///
     /// * `shutdown_rx` - Receiver for shutdown signals
-    pub(crate) fn new(shutdown_rx: watch::Receiver<bool>) -> Self {
-        Self { shutdown_rx }
+    pub(crate) fn new(shutdown_rx: watch::Receiver<bool>, timers: TimerManager<T>) -> Self {
+        Self {
+            shutdown_rx,
+            timers,
+        }
     }
 
     /// Waits for a shutdown signal.
@@ -52,7 +57,7 @@ impl MessageContext {
     /// # Errors
     ///
     /// Logs an error if the shutdown hook fails.
-    pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send + use<> {
+    pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send + use<T> {
         let mut shutdown_rx = self.shutdown_rx.clone();
         async move {
             if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
@@ -72,13 +77,20 @@ impl MessageContext {
     }
 }
 
-#[derive(Debug)]
-pub enum UncommittedEvent<T> {
+#[derive(Educe)]
+#[educe(Debug(bound = ""))]
+pub enum UncommittedEvent<T>
+where
+    T: TriggerStore,
+{
     Message(UncommittedMessage),
     Timer(UncommittedTimer<T>),
 }
 
-impl<T> Keyed for UncommittedEvent<T> {
+impl<T> Keyed for UncommittedEvent<T>
+where
+    T: TriggerStore,
+{
     type Key = Key;
 
     fn key(&self) -> &Self::Key {
@@ -89,13 +101,38 @@ impl<T> Keyed for UncommittedEvent<T> {
     }
 }
 
-impl<T> From<UncommittedMessage> for UncommittedEvent<T> {
+impl<T> Uncommitted for UncommittedEvent<T>
+where
+    T: TriggerStore,
+{
+    async fn commit(self) {
+        match self {
+            UncommittedEvent::Message(message) => message.commit().await,
+            UncommittedEvent::Timer(timer) => timer.commit().await,
+        }
+    }
+
+    async fn abort(self) {
+        match self {
+            UncommittedEvent::Message(message) => message.abort().await,
+            UncommittedEvent::Timer(timer) => timer.abort().await,
+        }
+    }
+}
+
+impl<T> From<UncommittedMessage> for UncommittedEvent<T>
+where
+    T: TriggerStore,
+{
     fn from(value: UncommittedMessage) -> Self {
         Self::Message(value)
     }
 }
 
-impl<T> From<UncommittedTimer<T>> for UncommittedEvent<T> {
+impl<T> From<UncommittedTimer<T>> for UncommittedEvent<T>
+where
+    T: TriggerStore,
+{
     fn from(value: UncommittedTimer<T>) -> Self {
         Self::Timer(value)
     }

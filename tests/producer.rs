@@ -6,7 +6,7 @@
 use color_eyre::eyre::{self, ensure};
 use eyre::Result;
 use prosody::admin::ProsodyAdminClient;
-use prosody::consumer::message::{MessageContext, UncommittedMessage};
+use prosody::consumer::message::{EventContext, UncommittedMessage};
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::{Payload, Topic};
@@ -27,7 +27,7 @@ struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message(&self, _ctx: MessageContext, msg: UncommittedMessage) {
+    async fn on_message(&self, _ctx: EventContext, msg: UncommittedMessage) {
         let (inner, uncommitted) = msg.into_inner();
         let key = inner.key().to_string();
         let payload = inner.payload().clone();

@@ -30,7 +30,7 @@
 //! use prosody::consumer::failure::retry::RetryConfiguration;
 //! use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::failure::{FallibleHandler, ClassifyError};
-//! use prosody::consumer::message::{ConsumerMessage, MessageContext};
+//! use prosody::consumer::message::{ConsumerMessage, EventContext};
 //! use prosody::high_level::mode::Mode;
 //! use prosody::high_level::{HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
@@ -46,7 +46,7 @@
 //!
 //!     async fn on_message(
 //!         &self,
-//!         context: MessageContext,
+//!         context: EventContext,
 //!         message: ConsumerMessage
 //!     ) -> Result<(), Self::Error> {
 //!         println!("Received: {message:?}");
@@ -288,13 +288,13 @@ const SOURCE_SYSTEM_HEADER: &str = "source-system";
 /// This trait enables idempotent message processing by providing access to
 /// event identifiers that can be used to deduplicate messages.
 pub trait EventIdentity {
+    /// The type used to represent a borrowed event ID.
+    type BorrowedEventId: ?Sized;
+
     /// The type used to represent the event ID when owned.
     /// Must implement `AsRef<Self::BorrowedEventId>` and be constructible from
     /// a borrowed event ID.
     type EventId: AsRef<Self::BorrowedEventId> + for<'a> From<&'a Self::BorrowedEventId>;
-
-    /// The type used to represent a borrowed event ID.
-    type BorrowedEventId: ?Sized;
 
     /// Returns a reference to this event's identifier if one exists.
     ///

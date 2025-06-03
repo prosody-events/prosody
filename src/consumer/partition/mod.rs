@@ -14,11 +14,23 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
+use crate::consumer::heartbeat::Heartbeat;
+use crate::consumer::message::{
+    ConsumerMessage, EventContext, UncommittedEvent, UncommittedMessage,
+};
+use crate::consumer::partition::keyed::KeyManager;
+use crate::consumer::partition::offsets::OffsetTracker;
+use crate::consumer::{EventHandler, Keyed, Uncommitted};
+use crate::timers::duration::CompactDuration;
+use crate::timers::store::TriggerStore;
+use crate::timers::{TimerManager, UncommittedTimer};
+use crate::{EventId, EventIdentity, Key, Offset, Partition, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
-use futures::Stream;
+use futures::stream::select;
+use futures::{Stream, StreamExt, pin_mut};
 use quick_cache::unsync::Cache;
 use serde_json::Value;
 use std::future::{Ready, ready};
@@ -32,14 +44,9 @@ use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tracing::{debug, debug_span, error, info, info_span, instrument};
-
-use crate::consumer::heartbeat::Heartbeat;
-use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
-use crate::consumer::partition::keyed::KeyManager;
-use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{EventHandler, Keyed, Uncommitted};
-use crate::{EventId, EventIdentity, Key, Offset, Partition, Topic};
+use uuid::Uuid;
 
 mod keyed;
 pub mod offsets;
@@ -54,7 +61,7 @@ mod test;
 /// for a Kafka partition, including buffer sizes, concurrency limits,
 /// and filtering options.
 #[derive(Clone, Debug)]
-pub struct PartitionConfiguration {
+pub struct PartitionConfiguration<T> {
     /// Consumer group identifier
     pub group_id: Arc<str>,
 
@@ -84,6 +91,12 @@ pub struct PartitionConfiguration {
 
     /// Global concurrency limit
     pub global_limit: Arc<Semaphore>,
+
+    /// Timer store
+    pub trigger_store: T,
+
+    /// Timer slab size
+    pub timer_slab_size: CompactDuration,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -133,14 +146,15 @@ impl PartitionManager {
     /// # Returns
     ///
     /// A new `PartitionManager` instance
-    pub fn new<T>(
-        config: PartitionConfiguration,
+    pub fn new<T, S>(
+        config: PartitionConfiguration<S>,
         handler: T,
         topic: Topic,
         partition: Partition,
     ) -> Self
     where
         T: EventHandler + Send + Sync + 'static,
+        S: TriggerStore,
     {
         // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
@@ -162,6 +176,8 @@ impl PartitionManager {
         // Spawn the background task for message handling
         let handle = spawn(handle_messages(
             config,
+            topic,
+            partition,
             handler,
             offsets.clone(),
             message_rx,
@@ -306,8 +322,10 @@ impl PartitionManager {
 /// * `message_rx` - Channel receiving messages to process
 /// * `heartbeat` - Heartbeat used to detect stalled processing loop
 /// * `shutdown_rx` - Channel receiving shutdown signal
-async fn handle_messages<T>(
-    config: PartitionConfiguration,
+async fn handle_messages<T, S>(
+    config: PartitionConfiguration<S>,
+    topic: Topic,
+    partition: Partition,
     handler: T,
     offsets: OffsetTracker,
     message_rx: Receiver<ConsumerMessage>,
@@ -315,6 +333,7 @@ async fn handle_messages<T>(
     shutdown_rx: watch::Receiver<bool>,
 ) where
     T: EventHandler,
+    S: TriggerStore,
 {
     let mut highest_offset_seen = -1;
 
@@ -323,7 +342,7 @@ async fn handle_messages<T>(
         NonZeroUsize::new(config.idempotence_cache_size).map(|size| Cache::new(size.into()));
 
     // Create a processing pipeline for incoming messages
-    let stream = build_stream(
+    let message_events = build_message_stream(
         &offsets,
         message_rx,
         &config.group_id,
@@ -332,33 +351,68 @@ async fn handle_messages<T>(
         config.allowed_events.as_ref(),
     );
 
+    let name = format!("{}:{topic}/{partition}", config.group_id);
+    let segment_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
+
+    let (timer_stream, timer_manager) = loop {
+        if !*shutdown_rx.borrow() {
+            return;
+        }
+
+        match TimerManager::new(
+            segment_id,
+            config.timer_slab_size,
+            &name,
+            config.trigger_store.clone(),
+        )
+        .await
+        {
+            Ok(result) => break result,
+            Err(error) => {
+                error!("failed to initialize timer manager: {error:#}; retrying");
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+
+    let timer_events = build_timer_stream(timer_stream);
+    let combined_stream = select(message_events, timer_events);
+
     // Define how to process each message
-    let process = |message: UncommittedMessage| async {
+    let process = |event: UncommittedEvent<S>| async {
         // Acquire a semaphore to bound global concurrency
-        debug!(?message, "acquiring permit");
+        debug!(?event, "acquiring permit");
         let _permit = match config.global_limit.acquire().await {
             Ok(permit) => permit,
             Err(error) => {
                 error!(
-                    ?message,
+                    ?event,
                     "failed to acquire permit: {error:#}; aborting message"
                 );
-                message.abort().await;
+                event.abort().await;
                 return;
             }
         };
 
         // Process message with handler
-        debug!(?message, "permit acquired; calling handler");
-        let context = MessageContext::new(shutdown_rx.clone());
-        handler.on_message(context, message).await;
+        debug!(?event, "permit acquired; calling handler");
+        let context = EventContext::new(shutdown_rx.clone(), timer_manager.clone());
+
+        match event {
+            UncommittedEvent::Message(message) => handler.on_message(context, message).await,
+            UncommittedEvent::Timer(timer) => {
+                if timer.is_active() {
+                    handler.on_timer(context, timer).await
+                }
+            }
+        }
     };
 
     // Create key manager to handle concurrent processing while maintaining key
     // order
     KeyManager::new(process, config.max_enqueued_per_key)
         .process_messages(
-            stream,
+            combined_stream,
             heartbeat,
             shutdown_rx.clone(),
             config.max_uncommitted,
@@ -391,14 +445,17 @@ async fn handle_messages<T>(
 /// # Returns
 ///
 /// A stream of `UncommittedMessage` objects ready for processing
-fn build_stream(
+fn build_message_stream<T>(
     offsets: &OffsetTracker,
     mut message_rx: Receiver<ConsumerMessage>,
     group_id: &str,
     highest_offset_seen: &mut i64,
     idempotence_cache: &mut Option<Cache<Key, EventId>>,
     allowed_events: Option<&AhoCorasick>,
-) -> impl Stream<Item = UncommittedMessage> + Send {
+) -> impl Stream<Item = UncommittedEvent<T>>
+where
+    T: TriggerStore,
+{
     stream! {
         while let Some(message) = message_rx.recv().await {
             // Apply filter_rewind - skip messages with offsets we've already processed
@@ -426,7 +483,21 @@ fn build_stream(
                 continue;
             };
 
-            yield uncommitted;
+            yield UncommittedEvent::Message(uncommitted);
+        }
+    }
+}
+
+fn build_timer_stream<T, S>(timer_stream: S) -> impl Stream<Item = UncommittedEvent<T>>
+where
+    S: Stream<Item = UncommittedTimer<T>>,
+    T: TriggerStore,
+{
+    stream! {
+        pin_mut!(timer_stream);
+
+        while let Some(timer) = timer_stream.next().await {
+            yield UncommittedEvent::Timer(timer);
         }
     }
 }

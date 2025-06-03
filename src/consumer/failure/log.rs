@@ -4,7 +4,7 @@
 //! according to their severity while maintaining the original error flow.
 
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider};
 use tracing::error;
 
@@ -51,7 +51,7 @@ where
     /// Returns the original error from the wrapped handler after logging it
     async fn on_message(
         &self,
-        context: MessageContext,
+        context: EventContext,
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
         // Attempt to process the message with the wrapped handler
@@ -87,7 +87,7 @@ where
     ///
     /// * `context` - The context of the message being processed
     /// * `message` - The uncommitted message to process
-    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, context: EventContext, message: UncommittedMessage) {
         let (message, uncommitted_offset) = message.into_inner();
 
         // Attempt message processing

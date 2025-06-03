@@ -45,7 +45,7 @@ use prosody::{
     consumer::ConsumerConfiguration,
     consumer::EventHandler,
     consumer::ProsodyConsumer,
-    consumer::message::{MessageContext, UncommittedMessage},
+    consumer::message::{EventContext, UncommittedMessage},
     producer::ProducerConfiguration,
     producer::ProsodyProducer,
 };
@@ -76,7 +76,7 @@ struct ConcurrencyTestHandler {
 }
 
 impl EventHandler for ConcurrencyTestHandler {
-    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, _context: EventContext, message: UncommittedMessage) {
         // Increment the current processing count and update maximum observed
         // concurrency
         let current = self.current.fetch_add(1, Ordering::AcqRel) + 1;

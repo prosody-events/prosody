@@ -5,7 +5,7 @@
 //! and preventing new message processing.
 
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider};
 use thiserror::Error;
 
@@ -54,7 +54,7 @@ where
     /// or a `ShutdownError::Handler` containing the wrapped handler's error.
     async fn on_message(
         &self,
-        context: MessageContext,
+        context: EventContext,
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
         if context.should_shutdown() {
@@ -78,7 +78,7 @@ where
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, context: EventContext, message: UncommittedMessage) {
         let (message, uncommitted_offset) = message.into_inner();
 
         // Check if the partition is being revoked

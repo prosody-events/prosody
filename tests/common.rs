@@ -19,7 +19,7 @@ use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
 use prosody::Topic;
 use prosody::admin::ProsodyAdminClient;
-use prosody::consumer::message::{MessageContext, UncommittedMessage};
+use prosody::consumer::message::{EventContext, UncommittedMessage};
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
@@ -375,7 +375,7 @@ pub struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, _context: EventContext, message: UncommittedMessage) {
         let (msg, uncommitted) = message.into_inner();
         let message = msg.into_value();
 
@@ -406,7 +406,7 @@ pub struct SlowTestHandler {
 
 impl EventHandler for SlowTestHandler {
     #[instrument(skip(self, _context))]
-    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, _context: EventContext, message: UncommittedMessage) {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
         let payload: Value = msg.payload().clone();

@@ -9,7 +9,9 @@ use std::fmt::Display;
 use std::future::Future;
 
 use crate::consumer::HandlerProvider;
-use crate::consumer::message::{ConsumerMessage, MessageContext};
+use crate::consumer::message::{ConsumerMessage, EventContext};
+use crate::timers::UncommittedTimer;
+use crate::timers::store::TriggerStore;
 
 pub mod log;
 pub mod retry;
@@ -96,11 +98,21 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     ///
     /// A `Future` that resolves to `Ok(())` if the message was processed
     /// successfully, or an `Err` containing the error if processing failed.
-    fn on_message(
+    fn on_message<T>(
         &self,
-        context: MessageContext,
+        context: EventContext<T>,
         message: ConsumerMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        T: TriggerStore;
+
+    fn on_timer<T>(
+        &self,
+        context: EventContext<T>,
+        timer: UncommittedTimer<T>,
+    ) -> impl Future<Output = ()> + Send
+    where
+        T: TriggerStore;
 }
 
 /// A composition of two failure strategies.

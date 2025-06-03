@@ -29,30 +29,37 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span, debug, error, warn};
 
 mod active;
-mod datetime;
-mod duration;
+pub mod datetime;
+pub mod duration;
 mod guards;
 mod range;
 mod scheduler;
 mod slab;
-mod store;
+pub mod store;
 mod triggers;
 
 const LOAD_CONCURRENCY: usize = 32;
 const DELETE_CONCURRENCY: usize = 16;
 
 #[derive(Educe)]
-#[educe(Debug)]
-pub struct UncommittedTimer<T> {
+#[educe(Debug(bound = ""))]
+pub struct UncommittedTimer<T>
+where
+    T: TriggerStore,
+{
     trigger: Trigger,
 
     #[educe(Debug(ignore))]
-    uncommitted: Option<UncommittedTrigger<T>>,
+    uncommitted: UncommittedTrigger<T>,
 }
 
-struct UncommittedTrigger<T> {
-    operations: TimerManager<T>,
-    completed: bool,
+struct UncommittedTrigger<T>
+where
+    T: TriggerStore,
+{
+    key: Key,
+    time: CompactDateTime,
+    manager: TimerManager<T>,
 }
 
 impl<T> UncommittedTimer<T>
@@ -60,13 +67,17 @@ where
     T: TriggerStore,
 {
     pub fn new(trigger: Trigger, manager: TimerManager<T>) -> Self {
+        let key = trigger.key.clone();
+        let time = trigger.time;
+
         Self {
             trigger,
-            uncommitted: Some(UncommittedTrigger {
-                operations: manager,
-                completed: false,
-            }),
+            uncommitted: UncommittedTrigger { key, time, manager },
         }
+    }
+
+    pub fn into_inner(self) -> (Trigger, UncommittedTrigger<T>) {
+        (self.trigger, self.uncommitted)
     }
 
     pub fn time(&self) -> CompactDateTime {
@@ -77,13 +88,8 @@ where
         &self.trigger.span
     }
 
-    pub async fn is_active(&self) -> Result<bool, TimerManagerError<T::Error>> {
-        Ok(self
-            .uncommitted
-            .as_ref()
-            .ok_or(TimerManagerError::Shutdown)?
-            .is_active(&self.trigger)
-            .await)
+    pub fn is_active(&self) -> bool {
+        self.uncommitted.is_active()
     }
 }
 
@@ -92,27 +98,22 @@ where
     T: TriggerStore,
 {
     async fn commit(mut self) {
-        let Some(mut uncommitted) = self.uncommitted.take() else {
-            error!("timer already committed");
-            return;
-        };
-
-        if let Err(error) = uncommitted.commit(self.trigger).await {
+        if let Err(error) = self.uncommitted.commit().await {
             error!("failed to commit timer: {error:#}");
         }
     }
 
     async fn abort(mut self) {
-        let Some(mut uncommitted) = self.uncommitted.take() else {
-            error!("timer already committed");
-            return;
-        };
-
-        uncommitted.abort();
+        if let Err(error) = self.uncommitted.abort().await {
+            error!("failed to abort timer: {error:#}");
+        }
     }
 }
 
-impl<T> Keyed for UncommittedTimer<T> {
+impl<T> Keyed for UncommittedTimer<T>
+where
+    T: TriggerStore,
+{
     type Key = Key;
 
     fn key(&self) -> &Self::Key {
@@ -124,29 +125,35 @@ impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    async fn is_active(&self, trigger: &Trigger) -> bool {
-        !self.completed && self.operations.is_active(&trigger.key, trigger.time).await
+    fn is_active(&self) -> bool {
+        self.manager.is_active(&self.key, self.time)
     }
 
-    async fn commit(&mut self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
-        if self.completed {
-            return Err(TimerManagerError::AlreadyCommitted);
+    async fn commit(&mut self) -> Result<(), TimerManagerError<T::Error>> {
+        if !self.is_active() {
+            return Err(TimerManagerError::Inactive);
         }
 
-        self.operations.complete(&trigger.key, trigger.time).await?;
-        self.completed = true;
-
+        self.manager.complete(&self.key, self.time).await?;
         Ok(())
     }
 
-    fn abort(&mut self) {
-        self.completed = true;
+    async fn abort(&mut self) -> Result<(), TimerManagerError<T::Error>> {
+        if !self.is_active() {
+            return Err(TimerManagerError::Inactive);
+        }
+
+        self.manager.abort(&self.key, self.time).await?;
+        Ok(())
     }
 }
 
-impl<T> Drop for UncommittedTrigger<T> {
+impl<T> Drop for UncommittedTrigger<T>
+where
+    T: TriggerStore,
+{
     fn drop(&mut self) {
-        if !self.completed {
+        if self.is_active() {
             warn!("trigger was dropped without committing");
         }
     }
@@ -276,8 +283,8 @@ where
             .await
     }
 
-    pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
-        self.0.scheduler.is_active(key, time).await
+    pub fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
+        self.0.scheduler.is_active(key, time)
     }
 
     pub async fn complete(
@@ -300,6 +307,24 @@ where
             .remove_trigger(&self.0.segment, &slab, key, time)
             .await
             .map_err(TimerManagerError::Store)?;
+
+        Ok(())
+    }
+
+    pub async fn abort(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
+        let slab_id = slab.id();
+
+        let mut range_rx = self.0.range_rx.clone();
+        let range = lock_range(slab_id, &mut range_rx).await?;
+
+        if range.is_owned(slab_id) {
+            self.0.scheduler.deactivate(key, time).await;
+        }
 
         Ok(())
     }
@@ -581,8 +606,8 @@ where
     #[error("Time not found")]
     NotFound,
 
-    #[error("Timer already committed")]
-    AlreadyCommitted,
+    #[error("Timer is inactive")]
+    Inactive,
 
     #[error("Timer has been shutdown")]
     Shutdown,

@@ -4,7 +4,8 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, MessageContext, Uncommitted};
+use crate::consumer::{EventContext, EventHandler, Uncommitted};
+use crate::timers::store::memory::InMemoryTriggerStore;
 use aho_corasick::StartKind;
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
@@ -23,7 +24,7 @@ trait HasProcessedOffsets {
 }
 
 /// Returns a default `PartitionConfiguration` with sensible defaults.
-fn default_config() -> PartitionConfiguration {
+fn default_config() -> PartitionConfiguration<InMemoryTriggerStore> {
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
         buffer_size: 10,
@@ -35,6 +36,8 @@ fn default_config() -> PartitionConfiguration {
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         global_limit: Arc::new(Semaphore::new(10)),
+        trigger_store: InMemoryTriggerStore::new(),
+        timer_slab_size: CompactDuration::new(30),
     }
 }
 
@@ -199,11 +202,14 @@ async fn test_partition_manager_is_stalled() {
     }
 
     impl EventHandler for StallTestHandler {
-        fn on_message(
+        fn on_message<T>(
             &self,
-            _context: MessageContext,
+            _context: EventContext<T>,
             message: UncommittedMessage,
-        ) -> impl Future<Output = ()> + Send {
+        ) -> impl Future<Output = ()> + Send
+        where
+            T: TriggerStore,
+        {
             let offset = message.offset();
             let processed = self.processed_offsets.clone();
             let notify = self.notify.clone();
@@ -215,6 +221,19 @@ async fn test_partition_manager_is_stalled() {
                 };
                 notify.notify_waiters();
                 message.commit().await;
+            }
+        }
+
+        fn on_timer<T>(
+            &self,
+            _context: EventContext<T>,
+            _timer: UncommittedTimer<T>,
+        ) -> impl Future<Output = ()> + Send
+        where
+            T: TriggerStore,
+        {
+            async move {
+                // todo: add timer test
             }
         }
 
@@ -433,9 +452,9 @@ impl HasProcessedOffsets for TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    fn on_message(
+    fn on_message<T>(
         &self,
-        _context: MessageContext,
+        _context: EventContext<T>,
         message: UncommittedMessage,
     ) -> impl Future<Output = ()> + Send {
         let key = message.key().clone();
@@ -464,6 +483,19 @@ impl EventHandler for TestHandler {
             };
             notify.notify_waiters();
             message.commit().await;
+        }
+    }
+
+    fn on_timer<T>(
+        &self,
+        _context: EventContext<T>,
+        _timer: UncommittedTimer<T>,
+    ) -> impl Future<Output = ()> + Send
+    where
+        T: TriggerStore,
+    {
+        async move {
+            // todo: add timer test
         }
     }
 

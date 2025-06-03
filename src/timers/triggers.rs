@@ -116,7 +116,7 @@ mod tests {
         triggers.remove(&trigger).await;
 
         // Verify the trigger is no longer active
-        assert!(!triggers.active_triggers().contains(&key, time).await);
+        assert!(!triggers.active_triggers().contains(&key, time));
 
         // Advance time by 5 seconds to simulate the trigger's original expiration time
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -197,13 +197,13 @@ mod tests {
         triggers.insert(trigger.clone()).await;
 
         // Verify the trigger is active
-        assert!(triggers.active_triggers().contains(&key, time).await);
+        assert!(triggers.active_triggers().contains(&key, time));
 
         // Remove the trigger
         triggers.remove(&trigger).await;
 
         // Verify the trigger is no longer active
-        assert!(!triggers.active_triggers().contains(&key, time).await);
+        assert!(!triggers.active_triggers().contains(&key, time));
 
         Ok(())
     }

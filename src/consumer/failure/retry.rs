@@ -15,7 +15,7 @@ use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider, Keyed};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 
@@ -163,7 +163,7 @@ where
     /// Returns the underlying handler's error if all retry attempts fail.
     async fn on_message(
         &self,
-        context: MessageContext,
+        context: EventContext,
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
         let topic = message.topic();
@@ -261,7 +261,7 @@ where
     ///
     /// * `context` - The message context.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, context: EventContext, message: UncommittedMessage) {
         let topic = message.topic();
         let partition = message.partition();
         let key = message.key().to_owned();

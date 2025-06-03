@@ -27,6 +27,8 @@ use tracing::{debug, error, info, warn};
 use crate::Topic;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
+use crate::timers::duration::CompactDuration;
+use crate::timers::store::TriggerStore;
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///
@@ -40,12 +42,12 @@ use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, Watermar
 ///
 /// * `T` - Type implementing `HandlerProvider` to create message handlers for
 ///   partitions
-pub struct Context<T>
+pub struct Context<T, S>
 where
     T: HandlerProvider,
 {
     /// Partition-level configuration settings
-    config: PartitionConfiguration,
+    config: PartitionConfiguration<S>,
 
     /// Creates message handlers for partitions
     handler_provider: T,
@@ -54,7 +56,7 @@ where
     managers: Arc<Managers>,
 }
 
-impl<T> Context<T>
+impl<T, S> Context<T, S>
 where
     T: HandlerProvider,
 {
@@ -74,10 +76,16 @@ where
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
+        trigger_store: S,
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers>,
         allowed_events: Option<AhoCorasick>,
     ) -> Self {
+        let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
+            error!("invalid timer slab size: {error:#}; using default");
+            CompactDuration::new(10 * 60)
+        });
+
         let config = PartitionConfiguration {
             group_id: Arc::from(config.group_id.as_str()),
             buffer_size: config.max_uncommitted,
@@ -89,6 +97,8 @@ where
             stall_threshold: config.stall_threshold,
             watermark_version,
             global_limit: Arc::new(Semaphore::new(config.max_concurrency)),
+            trigger_store,
+            timer_slab_size,
         };
 
         Self {
@@ -99,11 +109,17 @@ where
     }
 }
 
-impl<T> ClientContext for Context<T> where T: HandlerProvider {}
-
-impl<T> ConsumerContext for Context<T>
+impl<T, S> ClientContext for Context<T, S>
 where
     T: HandlerProvider,
+    S: TriggerStore,
+{
+}
+
+impl<T, S> ConsumerContext for Context<T, S>
+where
+    T: HandlerProvider,
+    S: TriggerStore,
 {
     /// Handles partition assignments and revocations during consumer group
     /// rebalancing.

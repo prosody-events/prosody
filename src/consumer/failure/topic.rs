@@ -11,7 +11,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::Topic;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::util::from_env;
@@ -135,7 +135,7 @@ where
     /// to the failure topic fails.
     async fn on_message(
         &self,
-        context: MessageContext,
+        context: EventContext,
         message: ConsumerMessage,
     ) -> Result<(), Self::Error> {
         let topic = message.topic().as_ref();
@@ -203,7 +203,7 @@ where
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message(&self, context: EventContext, message: UncommittedMessage) {
         let (message, uncommitted_offset) = message.into_inner();
 
         // Attempt to handle the message and send to failure topic if it fails

@@ -31,7 +31,7 @@
 //! and start processing:
 //!
 //! ```
-//! use prosody::consumer::message::{MessageContext, UncommittedMessage};
+//! use prosody::consumer::message::{EventContext, UncommittedMessage};
 //! use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 //!
 //! // Implement your message handler
@@ -39,7 +39,7 @@
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
-//!     async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
+//!     async fn on_message(&self, context: EventContext, message: UncommittedMessage) {
 //!         // Process the message
 //!         println!("Processing message with key: {}", message.key());
 //!
@@ -121,10 +121,13 @@ use crate::consumer::failure::shutdown::ShutdownStrategy;
 use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
 use crate::consumer::failure::{FailureStrategy, FallibleHandler};
 use crate::consumer::heartbeat::Heartbeat;
-use crate::consumer::message::{MessageContext, UncommittedMessage};
+use crate::consumer::message::{EventContext, UncommittedMessage};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::producer::ProsodyProducer;
+use crate::timers::UncommittedTimer;
+use crate::timers::store::TriggerStore;
+use crate::timers::store::memory::InMemoryTriggerStore;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
@@ -217,11 +220,21 @@ pub trait EventHandler {
     /// # Returns
     ///
     /// A future that resolves when the message is handled.
-    fn on_message(
+    fn on_message<T>(
         &self,
-        context: MessageContext,
+        context: EventContext<T>,
         message: UncommittedMessage,
-    ) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = ()> + Send
+    where
+        T: TriggerStore;
+
+    fn on_timer<T>(
+        &self,
+        context: EventContext<T>,
+        timer: UncommittedTimer<T>,
+    ) -> impl Future<Output = ()> + Send
+    where
+        T: TriggerStore;
 
     /// Shuts down the message handler.
     ///
@@ -243,18 +256,6 @@ where
     fn handler_for_partition(&self, _: Topic, _: Partition) -> Self::Handler {
         self.clone()
     }
-}
-
-impl<T, Fut> EventHandler for T
-where
-    T: Fn(MessageContext, UncommittedMessage) -> Fut + Send + Sync,
-    Fut: Future<Output = ()> + Send,
-{
-    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
-        self(context, message).await;
-    }
-
-    async fn shutdown(self) {}
 }
 
 /// Configuration for the Kafka consumer.
@@ -448,6 +449,13 @@ pub struct ConsumerConfiguration {
         setter(into)
     )]
     pub probe_port: Option<u16>,
+
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_SLAB_SIZE\", Duration::from_secs(10 \
+                   * 60))?",
+        setter(into)
+    )]
+    pub slab_size: Duration,
 }
 
 impl ConsumerConfiguration {
@@ -569,9 +577,10 @@ impl ProsodyConsumer {
             .transpose()?;
 
         // Create the consumer context with the message handler and shared state
-        let context: Context<T> = Context::new(
+        let context = Context::new(
             config,
             handler_provider,
+            InMemoryTriggerStore::new(), // todo: parameterize
             watermark_version.clone(),
             managers.clone(),
             allowed_events,
