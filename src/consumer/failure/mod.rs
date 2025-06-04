@@ -110,7 +110,7 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
         &self,
         context: EventContext<T>,
         timer: UncommittedTimer<T>,
-    ) -> impl Future<Output = ()> + Send
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         T: TriggerStore;
 }

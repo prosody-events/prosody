@@ -4,8 +4,7 @@ use crate::Key;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::duration::CompactDuration;
-use crate::timers::guards::{DeleteGuard, LoadGuard};
-use crate::timers::range::ContiguousRange;
+use crate::timers::range::RangeLock;
 use crate::timers::scheduler::{TimerSchedulerError, TriggerScheduler};
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
@@ -17,7 +16,7 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use std::cmp::max;
 use std::error::Error;
 use std::fmt::Debug;
-use std::ops::RangeInclusive;
+use std::ops::{Deref, RangeInclusive};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -31,7 +30,6 @@ use tracing::{Instrument, Span, debug, error, warn};
 mod active;
 pub mod datetime;
 pub mod duration;
-mod guards;
 mod range;
 mod scheduler;
 mod slab;
@@ -175,9 +173,8 @@ pub struct TimerManager<T>(Arc<TimerManagerInner<T>>);
 #[derive(Debug)]
 pub struct TimerManagerInner<T> {
     segment: Segment,
-    range_rx: Receiver<ContiguousRange>,
     scheduler: TriggerScheduler,
-    store: T,
+    store: RangeLock<T>,
 }
 
 impl<T> TimerManager<T>
@@ -191,19 +188,17 @@ where
         store: T,
     ) -> Result<(impl Stream<Item = UncommittedTimer<T>>, Self), TimerManagerError<T::Error>> {
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
-        let (range_tx, range_rx) = watch::channel(ContiguousRange::default());
         let (trigger_rx, scheduler) = TriggerScheduler::new();
+        let store = RangeLock::new(store);
 
         spawn(slab_loader(
-            store.clone(),
             scheduler.clone(),
             segment.clone(),
-            range_tx,
+            store.clone(),
         ));
 
         let manager = Self(Arc::new(TimerManagerInner {
             segment,
-            range_rx,
             scheduler,
             store,
         }));
@@ -215,30 +210,31 @@ where
         Ok((stream, manager))
     }
 
-    pub fn scheduled_times(
+    pub async fn scheduled_times(
         &self,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, TimerManagerError<T::Error>>> {
+    ) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
         self.0
             .store
+            .trigger_lock()
+            .await
             .get_key_triggers(&self.0.segment.id, key)
             .map_err(TimerManagerError::Store)
+            .try_collect()
+            .await
     }
 
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, trigger.time);
         let slab_id = slab.id();
+        let store = self.0.store.trigger_lock().await;
 
-        let mut range_rx = self.0.range_rx.clone();
-        let range = lock_range(slab_id, &mut range_rx).await?;
-
-        self.0
-            .store
+        store
             .add_trigger(&self.0.segment, slab, trigger.clone())
             .await
             .map_err(TimerManagerError::Store)?;
 
-        if range.is_owned(slab_id) {
+        if store.is_owned(slab_id) {
             self.0.scheduler.schedule(trigger).await?;
         }
 
@@ -252,11 +248,9 @@ where
     ) -> Result<(), TimerManagerError<T::Error>> {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
+        let store = self.0.store.trigger_lock().await;
 
-        let mut range_rx = self.0.range_rx.clone();
-        let range = lock_range(slab_id, &mut range_rx).await?;
-
-        if range.is_owned(slab_id) {
+        if store.is_owned(slab_id) {
             let trigger = Trigger {
                 key: key.clone(),
                 time,
@@ -266,8 +260,7 @@ where
             self.0.scheduler.unschedule(trigger).await?;
         }
 
-        self.0
-            .store
+        store
             .remove_trigger(&self.0.segment, &slab, key, time)
             .await
             .map_err(TimerManagerError::Store)
@@ -275,11 +268,15 @@ where
 
     pub async fn unschedule_all(&self, key: &Key) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
+        let times = self.scheduled_times(key).await?;
 
-        self.scheduled_times(key)
-            .try_for_each_concurrent(DELETE_CONCURRENCY, |time| {
-                self.unschedule(key, time).instrument(span.clone())
-            })
+        let futures = times
+            .into_iter()
+            .map(|time| self.unschedule(key, time).instrument(span.clone()));
+
+        iter(futures)
+            .buffer_unordered(DELETE_CONCURRENCY)
+            .try_collect::<()>()
             .await
     }
 
@@ -294,16 +291,13 @@ where
     ) -> Result<(), TimerManagerError<T::Error>> {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
+        let store = self.0.store.trigger_lock().await;
 
-        let mut range_rx = self.0.range_rx.clone();
-        let range = lock_range(slab_id, &mut range_rx).await?;
-
-        if range.is_owned(slab_id) {
+        if store.is_owned(slab_id) {
             self.0.scheduler.deactivate(key, time).await;
         }
 
-        self.0
-            .store
+        store
             .remove_trigger(&self.0.segment, &slab, key, time)
             .await
             .map_err(TimerManagerError::Store)?;
@@ -318,11 +312,9 @@ where
     ) -> Result<(), TimerManagerError<T::Error>> {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
+        let store = self.0.store.trigger_lock().await;
 
-        let mut range_rx = self.0.range_rx.clone();
-        let range = lock_range(slab_id, &mut range_rx).await?;
-
-        if range.is_owned(slab_id) {
+        if store.is_owned(slab_id) {
             self.0.scheduler.deactivate(key, time).await;
         }
 
@@ -330,25 +322,8 @@ where
     }
 }
 
-async fn lock_range<E>(
-    slab_id: SlabId,
-    range_rx: &mut Receiver<ContiguousRange>,
-) -> Result<Ref<ContiguousRange>, TimerManagerError<E>>
+async fn slab_loader<T>(scheduler: TriggerScheduler, segment: Segment, store: RangeLock<T>)
 where
-    E: Error,
-{
-    range_rx
-        .wait_for(|range| !range.is_busy(slab_id))
-        .await
-        .map_err(|_| TimerManagerError::Shutdown)
-}
-
-async fn slab_loader<T>(
-    store: T,
-    scheduler: TriggerScheduler,
-    segment: Segment,
-    range_tx: watch::Sender<ContiguousRange>,
-) where
     T: TriggerStore,
 {
     const MIN_PRELOAD_SECONDS: u32 = 30;
@@ -388,7 +363,7 @@ async fn slab_loader<T>(
             let load_range = start_slab_id..=target_slab_id;
 
             debug!("Loading slabs {start_slab_id}..={target_slab_id}");
-            match load_slabs(&store, &scheduler, &range_tx, &segment, load_range).await {
+            match load_slabs(&store, &scheduler, &segment, load_range).await {
                 Ok(loaded) => {
                     loaded_slab_ids.extend(loaded);
                     highest_loaded_slab_id = Some(target_slab_id);
@@ -409,14 +384,8 @@ async fn slab_loader<T>(
         };
 
         // clean up old slabs
-        if let Err(error) = remove_completed_slabs(
-            &store,
-            &scheduler,
-            &range_tx,
-            &segment,
-            &mut loaded_slab_ids,
-        )
-        .await
+        if let Err(error) =
+            remove_completed_slabs(&store, &scheduler, &segment, &mut loaded_slab_ids).await
         {
             error!("Failed to remove completed slabs: {error:#}");
         }
@@ -466,49 +435,51 @@ fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Dura
 }
 
 async fn load_slabs<T>(
-    store: &T,
+    store: &RangeLock<T>,
     scheduler: &TriggerScheduler,
-    range_tx: &watch::Sender<ContiguousRange>,
     segment: &Segment,
     slab_range: RangeInclusive<SlabId>,
 ) -> Result<Vec<SlabId>, TimerManagerError<T::Error>>
 where
     T: TriggerStore,
 {
-    let guard = LoadGuard::new(range_tx, *slab_range.end());
+    let mut store = store.slab_lock().await;
+    let store_ref = store.deref();
+    let range_end = *slab_range.end();
+
     let loaded = store
         .get_slab_range(&segment.id, slab_range)
         .map_err(TimerManagerError::Store)
         .map_ok(|slab_id| async move {
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
-            load_triggers(store, scheduler, slab).await?;
+            load_triggers(store_ref, scheduler, slab).await?;
             Ok(slab_id)
         })
         .try_buffer_unordered(LOAD_CONCURRENCY)
         .try_collect()
         .await?;
 
-    guard.complete();
+    store.extend_ownership(range_end);
     Ok(loaded)
 }
 
 async fn remove_completed_slabs<T>(
-    store: &T,
+    store: &RangeLock<T>,
     scheduler: &TriggerScheduler,
-    range_tx: &watch::Sender<ContiguousRange>,
     segment: &Segment,
     loaded_slab_ids: &mut HashSet<SlabId>,
 ) -> Result<(), T::Error>
 where
     T: TriggerStore,
 {
-    let guard = DeleteGuard::new(range_tx);
+    let store = store.slab_lock().await;
+    let store_ref = store.deref();
     let active_slab_ids = active_slab_ids(segment, scheduler).await;
     let completed_slab_ids = loaded_slab_ids.difference(&active_slab_ids).copied();
 
     let deleted_slab_ids = iter(completed_slab_ids)
         .map(|slab_id| async move {
-            store.delete_slab(&segment.id, slab_id).await?;
+            store_ref.delete_slab(&segment.id, slab_id).await?;
             Ok(slab_id)
         })
         .buffer_unordered(DELETE_CONCURRENCY)
@@ -519,7 +490,6 @@ where
         loaded_slab_ids.remove(&deleted_slab_id);
     }
 
-    guard.complete();
     Ok(())
 }
 

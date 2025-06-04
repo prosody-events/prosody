@@ -1,30 +1,101 @@
 use crate::timers::slab::SlabId;
+use educe::Educe;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-#[derive(Clone, Debug, Default)]
-pub struct ContiguousRange {
-    max_owned: Option<SlabId>,
-    max_loading: Option<SlabId>,
-    deleting: bool,
+#[derive(Clone, Educe)]
+#[educe(Debug)]
+pub struct RangeLock<T> {
+    #[educe(Debug(ignore))]
+    range: Arc<RwLock<ContiguousRange<T>>>,
 }
 
-impl ContiguousRange {
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct RangeLockTriggerGuard<'a, T>(
+    #[educe(Debug(ignore))] RwLockReadGuard<'a, ContiguousRange<T>>,
+);
+
+impl<'a, T> Deref for RangeLockTriggerGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.value
+    }
+}
+
+impl<'a, T> RangeLockTriggerGuard<'a, T> {
+    pub fn is_owned(&self, slab_id: SlabId) -> bool {
+        self.0.is_owned(slab_id)
+    }
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct RangeLockSlabGuard<'a, T>(
+    #[educe(Debug(ignore))] RwLockWriteGuard<'a, ContiguousRange<T>>,
+);
+
+impl<'a, T> Deref for RangeLockSlabGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.value
+    }
+}
+
+impl<'a, T> DerefMut for RangeLockSlabGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0.value
+    }
+}
+
+impl<'a, T> RangeLockSlabGuard<'a, T> {
+    pub fn value(&mut self) -> &mut T {
+        &mut self.0.value
+    }
+
+    pub fn extend_ownership(&mut self, new_max: SlabId) {
+        self.0.extend_ownership(new_max);
+    }
+}
+
+impl<T> RangeLock<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            range: Arc::new(RwLock::new(ContiguousRange::new(value))),
+        }
+    }
+
+    pub async fn trigger_lock(&self) -> RangeLockTriggerGuard<T> {
+        RangeLockTriggerGuard(self.range.read().await)
+    }
+
+    pub async fn slab_lock(&self) -> RangeLockSlabGuard<T> {
+        RangeLockSlabGuard(self.range.write().await)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ContiguousRange<T> {
+    value: T,
+    max_owned: Option<SlabId>,
+}
+
+impl<T> ContiguousRange<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            max_owned: None,
+        }
+    }
+
     pub fn is_owned(&self, slab_id: SlabId) -> bool {
         self.max_owned.filter(|max| slab_id <= *max).is_some()
     }
 
-    pub fn is_busy(&self, slab_id: SlabId) -> bool {
-        self.is_loading(slab_id) || self.is_deleting(slab_id)
-    }
-
-    fn is_loading(&self, slab_id: SlabId) -> bool {
-        self.max_loading.filter(|max| slab_id <= *max).is_some() && !self.is_owned(slab_id)
-    }
-
-    fn is_deleting(&self, slab_id: SlabId) -> bool {
-        self.deleting && self.is_owned(slab_id)
-    }
-
-    pub fn start_load(&mut self, new_max: SlabId) {
+    pub fn extend_ownership(&mut self, new_max: SlabId) {
         if self
             .max_owned
             .is_some_and(|current_max| current_max > new_max)
@@ -32,26 +103,6 @@ impl ContiguousRange {
             return;
         }
 
-        self.max_loading = Some(new_max);
-    }
-
-    pub fn complete_load(&mut self) {
-        let Some(new_max) = self.max_loading else {
-            return;
-        };
-
         self.max_owned = Some(new_max);
-    }
-
-    pub fn abort_load(&mut self) {
-        self.max_loading = None;
-    }
-
-    pub fn start_delete(&mut self) {
-        self.deleting = true;
-    }
-
-    pub fn end_delete(&mut self) {
-        self.deleting = false;
     }
 }
