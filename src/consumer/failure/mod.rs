@@ -10,7 +10,7 @@ use std::future::Future;
 
 use crate::consumer::HandlerProvider;
 use crate::consumer::message::{ConsumerMessage, EventContext};
-use crate::timers::UncommittedTimer;
+use crate::timers::Trigger;
 use crate::timers::store::TriggerStore;
 
 pub mod log;
@@ -109,7 +109,7 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     fn on_timer<T>(
         &self,
         context: EventContext<T>,
-        timer: UncommittedTimer<T>,
+        trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         T: TriggerStore;

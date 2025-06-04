@@ -4,8 +4,8 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-#[derive(Clone, Educe)]
-#[educe(Debug)]
+#[derive(Educe)]
+#[educe(Clone(bound()), Debug)]
 pub struct RangeLock<T> {
     #[educe(Debug(ignore))]
     range: Arc<RwLock<ContiguousRange<T>>>,
@@ -17,7 +17,7 @@ pub struct RangeLockTriggerGuard<'a, T>(
     #[educe(Debug(ignore))] RwLockReadGuard<'a, ContiguousRange<T>>,
 );
 
-impl<'a, T> Deref for RangeLockTriggerGuard<'a, T> {
+impl<T> Deref for RangeLockTriggerGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -25,7 +25,7 @@ impl<'a, T> Deref for RangeLockTriggerGuard<'a, T> {
     }
 }
 
-impl<'a, T> RangeLockTriggerGuard<'a, T> {
+impl<T> RangeLockTriggerGuard<'_, T> {
     pub fn is_owned(&self, slab_id: SlabId) -> bool {
         self.0.is_owned(slab_id)
     }
@@ -37,7 +37,7 @@ pub struct RangeLockSlabGuard<'a, T>(
     #[educe(Debug(ignore))] RwLockWriteGuard<'a, ContiguousRange<T>>,
 );
 
-impl<'a, T> Deref for RangeLockSlabGuard<'a, T> {
+impl<T> Deref for RangeLockSlabGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -45,13 +45,13 @@ impl<'a, T> Deref for RangeLockSlabGuard<'a, T> {
     }
 }
 
-impl<'a, T> DerefMut for RangeLockSlabGuard<'a, T> {
+impl<T> DerefMut for RangeLockSlabGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0.value
     }
 }
 
-impl<'a, T> RangeLockSlabGuard<'a, T> {
+impl<T> RangeLockSlabGuard<'_, T> {
     pub fn value(&mut self) -> &mut T {
         &mut self.0.value
     }

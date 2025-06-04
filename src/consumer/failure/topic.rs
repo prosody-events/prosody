@@ -14,6 +14,8 @@ use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, Fa
 use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
+use crate::timers::store::TriggerStore;
+use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::from_env;
 
 /// Configuration for the failure topic strategy.
@@ -133,11 +135,14 @@ where
     /// Returns a `FailureTopicError::Handler` if the wrapped handler fails with
     /// a terminal error. Returns a `FailureTopicError::Producer` if sending
     /// to the failure topic fails.
-    async fn on_message(
+    async fn on_message<S>(
         &self,
-        context: EventContext,
+        context: EventContext<S>,
         message: ConsumerMessage,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        S: TriggerStore,
+    {
         let topic = message.topic().as_ref();
         let partition = message.partition();
         let key = message.key();
@@ -191,6 +196,13 @@ where
 
         Ok(())
     }
+
+    async fn on_timer<S>(&self, context: EventContext<S>, timer: Trigger) -> Result<(), Self::Error>
+    where
+        S: TriggerStore,
+    {
+        todo!()
+    }
 }
 
 impl<T> EventHandler for FailureTopicHandler<T>
@@ -203,7 +215,10 @@ where
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message(&self, context: EventContext, message: UncommittedMessage) {
+    async fn on_message<S>(&self, context: EventContext<S>, message: UncommittedMessage)
+    where
+        S: TriggerStore,
+    {
         let (message, uncommitted_offset) = message.into_inner();
 
         // Attempt to handle the message and send to failure topic if it fails
@@ -217,6 +232,13 @@ where
             ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted_offset.commit(),
             ErrorCategory::Terminal => uncommitted_offset.abort(),
         }
+    }
+
+    async fn on_timer<S>(&self, context: EventContext<S>, timer: UncommittedTimer<S>)
+    where
+        S: TriggerStore,
+    {
+        todo!()
     }
 
     /// Shuts down the handler.

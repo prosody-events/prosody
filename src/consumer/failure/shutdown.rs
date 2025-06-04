@@ -7,6 +7,8 @@
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider};
+use crate::timers::store::TriggerStore;
+use crate::timers::{Trigger, UncommittedTimer};
 use thiserror::Error;
 
 /// A strategy that checks if the partition is shutting down before running the
@@ -52,11 +54,14 @@ where
     ///
     /// Returns a `ShutdownError::Shutdown` if the partition is being revoked,
     /// or a `ShutdownError::Handler` containing the wrapped handler's error.
-    async fn on_message(
+    async fn on_message<S>(
         &self,
-        context: EventContext,
+        context: EventContext<S>,
         message: ConsumerMessage,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        S: TriggerStore,
+    {
         if context.should_shutdown() {
             return Err(ShutdownError::Shutdown);
         }
@@ -65,6 +70,13 @@ where
             .on_message(context, message)
             .await
             .map_err(ShutdownError::Handler)
+    }
+
+    async fn on_timer<S>(&self, context: EventContext<S>, timer: Trigger) -> Result<(), Self::Error>
+    where
+        S: TriggerStore,
+    {
+        todo!()
     }
 }
 
@@ -78,7 +90,10 @@ where
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message(&self, context: EventContext, message: UncommittedMessage) {
+    async fn on_message<S>(&self, context: EventContext<S>, message: UncommittedMessage)
+    where
+        S: TriggerStore,
+    {
         let (message, uncommitted_offset) = message.into_inner();
 
         // Check if the partition is being revoked
@@ -98,6 +113,13 @@ where
             ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted_offset.commit(),
             ErrorCategory::Terminal => uncommitted_offset.abort(),
         }
+    }
+
+    async fn on_timer<S>(&self, context: EventContext<S>, timer: UncommittedTimer<S>)
+    where
+        S: TriggerStore,
+    {
+        todo!()
     }
 
     /// Implements shutdown behavior for the handler.

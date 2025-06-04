@@ -16,13 +16,11 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use std::cmp::max;
 use std::error::Error;
 use std::fmt::Debug;
-use std::ops::{Deref, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::spawn;
-use tokio::sync::watch;
-use tokio::sync::watch::{Receiver, Ref};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span, debug, error, warn};
@@ -38,6 +36,7 @@ mod triggers;
 
 const LOAD_CONCURRENCY: usize = 32;
 const DELETE_CONCURRENCY: usize = 16;
+const RETRY_DURATION: Duration = Duration::from_secs(1);
 
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
@@ -51,13 +50,14 @@ where
     uncommitted: UncommittedTrigger<T>,
 }
 
-struct UncommittedTrigger<T>
+pub struct UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
     key: Key,
     time: CompactDateTime,
     manager: TimerManager<T>,
+    completed: bool,
 }
 
 impl<T> UncommittedTimer<T>
@@ -67,10 +67,16 @@ where
     pub fn new(trigger: Trigger, manager: TimerManager<T>) -> Self {
         let key = trigger.key.clone();
         let time = trigger.time;
+        let completed = false;
 
         Self {
             trigger,
-            uncommitted: UncommittedTrigger { key, time, manager },
+            uncommitted: UncommittedTrigger {
+                key,
+                time,
+                manager,
+                completed,
+            },
         }
     }
 
@@ -86,8 +92,8 @@ where
         &self.trigger.span
     }
 
-    pub fn is_active(&self) -> bool {
-        self.uncommitted.is_active()
+    pub async fn is_active(&self) -> bool {
+        self.uncommitted.is_active().await
     }
 }
 
@@ -96,15 +102,11 @@ where
     T: TriggerStore,
 {
     async fn commit(mut self) {
-        if let Err(error) = self.uncommitted.commit().await {
-            error!("failed to commit timer: {error:#}");
-        }
+        self.uncommitted.commit().await;
     }
 
     async fn abort(mut self) {
-        if let Err(error) = self.uncommitted.abort().await {
-            error!("failed to abort timer: {error:#}");
-        }
+        self.uncommitted.abort().await;
     }
 }
 
@@ -123,26 +125,33 @@ impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    fn is_active(&self) -> bool {
-        self.manager.is_active(&self.key, self.time)
+    pub async fn is_active(&self) -> bool {
+        self.manager.is_active(&self.key, self.time).await
     }
 
-    async fn commit(&mut self) -> Result<(), TimerManagerError<T::Error>> {
-        if !self.is_active() {
-            return Err(TimerManagerError::Inactive);
+    pub async fn commit(&mut self) {
+        if self.completed {
+            warn!("timer already marked as completed; ignoring commit");
+            return;
         }
 
-        self.manager.complete(&self.key, self.time).await?;
-        Ok(())
+        loop {
+            let Err(error) = self.manager.complete(&self.key, self.time).await else {
+                break;
+            };
+
+            error!("failed to commit timer: {error:#}; retrying");
+            sleep(RETRY_DURATION).await;
+        }
     }
 
-    async fn abort(&mut self) -> Result<(), TimerManagerError<T::Error>> {
-        if !self.is_active() {
-            return Err(TimerManagerError::Inactive);
+    pub async fn abort(&mut self) {
+        if self.completed {
+            warn!("timer already marked as completed; ignoring abort");
+            return;
         }
 
-        self.manager.abort(&self.key, self.time).await?;
-        Ok(())
+        self.manager.abort(&self.key, self.time).await;
     }
 }
 
@@ -151,7 +160,7 @@ where
     T: TriggerStore,
 {
     fn drop(&mut self) {
-        if self.is_active() {
+        if !self.completed {
             warn!("trigger was dropped without committing");
         }
     }
@@ -167,14 +176,18 @@ pub struct Trigger {
     span: Span,
 }
 
-#[derive(Clone, Debug)]
-pub struct TimerManager<T>(Arc<TimerManagerInner<T>>);
+#[derive(Educe)]
+#[educe(Debug(bound = ""), Clone(bound()))]
+pub struct TimerManager<T>(#[educe(Debug(ignore))] Arc<TimerManagerInner<T>>);
 
-#[derive(Debug)]
 pub struct TimerManagerInner<T> {
     segment: Segment,
+    state: RangeLock<State<T>>,
+}
+
+struct State<T> {
+    store: T,
     scheduler: TriggerScheduler,
-    store: RangeLock<T>,
 }
 
 impl<T> TimerManager<T>
@@ -189,20 +202,11 @@ where
     ) -> Result<(impl Stream<Item = UncommittedTimer<T>>, Self), TimerManagerError<T::Error>> {
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
         let (trigger_rx, scheduler) = TriggerScheduler::new();
-        let store = RangeLock::new(store);
+        let state = RangeLock::new(State { store, scheduler });
 
-        spawn(slab_loader(
-            scheduler.clone(),
-            segment.clone(),
-            store.clone(),
-        ));
+        spawn(slab_loader(segment.clone(), state.clone()));
 
-        let manager = Self(Arc::new(TimerManagerInner {
-            segment,
-            scheduler,
-            store,
-        }));
-
+        let manager = Self(Arc::new(TimerManagerInner { segment, state }));
         let cloned_manager = manager.clone();
         let stream = ReceiverStream::new(trigger_rx)
             .map(move |trigger| UncommittedTimer::new(trigger, cloned_manager.clone()));
@@ -215,9 +219,10 @@ where
         key: &Key,
     ) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
         self.0
-            .store
+            .state
             .trigger_lock()
             .await
+            .store
             .get_key_triggers(&self.0.segment.id, key)
             .map_err(TimerManagerError::Store)
             .try_collect()
@@ -227,15 +232,16 @@ where
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, trigger.time);
         let slab_id = slab.id();
-        let store = self.0.store.trigger_lock().await;
+        let state = self.0.state.trigger_lock().await;
 
-        store
+        state
+            .store
             .add_trigger(&self.0.segment, slab, trigger.clone())
             .await
             .map_err(TimerManagerError::Store)?;
 
-        if store.is_owned(slab_id) {
-            self.0.scheduler.schedule(trigger).await?;
+        if state.is_owned(slab_id) {
+            state.scheduler.schedule(trigger).await?;
         }
 
         Ok(())
@@ -248,19 +254,20 @@ where
     ) -> Result<(), TimerManagerError<T::Error>> {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
-        let store = self.0.store.trigger_lock().await;
+        let state = self.0.state.trigger_lock().await;
 
-        if store.is_owned(slab_id) {
+        if state.is_owned(slab_id) {
             let trigger = Trigger {
                 key: key.clone(),
                 time,
                 span: Span::current(),
             };
 
-            self.0.scheduler.unschedule(trigger).await?;
+            state.scheduler.unschedule(trigger).await?;
         }
 
-        store
+        state
+            .store
             .remove_trigger(&self.0.segment, &slab, key, time)
             .await
             .map_err(TimerManagerError::Store)
@@ -280,8 +287,14 @@ where
             .await
     }
 
-    pub fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
-        self.0.scheduler.is_active(key, time)
+    pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
+        self.0
+            .state
+            .trigger_lock()
+            .await
+            .scheduler
+            .is_active(key, time)
+            .await
     }
 
     pub async fn complete(
@@ -291,13 +304,14 @@ where
     ) -> Result<(), TimerManagerError<T::Error>> {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
-        let store = self.0.store.trigger_lock().await;
+        let state = self.0.state.trigger_lock().await;
 
-        if store.is_owned(slab_id) {
-            self.0.scheduler.deactivate(key, time).await;
+        if state.is_owned(slab_id) {
+            state.scheduler.deactivate(key, time).await;
         }
 
-        store
+        state
+            .store
             .remove_trigger(&self.0.segment, &slab, key, time)
             .await
             .map_err(TimerManagerError::Store)?;
@@ -305,24 +319,18 @@ where
         Ok(())
     }
 
-    pub async fn abort(
-        &self,
-        key: &Key,
-        time: CompactDateTime,
-    ) -> Result<(), TimerManagerError<T::Error>> {
+    pub async fn abort(&self, key: &Key, time: CompactDateTime) {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
-        let store = self.0.store.trigger_lock().await;
+        let state = self.0.state.trigger_lock().await;
 
-        if store.is_owned(slab_id) {
-            self.0.scheduler.deactivate(key, time).await;
+        if state.is_owned(slab_id) {
+            state.scheduler.deactivate(key, time).await;
         }
-
-        Ok(())
     }
 }
 
-async fn slab_loader<T>(scheduler: TriggerScheduler, segment: Segment, store: RangeLock<T>)
+async fn slab_loader<T>(segment: Segment, state: RangeLock<State<T>>)
 where
     T: TriggerStore,
 {
@@ -363,7 +371,7 @@ where
             let load_range = start_slab_id..=target_slab_id;
 
             debug!("Loading slabs {start_slab_id}..={target_slab_id}");
-            match load_slabs(&store, &scheduler, &segment, load_range).await {
+            match load_slabs(&state, &segment, load_range).await {
                 Ok(loaded) => {
                     loaded_slab_ids.extend(loaded);
                     highest_loaded_slab_id = Some(target_slab_id);
@@ -384,9 +392,7 @@ where
         };
 
         // clean up old slabs
-        if let Err(error) =
-            remove_completed_slabs(&store, &scheduler, &segment, &mut loaded_slab_ids).await
-        {
+        if let Err(error) = remove_completed_slabs(&state, &segment, &mut loaded_slab_ids).await {
             error!("Failed to remove completed slabs: {error:#}");
         }
 
@@ -435,46 +441,46 @@ fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Dura
 }
 
 async fn load_slabs<T>(
-    store: &RangeLock<T>,
-    scheduler: &TriggerScheduler,
+    state: &RangeLock<State<T>>,
     segment: &Segment,
     slab_range: RangeInclusive<SlabId>,
 ) -> Result<Vec<SlabId>, TimerManagerError<T::Error>>
 where
     T: TriggerStore,
 {
-    let mut store = store.slab_lock().await;
-    let store_ref = store.deref();
     let range_end = *slab_range.end();
+    let mut state = state.slab_lock().await;
+    let store_ref = &state.store;
+    let scheduler_ref = &state.scheduler;
 
-    let loaded = store
+    let loaded = state
+        .store
         .get_slab_range(&segment.id, slab_range)
         .map_err(TimerManagerError::Store)
         .map_ok(|slab_id| async move {
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
-            load_triggers(store_ref, scheduler, slab).await?;
+            load_triggers(store_ref, scheduler_ref, slab).await?;
             Ok(slab_id)
         })
         .try_buffer_unordered(LOAD_CONCURRENCY)
         .try_collect()
         .await?;
 
-    store.extend_ownership(range_end);
+    state.extend_ownership(range_end);
     Ok(loaded)
 }
 
 async fn remove_completed_slabs<T>(
-    store: &RangeLock<T>,
-    scheduler: &TriggerScheduler,
+    state: &RangeLock<State<T>>,
     segment: &Segment,
     loaded_slab_ids: &mut HashSet<SlabId>,
 ) -> Result<(), T::Error>
 where
     T: TriggerStore,
 {
-    let store = store.slab_lock().await;
-    let store_ref = store.deref();
-    let active_slab_ids = active_slab_ids(segment, scheduler).await;
+    let state = state.slab_lock().await;
+    let store_ref = &state.store;
+    let active_slab_ids = active_slab_ids(segment, &state.scheduler).await;
     let completed_slab_ids = loaded_slab_ids.difference(&active_slab_ids).copied();
 
     let deleted_slab_ids = iter(completed_slab_ids)

@@ -30,9 +30,13 @@ use crate::{
 /// The context for message processing within a consumer.
 ///
 /// Provides shutdown notification capabilities to coordinate graceful shutdown.
-#[derive(Clone, Debug)]
+#[derive(Educe)]
+#[educe(Debug, Clone(bound()))]
 pub struct EventContext<T> {
+    #[educe(Debug(ignore))]
     shutdown_rx: watch::Receiver<bool>,
+
+    #[educe(Debug(ignore))]
     timers: TimerManager<T>,
 }
 

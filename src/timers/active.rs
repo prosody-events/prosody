@@ -28,9 +28,10 @@ impl ActiveTriggers {
         }
     }
 
-    pub fn contains(&self, key: &Key, time: CompactDateTime) -> bool {
+    pub async fn contains(&self, key: &Key, time: CompactDateTime) -> bool {
         self.0
-            .read(key, |_, v| v.contains(&time))
+            .read_async(key, |_, v| v.contains(&time))
+            .await
             .unwrap_or_default()
     }
 
@@ -69,13 +70,13 @@ mod tests {
         };
 
         // Initially, the trigger should not be present
-        assert!(!active_triggers.contains(&key, time));
+        assert!(!active_triggers.contains(&key, time).await);
 
         // Insert the trigger
         active_triggers.insert(trigger.clone()).await;
 
         // Now, the trigger should be present
-        assert!(active_triggers.contains(&key, time));
+        assert!(active_triggers.contains(&key, time).await);
     }
 
     #[test]
@@ -94,13 +95,13 @@ mod tests {
         active_triggers.insert(trigger.clone()).await;
 
         // Verify it exists
-        assert!(active_triggers.contains(&key, time));
+        assert!(active_triggers.contains(&key, time).await);
 
         // Remove the trigger
         active_triggers.remove(&key, time).await;
 
         // Verify it no longer exists
-        assert!(!active_triggers.contains(&key, time));
+        assert!(!active_triggers.contains(&key, time).await);
     }
 
     #[test]
@@ -127,21 +128,21 @@ mod tests {
         active_triggers.insert(trigger2.clone()).await;
 
         // Verify both triggers exist
-        assert!(active_triggers.contains(&key, time1));
-        assert!(active_triggers.contains(&key, time2));
+        assert!(active_triggers.contains(&key, time1).await);
+        assert!(active_triggers.contains(&key, time2).await);
 
         // Remove one trigger
         active_triggers.remove(&key, time1).await;
 
         // Verify only the second trigger exists
-        assert!(!active_triggers.contains(&key, time1));
-        assert!(active_triggers.contains(&key, time2));
+        assert!(!active_triggers.contains(&key, time1).await);
+        assert!(active_triggers.contains(&key, time2).await);
 
         // Remove the second trigger
         active_triggers.remove(&key, time2).await;
 
         // Verify no triggers exist for the key
-        assert!(!active_triggers.contains(&key, time1));
-        assert!(!active_triggers.contains(&key, time2));
+        assert!(!active_triggers.contains(&key, time1).await);
+        assert!(!active_triggers.contains(&key, time2).await);
     }
 }

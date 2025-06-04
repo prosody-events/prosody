@@ -401,8 +401,8 @@ async fn handle_messages<T, S>(
         match event {
             UncommittedEvent::Message(message) => handler.on_message(context, message).await,
             UncommittedEvent::Timer(timer) => {
-                if timer.is_active() {
-                    handler.on_timer(context, timer).await
+                if timer.is_active().await {
+                    handler.on_timer(context, timer).await;
                 }
             }
         }

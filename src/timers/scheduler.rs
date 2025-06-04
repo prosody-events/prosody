@@ -85,8 +85,8 @@ impl TriggerScheduler {
         &self.active_triggers
     }
 
-    pub fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
-        self.active_triggers.contains(key, time)
+    pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
+        self.active_triggers.contains(key, time).await
     }
 
     pub async fn deactivate(&self, key: &Key, time: CompactDateTime) {
@@ -197,7 +197,7 @@ mod tests {
             .map_err(|e| format!("Failed to schedule trigger: {e:?}"))?;
 
         // Verify the trigger is active
-        if !scheduler.is_active(&key, time) {
+        if !scheduler.is_active(&key, time).await {
             return Err("Trigger is not active after scheduling".to_owned());
         }
 
@@ -208,7 +208,7 @@ mod tests {
             .map_err(|e| format!("Failed to unschedule trigger: {e:?}"))?;
 
         // Verify the trigger is no longer active
-        if scheduler.is_active(&key, time) {
+        if scheduler.is_active(&key, time).await {
             return Err("Trigger is still active after unscheduling".to_owned());
         }
 
@@ -258,7 +258,7 @@ mod tests {
         }
 
         // Verify the trigger is still active
-        if !scheduler.is_active(&key, time) {
+        if !scheduler.is_active(&key, time).await {
             return Err(format!(
                 "Trigger is not active after emission. Key: {key:?}, Time: {time:?}"
             ));
@@ -318,7 +318,7 @@ mod tests {
         }
 
         // Verify the first trigger is still active
-        if !scheduler.is_active(&key1, time1) {
+        if !scheduler.is_active(&key1, time1).await {
             return Err(format!(
                 "First trigger is not active after emission. Key: {key1:?}, Time: {time1:?}"
             ));
@@ -339,7 +339,7 @@ mod tests {
         }
 
         // Verify the second trigger is still active
-        if !scheduler.is_active(&key2, time2) {
+        if !scheduler.is_active(&key2, time2).await {
             return Err(format!(
                 "Second trigger is not active after emission. Key: {key2:?}, Time: {time2:?}"
             ));
@@ -385,7 +385,7 @@ mod tests {
         scheduler.deactivate(&key, time).await;
 
         // Verify the trigger is no longer active
-        if scheduler.is_active(&key, time) {
+        if scheduler.is_active(&key, time).await {
             return Err("Trigger is still active after deactivation".to_owned());
         }
 
@@ -455,7 +455,7 @@ mod tests {
 
         // Verify the first trigger is still active
         assert!(
-            scheduler.is_active(&key, time1),
+            scheduler.is_active(&key, time1).await,
             "First trigger is not active after emission"
         );
 
@@ -473,7 +473,7 @@ mod tests {
 
         // Verify the second trigger is still active
         assert!(
-            scheduler.is_active(&key, time2),
+            scheduler.is_active(&key, time2).await,
             "Second trigger is not active after emission"
         );
 
@@ -491,7 +491,7 @@ mod tests {
 
         // Verify the third trigger is still active
         assert!(
-            scheduler.is_active(&key, time3),
+            scheduler.is_active(&key, time3).await,
             "Third trigger is not active after emission"
         );
 
@@ -502,15 +502,15 @@ mod tests {
 
         // Verify all triggers are no longer active
         assert!(
-            !scheduler.is_active(&key, time1),
+            !scheduler.is_active(&key, time1).await,
             "First trigger is still active after deactivation"
         );
         assert!(
-            !scheduler.is_active(&key, time2),
+            !scheduler.is_active(&key, time2).await,
             "Second trigger is still active after deactivation"
         );
         assert!(
-            !scheduler.is_active(&key, time3),
+            !scheduler.is_active(&key, time3).await,
             "Third trigger is still active after deactivation"
         );
 
