@@ -145,4 +145,127 @@ mod tests {
         assert!(!active_triggers.contains(&key, time1).await);
         assert!(!active_triggers.contains(&key, time2).await);
     }
+
+    #[test]
+    async fn test_multiple_keys() {
+        let active_triggers = ActiveTriggers::default();
+
+        let key1 = Key::from("key-1");
+        let key2 = Key::from("key-2");
+        let time1 = CompactDateTime::from(11111u32);
+        let time2 = CompactDateTime::from(22222u32);
+
+        let trigger1 = Trigger {
+            key: key1.clone(),
+            time: time1,
+            span: tracing::Span::current(),
+        };
+        let trigger2 = Trigger {
+            key: key2.clone(),
+            time: time2,
+            span: tracing::Span::current(),
+        };
+
+        // Insert triggers for different keys
+        active_triggers.insert(trigger1.clone()).await;
+        active_triggers.insert(trigger2.clone()).await;
+
+        // Verify both triggers exist under their respective keys
+        assert!(active_triggers.contains(&key1, time1).await);
+        assert!(active_triggers.contains(&key2, time2).await);
+
+        // Verify cross-key isolation
+        assert!(!active_triggers.contains(&key1, time2).await);
+        assert!(!active_triggers.contains(&key2, time1).await);
+
+        // Remove one trigger
+        active_triggers.remove(&key1, time1).await;
+
+        // Verify only the second trigger remains
+        assert!(!active_triggers.contains(&key1, time1).await);
+        assert!(active_triggers.contains(&key2, time2).await);
+    }
+
+    #[test]
+    async fn test_scan_active_times() {
+        let active_triggers = ActiveTriggers::default();
+
+        let key1 = Key::from("key-1");
+        let key2 = Key::from("key-2");
+        let time1 = CompactDateTime::from(10000u32);
+        let time2 = CompactDateTime::from(20000u32);
+        let time3 = CompactDateTime::from(30000u32);
+
+        // Insert multiple triggers
+        active_triggers.insert(Trigger {
+            key: key1.clone(),
+            time: time1,
+            span: tracing::Span::current(),
+        }).await;
+
+        active_triggers.insert(Trigger {
+            key: key1.clone(),
+            time: time2,
+            span: tracing::Span::current(),
+        }).await;
+
+        active_triggers.insert(Trigger {
+            key: key2.clone(),
+            time: time3,
+            span: tracing::Span::current(),
+        }).await;
+
+        // Collect all active times using scan_active_times
+        let mut collected_times = Vec::new();
+        active_triggers.scan_active_times(|time| {
+            collected_times.push(time);
+        }).await;
+
+        // Sort for consistent comparison
+        collected_times.sort();
+        let mut expected_times = vec![time1, time2, time3];
+        expected_times.sort();
+
+        assert_eq!(collected_times, expected_times);
+    }
+
+    #[test]
+    async fn test_edge_cases() {
+        let active_triggers = ActiveTriggers::default();
+        let key = Key::from("test-key");
+        let time = CompactDateTime::from(12345u32);
+
+        // Test contains on empty state
+        assert!(!active_triggers.contains(&key, time).await);
+
+        // Test remove on non-existent key
+        active_triggers.remove(&key, time).await; // Should not panic
+
+        // Test remove on non-existent time for existing key
+        let trigger = Trigger {
+            key: key.clone(),
+            time,
+            span: tracing::Span::current(),
+        };
+        active_triggers.insert(trigger).await;
+
+        let other_time = CompactDateTime::from(99999u32);
+        active_triggers.remove(&key, other_time).await; // Should not panic
+
+        // Original trigger should still exist
+        assert!(active_triggers.contains(&key, time).await);
+    }
+
+    #[test]
+    async fn test_scan_active_times_empty() {
+        let active_triggers = ActiveTriggers::default();
+
+        let mut call_count = 0_i32;
+        active_triggers.scan_active_times(|_| {
+            call_count += 1_i32;
+        }).await;
+
+        // Should not call the function for empty state
+        assert_eq!(call_count, 0_i32);
+    }
 }
