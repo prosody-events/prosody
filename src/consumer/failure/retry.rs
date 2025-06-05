@@ -258,7 +258,46 @@ where
     where
         S: TriggerStore,
     {
-        todo!()
+        // Retry logic for a fired timer
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+            // Try handling the timer
+            let Err(error) = self.handler.on_timer(context.clone(), timer.clone()).await else {
+                return Ok(());
+            };
+            // If shutdown was requested, stop retrying
+            if context.should_shutdown() {
+                return Err(error);
+            }
+            match error.classify_error() {
+                ErrorCategory::Transient => {
+                    if attempt > self.max_retries {
+                        error!("failed to handle timer: {error:#}; maximum attempts reached");
+                        return Err(error);
+                    }
+                    let sleep_time = self.sleep_time(attempt);
+                    error!(
+                        "failed to handle timer: {error:#}; retrying after {}",
+                        format_duration(sleep_time)
+                    );
+                    select! {
+                        () = sleep(sleep_time) => {},
+                        () = context.on_shutdown() => return Err(error),
+                    }
+                }
+                ErrorCategory::Permanent => {
+                    error!("permanently failed to handle timer: {error:#}");
+                    return Err(error);
+                }
+                ErrorCategory::Terminal => {
+                    info!(
+                        "terminal condition encountered while handling timer: {error:#}; aborting"
+                    );
+                    return Err(error);
+                }
+            }
+        }
     }
 }
 
@@ -355,7 +394,54 @@ where
     where
         S: TriggerStore,
     {
-        todo!()
+        // Retry logic for an uncommitted timer
+        let (trigger, mut uncommitted) = timer.into_inner();
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+            // Try handling the timer
+            let Err(error) = self
+                .handler
+                .on_timer(context.clone(), trigger.clone())
+                .await
+            else {
+                uncommitted.commit().await;
+                break;
+            };
+            // If shutdown was requested, abort and stop retrying
+            if context.should_shutdown() {
+                uncommitted.abort().await;
+                break;
+            }
+            match error.classify_error() {
+                ErrorCategory::Transient => {
+                    let sleep_time = self.sleep_time(attempt);
+                    error!(
+                        "failed to handle timer: {error:#}; retrying after {}",
+                        format_duration(sleep_time)
+                    );
+                    select! {
+                        () = sleep(sleep_time) => {},
+                        () = context.on_shutdown() => {
+                            uncommitted.abort().await;
+                            break;
+                        }
+                    }
+                }
+                ErrorCategory::Permanent => {
+                    error!("permanently failed to handle timer: {error:#}; discarding timer");
+                    uncommitted.commit().await;
+                    break;
+                }
+                ErrorCategory::Terminal => {
+                    info!(
+                        "terminal condition encountered while handling timer: {error:#}; aborting"
+                    );
+                    uncommitted.abort().await;
+                    break;
+                }
+            }
+        }
     }
 
     /// Performs any necessary shutdown operations for the handler.

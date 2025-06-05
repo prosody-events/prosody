@@ -169,11 +169,11 @@ where
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {
-    key: Key,
-    time: CompactDateTime,
+    pub key: Key,
+    pub time: CompactDateTime,
 
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
-    span: Span,
+    pub span: Span,
 }
 
 #[derive(Educe)]

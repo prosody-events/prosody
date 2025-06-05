@@ -76,7 +76,13 @@ where
     where
         S: TriggerStore,
     {
-        todo!()
+        if context.should_shutdown() {
+            return Err(ShutdownError::Shutdown);
+        }
+        self.0
+            .on_timer(context, timer)
+            .await
+            .map_err(ShutdownError::Handler)
     }
 }
 
@@ -119,7 +125,25 @@ where
     where
         S: TriggerStore,
     {
-        todo!()
+        let (trigger, mut uncommitted) = timer.into_inner();
+
+        // Check if the partition is being revoked
+        if context.should_shutdown() {
+            uncommitted.abort().await;
+            return;
+        }
+
+        // Process the timer and handle potential errors
+        let Err(error) = self.0.on_timer(context, trigger).await else {
+            uncommitted.commit().await;
+            return;
+        };
+
+        // Commit or abort based on the error category
+        match error.classify_error() {
+            ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted.commit().await,
+            ErrorCategory::Terminal => uncommitted.abort().await,
+        }
     }
 
     /// Implements shutdown behavior for the handler.
