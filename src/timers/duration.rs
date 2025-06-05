@@ -1,14 +1,16 @@
 //! Compact duration representation for efficient timer calculations.
 //!
-//! This module provides [`CompactDuration`], a space-efficient representation of
-//! time durations using 32-bit seconds. This compact format is optimized for
-//! timer systems where storage efficiency and fast arithmetic operations are important.
+//! This module provides [`CompactDuration`], a space-efficient representation
+//! of time durations using 32-bit seconds. This compact format is optimized for
+//! timer systems where storage efficiency and fast arithmetic operations are
+//! important.
 //!
 //! ## Design Rationale
 //!
-//! Standard duration types often use 64-bit representations or complex structures
-//! with nanosecond precision. For timer systems that only need second-level precision,
-//! this creates unnecessary overhead. [`CompactDuration`] addresses this by:
+//! Standard duration types often use 64-bit representations or complex
+//! structures with nanosecond precision. For timer systems that only need
+//! second-level precision, this creates unnecessary overhead.
+//! [`CompactDuration`] addresses this by:
 //!
 //! - Using only 32 bits for storage (4 bytes vs 8+ bytes)
 //! - Providing fast arithmetic operations
@@ -75,7 +77,6 @@ pub struct CompactDuration {
 impl CompactDuration {
     /// The maximum representable duration (~136 years).
     pub const MAX: Self = Self { seconds: u32::MAX };
-
     /// The minimum representable duration (0 seconds).
     pub const MIN: Self = Self { seconds: u32::MIN };
 
@@ -205,9 +206,9 @@ impl Debug for CompactDuration {
 pub enum CompactDurationError {
     /// The duration value is outside the representable range.
     ///
-    /// [`CompactDuration`] can only represent durations from 0 to 4,294,967,295 seconds
-    /// (approximately 136 years). This error occurs when attempting to create or
-    /// calculate a duration outside this range.
+    /// [`CompactDuration`] can only represent durations from 0 to 4,294,967,295
+    /// seconds (approximately 136 years). This error occurs when attempting
+    /// to create or calculate a duration outside this range.
     #[error("Duration is out of range")]
     OutOfRange,
 }
@@ -215,6 +216,7 @@ pub enum CompactDurationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::eyre::Result;
     use std::time::Duration;
 
     #[test]
@@ -316,26 +318,27 @@ mod tests {
     }
 
     #[test]
-    fn test_rounding_behavior() {
+    fn test_rounding_behavior() -> Result<()> {
         // Test rounding down when nanoseconds are < 500_000_000
         let duration_round_down = Duration::new(1234, 499_999_999);
-        let compact = CompactDuration::try_from(duration_round_down).expect("Valid duration should convert");
+        let compact = CompactDuration::try_from(duration_round_down)?;
         assert_eq!(compact.seconds(), 1234);
 
-        // Test rounding up when nanoseconds are > 500_000_000  
+        // Test rounding up when nanoseconds are > 500_000_000
         let duration_round_up = Duration::new(1234, 500_000_001);
-        let compact = CompactDuration::try_from(duration_round_up).expect("Valid duration should convert");
+        let compact = CompactDuration::try_from(duration_round_up)?;
         assert_eq!(compact.seconds(), 1235);
 
         // Test exact boundary case (500_000_000 nanoseconds)
         let duration_exact_boundary = Duration::new(1234, 500_000_000);
-        let compact = CompactDuration::try_from(duration_exact_boundary).expect("Valid duration should convert");
+        let compact = CompactDuration::try_from(duration_exact_boundary)?;
         assert_eq!(compact.seconds(), 1235);
 
         // Test zero nanoseconds (no rounding)
         let duration_no_nanos = Duration::new(1234, 0);
-        let compact = CompactDuration::try_from(duration_no_nanos).expect("Valid duration should convert");
+        let compact = CompactDuration::try_from(duration_no_nanos)?;
         assert_eq!(compact.seconds(), 1234);
+        Ok(())
     }
 
     #[test]
@@ -391,12 +394,12 @@ mod tests {
     #[test]
     fn test_copy_clone_behavior() {
         let original = CompactDuration::new(1234);
-        
+
         // Test Copy trait (implicit)
         let copied = original;
         assert_eq!(copied.seconds(), 1234);
         assert_eq!(original.seconds(), 1234); // Original should still be usable
-        
+
         // Test Clone trait (explicit)
         let cloned = original;
         assert_eq!(cloned.seconds(), 1234);
@@ -404,17 +407,17 @@ mod tests {
     }
 
     #[test]
-    fn test_checked_add_edge_cases() {
+    fn test_checked_add_edge_cases() -> Result<()> {
         let zero = CompactDuration::new(0);
         let some_duration = CompactDuration::new(1000);
         let max_duration = CompactDuration::MAX;
 
         // Adding zero should not change the value
-        assert_eq!(some_duration.checked_add(zero).expect("Adding zero should succeed").seconds(), 1000);
-        assert_eq!(zero.checked_add(some_duration).expect("Adding to zero should succeed").seconds(), 1000);
+        assert_eq!(some_duration.checked_add(zero)?.seconds(), 1000);
+        assert_eq!(zero.checked_add(some_duration)?.seconds(), 1000);
 
         // Adding zero to max should still be max
-        assert_eq!(max_duration.checked_add(zero).expect("Adding zero to max should succeed").seconds(), u32::MAX);
+        assert_eq!(max_duration.checked_add(zero)?.seconds(), u32::MAX);
 
         // Adding any non-zero value to max should overflow
         let one = CompactDuration::new(1);
@@ -428,41 +431,46 @@ mod tests {
         let five = CompactDuration::new(5);
         let six = CompactDuration::new(6);
 
-        assert_eq!(near_max.checked_add(five).expect("Adding to near max should succeed").seconds(), u32::MAX);
+        assert_eq!(near_max.checked_add(five)?.seconds(), u32::MAX);
         assert!(matches!(
             near_max.checked_add(six),
             Err(CompactDurationError::OutOfRange)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_precision_loss_documentation() {
+    fn test_precision_loss_documentation() -> Result<()> {
         // Verify that subsecond precision is indeed lost
         let precise_duration = Duration::new(5, 123_456_789);
-        let compact = CompactDuration::try_from(precise_duration).expect("Valid duration should convert");
+        let compact = CompactDuration::try_from(precise_duration)?;
         let back_to_duration: Duration = compact.into();
-        
+
         // Should lose nanosecond precision
         assert_eq!(back_to_duration.as_secs(), 5);
         assert_eq!(back_to_duration.subsec_nanos(), 0);
-        
+
         // Original had subsecond precision, converted back should not
-        assert_ne!(precise_duration.subsec_nanos(), back_to_duration.subsec_nanos());
+        assert_ne!(
+            precise_duration.subsec_nanos(),
+            back_to_duration.subsec_nanos()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_range_boundaries() {
+    fn test_range_boundaries() -> Result<()> {
         // Test exactly at the boundaries
         let min_duration = Duration::from_secs(0);
         let max_valid_duration = Duration::from_secs(u64::from(u32::MAX));
         let just_over_max = Duration::from_secs(u64::from(u32::MAX) + 1);
 
         // Min should work
-        let compact_min = CompactDuration::try_from(min_duration).expect("Min duration should convert");
+        let compact_min = CompactDuration::try_from(min_duration)?;
         assert_eq!(compact_min.seconds(), 0);
 
-        // Max should work  
-        let compact_max = CompactDuration::try_from(max_valid_duration).expect("Max valid duration should convert");
+        // Max should work
+        let compact_max = CompactDuration::try_from(max_valid_duration)?;
         assert_eq!(compact_max.seconds(), u32::MAX);
 
         // Just over max should fail
@@ -470,5 +478,6 @@ mod tests {
             CompactDuration::try_from(just_over_max),
             Err(CompactDurationError::OutOfRange)
         ));
+        Ok(())
     }
 }

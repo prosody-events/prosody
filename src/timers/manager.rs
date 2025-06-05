@@ -1,9 +1,9 @@
 //! Timer management and coordination for scheduled events.
 //!
-//! This module provides the [`TimerManager`], which serves as the primary interface
-//! for scheduling, managing, and delivering timer events. The manager coordinates
-//! between persistent storage, in-memory scheduling, and event delivery to ensure
-//! reliable timer processing across distributed systems.
+//! This module provides the [`TimerManager`], which serves as the primary
+//! interface for scheduling, managing, and delivering timer events. The manager
+//! coordinates between persistent storage, in-memory scheduling, and event
+//! delivery to ensure reliable timer processing across distributed systems.
 //!
 //! ## Architecture Overview
 //!
@@ -34,7 +34,8 @@
 //! ## Key Features
 //!
 //! - **Persistent Storage**: Timers survive application restarts
-//! - **Distributed Coordination**: Multiple instances can share timer processing
+//! - **Distributed Coordination**: Multiple instances can share timer
+//!   processing
 //! - **Preloading**: Upcoming timers are loaded before their execution time
 //! - **Efficient Scheduling**: In-memory queues for precise timing
 //! - **Key-based Operations**: Schedule and query timers by entity keys
@@ -43,8 +44,8 @@
 //!
 //! ```rust,no_run
 //! use prosody::timers::TimerManager;
-//! use prosody::timers::store::memory::InMemoryTriggerStore;
 //! use prosody::timers::duration::CompactDuration;
+//! use prosody::timers::store::memory::InMemoryTriggerStore;
 //! use uuid::Uuid;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,12 +53,8 @@
 //! let segment_id = Uuid::new_v4();
 //! let slab_size = CompactDuration::new(300); // 5 minutes
 //!
-//! let (timer_stream, manager) = TimerManager::new(
-//!     segment_id,
-//!     slab_size,
-//!     "my-application",
-//!     store,
-//! ).await?;
+//! let (timer_stream, manager) =
+//!     TimerManager::new(segment_id, slab_size, "my-application", store).await?;
 //!
 //! // Manager is now ready for scheduling timers
 //! # Ok(())
@@ -94,16 +91,17 @@ pub const DELETE_CONCURRENCY: usize = 16;
 /// Manages timer scheduling, storage, and delivery for a specific segment.
 ///
 /// [`TimerManager`] serves as the primary interface for timer operations within
-/// a specific segment (typically corresponding to a consumer group). It coordinates
-/// between persistent storage, in-memory scheduling, and event delivery to provide
-/// reliable timer functionality.
+/// a specific segment (typically corresponding to a consumer group). It
+/// coordinates between persistent storage, in-memory scheduling, and event
+/// delivery to provide reliable timer functionality.
 ///
 /// ## Responsibilities
 ///
 /// - **Persistent Storage**: Ensures timers survive application restarts
 /// - **Scheduling**: Maintains in-memory queues for precise timer delivery
 /// - **Preloading**: Loads upcoming timers before their execution time
-/// - **Coordination**: Manages distributed timer processing across multiple instances
+/// - **Coordination**: Manages distributed timer processing across multiple
+///   instances
 /// - **Lifecycle**: Handles timer creation, scheduling, execution, and cleanup
 ///
 /// ## Thread Safety
@@ -173,8 +171,8 @@ where
     ///
     /// ```rust,no_run
     /// use prosody::timers::TimerManager;
-    /// use prosody::timers::store::memory::InMemoryTriggerStore;
     /// use prosody::timers::duration::CompactDuration;
+    /// use prosody::timers::store::memory::InMemoryTriggerStore;
     /// use uuid::Uuid;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -184,7 +182,8 @@ where
     ///     CompactDuration::new(300), // 5-minute slabs
     ///     "order-processor",
     ///     store,
-    /// ).await?;
+    /// )
+    /// .await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -266,17 +265,18 @@ where
     ///
     /// This method adds a new timer to both the persistent storage and the
     /// in-memory scheduler (if the timer's slab is currently owned by this
-    /// manager instance). The timer will be delivered as an [`UncommittedTimer`]
-    /// when its scheduled time arrives.
+    /// manager instance). The timer will be delivered as an
+    /// [`UncommittedTimer`] when its scheduled time arrives.
     ///
     /// # Arguments
     ///
-    /// * `trigger` - The timer event to schedule, containing the key, time, and tracing span
+    /// * `trigger` - The timer event to schedule, containing the key, time, and
+    ///   tracing span
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the timer was successfully scheduled, or a [`TimerManagerError`]
-    /// if the operation failed.
+    /// `Ok(())` if the timer was successfully scheduled, or a
+    /// [`TimerManagerError`] if the operation failed.
     ///
     /// # Errors
     ///
@@ -406,9 +406,9 @@ where
     ///
     /// # Returns
     ///
-    /// `Ok(())` if all timers were successfully canceled, or a [`TimerManagerError`]
-    /// if the operation failed. Partial failures may occur where some timers
-    /// are canceled before an error occurs.
+    /// `Ok(())` if all timers were successfully canceled, or a
+    /// [`TimerManagerError`] if the operation failed. Partial failures may
+    /// occur where some timers are canceled before an error occurs.
     ///
     /// # Errors
     ///
@@ -526,8 +526,9 @@ where
     ///
     /// # Usage
     ///
-    /// This method is typically called automatically when an [`UncommittedTimer`]
-    /// is committed. Direct usage is rare but may be needed for cleanup operations.
+    /// This method is typically called automatically when an
+    /// [`UncommittedTimer`] is committed. Direct usage is rare but may be
+    /// needed for cleanup operations.
     ///
     /// # Examples
     ///
@@ -581,10 +582,10 @@ where
     ///
     /// # Usage
     ///
-    /// This method is typically called automatically when an [`UncommittedTimer`]
-    /// is aborted due to processing failure or shutdown conditions. It ensures
-    /// the timer is not retried immediately while preserving it for potential
-    /// future execution.
+    /// This method is typically called automatically when an
+    /// [`UncommittedTimer`] is aborted due to processing failure or
+    /// shutdown conditions. It ensures the timer is not retried immediately
+    /// while preserving it for potential future execution.
     ///
     /// # Examples
     ///

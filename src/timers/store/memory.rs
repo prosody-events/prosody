@@ -6,8 +6,10 @@
 //!
 //! ## Features
 //!
-//! - **Thread-Safe**: Uses concurrent data structures for safe multi-threaded access
-//! - **Fast Operations**: All operations are in-memory with O(1) or O(log n) complexity
+//! - **Thread-Safe**: Uses concurrent data structures for safe multi-threaded
+//!   access
+//! - **Fast Operations**: All operations are in-memory with O(1) or O(log n)
+//!   complexity
 //! - **Complete Implementation**: Supports all [`TriggerStore`] operations
 //! - **Zero Dependencies**: No external storage systems required
 //!
@@ -22,14 +24,15 @@
 //!
 //! - **Testing**: Unit and integration tests that need timer functionality
 //! - **Development**: Local development without external dependencies
-//! - **Ephemeral Workloads**: Short-lived processes where persistence isn't needed
+//! - **Ephemeral Workloads**: Short-lived processes where persistence isn't
+//!   needed
 //! - **Prototyping**: Quick validation of timer-based application logic
 //!
 //! ## Example Usage
 //!
 //! ```rust,no_run
-//! use prosody::timers::store::memory::InMemoryTriggerStore;
 //! use prosody::timers::store::TriggerStore;
+//! use prosody::timers::store::memory::InMemoryTriggerStore;
 //!
 //! let store = InMemoryTriggerStore::new();
 //! // Use store with any TriggerStore operations...
@@ -53,9 +56,9 @@ use tracing::Span;
 
 /// An in-memory implementation of [`TriggerStore`] for testing and development.
 ///
-/// [`InMemoryTriggerStore`] provides a complete implementation of the [`TriggerStore`]
-/// trait using concurrent in-memory data structures. All data is stored in memory
-/// and will be lost when the process terminates.
+/// [`InMemoryTriggerStore`] provides a complete implementation of the
+/// [`TriggerStore`] trait using concurrent in-memory data structures. All data
+/// is stored in memory and will be lost when the process terminates.
 ///
 /// ## Thread Safety
 ///
@@ -65,7 +68,8 @@ use tracing::Span;
 ///
 /// ## Data Organization
 ///
-/// The store maintains several concurrent hash maps to support efficient operations:
+/// The store maintains several concurrent hash maps to support efficient
+/// operations:
 /// - **Segments**: Metadata about timer segments
 /// - **Slab Index**: Which slabs exist for each segment
 /// - **Time Index**: Triggers organized by time ranges (slabs)
@@ -93,8 +97,10 @@ pub struct InMemoryTriggerStore(Arc<Inner>);
 ///
 /// - `segments`: Maps segment IDs to their configuration (name and slab size)
 /// - `segment_slabs`: Maps segment IDs to sets of active slab IDs
-/// - `slab_triggers`: Maps slab specifications to sets of triggers (time-based index)
-/// - `key_triggers`: Maps (segment, key) pairs to sets of scheduled times (key-based index)
+/// - `slab_triggers`: Maps slab specifications to sets of triggers (time-based
+///   index)
+/// - `key_triggers`: Maps (segment, key) pairs to sets of scheduled times
+///   (key-based index)
 ///
 /// ## Concurrency
 ///
@@ -105,13 +111,13 @@ pub struct InMemoryTriggerStore(Arc<Inner>);
 struct Inner {
     /// Segment metadata: segment ID -> (name, `slab_size`)
     segments: HashMap<SegmentId, (String, CompactDuration)>,
-    
+
     /// Slab registry: segment ID -> set of active slab IDs
     segment_slabs: HashMap<SegmentId, BTreeSet<SlabId>>,
-    
+
     /// Time-based index: slab -> set of triggers in that time range
     slab_triggers: HashMap<Slab, BTreeSet<Trigger>>,
-    
+
     /// Key-based index: (segment ID, key) -> set of scheduled times
     key_triggers: HashMap<(SegmentId, Key), BTreeSet<CompactDateTime>>,
 }

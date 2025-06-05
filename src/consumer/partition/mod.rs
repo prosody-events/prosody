@@ -358,7 +358,10 @@ async fn handle_messages<T, S>(
         config.allowed_events.as_ref(),
     );
 
-    let name = format!("{}:{}/{}", config.group_id, partition_info.topic, partition_info.partition);
+    let name = format!(
+        "{}:{}/{}",
+        config.group_id, partition_info.topic, partition_info.partition
+    );
     let segment_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
 
     let (timer_stream, timer_manager) = loop {

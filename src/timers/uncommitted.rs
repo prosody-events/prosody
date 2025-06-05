@@ -18,7 +18,8 @@
 //!
 //! - **At-least-once delivery**: Timers are delivered at least once
 //! - **Fault tolerance**: Uncommitted timers survive application crashes
-//! - **Graceful shutdown**: Uncommitted timers are properly handled during shutdown
+//! - **Graceful shutdown**: Uncommitted timers are properly handled during
+//!   shutdown
 //! - **Retry logic**: Failed operations are retried with exponential backoff
 //!
 //! ## Usage Pattern
@@ -79,8 +80,10 @@ const RETRY_DURATION: Duration = Duration::from_secs(1);
 /// ## Reliability
 ///
 /// - **Persistence**: Uncommitted timers survive application restarts
-/// - **Exactly-once semantics**: Each timer is processed exactly once when committed
-/// - **Failure handling**: Aborted timers may be retried or permanently discarded
+/// - **Exactly-once semantics**: Each timer is processed exactly once when
+///   committed
+/// - **Failure handling**: Aborted timers may be retried or permanently
+///   discarded
 /// - **Resource cleanup**: Uncommitted timers are cleaned up during shutdown
 ///
 /// ## Thread Safety
@@ -112,9 +115,11 @@ where
 ///
 /// ## Purpose
 ///
-/// - **Transaction State**: Tracks whether the timer has been committed or aborted
+/// - **Transaction State**: Tracks whether the timer has been committed or
+///   aborted
 /// - **Resource Management**: Ensures proper cleanup of timer resources
-/// - **Coordination**: Interfaces with the timer manager for persistence operations
+/// - **Coordination**: Interfaces with the timer manager for persistence
+///   operations
 /// - **Safety**: Prevents double-commit or double-abort scenarios
 pub struct UncommittedTrigger<T>
 where
@@ -122,13 +127,13 @@ where
 {
     /// The key associated with this timer.
     key: Key,
-    
+
     /// The scheduled execution time of this timer.
     time: CompactDateTime,
-    
+
     /// The timer manager responsible for this timer's lifecycle.
     manager: TimerManager<T>,
-    
+
     /// Whether this timer has been completed (committed or aborted).
     completed: bool,
 }
@@ -155,19 +160,19 @@ where
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use prosody::timers::{UncommittedTimer, Trigger, TimerManager};
     /// use prosody::timers::store::memory::InMemoryTriggerStore;
+    /// use prosody::timers::{TimerManager, Trigger, UncommittedTimer};
     /// # use prosody::timers::datetime::CompactDateTime;
     /// # use prosody::Key;
     /// # use tracing::Span;
-    /// 
+    ///
     /// # fn example(manager: TimerManager<InMemoryTriggerStore>) {
     /// let trigger = Trigger {
     ///     key: Key::from("example-key"),
     ///     time: CompactDateTime::from(1234567890_u32),
     ///     span: Span::current(),
     /// };
-    /// 
+    ///
     /// let uncommitted = UncommittedTimer::new(trigger, manager);
     /// // Timer is now ready for processing
     /// # }
@@ -208,11 +213,11 @@ where
     /// # use prosody::timers::store::memory::InMemoryTriggerStore;
     /// # fn example(timer: UncommittedTimer<InMemoryTriggerStore>) {
     /// let (trigger, uncommitted) = timer.into_inner();
-    /// 
+    ///
     /// // Access trigger data
     /// println!("Timer key: {:?}", trigger.key);
     /// println!("Timer time: {:?}", trigger.time);
-    /// 
+    ///
     /// // Handle transaction state separately
     /// // ... custom processing logic ...
     /// # }
@@ -363,10 +368,10 @@ where
     /// # async fn example(timer: UncommittedTimer<InMemoryTriggerStore>) {
     /// // Process the timer successfully
     /// let (trigger, mut uncommitted) = timer.into_inner();
-    /// 
+    ///
     /// // Perform business logic...
     /// println!("Processing timer for key: {:?}", trigger.key);
-    /// 
+    ///
     /// // Mark as complete
     /// uncommitted.commit().await;
     /// println!("Timer committed successfully");
@@ -396,9 +401,12 @@ where
     ///
     /// # Use Cases
     ///
-    /// - **Processing failures**: When timer processing fails but should be retried
-    /// - **Shutdown conditions**: When the application is shutting down gracefully
-    /// - **Rate limiting**: When processing should be delayed due to external constraints
+    /// - **Processing failures**: When timer processing fails but should be
+    ///   retried
+    /// - **Shutdown conditions**: When the application is shutting down
+    ///   gracefully
+    /// - **Rate limiting**: When processing should be delayed due to external
+    ///   constraints
     ///
     /// # Panics
     ///
@@ -413,7 +421,7 @@ where
     /// # async fn example(timer: UncommittedTimer<InMemoryTriggerStore>) {
     /// // Attempt to process the timer
     /// let (trigger, mut uncommitted) = timer.into_inner();
-    /// 
+    ///
     /// match process_timer(&trigger).await {
     ///     Ok(()) => uncommitted.commit().await,
     ///     Err(_) => {
@@ -438,7 +446,8 @@ impl<T> Drop for UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Logs a warning if the timer is dropped without being committed or aborted.
+    /// Logs a warning if the timer is dropped without being committed or
+    /// aborted.
     ///
     /// This implementation helps detect resource leaks where timers are
     /// delivered but not properly acknowledged. Such scenarios can lead to
@@ -465,7 +474,7 @@ where
     /// }
     /// // Timer is now properly acknowledged
     /// # }
-    /// # async fn process_timer_event<T>(_timer: &UncommittedTimer<T>) -> Result<(), Box<dyn std::error::Error>> 
+    /// # async fn process_timer_event<T>(_timer: &UncommittedTimer<T>) -> Result<(), Box<dyn std::error::Error>>
     /// # where T: prosody::timers::store::TriggerStore { Ok(()) }
     /// ```
     fn drop(&mut self) {

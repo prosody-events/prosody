@@ -81,19 +81,23 @@ impl<T> EventContext<T> {
     }
 }
 
-/// A union type representing either a message or timer event that requires acknowledgment.
+/// A union type representing either a message or timer event that requires
+/// acknowledgment.
 ///
-/// [`UncommittedEvent`] provides a unified interface for handling both message and timer
-/// events within the consumer processing pipeline. Both event types follow the same
-/// transaction-like semantics where they must be explicitly committed or aborted
-/// after processing.
+/// [`UncommittedEvent`] provides a unified interface for handling both message
+/// and timer events within the consumer processing pipeline. Both event types
+/// follow the same transaction-like semantics where they must be explicitly
+/// committed or aborted after processing.
 ///
 /// ## Purpose
 ///
 /// This enum enables:
-/// - **Unified Processing**: Handle both message and timer events with the same interface
-/// - **Key-based Ordering**: Maintain ordering guarantees across both event types
-/// - **Transaction Semantics**: Consistent commit/abort behavior for all event types
+/// - **Unified Processing**: Handle both message and timer events with the same
+///   interface
+/// - **Key-based Ordering**: Maintain ordering guarantees across both event
+///   types
+/// - **Transaction Semantics**: Consistent commit/abort behavior for all event
+///   types
 /// - **Type Safety**: Compile-time guarantees about event handling
 ///
 /// ## Usage Pattern

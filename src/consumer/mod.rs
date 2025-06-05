@@ -32,7 +32,9 @@
 //!
 //! ```
 //! use prosody::consumer::message::{EventContext, UncommittedMessage};
-//! use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted};
+//! use prosody::consumer::{
+//!     ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
+//! };
 //! use prosody::timers::{UncommittedTimer, store::TriggerStore};
 //!
 //! // Implement your message handler
@@ -194,8 +196,8 @@ pub trait Keyed {
 ///
 /// The [`Uncommitted`] trait enables reliable event processing by requiring
 /// explicit acknowledgment after processing. Events that implement this trait
-/// must be either committed (successfully processed) or aborted (failed processing)
-/// to ensure proper resource cleanup and delivery guarantees.
+/// must be either committed (successfully processed) or aborted (failed
+/// processing) to ensure proper resource cleanup and delivery guarantees.
 ///
 /// ## Transaction Semantics
 ///
@@ -205,8 +207,10 @@ pub trait Keyed {
 ///
 /// ## Reliability Guarantees
 ///
-/// - **At-least-once delivery**: Events are delivered at least once until committed
-/// - **Resource cleanup**: Proper acknowledgment ensures resources are cleaned up
+/// - **At-least-once delivery**: Events are delivered at least once until
+///   committed
+/// - **Resource cleanup**: Proper acknowledgment ensures resources are cleaned
+///   up
 /// - **Fault tolerance**: Uncommitted events survive application crashes
 /// - **Graceful shutdown**: Uncommitted events are handled during shutdown
 pub trait Uncommitted {
@@ -226,12 +230,13 @@ pub trait Uncommitted {
     ///
     /// This method should be called when event processing fails and the event
     /// should be handled according to the configured failure policy. Depending
-    /// on the implementation, aborted events may be retried, sent to dead letter
-    /// queues, or permanently discarded.
+    /// on the implementation, aborted events may be retried, sent to dead
+    /// letter queues, or permanently discarded.
     ///
     /// # Failure Handling
     ///
-    /// The specific behavior of abort depends on the event type and configuration:
+    /// The specific behavior of abort depends on the event type and
+    /// configuration:
     /// - **Messages**: May be retried or sent to failure topics
     /// - **Timers**: May be rescheduled or permanently canceled
     fn abort(self) -> impl Future<Output = ()>;
@@ -294,7 +299,8 @@ pub trait EventHandler {
     ///
     /// # Arguments
     ///
-    /// * `context` - The event processing context with access to timer management
+    /// * `context` - The event processing context with access to timer
+    ///   management
     /// * `timer` - The uncommitted timer event that fired
     ///
     /// # Processing Requirements
@@ -544,12 +550,13 @@ pub struct ConsumerConfiguration {
     /// # Recommended Values
     ///
     /// - **High-frequency timers**: 5-15 minutes
-    /// - **Medium-frequency timers**: 15-60 minutes  
+    /// - **Medium-frequency timers**: 15-60 minutes
     /// - **Low-frequency timers**: 1-4 hours
     ///
     /// # Default
     ///
-    /// Defaults to 10 minutes if not specified or if parsing from environment fails.
+    /// Defaults to 10 minutes if not specified or if parsing from environment
+    /// fails.
     pub slab_size: Duration,
 }
 

@@ -197,29 +197,37 @@ mod tests {
         let time3 = CompactDateTime::from(30000u32);
 
         // Insert multiple triggers
-        active_triggers.insert(Trigger {
-            key: key1.clone(),
-            time: time1,
-            span: tracing::Span::current(),
-        }).await;
+        active_triggers
+            .insert(Trigger {
+                key: key1.clone(),
+                time: time1,
+                span: tracing::Span::current(),
+            })
+            .await;
 
-        active_triggers.insert(Trigger {
-            key: key1.clone(),
-            time: time2,
-            span: tracing::Span::current(),
-        }).await;
+        active_triggers
+            .insert(Trigger {
+                key: key1.clone(),
+                time: time2,
+                span: tracing::Span::current(),
+            })
+            .await;
 
-        active_triggers.insert(Trigger {
-            key: key2.clone(),
-            time: time3,
-            span: tracing::Span::current(),
-        }).await;
+        active_triggers
+            .insert(Trigger {
+                key: key2.clone(),
+                time: time3,
+                span: tracing::Span::current(),
+            })
+            .await;
 
         // Collect all active times using scan_active_times
         let mut collected_times = Vec::new();
-        active_triggers.scan_active_times(|time| {
-            collected_times.push(time);
-        }).await;
+        active_triggers
+            .scan_active_times(|time| {
+                collected_times.push(time);
+            })
+            .await;
 
         // Sort for consistent comparison
         collected_times.sort();
@@ -261,9 +269,11 @@ mod tests {
         let active_triggers = ActiveTriggers::default();
 
         let mut call_count = 0_i32;
-        active_triggers.scan_active_times(|_| {
-            call_count += 1_i32;
-        }).await;
+        active_triggers
+            .scan_active_times(|_| {
+                call_count += 1_i32;
+            })
+            .await;
 
         // Should not call the function for empty state
         assert_eq!(call_count, 0_i32);

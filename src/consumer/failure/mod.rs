@@ -114,8 +114,10 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     ///
     /// # Arguments
     ///
-    /// * `context` - The event processing context with access to timer management
-    /// * `trigger` - The timer trigger containing key, time, and span information
+    /// * `context` - The event processing context with access to timer
+    ///   management
+    /// * `trigger` - The timer trigger containing key, time, and span
+    ///   information
     ///
     /// # Returns
     ///

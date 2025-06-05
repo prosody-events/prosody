@@ -1,9 +1,9 @@
 //! Persistent storage abstraction for timer data.
 //!
-//! This module provides the [`TriggerStore`] trait and related types for persisting
-//! timer data across application restarts. The storage system is designed to handle
-//! large volumes of timer events efficiently while providing strong consistency
-//! guarantees.
+//! This module provides the [`TriggerStore`] trait and related types for
+//! persisting timer data across application restarts. The storage system is
+//! designed to handle large volumes of timer events efficiently while providing
+//! strong consistency guarantees.
 //!
 //! ## Architecture Overview
 //!
@@ -20,16 +20,20 @@
 //! ## Key Concepts
 //!
 //! - **Segments**: Top-level partitions that isolate timers by consumer group
-//! - **Slabs**: Time-based partitions within segments for efficient range operations
+//! - **Slabs**: Time-based partitions within segments for efficient range
+//!   operations
 //! - **Triggers**: Individual timer events with key, time, and metadata
-//! - **Dual Indexing**: Both slab-based (time-oriented) and key-based (entity-oriented) indices
+//! - **Dual Indexing**: Both slab-based (time-oriented) and key-based
+//!   (entity-oriented) indices
 //!
 //! ## Storage Implementations
 //!
 //! The crate provides several storage implementations:
 //!
-//! - [`memory::InMemoryTriggerStore`]: In-memory storage for testing and development
-//! - Future implementations may include persistent stores like `ScyllaDB`, `PostgreSQL`, etc.
+//! - [`memory::InMemoryTriggerStore`]: In-memory storage for testing and
+//!   development
+//! - Future implementations may include persistent stores like `ScyllaDB`,
+//!   `PostgreSQL`, etc.
 //!
 //! ## Usage Patterns
 //!
@@ -64,29 +68,27 @@
 //!
 //! ### Querying by Time Range
 //! ```rust,no_run
-//! use prosody::timers::store::TriggerStore;
 //! use futures::StreamExt;
+//! use prosody::timers::store::TriggerStore;
 //! # async fn example<T: TriggerStore>(store: &T) {
 //! # use prosody::timers::store::SegmentId;
 //! # use uuid::Uuid;
 //! # let segment_id = SegmentId::new_v4();
-//! let slab_ids: Vec<_> = store.get_slab_range(&segment_id, 0..100)
-//!     .collect().await;
+//! let slab_ids: Vec<_> = store.get_slab_range(&segment_id, 0..100).collect().await;
 //! # }
 //! ```
 //!
 //! ### Querying by Key
 //! ```rust,no_run
-//! use prosody::timers::store::TriggerStore;
 //! use futures::StreamExt;
+//! use prosody::timers::store::TriggerStore;
 //! # async fn example<T: TriggerStore>(store: &T) {
 //! # use prosody::timers::store::SegmentId;
 //! # use prosody::Key;
 //! # use uuid::Uuid;
 //! # let segment_id = SegmentId::new_v4();
 //! # let key: Key = "test".into();
-//! let times: Vec<_> = store.get_key_triggers(&segment_id, &key)
-//!     .collect().await;
+//! let times: Vec<_> = store.get_key_triggers(&segment_id, &key).collect().await;
 //! # }
 //! ```
 
@@ -111,9 +113,9 @@ pub mod tests;
 
 /// Unique identifier for timer segments.
 ///
-/// Each segment represents a logical partition of timers, typically corresponding
-/// to a consumer group or application instance. Using [`Uuid`] ensures global
-/// uniqueness across distributed deployments.
+/// Each segment represents a logical partition of timers, typically
+/// corresponding to a consumer group or application instance. Using [`Uuid`]
+/// ensures global uniqueness across distributed deployments.
 pub type SegmentId = Uuid;
 
 /// Represents a logical partition of timers with time-based organization.
@@ -158,7 +160,8 @@ pub struct Segment {
 ///
 /// ## Design Principles
 ///
-/// - **Dual Indexing**: Support both time-oriented (slab) and entity-oriented (key) access
+/// - **Dual Indexing**: Support both time-oriented (slab) and entity-oriented
+///   (key) access
 /// - **Consistency**: Maintain consistency between multiple indices
 /// - **Efficiency**: Optimize for high-volume timer operations
 /// - **Durability**: Survive application restarts and failures
@@ -184,7 +187,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     // Segment management operations
-    
+
     /// Creates a new segment in the store.
     ///
     /// # Arguments
@@ -222,7 +225,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns an error if the storage system is unavailable or the operation fails.
+    /// Returns an error if the storage system is unavailable or the operation
+    /// fails.
     fn get_segment(
         &self,
         segment_id: &SegmentId,
@@ -254,7 +258,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // Slab management operations
-    
+
     /// Returns all slab identifiers for a segment.
     ///
     /// This provides a way to discover which time ranges have active timers
@@ -287,7 +291,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `segment_id` - The segment to query for slabs
-    /// * `range` - The range of slab IDs to include (supports any [`RangeBounds`])
+    /// * `range` - The range of slab IDs to include (supports any
+    ///   [`RangeBounds`])
     ///
     /// # Returns
     ///
@@ -305,7 +310,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// # use prosody::timers::store::TriggerStore;
     /// # async fn example<T: TriggerStore>(store: &T, segment_id: &prosody::timers::store::SegmentId) {
     /// use futures::StreamExt;
-    /// 
+    ///
     /// // Get slabs 10 through 20
     /// let slabs: Vec<_> = store.get_slab_range(segment_id, 10..=20)
     ///     .collect().await;
@@ -347,8 +352,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Unregisters a slab identifier from a segment.
     ///
     /// This operation removes the slab from the segment's slab index but does
-    /// NOT automatically delete the slab's trigger data. Use [`clear_slab_triggers`]
-    /// to remove the actual timer data.
+    /// NOT automatically delete the slab's trigger data. Use
+    /// [`clear_slab_triggers`] to remove the actual timer data.
     ///
     /// # Arguments
     ///
@@ -369,7 +374,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // Slab trigger operations (time-based index)
-    
+
     /// Returns all triggers within a specific slab.
     ///
     /// This provides time-range-based access to timers, enabling efficient
@@ -463,7 +468,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // Key trigger operations (entity-based index)
-    
+
     /// Returns all scheduled times for a specific key within a segment.
     ///
     /// This provides entity-oriented access to timers, enabling efficient
@@ -563,12 +568,13 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // High-level composite operations
-    
+
     /// Adds a trigger to all relevant indices atomically.
     ///
-    /// This is the primary method for adding new timers to the store. It ensures
-    /// that the trigger is properly indexed in both the time-based (slab) and
-    /// entity-based (key) indices, maintaining consistency across the storage system.
+    /// This is the primary method for adding new timers to the store. It
+    /// ensures that the trigger is properly indexed in both the time-based
+    /// (slab) and entity-based (key) indices, maintaining consistency
+    /// across the storage system.
     ///
     /// # Arguments
     ///
@@ -605,7 +611,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Removes a trigger from all relevant indices atomically.
     ///
     /// This operation removes the specified trigger from both the time-based
-    /// and entity-based indices, maintaining consistency across the storage system.
+    /// and entity-based indices, maintaining consistency across the storage
+    /// system.
     ///
     /// # Arguments
     ///
@@ -640,16 +647,18 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
 
     /// Removes all triggers for a specific key from all indices.
     ///
-    /// This operation efficiently removes all timers associated with a particular
-    /// entity by first querying the key index, then removing from both the slab
-    /// and key indices. This is useful for cleanup operations when an entity
-    /// is deleted or when canceling all timers for an entity.
+    /// This operation efficiently removes all timers associated with a
+    /// particular entity by first querying the key index, then removing
+    /// from both the slab and key indices. This is useful for cleanup
+    /// operations when an entity is deleted or when canceling all timers
+    /// for an entity.
     ///
     /// # Arguments
     ///
     /// * `segment_id` - The segment containing the triggers
     /// * `key` - The key to clear all triggers for
-    /// * `slab_size` - The slab size configuration for calculating slab locations
+    /// * `slab_size` - The slab size configuration for calculating slab
+    ///   locations
     ///
     /// # Returns
     ///
@@ -658,7 +667,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an error if any of the removal operations fail. The operation
-    /// may partially complete if some triggers are removed before an error occurs.
+    /// may partially complete if some triggers are removed before an error
+    /// occurs.
     fn clear_triggers_for_key(
         &self,
         segment_id: &SegmentId,

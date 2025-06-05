@@ -1,25 +1,31 @@
 //! Time-based partitioning for efficient timer storage and retrieval.
 //!
-//! This module provides the [`Slab`] type, which represents time-based partitions
-//! of timer data. Slabs enable efficient range queries and storage organization
-//! by grouping timers into fixed time windows.
+//! This module provides the [`Slab`] type, which represents time-based
+//! partitions of timer data. Slabs enable efficient range queries and storage
+//! organization by grouping timers into fixed time windows.
 //!
 //! ## Purpose
 //!
 //! Slabs serve several key purposes in the timer system:
 //!
 //! - **Time Partitioning**: Group timers into manageable time ranges
-//! - **Efficient Queries**: Enable fast lookups for timers in specific time windows
-//! - **Storage Organization**: Provide a hierarchical structure for persistent storage
-//! - **Memory Management**: Allow loading and unloading of timer data based on time relevance
+//! - **Efficient Queries**: Enable fast lookups for timers in specific time
+//!   windows
+//! - **Storage Organization**: Provide a hierarchical structure for persistent
+//!   storage
+//! - **Memory Management**: Allow loading and unloading of timer data based on
+//!   time relevance
 //!
 //! ## Slab Sizing
 //!
-//! The size of each slab determines the trade-offs between query efficiency and storage overhead:
+//! The size of each slab determines the trade-offs between query efficiency and
+//! storage overhead:
 //!
 //! - **Smaller slabs**: More precise time ranges, higher metadata overhead
-//! - **Larger slabs**: Broader time ranges, lower metadata overhead, less precise queries
-//! - **Typical sizes**: 5-60 minutes depending on timer density and access patterns
+//! - **Larger slabs**: Broader time ranges, lower metadata overhead, less
+//!   precise queries
+//! - **Typical sizes**: 5-60 minutes depending on timer density and access
+//!   patterns
 //!
 //! ## Slab Calculation
 //!
@@ -28,7 +34,8 @@
 //! slab_id = floor(time_seconds / slab_size_seconds)
 //! ```
 //!
-//! This ensures that all times within a slab's duration map to the same slab ID.
+//! This ensures that all times within a slab's duration map to the same slab
+//! ID.
 
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -38,16 +45,17 @@ use std::ops::Range;
 
 /// Unique identifier for a time-based slab within a segment.
 ///
-/// Slab IDs are calculated based on time and slab size, providing a deterministic
-/// mapping from any point in time to its containing slab. This enables efficient
-/// time-range queries and storage organization.
+/// Slab IDs are calculated based on time and slab size, providing a
+/// deterministic mapping from any point in time to its containing slab. This
+/// enables efficient time-range queries and storage organization.
 pub type SlabId = u32;
 
 /// A time-based partition of timer data within a segment.
 ///
 /// A [`Slab`] represents a contiguous time range within a segment, providing
 /// efficient organization and querying of timer data. All timers with execution
-/// times within the slab's time range are grouped together for storage and retrieval.
+/// times within the slab's time range are grouped together for storage and
+/// retrieval.
 ///
 /// ## Structure
 ///
@@ -72,10 +80,10 @@ pub type SlabId = u32;
 pub struct Slab {
     /// The segment this slab belongs to.
     segment_id: SegmentId,
-    
+
     /// Numeric identifier for this slab within the segment.
     id: SlabId,
-    
+
     /// Duration of the time range this slab covers.
     size: CompactDuration,
 }
@@ -170,8 +178,9 @@ impl Slab {
 
     /// Returns the time range covered by this slab.
     ///
-    /// The range spans from the slab's start time (inclusive) to its end time (exclusive),
-    /// covering exactly the duration specified by the slab size.
+    /// The range spans from the slab's start time (inclusive) to its end time
+    /// (exclusive), covering exactly the duration specified by the slab
+    /// size.
     ///
     /// # Returns
     ///
@@ -206,7 +215,8 @@ impl Slab {
         Some(slab)
     }
 
-    /// Creates a new slab by subtracting the specified number from this slab's ID.
+    /// Creates a new slab by subtracting the specified number from this slab's
+    /// ID.
     ///
     /// This operation preserves the segment ID and size while moving
     /// the slab ID backward by the specified amount.
@@ -268,8 +278,8 @@ impl Debug for Slab {
 impl Display for Slab {
     /// Formats the slab for display purposes.
     ///
-    /// The display output shows the segment ID, slab ID, and time range in the format:
-    /// `segment_id/slab_id[start_time—end_time]`
+    /// The display output shows the segment ID, slab ID, and time range in the
+    /// format: `segment_id/slab_id[start_time—end_time]`
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let range = self.range();
         write!(
