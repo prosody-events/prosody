@@ -32,19 +32,34 @@
 //!
 //! ```
 //! use prosody::consumer::message::{EventContext, UncommittedMessage};
-//! use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+//! use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted};
+//! use prosody::timers::{UncommittedTimer, store::TriggerStore};
 //!
 //! // Implement your message handler
 //! #[derive(Clone)]
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
-//!     async fn on_message(&self, context: EventContext, message: UncommittedMessage) {
+//!     async fn on_message<T>(&self, context: EventContext<T>, message: UncommittedMessage)
+//!     where
+//!         T: TriggerStore,
+//!     {
 //!         // Process the message
 //!         println!("Processing message with key: {}", message.key());
 //!
 //!         // Commit the message when processing is complete
-//!         message.commit();
+//!         message.commit().await;
+//!     }
+//!
+//!     async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+//!     where
+//!         T: TriggerStore,
+//!     {
+//!         // Process the timer
+//!         println!("Processing timer");
+//!
+//!         // Commit the timer when processing is complete
+//!         timer.commit().await;
 //!     }
 //!
 //!     async fn shutdown(self) {
