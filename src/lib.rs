@@ -216,7 +216,7 @@ pub mod consumer;
 pub mod high_level;
 pub mod producer;
 pub mod propagator;
-mod timers;
+pub mod timers;
 pub mod tracing;
 mod util;
 

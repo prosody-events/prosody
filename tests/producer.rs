@@ -9,6 +9,8 @@ use prosody::admin::ProsodyAdminClient;
 use prosody::consumer::message::{EventContext, UncommittedMessage};
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::timers::UncommittedTimer;
+use prosody::timers::store::TriggerStore;
 use prosody::{Payload, Topic};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -27,12 +29,21 @@ struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message(&self, _ctx: EventContext, msg: UncommittedMessage) {
+    async fn on_message<T>(&self, _ctx: EventContext<T>, msg: UncommittedMessage)
+    where
+        T: TriggerStore,
+    {
         let (inner, uncommitted) = msg.into_inner();
         let key = inner.key().to_string();
         let payload = inner.payload().clone();
         let _ = self.tx.send((key, payload)).await;
         uncommitted.commit();
+    }
+
+    async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+    where
+        T: TriggerStore,
+    {
     }
 
     async fn shutdown(self) {}

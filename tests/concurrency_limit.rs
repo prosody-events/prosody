@@ -39,6 +39,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::consumer::Uncommitted;
+use prosody::timers::UncommittedTimer;
+use prosody::timers::store::TriggerStore;
 use prosody::{
     Topic,
     admin::ProsodyAdminClient,
@@ -76,7 +78,10 @@ struct ConcurrencyTestHandler {
 }
 
 impl EventHandler for ConcurrencyTestHandler {
-    async fn on_message(&self, _context: EventContext, message: UncommittedMessage) {
+    async fn on_message<T>(&self, _context: EventContext<T>, message: UncommittedMessage)
+    where
+        T: TriggerStore,
+    {
         // Increment the current processing count and update maximum observed
         // concurrency
         let current = self.current.fetch_add(1, Ordering::AcqRel) + 1;
@@ -99,6 +104,12 @@ impl EventHandler for ConcurrencyTestHandler {
         if self.processed.load(Ordering::Acquire) == self.total {
             self.notify.notify_waiters();
         }
+    }
+
+    async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+    where
+        T: TriggerStore,
+    {
     }
 
     async fn shutdown(self) {}

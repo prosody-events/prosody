@@ -22,6 +22,8 @@ use prosody::admin::ProsodyAdminClient;
 use prosody::consumer::message::{EventContext, UncommittedMessage};
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::timers::UncommittedTimer;
+use prosody::timers::store::TriggerStore;
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{Sender, channel};
@@ -375,7 +377,10 @@ pub struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message(&self, _context: EventContext, message: UncommittedMessage) {
+    async fn on_message<T>(&self, _context: EventContext<T>, message: UncommittedMessage)
+    where
+        T: TriggerStore,
+    {
         let (msg, uncommitted) = message.into_inner();
         let message = msg.into_value();
 
@@ -389,6 +394,12 @@ impl EventHandler for TestHandler {
         }
 
         uncommitted.commit(); // Commit message to mark as processed
+    }
+
+    async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+    where
+        T: TriggerStore,
+    {
     }
 
     async fn shutdown(self) {
@@ -406,7 +417,10 @@ pub struct SlowTestHandler {
 
 impl EventHandler for SlowTestHandler {
     #[instrument(skip(self, _context))]
-    async fn on_message(&self, _context: EventContext, message: UncommittedMessage) {
+    async fn on_message<T>(&self, _context: EventContext<T>, message: UncommittedMessage)
+    where
+        T: TriggerStore,
+    {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
         let payload: Value = msg.payload().clone();
@@ -418,6 +432,12 @@ impl EventHandler for SlowTestHandler {
             error!("failed to send message for key {}: {e:#}", key);
         }
         uncommitted.commit(); // Commit message to mark as processed
+    }
+
+    async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+    where
+        T: TriggerStore,
+    {
     }
 
     async fn shutdown(self) {
