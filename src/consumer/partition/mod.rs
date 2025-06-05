@@ -355,7 +355,7 @@ async fn handle_messages<T, S>(
     let segment_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
 
     let (timer_stream, timer_manager) = loop {
-        if !*shutdown_rx.borrow() {
+        if *shutdown_rx.borrow() {
             return;
         }
 
