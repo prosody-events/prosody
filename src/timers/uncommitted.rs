@@ -24,7 +24,7 @@
 //! ## Usage Pattern
 //!
 //! ```rust,no_run
-//! use prosody::consumer::Uncommitted;
+//! use prosody::consumer::{Uncommitted, Keyed};
 //! use prosody::timers::UncommittedTimer;
 //! use prosody::timers::store::TriggerStore;
 //!
@@ -357,6 +357,7 @@ where
     /// # Examples
     ///
     /// ```rust,no_run
+    /// # use prosody::consumer::Uncommitted;
     /// # use prosody::timers::UncommittedTimer;
     /// # use prosody::timers::store::memory::InMemoryTriggerStore;
     /// # async fn example(timer: UncommittedTimer<InMemoryTriggerStore>) {
@@ -454,6 +455,7 @@ where
     ///
     /// Always ensure timers are properly acknowledged:
     /// ```rust,no_run
+    /// # use prosody::consumer::Uncommitted;
     /// # use prosody::timers::UncommittedTimer;
     /// # use prosody::timers::store::memory::InMemoryTriggerStore;
     /// # async fn example(timer: UncommittedTimer<InMemoryTriggerStore>) {

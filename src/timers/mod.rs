@@ -27,8 +27,8 @@
 //! Timers are typically used through the consumer's event handler interface:
 //!
 //! ```rust,no_run
-//! use prosody::consumer::EventHandler;
-//! use prosody::consumer::message::EventContext;
+//! use prosody::consumer::{EventHandler, Keyed, Uncommitted};
+//! use prosody::consumer::message::{EventContext, UncommittedMessage};
 //! use prosody::timers::{Trigger, UncommittedTimer};
 //! use prosody::timers::store::TriggerStore;
 //!
@@ -46,7 +46,16 @@
 //!         timer.commit().await;
 //!     }
 //!     
-//!     // ... other handler methods
+//!     async fn on_message<T>(&self, _context: EventContext<T>, _message: UncommittedMessage)
+//!     where
+//!         T: TriggerStore,
+//!     {
+//!         // Handle message processing
+//!     }
+//!     
+//!     async fn shutdown(self) {
+//!         // Handle shutdown
+//!     }
 //! }
 //! ```
 //!

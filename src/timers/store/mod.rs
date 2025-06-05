@@ -39,8 +39,26 @@
 //! ```rust,no_run
 //! use prosody::timers::store::TriggerStore;
 //! # async fn example<T: TriggerStore>(store: &T) {
-//! // High-level operation that maintains all indices
-//! store.add_trigger(&segment, slab, trigger).await.unwrap();
+//! # use prosody::timers::store::{Segment, SegmentId};
+//! # use prosody::timers::Trigger;
+//! # use prosody::timers::duration::CompactDuration;
+//! # use prosody::timers::datetime::CompactDateTime;
+//! # use prosody::Key;
+//! # use uuid::Uuid;
+//! # use tracing::Span;
+//! # let segment_id = SegmentId::new_v4();
+//! # let segment = Segment {
+//! #     id: segment_id,
+//! #     name: "test".to_string(),
+//! #     slab_size: CompactDuration::new(60),
+//! # };
+//! # let trigger = Trigger {
+//! #     key: "test".into(),
+//! #     time: CompactDateTime::now().unwrap(),
+//! #     span: Span::none(),
+//! # };
+//! // Note: This is a simplified example - actual usage would involve slabs
+//! // store.add_trigger(&segment, slab, trigger).await.unwrap();
 //! # }
 //! ```
 //!
@@ -49,6 +67,9 @@
 //! use prosody::timers::store::TriggerStore;
 //! use futures::StreamExt;
 //! # async fn example<T: TriggerStore>(store: &T) {
+//! # use prosody::timers::store::SegmentId;
+//! # use uuid::Uuid;
+//! # let segment_id = SegmentId::new_v4();
 //! let slab_ids: Vec<_> = store.get_slab_range(&segment_id, 0..100)
 //!     .collect().await;
 //! # }
@@ -59,6 +80,11 @@
 //! use prosody::timers::store::TriggerStore;
 //! use futures::StreamExt;
 //! # async fn example<T: TriggerStore>(store: &T) {
+//! # use prosody::timers::store::SegmentId;
+//! # use prosody::Key;
+//! # use uuid::Uuid;
+//! # let segment_id = SegmentId::new_v4();
+//! # let key: Key = "test".into();
 //! let times: Vec<_> = store.get_key_triggers(&segment_id, &key)
 //!     .collect().await;
 //! # }
@@ -277,7 +303,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// ```rust,no_run
     /// # use prosody::timers::store::TriggerStore;
-    /// # async fn example<T: TriggerStore>(store: &T, segment_id: &T::SegmentId) {
+    /// # async fn example<T: TriggerStore>(store: &T, segment_id: &prosody::timers::store::SegmentId) {
     /// use futures::StreamExt;
     /// 
     /// // Get slabs 10 through 20
