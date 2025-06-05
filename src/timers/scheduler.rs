@@ -2,7 +2,7 @@ use crate::Key;
 use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
-use crate::timers::triggers::Triggers;
+use crate::timers::queue::Triggers;
 use futures::TryFutureExt;
 use std::fmt::Debug;
 use thiserror::Error;

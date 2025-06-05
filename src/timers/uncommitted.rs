@@ -3,7 +3,7 @@ use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
 use crate::timers::store::TriggerStore;
-use crate::timers::trigger::Trigger;
+use crate::timers::Trigger;
 use educe::Educe;
 use std::time::Duration;
 use tokio::time::sleep;

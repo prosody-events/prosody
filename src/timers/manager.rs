@@ -4,11 +4,11 @@ use crate::timers::duration::CompactDuration;
 
 pub use crate::timers::error::TimerManagerError;
 use crate::timers::loader::{get_or_create_segment, slab_loader, State};
-use crate::timers::range::RangeLock;
+use crate::timers::slab_lock::SlabLock;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use crate::timers::trigger::Trigger;
+use crate::timers::Trigger;
 use crate::timers::uncommitted::UncommittedTimer;
 use educe::Educe;
 use futures::stream::iter;
@@ -27,7 +27,7 @@ pub struct TimerManager<T>(#[educe(Debug(ignore))] Arc<TimerManagerInner<T>>);
 
 pub struct TimerManagerInner<T> {
     segment: Segment,
-    state: RangeLock<State<T>>,
+    state: SlabLock<State<T>>,
 }
 
 impl<T> TimerManager<T>
@@ -42,7 +42,7 @@ where
     ) -> Result<(impl Stream<Item = UncommittedTimer<T>>, Self), TimerManagerError<T::Error>> {
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
         let (trigger_rx, scheduler) = TriggerScheduler::new();
-        let state = RangeLock::new(State { store, scheduler });
+        let state = SlabLock::new(State::new(store, scheduler));
 
         spawn(slab_loader(segment.clone(), state.clone()));
 

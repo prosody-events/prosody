@@ -1,5 +1,5 @@
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
-use crate::timers::range::RangeLock;
+use crate::timers::slab_lock::SlabLock;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, TriggerStore};
@@ -19,9 +19,37 @@ const DELETE_CONCURRENCY: usize = 16;
 pub struct State<T> {
     pub store: T,
     pub scheduler: TriggerScheduler,
+    max_owned: Option<SlabId>,
 }
 
-pub async fn slab_loader<T>(segment: Segment, state: RangeLock<State<T>>)
+impl<T> State<T> {
+    pub fn new(store: T, scheduler: TriggerScheduler) -> Self {
+        Self {
+            store,
+            scheduler,
+            max_owned: None,
+        }
+    }
+
+    pub fn is_owned(&self, slab_id: SlabId) -> bool {
+        self.max_owned.filter(|max| slab_id <= *max).is_some()
+    }
+
+    pub fn extend_ownership(&mut self, new_max: SlabId) {
+        if self
+            .max_owned
+            .is_some_and(|current_max| current_max > new_max)
+        {
+            return;
+        }
+
+        self.max_owned = Some(new_max);
+    }
+}
+
+
+
+pub async fn slab_loader<T>(segment: Segment, state: SlabLock<State<T>>)
 where
     T: TriggerStore,
 {
@@ -132,7 +160,7 @@ fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Dura
 }
 
 async fn load_slabs<T>(
-    state: &RangeLock<State<T>>,
+    state: &SlabLock<State<T>>,
     segment: &Segment,
     slab_range: RangeInclusive<SlabId>,
 ) -> Result<Vec<SlabId>, TimerManagerError<T::Error>>
@@ -162,7 +190,7 @@ where
 }
 
 async fn remove_completed_slabs<T>(
-    state: &RangeLock<State<T>>,
+    state: &SlabLock<State<T>>,
     segment: &Segment,
     loaded_slab_ids: &mut HashSet<SlabId>,
 ) -> Result<(), T::Error>
