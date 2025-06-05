@@ -55,6 +55,14 @@ mod util;
 #[cfg(test)]
 mod test;
 
+/// Information about the Kafka partition being processed.
+struct PartitionInfo {
+    /// The Kafka topic name.
+    topic: Topic,
+    /// The partition number within the topic.
+    partition: Partition,
+}
+
 /// Configuration settings for a partition manager.
 ///
 /// Contains all the parameters needed to configure message processing
@@ -174,10 +182,10 @@ impl PartitionManager {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Spawn the background task for message handling
+        let partition_info = PartitionInfo { topic, partition };
         let handle = spawn(handle_messages(
             config,
-            topic,
-            partition,
+            partition_info,
             handler,
             offsets.clone(),
             message_rx,
@@ -324,8 +332,7 @@ impl PartitionManager {
 /// * `shutdown_rx` - Channel receiving shutdown signal
 async fn handle_messages<T, S>(
     config: PartitionConfiguration<S>,
-    topic: Topic,
-    partition: Partition,
+    partition_info: PartitionInfo,
     handler: T,
     offsets: OffsetTracker,
     message_rx: Receiver<ConsumerMessage>,
@@ -351,7 +358,7 @@ async fn handle_messages<T, S>(
         config.allowed_events.as_ref(),
     );
 
-    let name = format!("{}:{topic}/{partition}", config.group_id);
+    let name = format!("{}:{}/{}", config.group_id, partition_info.topic, partition_info.partition);
     let segment_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
 
     let (timer_stream, timer_manager) = loop {
@@ -410,7 +417,7 @@ async fn handle_messages<T, S>(
 
     // Create key manager to handle concurrent processing while maintaining key
     // order
-    KeyManager::new(process, config.max_enqueued_per_key)
+    KeyManager::<UncommittedEvent<S>, _, _>::new(process, config.max_enqueued_per_key)
         .process_messages(
             combined_stream,
             heartbeat,

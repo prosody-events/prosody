@@ -106,6 +106,38 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     where
         T: TriggerStore;
 
+    /// Handles timer events with potential for failure.
+    ///
+    /// This method is called when a scheduled timer fires and is delivered to
+    /// the handler for processing. Unlike [`on_message`], this method handles
+    /// timer events that contain a key, execution time, and tracing span.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The event processing context with access to timer management
+    /// * `trigger` - The timer trigger containing key, time, and span information
+    ///
+    /// # Returns
+    ///
+    /// A [`Future`] that resolves to:
+    /// - `Ok(())` if the timer was processed successfully
+    /// - `Err(Self::Error)` if processing failed
+    ///
+    /// # Error Handling
+    ///
+    /// Errors returned by this method are classified using [`ClassifyError`] to
+    /// determine the appropriate failure handling strategy:
+    /// - **Transient errors**: May be retried with backoff
+    /// - **Permanent errors**: Logged and timer may be discarded
+    /// - **Terminal errors**: Cause processing to stop entirely
+    ///
+    /// # Implementation Requirements
+    ///
+    /// Implementations should:
+    /// - Process the timer event according to business logic
+    /// - Return appropriate error types that implement [`ClassifyError`]
+    /// - Ensure processing is idempotent where possible
+    /// - Handle the timer's tracing span for observability
     fn on_timer<T>(
         &self,
         context: EventContext<T>,

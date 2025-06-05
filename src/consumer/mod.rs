@@ -190,8 +190,50 @@ pub trait Keyed {
     fn key(&self) -> &Self::Key;
 }
 
+/// Provides transaction-like semantics for event processing acknowledgment.
+///
+/// The [`Uncommitted`] trait enables reliable event processing by requiring
+/// explicit acknowledgment after processing. Events that implement this trait
+/// must be either committed (successfully processed) or aborted (failed processing)
+/// to ensure proper resource cleanup and delivery guarantees.
+///
+/// ## Transaction Semantics
+///
+/// The trait provides a simple two-phase commit protocol:
+/// 1. **Processing**: Application processes the delivered event
+/// 2. **Acknowledgment**: Application calls [`commit()`] or [`abort()`]
+///
+/// ## Reliability Guarantees
+///
+/// - **At-least-once delivery**: Events are delivered at least once until committed
+/// - **Resource cleanup**: Proper acknowledgment ensures resources are cleaned up
+/// - **Fault tolerance**: Uncommitted events survive application crashes
+/// - **Graceful shutdown**: Uncommitted events are handled during shutdown
 pub trait Uncommitted {
+    /// Acknowledges successful processing of the event.
+    ///
+    /// This method should be called when the event has been successfully
+    /// processed and should be permanently removed from the system. Committing
+    /// an event typically triggers cleanup operations and prevents redelivery.
+    ///
+    /// # Reliability
+    ///
+    /// Implementations should ensure that commit operations are idempotent
+    /// and will eventually succeed even in the face of transient failures.
     fn commit(self) -> impl Future<Output = ()>;
+
+    /// Acknowledges failed processing of the event.
+    ///
+    /// This method should be called when event processing fails and the event
+    /// should be handled according to the configured failure policy. Depending
+    /// on the implementation, aborted events may be retried, sent to dead letter
+    /// queues, or permanently discarded.
+    ///
+    /// # Failure Handling
+    ///
+    /// The specific behavior of abort depends on the event type and configuration:
+    /// - **Messages**: May be retried or sent to failure topics
+    /// - **Timers**: May be rescheduled or permanently canceled
     fn abort(self) -> impl Future<Output = ()>;
 }
 
@@ -243,6 +285,28 @@ pub trait EventHandler {
     where
         T: TriggerStore;
 
+    /// Handles timer events when they fire.
+    ///
+    /// This method is called when a scheduled timer reaches its execution time
+    /// and is delivered to the application for processing. The timer must be
+    /// explicitly committed or aborted after processing to ensure proper
+    /// resource cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The event processing context with access to timer management
+    /// * `timer` - The uncommitted timer event that fired
+    ///
+    /// # Processing Requirements
+    ///
+    /// Implementations must ensure that the timer is properly acknowledged:
+    /// - Call [`timer.commit()`] after successful processing
+    /// - Call [`timer.abort()`] if processing fails or should be retried
+    ///
+    /// # Returns
+    ///
+    /// A future that resolves when timer processing is complete. Note that
+    /// this future completing does not automatically commit the timer.
     fn on_timer<T>(
         &self,
         context: EventContext<T>,
@@ -470,6 +534,22 @@ pub struct ConsumerConfiguration {
                    * 60))?",
         setter(into)
     )]
+    /// Duration for timer slab partitioning.
+    ///
+    /// This setting controls how timers are partitioned into time-based slabs
+    /// for efficient storage and retrieval. Smaller slabs provide more precise
+    /// time ranges but increase metadata overhead, while larger slabs reduce
+    /// overhead but may be less efficient for sparse timer patterns.
+    ///
+    /// # Recommended Values
+    ///
+    /// - **High-frequency timers**: 5-15 minutes
+    /// - **Medium-frequency timers**: 15-60 minutes  
+    /// - **Low-frequency timers**: 1-4 hours
+    ///
+    /// # Default
+    ///
+    /// Defaults to 10 minutes if not specified or if parsing from environment fails.
     pub slab_size: Duration,
 }
 

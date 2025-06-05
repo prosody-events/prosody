@@ -1,25 +1,153 @@
+//! Compact duration representation for efficient timer calculations.
+//!
+//! This module provides [`CompactDuration`], a space-efficient representation of
+//! time durations using 32-bit seconds. This compact format is optimized for
+//! timer systems where storage efficiency and fast arithmetic operations are important.
+//!
+//! ## Design Rationale
+//!
+//! Standard duration types often use 64-bit representations or complex structures
+//! with nanosecond precision. For timer systems that only need second-level precision,
+//! this creates unnecessary overhead. [`CompactDuration`] addresses this by:
+//!
+//! - Using only 32 bits for storage (4 bytes vs 8+ bytes)
+//! - Providing fast arithmetic operations
+//! - Supporting durations up to ~136 years
+//! - Maintaining second-level precision sufficient for most timer use cases
+//!
+//! ## Range and Precision
+//!
+//! The 32-bit seconds representation provides:
+//!
+//! - **Range**: 0 seconds to 4,294,967,295 seconds (~136 years)
+//! - **Precision**: 1 second
+//! - **Rounding**: Sub-second values are rounded to the nearest second
+//!
+//! ## Usage Examples
+//!
+//! ```rust,no_run
+//! use prosody::timers::duration::CompactDuration;
+//! use std::time::Duration;
+//!
+//! // Create from seconds
+//! let duration = CompactDuration::new(3600); // 1 hour
+//!
+//! // Convert from/to std::time::Duration
+//! let std_duration = Duration::from_secs(7200);
+//! let compact = CompactDuration::try_from(std_duration).unwrap();
+//! let back_to_std: Duration = compact.into();
+//!
+//! // Duration arithmetic
+//! let total = duration.checked_add(compact).unwrap();
+//! ```
+
 use std::fmt::{Debug, Display, Formatter};
 use std::time::Duration;
 use thiserror::Error;
 
+/// A compact duration representation using 32-bit seconds.
+///
+/// [`CompactDuration`] provides an efficient way to represent time durations
+/// for timer systems where memory usage and fast operations are critical.
+/// It stores duration as seconds, providing sufficient precision for most
+/// timer-based applications while using minimal memory.
+///
+/// ## Storage Efficiency
+///
+/// - **Size**: 4 bytes (vs 8+ for standard duration types)
+/// - **Alignment**: Optimal for CPU cache usage
+/// - **Arithmetic**: Fast integer operations
+///
+/// ## Precision and Range
+///
+/// - **Precision**: 1 second (sub-second values are rounded)
+/// - **Range**: 0 seconds to 4,294,967,295 seconds (~136 years)
+/// - **Overflow**: Operations that would exceed the range return errors
+///
+/// ## Thread Safety
+///
+/// [`CompactDuration`] is [`Copy`] and all operations are thread-safe.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct CompactDuration {
     seconds: u32,
 }
 
 impl CompactDuration {
+    /// The maximum representable duration (~136 years).
     pub const MAX: Self = Self { seconds: u32::MAX };
+
+    /// The minimum representable duration (0 seconds).
     pub const MIN: Self = Self { seconds: u32::MIN };
 
+    /// Creates a new [`CompactDuration`] from the specified number of seconds.
+    ///
+    /// # Arguments
+    ///
+    /// * `seconds` - The number of seconds for this duration
+    ///
+    /// # Returns
+    ///
+    /// A new [`CompactDuration`] representing the specified time span.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use prosody::timers::duration::CompactDuration;
+    ///
+    /// let one_hour = CompactDuration::new(3600);
+    /// let one_day = CompactDuration::new(86400);
+    /// ```
+    #[must_use]
     pub fn new(seconds: u32) -> Self {
         Self { seconds }
     }
 
+    /// Returns the number of seconds in this duration.
+    ///
+    /// # Returns
+    ///
+    /// The duration in seconds as a [`u32`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use prosody::timers::duration::CompactDuration;
+    ///
+    /// let duration = CompactDuration::new(3600);
+    /// assert_eq!(duration.seconds(), 3600);
+    /// ```
+    #[must_use]
     pub fn seconds(self) -> u32 {
         self.seconds
     }
 
-    pub fn add(self, other: Self) -> Result<Self, CompactDurationError> {
+    /// Adds two durations together with overflow checking.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The [`CompactDuration`] to add to this one
+    ///
+    /// # Returns
+    ///
+    /// A [`Result`] containing the sum of the durations if successful,
+    /// or a [`CompactDurationError`] if the result would overflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactDurationError::OutOfRange`] if adding the durations
+    /// would result in a value greater than [`u32::MAX`] seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use prosody::timers::duration::CompactDuration;
+    ///
+    /// let one_hour = CompactDuration::new(3600);
+    /// let two_hours = CompactDuration::new(7200);
+    /// let three_hours = one_hour.checked_add(two_hours).unwrap();
+    /// assert_eq!(three_hours.seconds(), 10800);
+    /// ```
+    pub fn checked_add(self, other: Self) -> Result<Self, CompactDurationError> {
         Ok(Self {
             seconds: self
                 .seconds
@@ -72,8 +200,14 @@ impl Debug for CompactDuration {
     }
 }
 
+/// Errors that can occur when working with [`CompactDuration`].
 #[derive(Clone, Debug, Error)]
 pub enum CompactDurationError {
+    /// The duration value is outside the representable range.
+    ///
+    /// [`CompactDuration`] can only represent durations from 0 to 4,294,967,295 seconds
+    /// (approximately 136 years). This error occurs when attempting to create or
+    /// calculate a duration outside this range.
     #[error("Duration is out of range")]
     OutOfRange,
 }
@@ -95,7 +229,7 @@ mod tests {
         let duration2 = CompactDuration::new(2000);
 
         // Adding two durations within range
-        let result = duration1.add(duration2);
+        let result = duration1.checked_add(duration2);
         assert!(result.is_ok(), "Addition failed unexpectedly");
         assert_eq!(
             result.unwrap_or_else(|_| CompactDuration::new(0)).seconds(),
@@ -104,7 +238,7 @@ mod tests {
 
         // Adding durations that exceed the maximum range
         let max_duration = CompactDuration::MAX;
-        let result = max_duration.add(CompactDuration::new(1));
+        let result = max_duration.checked_add(CompactDuration::new(1));
         assert!(
             matches!(result, Err(CompactDurationError::OutOfRange)),
             "Expected OutOfRange error"

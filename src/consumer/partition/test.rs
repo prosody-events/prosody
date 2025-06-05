@@ -224,17 +224,11 @@ async fn test_partition_manager_is_stalled() {
             }
         }
 
-        fn on_timer<T>(
-            &self,
-            _context: EventContext<T>,
-            _timer: UncommittedTimer<T>,
-        ) -> impl Future<Output = ()> + Send
+        async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
         where
             T: TriggerStore,
         {
-            async move {
-                // todo: add timer test
-            }
+            // todo: add timer test
         }
 
         async fn shutdown(self) {}
@@ -486,17 +480,11 @@ impl EventHandler for TestHandler {
         }
     }
 
-    fn on_timer<T>(
-        &self,
-        _context: EventContext<T>,
-        _timer: UncommittedTimer<T>,
-    ) -> impl Future<Output = ()> + Send
+    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
     where
         T: TriggerStore,
     {
-        async move {
-            // todo: add timer test
-        }
+        // todo: add timer test
     }
 
     async fn shutdown(self) {}

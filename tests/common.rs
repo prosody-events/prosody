@@ -396,7 +396,7 @@ impl EventHandler for TestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
     where
         T: TriggerStore,
     {
@@ -434,7 +434,7 @@ impl EventHandler for SlowTestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
     where
         T: TriggerStore,
     {

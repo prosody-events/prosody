@@ -106,7 +106,7 @@ impl EventHandler for ConcurrencyTestHandler {
         }
     }
 
-    async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
     where
         T: TriggerStore,
     {

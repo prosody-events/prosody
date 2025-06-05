@@ -81,13 +81,44 @@ impl<T> EventContext<T> {
     }
 }
 
+/// A union type representing either a message or timer event that requires acknowledgment.
+///
+/// [`UncommittedEvent`] provides a unified interface for handling both message and timer
+/// events within the consumer processing pipeline. Both event types follow the same
+/// transaction-like semantics where they must be explicitly committed or aborted
+/// after processing.
+///
+/// ## Purpose
+///
+/// This enum enables:
+/// - **Unified Processing**: Handle both message and timer events with the same interface
+/// - **Key-based Ordering**: Maintain ordering guarantees across both event types
+/// - **Transaction Semantics**: Consistent commit/abort behavior for all event types
+/// - **Type Safety**: Compile-time guarantees about event handling
+///
+/// ## Usage Pattern
+///
+/// Typically used in scenarios where messages and timers need to be processed
+/// with the same ordering and reliability guarantees, such as in key-based
+/// processing pipelines.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
 pub enum UncommittedEvent<T>
 where
     T: TriggerStore,
 {
+    /// A message event that requires acknowledgment.
+    ///
+    /// Contains an [`UncommittedMessage`] that was received from a Kafka topic
+    /// and must be committed or aborted after processing to ensure proper
+    /// offset management and delivery guarantees.
     Message(UncommittedMessage),
+
+    /// A timer event that requires acknowledgment.
+    ///
+    /// Contains an [`UncommittedTimer`] that fired at its scheduled time
+    /// and must be committed or aborted after processing to ensure proper
+    /// timer lifecycle management and cleanup.
     Timer(UncommittedTimer<T>),
 }
 
