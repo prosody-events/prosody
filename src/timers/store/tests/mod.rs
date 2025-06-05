@@ -3,15 +3,25 @@
 //! This module contains property-based tests that verify the behavior
 //! of any implementation of the `TriggerStore` trait.
 
+/// Tests for cleanup operations of the trigger store.
 pub mod cleanup_operations;
+/// Common utilities and helpers for trigger store tests.
 pub mod common;
+/// Tests for key contention scenarios in the trigger store.
 pub mod contention;
+/// Tests for operations spanning multiple slabs.
 pub mod cross_slab;
+/// Tests for primitive trigger store operations.
 pub mod primitive_operations;
+/// Tests for segment management in the trigger store.
 pub mod segment;
+/// Tests for sequential interleavings of trigger operations.
 pub mod sequential_interleavings;
+/// Tests for slab-related functionality in the trigger store.
 pub mod slabs;
+/// Tests verifying trigger consistency across operations.
 pub mod trigger_consistency;
+/// Tests for basic trigger add/remove/clear operations.
 pub mod trigger_operations;
 
 use crate::Key;
@@ -24,6 +34,7 @@ use std::fmt::Debug;
 use tracing::Span;
 use uuid::Uuid;
 
+/// Alias for the result returned by trigger store tests.
 pub type TestStoreResult = Result<(), String>;
 
 // Implement Arbitrary trait for test types - these should only be available
@@ -63,15 +74,20 @@ impl Arbitrary for Segment {
     }
 }
 #[derive(Debug, Clone)]
+/// Represents an operation performed on a trigger.
 pub enum TriggerOperation {
+    /// Add operation for a trigger.
     Add,
+    /// Remove operation for a trigger.
     Remove,
+    /// Clear operation for a trigger.
     Clear,
 }
 
 /// Test input for segment operations
 #[derive(Debug, Clone)]
 pub struct SegmentTestInput {
+    /// Segments involved in the test.
     pub segments: Vec<Segment>,
 }
 
@@ -88,7 +104,12 @@ impl Arbitrary for SegmentTestInput {
 /// Test input for trigger operations
 #[derive(Debug, Clone)]
 pub struct TriggerTestInput {
+    /// The segment under test.
+    /// Segment on which the trigger sequence is applied.
+    /// The segment in which to apply the operation sequence.
+    /// The segment in which to apply the operation sequence.
     pub segment: Segment,
+    /// The trigger entries to use in tests.
     pub triggers: Vec<Trigger>,
 }
 
@@ -120,9 +141,13 @@ impl Arbitrary for TriggerTestInput {
 /// Represents a sequence of operations on the same trigger
 #[derive(Debug, Clone)]
 pub struct TriggerSequence {
+    /// Segment the triggers belong to
     pub segment: Segment,
+    /// Key identifying the trigger.
     pub key: Key,
+    /// Sequence of trigger times to test.
     pub times: Vec<CompactDateTime>,
+    /// Corresponding operations (add, remove, clear) for each time.
     pub operations: Vec<TriggerOperation>,
 }
 
