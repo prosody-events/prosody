@@ -3,8 +3,6 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-
-
 #[derive(Educe)]
 #[educe(Clone(bound()), Debug)]
 pub struct SlabLock<T> {
@@ -14,9 +12,7 @@ pub struct SlabLock<T> {
 
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct SlabLockTriggerGuard<'a, T>(
-    #[educe(Debug(ignore))] RwLockReadGuard<'a, T>,
-);
+pub struct SlabLockTriggerGuard<'a, T>(#[educe(Debug(ignore))] RwLockReadGuard<'a, T>);
 
 impl<T> Deref for SlabLockTriggerGuard<'_, T> {
     type Target = T;
@@ -26,13 +22,9 @@ impl<T> Deref for SlabLockTriggerGuard<'_, T> {
     }
 }
 
-
-
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct SlabLockSlabGuard<'a, T>(
-    #[educe(Debug(ignore))] RwLockWriteGuard<'a, T>,
-);
+pub struct SlabLockSlabGuard<'a, T>(#[educe(Debug(ignore))] RwLockWriteGuard<'a, T>);
 
 impl<T> Deref for SlabLockSlabGuard<'_, T> {
     type Target = T;
@@ -47,14 +39,6 @@ impl<T> DerefMut for SlabLockSlabGuard<'_, T> {
         &mut self.0
     }
 }
-
-impl<T> SlabLockSlabGuard<'_, T> {
-    pub fn value(&mut self) -> &mut T {
-        &mut self.0
-    }
-}
-
-
 
 impl<T> SlabLock<T> {
     pub fn new(value: T) -> Self {
@@ -71,4 +55,3 @@ impl<T> SlabLock<T> {
         SlabLockSlabGuard(self.inner.write().await)
     }
 }
-

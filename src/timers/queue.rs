@@ -5,13 +5,13 @@ use std::collections::hash_map::Entry;
 use std::{future::poll_fn, time::Duration};
 use tokio_util::time::{DelayQueue, delay_queue};
 
-pub struct Triggers {
+pub struct TriggerQueue {
     queue: DelayQueue<Trigger>,
     queue_keys: HashMap<Trigger, delay_queue::Key>,
     active: ActiveTriggers,
 }
 
-impl Triggers {
+impl TriggerQueue {
     pub fn new() -> Self {
         Self {
             queue: DelayQueue::default(),
@@ -66,7 +66,7 @@ mod tests {
     async fn test_insert_and_next() -> Result<(), TimerSchedulerError> {
         pause();
 
-        let mut triggers = Triggers::new();
+        let mut triggers = TriggerQueue::new();
 
         let key = Key::from("test-key");
         let time = CompactDateTime::now()
@@ -96,7 +96,7 @@ mod tests {
     async fn test_remove_trigger() -> Result<(), TimerSchedulerError> {
         tokio::time::pause();
 
-        let mut triggers = Triggers::new();
+        let mut triggers = TriggerQueue::new();
 
         let key = Key::from("test-key");
         let time = CompactDateTime::now()
@@ -131,7 +131,7 @@ mod tests {
     async fn test_multiple_triggers() -> Result<(), TimerSchedulerError> {
         pause();
 
-        let mut triggers = Triggers::new();
+        let mut triggers = TriggerQueue::new();
 
         let key_first = Key::from("key1");
         let time_first = CompactDateTime::now()
@@ -180,7 +180,7 @@ mod tests {
     async fn test_active_triggers() -> Result<(), TimerSchedulerError> {
         pause();
 
-        let mut triggers = Triggers::new();
+        let mut triggers = TriggerQueue::new();
 
         let key = Key::from("active-key");
         let time = CompactDateTime::now()

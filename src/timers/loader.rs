@@ -1,9 +1,9 @@
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
-use crate::timers::slab_lock::SlabLock;
+use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, TriggerStore};
-use crate::timers::error::TimerManagerError;
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
 use futures::{StreamExt, TryStreamExt};
@@ -47,8 +47,6 @@ impl<T> State<T> {
     }
 }
 
-
-
 pub async fn slab_loader<T>(segment: Segment, state: SlabLock<State<T>>)
 where
     T: TriggerStore,
@@ -71,7 +69,9 @@ where
             }
         };
 
-        let target_time = match now.add_duration(crate::timers::duration::CompactDuration::new(preload_seconds)) {
+        let target_time = match now.add_duration(crate::timers::duration::CompactDuration::new(
+            preload_seconds,
+        )) {
             Ok(time) => time,
             Err(error) => {
                 error!("Failed to calculate target time: {error:#}; retrying");

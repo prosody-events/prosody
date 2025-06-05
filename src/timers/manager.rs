@@ -2,13 +2,13 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 
+use crate::timers::Trigger;
 pub use crate::timers::error::TimerManagerError;
-use crate::timers::loader::{get_or_create_segment, slab_loader, State};
-use crate::timers::slab_lock::SlabLock;
+use crate::timers::loader::{State, get_or_create_segment, slab_loader};
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
+use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use crate::timers::Trigger;
 use crate::timers::uncommitted::UncommittedTimer;
 use educe::Educe;
 use futures::stream::iter;

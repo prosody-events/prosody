@@ -2,7 +2,7 @@ use crate::Key;
 use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
-use crate::timers::queue::Triggers;
+use crate::timers::queue::TriggerQueue;
 use futures::TryFutureExt;
 use std::fmt::Debug;
 use thiserror::Error;
@@ -35,7 +35,7 @@ impl TriggerScheduler {
     pub fn new() -> (mpsc::Receiver<Trigger>, Self) {
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
         let (triggers_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
-        let triggers = Triggers::new();
+        let triggers = TriggerQueue::new();
         let active_triggers = triggers.active_triggers().clone();
 
         spawn(process_commands(commands_rx, triggers_tx, triggers));
@@ -97,7 +97,7 @@ impl TriggerScheduler {
 async fn process_commands(
     mut commands: mpsc::Receiver<Command>,
     trigger_tx: mpsc::Sender<Trigger>,
-    mut triggers: Triggers,
+    mut triggers: TriggerQueue,
 ) {
     let mut trigger_to_send: Option<Trigger> = None;
 
@@ -141,7 +141,7 @@ async fn process_commands(
 }
 
 async fn process_command(
-    triggers: &mut Triggers,
+    triggers: &mut TriggerQueue,
     Command {
         result_tx,
         trigger,
