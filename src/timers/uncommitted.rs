@@ -391,7 +391,7 @@ where
             tracing::error!("failed to commit timer: {error:#}; retrying");
             sleep(RETRY_DURATION).await;
         }
-        
+
         self.completed = true;
     }
 
