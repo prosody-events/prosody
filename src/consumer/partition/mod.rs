@@ -406,7 +406,11 @@ async fn handle_messages<T, S>(
 
         // Process message with handler
         debug!(?event, "permit acquired; calling handler");
-        let context = EventContext::new(shutdown_rx.clone(), timer_manager.clone());
+        let context = EventContext::new(
+            event.key().clone(),
+            shutdown_rx.clone(),
+            timer_manager.clone(),
+        );
 
         match event {
             UncommittedEvent::Message(message) => handler.on_message(context, message).await,

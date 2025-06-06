@@ -153,7 +153,7 @@ pub struct Trigger {
 mod active;
 pub mod datetime;
 pub mod duration;
-mod error;
+pub mod error;
 mod loader;
 mod manager;
 mod queue;
@@ -166,3 +166,11 @@ mod uncommitted;
 // Re-export main public APIs
 pub use manager::TimerManager;
 pub use uncommitted::UncommittedTimer;
+
+const LOAD_CONCURRENCY: usize = 16;
+
+/// Maximum number of concurrent delete operations for timer cleanup.
+///
+/// This constant controls the parallelism level when performing bulk
+/// cleanup operations such as removing all timers for a specific key.
+pub const DELETE_CONCURRENCY: usize = 16;

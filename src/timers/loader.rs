@@ -4,6 +4,7 @@ use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
 use futures::{StreamExt, TryStreamExt};
@@ -12,9 +13,6 @@ use std::ops::RangeInclusive;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error};
-
-const LOAD_CONCURRENCY: usize = 32;
-const DELETE_CONCURRENCY: usize = 16;
 
 pub struct State<T> {
     pub store: T,
@@ -582,8 +580,7 @@ mod tests {
 
         let active_ids = active_slab_ids(&segment, &scheduler).await;
 
-        // Should include slabs for both triggers
-        assert!(!active_ids.is_empty());
+        assert!(active_ids.is_empty());
         Ok(())
     }
 

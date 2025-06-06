@@ -93,11 +93,10 @@
 //! ```
 
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::manager::DELETE_CONCURRENCY;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::{DELETE_CONCURRENCY, Trigger};
 use futures::{Stream, TryStreamExt};
 use std::error::Error;
 use std::ops::RangeBounds;

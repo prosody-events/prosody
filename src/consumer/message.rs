@@ -17,12 +17,14 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{Span, debug, error};
+use tracing::{Span, debug, error, info_span};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
-use crate::timers::{TimerManager, UncommittedTimer};
+use crate::timers::{TimerManager, Trigger, UncommittedTimer};
 use crate::{
     BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem, Topic,
 };
@@ -33,6 +35,8 @@ use crate::{
 #[derive(Educe)]
 #[educe(Debug, Clone(bound()))]
 pub struct EventContext<T> {
+    key: Key,
+
     #[educe(Debug(ignore))]
     shutdown_rx: watch::Receiver<bool>,
 
@@ -40,14 +44,22 @@ pub struct EventContext<T> {
     timers: TimerManager<T>,
 }
 
-impl<T> EventContext<T> {
+impl<T> EventContext<T>
+where
+    T: TriggerStore,
+{
     /// Creates a new message context.
     ///
     /// # Arguments
     ///
     /// * `shutdown_rx` - Receiver for shutdown signals
-    pub(crate) fn new(shutdown_rx: watch::Receiver<bool>, timers: TimerManager<T>) -> Self {
+    pub(crate) fn new(
+        key: Key,
+        shutdown_rx: watch::Receiver<bool>,
+        timers: TimerManager<T>,
+    ) -> Self {
         Self {
+            key,
             shutdown_rx,
             timers,
         }
@@ -68,6 +80,65 @@ impl<T> EventContext<T> {
                 error!("shutdown hook failed: {error:#}");
             }
         }
+    }
+
+    pub async fn schedule(&self, time: CompactDateTime) -> Result<(), TimerManagerError<T::Error>> {
+        self.timers
+            .schedule(Trigger {
+                key: self.key.clone(),
+                time,
+                span: info_span!("timer", key = %self.key, time = %time.to_string()),
+            })
+            .await
+    }
+
+    // pub async fn clear_and_schedule(
+    //     &self,
+    //     time: CompactDateTime,
+    // ) -> Result<(), TimerManagerError<T::Error>> {
+    //     let span = info_span!("timer", key = %self.key, time =
+    // %time.to_string());
+    //
+    //     iter(self.timers.scheduled(&self.key).await?)
+    //         .map(|trigger| {
+    //             let cloned_span = span.clone();
+    //
+    //             async move {
+    //                 cloned_span.follows_from(&trigger.span);
+    //                 self.timers.unschedule(&trigger.key, trigger.time).await
+    //             }
+    //         })
+    //         .buffer_unordered(DELETE_CONCURRENCY)
+    //         .try_collect::<()>()
+    //         .await?;
+    //
+    //     self.timers
+    //         .schedule(Trigger {
+    //             key: self.key.clone(),
+    //             time,
+    //             span,
+    //         })
+    //         .await
+    // }
+
+    pub async fn unschedule(
+        &self,
+        time: CompactDateTime,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        self.timers.unschedule(&self.key, time).await
+    }
+
+    pub async fn clear_scheduled(&self) -> Result<(), TimerManagerError<T::Error>> {
+        self.timers.unschedule_all(&self.key).await
+    }
+
+    pub async fn scheduled(&self) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
+        Ok(self
+            .timers
+            .scheduled(&self.key)
+            .await?
+            .into_iter()
+            .collect())
     }
 
     /// Checks if a shutdown signal has been received.
