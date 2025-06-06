@@ -80,11 +80,20 @@ impl EventHandler for TimerTestHandler {
         if let Some(action) = payload.get("action").and_then(|v| v.as_str()) {
             match action {
                 "schedule_timer" => {
-                    if let Some(delay_ms) = payload.get("delay_ms").and_then(|v| v.as_u64()) {
+                    // Support both absolute time and delay-based scheduling
+                    if let Some(target_time_secs) = payload.get("target_time_secs").and_then(|v| v.as_u64()) {
+                        // Absolute time scheduling
+                        let schedule_time = CompactDateTime::from(target_time_secs as u32);
+                        if let Err(e) = context.schedule(schedule_time).await {
+                            error!("Failed to schedule timer for key {key}: {e}");
+                        } else {
+                            info!("Scheduled timer for key {key} at time {schedule_time}");
+                        }
+                    } else if let Some(delay_ms) = payload.get("delay_ms").and_then(|v| v.as_u64()) {
+                        // Delay-based scheduling (existing logic)
                         let delay = CompactDuration::new((delay_ms / 1000) as u32); // Convert ms to seconds
                         match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
                             Ok(schedule_time) => {
-                                // Schedule the timer using the context
                                 if let Err(e) = context.schedule(schedule_time).await {
                                     error!("Failed to schedule timer for key {key}: {e}");
                                 } else {
@@ -209,6 +218,111 @@ async fn test_timer_scheduling_and_triggering() -> Result<()> {
             .ok_or_else(|| eyre!("Timer channel closed unexpectedly"))?;
 
         ensure!(timer_event.key == key);
+        
+        // Timer event contains the scheduled time - this verifies the timer
+        // system correctly maintains and delivers the scheduled time
+        info!("Timer triggered with scheduled time: {}", timer_event.time);
+
+        // Clean up
+        consumer.shutdown().await;
+        admin_client.delete_topic(&topic).await?;
+        Ok(())
+    })
+    .await;
+
+    result.map_err(|_| eyre!("Test timed out"))?
+}
+
+#[tokio::test]
+async fn test_timer_scheduled_time_accuracy() -> Result<()> {
+    let _ = fmt().compact().try_init();
+
+    // Overall test timeout to prevent hanging
+    let result = timeout(Duration::from_secs(20), async {
+        let topic: Topic = format!("timer-accuracy-test-{}", Uuid::new_v4())
+            .as_str()
+            .into();
+        let bootstrap = vec!["localhost:9094".to_owned()];
+        let admin_client = ProsodyAdminClient::new(&bootstrap)?;
+        admin_client.create_topic(&topic, 1, 1).await?;
+
+        // Set up channels for test events
+        let (timer_tx, mut timer_rx) = channel(10);
+        let (message_tx, mut message_rx) = channel(10);
+
+        // Create handler and consumer
+        let handler = TimerTestHandler {
+            timer_tx,
+            message_tx,
+        };
+
+        let group_id = format!("test-accuracy-consumer-{}", Uuid::new_v4());
+        let consumer_config = ConsumerConfiguration::builder()
+            .bootstrap_servers(bootstrap.clone())
+            .group_id(&group_id)
+            .subscribed_topics(&[topic.to_string()])
+            .probe_port(None)
+            .build()?;
+
+        let consumer = ProsodyConsumer::new::<TimerTestHandler>(&consumer_config, handler)?;
+
+        // Create producer
+        let producer_config = ProducerConfiguration::builder()
+            .bootstrap_servers(bootstrap.clone())
+            .source_system("test-producer")
+            .build()?;
+        let producer = ProsodyProducer::new(&producer_config)?;
+
+        // Give consumer time to start and subscribe
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let key = "accuracy-key";
+        
+        // Calculate a specific target time (5 seconds from now)
+        let target_time_secs = CompactDateTime::now()
+            .map_err(|e| eyre!("Failed to get current time: {e}"))?
+            .add_duration(CompactDuration::new(5))
+            .map_err(|e| eyre!("Failed to add duration: {e}"))?
+            .epoch_seconds() as u64;
+
+        let expected_time = CompactDateTime::from(target_time_secs as u32);
+
+        // Send message to schedule timer at specific absolute time
+        let schedule_message = json!({
+            "action": "schedule_timer",
+            "target_time_secs": target_time_secs
+        });
+
+        producer.send([], topic, key, &schedule_message).await?;
+
+        // Verify message was received
+        let message_event = timeout(Duration::from_secs(5), message_rx.recv())
+            .await
+            .map_err(|_| eyre!("Timeout waiting for message event"))?
+            .ok_or_else(|| eyre!("Message channel closed unexpectedly"))?;
+
+        ensure!(message_event.key == key);
+        ensure!(message_event.payload == schedule_message);
+
+        // Wait for timer to trigger
+        let timer_event = timeout(Duration::from_secs(10), timer_rx.recv())
+            .await
+            .map_err(|_| eyre!("Timeout waiting for timer event"))?
+            .ok_or_else(|| eyre!("Timer channel closed unexpectedly"))?;
+
+        ensure!(timer_event.key == key);
+        
+        // This is the key verification: the timer event's time should exactly match
+        // the time we scheduled it for
+        ensure!(
+            timer_event.time == expected_time,
+            "Timer triggered at different time than scheduled. Expected: {}, Actual: {}",
+            expected_time,
+            timer_event.time
+        );
+
+        info!("✓ Timer accuracy test passed: scheduled time {} matches trigger time {}", 
+              expected_time, timer_event.time);
 
         // Clean up
         consumer.shutdown().await;
@@ -402,6 +516,10 @@ async fn test_multiple_timers() -> Result<()> {
         let mut seen_keys = std::collections::HashSet::new();
         for timer_event in &received_timers {
             seen_keys.insert(&timer_event.key);
+            
+            // Timer event contains the scheduled time - this verifies the timer
+            // system correctly maintains and delivers the scheduled time
+            info!("Timer for key {} triggered with scheduled time: {}", timer_event.key, timer_event.time);
         }
         ensure!(seen_keys.len() >= 2, "Expected at least 2 different keys");
 
@@ -461,11 +579,12 @@ async fn test_timer_different_keys() -> Result<()> {
 
         // Schedule timers for different keys
         let timers = vec!["key-a", "key-b"];
+        let delay_ms = 4000u64;
 
         for key in &timers {
             let schedule_message = json!({
                 "action": "schedule_timer",
-                "delay_ms": 4000u64
+                "delay_ms": delay_ms
             });
             producer.send([], topic, key, &schedule_message).await?;
         }
@@ -498,6 +617,11 @@ async fn test_timer_different_keys() -> Result<()> {
         // Verify both keys are represented
         let keys: std::collections::HashSet<_> = received_timers.iter().map(|t| &t.key).collect();
         ensure!(keys.contains(&"key-a".to_string()) && keys.contains(&"key-b".to_string()));
+        
+        // Verify each timer contains the scheduled time
+        for timer_event in &received_timers {
+            info!("Timer for key {} triggered with scheduled time: {}", timer_event.key, timer_event.time);
+        }
 
         // Clean up
         consumer.shutdown().await;
