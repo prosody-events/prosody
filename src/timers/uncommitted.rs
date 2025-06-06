@@ -391,6 +391,8 @@ where
             tracing::error!("failed to commit timer: {error:#}; retrying");
             sleep(RETRY_DURATION).await;
         }
+        
+        self.completed = true;
     }
 
     /// Aborts the timer without removing it from persistent storage.
@@ -439,6 +441,7 @@ where
         }
 
         self.manager.abort(&self.key, self.time).await;
+        self.completed = true;
     }
 }
 
