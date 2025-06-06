@@ -45,6 +45,7 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use async_stream::try_stream;
+use futures::TryStreamExt;
 use futures::stream::Stream;
 use scc::HashMap;
 use std::collections::BTreeSet;
@@ -119,7 +120,7 @@ struct Inner {
     slab_triggers: HashMap<Slab, BTreeSet<Trigger>>,
 
     /// Key-based index: (segment ID, key) -> set of scheduled times
-    key_triggers: HashMap<(SegmentId, Key), BTreeSet<CompactDateTime>>,
+    key_triggers: HashMap<(SegmentId, Key), BTreeSet<Trigger>>,
 }
 
 impl InMemoryTriggerStore {
@@ -304,19 +305,28 @@ impl TriggerStore for InMemoryTriggerStore {
     }
 
     // Key triggers
+    fn get_key_times(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
+        self.get_key_triggers(segment_id, key)
+            .map_ok(|trigger| trigger.time)
+    }
+
     fn get_key_triggers(
         &self,
         segment_id: &SegmentId,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         try_stream! {
             let map_key = (*segment_id, key.clone());
             let Some(entry) = self.0.key_triggers.get_async(&map_key).await else {
                 return;
             };
 
-            for &time in entry.iter() {
-                yield time;
+            for trigger in entry.iter() {
+                yield trigger.clone();
             }
         }
     }
@@ -326,14 +336,14 @@ impl TriggerStore for InMemoryTriggerStore {
         segment_id: &SegmentId,
         trigger: Trigger,
     ) -> Result<(), Self::Error> {
-        let map_key = (*segment_id, trigger.key);
+        let map_key = (*segment_id, trigger.key.clone());
         self.0
             .key_triggers
             .entry_async(map_key)
             .await
             .or_default()
             .get_mut()
-            .insert(trigger.time);
+            .insert(trigger);
 
         Ok(())
     }
@@ -349,7 +359,13 @@ impl TriggerStore for InMemoryTriggerStore {
             return Ok(());
         };
 
-        entry.get_mut().remove(&time);
+        let trigger = Trigger {
+            key: key.clone(),
+            time,
+            span: Span::none(),
+        };
+
+        entry.get_mut().remove(&trigger);
         if entry.is_empty() {
             let _ = entry.remove();
         }

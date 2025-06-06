@@ -126,7 +126,7 @@ where
     S::Error: Debug,
 {
     store
-        .get_key_triggers(segment_id, key)
+        .get_key_times(segment_id, key)
         .collect::<Vec<_>>()
         .await
         .into_iter()

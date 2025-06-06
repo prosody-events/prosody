@@ -86,8 +86,6 @@
 //! - **Slab-based Partitioning**: Timers are organized into time-based slabs
 //!   for efficient access
 
-#![allow(dead_code)]
-
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use educe::Educe;

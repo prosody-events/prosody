@@ -13,6 +13,8 @@
 
 use chrono::{DateTime, Utc};
 use educe::Educe;
+use futures::stream::iter;
+use futures::{StreamExt, TryStreamExt};
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
-use crate::timers::{TimerManager, Trigger, UncommittedTimer};
+use crate::timers::{DELETE_CONCURRENCY, TimerManager, Trigger, UncommittedTimer};
 use crate::{
     BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem, Topic,
 };
@@ -92,34 +94,33 @@ where
             .await
     }
 
-    // pub async fn clear_and_schedule(
-    //     &self,
-    //     time: CompactDateTime,
-    // ) -> Result<(), TimerManagerError<T::Error>> {
-    //     let span = info_span!("timer", key = %self.key, time =
-    // %time.to_string());
-    //
-    //     iter(self.timers.scheduled(&self.key).await?)
-    //         .map(|trigger| {
-    //             let cloned_span = span.clone();
-    //
-    //             async move {
-    //                 cloned_span.follows_from(&trigger.span);
-    //                 self.timers.unschedule(&trigger.key, trigger.time).await
-    //             }
-    //         })
-    //         .buffer_unordered(DELETE_CONCURRENCY)
-    //         .try_collect::<()>()
-    //         .await?;
-    //
-    //     self.timers
-    //         .schedule(Trigger {
-    //             key: self.key.clone(),
-    //             time,
-    //             span,
-    //         })
-    //         .await
-    // }
+    pub async fn clear_and_schedule(
+        &self,
+        time: CompactDateTime,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let span = info_span!("timer", key = %self.key, time = %time.to_string());
+
+        iter(self.timers.scheduled_triggers(&self.key).await?)
+            .map(|trigger| {
+                let cloned_span = span.clone();
+
+                async move {
+                    cloned_span.follows_from(&trigger.span);
+                    self.timers.unschedule(&trigger.key, trigger.time).await
+                }
+            })
+            .buffer_unordered(DELETE_CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
+
+        self.timers
+            .schedule(Trigger {
+                key: self.key.clone(),
+                time,
+                span,
+            })
+            .await
+    }
 
     pub async fn unschedule(
         &self,
@@ -135,7 +136,7 @@ where
     pub async fn scheduled(&self) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
         Ok(self
             .timers
-            .scheduled(&self.key)
+            .scheduled_times(&self.key)
             .await?
             .into_iter()
             .collect())

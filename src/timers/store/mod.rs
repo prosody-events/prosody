@@ -88,7 +88,7 @@
 //! # use uuid::Uuid;
 //! # let segment_id = SegmentId::new_v4();
 //! # let key: Key = "test".into();
-//! let times: Vec<_> = store.get_key_triggers(&segment_id, &key).collect().await;
+//! let times: Vec<_> = store.get_key_times(&segment_id, &key).collect().await;
 //! # }
 //! ```
 
@@ -489,11 +489,17 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Stream items are [`Result`] types that may contain errors if:
     /// - The storage system becomes unavailable during iteration
     /// - Individual time records are corrupted
-    fn get_key_triggers(
+    fn get_key_times(
         &self,
         segment_id: &SegmentId,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
+
+    fn get_key_triggers(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     /// Adds a trigger to the key-based index.
     ///
@@ -677,7 +683,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         // pull the stream, then delete per time, then final clear
         let segment_id_copy = *segment_id;
         let key_clone = key.clone();
-        let stream = self.get_key_triggers(segment_id, key);
+        let stream = self.get_key_times(segment_id, key);
 
         async move {
             stream

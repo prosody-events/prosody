@@ -231,7 +231,7 @@ where
     /// # use prosody::timers::store::memory::InMemoryTriggerStore;
     /// # async fn example(manager: &TimerManager<InMemoryTriggerStore>) -> Result<(), Box<dyn std::error::Error>> {
     /// let key = Key::from("user-123");
-    /// let times = manager.scheduled(&key).await?;
+    /// let times = manager.scheduled_times(&key).await?;
     ///
     /// println!("User 123 has {} scheduled timers", times.len());
     /// for time in times {
@@ -240,10 +240,25 @@ where
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn scheduled(
+    pub async fn scheduled_times(
         &self,
         key: &Key,
     ) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
+        self.0
+            .state
+            .trigger_lock()
+            .await
+            .store
+            .get_key_times(&self.0.segment.id, key)
+            .map_err(TimerManagerError::Store)
+            .try_collect()
+            .await
+    }
+
+    pub async fn scheduled_triggers(
+        &self,
+        key: &Key,
+    ) -> Result<Vec<Trigger>, TimerManagerError<T::Error>> {
         self.0
             .state
             .trigger_lock()
@@ -436,7 +451,7 @@ where
     /// ```
     pub async fn unschedule_all(&self, key: &Key) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
-        let times = self.scheduled(key).await?;
+        let times = self.scheduled_times(key).await?;
 
         let futures = times
             .into_iter()
@@ -684,7 +699,7 @@ mod tests {
         assert!(result.is_ok(), "Scheduling should succeed");
 
         // Verify the timer is stored
-        let scheduled_times = manager.scheduled(&trigger.key).await.unwrap();
+        let scheduled_times = manager.scheduled_times(&trigger.key).await.unwrap();
         assert_eq!(scheduled_times.len(), 1);
         assert!(scheduled_times.contains(&trigger.time));
     }
@@ -707,7 +722,7 @@ mod tests {
             manager.schedule(trigger.clone()).await.unwrap();
         }
 
-        let scheduled_times = manager.scheduled(&key).await.unwrap();
+        let scheduled_times = manager.scheduled_times(&key).await.unwrap();
         assert_eq!(scheduled_times.len(), 3);
 
         for trigger in &triggers {
@@ -728,8 +743,8 @@ mod tests {
         manager.schedule(trigger2.clone()).await.unwrap();
 
         // Verify each key has its timer
-        let times1 = manager.scheduled(&trigger1.key).await.unwrap();
-        let times2 = manager.scheduled(&trigger2.key).await.unwrap();
+        let times1 = manager.scheduled_times(&trigger1.key).await.unwrap();
+        let times2 = manager.scheduled_times(&trigger2.key).await.unwrap();
 
         assert_eq!(times1.len(), 1);
         assert_eq!(times2.len(), 1);
@@ -744,7 +759,7 @@ mod tests {
         let (_stream, manager) = setup_timer_manager().await;
         let nonexistent_key = Key::from("nonexistent");
 
-        let scheduled_times = manager.scheduled(&nonexistent_key).await.unwrap();
+        let scheduled_times = manager.scheduled_times(&nonexistent_key).await.unwrap();
         assert!(scheduled_times.is_empty());
     }
 
@@ -761,7 +776,7 @@ mod tests {
         assert!(result.is_ok(), "Unscheduling should succeed");
 
         // Verify timer is removed
-        let scheduled_times = manager.scheduled(&trigger.key).await.unwrap();
+        let scheduled_times = manager.scheduled_times(&trigger.key).await.unwrap();
         assert!(scheduled_times.is_empty());
     }
 
@@ -800,7 +815,7 @@ mod tests {
         }
 
         // Verify all are scheduled
-        let scheduled_times = manager.scheduled(&key).await.unwrap();
+        let scheduled_times = manager.scheduled_times(&key).await.unwrap();
         assert_eq!(scheduled_times.len(), 3);
 
         // Unschedule all
@@ -808,7 +823,7 @@ mod tests {
         assert!(result.is_ok(), "Unschedule all should succeed");
 
         // Verify all are removed
-        let scheduled_times = manager.scheduled(&key).await.unwrap();
+        let scheduled_times = manager.scheduled_times(&key).await.unwrap();
         assert!(scheduled_times.is_empty());
     }
 
@@ -879,7 +894,7 @@ mod tests {
         assert!(result.is_ok(), "Complete should succeed");
 
         // Verify timer is removed from storage
-        let scheduled_times = manager.scheduled(&trigger.key).await.unwrap();
+        let scheduled_times = manager.scheduled_times(&trigger.key).await.unwrap();
         assert!(scheduled_times.is_empty());
     }
 
@@ -910,7 +925,7 @@ mod tests {
         manager.abort(&trigger.key, trigger.time).await;
 
         // Timer should still be in storage after abort
-        let scheduled_times = manager.scheduled(&trigger.key).await.unwrap();
+        let scheduled_times = manager.scheduled_times(&trigger.key).await.unwrap();
         assert_eq!(scheduled_times.len(), 1);
         assert!(scheduled_times.contains(&trigger.time));
     }
@@ -993,7 +1008,7 @@ mod tests {
         // Verify all timers were scheduled
         for i in 0..10 {
             let key = Key::from(format!("concurrent-{}", i));
-            let times = manager.scheduled(&key).await.unwrap();
+            let times = manager.scheduled_times(&key).await.unwrap();
             assert_eq!(times.len(), 1, "Timer {} should be scheduled", i);
         }
     }
@@ -1007,7 +1022,7 @@ mod tests {
 
         // 1. Schedule timer
         manager.schedule(trigger.clone()).await.unwrap();
-        let times = manager.scheduled(&trigger.key).await.unwrap();
+        let times = manager.scheduled_times(&trigger.key).await.unwrap();
         assert_eq!(times.len(), 1);
 
         // 2. Verify timer exists
@@ -1015,7 +1030,7 @@ mod tests {
 
         // 3. Complete timer
         manager.complete(&trigger.key, trigger.time).await.unwrap();
-        let times = manager.scheduled(&trigger.key).await.unwrap();
+        let times = manager.scheduled_times(&trigger.key).await.unwrap();
         assert!(times.is_empty());
     }
 
@@ -1054,7 +1069,7 @@ mod tests {
 
         // Verify each key has exactly one timer at the same time
         for trigger in &triggers {
-            let times = manager.scheduled(&trigger.key).await.unwrap();
+            let times = manager.scheduled_times(&trigger.key).await.unwrap();
             assert_eq!(times.len(), 1);
             assert!(times.contains(&base_time));
         }
@@ -1089,8 +1104,8 @@ mod tests {
         assert!(result.is_ok(), "Scheduling far in future should succeed");
 
         // Verify both timers are stored
-        let times_now = manager.scheduled(&trigger_now.key).await.unwrap();
-        let times_future = manager.scheduled(&trigger_future.key).await.unwrap();
+        let times_now = manager.scheduled_times(&trigger_now.key).await.unwrap();
+        let times_future = manager.scheduled_times(&trigger_future.key).await.unwrap();
 
         assert_eq!(times_now.len(), 1);
         assert_eq!(times_future.len(), 1);
