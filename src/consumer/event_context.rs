@@ -10,6 +10,7 @@
 use educe::Educe;
 use futures::stream::iter;
 use futures::{StreamExt, TryStreamExt};
+use std::error::Error;
 use std::future::Future;
 use tokio::sync::watch;
 use tracing::{error, info_span};
@@ -26,7 +27,7 @@ use crate::timers::{DELETE_CONCURRENCY, TimerManager, Trigger};
 /// for message handlers.
 pub trait EventContext: Clone + Send {
     /// The trigger store type used by this context.
-    type Store: TriggerStore;
+    type Error: Error;
 
     /// Returns a future that completes when a shutdown signal is received.
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send;
@@ -43,7 +44,7 @@ pub trait EventContext: Clone + Send {
     fn schedule(
         &self,
         time: CompactDateTime,
-    ) -> impl Future<Output = Result<(), TimerManagerError<<Self::Store as TriggerStore>::Error>>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Remove all existing timers for the key, then schedule a new one.
     ///
@@ -61,7 +62,7 @@ pub trait EventContext: Clone + Send {
     fn clear_and_schedule(
         &self,
         time: CompactDateTime,
-    ) -> impl Future<Output = Result<(), TimerManagerError<<Self::Store as TriggerStore>::Error>>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Unschedule a specific timer for the current key.
     ///
@@ -75,30 +76,21 @@ pub trait EventContext: Clone + Send {
     fn unschedule(
         &self,
         time: CompactDateTime,
-    ) -> impl Future<Output = Result<(), TimerManagerError<<Self::Store as TriggerStore>::Error>>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Unschedule all timers for the current key.
     ///
     /// # Errors
     ///
     /// Returns a `TimerManagerError` if any unschedule operation fails.
-    fn clear_scheduled(
-        &self,
-    ) -> impl Future<Output = Result<(), TimerManagerError<<Self::Store as TriggerStore>::Error>>> + Send;
+    fn clear_scheduled(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Retrieve all scheduled times for the current key.
     ///
     /// # Errors
     ///
     /// Returns a `TimerManagerError` if the retrieval from storage fails.
-    fn scheduled(
-        &self,
-    ) -> impl Future<
-        Output = Result<
-            Vec<CompactDateTime>,
-            TimerManagerError<<Self::Store as TriggerStore>::Error>,
-        >,
-    > + Send;
+    fn scheduled(&self) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send;
 
     /// Return `true` if a shutdown signal has been triggered.
     fn should_shutdown(&self) -> bool;
@@ -152,7 +144,7 @@ impl<T> EventContext for ConcreteEventContext<T>
 where
     T: TriggerStore,
 {
-    type Store = T;
+    type Error = TimerManagerError<T::Error>;
 
     /// Returns a future that completes when a shutdown signal is received.
     ///
@@ -178,7 +170,7 @@ where
     /// # Errors
     ///
     /// Returns a `TimerManagerError` if the scheduler or store operation fails.
-    async fn schedule(&self, time: CompactDateTime) -> Result<(), TimerManagerError<T::Error>> {
+    async fn schedule(&self, time: CompactDateTime) -> Result<(), Self::Error> {
         let span = info_span!("timer", key = %self.key, time = %time);
         self.timers
             .schedule(Trigger {
