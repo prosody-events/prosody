@@ -1,65 +1,14 @@
 //! Timer management and coordination for scheduled events.
 //!
-//! This module provides the [`TimerManager`], which serves as the primary
-//! interface for scheduling, managing, and delivering timer events. The manager
-//! coordinates between persistent storage, in-memory scheduling, and event
-//! delivery to ensure reliable timer processing across distributed systems.
+//! The `TimerManager` serves as the primary interface for scheduling, querying,
+//! and canceling timers within a specific segment. It coordinates between:
+//! - **Persistent Storage**: Durable `TriggerStore` for timer metadata.
+//! - **Background Slab Loader**: Preloads upcoming timer slabs.
+//! - **In-Memory Scheduler**: Precise, delay-queue based timer dispatch.
+//! - **Application**: Delivers timers as an async stream of `UncommittedTimer`.
 //!
-//! ## Architecture Overview
-//!
-//! The [`TimerManager`] implements a multi-layered architecture:
-//!
-//! ```text
-//! ┌─────────────────┐
-//! │   Application   │ ← Timer events delivered here
-//! └─────────────────┘
-//!          ↑
-//! ┌─────────────────┐
-//! │  TimerManager   │ ← Primary coordination layer
-//! └─────────────────┘
-//!          ↑
-//! ┌─────────────────┐
-//! │   Scheduler     │ ← In-memory event scheduling
-//! └─────────────────┘
-//!          ↑
-//! ┌─────────────────┐
-//! │  Slab Loader    │ ← Preload upcoming timers
-//! └─────────────────┘
-//!          ↑
-//! ┌─────────────────┐
-//! │ Trigger Store   │ ← Persistent storage
-//! └─────────────────┘
-//! ```
-//!
-//! ## Key Features
-//!
-//! - **Persistent Storage**: Timers survive application restarts
-//! - **Distributed Coordination**: Multiple instances can share timer
-//!   processing
-//! - **Preloading**: Upcoming timers are loaded before their execution time
-//! - **Efficient Scheduling**: In-memory queues for precise timing
-//! - **Key-based Operations**: Schedule and query timers by entity keys
-//!
-//! ## Usage Example
-//!
-//! ```rust,no_run
-//! use prosody::timers::TimerManager;
-//! use prosody::timers::duration::CompactDuration;
-//! use prosody::timers::store::memory::InMemoryTriggerStore;
-//! use uuid::Uuid;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let store = InMemoryTriggerStore::new();
-//! let segment_id = Uuid::new_v4();
-//! let slab_size = CompactDuration::new(300); // 5 minutes
-//!
-//! let (timer_stream, manager) =
-//!     TimerManager::new(segment_id, slab_size, "my-application", store).await?;
-//!
-//! // Manager is now ready for scheduling timers
-//! # Ok(())
-//! # }
-//! ```
+//! The manager ensures timers survive restarts, supports distributed ownership,
+//! and provides at-least-once delivery semantics for timer events.
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
@@ -84,50 +33,23 @@ use tracing::{Instrument, Span};
 
 /// Manages timer scheduling, storage, and delivery for a specific segment.
 ///
-/// [`TimerManager`] serves as the primary interface for timer operations within
-/// a specific segment (typically corresponding to a consumer group). It
-/// coordinates between persistent storage, in-memory scheduling, and event
-/// delivery to provide reliable timer functionality.
+/// A `TimerManager` partitions timers into time-based slabs, persists them
+/// in a `TriggerStore`, schedules them in memory, and delivers them as an
+/// async stream of `UncommittedTimer`. It supports concurrent operations
+/// and automatically cleans up resources when dropped.
 ///
-/// ## Responsibilities
+/// # Type Parameters
 ///
-/// - **Persistent Storage**: Ensures timers survive application restarts
-/// - **Scheduling**: Maintains in-memory queues for precise timer delivery
-/// - **Preloading**: Loads upcoming timers before their execution time
-/// - **Coordination**: Manages distributed timer processing across multiple
-///   instances
-/// - **Lifecycle**: Handles timer creation, scheduling, execution, and cleanup
-///
-/// ## Thread Safety
-///
-/// [`TimerManager`] is designed for concurrent access and can be safely shared
-/// across multiple threads. All operations are internally synchronized.
-///
-/// ## Resource Management
-///
-/// The manager automatically spawns background tasks for:
-/// - Loading upcoming timer slabs
-/// - Maintaining in-memory timer queues
-/// - Coordinating with the persistent store
-///
-/// These tasks are automatically cleaned up when the manager is dropped.
-///
-/// ## Generic Parameters
-///
-/// * `T` - The [`TriggerStore`] implementation used for persistent storage
+/// * `T`: The `TriggerStore` backend for persistent timer data.
 #[derive(Educe)]
 #[educe(Debug(bound = ""), Clone(bound()))]
 pub struct TimerManager<T>(#[educe(Debug(ignore))] Arc<TimerManagerInner<T>>);
 
-/// Internal state for the timer manager.
-///
-/// This structure contains the segment configuration and shared state
-/// needed for timer coordination between the storage layer and scheduler.
+/// Internal shared state for the `TimerManager`.
 pub struct TimerManagerInner<T> {
-    /// The segment configuration for this timer manager instance.
+    /// Segment configuration (ID, name, slab size).
     segment: Segment,
-
-    /// Shared state including the trigger store and scheduler.
+    /// Shared state for loader and scheduler (wrapped in a read–write lock).
     state: SlabLock<State<T>>,
 }
 
@@ -137,109 +59,74 @@ where
 {
     /// Creates a new timer manager for the specified segment.
     ///
-    /// This operation initializes the timer management system for a specific
-    /// segment, including setting up the persistent storage connection,
-    /// in-memory scheduler, and background slab loading tasks.
+    /// This initializes:
+    /// 1. A persistent segment record (creating or retrieving it).
+    /// 2. An in-memory scheduler and its command processing task.
+    /// 3. A background slab loader task for preloading upcoming timers.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - Unique identifier for the timer segment
-    /// * `slab_size` - Time span for each slab (determines timer partitioning)
-    /// * `name` - Human-readable name for the segment (used for monitoring)
-    /// * `store` - The persistent storage implementation to use
+    /// * `segment_id` - Unique identifier for the timer segment.
+    /// * `slab_size` - Duration of each time-based slab.
+    /// * `name` - Human-readable name for the segment.
+    /// * `store` - Persistent `TriggerStore` implementation.
     ///
     /// # Returns
     ///
-    /// A tuple containing:
-    /// - A [`Stream`] of [`UncommittedTimer`] events ready for processing
-    /// - The [`TimerManager`] instance for scheduling new timers
+    /// On success, returns a tuple:
+    /// - A `Stream` of `UncommittedTimer<T>` delivering timer events.
+    /// - The `TimerManager<T>` instance for scheduling and management.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The segment cannot be created or retrieved from storage
-    /// - The scheduler initialization fails
-    /// - Background tasks cannot be spawned
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::timers::TimerManager;
-    /// use prosody::timers::duration::CompactDuration;
-    /// use prosody::timers::store::memory::InMemoryTriggerStore;
-    /// use uuid::Uuid;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let store = InMemoryTriggerStore::new();
-    /// let (timer_stream, manager) = TimerManager::new(
-    ///     Uuid::new_v4(),
-    ///     CompactDuration::new(300), // 5-minute slabs
-    ///     "order-processor",
-    ///     store,
-    /// )
-    /// .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns `TimerManagerError` if:
+    /// - The segment metadata cannot be created or retrieved.
+    /// - The scheduler fails to initialize.
+    /// - The slab loader task cannot be spawned.
     pub async fn new(
         segment_id: SegmentId,
         slab_size: CompactDuration,
         name: &str,
         store: T,
     ) -> Result<(impl Stream<Item = UncommittedTimer<T>>, Self), TimerManagerError<T::Error>> {
+        // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
+
+        // Initialize the in-memory scheduler.
         let (trigger_rx, scheduler) = TriggerScheduler::new();
+
+        // Share state between loader and API.
         let state = SlabLock::new(State::new(store, scheduler));
 
+        // Spawn the background task to preload and clean slab data.
         spawn(slab_loader(segment.clone(), state.clone()));
 
+        // Build the manager wrapper.
         let manager = Self(Arc::new(TimerManagerInner { segment, state }));
         let cloned_manager = manager.clone();
+
+        // Wrap the scheduler receiver into an UncommittedTimer stream.
         let stream = ReceiverStream::new(trigger_rx)
             .map(move |trigger| UncommittedTimer::new(trigger, cloned_manager.clone()));
 
         Ok((stream, manager))
     }
 
-    /// Retrieves all scheduled times for a specific key.
-    ///
-    /// This method queries the persistent storage to find all times when
-    /// timers are scheduled to execute for the specified key. This is useful
-    /// for displaying upcoming events or validating timer schedules.
+    /// Retrieves all scheduled execution times for a given key.
     ///
     /// # Arguments
     ///
-    /// * `key` - The key to query for scheduled times
+    /// * `key` - The entity key whose timers to list.
     ///
     /// # Returns
     ///
-    /// A [`Vec`] of [`CompactDateTime`] values representing all scheduled
-    /// execution times for the specified key, sorted in chronological order.
+    /// A `Vec<CompactDateTime>` of all scheduled times for `key`, sorted
+    /// in ascending order.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The storage system is unavailable
-    /// - The query operation fails
-    /// - Data corruption is detected
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::Key;
-    /// # use prosody::timers::TimerManager;
-    /// # use prosody::timers::store::memory::InMemoryTriggerStore;
-    /// # async fn example(manager: &TimerManager<InMemoryTriggerStore>) -> Result<(), Box<dyn std::error::Error>> {
-    /// let key = Key::from("user-123");
-    /// let times = manager.scheduled_times(&key).await?;
-    ///
-    /// println!("User 123 has {} scheduled timers", times.len());
-    /// for time in times {
-    ///     println!("Timer at: {}", time);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns `TimerManagerError::Store` if the underlying storage query
+    /// fails.
     pub async fn scheduled_times(
         &self,
         key: &Key,
@@ -255,6 +142,20 @@ where
             .await
     }
 
+    /// Retrieves all scheduled triggers for a given key.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The entity key whose full `Trigger` records to list.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<Trigger>` of all scheduled triggers for `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TimerManagerError::Store` if the underlying storage query
+    /// fails.
     pub async fn scheduled_triggers(
         &self,
         key: &Key,
@@ -270,66 +171,39 @@ where
             .await
     }
 
-    /// Schedules a new timer for execution.
+    /// Schedules a new timer for future execution.
     ///
-    /// This method adds a new timer to both the persistent storage and the
-    /// in-memory scheduler (if the timer's slab is currently owned by this
-    /// manager instance). The timer will be delivered as an
-    /// [`UncommittedTimer`] when its scheduled time arrives.
+    /// This inserts the timer into persistent storage and, if its slab is
+    /// currently owned, enqueues it in the in-memory scheduler.
     ///
     /// # Arguments
     ///
-    /// * `trigger` - The timer event to schedule, containing the key, time, and
-    ///   tracing span
+    /// * `trigger` - The `Trigger` to schedule (key, time, span).
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the timer was successfully scheduled, or a
-    /// [`TimerManagerError`] if the operation failed.
+    /// `Ok(())` on success.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The timer time is in the past
-    /// - The storage operation fails
-    /// - The scheduler is unavailable
-    /// - The trigger data is invalid
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::Key;
-    /// use prosody::timers::{Trigger, datetime::CompactDateTime, duration::CompactDuration};
-    /// use tracing::Span;
-    /// # use prosody::timers::TimerManager;
-    /// # use prosody::timers::store::memory::InMemoryTriggerStore;
-    /// # async fn example(manager: &TimerManager<InMemoryTriggerStore>) -> Result<(), Box<dyn std::error::Error>> {
-    ///
-    /// let future_time = CompactDateTime::now()?
-    ///     .add_duration(CompactDuration::new(3600))?; // 1 hour from now
-    ///
-    /// let trigger = Trigger {
-    ///     key: Key::from("order-456"),
-    ///     time: future_time,
-    ///     span: Span::current(),
-    /// };
-    ///
-    /// manager.schedule(trigger).await?;
-    /// println!("Timer scheduled successfully");
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns `TimerManagerError` if:
+    /// - The time is in the past.
+    /// - The storage insert fails.
+    /// - The scheduler enqueue fails.
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
+        // Determine the slab for this trigger time.
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, trigger.time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
+        // Persist the trigger in both slab and key indices.
         state
             .store
             .add_trigger(&self.0.segment, slab, trigger.clone())
             .await
             .map_err(TimerManagerError::Store)?;
 
+        // If we own the slab, enqueue in the in-memory scheduler.
         if state.is_owned(slab_id) {
             state.scheduler.schedule(trigger).await?;
         }
@@ -339,63 +213,45 @@ where
 
     /// Cancels a specific scheduled timer.
     ///
-    /// This method removes a timer from both the persistent storage and the
-    /// in-memory scheduler. If the timer has already been delivered but not
-    /// yet committed, this operation will not affect the delivered timer.
+    /// This removes the timer from persistent storage and, if owned, from
+    /// the in-memory scheduler. If already delivered, the delivery is not
+    /// reversed.
     ///
     /// # Arguments
     ///
-    /// * `key` - The key of the timer to cancel
-    /// * `time` - The scheduled execution time of the timer to cancel
+    /// * `key`  - The entity key of the timer.
+    /// * `time` - The scheduled execution time to cancel.
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the timer was successfully canceled (or did not exist),
-    /// or a [`TimerManagerError`] if the operation failed.
+    /// `Ok(())` on success.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The storage operation fails
-    /// - The scheduler is unavailable
-    /// - The timer data is corrupted
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::Key;
-    /// use prosody::timers::datetime::CompactDateTime;
-    /// # use prosody::timers::TimerManager;
-    /// # use prosody::timers::store::memory::InMemoryTriggerStore;
-    /// # async fn example(manager: &TimerManager<InMemoryTriggerStore>) -> Result<(), Box<dyn std::error::Error>> {
-    ///
-    /// let key = Key::from("session-789");
-    /// let time = CompactDateTime::from(1234567890_u32);
-    ///
-    /// manager.unschedule(&key, time).await?;
-    /// println!("Timer canceled successfully");
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns `TimerManagerError` if:
+    /// - The scheduler removal fails.
+    /// - The storage removal fails.
     pub async fn unschedule(
         &self,
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), TimerManagerError<T::Error>> {
+        // Identify the slab containing this time.
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
+        // Remove from in-memory scheduler if owned.
         if state.is_owned(slab_id) {
             let trigger = Trigger {
                 key: key.clone(),
                 time,
                 span: Span::current(),
             };
-
             state.scheduler.unschedule(trigger).await?;
         }
 
+        // Remove from persistent storage.
         state
             .store
             .remove_trigger(&self.0.segment, &slab, key, time)
@@ -403,56 +259,28 @@ where
             .map_err(TimerManagerError::Store)
     }
 
-    /// Cancels all scheduled timers for a specific key.
+    /// Cancels all timers for a specific key concurrently.
     ///
-    /// This method removes all timers associated with the specified key from
-    /// both persistent storage and in-memory scheduling. This is useful when
-    /// an entity is deleted or when all related timers should be canceled.
+    /// This operation queries all scheduled times for `key` and issues
+    /// `unschedule` for each in parallel, controlled by `DELETE_CONCURRENCY`.
     ///
     /// # Arguments
     ///
-    /// * `key` - The key for which to cancel all timers
+    /// * `key` - The entity key whose timers to cancel.
     ///
     /// # Returns
     ///
-    /// `Ok(())` if all timers were successfully canceled, or a
-    /// [`TimerManagerError`] if the operation failed. Partial failures may
-    /// occur where some timers are canceled before an error occurs.
+    /// `Ok(())` if all cancellations succeed or the key had no timers.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The storage query or delete operations fail
-    /// - The scheduler is unavailable
-    /// - Individual timer operations fail
-    ///
-    /// # Performance
-    ///
-    /// This operation may be expensive for keys with many scheduled timers,
-    /// as it requires querying all scheduled times and then removing each
-    /// timer individually. Consider the performance implications for keys
-    /// with hundreds or thousands of scheduled timers.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::Key;
-    /// # use prosody::timers::TimerManager;
-    /// # use prosody::timers::store::memory::InMemoryTriggerStore;
-    /// # async fn example(manager: &TimerManager<InMemoryTriggerStore>) -> Result<(), Box<dyn std::error::Error>> {
-    ///
-    /// let key = Key::from("user-account-123");
-    ///
-    /// // Cancel all timers when user deletes their account
-    /// manager.unschedule_all(&key).await?;
-    /// println!("All timers for user account canceled");
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns `TimerManagerError::Store` or scheduler errors if any cancel
+    /// operation fails.
     pub async fn unschedule_all(&self, key: &Key) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
         let times = self.scheduled_times(key).await?;
 
+        // Issue unschedule futures in parallel, reusing the current tracing span.
         let futures = times
             .into_iter()
             .map(|time| self.unschedule(key, time).instrument(span.clone()));
@@ -463,43 +291,19 @@ where
             .await
     }
 
-    /// Checks if a timer is currently active in the in-memory scheduler.
+    /// Checks if a timer is currently loaded in the in-memory scheduler.
     ///
-    /// This method queries the in-memory scheduler to determine if a specific
-    /// timer is currently loaded and active. A timer is considered active if
-    /// it has been loaded from storage and is awaiting execution or has been
-    /// delivered but not yet committed.
+    /// This does not query persistent storage; a `false` return means the
+    /// timer is either not scheduled yet or not owned/loaded.
     ///
     /// # Arguments
     ///
-    /// * `key` - The key of the timer to check
-    /// * `time` - The scheduled execution time of the timer to check
+    /// * `key` - The entity key of the timer.
+    /// * `time` - The scheduled execution time to check.
     ///
     /// # Returns
     ///
     /// `true` if the timer is active in the scheduler, `false` otherwise.
-    /// Note that `false` does not necessarily mean the timer doesn't exist;
-    /// it may be stored persistently but not currently loaded.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::Key;
-    /// use prosody::timers::datetime::CompactDateTime;
-    /// # use prosody::timers::TimerManager;
-    /// # use prosody::timers::store::memory::InMemoryTriggerStore;
-    /// # async fn example(manager: &TimerManager<InMemoryTriggerStore>) {
-    ///
-    /// let key = Key::from("task-456");
-    /// let time = CompactDateTime::from(1234567890_u32);
-    ///
-    /// if manager.is_active(&key, time).await {
-    ///     println!("Timer is currently active in scheduler");
-    /// } else {
-    ///     println!("Timer is not currently active (may be in storage)");
-    /// }
-    /// # }
-    /// ```
     pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
         self.0
             .state
@@ -510,65 +314,39 @@ where
             .await
     }
 
-    /// Marks a timer as completed and removes it from all storage.
+    /// Marks a timer as completed and removes it permanently.
     ///
-    /// This method is called when a timer has been successfully processed
-    /// and should be permanently removed. It removes the timer from both
-    /// the in-memory scheduler and persistent storage.
+    /// This deactivates the timer if owned, then deletes it from persistent
+    /// storage. Typically invoked by `UncommittedTimer::commit()`.
     ///
     /// # Arguments
     ///
-    /// * `key` - The key of the completed timer
-    /// * `time` - The execution time of the completed timer
+    /// * `key`  - The entity key of the completed timer.
+    /// * `time` - The execution time of the completed timer.
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the timer was successfully marked as complete, or a
-    /// [`TimerManagerError`] if the operation failed.
+    /// `Ok(())` on success.
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError`] if:
-    /// - The storage removal operation fails
-    /// - The timer was not found in storage
-    /// - The scheduler deactivation fails
-    ///
-    /// # Usage
-    ///
-    /// This method is typically called automatically when an
-    /// [`UncommittedTimer`] is committed. Direct usage is rare but may be
-    /// needed for cleanup operations.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::Key;
-    /// use prosody::timers::datetime::CompactDateTime;
-    /// # use prosody::timers::TimerManager;
-    /// # use prosody::timers::store::memory::InMemoryTriggerStore;
-    /// # async fn example(manager: &TimerManager<InMemoryTriggerStore>) -> Result<(), Box<dyn std::error::Error>> {
-    ///
-    /// let key = Key::from("completed-task");
-    /// let time = CompactDateTime::from(1234567890_u32);
-    ///
-    /// // Mark timer as completed (usually done automatically)
-    /// manager.complete(&key, time).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns `TimerManagerError::Store` if the storage removal fails.
     pub async fn complete(
         &self,
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), TimerManagerError<T::Error>> {
+        // Derive the slab and lock state.
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
+        // Deactivate in-memory if owned.
         if state.is_owned(slab_id) {
             state.scheduler.deactivate(key, time).await;
         }
 
+        // Remove from storage.
         state
             .store
             .remove_trigger(&self.0.segment, &slab, key, time)
@@ -578,40 +356,15 @@ where
         Ok(())
     }
 
-    /// Aborts a timer without removing it from persistent storage.
+    /// Aborts a timer delivery, deactivating it but preserving storage state.
     ///
-    /// This method deactivates a timer in the in-memory scheduler but leaves
-    /// it in persistent storage. This is typically used when a timer delivery
-    /// fails and should not be retried immediately, but may be reloaded later.
+    /// This does not delete the timer from persistent storage; it can be
+    /// reloaded and retried later by the slab loader.
     ///
     /// # Arguments
     ///
-    /// * `key` - The key of the timer to abort
-    /// * `time` - The execution time of the timer to abort
-    ///
-    /// # Usage
-    ///
-    /// This method is typically called automatically when an
-    /// [`UncommittedTimer`] is aborted due to processing failure or
-    /// shutdown conditions. It ensures the timer is not retried immediately
-    /// while preserving it for potential future execution.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::Key;
-    /// use prosody::timers::datetime::CompactDateTime;
-    /// # use prosody::timers::TimerManager;
-    /// # use prosody::timers::store::memory::InMemoryTriggerStore;
-    /// # async fn example(manager: &TimerManager<InMemoryTriggerStore>) {
-    ///
-    /// let key = Key::from("failed-task");
-    /// let time = CompactDateTime::from(1234567890_u32);
-    ///
-    /// // Abort timer due to processing failure
-    /// manager.abort(&key, time).await;
-    /// # }
-    /// ```
+    /// * `key`  - The entity key of the timer.
+    /// * `time` - The scheduled execution time to abort.
     pub async fn abort(&self, key: &Key, time: CompactDateTime) {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
@@ -633,15 +386,6 @@ mod tests {
     use tokio::time;
     use tracing::Span;
     use uuid::Uuid;
-
-    /// Helper function to create a test segment configuration
-    fn create_test_segment() -> Segment {
-        Segment {
-            id: Uuid::new_v4(),
-            name: "test-segment".to_string(),
-            slab_size: CompactDuration::new(300), // 5 minutes
-        }
-    }
 
     /// Helper function to create a test trigger
     fn create_test_trigger(key: &str, seconds_offset: u32) -> Result<Trigger> {
@@ -864,14 +608,12 @@ mod tests {
         manager.schedule(trigger.clone()).await?;
 
         // Allow some time for the scheduler to process
-        time::advance(Duration::from_millis(100)).await;
+        time::advance(Duration::from_secs(10)).await;
         tokio::task::yield_now().await;
 
-        // Check if timer is active - this may depend on slab ownership
+        // Check if timer is active
         let is_active = manager.is_active(&trigger.key, trigger.time).await;
-        // Note: is_active depends on whether this manager instance owns the slab
-        // We'll just verify the call succeeds without error
-        assert!(is_active || !is_active); // Tautology to verify call works
+        assert!(is_active);
         Ok(())
     }
 
@@ -1016,7 +758,7 @@ mod tests {
 
         // Wait for all operations to complete
         for handle in handles {
-            let result = handle
+            handle
                 .await
                 .map_err(|e| eyre!("Task join error: {}", e))??;
         }
@@ -1025,7 +767,7 @@ mod tests {
         for i in 0..10 {
             let key = Key::from(format!("concurrent-{}", i));
             let times = manager.scheduled_times(&key).await?;
-            assert_eq!(times.len(), 1, "Timer {} should be scheduled", i);
+            assert_eq!(times.len(), 1, "Timer {i} should be scheduled");
         }
         Ok(())
     }

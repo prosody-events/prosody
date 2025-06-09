@@ -1,3 +1,10 @@
+//! Background slab loader and state management for timer preloading.
+//!
+//! This module implements the background task that preloads upcoming timer
+//! slabs from the persistent `TriggerStore` into the in-memory scheduler.
+//! It also handles cleanup of completed slabs and dynamically adjusts its
+//! preload window based on current time.
+
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::TriggerScheduler;
@@ -14,13 +21,29 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error};
 
+/// Shared state for the slab loader task.
+///
+/// Tracks which slabs have been loaded and which slab IDs this loader
+/// instance currently owns (i.e., should schedule triggers for).
 pub struct State<T> {
+    /// Persistent trigger store.
     pub store: T,
+
+    /// In-memory trigger scheduler.
     pub scheduler: TriggerScheduler,
+
+    /// Highest slab ID this loader has taken ownership of.
     max_owned: Option<SlabId>,
 }
 
 impl<T> State<T> {
+    /// Creates a new loader state with no owned slabs.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` – The persistent `TriggerStore` implementation.
+    /// * `scheduler` – The in-memory `TriggerScheduler`.
+    #[must_use]
     pub fn new(store: T, scheduler: TriggerScheduler) -> Self {
         Self {
             store,
@@ -29,10 +52,26 @@ impl<T> State<T> {
         }
     }
 
+    /// Returns `true` if the given slab ID is owned by this loader.
+    ///
+    /// A slab is considered owned if its ID is less than or equal to
+    /// the highest owned slab ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `slab_id` – The slab identifier to check.
+    #[must_use]
     pub fn is_owned(&self, slab_id: SlabId) -> bool {
         self.max_owned.filter(|max| slab_id <= *max).is_some()
     }
 
+    /// Extends the range of owned slab IDs to include `new_max`.
+    ///
+    /// If `new_max` is less than the current maximum, this call is a no-op.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_max` – The new highest slab ID to own.
     pub fn extend_ownership(&mut self, new_max: SlabId) {
         if self
             .max_owned
@@ -45,6 +84,20 @@ impl<T> State<T> {
     }
 }
 
+/// Background task that continuously loads upcoming slabs and cleans up old
+/// ones.
+///
+/// This loop:
+/// 1. Determines a preload window based on half the slab size (minimum 30s).
+/// 2. Calculates the range of slabs to load (from last loaded to target slab).
+/// 3. Loads triggers from those slabs into the scheduler.
+/// 4. Extends ownership for loaded slabs.
+/// 5. Removes slabs whose triggers have all completed.
+/// 6. Waits until it's time to load the next slab.
+///
+/// # Type Parameters
+///
+/// * `T` – A `TriggerStore` implementation for persistent storage.
 pub async fn slab_loader<T>(segment: Segment, state: SlabLock<State<T>>)
 where
     T: TriggerStore,
@@ -52,12 +105,13 @@ where
     const MIN_PRELOAD_SECONDS: u32 = 30;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
+    // Determine preload window: half slab size or minimum
     let preload_seconds = max(segment.slab_size.seconds() / 2, MIN_PRELOAD_SECONDS);
     let mut loaded_slab_ids = HashSet::new();
     let mut highest_loaded_slab_id: Option<SlabId> = None;
 
     loop {
-        // Calculate target slab based on current time + preload window
+        // Compute the target time to preload (current time + preload window)
         let now = match CompactDateTime::now() {
             Ok(now) => now,
             Err(error) => {
@@ -78,16 +132,18 @@ where
             }
         };
 
+        // Map target time to its slab ID
         let target_slab = Slab::from_time(segment.id, segment.slab_size, target_time);
         let target_slab_id = target_slab.id();
 
-        // Determine range to load
+        // Determine the next slab ID to load
         let start_slab_id = highest_loaded_slab_id.map_or(0, |id| id + 1);
 
         if start_slab_id <= target_slab_id {
             let load_range = start_slab_id..=target_slab_id;
-
             debug!("Loading slabs {start_slab_id}..={target_slab_id}");
+
+            // Load the slabs in parallel and update ownership
             match load_slabs(&state, &segment, load_range).await {
                 Ok(loaded) => {
                     loaded_slab_ids.extend(loaded);
@@ -102,17 +158,18 @@ where
             }
         }
 
-        // Calculate when we need to load the next slab
+        // Determine the next slab chronologically
         let Some(next_slab) = target_slab.next() else {
             error!("Out of slab range - reached maximum slab ID");
             return;
         };
 
-        // clean up old slabs
+        // Remove any slabs whose triggers have completed
         if let Err(error) = remove_completed_slabs(&state, &segment, &mut loaded_slab_ids).await {
             error!("Failed to remove completed slabs: {error:#}");
         }
 
+        // Calculate wait time until next slab needs loading
         let wait_time = calculate_wait_time(next_slab.range().start, preload_seconds);
         if !wait_time.is_zero() {
             debug!("Waiting {wait_time:?} before next load cycle");
@@ -121,9 +178,19 @@ where
     }
 }
 
-/// Calculate how long to wait before loading a slab
+/// Computes how long to wait before loading a slab that begins at `load_time`.
+///
+/// Returns zero if the load time is within the preload window or in the past.
+///
+/// # Arguments
+///
+/// * `load_time` – The start time of the next slab.
+/// * `preload_seconds` – The configured preload window in seconds.
+///
+/// # Returns
+///
+/// A `Duration` to sleep before loading the slab.
 fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Duration {
-    // Get current time
     let now = match CompactDateTime::now() {
         Ok(now) => now,
         Err(error) => {
@@ -132,18 +199,18 @@ fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Dura
         }
     };
 
-    // Calculate time to wait
     match load_time.duration_since(now) {
         Ok(duration) => {
-            // If time is more than preload_seconds away, wait until we're closer
+            // If slab start is farther than preload window, wait accordingly
             if duration.as_secs() > u64::from(preload_seconds) {
                 Duration::from_secs(duration.as_secs() - u64::from(preload_seconds))
             } else {
-                // Already within preload window, load immediately
+                // Already within preload window
                 Duration::from_secs(0)
             }
         }
         Err(error) => {
+            // Past or out-of-range times trigger immediate load
             match error {
                 CompactDateTimeError::PastDateTime => {
                     debug!("Load time is in the past; loading immediately");
@@ -157,6 +224,24 @@ fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Dura
     }
 }
 
+/// Loads all slabs in `slab_range` and schedules their triggers.
+///
+/// Each slab ID is fetched from the store, its triggers are loaded into the
+/// in-memory scheduler, and the slab ID is returned if loading succeeds.
+///
+/// # Arguments
+///
+/// * `state` – Locked loader state (store + scheduler).
+/// * `segment` – The segment metadata.
+/// * `slab_range` – Inclusive range of slab IDs to load.
+///
+/// # Errors
+///
+/// Returns `TimerManagerError` if any store or scheduling operation fails.
+///
+/// # Returns
+///
+/// A `Vec<SlabId>` of successfully loaded slab identifiers.
 async fn load_slabs<T>(
     state: &SlabLock<State<T>>,
     segment: &Segment,
@@ -187,6 +272,21 @@ where
     Ok(loaded)
 }
 
+/// Deletes slabs that are no longer active (all triggers completed).
+///
+/// Compares the set of loaded slabs with active slab IDs derived from
+/// the scheduler's active triggers, then deletes any completed slabs
+/// from the store and the `loaded_slab_ids` set.
+///
+/// # Arguments
+///
+/// * `state` – Locked loader state (store + scheduler).
+/// * `segment` – The segment metadata.
+/// * `loaded_slab_ids` – Mutable set of currently loaded slab IDs.
+///
+/// # Errors
+///
+/// Returns the underlying store error if any deletion fails.
 async fn remove_completed_slabs<T>(
     state: &SlabLock<State<T>>,
     segment: &Segment,
@@ -216,6 +316,19 @@ where
     Ok(())
 }
 
+/// Loads all triggers from a single slab into the scheduler.
+///
+/// Fetches triggers from the store and schedules each one concurrently.
+///
+/// # Arguments
+///
+/// * `store` – The persistent trigger store.
+/// * `scheduler` – The in-memory scheduler.
+/// * `slab` – The slab to load triggers from.
+///
+/// # Errors
+///
+/// Returns `TimerManagerError` if retrieving triggers or scheduling fails.
 async fn load_triggers<T>(
     store: &T,
     scheduler: &TriggerScheduler,
@@ -236,6 +349,19 @@ where
         .await
 }
 
+/// Gathers slab IDs for slabs that currently have active triggers.
+///
+/// Iterates over all active trigger times in the scheduler and maps each
+/// time to its containing slab ID.
+///
+/// # Arguments
+///
+/// * `segment` – The segment metadata.
+/// * `scheduler` – The in-memory scheduler.
+///
+/// # Returns
+///
+/// A `HashSet<SlabId>` containing IDs of slabs with active triggers.
 async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> HashSet<SlabId> {
     let mut active_slab_ids = HashSet::new();
 
@@ -249,6 +375,25 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
     active_slab_ids
 }
 
+/// Retrieves or creates a `Segment` in the store.
+///
+/// If a segment with `segment_id` exists, it is returned. Otherwise, a new
+/// segment is inserted with the given `slab_size` and `name`.
+///
+/// # Arguments
+///
+/// * `store` – The persistent trigger store.
+/// * `segment_id` – Unique identifier for the segment.
+/// * `slab_size` – Slab duration for time partitioning.
+/// * `name` – Human-readable name for the segment.
+///
+/// # Errors
+///
+/// Returns `TimerManagerError` if any store operation fails.
+///
+/// # Returns
+///
+/// The existing or newly created `Segment` object.
 pub async fn get_or_create_segment<T>(
     store: &T,
     segment_id: crate::timers::store::SegmentId,

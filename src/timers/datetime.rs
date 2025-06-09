@@ -95,14 +95,13 @@ impl CompactDateTime {
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the current time as a [`CompactDateTime`] if
-    /// successful, or a [`CompactDateTimeError`] if the current time is
-    /// outside the representable range.
+    /// `Ok(CompactDateTime)` if the system clock is within the representable
+    /// range, otherwise an error.
     ///
     /// # Errors
     ///
-    /// Returns [`CompactDateTimeError::OutOfRange`] if the current system time
-    /// is before 1970 or after 2106.
+    /// Returns [`CompactDateTimeError::OutOfRange`] if the system time is
+    /// before 1970 or after 2106.
     ///
     /// # Examples
     ///
@@ -120,7 +119,7 @@ impl CompactDateTime {
     ///
     /// # Returns
     ///
-    /// The number of seconds since January 1, 1970 00:00:00 UTC as a [`u32`].
+    /// A `u32` value representing seconds since January 1, 1970 00:00:00 UTC.
     ///
     /// # Examples
     ///
@@ -139,18 +138,16 @@ impl CompactDateTime {
     ///
     /// # Arguments
     ///
-    /// * `other` - The earlier [`CompactDateTime`] to calculate duration from
+    /// * `other` - An earlier [`CompactDateTime`] to measure from.
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the [`Duration`] between the two times if
-    /// successful, or a [`CompactDateTimeError`] if the other time is in
-    /// the future relative to this time.
+    /// `Ok(Duration)` if `other <= self`, otherwise an error.
     ///
     /// # Errors
     ///
-    /// Returns [`CompactDateTimeError::PastDateTime`] if `other` is later than
-    /// `self`.
+    /// Returns [`CompactDateTimeError::PastDateTime`] if `other` is later
+    /// than `self`.
     ///
     /// # Examples
     ///
@@ -161,8 +158,10 @@ impl CompactDateTime {
     /// let earlier = CompactDateTime::from(1000_u32);
     /// let later = CompactDateTime::from(2000_u32);
     ///
-    /// let duration = later.duration_since(earlier).unwrap();
-    /// assert_eq!(duration, Duration::from_secs(1000));
+    /// assert_eq!(
+    ///     later.duration_since(earlier).unwrap(),
+    ///     Duration::from_secs(1000)
+    /// );
     /// ```
     pub fn duration_since(self, other: Self) -> Result<Duration, CompactDateTimeError> {
         let seconds = self
@@ -173,22 +172,16 @@ impl CompactDateTime {
         Ok(Duration::from_secs(u64::from(seconds)))
     }
 
-    /// Calculates the duration from the current time to this datetime.
-    ///
-    /// This is a convenience method equivalent to
-    /// `self.duration_since(CompactDateTime::now()?)`.
+    /// Calculates the duration from now until this datetime.
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the [`Duration`] from now to this time if
-    /// successful, or a [`CompactDateTimeError`] if this time is in the
-    /// past or if the current time cannot be determined.
+    /// `Ok(Duration)` if `self >= now()`, otherwise an error.
     ///
     /// # Errors
     ///
-    /// - [`CompactDateTimeError::PastDateTime`] if this time is in the past
-    /// - [`CompactDateTimeError::OutOfRange`] if the current time is outside
-    ///   the representable range
+    /// - [`CompactDateTimeError::OutOfRange`] if current time is out of range.
+    /// - [`CompactDateTimeError::PastDateTime`] if `self` is in the past.
     ///
     /// # Examples
     ///
@@ -196,34 +189,32 @@ impl CompactDateTime {
     /// use prosody::timers::datetime::CompactDateTime;
     /// use prosody::timers::duration::CompactDuration;
     ///
-    /// let future_time = CompactDateTime::now()
+    /// let future = CompactDateTime::now()
     ///     .unwrap()
-    ///     .add_duration(CompactDuration::new(3600))
+    ///     .add_duration(CompactDuration::new(60))
     ///     .unwrap();
     ///
-    /// let time_until = future_time.duration_from_now().unwrap();
-    /// assert!(time_until.as_secs() <= 3600);
+    /// let until = future.duration_from_now().unwrap();
+    /// assert!(until.as_secs() <= 60);
     /// ```
     pub fn duration_from_now(self) -> Result<Duration, CompactDateTimeError> {
         self.duration_since(Self::now()?)
     }
 
-    /// Adds a duration to this datetime.
+    /// Adds a [`CompactDuration`] to this datetime.
     ///
     /// # Arguments
     ///
-    /// * `duration` - The [`CompactDuration`] to add
+    /// * `duration` - The number of seconds to add.
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the new [`CompactDateTime`] if successful,
-    /// or a [`CompactDateTimeError`] if the result would be outside the
-    /// representable range.
+    /// `Ok(CompactDateTime)` for the new time, or an error if it overflows.
     ///
     /// # Errors
     ///
-    /// Returns [`CompactDateTimeError::OutOfRange`] if adding the duration
-    /// would result in a time after 2106-02-07 06:28:15 UTC.
+    /// Returns [`CompactDateTimeError::OutOfRange`] if the result exceeds the
+    /// maximum representable time.
     ///
     /// # Examples
     ///
@@ -231,8 +222,8 @@ impl CompactDateTime {
     /// use prosody::timers::datetime::CompactDateTime;
     /// use prosody::timers::duration::CompactDuration;
     ///
-    /// let base_time = CompactDateTime::from(1000_u32);
-    /// let later = base_time.add_duration(CompactDuration::new(500)).unwrap();
+    /// let base = CompactDateTime::from(1000_u32);
+    /// let later = base.add_duration(CompactDuration::new(500)).unwrap();
     /// assert_eq!(later.epoch_seconds(), 1500);
     /// ```
     pub fn add_duration(self, duration: CompactDuration) -> Result<Self, CompactDateTimeError> {
@@ -244,22 +235,20 @@ impl CompactDateTime {
         Ok(Self { epoch_seconds })
     }
 
-    /// Subtracts a duration from this datetime.
+    /// Subtracts a [`CompactDuration`] from this datetime.
     ///
     /// # Arguments
     ///
-    /// * `duration` - The [`CompactDuration`] to subtract
+    /// * `duration` - The number of seconds to subtract.
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the new [`CompactDateTime`] if successful,
-    /// or a [`CompactDateTimeError`] if the result would be outside the
-    /// representable range.
+    /// `Ok(CompactDateTime)` for the new time, or an error if it underflows.
     ///
     /// # Errors
     ///
-    /// Returns [`CompactDateTimeError::OutOfRange`] if subtracting the duration
-    /// would result in a time before 1970-01-01 00:00:00 UTC.
+    /// Returns [`CompactDateTimeError::OutOfRange`] if the result goes before
+    /// the Unix epoch.
     ///
     /// # Examples
     ///
@@ -267,10 +256,8 @@ impl CompactDateTime {
     /// use prosody::timers::datetime::CompactDateTime;
     /// use prosody::timers::duration::CompactDuration;
     ///
-    /// let base_time = CompactDateTime::from(2000_u32);
-    /// let earlier = base_time
-    ///     .subtract_duration(CompactDuration::new(500))
-    ///     .unwrap();
+    /// let base = CompactDateTime::from(2000_u32);
+    /// let earlier = base.subtract_duration(CompactDuration::new(500)).unwrap();
     /// assert_eq!(earlier.epoch_seconds(), 1500);
     /// ```
     pub fn subtract_duration(
@@ -289,26 +276,22 @@ impl CompactDateTime {
 impl TryFrom<DateTime<Utc>> for CompactDateTime {
     type Error = CompactDateTimeError;
 
-    /// Converts a [`DateTime<Utc>`] to a [`CompactDateTime`].
-    ///
-    /// Sub-second precision is handled by rounding to the nearest second:
-    /// - Nanoseconds >= 500,000,000 round up to the next second
-    /// - Nanoseconds < 500,000,000 round down to the current second
+    /// Converts a [`DateTime<Utc>`] to a [`CompactDateTime`], rounding
+    /// sub-second precision to the nearest second.
     ///
     /// # Arguments
     ///
-    /// * `value` - The [`DateTime<Utc>`] to convert
+    /// * `value` - The `DateTime<Utc>` to convert.
     ///
     /// # Returns
     ///
-    /// A [`Result`] containing the [`CompactDateTime`] if the conversion
-    /// succeeds, or a [`CompactDateTimeError`] if the datetime is outside
-    /// the representable range.
+    /// `Ok(CompactDateTime)` if the timestamp fits in `u32`, otherwise an
+    /// error.
     ///
     /// # Errors
     ///
     /// Returns [`CompactDateTimeError::OutOfRange`] if the datetime is before
-    /// 1970-01-01 00:00:00 UTC or after 2106-02-07 06:28:15 UTC.
+    /// 1970-01-01 or after 2106-02-07.
     fn try_from(value: DateTime<Utc>) -> Result<Self, Self::Error> {
         let seconds = value.timestamp();
         let nanos = value.timestamp_subsec_nanos();
@@ -328,14 +311,15 @@ impl TryFrom<DateTime<Utc>> for CompactDateTime {
 }
 
 impl Display for CompactDateTime {
-    /// Formats the datetime for display using RFC 3339 format.
-    ///
-    /// The output format is compatible with ISO 8601 and RFC 3339 standards,
-    /// showing the datetime in UTC timezone.
+    /// Formats the datetime using RFC 3339 (ISO 8601) in UTC.
     ///
     /// # Examples
     ///
-    /// Output format: `1970-01-01 03:25:45 UTC`
+    /// ```
+    /// use prosody::timers::datetime::CompactDateTime;
+    /// let dt = CompactDateTime::from(0_u32);
+    /// assert_eq!(dt.to_string(), "1970-01-01 00:00:00 UTC");
+    /// ```
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let time: DateTime<Utc> = (*self).into();
         write!(f, "{time}")
@@ -343,14 +327,15 @@ impl Display for CompactDateTime {
 }
 
 impl Debug for CompactDateTime {
-    /// Formats the datetime for debugging using ISO 8601 format.
-    ///
-    /// The debug output uses the standard ISO 8601 format for precise
-    /// debugging and logging purposes.
+    /// Formats the datetime using the `{:?}` representation of `DateTime<Utc>`.
     ///
     /// # Examples
     ///
-    /// Output format: `1970-01-01T03:25:45Z`
+    /// ```
+    /// use prosody::timers::datetime::CompactDateTime;
+    /// let dt = CompactDateTime::from(0_u32);
+    /// assert_eq!(format!("{dt:?}"), "1970-01-01T00:00:00Z");
+    /// ```
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let time: DateTime<Utc> = (*self).into();
         write!(f, "{time:?}")
@@ -358,41 +343,29 @@ impl Debug for CompactDateTime {
 }
 
 impl From<CompactDateTime> for DateTime<Utc> {
-    /// Converts a [`CompactDateTime`] to a [`DateTime<Utc>`].
-    ///
-    /// This conversion is infallible as all [`CompactDateTime`] values
-    /// represent valid times within the range supported by [`DateTime<Utc>`].
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The [`CompactDateTime`] to convert
+    /// Converts a [`CompactDateTime`] into a `DateTime<Utc>`.
     ///
     /// # Returns
     ///
-    /// A [`DateTime<Utc>`] representing the same instant in time.
+    /// A `DateTime<Utc>` corresponding to the same epoch second.
     fn from(value: CompactDateTime) -> Self {
         DateTime::UNIX_EPOCH + Duration::from_secs(u64::from(value.epoch_seconds))
     }
 }
 
 impl From<u32> for CompactDateTime {
-    /// Creates a [`CompactDateTime`] from epoch seconds.
+    /// Creates a [`CompactDateTime`] from raw epoch seconds.
     ///
     /// # Arguments
     ///
-    /// * `value` - The number of seconds since the Unix epoch
-    ///
-    /// # Returns
-    ///
-    /// A [`CompactDateTime`] representing the specified time.
+    /// * `value` - Seconds since the Unix epoch.
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use prosody::timers::datetime::CompactDateTime;
-    ///
-    /// let time = CompactDateTime::from(1234567890_u32);
-    /// assert_eq!(time.epoch_seconds(), 1234567890);
+    /// let dt = CompactDateTime::from(12345_u32);
+    /// assert_eq!(dt.epoch_seconds(), 12345);
     /// ```
     fn from(value: u32) -> Self {
         Self {
@@ -402,20 +375,12 @@ impl From<u32> for CompactDateTime {
 }
 
 impl From<i32> for CompactDateTime {
-    /// Creates a [`CompactDateTime`] from a signed 32-bit epoch seconds value.
-    ///
-    /// The conversion treats the `i32` value as an unsigned value using
-    /// little-endian byte representation. This allows handling of values
-    /// that might be represented as negative in signed arithmetic but
-    /// represent valid epoch times.
+    /// Creates a [`CompactDateTime`] from a signed epoch seconds by
+    /// interpreting its bytes as little-endian.
     ///
     /// # Arguments
     ///
-    /// * `value` - The signed epoch seconds value
-    ///
-    /// # Returns
-    ///
-    /// A [`CompactDateTime`] representing the specified time.
+    /// * `value` - A signed 32-bit epoch seconds value.
     fn from(value: i32) -> Self {
         Self {
             epoch_seconds: u32::from_le_bytes(value.to_le_bytes()),
@@ -424,18 +389,8 @@ impl From<i32> for CompactDateTime {
 }
 
 impl From<CompactDateTime> for i32 {
-    /// Converts a [`CompactDateTime`] to a signed 32-bit epoch seconds value.
-    ///
-    /// The conversion uses little-endian byte representation to maintain
-    /// bijection with the [`From<i32>`] implementation.
-    ///
-    /// # Arguments
-    ///
-    /// * `value` - The [`CompactDateTime`] to convert
-    ///
-    /// # Returns
-    ///
-    /// A signed 32-bit representation of the epoch seconds.
+    /// Converts a [`CompactDateTime`] to a signed 32-bit epoch seconds by
+    /// using little-endian representation.
     fn from(value: CompactDateTime) -> Self {
         i32::from_le_bytes(value.epoch_seconds.to_le_bytes())
     }
@@ -444,18 +399,13 @@ impl From<CompactDateTime> for i32 {
 /// Errors that can occur when working with [`CompactDateTime`].
 #[derive(Clone, Debug, Error)]
 pub enum CompactDateTimeError {
-    /// The time value is outside the representable range.
-    ///
-    /// [`CompactDateTime`] can only represent times between 1970-01-01 00:00:00
-    /// UTC and 2106-02-07 06:28:15 UTC. This error occurs when attempting
-    /// to create or calculate a time outside this range.
+    /// Indicates an attempt to create or calculate a time outside the
+    /// representable range (before 1970-01-01 or after 2106-02-07).
     #[error("Time is out of range")]
     OutOfRange,
 
-    /// The specified time is in the past relative to another time.
-    ///
-    /// This error occurs when attempting to calculate a duration where the
-    /// end time is earlier than the start time.
+    /// Indicates that a time subtraction or duration calculation resulted
+    /// in a negative interval.
     #[error("Time is in the past")]
     PastDateTime,
 }

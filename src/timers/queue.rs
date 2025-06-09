@@ -1,3 +1,11 @@
+//! A delay-based trigger queue for scheduling and expiring timer events.
+//!
+//! This module provides `TriggerQueue`, a wrapper around
+//! `tokio_util::time::DelayQueue` that schedules `Trigger` events to fire at
+//! their specified times. It maintains an `ActiveTriggers` registry for
+//! efficient membership checks and prevents duplicate scheduling of the same
+//! trigger.
+
 use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
 use ahash::HashMap;
@@ -5,6 +13,12 @@ use std::collections::hash_map::Entry;
 use std::{future::poll_fn, time::Duration};
 use tokio_util::time::{DelayQueue, delay_queue};
 
+/// A queue of `Trigger` values that fire after a configured delay.
+///
+/// Internally, `TriggerQueue` uses a `DelayQueue<Trigger>` to manage timers
+/// and a `HashMap<Trigger, delay_queue::Key>` to avoid duplicate scheduling.
+/// It also updates an `ActiveTriggers` registry to allow fast membership
+/// checks.
 pub struct TriggerQueue {
     queue: DelayQueue<Trigger>,
     queue_keys: HashMap<Trigger, delay_queue::Key>,
@@ -12,6 +26,15 @@ pub struct TriggerQueue {
 }
 
 impl TriggerQueue {
+    /// Creates a new, empty `TriggerQueue`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use prosody::timers::queue::TriggerQueue;
+    ///
+    /// let mut queue = TriggerQueue::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             queue: DelayQueue::default(),
@@ -20,34 +43,106 @@ impl TriggerQueue {
         }
     }
 
+    /// Returns a reference to the registry of currently active triggers.
+    ///
+    /// The returned `ActiveTriggers` can be used to check membership of keys
+    /// and times without affecting the queue.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use prosody::timers::queue::TriggerQueue;
+    /// # let queue = TriggerQueue::new();
+    /// let active = queue.active_triggers();
+    /// ```
+    #[must_use]
     pub fn active_triggers(&self) -> &ActiveTriggers {
         &self.active
     }
 
+    /// Inserts a `Trigger` into the queue for delayed firing.
+    ///
+    /// If the same `Trigger` (same key and time) is already scheduled, this
+    /// call has no effect.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The timer event to schedule.
+    ///
+    /// # Panics
+    ///
+    /// This method does not panic under normal operation.
     pub async fn insert(&mut self, trigger: Trigger) {
+        // Skip scheduling if the trigger is already present.
         let Entry::Vacant(vacant) = self.queue_keys.entry(trigger.clone()) else {
             return;
         };
 
-        let duration = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
-        let queue_key = self.queue.insert(trigger.clone(), duration);
+        // Compute delay until trigger time, defaulting to zero if in the past.
+        let delay = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
+
+        // Schedule the trigger and record its key in the map.
+        let queue_key = self.queue.insert(trigger.clone(), delay);
         vacant.insert(queue_key);
+
+        // Mark the trigger as active for fast membership checks.
         self.active.insert(trigger).await;
     }
 
+    /// Waits for and returns the next expired `Trigger`, if any.
+    ///
+    /// This method asynchronously polls the internal delay queue for the
+    /// next item whose delay has elapsed. Once retrieved, the trigger is
+    /// removed from the `queue_keys` map.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(Trigger)` when a scheduled trigger expires.
+    /// * `None` if the underlying queue has been closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use prosody::timers::queue::TriggerQueue;
+    /// # tokio_test::block_on(async {
+    /// let mut queue = TriggerQueue::new();
+    /// // ... queue.insert(trigger).await ...
+    /// if let Some(trigger) = queue.next().await {
+    ///     // Process expired trigger
+    /// }
+    /// # });
+    /// ```
     pub async fn next(&mut self) -> Option<Trigger> {
+        // Poll for the next expired item.
         let expired = poll_fn(|cx| self.queue.poll_expired(cx)).await?;
+        // Remove its scheduling key to allow potential rescheduling.
         self.queue_keys.remove(expired.get_ref());
         Some(expired.into_inner())
     }
 
+    /// Removes a scheduled `Trigger` from both the delay queue and the
+    /// active registry.
+    ///
+    /// If the trigger was not previously scheduled, this call has no effect.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The trigger to remove.
+    ///
+    /// # Panics
+    ///
+    /// This method does not panic under normal operation.
     pub async fn remove(&mut self, trigger: &Trigger) {
-        let Some((trigger, queue_key)) = self.queue_keys.remove_entry(trigger) else {
+        // Look up and remove the trigger's delay queue key.
+        let Some((owned_trigger, queue_key)) = self.queue_keys.remove_entry(trigger) else {
             return;
         };
 
+        // Remove from the delay queue and deactivate in the registry.
         self.queue.remove(&queue_key);
-        self.active.remove(&trigger.key, trigger.time).await;
+        self.active
+            .remove(&owned_trigger.key, owned_trigger.time)
+            .await;
     }
 }
 

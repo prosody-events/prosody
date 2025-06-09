@@ -1,39 +1,20 @@
 //! Timer system for scheduling and managing time-based events.
 //!
 //! This module provides a comprehensive timer system that integrates with
-//! Prosody's event processing capabilities. It allows applications to schedule
-//! timer events that fire at specific times and are processed alongside regular
-//! Kafka messages.
+//! Prosody's event processing framework. It allows applications to:
+//! - Schedule timer events by key and execution time.
+//! - Persist timers so they survive application restarts.
+//! - Coordinate timer processing across distributed instances.
+//! - Partition timers into time-based slabs for efficient storage and queries.
 //!
-//! ## Overview
+//! Core components:
+//! - **Trigger**: Metadata for a scheduled event.
+//! - **TimerManager**: Coordinates scheduling, loading, and delivery.
+//! - **TriggerStore**: Persistent storage abstraction.
+//! - **Scheduler**: In-memory queue for precise timing.
+//! - **Slabs**: Fixed-duration partitions for time-range queries.
 //!
-//! The timer system consists of several key components:
-//!
-//! - **Triggers**: Represent scheduled timer events with a key and execution
-//!   time
-//! - **Timer Manager**: Coordinates timer scheduling, storage, and execution
-//! - **Trigger Store**: Provides persistent storage for timer data
-//! - **Scheduler**: Manages in-memory timer queues and delivery
-//! - **Slabs**: Time-based partitioning for efficient timer storage and
-//!   retrieval
-//!
-//! ## Key Features
-//!
-//! - **Persistent Storage**: Timers are stored persistently and survive
-//!   application restarts
-//! - **Distributed Operation**: Multiple consumer instances can coordinate
-//!   timer processing
-//! - **Key-based Organization**: Timers are organized by keys, maintaining
-//!   ordering guarantees
-//! - **Efficient Querying**: Time-based slab organization enables efficient
-//!   range queries
-//! - **Integration**: Seamless integration with existing event processing
-//!   pipelines
-//!
-//! ## Usage
-//!
-//! Timers are typically used through the consumer's event handler interface:
-//!
+//! Integration example (in an event handler):
 //! ```rust,no_run
 //! use prosody::consumer::message::{EventContext, UncommittedMessage};
 //! use prosody::consumer::{EventHandler, Keyed, Uncommitted};
@@ -67,83 +48,53 @@
 //! }
 //! ```
 //!
-//! ## Architecture
-//!
-//! The timer system uses a multi-layered architecture:
-//!
-//! 1. **Storage Layer**: Persistent storage via [`TriggerStore`]
-//!    implementations
-//! 2. **Management Layer**: [`TimerManager`] coordinates timer lifecycle
-//! 3. **Scheduling Layer**: In-memory scheduling and delivery to consumers
-//! 4. **Integration Layer**: Seamless integration with event processing
-//!
-//! ## Time Representation
-//!
-//! The system uses compact time representations for efficiency:
-//!
-//! - [`CompactDateTime`]: 32-bit epoch seconds for timer execution times
-//! - [`CompactDuration`]: 32-bit seconds for duration calculations
-//! - **Slab-based Partitioning**: Timers are organized into time-based slabs
-//!   for efficient access
+//! The system uses compact, 32-bit representations for time (`CompactDateTime`)
+//! and durations (`CompactDuration`). Timers are grouped into slabs of fixed
+//! size for efficient range operations.
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use educe::Educe;
 use tracing::Span;
 
-/// Represents a scheduled timer event with an associated key and execution
-/// time.
+/// A scheduled timer event with a key, execution time, and tracing span.
 ///
-/// A [`Trigger`] encapsulates the information needed to identify and execute
-/// a timer event. It consists of a key for logical grouping and ordering,
-/// an execution time, and a tracing span for observability.
-///
-/// ## Key Properties
-///
-/// - **Key**: Associates the timer with a logical entity (e.g., user ID, order
-///   ID)
-/// - **Time**: Specifies when the timer should execute using
-///   [`CompactDateTime`]
-/// - **Span**: Provides distributed tracing context for the timer event
+/// A `Trigger` carries the data needed to identify and execute a timer:
+/// - `key`: Logical entity identifier (e.g., user ID, order ID).
+/// - `time`: When the timer should fire, stored as `CompactDateTime`.
+/// - `span`: Tracing context for observability.
 ///
 /// ## Ordering and Equality
 ///
-/// Triggers are ordered first by key, then by time. The tracing span is
-/// excluded from equality and hash calculations to ensure consistent behavior
-/// across different execution contexts.
+/// `Trigger` values are ordered first by `key`, then by `time`. The `span`
+/// is ignored in hashing and equality to ensure consistent behavior
+/// across contexts.
 ///
-/// ## Example
+/// # Example
 ///
-/// ```rust,no_run
+/// ```rust
 /// use prosody::Key;
 /// use prosody::timers::{Trigger, datetime::CompactDateTime};
 /// use tracing::Span;
 ///
 /// let trigger = Trigger {
 ///     key: Key::from("user-123"),
-///     time: CompactDateTime::from(1234567890_u32),
+///     time: CompactDateTime::from(1_234_567_890_u32),
 ///     span: Span::current(),
 /// };
 /// ```
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {
-    /// The key that identifies the logical entity this timer is associated
-    /// with.
-    ///
-    /// Used for maintaining ordering guarantees and logical grouping of timers.
+    /// The logical entity this timer is associated with.
     pub key: Key,
 
-    /// The time when this timer should execute.
-    ///
-    /// Represented as a [`CompactDateTime`] for efficient storage and
-    /// comparison.
+    /// The scheduled execution time of the timer.
     pub time: CompactDateTime,
 
-    /// Tracing span for observability and debugging.
+    /// Tracing span for distributed observability.
     ///
-    /// Excluded from equality and hash calculations to ensure consistent
-    /// behavior across different execution contexts.
+    /// Excluded from hash and equality to avoid context-specific differences.
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
     pub span: Span,
 }
@@ -161,14 +112,16 @@ mod slab_lock;
 pub mod store;
 mod uncommitted;
 
-// Re-export main public APIs
-pub use manager::TimerManager;
-pub use uncommitted::UncommittedTimer;
-
+/// The maximum number of concurrent slab load tasks.
+///
+/// Used internally by the slab loader to bound parallelism.
 const LOAD_CONCURRENCY: usize = 16;
 
-/// Maximum number of concurrent delete operations for timer cleanup.
+/// The maximum number of concurrent delete operations during timer cleanup.
 ///
-/// This constant controls the parallelism level when performing bulk
-/// cleanup operations such as removing all timers for a specific key.
+/// Controls parallelism when removing timers, for example in `unschedule_all`.
 pub const DELETE_CONCURRENCY: usize = 16;
+
+// Re-export primary APIs:
+pub use manager::TimerManager;
+pub use uncommitted::UncommittedTimer;
