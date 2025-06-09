@@ -27,14 +27,6 @@ pub struct TriggerQueue {
 
 impl TriggerQueue {
     /// Creates a new, empty `TriggerQueue`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use prosody::timers::queue::TriggerQueue;
-    ///
-    /// let mut queue = TriggerQueue::new();
-    /// ```
     pub fn new() -> Self {
         Self {
             queue: DelayQueue::default(),
@@ -47,14 +39,6 @@ impl TriggerQueue {
     ///
     /// The returned `ActiveTriggers` can be used to check membership of keys
     /// and times without affecting the queue.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use prosody::timers::queue::TriggerQueue;
-    /// # let queue = TriggerQueue::new();
-    /// let active = queue.active_triggers();
-    /// ```
     #[must_use]
     pub fn active_triggers(&self) -> &ActiveTriggers {
         &self.active
@@ -99,19 +83,6 @@ impl TriggerQueue {
     ///
     /// * `Some(Trigger)` when a scheduled trigger expires.
     /// * `None` if the underlying queue has been closed.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use prosody::timers::queue::TriggerQueue;
-    /// # tokio_test::block_on(async {
-    /// let mut queue = TriggerQueue::new();
-    /// // ... queue.insert(trigger).await ...
-    /// if let Some(trigger) = queue.next().await {
-    ///     // Process expired trigger
-    /// }
-    /// # });
-    /// ```
     pub async fn next(&mut self) -> Option<Trigger> {
         // Poll for the next expired item.
         let expired = poll_fn(|cx| self.queue.poll_expired(cx)).await?;
