@@ -43,6 +43,13 @@
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
+//!     async fn on_message<T>(&self, _context: EventContext<T>, _message: UncommittedMessage)
+//!     where
+//!         T: TriggerStore,
+//!     {
+//!         // Handle message processing
+//!     }
+//!
 //!     async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
 //!     where
 //!         T: TriggerStore,
@@ -52,13 +59,6 @@
 //!
 //!         // Commit the timer to mark it as processed
 //!         timer.commit().await;
-//!     }
-//!
-//!     async fn on_message<T>(&self, _context: EventContext<T>, _message: UncommittedMessage)
-//!     where
-//!         T: TriggerStore,
-//!     {
-//!         // Handle message processing
 //!     }
 //!
 //!     async fn shutdown(self) {

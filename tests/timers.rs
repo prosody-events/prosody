@@ -91,7 +91,8 @@ impl EventHandler for TimerTestHandler {
                         } else {
                             info!("Scheduled timer for key {key} at time {schedule_time}");
                         }
-                    } else if let Some(delay_secs) = payload.get("delay_secs").and_then(|v| v.as_u64())
+                    } else if let Some(delay_secs) =
+                        payload.get("delay_secs").and_then(|v| v.as_u64())
                     {
                         // Delay-based scheduling
                         let delay = CompactDuration::new(delay_secs as u32);
@@ -248,7 +249,12 @@ impl TestEnvironment {
     async fn expect_message(&mut self, timeout_secs: u64) -> Result<MessageEvent> {
         timeout(Duration::from_secs(timeout_secs), self.message_rx.recv())
             .await
-            .map_err(|_| eyre!("Timeout waiting for message event after {} seconds", timeout_secs))?
+            .map_err(|_| {
+                eyre!(
+                    "Timeout waiting for message event after {} seconds",
+                    timeout_secs
+                )
+            })?
             .ok_or_else(|| eyre!("Message channel closed unexpectedly"))
     }
 
@@ -256,31 +262,50 @@ impl TestEnvironment {
     async fn expect_timer(&mut self, timeout_secs: u64) -> Result<TimerEvent> {
         timeout(Duration::from_secs(timeout_secs), self.timer_rx.recv())
             .await
-            .map_err(|_| eyre!("Timeout waiting for timer event after {} seconds", timeout_secs))?
+            .map_err(|_| {
+                eyre!(
+                    "Timeout waiting for timer event after {} seconds",
+                    timeout_secs
+                )
+            })?
             .ok_or_else(|| eyre!("Timer channel closed unexpectedly"))
     }
 
     /// Wait for exact number of timer events with timeout
     async fn expect_timers(&mut self, count: usize, timeout_secs: u64) -> Result<Vec<TimerEvent>> {
         let mut received_timers = Vec::new();
-        
+
         for i in 0..count {
             match timeout(Duration::from_secs(timeout_secs), self.timer_rx.recv()).await {
                 Ok(Some(timer_event)) => {
                     received_timers.push(timer_event);
                 }
                 Ok(None) => {
-                    return Err(eyre!("Timer channel closed after receiving {} of {} expected timers", i, count));
+                    return Err(eyre!(
+                        "Timer channel closed after receiving {} of {} expected timers",
+                        i,
+                        count
+                    ));
                 }
                 Err(_) => {
-                    return Err(eyre!("Timeout waiting for timer {} of {} after {} seconds", i + 1, count, timeout_secs));
+                    return Err(eyre!(
+                        "Timeout waiting for timer {} of {} after {} seconds",
+                        i + 1,
+                        count,
+                        timeout_secs
+                    ));
                 }
             }
         }
 
         // Verify no extra timers are received
-        if let Ok(Some(extra_timer)) = timeout(Duration::from_millis(100), self.timer_rx.recv()).await {
-            return Err(eyre!("Received unexpected extra timer for key '{}'", extra_timer.key));
+        if let Ok(Some(extra_timer)) =
+            timeout(Duration::from_millis(100), self.timer_rx.recv()).await
+        {
+            return Err(eyre!(
+                "Received unexpected extra timer for key '{}'",
+                extra_timer.key
+            ));
         }
 
         Ok(received_timers)
@@ -288,7 +313,11 @@ impl TestEnvironment {
 
     /// Verify that no timer event occurs within the given timeout
     async fn expect_no_timer(&mut self, timeout_secs: u32) -> Result<()> {
-        let timer_result = timeout(Duration::from_secs(timeout_secs as u64), self.timer_rx.recv()).await;
+        let timer_result = timeout(
+            Duration::from_secs(timeout_secs as u64),
+            self.timer_rx.recv(),
+        )
+        .await;
         ensure!(
             timer_result.is_err(),
             "Expected no timer event, but one was received"
@@ -337,17 +366,23 @@ impl TestEnvironment {
     fn verify_timer_order(&self, timers: &[TimerEvent]) -> Result<()> {
         for i in 1..timers.len() {
             ensure!(
-                timers[i-1].time.epoch_seconds() <= timers[i].time.epoch_seconds(),
+                timers[i - 1].time.epoch_seconds() <= timers[i].time.epoch_seconds(),
                 "Timers not in chronological order: timer {} at {} came after timer {} at {}",
-                timers[i-1].key, timers[i-1].time,
-                timers[i].key, timers[i].time
+                timers[i - 1].key,
+                timers[i - 1].time,
+                timers[i].key,
+                timers[i].time
             );
         }
         Ok(())
     }
 
     /// Verify timers contain exactly the expected keys
-    fn verify_timer_keys(&self, timers: &[TimerEvent], expected_keys: &HashSet<String>) -> Result<()> {
+    fn verify_timer_keys(
+        &self,
+        timers: &[TimerEvent],
+        expected_keys: &HashSet<String>,
+    ) -> Result<()> {
         let actual_keys: HashSet<String> = timers.iter().map(|t| t.key.clone()).collect();
         ensure!(
             actual_keys == *expected_keys,
@@ -378,7 +413,7 @@ impl TestEnvironment {
 async fn run_test<F, Fut>(test_name: &str, timeout_secs: u64, test_fn: F) -> Result<()>
 where
     F: FnOnce(TestEnvironment) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
 {
     let _ = fmt().compact().try_init();
 
@@ -389,7 +424,13 @@ where
     })
     .await;
 
-    result.map_err(|_| eyre!("Test '{}' timed out after {} seconds", test_name, timeout_secs))?
+    result.map_err(|_| {
+        eyre!(
+            "Test '{}' timed out after {} seconds",
+            test_name,
+            timeout_secs
+        )
+    })?
 }
 
 /// Tests basic timer scheduling and triggering functionality.
@@ -420,8 +461,6 @@ async fn test_timer_scheduling_and_triggering() -> Result<()> {
     })
     .await
 }
-
-
 
 /// Tests edge case: scheduling multiple timers for the same key.
 #[tokio::test]
@@ -468,10 +507,10 @@ async fn test_immediate_timer() -> Result<()> {
         let delay_secs = 1u32;
 
         let start_time = CompactDateTime::now()?;
-        
+
         // Schedule immediate timer
         env.schedule_timer(key, delay_secs).await?;
-        
+
         // Verify message was received
         env.expect_message(3).await?;
 
@@ -483,7 +522,7 @@ async fn test_immediate_timer() -> Result<()> {
         let end_time = CompactDateTime::now()?;
         let elapsed = end_time.epoch_seconds() - start_time.epoch_seconds();
         ensure!(
-            elapsed >= 1 && elapsed <= 3,
+            (1..=3).contains(&elapsed),
             "Timer took {} seconds, expected 1-3 seconds",
             elapsed
         );
@@ -534,9 +573,12 @@ async fn test_timer_scheduled_time_accuracy() -> Result<()> {
             timer_event.time
         );
 
-        // Additional verification: timer should have triggered at the right wall-clock time
+        // Additional verification: timer should have triggered at the right wall-clock
+        // time
         let actual_trigger_time = CompactDateTime::now()?;
-        let time_diff = actual_trigger_time.epoch_seconds().abs_diff(expected_time.epoch_seconds());
+        let time_diff = actual_trigger_time
+            .epoch_seconds()
+            .abs_diff(expected_time.epoch_seconds());
         ensure!(
             time_diff <= 1,
             "Timer triggered too far from expected time. Expected: {}, Now: {}, Diff: {} seconds",
@@ -620,7 +662,8 @@ async fn test_multiple_timers() -> Result<()> {
         env.verify_timer_order(&received_timers)?;
 
         // Verify all expected keys are present
-        let expected_keys: HashSet<String> = timers_data.iter().map(|(k, _)| k.to_string()).collect();
+        let expected_keys: HashSet<String> =
+            timers_data.iter().map(|(k, _)| k.to_string()).collect();
         env.verify_timer_keys(&received_timers, &expected_keys)?;
 
         // Log all received timer events

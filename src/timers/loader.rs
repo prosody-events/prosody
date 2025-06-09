@@ -288,7 +288,7 @@ mod tests {
     use crate::timers::duration::CompactDuration;
     use crate::timers::store::Segment;
     use crate::timers::store::memory::InMemoryTriggerStore;
-    use color_eyre::eyre::Result;
+    use color_eyre::eyre::{Result, eyre};
     use std::time::Duration;
     use tracing::Span;
     use uuid::Uuid;
@@ -430,7 +430,8 @@ mod tests {
         // Check that it was stored
         let retrieved = store.get_segment(&segment_id).await?;
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().name, name);
+        let retrieved = retrieved.ok_or_else(|| eyre!("Expected segment to be stored"))?;
+        assert_eq!(retrieved.name, name);
         Ok(())
     }
 
@@ -455,6 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::reversed_empty_ranges)]
     async fn test_load_slabs_empty_range() -> Result<()> {
         let store = InMemoryTriggerStore::new();
         let (_triggers_rx, scheduler) = TriggerScheduler::new();
@@ -727,7 +729,7 @@ mod tests {
 
         // Insert slabs beyond current ownership
         for slab_id in 6..=10 {
-            store.insert_slab(&segment.id, slab_id).await.unwrap();
+            store.insert_slab(&segment.id, slab_id).await?;
         }
 
         let result = load_slabs(&slab_lock, &segment, 6..=10).await;
@@ -846,8 +848,8 @@ mod tests {
 
         // Verify only one segment exists in the store
         let stored_segment = store.get_segment(&segment_id).await?;
-        assert!(stored_segment.is_some());
-        let stored_segment = stored_segment.unwrap();
+        let stored_segment =
+            stored_segment.ok_or_else(|| eyre!("Expected segment to be stored"))?;
         assert_eq!(stored_segment.id, segment_id);
         assert_eq!(stored_segment.name, name);
         Ok(())
