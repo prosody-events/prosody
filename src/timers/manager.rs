@@ -994,6 +994,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::unwrap_used)]
     async fn test_concurrent_operations() -> Result<()> {
         time::pause();
 
@@ -1007,7 +1008,7 @@ mod tests {
         for i in 0..10 {
             let manager_clone = manager.clone();
             let handle = spawn(async move {
-                let trigger = create_test_trigger(&format!("concurrent-{}", i), 60 + i)?;
+                let trigger = create_test_trigger(&format!("concurrent-{}", i), 60 + i).unwrap();
                 manager_clone.schedule(trigger).await
             });
             handles.push(handle);
