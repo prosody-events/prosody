@@ -2,7 +2,7 @@
 //!
 //! This module defines the [`TimerManagerError`] enum, which represents all
 //! possible error conditions that can occur when interacting with the
-//! [`TimerManager`], including storage failures, scheduling failures,
+//! [`super::manager::TimerManager`], including storage failures, scheduling failures,
 //! invalid datetime values, and timer lifecycle errors.
 
 use crate::timers::datetime::CompactDateTimeError;
@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use thiserror::Error;
 
-/// Errors returned by [`TimerManager`] methods.
+/// Errors returned by [`super::manager::TimerManager`] methods.
 ///
 /// The type parameter `T` is the error type returned by the underlying
 /// storage implementation. This enum covers:

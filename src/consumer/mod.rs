@@ -203,7 +203,7 @@ pub trait Keyed {
 ///
 /// The trait provides a simple two-phase commit protocol:
 /// 1. **Processing**: Application processes the delivered event
-/// 2. **Acknowledgment**: Application calls [`commit()`] or [`abort()`]
+/// 2. **Acknowledgment**: Application calls [`Uncommitted::commit()`] or [`Uncommitted::abort()`]
 ///
 /// ## Reliability Guarantees
 ///

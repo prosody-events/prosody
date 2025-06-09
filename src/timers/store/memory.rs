@@ -14,8 +14,8 @@
 //! - **Key Index**: Maps each (segment, key) pair to the set of `Trigger`s for
 //!   that key.
 //!
-//! All maps use [`HashMap`] for concurrent access, and values are stored
-//! in [`BTreeSet`] to maintain sorted order where needed.
+//! All maps use [`scc::HashMap`] for concurrent access, and values are stored
+//! in [`std::collections::BTreeSet`] to maintain sorted order where needed.
 
 use crate::Key;
 use crate::timers::Trigger;

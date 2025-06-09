@@ -185,7 +185,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Unregisters (deletes) a slab ID from a segment.
     ///
     /// Does **not** delete the actual triggers in that slab; use
-    /// [`clear_slab_triggers`] to remove those.
+    /// [`Self::clear_slab_triggers`] to remove those.
     ///
     /// # Arguments
     ///
