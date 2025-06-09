@@ -1,96 +1,23 @@
 //! Persistent storage abstraction for timer data.
 //!
-//! This module provides the [`TriggerStore`] trait and related types for
-//! persisting timer data across application restarts. The storage system is
-//! designed to handle large volumes of timer events efficiently while providing
-//! strong consistency guarantees.
+//! This module defines the [`TriggerStore`] trait and supporting types for
+//! persisting and querying timer events. Timer data is organized into
+//! segments and time-based slabs, and indexed both by time and by key,
+//! enabling efficient range and entity lookups.
 //!
-//! ## Architecture Overview
-//!
-//! The storage system uses a hierarchical organization:
+//! # Architecture
 //!
 //! ```text
 //! Segment (partition of timers by consumer group)
-//!   ├── Slabs (time-based partitions for efficient queries)
-//!   │   └── Triggers (individual timer events)
-//!   └── Key Index (fast lookup by key)
-//!       └── Times (scheduled times for each key)
+//! ├── Slabs (time-based partitions for efficient queries)
+//! │   └── Triggers (individual timer events)
+//! └── Key Index (fast lookup by key)
+//!     └── Times (scheduled times for each key)
 //! ```
 //!
-//! ## Key Concepts
-//!
-//! - **Segments**: Top-level partitions that isolate timers by consumer group
-//! - **Slabs**: Time-based partitions within segments for efficient range
-//!   operations
-//! - **Triggers**: Individual timer events with key, time, and metadata
-//! - **Dual Indexing**: Both slab-based (time-oriented) and key-based
-//!   (entity-oriented) indices
-//!
-//! ## Storage Implementations
-//!
-//! The crate provides several storage implementations:
-//!
-//! - [`memory::InMemoryTriggerStore`]: In-memory storage for testing and
-//!   development
-//! - Future implementations may include persistent stores like `ScyllaDB`,
-//!   `PostgreSQL`, etc.
-//!
-//! ## Usage Patterns
-//!
-//! The [`TriggerStore`] trait supports several key usage patterns:
-//!
-//! ### Adding Timers
-//! ```rust,no_run
-//! use prosody::timers::store::TriggerStore;
-//! # async fn example<T: TriggerStore>(store: &T) {
-//! # use prosody::timers::store::{Segment, SegmentId};
-//! # use prosody::timers::Trigger;
-//! # use prosody::timers::duration::CompactDuration;
-//! # use prosody::timers::datetime::CompactDateTime;
-//! # use prosody::Key;
-//! # use uuid::Uuid;
-//! # use tracing::Span;
-//! # let segment_id = SegmentId::new_v4();
-//! # let segment = Segment {
-//! #     id: segment_id,
-//! #     name: "test".to_string(),
-//! #     slab_size: CompactDuration::new(60),
-//! # };
-//! # let trigger = Trigger {
-//! #     key: "test".into(),
-//! #     time: CompactDateTime::now().unwrap(),
-//! #     span: Span::none(),
-//! # };
-//! // Note: This is a simplified example - actual usage would involve slabs
-//! // store.add_trigger(&segment, slab, trigger).await.unwrap();
-//! # }
-//! ```
-//!
-//! ### Querying by Time Range
-//! ```rust,no_run
-//! use futures::StreamExt;
-//! use prosody::timers::store::TriggerStore;
-//! # async fn example<T: TriggerStore>(store: &T) {
-//! # use prosody::timers::store::SegmentId;
-//! # use uuid::Uuid;
-//! # let segment_id = SegmentId::new_v4();
-//! let slab_ids: Vec<_> = store.get_slab_range(&segment_id, 0..100).collect().await;
-//! # }
-//! ```
-//!
-//! ### Querying by Key
-//! ```rust,no_run
-//! use futures::StreamExt;
-//! use prosody::timers::store::TriggerStore;
-//! # async fn example<T: TriggerStore>(store: &T) {
-//! # use prosody::timers::store::SegmentId;
-//! # use prosody::Key;
-//! # use uuid::Uuid;
-//! # let segment_id = SegmentId::new_v4();
-//! # let key: Key = "test".into();
-//! let times: Vec<_> = store.get_key_times(&segment_id, &key).collect().await;
-//! # }
-//! ```
+//! The default in-memory implementation [`memory::InMemoryTriggerStore`] is
+//! suitable for testing and development. Production storage backends can
+//! implement the same trait to provide durability.
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
@@ -110,100 +37,66 @@ pub mod memory;
 /// Comprehensive test suite for [`TriggerStore`] implementations.
 pub mod tests;
 
-/// Unique identifier for timer segments.
+/// Unique identifier for a timer segment.
 ///
-/// Each segment represents a logical partition of timers, typically
-/// corresponding to a consumer group or application instance. Using [`Uuid`]
-/// ensures global uniqueness across distributed deployments.
+/// Segments partition timers by logical grouping (for example, by consumer
+/// group or application instance). Each segment has its own time-based slab
+/// configuration.
 pub type SegmentId = Uuid;
 
-/// Represents a logical partition of timers with time-based organization.
+/// Configuration for a timer segment.
 ///
-/// A [`Segment`] defines how timers are partitioned and organized within the
-/// storage system. Each segment has a unique identifier, human-readable name,
-/// and configuration for time-based slab organization.
-///
-/// ## Purpose
-///
-/// Segments serve several purposes:
-/// - **Isolation**: Separate timer data between different consumer groups
-/// - **Organization**: Provide time-based partitioning via slab configuration
-/// - **Scalability**: Enable horizontal scaling by distributing segments
-///
-/// ## Slab Organization
-///
-/// The `slab_size` determines how timers are partitioned by time:
-/// - Smaller slabs: More precise time ranges, more metadata overhead
-/// - Larger slabs: Broader time ranges, less metadata overhead
-/// - Typical values: 5-60 minutes depending on timer density
+/// Each segment has:
+/// - `id`: its unique [`Uuid`]
+/// - `name`: a human-readable identifier
+/// - `slab_size`: the duration of each time-based partition (slab)
 #[derive(Clone, Debug)]
 pub struct Segment {
-    /// Unique identifier for this segment.
+    /// Unique segment identifier.
     pub id: SegmentId,
 
-    /// Human-readable name for debugging and monitoring.
+    /// Human-readable name for monitoring and debugging.
     pub name: String,
 
-    /// Time span for each slab within this segment.
-    ///
-    /// Determines how timers are partitioned by time for efficient
-    /// range queries and storage organization.
+    /// Duration of a time-based slab in this segment.
     pub slab_size: CompactDuration,
 }
 
 /// Persistent storage interface for timer data.
 ///
-/// [`TriggerStore`] defines the interface for storing and retrieving timer data
-/// with strong consistency guarantees. Implementations must provide efficient
-/// operations for both time-based and key-based access patterns.
+/// Implementations group timer triggers in two ways:
+/// 1. **Time-based**: grouped into slabs for efficient range queries.
+/// 2. **Key-based**: grouped by entity key for efficient lookup and deletion.
 ///
-/// ## Design Principles
+/// # Consistency
 ///
-/// - **Dual Indexing**: Support both time-oriented (slab) and entity-oriented
-///   (key) access
-/// - **Consistency**: Maintain consistency between multiple indices
-/// - **Efficiency**: Optimize for high-volume timer operations
-/// - **Durability**: Survive application restarts and failures
+/// Trigger addition and removal involve two indices (slab and key).
+/// Implementations should strive to perform both updates such that the two
+/// indices remain in sync. In some storage backends this may be best-effort (no
+/// cross-index transaction).
 ///
-/// ## Implementation Requirements
+/// # Performance
 ///
-/// Implementations must ensure:
-/// - **Atomicity**: Operations that modify multiple indices must be atomic
-/// - **Consistency**: All indices must reflect the same logical state
-/// - **Durability**: Data must persist across application restarts
-/// - **Performance**: Operations should scale with data volume
-///
-/// ## Error Handling
-///
-/// All operations return [`Result`] types to handle storage errors gracefully.
-/// Implementations should distinguish between transient errors (network issues)
-/// and permanent errors (constraint violations).
+/// Storage backends should scale to high volumes of timer events and handle
+/// concurrent access.
 pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Error type for storage operations.
     ///
-    /// Should provide detailed information about the failure mode to enable
-    /// appropriate error handling and retry logic.
+    /// Should convey I/O and consistency failures.
     type Error: Error + Send + Sync + 'static;
 
-    // Segment management operations
+    // === Segment operations ===
 
-    /// Creates a new segment in the store.
+    /// Creates a new segment configuration.
     ///
     /// # Arguments
     ///
-    /// * `segment` - The [`Segment`] configuration to store
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful, or an error if
-    /// the segment could not be created.
+    /// * `segment` - The segment metadata to insert.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - A segment with the same ID already exists
-    /// - The storage system is unavailable
-    /// - The segment configuration is invalid
+    /// Returns an error if insertion fails or if a segment with the same ID
+    /// already exists.
     fn insert_segment(
         &self,
         segment: Segment,
@@ -213,108 +106,58 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The unique identifier of the segment to retrieve
+    /// * `segment_id` - The segment identifier to look up.
     ///
     /// # Returns
     ///
-    /// A [`Future`] that resolves to:
-    /// - `Ok(Some(segment))` if the segment exists
-    /// - `Ok(None)` if the segment does not exist
-    /// - `Err(error)` if the operation failed
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the storage system is unavailable or the operation
-    /// fails.
+    /// * `Ok(Some(segment))` if found.
+    /// * `Ok(None)` if not found.
+    /// * `Err` on failure.
     fn get_segment(
         &self,
         segment_id: &SegmentId,
     ) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
 
-    /// Deletes a segment and all associated data.
-    ///
-    /// This operation removes the segment and all slabs, triggers, and indices
-    /// associated with it. Use with caution as this operation is typically
-    /// irreversible.
+    /// Deletes a segment and all associated metadata.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The unique identifier of the segment to delete
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful, or an error if
-    /// the deletion failed.
+    /// * `segment_id` - The segment identifier to delete.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The storage system is unavailable
-    /// - The deletion operation fails partway through
+    /// Returns an error if deletion of the segment or its indices fails.
     fn delete_segment(
         &self,
         segment_id: &SegmentId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // Slab management operations
+    // === Slab (time partition) operations ===
 
-    /// Returns all slab identifiers for a segment.
-    ///
-    /// This provides a way to discover which time ranges have active timers
-    /// within a segment. Useful for cleanup operations and monitoring.
+    /// Lists all slab IDs in a segment.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment to query for slabs
+    /// * `segment_id` - The segment identifier.
     ///
     /// # Returns
     ///
-    /// A [`Stream`] of slab identifiers. The stream may be empty if no
-    /// slabs exist for the segment.
-    ///
-    /// # Errors
-    ///
-    /// Stream items are [`Result`] types that may contain errors if:
-    /// - The storage system becomes unavailable during iteration
-    /// - Individual slab records are corrupted
+    /// A stream of slab identifiers. Each item may be an error.
     fn get_slabs(
         &self,
         segment_id: &SegmentId,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
 
-    /// Returns slab identifiers within a specified range for a segment.
-    ///
-    /// This enables efficient querying of timers within specific time ranges
-    /// by first identifying which slabs overlap with the desired time window.
+    /// Lists slab IDs in a specified inclusive range.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment to query for slabs
-    /// * `range` - The range of slab IDs to include (supports any
-    ///   [`RangeBounds`])
+    /// * `segment_id` - The segment identifier.
+    /// * `range` - The inclusive range of slab IDs to query.
     ///
     /// # Returns
     ///
-    /// A [`Stream`] of slab identifiers within the specified range.
-    ///
-    /// # Errors
-    ///
-    /// Stream items are [`Result`] types that may contain errors if:
-    /// - The storage system becomes unavailable during iteration
-    /// - Individual slab records are corrupted
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # use prosody::timers::store::TriggerStore;
-    /// # async fn example<T: TriggerStore>(store: &T, segment_id: &prosody::timers::store::SegmentId) {
-    /// use futures::StreamExt;
-    ///
-    /// // Get slabs 10 through 20
-    /// let slabs: Vec<_> = store.get_slab_range(segment_id, 10..=20)
-    ///     .collect().await;
-    /// # }
-    /// ```
+    /// A stream of slab identifiers within the range.
     fn get_slab_range<B>(
         &self,
         segment_id: &SegmentId,
@@ -323,121 +166,84 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     where
         B: RangeBounds<SlabId> + Send;
 
-    /// Registers a slab identifier for a segment.
-    ///
-    /// This operation tracks which time ranges (slabs) contain active timers.
-    /// It's typically called when the first timer is added to a new time range.
+    /// Registers (inserts) a slab ID under a segment.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment that owns this slab
-    /// * `slab_id` - The slab identifier to register
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful.
+    /// * `segment_id` - The segment identifier.
+    /// * `slab_id` - The slab ID to insert.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The storage system is unavailable
-    /// - The segment does not exist
+    /// Returns an error if registration fails.
     fn insert_slab(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Unregisters a slab identifier from a segment.
+    /// Unregisters (deletes) a slab ID from a segment.
     ///
-    /// This operation removes the slab from the segment's slab index but does
-    /// NOT automatically delete the slab's trigger data. Use
-    /// [`clear_slab_triggers`] to remove the actual timer data.
+    /// Does **not** delete the actual triggers in that slab; use
+    /// [`clear_slab_triggers`] to remove those.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment that owns this slab
-    /// * `slab_id` - The slab identifier to unregister
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful.
+    /// * `segment_id` - The segment identifier.
+    /// * `slab_id` - The slab ID to remove.
     ///
     /// # Errors
     ///
-    /// Returns an error if the storage system is unavailable.
+    /// Returns an error if removal fails.
     fn delete_slab(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // Slab trigger operations (time-based index)
+    // === Slab trigger (time-based index) operations ===
 
-    /// Returns all triggers within a specific slab.
-    ///
-    /// This provides time-range-based access to timers, enabling efficient
-    /// queries for timers that should execute within a specific time window.
+    /// Streams all triggers within a slab's time range.
     ///
     /// # Arguments
     ///
-    /// * `slab` - The slab specification (segment, ID, and size)
+    /// * `slab` - The slab descriptor.
     ///
     /// # Returns
     ///
-    /// A [`Stream`] of triggers within the slab's time range.
-    ///
-    /// # Errors
-    ///
-    /// Stream items are [`Result`] types that may contain errors if:
-    /// - The storage system becomes unavailable during iteration
-    /// - Individual trigger records are corrupted
+    /// A stream of triggers in that slab.
     fn get_slab_triggers(
         &self,
         slab: &Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
-    /// Adds a trigger to a slab's time-based index.
-    ///
-    /// This operation maintains the time-oriented view of timers, enabling
-    /// efficient queries by time range. Typically used in conjunction with
-    /// [`insert_key_trigger`] to maintain dual indexing.
+    /// Inserts a trigger into the slab index.
     ///
     /// # Arguments
     ///
-    /// * `slab` - The slab to add the trigger to
-    /// * `trigger` - The trigger to add
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful.
+    /// * `slab` - The slab descriptor.
+    /// * `trigger` - The trigger to insert.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The storage system is unavailable
-    /// - The trigger data is invalid
+    /// Returns an error if insertion fails.
     fn insert_slab_trigger(
         &self,
         slab: Slab,
         trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Removes a specific trigger from a slab's time-based index.
+    /// Deletes a specific trigger from a slab's index.
     ///
     /// # Arguments
     ///
-    /// * `slab` - The slab to remove the trigger from
-    /// * `key` - The key of the trigger to remove
-    /// * `time` - The time of the trigger to remove
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful.
+    /// * `slab` - The slab descriptor.
+    /// * `key` - The trigger's entity key.
+    /// * `time` - The trigger's scheduled time.
     ///
     /// # Errors
     ///
-    /// Returns an error if the storage system is unavailable.
+    /// Returns an error if deletion fails.
     fn delete_slab_trigger(
         &self,
         slab: &Slab,
@@ -445,103 +251,83 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Removes all triggers from a slab's time-based index.
+    /// Clears all triggers from a slab's index.
     ///
-    /// This is typically used during cleanup operations when a slab's
-    /// time range has passed and all timers have been processed.
+    /// Typically used after all timers in that slab have fired.
     ///
     /// # Arguments
     ///
-    /// * `slab` - The slab to clear
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful.
+    /// * `slab` - The slab descriptor.
     ///
     /// # Errors
     ///
-    /// Returns an error if the storage system is unavailable.
+    /// Returns an error if clearing fails.
     fn clear_slab_triggers(
         &self,
         slab: &Slab,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // Key trigger operations (entity-based index)
+    // === Key trigger (entity-based index) operations ===
 
-    /// Returns all scheduled times for a specific key within a segment.
-    ///
-    /// This provides entity-oriented access to timers, enabling efficient
-    /// queries for all timers associated with a particular logical entity
-    /// (e.g., user, order, session).
+    /// Streams all scheduled times for a given key.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment to search within
-    /// * `key` - The key to find scheduled times for
+    /// * `segment_id` - The segment identifier.
+    /// * `key` - The entity key.
     ///
     /// # Returns
     ///
-    /// A [`Stream`] of [`CompactDateTime`] values representing when
-    /// timers are scheduled for the specified key.
-    ///
-    /// # Errors
-    ///
-    /// Stream items are [`Result`] types that may contain errors if:
-    /// - The storage system becomes unavailable during iteration
-    /// - Individual time records are corrupted
+    /// A stream of times when the key has triggers scheduled.
     fn get_key_times(
         &self,
         segment_id: &SegmentId,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
 
+    /// Streams all triggers for a given key.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier.
+    /// * `key` - The entity key.
+    ///
+    /// # Returns
+    ///
+    /// A stream of full trigger records for the key.
     fn get_key_triggers(
         &self,
         segment_id: &SegmentId,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
-    /// Adds a trigger to the key-based index.
-    ///
-    /// This operation maintains the entity-oriented view of timers, enabling
-    /// efficient queries by key. Typically used in conjunction with
-    /// [`insert_slab_trigger`] to maintain dual indexing.
+    /// Inserts a trigger into the key-based index.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment containing the trigger
-    /// * `trigger` - The trigger to index by key
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful.
+    /// * `segment_id` - The segment identifier.
+    /// * `trigger` - The trigger to insert.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The storage system is unavailable
-    /// - The trigger data is invalid
+    /// Returns an error if insertion fails.
     fn insert_key_trigger(
         &self,
         segment_id: &SegmentId,
         trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Removes a specific trigger from the key-based index.
+    /// Deletes a specific trigger from the key-based index.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment containing the trigger
-    /// * `key` - The key of the trigger to remove
-    /// * `time` - The time of the trigger to remove
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful.
+    /// * `segment_id` - The segment identifier.
+    /// * `key` - The entity key.
+    /// * `time` - The scheduled time.
     ///
     /// # Errors
     ///
-    /// Returns an error if the storage system is unavailable.
+    /// Returns an error if deletion fails.
     fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
@@ -549,52 +335,39 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Removes all triggers for a specific key from the key-based index.
-    ///
-    /// This operation removes all scheduled times for a particular entity,
-    /// effectively canceling all timers associated with that key.
+    /// Clears all triggers for a specific key.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment containing the triggers
-    /// * `key` - The key to clear all triggers for
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if successful.
+    /// * `segment_id` - The segment identifier.
+    /// * `key` - The entity key.
     ///
     /// # Errors
     ///
-    /// Returns an error if the storage system is unavailable.
+    /// Returns an error if clearing fails.
     fn clear_key_triggers(
         &self,
         segment_id: &SegmentId,
         key: &Key,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // High-level composite operations
+    // === Composite operations ===
 
-    /// Adds a trigger to all relevant indices atomically.
+    /// Adds a trigger to both slab and key indices.
     ///
-    /// This is the primary method for adding new timers to the store. It
-    /// ensures that the trigger is properly indexed in both the time-based
-    /// (slab) and entity-based (key) indices, maintaining consistency
-    /// across the storage system.
+    /// Implementations should attempt to keep both indices updated so they
+    /// remain consistent; failures may still leave partial state in some
+    /// backends.
     ///
     /// # Arguments
     ///
-    /// * `segment` - The segment configuration
-    /// * `slab` - The slab containing the trigger
-    /// * `trigger` - The trigger to add
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if all operations succeed.
+    /// * `segment` - The segment configuration.
+    /// * `slab` - The slab descriptor.
+    /// * `trigger` - The trigger to add.
     ///
     /// # Errors
     ///
-    /// Returns an error if any of the indexing operations fail. Implementations
-    /// should ensure atomicity - either all indices are updated or none are.
+    /// Returns an error if any index insertion fails.
     fn add_trigger(
         &self,
         segment: &Segment,
@@ -606,34 +379,29 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         async move {
             try_join!(
                 self.insert_slab(&segment_id, slab_id),
-                self.insert_slab_trigger(slab, trigger.clone()),
+                self.insert_slab_trigger(slab.clone(), trigger.clone()),
                 self.insert_key_trigger(&segment_id, trigger),
             )?;
             Ok(())
         }
     }
 
-    /// Removes a trigger from all relevant indices atomically.
+    /// Removes a trigger from both slab and key indices.
     ///
-    /// This operation removes the specified trigger from both the time-based
-    /// and entity-based indices, maintaining consistency across the storage
-    /// system.
+    /// Implementations should attempt to keep both indices updated so they
+    /// remain consistent; failures may still leave partial state in some
+    /// backends.
     ///
     /// # Arguments
     ///
-    /// * `segment` - The segment configuration
-    /// * `slab` - The slab containing the trigger
-    /// * `key` - The key of the trigger to remove
-    /// * `time` - The time of the trigger to remove
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if all operations succeed.
+    /// * `segment` - The segment configuration.
+    /// * `slab` - The slab descriptor.
+    /// * `key` - The trigger's entity key.
+    /// * `time` - The trigger's scheduled time.
     ///
     /// # Errors
     ///
-    /// Returns an error if any of the removal operations fail. Implementations
-    /// should ensure atomicity - either all indices are updated or none are.
+    /// Returns an error if any index removal fails.
     fn remove_trigger(
         &self,
         segment: &Segment,
@@ -644,36 +412,24 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         async move {
             try_join!(
                 self.delete_slab_trigger(slab, key, time),
-                self.delete_key_trigger(&segment.id, key, time)
+                self.delete_key_trigger(&segment.id, key, time),
             )?;
             Ok(())
         }
     }
 
-    /// Removes all triggers for a specific key from all indices.
-    ///
-    /// This operation efficiently removes all timers associated with a
-    /// particular entity by first querying the key index, then removing
-    /// from both the slab and key indices. This is useful for cleanup
-    /// operations when an entity is deleted or when canceling all timers
-    /// for an entity.
+    /// Removes all triggers for a key, clearing both slab and key indices.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment containing the triggers
-    /// * `key` - The key to clear all triggers for
-    /// * `slab_size` - The slab size configuration for calculating slab
-    ///   locations
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to `Ok(())` if all operations succeed.
+    /// * `segment_id` - The segment identifier.
+    /// * `key` - The entity key.
+    /// * `slab_size` - Slab duration used to locate each time's slab.
     ///
     /// # Errors
     ///
-    /// Returns an error if any of the removal operations fail. The operation
-    /// may partially complete if some triggers are removed before an error
-    /// occurs.
+    /// Returns an error if any removal fails. Partial completion may occur
+    /// if an error interrupts processing.
     fn clear_triggers_for_key(
         &self,
         segment_id: &SegmentId,
