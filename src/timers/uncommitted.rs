@@ -39,8 +39,8 @@ const RETRY_DURATION: Duration = Duration::from_secs(1);
 /// Provides access to timer metadata and transaction operations,
 /// hiding the concrete store implementation from clients.
 pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
-    /// The transaction guard type for this timer.
-    type Store: TriggerStore;
+    /// The commit guard type for this timer.
+    type CommitGuard: Uncommitted + Send;
 
     /// Scheduled execution time of this timer.
     fn time(&self) -> CompactDateTime;
@@ -51,15 +51,15 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     /// Check if this timer is still active in the in-memory scheduler.
     fn is_active(&self) -> impl Future<Output = bool> + Send;
 
-    /// Decompose into the raw `Trigger` and the transaction guard.
+    /// Decompose into the raw `Trigger` and the commit guard.
     ///
     /// This is useful for advanced scenarios needing direct control over commit
     /// or abort without consuming the wrapper.
     ///
     /// # Returns
     ///
-    /// Tuple `(Trigger, Self::Guard)`.
-    fn into_inner(self) -> (Trigger, UncommittedTrigger<Self::Store>);
+    /// Tuple `(Trigger, Self::CommitGuard)`.
+    fn into_inner(self) -> (Trigger, Self::CommitGuard);
 }
 
 /// The concrete implementation of an uncommitted timer event.
@@ -70,7 +70,7 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
 /// persistent data.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
-pub struct ConcreteUncommittedTimer<T>
+pub struct PendingTimer<T>
 where
     T: TriggerStore,
 {
@@ -80,6 +80,18 @@ where
     /// Transaction state and coordination with `TimerManager`.
     #[educe(Debug(ignore))]
     uncommitted: UncommittedTrigger<T>,
+}
+
+/// A wrapper around `UncommittedTrigger` that implements `Uncommitted`.
+///
+/// This wrapper is necessary because `UncommittedTrigger` implements `Drop`
+/// and `Uncommitted` requires consuming `self`.
+pub struct UncommittedTriggerGuard<T>
+where
+    T: TriggerStore,
+{
+    /// The wrapped uncommitted trigger.
+    inner: Option<UncommittedTrigger<T>>,
 }
 
 /// Internal transaction state for an uncommitted timer.
@@ -103,7 +115,7 @@ where
     completed: bool,
 }
 
-impl<T> ConcreteUncommittedTimer<T>
+impl<T> PendingTimer<T>
 where
     T: TriggerStore,
 {
@@ -133,7 +145,7 @@ where
     }
 }
 
-impl<T> Uncommitted for ConcreteUncommittedTimer<T>
+impl<T> Uncommitted for PendingTimer<T>
 where
     T: TriggerStore,
 {
@@ -153,7 +165,7 @@ where
     }
 }
 
-impl<T> Keyed for ConcreteUncommittedTimer<T>
+impl<T> Keyed for PendingTimer<T>
 where
     T: TriggerStore,
 {
@@ -162,6 +174,49 @@ where
     /// Returns the key associated with this timer.
     fn key(&self) -> &Self::Key {
         &self.trigger.key
+    }
+}
+
+impl<T> UncommittedTriggerGuard<T>
+where
+    T: TriggerStore,
+{
+    /// Create a new guard wrapping an uncommitted trigger.
+    fn new(trigger: UncommittedTrigger<T>) -> Self {
+        Self {
+            inner: Some(trigger),
+        }
+    }
+
+    /// Check if the timer remains active in the scheduler.
+    ///
+    /// # Returns
+    ///
+    /// `true` if still loaded, `false` if completed or no longer scheduled.
+    pub async fn is_active(&self) -> bool {
+        match &self.inner {
+            Some(trigger) => trigger.is_active().await,
+            None => false,
+        }
+    }
+}
+
+impl<T> Uncommitted for UncommittedTriggerGuard<T>
+where
+    T: TriggerStore,
+{
+    /// Commit this timer after successful processing.
+    async fn commit(mut self) {
+        if let Some(mut trigger) = self.inner.take() {
+            trigger.commit().await;
+        }
+    }
+
+    /// Abort this timer without deleting persistent data.
+    async fn abort(mut self) {
+        if let Some(mut trigger) = self.inner.take() {
+            trigger.abort().await;
+        }
     }
 }
 
@@ -217,11 +272,11 @@ where
     }
 }
 
-impl<T> UncommittedTimer for ConcreteUncommittedTimer<T>
+impl<T> UncommittedTimer for PendingTimer<T>
 where
     T: TriggerStore,
 {
-    type Store = T;
+    type CommitGuard = UncommittedTriggerGuard<T>;
 
     /// Scheduled execution time of this timer.
     fn time(&self) -> CompactDateTime {
@@ -238,9 +293,9 @@ where
         self.uncommitted.is_active().await
     }
 
-    /// Decompose into the raw `Trigger` and the transaction guard.
-    fn into_inner(self) -> (Trigger, UncommittedTrigger<Self::Store>) {
-        (self.trigger, self.uncommitted)
+    /// Decompose into the raw `Trigger` and the commit guard.
+    fn into_inner(self) -> (Trigger, Self::CommitGuard) {
+        (self.trigger, UncommittedTriggerGuard::new(self.uncommitted))
     }
 }
 
@@ -254,6 +309,20 @@ where
     fn drop(&mut self) {
         if !self.completed {
             warn!("timer was dropped without committing or aborting");
+        }
+    }
+}
+
+impl<T> Drop for UncommittedTriggerGuard<T>
+where
+    T: TriggerStore,
+{
+    /// Warn if a guard is dropped without being committed or aborted.
+    ///
+    /// This helps detect resource leaks from unacknowledged timers.
+    fn drop(&mut self) {
+        if self.inner.is_some() {
+            warn!("timer guard was dropped without committing or aborting");
         }
     }
 }

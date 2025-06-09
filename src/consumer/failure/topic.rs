@@ -13,7 +13,7 @@ use crate::Topic;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider, Keyed};
+use crate::consumer::{EventHandler, HandlerProvider, Keyed, Uncommitted};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::from_env;
@@ -279,7 +279,7 @@ where
         C: EventContext,
         U: UncommittedTimer,
     {
-        let (trigger, mut uncommitted_timer) = timer.into_inner();
+        let (trigger, uncommitted_timer) = timer.into_inner();
         // Attempt to handle the timer and send to failure topic if it fails
         let Err(error) = FallibleHandler::on_timer(self, context, trigger.clone()).await else {
             uncommitted_timer.commit().await;

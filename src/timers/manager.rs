@@ -20,7 +20,7 @@ use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use crate::timers::{ConcreteUncommittedTimer, DELETE_CONCURRENCY, Trigger};
+use crate::timers::{DELETE_CONCURRENCY, PendingTimer, Trigger};
 use educe::Educe;
 use futures::stream::iter;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -87,8 +87,7 @@ where
         slab_size: CompactDuration,
         name: &str,
         store: T,
-    ) -> Result<(impl Stream<Item = ConcreteUncommittedTimer<T>>, Self), TimerManagerError<T::Error>>
-    {
+    ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
 
@@ -107,7 +106,7 @@ where
 
         // Wrap the scheduler receiver into an UncommittedTimer stream.
         let stream = ReceiverStream::new(trigger_rx)
-            .map(move |trigger| ConcreteUncommittedTimer::new(trigger, cloned_manager.clone()));
+            .map(move |trigger| PendingTimer::new(trigger, cloned_manager.clone()));
 
         Ok((stream, manager))
     }
@@ -401,7 +400,7 @@ mod tests {
 
     /// Helper function to set up a timer manager for testing
     async fn setup_timer_manager() -> Result<(
-        impl Stream<Item = ConcreteUncommittedTimer<InMemoryTriggerStore>>,
+        impl Stream<Item = PendingTimer<InMemoryTriggerStore>>,
         TimerManager<InMemoryTriggerStore>,
     )> {
         let store = InMemoryTriggerStore::new();

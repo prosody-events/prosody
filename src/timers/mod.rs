@@ -126,4 +126,4 @@ pub const DELETE_CONCURRENCY: usize = 16;
 
 // Re-export primary APIs:
 pub use manager::TimerManager;
-pub use uncommitted::{ConcreteUncommittedTimer, UncommittedTimer};
+pub use uncommitted::{PendingTimer, UncommittedTimer};

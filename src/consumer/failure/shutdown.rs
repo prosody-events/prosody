@@ -7,7 +7,7 @@
 use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider};
+use crate::consumer::{EventHandler, HandlerProvider, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use thiserror::Error;
 
@@ -122,7 +122,7 @@ where
         C: EventContext,
         U: UncommittedTimer,
     {
-        let (trigger, mut uncommitted) = timer.into_inner();
+        let (trigger, uncommitted) = timer.into_inner();
 
         // Check if the partition is being revoked
         if context.should_shutdown() {

@@ -106,7 +106,7 @@ pub trait EventContext: Clone + Send {
 /// * `T` – The `TriggerStore` implementation used by the timer manager.
 #[derive(Educe)]
 #[educe(Debug, Clone(bound()))]
-pub struct ConcreteEventContext<T> {
+pub struct TimerContext<T> {
     key: Key,
 
     #[educe(Debug(ignore))]
@@ -116,7 +116,7 @@ pub struct ConcreteEventContext<T> {
     timers: TimerManager<T>,
 }
 
-impl<T> ConcreteEventContext<T>
+impl<T> TimerContext<T>
 where
     T: TriggerStore,
 {
@@ -140,7 +140,7 @@ where
     }
 }
 
-impl<T> EventContext for ConcreteEventContext<T>
+impl<T> EventContext for TimerContext<T>
 where
     T: TriggerStore,
 {

@@ -17,7 +17,7 @@ use validator::{Validate, ValidationErrors};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider, Keyed};
+use crate::consumer::{EventHandler, HandlerProvider, Keyed, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 
@@ -392,7 +392,7 @@ where
         U: UncommittedTimer,
     {
         // Retry logic for an uncommitted timer
-        let (trigger, mut uncommitted) = timer.into_inner();
+        let (trigger, uncommitted) = timer.into_inner();
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);

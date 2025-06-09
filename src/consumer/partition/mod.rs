@@ -14,7 +14,7 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
-use crate::consumer::event_context::ConcreteEventContext;
+use crate::consumer::event_context::TimerContext;
 use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
@@ -22,7 +22,7 @@ use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Keyed, Uncommitted};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
-use crate::timers::{ConcreteUncommittedTimer, TimerManager, UncommittedTimer};
+use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
@@ -405,7 +405,7 @@ async fn handle_messages<T, S>(
 
         // Process message with handler
         debug!(?event, "permit acquired; calling handler");
-        let context = ConcreteEventContext::new(
+        let context = TimerContext::new(
             event.key().clone(),
             shutdown_rx.clone(),
             timer_manager.clone(),
@@ -503,7 +503,7 @@ where
 
 fn build_timer_stream<T, S>(timer_stream: S) -> impl Stream<Item = UncommittedEvent<T>>
 where
-    S: Stream<Item = ConcreteUncommittedTimer<T>>,
+    S: Stream<Item = PendingTimer<T>>,
     T: TriggerStore,
 {
     stream! {

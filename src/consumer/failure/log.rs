@@ -6,7 +6,7 @@
 use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider};
+use crate::consumer::{EventHandler, HandlerProvider, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use tracing::error;
 
@@ -147,7 +147,7 @@ where
         C: EventContext,
         U: UncommittedTimer,
     {
-        let (timer, mut uncommitted_timer) = timer.into_inner();
+        let (timer, uncommitted_timer) = timer.into_inner();
 
         // Attempt message processing
         let Err(error) = self.0.on_timer(context, timer).await else {
