@@ -386,9 +386,10 @@ where
         }
     }
 
-    async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
+    async fn on_timer<C, U>(&self, context: C, timer: U)
     where
         C: EventContext,
+        U: UncommittedTimer,
     {
         // Retry logic for an uncommitted timer
         let (trigger, mut uncommitted) = timer.into_inner();

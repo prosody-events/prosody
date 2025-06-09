@@ -40,9 +40,10 @@ impl EventHandler for TestHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
     where
         C: EventContext,
+        U: UncommittedTimer,
     {
     }
 

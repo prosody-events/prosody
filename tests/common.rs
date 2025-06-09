@@ -396,9 +396,10 @@ impl EventHandler for TestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
     where
         C: EventContext,
+        U: UncommittedTimer,
     {
     }
 
@@ -434,9 +435,10 @@ impl EventHandler for SlowTestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
     where
         C: EventContext,
+        U: UncommittedTimer,
     {
     }
 

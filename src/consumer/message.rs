@@ -15,7 +15,7 @@ use tracing::{Span, debug};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
-use crate::timers::UncommittedTimer;
+use crate::timers::ConcreteUncommittedTimer;
 use crate::timers::store::TriggerStore;
 use crate::{
     BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem, Topic,
@@ -40,7 +40,7 @@ where
     Message(UncommittedMessage),
 
     /// A timer event requiring commit/abort.
-    Timer(UncommittedTimer<T>),
+    Timer(ConcreteUncommittedTimer<T>),
 }
 
 impl<T> Keyed for UncommittedEvent<T>
@@ -85,11 +85,11 @@ where
     }
 }
 
-impl<T> From<UncommittedTimer<T>> for UncommittedEvent<T>
+impl<T> From<ConcreteUncommittedTimer<T>> for UncommittedEvent<T>
 where
     T: TriggerStore,
 {
-    fn from(value: UncommittedTimer<T>) -> Self {
+    fn from(value: ConcreteUncommittedTimer<T>) -> Self {
         Self::Timer(value)
     }
 }

@@ -22,7 +22,7 @@ use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Keyed, Uncommitted};
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
-use crate::timers::{TimerManager, UncommittedTimer};
+use crate::timers::{ConcreteUncommittedTimer, TimerManager, UncommittedTimer};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
@@ -503,7 +503,7 @@ where
 
 fn build_timer_stream<T, S>(timer_stream: S) -> impl Stream<Item = UncommittedEvent<T>>
 where
-    S: Stream<Item = UncommittedTimer<T>>,
+    S: Stream<Item = ConcreteUncommittedTimer<T>>,
     T: TriggerStore,
 {
     stream! {

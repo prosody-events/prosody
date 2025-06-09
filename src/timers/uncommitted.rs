@@ -1,9 +1,14 @@
 //! Uncommitted timer events and transaction-like semantics.
 //!
-//! This module defines `UncommittedTimer` and its internal state
-//! `UncommittedTrigger`, modeling timers that have fired and been delivered to
-//! the application but not yet acknowledged. It enforces a transaction-like
-//! pattern:
+//! This module defines the timer event abstraction used for processing fired
+//! timers that have been delivered to the application but not yet acknowledged:
+//!
+//! - `UncommittedTimer` – A trait providing timer metadata and transaction
+//!   operations while hiding the concrete store implementation.
+//! - `ConcreteUncommittedTimer` – The concrete implementation of
+//!   `UncommittedTimer`.
+//!
+//! It enforces a transaction-like pattern:
 //!
 //! 1. Delivery: timers arrive as `UncommittedTimer`
 //! 2. Processing: application handles the timer event
@@ -21,6 +26,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
 use crate::timers::store::TriggerStore;
 use educe::Educe;
+use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{Span, warn};
@@ -28,15 +34,43 @@ use tracing::{Span, warn};
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
 
-/// A timer event that has fired but not yet been acknowledged.
+/// A trait for uncommitted timer operations.
 ///
-/// `UncommittedTimer<T>` wraps a `Trigger` and an internal transaction state.
-/// After processing, applications must call `commit()` to remove the timer from
-/// storage, or `abort()` to deactivate it in-memory while leaving persistent
-/// data.
+/// Provides access to timer metadata and transaction operations,
+/// hiding the concrete store implementation from clients.
+pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
+    /// The transaction guard type for this timer.
+    type Store: TriggerStore;
+
+    /// Scheduled execution time of this timer.
+    fn time(&self) -> CompactDateTime;
+
+    /// Tracing span associated with this timer.
+    fn span(&self) -> &Span;
+
+    /// Check if this timer is still active in the in-memory scheduler.
+    fn is_active(&self) -> impl Future<Output = bool> + Send;
+
+    /// Decompose into the raw `Trigger` and the transaction guard.
+    ///
+    /// This is useful for advanced scenarios needing direct control over commit
+    /// or abort without consuming the wrapper.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(Trigger, Self::Guard)`.
+    fn into_inner(self) -> (Trigger, UncommittedTrigger<Self::Store>);
+}
+
+/// The concrete implementation of an uncommitted timer event.
+///
+/// `ConcreteUncommittedTimer<T>` wraps a `Trigger` and an internal transaction
+/// state. After processing, applications must call `commit()` to remove the
+/// timer from storage, or `abort()` to deactivate it in-memory while leaving
+/// persistent data.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
-pub struct UncommittedTimer<T>
+pub struct ConcreteUncommittedTimer<T>
 where
     T: TriggerStore,
 {
@@ -69,7 +103,7 @@ where
     completed: bool,
 }
 
-impl<T> UncommittedTimer<T>
+impl<T> ConcreteUncommittedTimer<T>
 where
     T: TriggerStore,
 {
@@ -82,7 +116,7 @@ where
     ///
     /// # Returns
     ///
-    /// A new `UncommittedTimer` in the pending state.
+    /// A new `ConcreteUncommittedTimer` in the pending state.
     #[must_use]
     pub fn new(trigger: Trigger, manager: TimerManager<T>) -> Self {
         let key = trigger.key.clone();
@@ -97,53 +131,9 @@ where
             },
         }
     }
-
-    /// Decompose into the raw `Trigger` and the transaction guard.
-    ///
-    /// This is useful for advanced scenarios needing direct control over commit
-    /// or abort without consuming the wrapper.
-    ///
-    /// # Returns
-    ///
-    /// Tuple `(Trigger, UncommittedTrigger<T>)`.
-    #[must_use]
-    pub fn into_inner(self) -> (Trigger, UncommittedTrigger<T>) {
-        (self.trigger, self.uncommitted)
-    }
-
-    /// Scheduled execution time of this timer.
-    ///
-    /// # Returns
-    ///
-    /// The `CompactDateTime` when this timer fires.
-    #[must_use]
-    pub fn time(&self) -> CompactDateTime {
-        self.trigger.time
-    }
-
-    /// Tracing span associated with this timer.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the `Span` for distributed tracing.
-    #[must_use]
-    pub fn span(&self) -> &Span {
-        &self.trigger.span
-    }
-
-    /// Check if this timer is still active in the in-memory scheduler.
-    ///
-    /// A timer remains active until it is committed or explicitly aborted.
-    ///
-    /// # Returns
-    ///
-    /// `true` if loaded and awaiting acknowledgment, `false` otherwise.
-    pub async fn is_active(&self) -> bool {
-        self.uncommitted.is_active().await
-    }
 }
 
-impl<T> Uncommitted for UncommittedTimer<T>
+impl<T> Uncommitted for ConcreteUncommittedTimer<T>
 where
     T: TriggerStore,
 {
@@ -163,7 +153,7 @@ where
     }
 }
 
-impl<T> Keyed for UncommittedTimer<T>
+impl<T> Keyed for ConcreteUncommittedTimer<T>
 where
     T: TriggerStore,
 {
@@ -224,6 +214,33 @@ where
 
         self.manager.abort(&self.key, self.time).await;
         self.completed = true;
+    }
+}
+
+impl<T> UncommittedTimer for ConcreteUncommittedTimer<T>
+where
+    T: TriggerStore,
+{
+    type Store = T;
+
+    /// Scheduled execution time of this timer.
+    fn time(&self) -> CompactDateTime {
+        self.trigger.time
+    }
+
+    /// Tracing span associated with this timer.
+    fn span(&self) -> &Span {
+        &self.trigger.span
+    }
+
+    /// Check if this timer is still active in the in-memory scheduler.
+    async fn is_active(&self) -> bool {
+        self.uncommitted.is_active().await
+    }
+
+    /// Decompose into the raw `Trigger` and the transaction guard.
+    fn into_inner(self) -> (Trigger, UncommittedTrigger<Self::Store>) {
+        (self.trigger, self.uncommitted)
     }
 }
 

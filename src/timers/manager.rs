@@ -20,8 +20,7 @@ use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use crate::timers::uncommitted::UncommittedTimer;
-use crate::timers::{DELETE_CONCURRENCY, Trigger};
+use crate::timers::{ConcreteUncommittedTimer, DELETE_CONCURRENCY, Trigger};
 use educe::Educe;
 use futures::stream::iter;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -88,7 +87,8 @@ where
         slab_size: CompactDuration,
         name: &str,
         store: T,
-    ) -> Result<(impl Stream<Item = UncommittedTimer<T>>, Self), TimerManagerError<T::Error>> {
+    ) -> Result<(impl Stream<Item = ConcreteUncommittedTimer<T>>, Self), TimerManagerError<T::Error>>
+    {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
 
@@ -107,7 +107,7 @@ where
 
         // Wrap the scheduler receiver into an UncommittedTimer stream.
         let stream = ReceiverStream::new(trigger_rx)
-            .map(move |trigger| UncommittedTimer::new(trigger, cloned_manager.clone()));
+            .map(move |trigger| ConcreteUncommittedTimer::new(trigger, cloned_manager.clone()));
 
         Ok((stream, manager))
     }
@@ -379,6 +379,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timers::UncommittedTimer;
     use crate::timers::store::memory::InMemoryTriggerStore;
     use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
@@ -400,7 +401,7 @@ mod tests {
 
     /// Helper function to set up a timer manager for testing
     async fn setup_timer_manager() -> Result<(
-        impl Stream<Item = UncommittedTimer<InMemoryTriggerStore>>,
+        impl Stream<Item = ConcreteUncommittedTimer<InMemoryTriggerStore>>,
         TimerManager<InMemoryTriggerStore>,
     )> {
         let store = InMemoryTriggerStore::new();
@@ -719,20 +720,12 @@ mod tests {
         time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
-        // Check if we receive the timer (may depend on slab ownership)
-        tokio::select! {
-            timer = stream.next() => {
-                if let Some(uncommitted_timer) = timer {
-                    let (trigger_data, _) = uncommitted_timer.into_inner();
-                    assert_eq!(trigger_data.key, trigger.key);
-                    assert_eq!(trigger_data.time, trigger.time);
-                }
-                // If no timer received, it may be due to slab ownership
-            }
-            _ = time::sleep(Duration::from_millis(100)) => {
-                // Timeout is acceptable - timer delivery depends on slab ownership
-            }
+        if let Some(uncommitted_timer) = stream.next().await {
+            let (trigger_data, _) = uncommitted_timer.into_inner();
+            assert_eq!(trigger_data.key, trigger.key);
+            assert_eq!(trigger_data.time, trigger.time);
         }
+
         Ok(())
     }
 
@@ -751,7 +744,7 @@ mod tests {
         for i in 0..10 {
             let manager_clone = manager.clone();
             let handle = spawn(async move {
-                let trigger = create_test_trigger(&format!("concurrent-{}", i), 60 + i).unwrap();
+                let trigger = create_test_trigger(&format!("concurrent-{i}"), 60 + i).unwrap();
                 manager_clone.schedule(trigger).await
             });
             handles.push(handle);
@@ -765,8 +758,8 @@ mod tests {
         }
 
         // Verify all timers were scheduled
-        for i in 0..10 {
-            let key = Key::from(format!("concurrent-{}", i));
+        for i in 0..10_u8 {
+            let key = Key::from(format!("concurrent-{i}"));
             let times = manager.scheduled_times(&key).await?;
             assert_eq!(times.len(), 1, "Timer {i} should be scheduled");
         }

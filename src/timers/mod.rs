@@ -32,9 +32,10 @@
 //!         // Handle message processing
 //!     }
 //!
-//!     async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
+//!     async fn on_timer<C, T>(&self, context: C, timer: T)
 //!     where
 //!         C: EventContext,
+//!         T: UncommittedTimer,
 //!     {
 //!         // Process the timer event
 //!         println!("Timer fired for key: {:?}", timer.key());
@@ -125,4 +126,4 @@ pub const DELETE_CONCURRENCY: usize = 16;
 
 // Re-export primary APIs:
 pub use manager::TimerManager;
-pub use uncommitted::UncommittedTimer;
+pub use uncommitted::{ConcreteUncommittedTimer, UncommittedTimer};

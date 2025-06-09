@@ -54,9 +54,10 @@
 //!         message.commit().await;
 //!     }
 //!
-//!     async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
+//!     async fn on_timer<C, U>(&self, context: C, timer: U)
 //!     where
 //!         C: EventContext,
+//!         U: UncommittedTimer,
 //!     {
 //!         // Process the timer
 //!         println!("Processing timer");
@@ -227,7 +228,7 @@ pub trait Uncommitted {
     ///
     /// Implementations should ensure that commit operations are idempotent
     /// and will eventually succeed even in the face of transient failures.
-    fn commit(self) -> impl Future<Output = ()>;
+    fn commit(self) -> impl Future<Output = ()> + Send;
 
     /// Acknowledges failed processing of the event.
     ///
@@ -242,7 +243,7 @@ pub trait Uncommitted {
     /// configuration:
     /// - **Messages**: May be retried or sent to failure topics
     /// - **Timers**: May be rescheduled or permanently canceled
-    fn abort(self) -> impl Future<Output = ()>;
+    fn abort(self) -> impl Future<Output = ()> + Send;
 }
 
 /// Provides handlers for processing messages from specific partitions.
@@ -316,13 +317,10 @@ pub trait EventHandler {
     ///
     /// A future that resolves when timer processing is complete. Note that
     /// this future completing does not automatically commit the timer.
-    fn on_timer<C>(
-        &self,
-        context: C,
-        timer: UncommittedTimer<C::Store>,
-    ) -> impl Future<Output = ()> + Send
+    fn on_timer<C, T>(&self, context: C, timer: T) -> impl Future<Output = ()> + Send
     where
-        C: EventContext;
+        C: EventContext,
+        T: UncommittedTimer;
 
     /// Shuts down the message handler.
     ///

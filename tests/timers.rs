@@ -12,7 +12,7 @@ use prosody::{
     Topic,
     admin::ProsodyAdminClient,
     consumer::message::UncommittedMessage,
-    consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted},
+    consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::UncommittedTimer,
     timers::datetime::CompactDateTime,
@@ -127,9 +127,10 @@ impl EventHandler for TimerTestHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<C>(&self, _context: C, timer: UncommittedTimer<C::Store>)
+    async fn on_timer<C, U>(&self, _context: C, timer: U)
     where
         C: EventContext,
+        U: UncommittedTimer,
     {
         let key = timer.key().to_string();
         let time = timer.time();

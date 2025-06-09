@@ -224,9 +224,10 @@ async fn test_partition_manager_is_stalled() {
             }
         }
 
-        async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
+        async fn on_timer<C, U>(&self, _context: C, _timer: U)
         where
             C: EventContext,
+            U: UncommittedTimer,
         {
             // todo: add timer test
         }
@@ -483,9 +484,10 @@ impl EventHandler for TestHandler {
         }
     }
 
-    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
     where
         C: EventContext,
+        U: UncommittedTimer,
     {
         // todo: add timer test
     }
