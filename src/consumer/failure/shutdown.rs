@@ -4,10 +4,10 @@
 //! partition is being revoked, ensuring proper handling of in-flight messages
 //! and preventing new message processing.
 
+use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider};
-use crate::timers::store::TriggerStore;
 use crate::timers::{Trigger, UncommittedTimer};
 use thiserror::Error;
 
@@ -54,13 +54,9 @@ where
     ///
     /// Returns a `ShutdownError::Shutdown` if the partition is being revoked,
     /// or a `ShutdownError::Handler` containing the wrapped handler's error.
-    async fn on_message<S>(
-        &self,
-        context: EventContext<S>,
-        message: ConsumerMessage,
-    ) -> Result<(), Self::Error>
+    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         if context.should_shutdown() {
             return Err(ShutdownError::Shutdown);
@@ -72,9 +68,9 @@ where
             .map_err(ShutdownError::Handler)
     }
 
-    async fn on_timer<S>(&self, context: EventContext<S>, timer: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(&self, context: C, timer: Trigger) -> Result<(), Self::Error>
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         if context.should_shutdown() {
             return Err(ShutdownError::Shutdown);
@@ -96,9 +92,9 @@ where
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message<S>(&self, context: EventContext<S>, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let (message, uncommitted_offset) = message.into_inner();
 
@@ -121,9 +117,9 @@ where
         }
     }
 
-    async fn on_timer<S>(&self, context: EventContext<S>, timer: UncommittedTimer<S>)
+    async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let (trigger, mut uncommitted) = timer.into_inner();
 

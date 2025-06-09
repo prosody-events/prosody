@@ -16,7 +16,8 @@
 //!
 //! Integration example (in an event handler):
 //! ```rust,no_run
-//! use prosody::consumer::message::{EventContext, UncommittedMessage};
+//! use prosody::consumer::event_context::EventContext;
+//! use prosody::consumer::message::UncommittedMessage;
 //! use prosody::consumer::{EventHandler, Keyed, Uncommitted};
 //! use prosody::timers::store::TriggerStore;
 //! use prosody::timers::{Trigger, UncommittedTimer};
@@ -24,16 +25,16 @@
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
-//!     async fn on_message<T>(&self, _context: EventContext<T>, _message: UncommittedMessage)
+//!     async fn on_message<C>(&self, _context: C, _message: UncommittedMessage)
 //!     where
-//!         T: TriggerStore,
+//!         C: EventContext,
 //!     {
 //!         // Handle message processing
 //!     }
 //!
-//!     async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+//!     async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
 //!     where
-//!         T: TriggerStore,
+//!         C: EventContext,
 //!     {
 //!         // Process the timer event
 //!         println!("Timer fired for key: {:?}", timer.key());

@@ -19,11 +19,11 @@ use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
 use prosody::Topic;
 use prosody::admin::ProsodyAdminClient;
-use prosody::consumer::message::{EventContext, UncommittedMessage};
+use prosody::consumer::event_context::EventContext;
+use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::timers::UncommittedTimer;
-use prosody::timers::store::TriggerStore;
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{Sender, channel};
@@ -377,9 +377,9 @@ pub struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message<T>(&self, _context: EventContext<T>, message: UncommittedMessage)
+    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
         let message = msg.into_value();
@@ -396,9 +396,9 @@ impl EventHandler for TestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
+    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
     }
 
@@ -417,9 +417,9 @@ pub struct SlowTestHandler {
 
 impl EventHandler for SlowTestHandler {
     #[instrument(skip(self, _context))]
-    async fn on_message<T>(&self, _context: EventContext<T>, message: UncommittedMessage)
+    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
@@ -434,9 +434,9 @@ impl EventHandler for SlowTestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
+    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
     }
 

@@ -14,10 +14,10 @@ use tokio::time::sleep;
 use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
+use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider, Keyed};
-use crate::timers::store::TriggerStore;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 
@@ -163,13 +163,9 @@ where
     /// # Errors
     ///
     /// Returns the underlying handler's error if all retry attempts fail.
-    async fn on_message<S>(
-        &self,
-        context: EventContext<S>,
-        message: ConsumerMessage,
-    ) -> Result<(), Self::Error>
+    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let topic = message.topic();
         let partition = message.partition();
@@ -254,9 +250,9 @@ where
         }
     }
 
-    async fn on_timer<S>(&self, context: EventContext<S>, timer: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(&self, context: C, timer: Trigger) -> Result<(), Self::Error>
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         // Retry logic for a fired timer
         let mut attempt: u32 = 0;
@@ -312,9 +308,9 @@ where
     ///
     /// * `context` - The message context.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message<S>(&self, context: EventContext<S>, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let topic = message.topic();
         let partition = message.partition();
@@ -390,9 +386,9 @@ where
         }
     }
 
-    async fn on_timer<S>(&self, context: EventContext<S>, timer: UncommittedTimer<S>)
+    async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         // Retry logic for an uncommitted timer
         let (trigger, mut uncommitted) = timer.into_inner();

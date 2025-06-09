@@ -202,13 +202,13 @@ async fn test_partition_manager_is_stalled() {
     }
 
     impl EventHandler for StallTestHandler {
-        fn on_message<T>(
+        fn on_message<C>(
             &self,
-            _context: EventContext<T>,
+            _context: C,
             message: UncommittedMessage,
         ) -> impl Future<Output = ()> + Send
         where
-            T: TriggerStore,
+            C: EventContext,
         {
             let offset = message.offset();
             let processed = self.processed_offsets.clone();
@@ -224,9 +224,9 @@ async fn test_partition_manager_is_stalled() {
             }
         }
 
-        async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
+        async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
         where
-            T: TriggerStore,
+            C: EventContext,
         {
             // todo: add timer test
         }
@@ -446,11 +446,14 @@ impl HasProcessedOffsets for TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    fn on_message<T>(
+    fn on_message<C>(
         &self,
-        _context: EventContext<T>,
+        _context: C,
         message: UncommittedMessage,
-    ) -> impl Future<Output = ()> + Send {
+    ) -> impl Future<Output = ()> + Send
+    where
+        C: EventContext,
+    {
         let key = message.key().clone();
         let offset = message.offset();
         let processed = self.processed_offsets.clone();
@@ -480,9 +483,9 @@ impl EventHandler for TestHandler {
         }
     }
 
-    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
+    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         // todo: add timer test
     }

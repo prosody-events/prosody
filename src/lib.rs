@@ -30,7 +30,8 @@
 //! use prosody::consumer::failure::retry::RetryConfiguration;
 //! use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::failure::{FallibleHandler, ClassifyError};
-//! use prosody::consumer::message::{ConsumerMessage, EventContext};
+//! use prosody::consumer::message::ConsumerMessage;
+//! use prosody::consumer::event_context::EventContext;
 //! use prosody::timers::{Trigger, store::TriggerStore};
 //! use prosody::high_level::mode::Mode;
 //! use prosody::high_level::{HighLevelClient};
@@ -45,25 +46,25 @@
 //! impl FallibleHandler for MyHandler {
 //!     type Error = Infallible;
 //!
-//!     async fn on_message<T>(
+//!     async fn on_message<C>(
 //!         &self,
-//!         context: EventContext<T>,
+//!         context: C,
 //!         message: ConsumerMessage
 //!     ) -> Result<(), Self::Error>
 //!     where
-//!         T: TriggerStore,
+//!         C: EventContext,
 //!     {
 //!         println!("Received: {message:?}");
 //!         Ok(())
 //!     }
 //!
-//!     async fn on_timer<T>(
+//!     async fn on_timer<C>(
 //!         &self,
-//!         context: EventContext<T>,
+//!         context: C,
 //!         trigger: Trigger,
 //!     ) -> Result<(), Self::Error>
 //!     where
-//!         T: TriggerStore,
+//!         C: EventContext,
 //!     {
 //!         println!("Timer triggered: {trigger:?}");
 //!         Ok(())

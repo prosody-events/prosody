@@ -10,11 +10,11 @@ use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
 use crate::Topic;
+use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
-use crate::timers::store::TriggerStore;
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::from_env;
 use serde_json::json;
@@ -137,13 +137,9 @@ where
     /// Returns a `FailureTopicError::Handler` if the wrapped handler fails with
     /// a terminal error. Returns a `FailureTopicError::Producer` if sending
     /// to the failure topic fails.
-    async fn on_message<S>(
-        &self,
-        context: EventContext<S>,
-        message: ConsumerMessage,
-    ) -> Result<(), Self::Error>
+    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let topic = message.topic().as_ref();
         let partition = message.partition();
@@ -200,9 +196,9 @@ where
         Ok(())
     }
 
-    async fn on_timer<S>(&self, context: EventContext<S>, timer: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(&self, context: C, timer: Trigger) -> Result<(), Self::Error>
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
         let Err(error) = self.handler.on_timer(context, timer.clone()).await else {
@@ -259,9 +255,9 @@ where
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message<S>(&self, context: EventContext<S>, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let (message, uncommitted_offset) = message.into_inner();
 
@@ -278,9 +274,9 @@ where
         }
     }
 
-    async fn on_timer<S>(&self, context: EventContext<S>, timer: UncommittedTimer<S>)
+    async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let (trigger, mut uncommitted_timer) = timer.into_inner();
         // Attempt to handle the timer and send to failure topic if it fails

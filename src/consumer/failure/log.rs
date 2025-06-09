@@ -3,10 +3,10 @@
 //! This module provides logging capabilities that wrap handlers and log errors
 //! according to their severity while maintaining the original error flow.
 
+use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, EventContext, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{EventHandler, HandlerProvider};
-use crate::timers::store::TriggerStore;
 use crate::timers::{Trigger, UncommittedTimer};
 use tracing::error;
 
@@ -51,13 +51,9 @@ where
     /// # Errors
     ///
     /// Returns the original error from the wrapped handler after logging it
-    async fn on_message<S>(
-        &self,
-        context: EventContext<S>,
-        message: ConsumerMessage,
-    ) -> Result<(), Self::Error>
+    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         // Attempt to process the message with the wrapped handler
         let Err(error) = self.0.on_message(context, message).await else {
@@ -80,13 +76,9 @@ where
         Err(error)
     }
 
-    async fn on_timer<S>(
-        &self,
-        context: EventContext<S>,
-        trigger: Trigger,
-    ) -> Result<(), Self::Error>
+    async fn on_timer<C>(&self, context: C, trigger: Trigger) -> Result<(), Self::Error>
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
         let Err(error) = self.0.on_timer(context, trigger).await else {
@@ -121,9 +113,9 @@ where
     ///
     /// * `context` - The context of the message being processed
     /// * `message` - The uncommitted message to process
-    async fn on_message<S>(&self, context: EventContext<S>, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let (message, uncommitted_offset) = message.into_inner();
 
@@ -150,9 +142,9 @@ where
         }
     }
 
-    async fn on_timer<S>(&self, context: EventContext<S>, timer: UncommittedTimer<S>)
+    async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
     where
-        S: TriggerStore,
+        C: EventContext,
     {
         let (timer, mut uncommitted_timer) = timer.into_inner();
 

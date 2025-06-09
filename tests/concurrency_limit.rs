@@ -39,17 +39,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::consumer::Uncommitted;
+use prosody::consumer::event_context::EventContext;
 use prosody::timers::UncommittedTimer;
-use prosody::timers::store::TriggerStore;
 use prosody::{
-    Topic,
-    admin::ProsodyAdminClient,
-    consumer::ConsumerConfiguration,
-    consumer::EventHandler,
-    consumer::ProsodyConsumer,
-    consumer::message::{EventContext, UncommittedMessage},
-    producer::ProducerConfiguration,
-    producer::ProsodyProducer,
+    Topic, admin::ProsodyAdminClient, consumer::ConsumerConfiguration, consumer::EventHandler,
+    consumer::ProsodyConsumer, consumer::message::UncommittedMessage,
+    producer::ProducerConfiguration, producer::ProsodyProducer,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
@@ -78,9 +73,9 @@ struct ConcurrencyTestHandler {
 }
 
 impl EventHandler for ConcurrencyTestHandler {
-    async fn on_message<T>(&self, _context: EventContext<T>, message: UncommittedMessage)
+    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         // Increment the current processing count and update maximum observed
         // concurrency
@@ -106,9 +101,9 @@ impl EventHandler for ConcurrencyTestHandler {
         }
     }
 
-    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
+    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
     }
 

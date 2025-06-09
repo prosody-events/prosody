@@ -14,10 +14,9 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
+use crate::consumer::event_context::ConcreteEventContext;
 use crate::consumer::heartbeat::Heartbeat;
-use crate::consumer::message::{
-    ConsumerMessage, EventContext, UncommittedEvent, UncommittedMessage,
-};
+use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Keyed, Uncommitted};
@@ -406,7 +405,7 @@ async fn handle_messages<T, S>(
 
         // Process message with handler
         debug!(?event, "permit acquired; calling handler");
-        let context = EventContext::new(
+        let context = ConcreteEventContext::new(
             event.key().clone(),
             shutdown_rx.clone(),
             timer_manager.clone(),

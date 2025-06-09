@@ -7,16 +7,16 @@
 
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::consumer::event_context::EventContext;
 use prosody::{
     Topic,
     admin::ProsodyAdminClient,
-    consumer::message::{EventContext, UncommittedMessage},
+    consumer::message::UncommittedMessage,
     consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted},
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::UncommittedTimer,
     timers::datetime::CompactDateTime,
     timers::duration::CompactDuration,
-    timers::store::TriggerStore,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -54,9 +54,9 @@ struct MessageEvent {
 }
 
 impl EventHandler for TimerTestHandler {
-    async fn on_message<T>(&self, context: EventContext<T>, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
@@ -127,9 +127,9 @@ impl EventHandler for TimerTestHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<T>(&self, _context: EventContext<T>, timer: UncommittedTimer<T>)
+    async fn on_timer<C>(&self, _context: C, timer: UncommittedTimer<C::Store>)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         let key = timer.key().to_string();
         let time = timer.time();

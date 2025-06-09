@@ -4,14 +4,13 @@
 //! and composing failure handling strategies in asynchronous
 //! message processing systems.
 
+use crate::consumer::HandlerProvider;
+use crate::consumer::event_context::EventContext;
+use crate::consumer::message::ConsumerMessage;
+use crate::timers::Trigger;
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::future::Future;
-
-use crate::consumer::HandlerProvider;
-use crate::consumer::message::{ConsumerMessage, EventContext};
-use crate::timers::Trigger;
-use crate::timers::store::TriggerStore;
 
 pub mod log;
 pub mod retry;
@@ -98,13 +97,13 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     ///
     /// A `Future` that resolves to `Ok(())` if the message was processed
     /// successfully, or an `Err` containing the error if processing failed.
-    fn on_message<T>(
+    fn on_message<C>(
         &self,
-        context: EventContext<T>,
+        context: C,
         message: ConsumerMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
-        T: TriggerStore;
+        C: EventContext;
 
     /// Handles timer events with potential for failure.
     ///
@@ -141,13 +140,13 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     /// - Return appropriate error types that implement [`ClassifyError`]
     /// - Ensure processing is idempotent where possible
     /// - Handle the timer's tracing span for observability
-    fn on_timer<T>(
+    fn on_timer<C>(
         &self,
-        context: EventContext<T>,
+        context: C,
         trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
-        T: TriggerStore;
+        C: EventContext;
 }
 
 /// A composition of two failure strategies.

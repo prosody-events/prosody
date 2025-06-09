@@ -6,11 +6,11 @@
 use color_eyre::eyre::{self, ensure};
 use eyre::Result;
 use prosody::admin::ProsodyAdminClient;
-use prosody::consumer::message::{EventContext, UncommittedMessage};
+use prosody::consumer::event_context::EventContext;
+use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::timers::UncommittedTimer;
-use prosody::timers::store::TriggerStore;
 use prosody::{Payload, Topic};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -29,9 +29,9 @@ struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message<T>(&self, _ctx: EventContext<T>, msg: UncommittedMessage)
+    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         let (inner, uncommitted) = msg.into_inner();
         let key = inner.key().to_string();
@@ -40,9 +40,9 @@ impl EventHandler for TestHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<T>(&self, _context: EventContext<T>, _timer: UncommittedTimer<T>)
+    async fn on_timer<C>(&self, _context: C, _timer: UncommittedTimer<C::Store>)
     where
-        T: TriggerStore,
+        C: EventContext,
     {
     }
 

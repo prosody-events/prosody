@@ -31,7 +31,8 @@
 //! and start processing:
 //!
 //! ```
-//! use prosody::consumer::message::{EventContext, UncommittedMessage};
+//! use prosody::consumer::event_context::EventContext;
+//! use prosody::consumer::message::UncommittedMessage;
 //! use prosody::consumer::{
 //!     ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
 //! };
@@ -42,9 +43,9 @@
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
-//!     async fn on_message<T>(&self, context: EventContext<T>, message: UncommittedMessage)
+//!     async fn on_message<C>(&self, context: C, message: UncommittedMessage)
 //!     where
-//!         T: TriggerStore,
+//!         C: EventContext,
 //!     {
 //!         // Process the message
 //!         println!("Processing message with key: {}", message.key());
@@ -53,9 +54,9 @@
 //!         message.commit().await;
 //!     }
 //!
-//!     async fn on_timer<T>(&self, context: EventContext<T>, timer: UncommittedTimer<T>)
+//!     async fn on_timer<C>(&self, context: C, timer: UncommittedTimer<C::Store>)
 //!     where
-//!         T: TriggerStore,
+//!         C: EventContext,
 //!     {
 //!         // Process the timer
 //!         println!("Processing timer");
@@ -131,19 +132,19 @@ use tracing::error;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
-use crate::consumer::context::Context;
+use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::log::LogStrategy;
 use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
 use crate::consumer::failure::shutdown::ShutdownStrategy;
 use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
 use crate::consumer::failure::{FailureStrategy, FallibleHandler};
 use crate::consumer::heartbeat::Heartbeat;
-use crate::consumer::message::{EventContext, UncommittedMessage};
+use crate::consumer::kafka_context::Context;
+use crate::consumer::message::UncommittedMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::producer::ProsodyProducer;
 use crate::timers::UncommittedTimer;
-use crate::timers::store::TriggerStore;
 use crate::timers::store::memory::InMemoryTriggerStore;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
@@ -151,10 +152,11 @@ use crate::util::{
 };
 use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 
-mod context;
+pub mod event_context;
 mod extractor;
 pub mod failure;
 mod heartbeat;
+mod kafka_context;
 pub mod message;
 mod partition;
 mod poll;
@@ -283,13 +285,13 @@ pub trait EventHandler {
     /// # Returns
     ///
     /// A future that resolves when the message is handled.
-    fn on_message<T>(
+    fn on_message<C>(
         &self,
-        context: EventContext<T>,
+        context: C,
         message: UncommittedMessage,
     ) -> impl Future<Output = ()> + Send
     where
-        T: TriggerStore;
+        C: EventContext;
 
     /// Handles timer events when they fire.
     ///
@@ -314,13 +316,13 @@ pub trait EventHandler {
     ///
     /// A future that resolves when timer processing is complete. Note that
     /// this future completing does not automatically commit the timer.
-    fn on_timer<T>(
+    fn on_timer<C>(
         &self,
-        context: EventContext<T>,
-        timer: UncommittedTimer<T>,
+        context: C,
+        timer: UncommittedTimer<C::Store>,
     ) -> impl Future<Output = ()> + Send
     where
-        T: TriggerStore;
+        C: EventContext;
 
     /// Shuts down the message handler.
     ///
