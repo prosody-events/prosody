@@ -2,8 +2,8 @@
 //!
 //! This module defines the [`TimerManagerError`] enum, which represents all
 //! possible error conditions that can occur when interacting with the
-//! [`super::manager::TimerManager`], including storage failures, scheduling failures,
-//! invalid datetime values, and timer lifecycle errors.
+//! [`super::manager::TimerManager`], including storage failures, scheduling
+//! failures, invalid datetime values, and timer lifecycle errors.
 
 use crate::timers::datetime::CompactDateTimeError;
 use crate::timers::scheduler::TimerSchedulerError;

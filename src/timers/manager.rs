@@ -608,12 +608,13 @@ mod tests {
         manager.schedule(trigger.clone()).await?;
 
         // Allow some time for the scheduler to process
-        time::advance(Duration::from_secs(10)).await;
+        time::advance(Duration::from_millis(100)).await;
         tokio::task::yield_now().await;
 
         // Check if timer is active
         let is_active = manager.is_active(&trigger.key, trigger.time).await;
         assert!(is_active);
+
         Ok(())
     }
 

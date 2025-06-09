@@ -109,8 +109,9 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     /// Handles timer events with potential for failure.
     ///
     /// This method is called when a scheduled timer fires and is delivered to
-    /// the handler for processing. Unlike [`Self::on_message`], this method handles
-    /// timer events that contain a key, execution time, and tracing span.
+    /// the handler for processing. Unlike [`Self::on_message`], this method
+    /// handles timer events that contain a key, execution time, and tracing
+    /// span.
     ///
     /// # Arguments
     ///
