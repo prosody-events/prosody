@@ -8,11 +8,11 @@
 //! - Partition timers into time-based slabs for efficient storage and queries.
 //!
 //! Core components:
-//! - **Trigger**: Metadata for a scheduled event.
-//! - **TimerManager**: Coordinates scheduling, loading, and delivery.
-//! - **TriggerStore**: Persistent storage abstraction.
-//! - **Scheduler**: In-memory queue for precise timing.
-//! - **Slabs**: Fixed-duration partitions for time-range queries.
+//! - **`Trigger`**: Metadata for a scheduled event.
+//! - **`TimerManager`**: Coordinates scheduling, loading, and delivery.
+//! - **`TriggerStore`**: Persistent storage abstraction.
+//! - **`Scheduler`**: In-memory queue for precise timing.
+//! - **`Slab`**: Fixed-duration partitions for time-range queries.
 //!
 //! Integration example (in an event handler):
 //! ```rust,no_run

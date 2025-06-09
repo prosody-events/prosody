@@ -14,20 +14,15 @@
 //!
 //! # Slab Calculations
 //!
-//! 1. Compute the slab ID:
-//!    ```text
-//!    slab_id = floor(epoch_seconds / slab_size_seconds)
-//!    ```
-//! 2. Derive the time range:
-//!    ```text
-//!    start = slab_id * slab_size_seconds
-//!    end   = start + slab_size_seconds
-//!    ```
+//! 1. Compute the slab ID: ```text slab_id = floor(epoch_seconds /
+//!    slab_size_seconds) ```
+//! 2. Derive the time range: ```text start = slab_id * slab_size_seconds end =
+//!    start + slab_size_seconds ```
 //!
 //! # Ordering and Comparison
 //!
-//! - Slabs implement `Ord` and `PartialOrd`, ordering first by segment ID,
-//!   then by slab ID.
+//! - Slabs implement `Ord` and `PartialOrd`, ordering first by segment ID, then
+//!   by slab ID.
 //! - `SlabId` is a type alias for `u32`.
 
 use crate::timers::datetime::CompactDateTime;
@@ -205,7 +200,8 @@ impl Debug for Slab {
 impl Display for Slab {
     /// Display format: `segment_id/slab_id[start—end]`.
     ///
-    /// Both `start` and `end` are formatted using `CompactDateTime`'s `Display`.
+    /// Both `start` and `end` are formatted using `CompactDateTime`'s
+    /// `Display`.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let range = self.range();
         write!(

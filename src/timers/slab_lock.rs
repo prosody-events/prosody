@@ -6,9 +6,8 @@
 //!
 //! - **Trigger operations**: Individual timer scheduling, querying, and
 //!   processing that can occur concurrently
-//! - **Slab operations**: Structural changes like loading time slabs,
-//!   ownership transfers, and system state modifications that require
-//!   exclusive access
+//! - **Slab operations**: Structural changes like loading time slabs, ownership
+//!   transfers, and system state modifications that require exclusive access
 //!
 //! The abstraction ensures that multiple trigger operations can proceed
 //! simultaneously while slab operations have exclusive access when needed,
@@ -26,8 +25,8 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 ///
 /// - **Trigger locks**: Allow concurrent access for operations that work with
 ///   individual timers (scheduling, querying, processing)
-/// - **Slab locks**: Provide exclusive access for operations that modify
-///   system structure (loading slabs, ownership changes, cleanup)
+/// - **Slab locks**: Provide exclusive access for operations that modify system
+///   structure (loading slabs, ownership changes, cleanup)
 ///
 /// This design optimizes for the common case where multiple trigger operations
 /// can safely occur simultaneously, while ensuring structural operations have

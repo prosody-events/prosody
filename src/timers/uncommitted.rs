@@ -1,8 +1,9 @@
 //! Uncommitted timer events and transaction-like semantics.
 //!
-//! This module defines `UncommittedTimer` and its internal state `UncommittedTrigger`,
-//! modeling timers that have fired and been delivered to the application but not
-//! yet acknowledged. It enforces a transaction-like pattern:
+//! This module defines `UncommittedTimer` and its internal state
+//! `UncommittedTrigger`, modeling timers that have fired and been delivered to
+//! the application but not yet acknowledged. It enforces a transaction-like
+//! pattern:
 //!
 //! 1. Delivery: timers arrive as `UncommittedTimer`
 //! 2. Processing: application handles the timer event
@@ -31,9 +32,8 @@ const RETRY_DURATION: Duration = Duration::from_secs(1);
 ///
 /// `UncommittedTimer<T>` wraps a `Trigger` and an internal transaction state.
 /// After processing, applications must call `commit()` to remove the timer from
-/// storage, or `abort()` to deactivate it in-memory while leaving persistent data.
-///
-///
+/// storage, or `abort()` to deactivate it in-memory while leaving persistent
+/// data.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
 pub struct UncommittedTimer<T>

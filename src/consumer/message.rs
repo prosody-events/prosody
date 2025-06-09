@@ -3,13 +3,13 @@
 //! This module defines the message types and contexts used for processing Kafka
 //! messages:
 //!
-//! - `MessageContext` - Provides shutdown notification capabilities
-//! - `UncommittedMessage` - A message with uncommitted offset tracking
-//! - `ConsumerMessage` - A message container optimized for cloning
-//! - `ConsumerMessageValue` - The raw message data and metadata
-//!
-//! The types work together to provide message lifecycle management, offset
-//! tracking, and shutdown coordination.
+//! - `EventContext` – Provides shutdown notification capabilities and timer
+//!   scheduling operations.
+//! - `UncommittedEvent` – A unified enum for message and timer events that
+//!   require acknowledgment.
+//! - `UncommittedMessage` – A message with uncommitted offset tracking.
+//! - `ConsumerMessage` – A clonable, offset-agnostic message container.
+//! - `ConsumerMessageValue` – The raw message data and metadata.
 
 use chrono::{DateTime, Utc};
 use educe::Educe;
@@ -33,7 +33,12 @@ use crate::{
 
 /// The context for message processing within a consumer.
 ///
-/// Provides shutdown notification capabilities to coordinate graceful shutdown.
+/// Provides the current message key, shutdown notification, and a handle to
+/// the `TimerManager` for scheduling and managing timers.
+///
+/// # Type Parameters
+///
+/// * `T` – The `TriggerStore` implementation used by the timer manager.
 #[derive(Educe)]
 #[educe(Debug, Clone(bound()))]
 pub struct EventContext<T> {
@@ -50,11 +55,13 @@ impl<T> EventContext<T>
 where
     T: TriggerStore,
 {
-    /// Creates a new message context.
+    /// Create a new `EventContext`.
     ///
     /// # Arguments
     ///
-    /// * `shutdown_rx` - Receiver for shutdown signals
+    /// * `key` – The message key for partition affinity.
+    /// * `shutdown_rx` – A watch receiver that signals shutdown when `true`.
+    /// * `timers` – The `TimerManager` instance for scheduling timers.
     pub(crate) fn new(
         key: Key,
         shutdown_rx: watch::Receiver<bool>,
@@ -67,15 +74,13 @@ where
         }
     }
 
-    /// Waits for a shutdown signal.
+    /// Returns a future that completes when a shutdown signal is received.
     ///
-    /// Returns a future that completes when a partition shutdown signal is
-    /// received.
+    /// # Panics
     ///
-    /// # Errors
-    ///
-    /// Logs an error if the shutdown hook fails.
-    pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send + use<T> {
+    /// This method logs an error if waiting on the shutdown channel fails,
+    /// but does not panic.
+    pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send {
         let mut shutdown_rx = self.shutdown_rx.clone();
         async move {
             if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
@@ -84,35 +89,17 @@ where
         }
     }
 
+    /// Schedule a timer for the current key.
+    ///
+    /// # Arguments
+    ///
+    /// * `time` – The execution time for the timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `TimerManagerError` if the scheduler or store operation fails.
     pub async fn schedule(&self, time: CompactDateTime) -> Result<(), TimerManagerError<T::Error>> {
-        self.timers
-            .schedule(Trigger {
-                key: self.key.clone(),
-                time,
-                span: info_span!("timer", key = %self.key, time = %time.to_string()),
-            })
-            .await
-    }
-
-    pub async fn clear_and_schedule(
-        &self,
-        time: CompactDateTime,
-    ) -> Result<(), TimerManagerError<T::Error>> {
-        let span = info_span!("timer", key = %self.key, time = %time.to_string());
-
-        iter(self.timers.scheduled_triggers(&self.key).await?)
-            .map(|trigger| {
-                let cloned_span = span.clone();
-
-                async move {
-                    cloned_span.follows_from(&trigger.span);
-                    self.timers.unschedule(&trigger.key, trigger.time).await
-                }
-            })
-            .buffer_unordered(DELETE_CONCURRENCY)
-            .try_collect::<()>()
-            .await?;
-
+        let span = info_span!("timer", key = %self.key, time = %time);
         self.timers
             .schedule(Trigger {
                 key: self.key.clone(),
@@ -122,6 +109,58 @@ where
             .await
     }
 
+    /// Remove all existing timers for the key, then schedule a new one.
+    ///
+    /// This first unschedules any existing timers for the key in parallel,
+    /// then adds the new timer.
+    ///
+    /// # Arguments
+    ///
+    /// * `time` – The new execution time for the timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `TimerManagerError` if any unschedule or schedule operation
+    /// fails.
+    pub async fn clear_and_schedule(
+        &self,
+        time: CompactDateTime,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let span = info_span!("timer", key = %self.key, time = %time);
+
+        // Unschedule all existing triggers for this key
+        iter(self.timers.scheduled_triggers(&self.key).await?)
+            .map(|trigger| {
+                let span_clone = span.clone();
+                async move {
+                    // Link tracing spans
+                    span_clone.follows_from(&trigger.span);
+                    self.timers.unschedule(&trigger.key, trigger.time).await
+                }
+            })
+            .buffer_unordered(DELETE_CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
+
+        // Schedule the new trigger
+        self.timers
+            .schedule(Trigger {
+                key: self.key.clone(),
+                time,
+                span,
+            })
+            .await
+    }
+
+    /// Unschedule a specific timer for the current key.
+    ///
+    /// # Arguments
+    ///
+    /// * `time` – The execution time of the timer to remove.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `TimerManagerError` if the unschedule operation fails.
     pub async fn unschedule(
         &self,
         time: CompactDateTime,
@@ -129,10 +168,20 @@ where
         self.timers.unschedule(&self.key, time).await
     }
 
+    /// Unschedule all timers for the current key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `TimerManagerError` if any unschedule operation fails.
     pub async fn clear_scheduled(&self) -> Result<(), TimerManagerError<T::Error>> {
         self.timers.unschedule_all(&self.key).await
     }
 
+    /// Retrieve all scheduled times for the current key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `TimerManagerError` if the retrieval from storage fails.
     pub async fn scheduled(&self) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
         Ok(self
             .timers
@@ -142,59 +191,32 @@ where
             .collect())
     }
 
-    /// Checks if a shutdown signal has been received.
-    ///
-    /// # Returns
-    ///
-    /// `true` if shutdown was signaled, `false` otherwise.
+    /// Return `true` if a shutdown signal has been triggered.
     #[must_use]
     pub fn should_shutdown(&self) -> bool {
         *self.shutdown_rx.borrow()
     }
 }
 
-/// A union type representing either a message or timer event that requires
-/// acknowledgment.
+/// A unified event that must be explicitly committed or aborted.
 ///
-/// [`UncommittedEvent`] provides a unified interface for handling both message
-/// and timer events within the consumer processing pipeline. Both event types
-/// follow the same transaction-like semantics where they must be explicitly
-/// committed or aborted after processing.
+/// This enum wraps either a Kafka message (`UncommittedMessage`) or a timer
+/// event (`UncommittedTimer`) and provides a single interface for acknowledging
+/// both types of events.
 ///
-/// ## Purpose
+/// # Type Parameters
 ///
-/// This enum enables:
-/// - **Unified Processing**: Handle both message and timer events with the same
-///   interface
-/// - **Key-based Ordering**: Maintain ordering guarantees across both event
-///   types
-/// - **Transaction Semantics**: Consistent commit/abort behavior for all event
-///   types
-/// - **Type Safety**: Compile-time guarantees about event handling
-///
-/// ## Usage Pattern
-///
-/// Typically used in scenarios where messages and timers need to be processed
-/// with the same ordering and reliability guarantees, such as in key-based
-/// processing pipelines.
+/// * `T` – The `TriggerStore` implementation for the timer variant.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
 pub enum UncommittedEvent<T>
 where
     T: TriggerStore,
 {
-    /// A message event that requires acknowledgment.
-    ///
-    /// Contains an [`UncommittedMessage`] that was received from a Kafka topic
-    /// and must be committed or aborted after processing to ensure proper
-    /// offset management and delivery guarantees.
+    /// A message event requiring offset commit/abort.
     Message(UncommittedMessage),
 
-    /// A timer event that requires acknowledgment.
-    ///
-    /// Contains an [`UncommittedTimer`] that fired at its scheduled time
-    /// and must be committed or aborted after processing to ensure proper
-    /// timer lifecycle management and cleanup.
+    /// A timer event requiring commit/abort.
     Timer(UncommittedTimer<T>),
 }
 
@@ -249,9 +271,9 @@ where
     }
 }
 
-/// A message with uncommitted offset tracking.
+/// A Kafka message with offset tracking for commits/aborts.
 ///
-/// Wraps a `ConsumerMessage` and tracks its offset commitment state.
+/// Wraps a `ConsumerMessage` and its `UncommittedOffset` handler.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct UncommittedMessage {
@@ -304,11 +326,7 @@ impl UncommittedMessage {
         self.inner.span()
     }
 
-    /// Decomposes the message into its parts.
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing the inner `ConsumerMessage` and `UncommittedOffset`.
+    /// Decomposes the message into its inner components.
     #[must_use]
     pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
         (self.inner, self.uncommitted_offset)
@@ -356,37 +374,39 @@ impl EventIdentity for UncommittedMessage {
     }
 }
 
-/// A message that is cheap to clone and which does not track offset commits
+/// A lightweight, clonable Kafka message without offset tracking.
+///
+/// Internally wraps its data in an `Arc<ConsumerMessageValue>`.
 #[derive(Clone, Debug)]
 pub struct ConsumerMessage(Arc<ConsumerMessageValue>);
 
-/// The raw message data and metadata.
+/// The full data structure for a consumer message.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ConsumerMessageValue {
-    /// The system originating the message
+    /// The system that originated this message.
     pub source_system: Option<SourceSystem>,
 
-    /// The message's topic
+    /// The Kafka topic name.
     pub topic: Topic,
 
-    /// The message's partition
+    /// The partition index.
     pub partition: Partition,
 
-    /// The message's offset in its partition
+    /// The offset within the partition.
     pub offset: Offset,
 
-    /// The message's key
+    /// The message key.
     pub key: Key,
 
-    /// The message's timestamp
+    /// The timestamp when the broker sent the message.
     pub timestamp: DateTime<Utc>,
 
-    /// The message's payload
+    /// The message payload.
     #[educe(Debug(ignore))]
     pub payload: Payload,
 
-    /// The message's tracing span
+    /// Span for distributed tracing.
     #[educe(Debug(ignore))]
     pub span: Span,
 }
@@ -396,14 +416,14 @@ impl ConsumerMessage {
     ///
     /// # Arguments
     ///
-    /// * `source_system` - The system originating the message
-    /// * `topic` - The message's topic
-    /// * `partition` - The message's partition
-    /// * `offset` - The message's offset
-    /// * `key` - The message's key
-    /// * `timestamp` - The message's timestamp
-    /// * `payload` - The message's payload
-    /// * `span` - The message's tracing span
+    /// * `source_system` – The system originating the message.
+    /// * `topic` – The message's topic.
+    /// * `partition` – The message's partition.
+    /// * `offset` – The message's offset.
+    /// * `key` – The message's key.
+    /// * `timestamp` – The message's timestamp.
+    /// * `payload` – The message's payload.
+    /// * `span` – The message's tracing span.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -470,15 +490,11 @@ impl ConsumerMessage {
         &self.0.span
     }
 
-    /// Converts this message to an uncommitted message.
+    /// Converts this message into an `UncommittedMessage`.
     ///
     /// # Arguments
     ///
-    /// * `uncommitted_offset` - The offset tracking state to attach
-    ///
-    /// # Returns
-    ///
-    /// A new `UncommittedMessage` containing this message and the offset state.
+    /// * `uncommitted_offset` – The offset tracking state to attach.
     #[must_use]
     pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage {
         UncommittedMessage {
@@ -487,11 +503,7 @@ impl ConsumerMessage {
         }
     }
 
-    /// Extracts the inner message value.
-    ///
-    /// # Returns
-    ///
-    /// The contained `ConsumerMessageValue`.
+    /// Extracts the inner `ConsumerMessageValue`, cloning if needed.
     #[must_use]
     pub fn into_value(self) -> ConsumerMessageValue {
         Arc::unwrap_or_clone(self.0)
