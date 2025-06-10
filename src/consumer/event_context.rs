@@ -242,8 +242,11 @@ where
     }
 }
 
+/// Object-safe boxed event context
+pub type BoxEventContext = Box<dyn DynEventContext>;
+
 /// Boxed error type for object-safe contexts.
-pub type BoxedError = Box<dyn Error + Send + Sync>;
+pub type BoxError = Box<dyn Error + Send + Sync>;
 
 /// Object-safe version of `EventContext` with boxed futures and errors.
 ///
@@ -267,27 +270,27 @@ pub trait DynEventContext: DynClone + Send + Sync {
     /// # Errors
     ///
     /// Returns an error if scheduling fails.
-    async fn schedule(&self, time: CompactDateTime) -> Result<(), BoxedError>;
+    async fn schedule(&self, time: CompactDateTime) -> Result<(), BoxError>;
 
     /// Unschedule all existing timers and schedule a new one.
     ///
     /// # Arguments
     ///
     /// * `time` – The new execution time.
-    async fn clear_and_schedule(&self, time: CompactDateTime) -> Result<(), BoxedError>;
+    async fn clear_and_schedule(&self, time: CompactDateTime) -> Result<(), BoxError>;
 
     /// Unschedule a specific timer.
     ///
     /// # Arguments
     ///
     /// * `time` – The time to unschedule.
-    async fn unschedule(&self, time: CompactDateTime) -> Result<(), BoxedError>;
+    async fn unschedule(&self, time: CompactDateTime) -> Result<(), BoxError>;
 
     /// Unschedule all timers.
-    async fn clear_scheduled(&self) -> Result<(), BoxedError>;
+    async fn clear_scheduled(&self) -> Result<(), BoxError>;
 
     /// List scheduled execution times.
-    async fn scheduled(&self) -> Result<Vec<CompactDateTime>, BoxedError>;
+    async fn scheduled(&self) -> Result<Vec<CompactDateTime>, BoxError>;
 
     /// Synchronously check if shutdown has been requested.
     fn should_shutdown(&self) -> bool;
@@ -305,34 +308,34 @@ where
         EventContext::on_shutdown(self).await;
     }
 
-    async fn schedule(&self, time: CompactDateTime) -> Result<(), BoxedError> {
+    async fn schedule(&self, time: CompactDateTime) -> Result<(), BoxError> {
         EventContext::schedule(self, time)
             .await
-            .map_err(|e| Box::new(e) as BoxedError)
+            .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn clear_and_schedule(&self, time: CompactDateTime) -> Result<(), BoxedError> {
+    async fn clear_and_schedule(&self, time: CompactDateTime) -> Result<(), BoxError> {
         EventContext::clear_and_schedule(self, time)
             .await
-            .map_err(|e| Box::new(e) as BoxedError)
+            .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn unschedule(&self, time: CompactDateTime) -> Result<(), BoxedError> {
+    async fn unschedule(&self, time: CompactDateTime) -> Result<(), BoxError> {
         EventContext::unschedule(self, time)
             .await
-            .map_err(|e| Box::new(e) as BoxedError)
+            .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn clear_scheduled(&self) -> Result<(), BoxedError> {
+    async fn clear_scheduled(&self) -> Result<(), BoxError> {
         EventContext::clear_scheduled(self)
             .await
-            .map_err(|e| Box::new(e) as BoxedError)
+            .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn scheduled(&self) -> Result<Vec<CompactDateTime>, BoxedError> {
+    async fn scheduled(&self) -> Result<Vec<CompactDateTime>, BoxError> {
         EventContext::scheduled(self)
             .await
-            .map_err(|e| Box::new(e) as BoxedError)
+            .map_err(|e| Box::new(e) as BoxError)
     }
 
     fn should_shutdown(&self) -> bool {
