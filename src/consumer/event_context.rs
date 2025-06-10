@@ -262,7 +262,7 @@ pub type BoxError = Box<dyn Error + Send + Sync>;
 /// Each method is turned into `async fn` or returns a `bool` for synchronous
 /// check.
 #[async_trait]
-pub trait DynEventContext: DynClone + Send + Sync {
+pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// Async wait for shutdown signal.
     async fn on_shutdown(&self);
 
