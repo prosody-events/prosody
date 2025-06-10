@@ -112,6 +112,11 @@ pub trait EventContext: Clone + Send + Sync + 'static {
 
     /// Returns `true` if a shutdown signal has already been issued.
     fn should_shutdown(&self) -> bool;
+
+    /// Return a boxed, type-erased event context
+    fn boxed(self) -> BoxEventContext {
+        Box::new(self)
+    }
 }
 
 /// Concrete implementation of `EventContext` that uses a `TimerManager<T>`.
