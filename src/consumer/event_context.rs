@@ -1,11 +1,10 @@
-//! Event context types and traits for message processing.
+//! Provides an execution context for processing Kafka messages and timer
+//! events.
 //!
-//! This module defines the event context abstraction used for processing Kafka
-//! messages and timer events:
-//!
-//! - `EventContext` – A trait providing shutdown notification capabilities and
-//!   timer scheduling operations.
-//! - `ConcreteEventContext` – The concrete implementation of `EventContext`.
+//! This module defines:
+//! - `EventContext`: Trait for shutdown notification and timer scheduling.
+//! - `TimerContext<T>`: Concrete `EventContext` implementation using a
+//!   `TimerManager`.
 
 use educe::Educe;
 use futures::stream::iter;
@@ -21,35 +20,43 @@ use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
 use crate::timers::{DELETE_CONCURRENCY, TimerManager, Trigger};
 
-/// A trait for event context operations in message processing.
+/// Provides shutdown notification and timer operations to message handlers.
 ///
-/// Provides shutdown notification capabilities and timer scheduling operations
-/// for message handlers.
+/// Handlers receive an `EventContext` to:
+/// - Await shutdown signals.
+/// - Schedule, unschedule, or clear timers for the current message key.
+/// - Inspect which timers are scheduled.
+/// - Check if shutdown has been requested.
 pub trait EventContext: Clone + Send {
-    /// The trigger store type used by this context.
+    /// The error type returned by timer operations.
     type Error: Error;
 
-    /// Returns a future that completes when a shutdown signal is received.
+    /// Returns a future completing when a shutdown signal is received.
+    ///
+    /// # Returns
+    ///
+    /// A future that resolves to `()` once shutdown is triggered.
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send;
 
-    /// Schedule a timer for the current key.
+    /// Schedule a timer for the current key at the given time.
     ///
     /// # Arguments
     ///
-    /// * `time` – The execution time for the timer.
+    /// * `time` – Execution time for the new timer.
     ///
     /// # Errors
     ///
-    /// Returns a `TimerManagerError` if the scheduler or store operation fails.
+    /// Returns a `TimerManagerError` if scheduling in the store or scheduler
+    /// fails.
     fn schedule(
         &self,
         time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Remove all existing timers for the key, then schedule a new one.
+    /// Unschedule all existing timers for the key, then schedule a new one.
     ///
-    /// This first unschedules any existing timers for the key in parallel,
-    /// then adds the new timer.
+    /// This first removes any existing timers for the key in parallel, then
+    /// adds the new timer at `time`.
     ///
     /// # Arguments
     ///
@@ -57,7 +64,7 @@ pub trait EventContext: Clone + Send {
     ///
     /// # Errors
     ///
-    /// Returns a `TimerManagerError` if any unschedule or schedule operation
+    /// Returns a `TimerManagerError` if any removal or the new scheduling
     /// fails.
     fn clear_and_schedule(
         &self,
@@ -68,7 +75,7 @@ pub trait EventContext: Clone + Send {
     ///
     /// # Arguments
     ///
-    /// * `time` – The execution time of the timer to remove.
+    /// * `time` – Execution time of the timer to remove.
     ///
     /// # Errors
     ///
@@ -85,28 +92,30 @@ pub trait EventContext: Clone + Send {
     /// Returns a `TimerManagerError` if any unschedule operation fails.
     fn clear_scheduled(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Retrieve all scheduled times for the current key.
+    /// Retrieve all execution times of scheduled timers for the current key.
     ///
     /// # Errors
     ///
-    /// Returns a `TimerManagerError` if the retrieval from storage fails.
+    /// Returns a `TimerManagerError` if retrieval from the persistent store
+    /// fails.
     fn scheduled(&self) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send;
 
-    /// Return `true` if a shutdown signal has been triggered.
+    /// Returns `true` if a shutdown signal has been issued.
     fn should_shutdown(&self) -> bool;
 }
 
-/// The concrete implementation of event context for message processing.
+/// Concrete implementation of `EventContext` for message processing.
 ///
-/// Provides the current message key, shutdown notification, and a handle to
-/// the `TimerManager` for scheduling and managing timers.
+/// Provides the message `key`, a shutdown watcher, and a `TimerManager` for
+/// scheduling and managing timers.
 ///
 /// # Type Parameters
 ///
-/// * `T` – The `TriggerStore` implementation used by the timer manager.
+/// * `T` – The `TriggerStore` backend used by the `TimerManager`.
 #[derive(Educe)]
 #[educe(Debug, Clone(bound()))]
 pub struct TimerContext<T> {
+    /// Message key for affinity and timer scoping.
     key: Key,
 
     #[educe(Debug(ignore))]
@@ -120,12 +129,13 @@ impl<T> TimerContext<T>
 where
     T: TriggerStore,
 {
-    /// Create a new `ConcreteEventContext`.
+    /// Constructs a new `TimerContext`.
     ///
     /// # Arguments
     ///
-    /// * `key` – The message key for partition affinity.
-    /// * `shutdown_rx` – A watch receiver that signals shutdown when `true`.
+    /// * `key` – The message key for timer operations.
+    /// * `shutdown_rx` – A watch receiver that signals shutdown when set to
+    ///   `true`.
     /// * `timers` – The `TimerManager` instance for scheduling timers.
     pub(crate) fn new(
         key: Key,
@@ -146,13 +156,8 @@ where
 {
     type Error = TimerManagerError<T::Error>;
 
-    /// Returns a future that completes when a shutdown signal is received.
-    ///
-    /// # Panics
-    ///
-    /// This method logs an error if waiting on the shutdown channel fails,
-    /// but does not panic.
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send {
+        // Clone receiver to await shutdown without consuming the original.
         let mut shutdown_rx = self.shutdown_rx.clone();
         async move {
             if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
@@ -161,16 +166,8 @@ where
         }
     }
 
-    /// Schedule a timer for the current key.
-    ///
-    /// # Arguments
-    ///
-    /// * `time` – The execution time for the timer.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `TimerManagerError` if the scheduler or store operation fails.
     async fn schedule(&self, time: CompactDateTime) -> Result<(), Self::Error> {
+        // Track the scheduling operation under a tracing span.
         let span = info_span!("timer", key = %self.key, time = %time);
         self.timers
             .schedule(Trigger {
@@ -181,31 +178,18 @@ where
             .await
     }
 
-    /// Remove all existing timers for the key, then schedule a new one.
-    ///
-    /// This first unschedules any existing timers for the key in parallel,
-    /// then adds the new timer.
-    ///
-    /// # Arguments
-    ///
-    /// * `time` – The new execution time for the timer.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `TimerManagerError` if any unschedule or schedule operation
-    /// fails.
     async fn clear_and_schedule(
         &self,
         time: CompactDateTime,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let span = info_span!("timer", key = %self.key, time = %time);
 
-        // Unschedule all existing triggers for this key
+        // Unschedule all existing triggers for this key in parallel.
         iter(self.timers.scheduled_triggers(&self.key).await?)
             .map(|trigger| {
                 let span_clone = span.clone();
                 async move {
-                    // Link tracing spans
+                    // Link new span with the original trigger's span.
                     span_clone.follows_from(&trigger.span);
                     self.timers.unschedule(&trigger.key, trigger.time).await
                 }
@@ -214,7 +198,7 @@ where
             .try_collect::<()>()
             .await?;
 
-        // Schedule the new trigger
+        // Schedule the new trigger.
         self.timers
             .schedule(Trigger {
                 key: self.key.clone(),
@@ -224,33 +208,14 @@ where
             .await
     }
 
-    /// Unschedule a specific timer for the current key.
-    ///
-    /// # Arguments
-    ///
-    /// * `time` – The execution time of the timer to remove.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `TimerManagerError` if the unschedule operation fails.
     async fn unschedule(&self, time: CompactDateTime) -> Result<(), TimerManagerError<T::Error>> {
         self.timers.unschedule(&self.key, time).await
     }
 
-    /// Unschedule all timers for the current key.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `TimerManagerError` if any unschedule operation fails.
     async fn clear_scheduled(&self) -> Result<(), TimerManagerError<T::Error>> {
         self.timers.unschedule_all(&self.key).await
     }
 
-    /// Retrieve all scheduled times for the current key.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `TimerManagerError` if the retrieval from storage fails.
     async fn scheduled(&self) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
         Ok(self
             .timers
@@ -260,7 +225,6 @@ where
             .collect())
     }
 
-    /// Return `true` if a shutdown signal has been triggered.
     fn should_shutdown(&self) -> bool {
         *self.shutdown_rx.borrow()
     }

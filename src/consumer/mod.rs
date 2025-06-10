@@ -223,26 +223,13 @@ pub trait Uncommitted {
     /// This method should be called when the event has been successfully
     /// processed and should be permanently removed from the system. Committing
     /// an event typically triggers cleanup operations and prevents redelivery.
-    ///
-    /// # Reliability
-    ///
-    /// Implementations should ensure that commit operations are idempotent
-    /// and will eventually succeed even in the face of transient failures.
     fn commit(self) -> impl Future<Output = ()> + Send;
 
     /// Acknowledges failed processing of the event.
     ///
-    /// This method should be called when event processing fails and the event
-    /// should be handled according to the configured failure policy. Depending
-    /// on the implementation, aborted events may be retried, sent to dead
-    /// letter queues, or permanently discarded.
-    ///
-    /// # Failure Handling
-    ///
-    /// The specific behavior of abort depends on the event type and
-    /// configuration:
-    /// - **Messages**: May be retried or sent to failure topics
-    /// - **Timers**: May be rescheduled or permanently canceled
+    /// This method should be called when event processing is shutting down and
+    /// cannot continue. Abort should only be called when the partition is being
+    /// revoked.
     fn abort(self) -> impl Future<Output = ()> + Send;
 }
 
@@ -333,6 +320,9 @@ pub trait EventHandler {
     fn shutdown(self) -> impl Future<Output = ()> + Send;
 }
 
+/// Implements `HandlerProvider` for any `EventHandler` that is clonable.
+///
+/// This allows a single handler instance to be used for all partitions.
 impl<T> HandlerProvider for T
 where
     T: EventHandler + Clone + Send + Sync + 'static,
@@ -668,7 +658,7 @@ impl ProsodyConsumer {
         let managers: Arc<Managers> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
 
-        // Build event type search automaton
+        // Build event type search automaton for filtering messages
         let allowed_events = config
             .allowed_events
             .as_ref()
@@ -689,13 +679,14 @@ impl ProsodyConsumer {
             allowed_events,
         );
 
+        // Use mock cluster for testing or real bootstrap servers
         let bootstrap = if config.mock {
             MOCK_CLUSTER_BOOTSTRAP.clone()
         } else {
             config.bootstrap_servers.join(",")
         };
 
-        // Configure and create the Kafka consumer
+        // Configure and create the Kafka consumer with optimal settings
         let mut client_config = ClientConfig::new();
         client_config
             .set("bootstrap.servers", bootstrap)
@@ -722,7 +713,7 @@ impl ProsodyConsumer {
 
         consumer.subscribe(&topics)?;
 
-        // Spawn a blocking task to continuously poll for messages
+        // Spawn the background polling task with monitoring
         let poll_interval = config.poll_interval;
         let heartbeat = Heartbeat::new("Kafka poll loop", config.stall_threshold);
         let cloned_managers = managers.clone();
@@ -739,6 +730,7 @@ impl ProsodyConsumer {
             });
         });
 
+        // Start optional probe server for health monitoring
         let probe_server = config
             .probe_port
             .filter(|_| !config.mock)
@@ -833,6 +825,7 @@ impl ProsodyConsumer {
         let retry_strategy = RetryStrategy::new(retry_config)?;
         let topic_strategy = FailureTopicStrategy::new(topic_config, group_id, producer)?;
 
+        // Compose strategies: shutdown → retry → failure topic → retry
         let strategy = ShutdownStrategy // stop processing if shutting down partition
             .and_then(retry_strategy.clone()) // retry processing up to limit
             .and_then(topic_strategy) // write to failure topic
@@ -938,6 +931,10 @@ impl ProsodyConsumer {
     }
 }
 
+/// Ensures graceful shutdown when the consumer is dropped.
+///
+/// This implementation guarantees that resources are cleaned up even if
+/// the consumer is dropped without explicitly calling `shutdown()`.
 impl Drop for ProsodyConsumer {
     fn drop(&mut self) {
         block_on(self.execute_shutdown());

@@ -260,7 +260,10 @@ static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
 /// The length of a UUID string (36 characters) plus one byte for length.
 const UUID_STR_LEN: usize = 36 + 1;
 
-/// The system originating a message
+/// The system originating a message.
+///
+/// Used to track which service or component generated a particular message,
+/// enabling loop detection and audit trails.
 pub type SourceSystem = Flexstr<UUID_STR_LEN>;
 
 /// An interned string representing a Kafka topic name.
@@ -296,14 +299,22 @@ pub type EventId = Flexstr<UUID_STR_LEN>;
 /// A borrowed string slice for event identifiers.
 pub type BorrowedEventId = str;
 
-/// Source system header used to prevent processing loops
+/// Source system header used to prevent processing loops.
 const SOURCE_SYSTEM_HEADER: &str = "source-system";
 
 /// Defines event identity behavior for messages that contain unique
 /// identifiers.
 ///
 /// This trait enables idempotent message processing by providing access to
-/// event identifiers that can be used to deduplicate messages.
+/// event identifiers that can be used to deduplicate messages. Implementations
+/// should extract identifiers from their internal representation and provide
+/// them in a consistent format.
+///
+/// # Usage
+///
+/// Typically used by consumers to detect and skip duplicate messages that may
+/// be delivered due to retries or network issues. The event ID should be stable
+/// across message delivery attempts.
 pub trait EventIdentity {
     /// The type used to represent a borrowed event ID.
     type BorrowedEventId: ?Sized;
@@ -326,6 +337,12 @@ impl EventIdentity for Payload {
     type BorrowedEventId = str;
     type EventId = EventId;
 
+    /// Extracts the event ID from a JSON payload's "id" field.
+    ///
+    /// # Returns
+    ///
+    /// The string value of the "id" field if it exists and is a string,
+    /// otherwise `None`.
     fn event_id(&self) -> Option<&Self::BorrowedEventId> {
         match self.get("id")? {
             Value::String(value) => Some(value.as_str()),

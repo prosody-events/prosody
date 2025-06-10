@@ -1,12 +1,15 @@
 //! Core message types and processing for Kafka consumers.
 //!
-//! This module defines the message types used for processing Kafka messages:
+//! This module defines the message types used for processing Kafka messages and
+//! timer events. It provides abstractions for acknowledging (commit or abort)
+//! both message and timer deliveries.
 //!
-//! - `UncommittedEvent` – A unified enum for message and timer events that
-//!   require acknowledgment.
-//! - `UncommittedMessage` – A message with uncommitted offset tracking.
-//! - `ConsumerMessage` – A clonable, offset-agnostic message container.
-//! - `ConsumerMessageValue` – The raw message data and metadata.
+//! - `UncommittedEvent` – Unified enum for message and timer events requiring
+//!   acknowledgment.
+//! - `UncommittedMessage` – A Kafka message paired with offset-tracking state.
+//! - `ConsumerMessage` – A clonable, offset-agnostic container for message
+//!   data.
+//! - `ConsumerMessageValue` – The raw data behind `ConsumerMessage`.
 
 use chrono::{DateTime, Utc};
 use educe::Educe;
@@ -24,7 +27,7 @@ use crate::{
 /// A unified event that must be explicitly committed or aborted.
 ///
 /// This enum wraps either a Kafka message (`UncommittedMessage`) or a timer
-/// event (`UncommittedTimer`) and provides a single interface for acknowledging
+/// event (`PendingTimer<T>`) and provides a single interface for acknowledging
 /// both types of events.
 ///
 /// # Type Parameters
@@ -36,10 +39,10 @@ pub enum UncommittedEvent<T>
 where
     T: TriggerStore,
 {
-    /// A message event requiring offset commit/abort.
+    /// A message event requiring offset commit or abort.
     Message(UncommittedMessage),
 
-    /// A timer event requiring commit/abort.
+    /// A timer event requiring commit or abort.
     Timer(PendingTimer<T>),
 }
 
@@ -61,6 +64,7 @@ impl<T> Uncommitted for UncommittedEvent<T>
 where
     T: TriggerStore,
 {
+    /// Commit the underlying message or timer.
     async fn commit(self) {
         match self {
             UncommittedEvent::Message(message) => message.commit().await,
@@ -68,6 +72,7 @@ where
         }
     }
 
+    /// Abort the underlying message or timer.
     async fn abort(self) {
         match self {
             UncommittedEvent::Message(message) => message.abort().await,
@@ -94,9 +99,9 @@ where
     }
 }
 
-/// A Kafka message with offset tracking for commits/aborts.
+/// A Kafka message with offset tracking for commit/abort semantics.
 ///
-/// Wraps a `ConsumerMessage` and its `UncommittedOffset` handler.
+/// Wraps a `ConsumerMessage` and its corresponding `UncommittedOffset` handler.
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct UncommittedMessage {
@@ -107,49 +112,58 @@ pub struct UncommittedMessage {
 }
 
 impl UncommittedMessage {
-    /// Returns the message's source system, if present.
+    /// Returns the optional source system identifier from message headers.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing the source system if present.
     #[must_use]
     pub fn source_system(&self) -> Option<&SourceSystem> {
         self.inner.source_system()
     }
 
-    /// Returns the message's topic.
+    /// Returns the message's Kafka topic.
     #[must_use]
     pub fn topic(&self) -> Topic {
         self.inner.topic()
     }
 
-    /// Returns the message's partition.
+    /// Returns the message's partition index.
     #[must_use]
     pub fn partition(&self) -> Partition {
         self.inner.partition()
     }
 
-    /// Returns the message's offset.
+    /// Returns the message's offset within the partition.
     #[must_use]
     pub fn offset(&self) -> Offset {
         self.inner.offset()
     }
 
-    /// Returns the message's timestamp.
+    /// Returns the message's broker timestamp.
     #[must_use]
     pub fn timestamp(&self) -> &DateTime<Utc> {
         self.inner.timestamp()
     }
 
-    /// Returns the message's payload.
+    /// Returns a reference to the deserialized JSON payload.
     #[must_use]
     pub fn payload(&self) -> &Payload {
         self.inner.payload()
     }
 
-    /// Returns the message's tracing span.
+    /// Returns the tracing `Span` associated with this message.
     #[must_use]
     pub fn span(&self) -> &Span {
         self.inner.span()
     }
 
-    /// Decomposes the message into its inner components.
+    /// Decomposes into its inner `ConsumerMessage` and the offset-tracking
+    /// guard.
+    ///
+    /// # Returns
+    ///
+    /// A tuple `(ConsumerMessage, UncommittedOffset)`.
     #[must_use]
     pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
         (self.inner, self.uncommitted_offset)
@@ -157,6 +171,7 @@ impl UncommittedMessage {
 }
 
 impl Uncommitted for UncommittedMessage {
+    /// Commit the message offset to Kafka and log the action.
     async fn commit(self) {
         debug!(
             topic = self.topic().as_ref(),
@@ -168,6 +183,7 @@ impl Uncommitted for UncommittedMessage {
         self.uncommitted_offset.commit();
     }
 
+    /// Abort the message processing and log the action.
     async fn abort(self) {
         debug!(
             topic = self.topic().as_ref(),
@@ -203,50 +219,52 @@ impl EventIdentity for UncommittedMessage {
 #[derive(Clone, Debug)]
 pub struct ConsumerMessage(Arc<ConsumerMessageValue>);
 
-/// The full data structure for a consumer message.
+/// The full data and metadata for a consumer message.
+///
+/// Owned by `ConsumerMessage` and shared via `Arc`.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct ConsumerMessageValue {
-    /// The system that originated this message.
+    /// Optional header indicating the source system that produced the message.
     pub source_system: Option<SourceSystem>,
 
-    /// The Kafka topic name.
+    /// Name of the Kafka topic.
     pub topic: Topic,
 
-    /// The partition index.
+    /// Index of the partition.
     pub partition: Partition,
 
-    /// The offset within the partition.
+    /// Offset of the message in the partition.
     pub offset: Offset,
 
-    /// The message key.
+    /// Message key, used for routing and deduplication.
     pub key: Key,
 
-    /// The timestamp when the broker sent the message.
+    /// Broker timestamp when the message was produced.
     pub timestamp: DateTime<Utc>,
 
-    /// The message payload.
+    /// JSON payload of the message.
     #[educe(Debug(ignore))]
     pub payload: Payload,
 
-    /// Span for distributed tracing.
+    /// Tracing span for this message.
     #[educe(Debug(ignore))]
     pub span: Span,
 }
 
 impl ConsumerMessage {
-    /// Creates a new consumer message.
+    /// Create a new `ConsumerMessage` from raw components.
     ///
     /// # Arguments
     ///
-    /// * `source_system` – The system originating the message.
-    /// * `topic` – The message's topic.
-    /// * `partition` – The message's partition.
-    /// * `offset` – The message's offset.
-    /// * `key` – The message's key.
-    /// * `timestamp` – The message's timestamp.
-    /// * `payload` – The message's payload.
-    /// * `span` – The message's tracing span.
+    /// * `source_system` – Optional source system identifier.
+    /// * `topic` – Kafka topic name.
+    /// * `partition` – Partition index.
+    /// * `offset` – Offset within the partition.
+    /// * `key` – Message key.
+    /// * `timestamp` – Broker timestamp.
+    /// * `payload` – Message payload as JSON.
+    /// * `span` – Tracing span for distributed context.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -271,7 +289,7 @@ impl ConsumerMessage {
         }))
     }
 
-    /// Returns the message's source system, if present.
+    /// Returns the optional source system identifier.
     #[must_use]
     pub fn source_system(&self) -> Option<&SourceSystem> {
         self.0.source_system.as_ref()
@@ -301,23 +319,23 @@ impl ConsumerMessage {
         &self.0.timestamp
     }
 
-    /// Returns the message's payload.
+    /// Returns the JSON payload.
     #[must_use]
     pub fn payload(&self) -> &Payload {
         &self.0.payload
     }
 
-    /// Returns the message's tracing span.
+    /// Returns the tracing span for the message.
     #[must_use]
     pub fn span(&self) -> &Span {
         &self.0.span
     }
 
-    /// Converts this message into an `UncommittedMessage`.
+    /// Convert into `UncommittedMessage` by attaching offset-tracking state.
     ///
     /// # Arguments
     ///
-    /// * `uncommitted_offset` – The offset tracking state to attach.
+    /// * `uncommitted_offset` – The offset guard to manage commit/abort.
     #[must_use]
     pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage {
         UncommittedMessage {
@@ -326,7 +344,7 @@ impl ConsumerMessage {
         }
     }
 
-    /// Extracts the inner `ConsumerMessageValue`, cloning if needed.
+    /// Extracts the inner `ConsumerMessageValue`, cloning if necessary.
     #[must_use]
     pub fn into_value(self) -> ConsumerMessageValue {
         Arc::unwrap_or_clone(self.0)
