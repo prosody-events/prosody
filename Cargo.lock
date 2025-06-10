@@ -469,6 +469,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dyn-clone"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c7a8fb8a9fbf66c1f703fe16184d10ca0ee9d23be5b4436400408ba54a95005"
+
+[[package]]
 name = "educe"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1600,6 +1606,7 @@ dependencies = [
  "ahash",
  "aho-corasick",
  "async-stream",
+ "async-trait",
  "axum 0.8.4",
  "axum-extra",
  "chrono",
@@ -1607,6 +1614,7 @@ dependencies = [
  "crossbeam-utils",
  "derive-quickcheck-arbitrary",
  "derive_builder",
+ "dyn-clone",
  "educe",
  "fixedstr",
  "futures",

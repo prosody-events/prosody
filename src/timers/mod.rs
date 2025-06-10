@@ -143,7 +143,7 @@ mod scheduler;
 mod slab;
 mod slab_lock;
 pub mod store;
-mod uncommitted;
+pub mod uncommitted;
 
 /// The maximum number of concurrent slab load tasks.
 ///

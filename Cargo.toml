@@ -19,11 +19,13 @@ version = "0.10.0"
 ahash = "0.8"
 aho-corasick = "1.1"
 async-stream = "0.3"
+async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
 axum-extra = "0.10"
 chrono = "0.4"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
+dyn-clone = "1.0"
 educe = "0.6"
 fixedstr = { version = "0.5", features = ["flex-str"] }
 futures = "0.3"

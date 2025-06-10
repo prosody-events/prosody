@@ -25,6 +25,7 @@ use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
 use crate::timers::store::TriggerStore;
+use async_trait::async_trait;
 use educe::Educe;
 use std::future::Future;
 use std::time::Duration;
@@ -64,7 +65,7 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
 
 /// The concrete implementation of an uncommitted timer event.
 ///
-/// `ConcreteUncommittedTimer<T>` wraps a `Trigger` and an internal transaction
+/// `PendingTimer<T>` wraps a `Trigger` and an internal transaction
 /// state. After processing, applications must call `commit()` to remove the
 /// timer from storage, or `abort()` to deactivate it in-memory while leaving
 /// persistent data.
@@ -313,16 +314,91 @@ where
     }
 }
 
-impl<T> Drop for UncommittedTriggerGuard<T>
+/// Object-safe trait for commit/abort guards.
+///
+/// Enables dynamic dispatch over types that implement `Uncommitted`.
+#[async_trait]
+pub trait DynUncommittedGuard: Send + Sync {
+    /// Commits the timer, consuming the guard.
+    async fn commit(self: Box<Self>);
+
+    /// Aborts the timer, consuming the guard.
+    async fn abort(self: Box<Self>);
+}
+
+#[async_trait]
+impl<G> DynUncommittedGuard for G
 where
-    T: TriggerStore,
+    G: Uncommitted + Send + Sync + 'static,
 {
-    /// Warn if a guard is dropped without being committed or aborted.
-    ///
-    /// This helps detect resource leaks from unacknowledged timers.
-    fn drop(&mut self) {
-        if self.inner.is_some() {
-            warn!("timer guard was dropped without committing or aborting");
-        }
+    async fn commit(self: Box<Self>) {
+        Uncommitted::commit(*self).await;
+    }
+
+    async fn abort(self: Box<Self>) {
+        Uncommitted::abort(*self).await;
+    }
+}
+
+/// Object-safe trait for uncommitted timer events.
+///
+/// Allows dynamic dispatch for types implementing `UncommittedTimer`.
+#[async_trait]
+pub trait DynUncommittedTimer: Send + Sync {
+    /// Returns the timer's key.
+    fn key(&self) -> &Key;
+
+    /// Returns the timer's scheduled execution time.
+    fn time(&self) -> CompactDateTime;
+
+    /// Returns the associated tracing span.
+    fn span(&self) -> &Span;
+
+    /// Checks if the timer is still active.
+    async fn is_active(&self) -> bool;
+
+    /// Commits the timer, removing it from storage.
+    async fn commit(self: Box<Self>);
+
+    /// Aborts the timer without deleting persistent state.
+    async fn abort(self: Box<Self>);
+
+    /// Decomposes into the raw `Trigger` and a boxed commit guard.
+    fn into_inner(self: Box<Self>) -> (Trigger, Box<dyn DynUncommittedGuard>);
+}
+
+#[async_trait]
+impl<U> DynUncommittedTimer for U
+where
+    U: UncommittedTimer + Send + Sync + 'static,
+    U::CommitGuard: Uncommitted + Send + Sync + 'static,
+{
+    fn key(&self) -> &Key {
+        Keyed::key(self)
+    }
+
+    fn time(&self) -> CompactDateTime {
+        UncommittedTimer::time(self)
+    }
+
+    fn span(&self) -> &Span {
+        UncommittedTimer::span(self)
+    }
+
+    async fn is_active(&self) -> bool {
+        UncommittedTimer::is_active(self).await
+    }
+
+    async fn commit(self: Box<Self>) {
+        Uncommitted::commit(*self).await;
+    }
+
+    async fn abort(self: Box<Self>) {
+        Uncommitted::abort(*self).await;
+    }
+
+    fn into_inner(self: Box<Self>) -> (Trigger, Box<dyn DynUncommittedGuard>) {
+        let (trigger, guard) = UncommittedTimer::into_inner(*self);
+        (trigger, Box::new(guard) as Box<dyn DynUncommittedGuard>)
     }
 }
