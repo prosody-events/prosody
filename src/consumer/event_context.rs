@@ -33,9 +33,9 @@ use crate::timers::{DELETE_CONCURRENCY, TimerManager, Trigger};
 /// - Clear any scheduled timers and reschedule a fresh one.
 /// - Inspect all scheduled timer execution times for the key.
 /// - Check synchronously if shutdown has been requested.
-pub trait EventContext: Clone + Send {
+pub trait EventContext: Clone + Send + Sync + 'static {
     /// Error type returned by timer-related operations.
-    type Error: Error;
+    type Error: Error + Send + Sync + 'static;
 
     /// Returns a future that resolves when a shutdown signal is received.
     ///
