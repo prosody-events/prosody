@@ -21,11 +21,10 @@ use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, PendingTimer, Trigger};
+use async_stream::try_stream;
 use educe::Educe;
-use futures::stream::iter;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use std::sync::Arc;
-
 use tokio::spawn;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
@@ -126,19 +125,28 @@ where
     ///
     /// Returns `TimerManagerError::Store` if the underlying storage query
     /// fails.
-    pub async fn scheduled_times(
+    pub fn scheduled_times(
         &self,
         key: &Key,
-    ) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
-        self.0
-            .state
-            .trigger_lock()
-            .await
-            .store
-            .get_key_times(&self.0.segment.id, key)
-            .map_err(TimerManagerError::Store)
-            .try_collect()
-            .await
+    ) -> impl Stream<Item = Result<CompactDateTime, TimerManagerError<T::Error>>> + Send + 'static
+    {
+        let slab_lock = self.0.state.clone();
+        let key = key.clone();
+        let segment_id = self.0.segment.id;
+
+        try_stream! {
+            let state = slab_lock.trigger_lock().await;
+
+            let stream = state
+                .store
+                .get_key_times(&segment_id, &key)
+                .map_err(TimerManagerError::Store);
+
+            pin_mut!(stream);
+            while let Some(item) = stream.try_next().await? {
+                yield item;
+            }
+        }
     }
 
     /// Retrieves all scheduled triggers for a given key.
@@ -277,15 +285,10 @@ where
     /// operation fails.
     pub async fn unschedule_all(&self, key: &Key) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
-        let times = self.scheduled_times(key).await?;
 
-        // Issue unschedule futures in parallel, reusing the current tracing span.
-        let futures = times
-            .into_iter()
-            .map(|time| self.unschedule(key, time).instrument(span.clone()));
-
-        iter(futures)
-            .buffer_unordered(DELETE_CONCURRENCY)
+        self.scheduled_times(key)
+            .map_ok(|time| self.unschedule(key, time).instrument(span.clone()))
+            .try_buffer_unordered(DELETE_CONCURRENCY)
             .try_collect::<()>()
             .await
     }
@@ -442,7 +445,10 @@ mod tests {
         assert!(result.is_ok(), "Scheduling should succeed");
 
         // Verify the timer is stored
-        let scheduled_times = manager.scheduled_times(&trigger.key).await?;
+        let scheduled_times = manager
+            .scheduled_times(&trigger.key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert_eq!(scheduled_times.len(), 1);
         assert!(scheduled_times.contains(&trigger.time));
         Ok(())
@@ -466,7 +472,10 @@ mod tests {
             manager.schedule(trigger.clone()).await?;
         }
 
-        let scheduled_times = manager.scheduled_times(&key).await?;
+        let scheduled_times = manager
+            .scheduled_times(&key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert_eq!(scheduled_times.len(), 3);
 
         for trigger in &triggers {
@@ -488,8 +497,14 @@ mod tests {
         manager.schedule(trigger2.clone()).await?;
 
         // Verify each key has its timer
-        let times1 = manager.scheduled_times(&trigger1.key).await?;
-        let times2 = manager.scheduled_times(&trigger2.key).await?;
+        let times1 = manager
+            .scheduled_times(&trigger1.key)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let times2 = manager
+            .scheduled_times(&trigger2.key)
+            .try_collect::<Vec<_>>()
+            .await?;
 
         assert_eq!(times1.len(), 1);
         assert_eq!(times2.len(), 1);
@@ -505,7 +520,10 @@ mod tests {
         let (_stream, manager) = setup_timer_manager().await?;
         let nonexistent_key = Key::from("nonexistent");
 
-        let scheduled_times = manager.scheduled_times(&nonexistent_key).await?;
+        let scheduled_times = manager
+            .scheduled_times(&nonexistent_key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert!(scheduled_times.is_empty());
         Ok(())
     }
@@ -523,7 +541,10 @@ mod tests {
         assert!(result.is_ok(), "Unscheduling should succeed");
 
         // Verify timer is removed
-        let scheduled_times = manager.scheduled_times(&trigger.key).await?;
+        let scheduled_times = manager
+            .scheduled_times(&trigger.key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert!(scheduled_times.is_empty());
         Ok(())
     }
@@ -564,7 +585,10 @@ mod tests {
         }
 
         // Verify all are scheduled
-        let scheduled_times = manager.scheduled_times(&key).await?;
+        let scheduled_times = manager
+            .scheduled_times(&key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert_eq!(scheduled_times.len(), 3);
 
         // Unschedule all
@@ -572,7 +596,10 @@ mod tests {
         assert!(result.is_ok(), "Unschedule all should succeed");
 
         // Verify all are removed
-        let scheduled_times = manager.scheduled_times(&key).await?;
+        let scheduled_times = manager
+            .scheduled_times(&key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert!(scheduled_times.is_empty());
         Ok(())
     }
@@ -646,7 +673,10 @@ mod tests {
         assert!(result.is_ok(), "Complete should succeed");
 
         // Verify timer is removed from storage
-        let scheduled_times = manager.scheduled_times(&trigger.key).await?;
+        let scheduled_times = manager
+            .scheduled_times(&trigger.key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert!(scheduled_times.is_empty());
         Ok(())
     }
@@ -679,7 +709,10 @@ mod tests {
         manager.abort(&trigger.key, trigger.time).await;
 
         // Timer should still be in storage after abort
-        let scheduled_times = manager.scheduled_times(&trigger.key).await?;
+        let scheduled_times = manager
+            .scheduled_times(&trigger.key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert_eq!(scheduled_times.len(), 1);
         assert!(scheduled_times.contains(&trigger.time));
         Ok(())
@@ -759,7 +792,10 @@ mod tests {
         // Verify all timers were scheduled
         for i in 0..10_u8 {
             let key = Key::from(format!("concurrent-{i}"));
-            let times = manager.scheduled_times(&key).await?;
+            let times = manager
+                .scheduled_times(&key)
+                .try_collect::<Vec<_>>()
+                .await?;
             assert_eq!(times.len(), 1, "Timer {i} should be scheduled");
         }
         Ok(())
@@ -774,7 +810,10 @@ mod tests {
 
         // 1. Schedule timer
         manager.schedule(trigger.clone()).await?;
-        let times = manager.scheduled_times(&trigger.key).await?;
+        let times = manager
+            .scheduled_times(&trigger.key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert_eq!(times.len(), 1);
 
         // 2. Verify timer exists
@@ -782,7 +821,10 @@ mod tests {
 
         // 3. Complete timer
         manager.complete(&trigger.key, trigger.time).await?;
-        let times = manager.scheduled_times(&trigger.key).await?;
+        let times = manager
+            .scheduled_times(&trigger.key)
+            .try_collect::<Vec<_>>()
+            .await?;
         assert!(times.is_empty());
         Ok(())
     }
@@ -819,7 +861,10 @@ mod tests {
 
         // Verify each key has exactly one timer at the same time
         for trigger in &triggers {
-            let times = manager.scheduled_times(&trigger.key).await?;
+            let times = manager
+                .scheduled_times(&trigger.key)
+                .try_collect::<Vec<_>>()
+                .await?;
             assert_eq!(times.len(), 1);
             assert!(times.contains(&base_time));
         }
@@ -855,8 +900,15 @@ mod tests {
         assert!(result.is_ok(), "Scheduling far in future should succeed");
 
         // Verify both timers are stored
-        let times_now = manager.scheduled_times(&trigger_now.key).await?;
-        let times_future = manager.scheduled_times(&trigger_future.key).await?;
+        let times_now = manager
+            .scheduled_times(&trigger_now.key)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let times_future = manager
+            .scheduled_times(&trigger_future.key)
+            .try_collect::<Vec<_>>()
+            .await?;
 
         assert_eq!(times_now.len(), 1);
         assert_eq!(times_future.len(), 1);

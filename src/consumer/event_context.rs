@@ -12,9 +12,10 @@ use async_trait::async_trait;
 use dyn_clone::DynClone;
 use educe::Educe;
 use futures::stream::iter;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use std::error::Error;
 use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::watch;
 use tracing::{error, info_span};
 
@@ -36,6 +37,9 @@ use crate::timers::{DELETE_CONCURRENCY, TimerManager, Trigger};
 pub trait EventContext: Clone + Send + Sync + 'static {
     /// Error type returned by timer-related operations.
     type Error: Error + Send + Sync + 'static;
+
+    /// Returns `true` if a shutdown signal has already been issued.
+    fn should_shutdown(&self) -> bool;
 
     /// Returns a future that resolves when a shutdown signal is received.
     ///
@@ -102,16 +106,15 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// A `Vec<CompactDateTime>` of all scheduled times.
+    /// A stream of scheduled time results.
     ///
     /// # Errors
     ///
-    /// Returns `Err(Self::Error)` if retrieving times from the persistent
+    /// Items will be `Err(Self::Error)` if retrieving times from the persistent
     /// store fails.
-    fn scheduled(&self) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send;
-
-    /// Returns `true` if a shutdown signal has already been issued.
-    fn should_shutdown(&self) -> bool;
+    fn scheduled(
+        &self,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static;
 
     /// Return a boxed, type-erased event context
     fn boxed(self) -> BoxEventContext {
@@ -173,6 +176,10 @@ where
 {
     type Error = TimerManagerError<T::Error>;
 
+    fn should_shutdown(&self) -> bool {
+        *self.shutdown_rx.borrow()
+    }
+
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send {
         // Clone receiver so awaiting shutdown does not consume original.
         let mut shutdown_rx = self.shutdown_rx.clone();
@@ -233,17 +240,10 @@ where
         self.timers.unschedule_all(&self.key).await
     }
 
-    async fn scheduled(&self) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
-        Ok(self
-            .timers
-            .scheduled_times(&self.key)
-            .await?
-            .into_iter()
-            .collect())
-    }
-
-    fn should_shutdown(&self) -> bool {
-        *self.shutdown_rx.borrow()
+    fn scheduled(
+        &self,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
+        self.timers.scheduled_times(&self.key)
     }
 }
 
@@ -251,7 +251,7 @@ where
 pub type BoxEventContext = Box<dyn DynEventContext>;
 
 /// Boxed error type for object-safe contexts.
-pub type BoxError = Box<dyn Error + Send + Sync>;
+pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Object-safe version of `EventContext` with boxed futures and errors.
 ///
@@ -295,7 +295,9 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     async fn clear_scheduled(&self) -> Result<(), BoxError>;
 
     /// List scheduled execution times.
-    async fn scheduled(&self) -> Result<Vec<CompactDateTime>, BoxError>;
+    fn scheduled(
+        &self,
+    ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxError>> + Send + 'static>>;
 
     /// Synchronously check if shutdown has been requested.
     fn should_shutdown(&self) -> bool;
@@ -337,10 +339,10 @@ where
             .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn scheduled(&self) -> Result<Vec<CompactDateTime>, BoxError> {
-        EventContext::scheduled(self)
-            .await
-            .map_err(|e| Box::new(e) as BoxError)
+    fn scheduled(
+        &self,
+    ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxError>> + Send + 'static>> {
+        Box::pin(EventContext::scheduled(self).map_err(|e| Box::new(e) as BoxError))
     }
 
     fn should_shutdown(&self) -> bool {
