@@ -130,10 +130,14 @@ impl TriggerStore for CassandraTriggerStore {
                 .session()
                 .execute_iter(self.queries().get_slabs.clone(), (segment_id,))
                 .await?
-                .rows_stream::<(i32,)>()?;
+                .rows_stream::<(Option<i32>,)>()?;
 
             pin_mut!(stream);
             while let Some((value,)) = stream.try_next().await? {
+                let Some(value) = value else {
+                    continue;
+                };
+
                 yield SlabId::from_le_bytes(value.to_le_bytes())
             }
         }
@@ -153,10 +157,14 @@ impl TriggerStore for CassandraTriggerStore {
                 .session()
                 .execute_iter(self.queries().get_slab_range.clone(), (segment_id, start, end))
                 .await?
-                .rows_stream::<(i32,)>()?;
+                .rows_stream::<(Option<i32>,)>()?;
 
             pin_mut!(stream);
             while let Some((value,)) = stream.try_next().await? {
+                let Some(value) = value else {
+                    continue;
+                };
+
                 yield SlabId::from_le_bytes(value.to_le_bytes())
             }
         }
