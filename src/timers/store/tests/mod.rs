@@ -1,7 +1,18 @@
 //! Tests for the `TriggerStore` trait implementations.
 //!
 //! This module contains property-based tests that verify the behavior
-//! of any implementation of the `TriggerStore` trait.
+//! of any implementation of the `TriggerStore` trait. The tests ensure
+//! that triggers with the same key and time act as upserts, maintaining
+//! data consistency across all storage backends.
+
+use crate::Key;
+use crate::timers::Trigger;
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
+use crate::timers::store::Segment;
+use quickcheck::{Arbitrary, Gen};
+use std::fmt::Debug;
+use uuid::Uuid;
 
 /// Tests for cleanup operations of the trigger store.
 pub mod cleanup_operations;
@@ -24,21 +35,14 @@ pub mod trigger_consistency;
 /// Tests for basic trigger add/remove/clear operations.
 pub mod trigger_operations;
 
-use crate::Key;
-use crate::timers::Trigger;
-use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
-use crate::timers::store::{Segment, TriggerStore};
-use quickcheck::{Arbitrary, Gen};
-use std::fmt::Debug;
-use tracing::Span;
-use uuid::Uuid;
+use crate::timers::store::TriggerStore;
 
 /// Alias for the result returned by trigger store tests.
 pub type TestStoreResult = Result<(), String>;
 
 // Implement Arbitrary trait for test types - these should only be available
 // during testing
+
 impl Arbitrary for CompactDuration {
     fn arbitrary(g: &mut Gen) -> Self {
         // Generate durations between 1 second and 24 hours
@@ -59,7 +63,6 @@ impl Arbitrary for CompactDateTime {
     }
 }
 
-#[cfg(test)]
 impl Arbitrary for Segment {
     fn arbitrary(g: &mut Gen) -> Self {
         let id = Uuid::new_v4();
@@ -73,6 +76,7 @@ impl Arbitrary for Segment {
         }
     }
 }
+
 #[derive(Debug, Clone)]
 /// Represents an operation performed on a trigger.
 pub enum TriggerOperation {
@@ -91,7 +95,6 @@ pub struct SegmentTestInput {
     pub segments: Vec<Segment>,
 }
 
-#[cfg(test)]
 impl Arbitrary for SegmentTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
         let count = usize::arbitrary(g) % 10 + 1; // 1-10 segments
@@ -113,7 +116,6 @@ pub struct TriggerTestInput {
     pub triggers: Vec<Trigger>,
 }
 
-#[cfg(test)]
 impl Arbitrary for TriggerTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
         let segment = Segment::arbitrary(g);
@@ -129,7 +131,7 @@ impl Arbitrary for TriggerTestInput {
                 triggers.push(Trigger {
                     key: Key::from(key.clone()),
                     time,
-                    span: Span::current(),
+                    span: tracing::Span::current(),
                 });
             }
         }
@@ -151,7 +153,6 @@ pub struct TriggerSequence {
     pub operations: Vec<TriggerOperation>,
 }
 
-#[cfg(test)]
 impl Arbitrary for TriggerSequence {
     fn arbitrary(g: &mut Gen) -> Self {
         let segment = Segment::arbitrary(g);
@@ -190,7 +191,6 @@ impl Arbitrary for TriggerSequence {
 }
 
 /// Runs all `TriggerStore` tests on the given store implementation
-#[cfg(test)]
 pub async fn run_all_tests<S>(store_constructor: impl Fn() -> S) -> Vec<TestStoreResult>
 where
     S: TriggerStore + Send + Sync,
@@ -220,13 +220,27 @@ where
     ]
 }
 
-/// Macro to define standardized tests for any `TriggerStore` implementation.
+/// Generate comprehensive test suite for a `TriggerStore` implementation.
+///
+/// This macro creates a full suite of property-based tests using QuickCheck to
+/// verify that a `TriggerStore` implementation correctly handles all operations
+/// across various scenarios including concurrent access, data consistency, and
+/// error conditions.
+///
+/// The macro expects an async constructor that returns a `Result<Store,
+/// Error>`.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// trigger_store_tests!(MyStore, MyStore::new());
+/// ```
 ///
 /// # Arguments
 ///
-/// * `$store_type` - The type of the `TriggerStore` implementation being tested
-/// * `$store_constructor` - Expression that constructs a new instance of the
-///   store
+/// * `$store_type` - The type implementing `TriggerStore`
+/// * `$store_constructor` - Async expression that creates a new instance of the
+///   store and returns `Result<$store_type, Error>`
 #[macro_export]
 macro_rules! trigger_store_tests {
     ($store_type:ty, $store_constructor:expr) => {
@@ -237,270 +251,347 @@ macro_rules! trigger_store_tests {
             use tokio::runtime::Builder;
             use $crate::timers::store::tests;
 
-            #[test]
-            fn test_segment_operations() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_segment_operations
-                        as fn($crate::timers::store::tests::SegmentTestInput) -> TestResult,
-                );
+            // Helper function to create runtime consistently
+            fn create_runtime() -> Result<tokio::runtime::Runtime, String> {
+                Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to build runtime: {}", e))
             }
 
-            #[test]
-            fn test_slab_operations() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
-                );
+            // Helper function to create store instance (always async)
+            async fn create_store() -> Result<$store_type, String> {
+                ($store_constructor).await
+                    .map_err(|e| format!("Failed to create store: {:#}", e))
             }
 
-            #[test]
-            fn test_trigger_operations() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_trigger_operations
-                        as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-                );
+            trigger_store_tests!(@test_functions);
+            trigger_store_tests!(@test_all);
+            trigger_store_tests!(@prop_functions);
+        }
+    };
+
+    // Common test function definitions
+    (@test_functions) => {
+        #[test]
+        fn test_segment_operations() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_segment_operations
+                    as fn($crate::timers::store::tests::SegmentTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_slab_operations() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_trigger_operations() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_trigger_operations
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_trigger_consistency() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_trigger_consistency
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_operation_sequences() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_operation_sequences
+                    as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_cross_slab_operations() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_key_contention() {
+            QuickCheck::new().tests(50).quickcheck(
+                prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_primitive_operations() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_primitive_operations
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_cleanup_operations() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_cleanup_operations
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_sequential_interleavings() {
+            QuickCheck::new().tests(100).quickcheck(
+                prop_sequential_interleavings
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+
+    };
+
+    // Property functions
+    (@prop_functions) => {
+        fn prop_segment_operations(
+            input: $crate::timers::store::tests::SegmentTestInput,
+        ) -> TestResult {
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::segment::test_segment_operations(&store, &input)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::slabs::test_slab_operations(&store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_trigger_operations(input: tests::TriggerTestInput) -> TestResult {
+            if input.triggers.is_empty() {
+                return TestResult::discard();
             }
 
-            #[test]
-            fn test_trigger_consistency() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_trigger_consistency
-                        as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-                );
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::trigger_operations::test_trigger_operations(
+                &store, &input,
+            )) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_trigger_consistency(input: tests::TriggerTestInput) -> TestResult {
+            if input.triggers.is_empty() {
+                return TestResult::discard();
             }
 
-            #[test]
-            fn test_operation_sequences() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_operation_sequences
-                        as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
-                );
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
+                &store, &input,
+            )) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_operation_sequences(input: tests::TriggerSequence) -> TestResult {
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::trigger_operations::test_operation_sequences(
+                &store, &input,
+            )) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_cross_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::cross_slab::test_cross_slab_operations(
+                &store, &segment,
+            )) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_key_contention(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::contention::test_key_contention(&store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_primitive_operations(input: tests::TriggerTestInput) -> TestResult {
+            if input.triggers.is_empty() {
+                return TestResult::discard();
             }
 
-            #[test]
-            fn test_cross_slab_operations() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
-                );
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::primitive_operations::test_primitive_operations(
+                &store, &input,
+            )) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_cleanup_operations(input: tests::TriggerTestInput) -> TestResult {
+            if input.triggers.is_empty() {
+                return TestResult::discard();
             }
 
-            #[test]
-            fn test_key_contention() {
-                QuickCheck::new().tests(50).quickcheck(
-                    prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
-                );
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(tests::cleanup_operations::test_cleanup_operations(
+                &store, &input,
+            )) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_sequential_interleavings(input: tests::TriggerTestInput) -> TestResult {
+            if input.triggers.is_empty() {
+                return TestResult::discard();
             }
 
-            // Tests all primitive operations directly for complete low-level coverage
-            #[test]
-            fn test_primitive_operations() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_primitive_operations
-                        as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-                );
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(e),
+            };
+
+            let store = match runtime.block_on(create_store()) {
+                Ok(store) => store,
+                Err(e) => return TestResult::error(e),
+            };
+
+            match runtime.block_on(
+                tests::sequential_interleavings::test_sequential_interleavings(&store, &input),
+            ) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
             }
+        }
+    };
 
-            // Tests cleanup operations and their interaction with persistence
-            #[test]
-            fn test_cleanup_operations() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_cleanup_operations
-                        as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-                );
-            }
-
-            #[test]
-            fn test_sequential_interleavings() {
-                QuickCheck::new().tests(100).quickcheck(
-                    prop_sequential_interleavings
-                        as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-                );
-            }
-
-            #[test]
-            fn test_all() {
-                // Create runtime for async operations
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => panic!("Failed to build runtime: {}", e),
-                };
-
-                // Run all tests with a store constructor
-                let results = runtime.block_on(tests::run_all_tests(|| $store_constructor));
-
-                // Check results
-                for (i, result) in results.into_iter().enumerate() {
-                    assert!(
-                        result.is_ok(),
-                        "Test #{} failed: {}",
-                        i,
-                        result.unwrap_err()
-                    );
+    // test_all implementation
+    (@test_all) => {
+        #[test]
+        fn test_all() {
+            let runtime = match create_runtime() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("Failed to create runtime: {}", e);
+                    return;
                 }
-            }
+            };
 
-            fn prop_segment_operations(
-                input: $crate::timers::store::tests::SegmentTestInput,
-            ) -> TestResult {
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
+            let results = runtime.block_on(tests::run_all_tests(|| {
+                // Use block_in_place to run async code without creating nested runtime
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        match create_store().await {
+                            Ok(store) => store,
+                            Err(e) => {
+                                eprintln!("Failed to create store: {}", e);
+                                panic!("Store creation failed: {}", e);
+                            }
+                        }
+                    })
+                })
+            }));
 
-                let store = $store_constructor;
-                match runtime.block_on(tests::segment::test_segment_operations(&store, &input)) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(tests::slabs::test_slab_operations(&store, &segment)) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_trigger_operations(input: tests::TriggerTestInput) -> TestResult {
-                if input.triggers.is_empty() {
-                    return TestResult::discard();
-                }
-
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(tests::trigger_operations::test_trigger_operations(
-                    &store, &input,
-                )) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_trigger_consistency(input: tests::TriggerTestInput) -> TestResult {
-                if input.triggers.is_empty() {
-                    return TestResult::discard();
-                }
-
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
-                    &store, &input,
-                )) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_operation_sequences(input: tests::TriggerSequence) -> TestResult {
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(tests::trigger_operations::test_operation_sequences(
-                    &store, &input,
-                )) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_cross_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(tests::cross_slab::test_cross_slab_operations(
-                    &store, &segment,
-                )) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_key_contention(segment: $crate::timers::store::Segment) -> TestResult {
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(tests::contention::test_key_contention(&store, &segment)) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_primitive_operations(input: tests::TriggerTestInput) -> TestResult {
-                if input.triggers.is_empty() {
-                    return TestResult::discard();
-                }
-
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(tests::primitive_operations::test_primitive_operations(
-                    &store, &input,
-                )) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_cleanup_operations(input: tests::TriggerTestInput) -> TestResult {
-                if input.triggers.is_empty() {
-                    return TestResult::discard();
-                }
-
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(tests::cleanup_operations::test_cleanup_operations(
-                    &store, &input,
-                )) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
-                }
-            }
-
-            fn prop_sequential_interleavings(input: tests::TriggerTestInput) -> TestResult {
-                if input.triggers.is_empty() {
-                    return TestResult::discard();
-                }
-
-                let runtime = match Builder::new_current_thread().enable_all().build() {
-                    Ok(rt) => rt,
-                    Err(e) => return TestResult::error(format!("Failed to build runtime: {}", e)),
-                };
-
-                let store = $store_constructor;
-                match runtime.block_on(
-                    tests::sequential_interleavings::test_sequential_interleavings(&store, &input),
-                ) {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(e),
+            for (i, result) in results.into_iter().enumerate() {
+                if let Err(e) = result {
+                    panic!("Test #{} failed: {}", i, e);
                 }
             }
         }

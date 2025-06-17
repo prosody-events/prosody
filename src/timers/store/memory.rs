@@ -15,7 +15,7 @@
 //!   that key.
 //!
 //! All maps use [`scc::HashMap`] for concurrent access, and values are stored
-//! in [`std::collections::BTreeSet`] to maintain sorted order where needed.
+//! in [`BTreeSet`] to maintain sorted order where needed.
 
 use crate::Key;
 use crate::timers::Trigger;
@@ -482,7 +482,10 @@ impl TriggerStore for InMemoryTriggerStore {
 mod test {
     use super::InMemoryTriggerStore;
     use crate::trigger_store_tests;
+    use std::convert::Infallible;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
-    trigger_store_tests!(InMemoryTriggerStore, InMemoryTriggerStore::new());
+    trigger_store_tests!(InMemoryTriggerStore, async {
+        Result::<_, Infallible>::Ok(InMemoryTriggerStore::new())
+    });
 }

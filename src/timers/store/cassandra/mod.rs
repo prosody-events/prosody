@@ -470,3 +470,22 @@ pub enum CassandraTriggerStoreError {
     #[error("expected and integer type")]
     IntExpected,
 }
+
+#[cfg(test)]
+mod test {
+    use super::{CassandraConfiguration, CassandraTriggerStore};
+    use crate::trigger_store_tests;
+
+    // Run the full suite of TriggerStore compliance tests on this implementation.
+    trigger_store_tests!(
+        CassandraTriggerStore,
+        CassandraTriggerStore::new(CassandraConfiguration {
+            datacenter: None,
+            rack: None,
+            nodes: vec!["localhost:9042".to_owned()],
+            keyspace: "prosody".to_owned(),
+            user: None,
+            password: None,
+        })
+    );
+}
