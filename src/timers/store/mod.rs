@@ -26,11 +26,11 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{DELETE_CONCURRENCY, Trigger};
 use futures::{Stream, TryStreamExt};
 use std::error::Error;
-use std::ops::RangeBounds;
+use std::ops::RangeInclusive;
 use tokio::try_join;
 use uuid::Uuid;
 
-/// In-memory storage implementation for testing and development.
+pub mod cassandra;
 pub mod memory;
 
 #[cfg(test)]
@@ -158,13 +158,11 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// # Returns
     ///
     /// A stream of slab identifiers within the range.
-    fn get_slab_range<B>(
+    fn get_slab_range(
         &self,
         segment_id: &SegmentId,
-        range: B,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send
-    where
-        B: RangeBounds<SlabId> + Send;
+        range: RangeInclusive<SlabId>,
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
 
     /// Registers (inserts) a slab ID under a segment.
     ///

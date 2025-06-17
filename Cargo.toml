@@ -46,6 +46,8 @@ quick_cache = "0.6"
 rand = "0.9"
 rdkafka = { version = "0.37", features = ["cmake-build", "tracing"] }
 scc = "2.3"
+scylla = { version = "1.2", features = ["rustls-023"] }
+scylla-migrate = "0.1"
 serde = "1.0"
 serde_json = "1.0"
 simd-json = { version = "0.15", features = ["serde_impl"], optional = true }

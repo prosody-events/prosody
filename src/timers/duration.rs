@@ -127,6 +127,18 @@ impl From<CompactDuration> for Duration {
     }
 }
 
+impl From<CompactDuration> for i32 {
+    fn from(value: CompactDuration) -> Self {
+        i32::from_le_bytes(value.seconds.to_le_bytes())
+    }
+}
+
+impl From<i32> for CompactDuration {
+    fn from(value: i32) -> Self {
+        CompactDuration::new(u32::from_le_bytes(value.to_le_bytes()))
+    }
+}
+
 impl TryFrom<Duration> for CompactDuration {
     type Error = CompactDurationError;
 

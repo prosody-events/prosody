@@ -29,7 +29,7 @@ use futures::stream::Stream;
 use scc::HashMap;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
-use std::ops::RangeBounds;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::join;
 use tracing::Span;
@@ -185,14 +185,11 @@ impl TriggerStore for InMemoryTriggerStore {
     /// # Returns
     ///
     /// A stream of `SlabId`. Never yields an error.
-    fn get_slab_range<B>(
+    fn get_slab_range(
         &self,
         segment_id: &SegmentId,
-        range: B,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>>
-    where
-        B: RangeBounds<SlabId>,
-    {
+        range: RangeInclusive<SlabId>,
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> {
         try_stream! {
             let Some(entry) = self.0.segment_slabs.get_async(segment_id).await else {
                 return;
