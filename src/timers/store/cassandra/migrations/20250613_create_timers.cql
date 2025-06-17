@@ -1,10 +1,7 @@
 -- Migration: create_timers
 -- Timestamp: 20250613
 
--- use this keyspace configuration only for development
-create keyspace if not exists prosody with replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 };
-
-create table prosody.segments
+create table segments
 (
     id        uuid,
     name      text static,
@@ -12,10 +9,10 @@ create table prosody.segments
     slab_id   int,
     primary key ((id), slab_id)
 )
-    with compression = { 'sstable_compression': 'ZstdCompressor' }
+    with compression = { 'class': 'ZstdCompressor' }
      and compaction = { 'class': 'UnifiedCompactionStrategy' };
 
-create table prosody.slabs
+create table slabs
 (
     segment_id uuid,
     id         int,
@@ -24,10 +21,10 @@ create table prosody.slabs
     span       frozen<map<text, text>>,
     primary key ((segment_id, id), key, time)
 )
-    with compression = { 'sstable_compression': 'ZstdCompressor' }
+    with compression = { 'class': 'ZstdCompressor' }
      and compaction = { 'class': 'UnifiedCompactionStrategy' };
 
-create table prosody.keys
+create table keys
 (
     segment_id uuid,
     key        text,
@@ -35,5 +32,5 @@ create table prosody.keys
     span       frozen<map<text, text>>,
     primary key ((segment_id, key), time)
 )
-    with compression = { 'sstable_compression': 'ZstdCompressor' }
+    with compression = { 'class': 'ZstdCompressor' }
      and compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'T2' };

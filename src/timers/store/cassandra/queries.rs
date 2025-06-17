@@ -1,3 +1,4 @@
+use super::embedded_migrator::EmbeddedMigrator;
 use crate::timers::store::cassandra::{CassandraConfiguration, CassandraTriggerStoreError};
 use educe::Educe;
 use scylla::client::Compression;
@@ -7,8 +8,8 @@ use scylla::client::session_builder::SessionBuilder;
 use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
 use scylla::statement::Consistency;
+
 use scylla::statement::prepared::PreparedStatement;
-use scylla_migrate::Migrator;
 use std::sync::Arc;
 
 #[derive(Educe)]
@@ -95,13 +96,10 @@ impl Queries {
         }
 
         let session = session.build().await?;
-
-        Migrator::new(&session, "migrations")
-            .run()
-            .await
-            .map_err(|e| CassandraTriggerStoreError::Migration(e.to_string()))?;
-
+        let migrator = EmbeddedMigrator::new(&session, &configuration.keyspace);
+        migrator.migrate().await?;
         session.use_keyspace(configuration.keyspace, true).await?;
+
         let insert_segment = prepare_insert_segment(&session).await?;
         let get_segment = prepare_get_segment(&session).await?;
         let delete_segment = prepare_delete_segment(&session).await?;

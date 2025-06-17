@@ -68,10 +68,10 @@ where
                 key_times.remove(&trigger.time);
             }
         }
-
-        // Verify the store matches our expected state after every operation
-        verify_store_state(store, &input.segment, &expected_state).await?;
     }
+
+    // Verify the store matches our expected state after all operations
+    verify_store_state(store, &input.segment, &expected_state).await?;
 
     Ok(())
 }

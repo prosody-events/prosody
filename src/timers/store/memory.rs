@@ -485,7 +485,9 @@ mod test {
     use std::convert::Infallible;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
-    trigger_store_tests!(InMemoryTriggerStore, async {
-        Result::<_, Infallible>::Ok(InMemoryTriggerStore::new())
-    });
+    trigger_store_tests!(
+        InMemoryTriggerStore,
+        async { Result::<_, Infallible>::Ok(InMemoryTriggerStore::new()) },
+        100
+    );
 }

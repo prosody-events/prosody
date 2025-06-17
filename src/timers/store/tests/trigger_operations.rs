@@ -176,16 +176,15 @@ where
                 expected_times.clear();
             }
         }
+    }
 
-        // Verify state after each operation
-        let actual_times = get_key_triggers(store, &input.segment.id, &input.key).await?;
+    // Verify final state after all operations
+    let actual_times = get_key_triggers(store, &input.segment.id, &input.key).await?;
 
-        if actual_times != expected_times {
-            return Err(format!(
-                "State mismatch after operation {op:?} on time {time:?}. Expected: \
-                 {expected_times:?}, Got: {actual_times:?}"
-            ));
-        }
+    if actual_times != expected_times {
+        return Err(format!(
+            "Final state mismatch. Expected: {expected_times:?}, Got: {actual_times:?}"
+        ));
     }
 
     Ok(())

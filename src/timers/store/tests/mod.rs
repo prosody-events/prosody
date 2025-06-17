@@ -35,8 +35,6 @@ pub mod trigger_consistency;
 /// Tests for basic trigger add/remove/clear operations.
 pub mod trigger_operations;
 
-use crate::timers::store::TriggerStore;
-
 /// Alias for the result returned by trigger store tests.
 pub type TestStoreResult = Result<(), String>;
 
@@ -190,36 +188,6 @@ impl Arbitrary for TriggerSequence {
     }
 }
 
-/// Runs all `TriggerStore` tests on the given store implementation
-pub async fn run_all_tests<S>(store_constructor: impl Fn() -> S) -> Vec<TestStoreResult>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    // Generate test inputs with quickcheck
-    let mut g = Gen::new(100);
-    let segment_input = SegmentTestInput::arbitrary(&mut g);
-    let trigger_input = TriggerTestInput::arbitrary(&mut g);
-    let segment = Segment::arbitrary(&mut g);
-
-    // Run all tests with a fresh store instance for each
-    vec![
-        segment::test_segment_operations(&store_constructor(), &segment_input).await,
-        slabs::test_slab_operations(&store_constructor(), &segment).await,
-        trigger_operations::test_trigger_operations(&store_constructor(), &trigger_input).await,
-        trigger_consistency::test_trigger_consistency(&store_constructor(), &trigger_input).await,
-        sequential_interleavings::test_sequential_interleavings(
-            &store_constructor(),
-            &trigger_input,
-        )
-        .await,
-        cross_slab::test_cross_slab_operations(&store_constructor(), &segment).await,
-        contention::test_key_contention(&store_constructor(), &segment).await,
-        primitive_operations::test_primitive_operations(&store_constructor(), &trigger_input).await,
-        cleanup_operations::test_cleanup_operations(&store_constructor(), &trigger_input).await,
-    ]
-}
-
 /// Generate comprehensive test suite for a `TriggerStore` implementation.
 ///
 /// This macro creates a full suite of property-based tests using QuickCheck to
@@ -233,7 +201,7 @@ where
 /// # Usage
 ///
 /// ```rust,ignore
-/// trigger_store_tests!(MyStore, MyStore::new());
+/// trigger_store_tests!(MyStore, MyStore::new(), 100);
 /// ```
 ///
 /// # Arguments
@@ -241,41 +209,54 @@ where
 /// * `$store_type` - The type implementing `TriggerStore`
 /// * `$store_constructor` - Async expression that creates a new instance of the
 ///   store and returns `Result<$store_type, Error>`
+/// * `$test_count` - Number of property tests to run for each test function
 #[macro_export]
 macro_rules! trigger_store_tests {
-    ($store_type:ty, $store_constructor:expr) => {
+    ($store_type:ty, $store_constructor:expr, $test_count:expr) => {
         #[cfg(test)]
         mod tests {
             use super::*;
             use quickcheck::{QuickCheck, TestResult};
+            use std::sync::LazyLock;
             use tokio::runtime::Builder;
             use $crate::timers::store::tests;
 
-            // Helper function to create runtime consistently
-            fn create_runtime() -> Result<tokio::runtime::Runtime, String> {
+            // Shared runtime instance, created lazily
+            static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
                 Builder::new_multi_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| format!("Failed to build runtime: {}", e))
+                    .unwrap()
+            });
+
+            // Shared store instance, created lazily
+            static STORE: LazyLock<$store_type> = LazyLock::new(|| {
+                RUNTIME.block_on(async {
+                    ($store_constructor).await
+                        .expect("Failed to create shared store instance")
+                })
+            });
+
+            // Helper function to get the shared runtime
+            fn get_runtime() -> &'static tokio::runtime::Runtime {
+                &RUNTIME
             }
 
-            // Helper function to create store instance (always async)
-            async fn create_store() -> Result<$store_type, String> {
-                ($store_constructor).await
-                    .map_err(|e| format!("Failed to create store: {:#}", e))
+            // Helper function to get the shared store
+            fn get_store() -> &'static $store_type {
+                &STORE
             }
 
-            trigger_store_tests!(@test_functions);
-            trigger_store_tests!(@test_all);
+            trigger_store_tests!(@test_functions, $test_count);
             trigger_store_tests!(@prop_functions);
         }
     };
 
     // Common test function definitions
-    (@test_functions) => {
+    (@test_functions, $test_count:expr) => {
         #[test]
         fn test_segment_operations() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_segment_operations
                     as fn($crate::timers::store::tests::SegmentTestInput) -> TestResult,
             );
@@ -283,14 +264,14 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_slab_operations() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
             );
         }
 
         #[test]
         fn test_trigger_operations() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_trigger_operations
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
@@ -298,7 +279,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_trigger_consistency() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_trigger_consistency
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
@@ -306,7 +287,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_operation_sequences() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_operation_sequences
                     as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
             );
@@ -314,21 +295,21 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_cross_slab_operations() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
             );
         }
 
         #[test]
         fn test_key_contention() {
-            QuickCheck::new().tests(50).quickcheck(
+            QuickCheck::new().tests($test_count / 2).quickcheck(
                 prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
             );
         }
 
         #[test]
         fn test_primitive_operations() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_primitive_operations
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
@@ -336,7 +317,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_cleanup_operations() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_cleanup_operations
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
@@ -344,7 +325,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_sequential_interleavings() {
-            QuickCheck::new().tests(100).quickcheck(
+            QuickCheck::new().tests($test_count).quickcheck(
                 prop_sequential_interleavings
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
@@ -358,34 +339,20 @@ macro_rules! trigger_store_tests {
         fn prop_segment_operations(
             input: $crate::timers::store::tests::SegmentTestInput,
         ) -> TestResult {
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
-
-            match runtime.block_on(tests::segment::test_segment_operations(&store, &input)) {
+            match runtime.block_on(tests::segment::test_segment_operations(store, &input)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
-
-            match runtime.block_on(tests::slabs::test_slab_operations(&store, &segment)) {
+            match runtime.block_on(tests::slabs::test_slab_operations(store, &segment)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
@@ -396,18 +363,11 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
-
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
             match runtime.block_on(tests::trigger_operations::test_trigger_operations(
-                &store, &input,
+                store, &input,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -419,18 +379,11 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
-
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
             match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
-                &store, &input,
+                store, &input,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -438,18 +391,11 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_operation_sequences(input: tests::TriggerSequence) -> TestResult {
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
-
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
             match runtime.block_on(tests::trigger_operations::test_operation_sequences(
-                &store, &input,
+                store, &input,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -457,18 +403,11 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_cross_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
-
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
             match runtime.block_on(tests::cross_slab::test_cross_slab_operations(
-                &store, &segment,
+                store, &segment,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -476,17 +415,10 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_key_contention(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
-
-            match runtime.block_on(tests::contention::test_key_contention(&store, &segment)) {
+            match runtime.block_on(tests::contention::test_key_contention(store, &segment)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
@@ -497,18 +429,11 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
-
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
             match runtime.block_on(tests::primitive_operations::test_primitive_operations(
-                &store, &input,
+                store, &input,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -520,18 +445,11 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
-
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
             match runtime.block_on(tests::cleanup_operations::test_cleanup_operations(
-                &store, &input,
+                store, &input,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -543,18 +461,11 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(e),
-            };
-
-            let store = match runtime.block_on(create_store()) {
-                Ok(store) => store,
-                Err(e) => return TestResult::error(e),
-            };
+            let runtime = get_runtime();
+            let store = get_store();
 
             match runtime.block_on(
-                tests::sequential_interleavings::test_sequential_interleavings(&store, &input),
+                tests::sequential_interleavings::test_sequential_interleavings(store, &input),
             ) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -562,38 +473,5 @@ macro_rules! trigger_store_tests {
         }
     };
 
-    // test_all implementation
-    (@test_all) => {
-        #[test]
-        fn test_all() {
-            let runtime = match create_runtime() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("Failed to create runtime: {}", e);
-                    return;
-                }
-            };
 
-            let results = runtime.block_on(tests::run_all_tests(|| {
-                // Use block_in_place to run async code without creating nested runtime
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        match create_store().await {
-                            Ok(store) => store,
-                            Err(e) => {
-                                eprintln!("Failed to create store: {}", e);
-                                panic!("Store creation failed: {}", e);
-                            }
-                        }
-                    })
-                })
-            }));
-
-            for (i, result) in results.into_iter().enumerate() {
-                if let Err(e) = result {
-                    panic!("Test #{} failed: {}", i, e);
-                }
-            }
-        }
-    };
 }

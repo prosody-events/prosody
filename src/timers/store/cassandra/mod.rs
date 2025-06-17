@@ -19,9 +19,10 @@ use scylla::client::session::Session;
 use scylla::cluster::metadata::NativeType;
 use scylla::errors::{
     ExecutionError, IntoRowsResultError, MaybeFirstRowError, NewSessionError, NextRowError,
-    PagerExecutionError, PrepareError, UseKeyspaceError,
+    PagerExecutionError, PrepareError, RowsError, UseKeyspaceError,
 };
 use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use thiserror::Error;
@@ -29,6 +30,7 @@ use tracing::{info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
 
+mod embedded_migrator;
 mod queries;
 
 #[derive(Builder, Clone, Educe, Validate)]
@@ -56,7 +58,7 @@ struct Inner {
 impl CassandraTriggerStore {
     pub async fn new(config: CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
         Ok(Self(Arc::new(Inner {
-            queries: Queries::new(config).await?,
+            queries: Box::pin(Queries::new(config)).await?,
             propagator: new_propagator(),
         })))
     }
@@ -407,7 +409,7 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDuration 
     fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
         match typ {
             ColumnType::Native(NativeType::Int) => Ok(()),
-            _ => Err(TypeCheckError::new(CassandraTriggerStoreError::IntExpected)),
+            _ => Err(TypeCheckError::new(InnerError::IntExpected)),
         }
     }
 
@@ -423,7 +425,7 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDateTime 
     fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
         match typ {
             ColumnType::Native(NativeType::Int) => Ok(()),
-            _ => Err(TypeCheckError::new(CassandraTriggerStoreError::IntExpected)),
+            _ => Err(TypeCheckError::new(InnerError::IntExpected)),
         }
     }
 
@@ -436,7 +438,7 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDateTime 
 }
 
 #[derive(Debug, Error)]
-pub enum CassandraTriggerStoreError {
+pub enum InnerError {
     #[error(transparent)]
     Session(#[from] NewSessionError),
 
@@ -467,9 +469,37 @@ pub enum CassandraTriggerStoreError {
     #[error("failed to get rows: {0:#}")]
     IntoRows(#[from] IntoRowsResultError),
 
+    #[error("rows error: {0:#}")]
+    Rows(#[from] RowsError),
+
     #[error("expected and integer type")]
     IntExpected,
 }
+
+pub struct CassandraTriggerStoreError(Box<InnerError>);
+
+impl<E> From<E> for CassandraTriggerStoreError
+where
+    InnerError: From<E>,
+{
+    fn from(err: E) -> Self {
+        Self(Box::new(InnerError::from(err)))
+    }
+}
+
+impl std::fmt::Debug for CassandraTriggerStoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Display for CassandraTriggerStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for CassandraTriggerStoreError {}
 
 #[cfg(test)]
 mod test {
@@ -486,6 +516,7 @@ mod test {
             keyspace: "prosody".to_owned(),
             user: None,
             password: None,
-        })
+        }),
+        25
     );
 }

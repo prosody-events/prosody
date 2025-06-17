@@ -45,11 +45,12 @@ pin-project = "1.1"
 quick_cache = "0.6"
 rand = "0.9"
 rdkafka = { version = "0.37", features = ["cmake-build", "tracing"] }
+rust-embed = { version = "8.0", features = ["include-exclude"] }
 scc = "2.3"
-scylla = { version = "1.2", features = ["rustls-023"] }
-scylla-migrate = "0.1"
+scylla = { version = "1.2", features = ["rustls-023", "chrono-04"] }
 serde = "1.0"
 serde_json = "1.0"
+sha2 = "0.10"
 simd-json = { version = "0.15", features = ["serde_impl"], optional = true }
 thiserror = "2.0"
 tokio = { version = "1.41", features = ["macros", "sync"] }
