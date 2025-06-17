@@ -49,7 +49,7 @@ impl<'a> EmbeddedMigrator<'a> {
             let create_keyspace_stmt = self
                 .session
                 .prepare(format!(
-                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{ 'class' : \
+                    "create keyspace if not exists {} WITH replication = {{ 'class' : \
                      'SimpleStrategy', 'replication_factor': 1 }}",
                     self.keyspace
                 ))
@@ -112,8 +112,9 @@ impl<'a> EmbeddedMigrator<'a> {
 
         debug!("Creating schema_migrations table");
         let create_table_sql = format!(
-            "CREATE TABLE {keyspace}.schema_migrations (filename text PRIMARY KEY, checksum text, \
-             applied_at timestamp, execution_time_ms bigint)
+            "create table {keyspace}.schema_migrations (filename text primary key, checksum text, \
+             applied_at timestamp, execution_time_ms bigint) with compression = {{ 'class': \
+             'ZstdCompressor' }} and compaction = {{ 'class': 'UnifiedCompactionStrategy' }};
             "
         );
 
