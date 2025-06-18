@@ -6,7 +6,7 @@ use crate::timers::store::tests::common::{
     add_trigger, get_key_triggers, insert_segment, remove_trigger,
 };
 use crate::timers::store::{Segment, TriggerStore};
-use std::collections::HashSet;
+use ahash::HashSet;
 use std::fmt::Debug;
 use tracing::Span;
 
@@ -16,6 +16,10 @@ use tracing::Span;
 /// - Handle a large number of triggers with the same key
 /// - Accurately track and retrieve all triggers for a high-contention key
 /// - Correctly perform selective deletion on high-volume keys
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_key_contention<S>(store: &S, segment: &Segment) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,

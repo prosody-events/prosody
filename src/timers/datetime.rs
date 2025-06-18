@@ -1,53 +1,8 @@
-//! Compact datetime representation for efficient timer storage and processing.
+//! Memory-efficient datetime using 32-bit epoch seconds.
 //!
-//! This module provides [`CompactDateTime`], a space-efficient representation
-//! of datetime values using 32-bit epoch seconds. This compact format is
-//! optimized for timer systems where storage efficiency and fast comparisons
-//! are important.
-//!
-//! ## Design Rationale
-//!
-//! Traditional datetime representations often use 64-bit timestamps or complex
-//! structures. For timer systems processing large volumes of scheduled events,
-//! this can lead to significant memory overhead. [`CompactDateTime`] addresses
-//! this by:
-//!
-//! - Using only 32 bits for storage (4 bytes vs 8+ bytes)
-//! - Providing fast arithmetic and comparison operations
-//! - Supporting a useful range from 1970 to 2106
-//! - Maintaining second-level precision which is sufficient for most timer use
-//!   cases
-//!
-//! ## Time Range and Precision
-//!
-//! The 32-bit epoch seconds representation provides:
-//!
-//! - **Range**: January 1, 1970 to February 7, 2106
-//! - **Precision**: 1 second
-//! - **Rounding**: Sub-second values are rounded to the nearest second
-//!
-//! ## Usage Examples
-//!
-//! ```rust,no_run
-//! use chrono::{DateTime, Utc};
-//! use prosody::timers::datetime::CompactDateTime;
-//! use prosody::timers::duration::CompactDuration;
-//!
-//! // Create from current time
-//! let now = CompactDateTime::now().unwrap();
-//!
-//! // Create from epoch seconds
-//! let specific_time = CompactDateTime::from(1234567890_u32);
-//!
-//! // Convert from/to chrono DateTime
-//! let chrono_time = Utc::now();
-//! let compact = CompactDateTime::try_from(chrono_time).unwrap();
-//! let back_to_chrono: DateTime<Utc> = compact.into();
-//!
-//! // Time arithmetic
-//! let later = now.add_duration(CompactDuration::new(3600)).unwrap(); // +1 hour
-//! let duration_between = later.duration_since(now).unwrap();
-//! ```
+//! Provides [`CompactDateTime`] which stores timestamps as 32-bit epoch seconds,
+//! reducing memory usage for timer systems that process large volumes of events.
+//! Supports the range 1970-2106 with second-level precision.
 
 use crate::timers::duration::CompactDuration;
 use chrono::{DateTime, Utc};
@@ -55,27 +10,11 @@ use std::fmt::{Debug, Display, Formatter};
 use std::time::Duration;
 use thiserror::Error;
 
-/// A compact datetime representation using 32-bit epoch seconds.
+/// 32-bit datetime stored as epoch seconds.
 ///
-/// [`CompactDateTime`] provides an efficient way to represent datetime values
-/// for timer systems where memory usage and fast operations are critical.
-/// It stores time as seconds since the Unix epoch (January 1, 1970 UTC).
-///
-/// ## Storage Efficiency
-///
-/// - **Size**: 4 bytes (vs 8+ for standard datetime types)
-/// - **Alignment**: Optimal for CPU cache usage
-/// - **Comparison**: Fast integer comparison operations
-///
-/// ## Precision and Range
-///
-/// - **Precision**: 1 second (sub-second values are rounded)
-/// - **Range**: 1970-01-01 00:00:00 UTC to 2106-02-07 06:28:15 UTC
-/// - **Overflow**: Operations that would exceed the range return errors
-///
-/// ## Thread Safety
-///
-/// [`CompactDateTime`] is [`Copy`] and all operations are thread-safe.
+/// Stores time as seconds since Unix epoch (1970-01-01 UTC). Uses 4 bytes instead
+/// of 8+ bytes for standard datetime types. Supports range 1970-2106 with second
+/// precision. Sub-second values are rounded to nearest second.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct CompactDateTime {
     epoch_seconds: u32,
@@ -91,78 +30,30 @@ impl CompactDateTime {
         epoch_seconds: u32::MIN,
     };
 
-    /// Creates a [`CompactDateTime`] representing the current time.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(CompactDateTime)` if the system clock is within the representable
-    /// range, otherwise an error.
+    /// Creates a `CompactDateTime` from the current system time.
     ///
     /// # Errors
     ///
-    /// Returns [`CompactDateTimeError::OutOfRange`] if the system time is
-    /// before 1970 or after 2106.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::timers::datetime::CompactDateTime;
-    ///
-    /// let now = CompactDateTime::now().unwrap();
-    /// println!("Current time: {}", now);
-    /// ```
+    /// Returns `CompactDateTimeError::OutOfRange` if the system time is outside the 1970-2106 range.
     pub fn now() -> Result<Self, CompactDateTimeError> {
         Self::try_from(Utc::now())
     }
 
-    /// Returns the number of seconds since the Unix epoch.
-    ///
-    /// # Returns
-    ///
-    /// A `u32` value representing seconds since January 1, 1970 00:00:00 UTC.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::timers::datetime::CompactDateTime;
-    ///
-    /// let time = CompactDateTime::from(1234567890_u32);
-    /// assert_eq!(time.epoch_seconds(), 1234567890);
-    /// ```
+    /// Returns the stored epoch seconds value.
     #[must_use]
     pub fn epoch_seconds(self) -> u32 {
         self.epoch_seconds
     }
 
-    /// Calculates the duration between this time and an earlier time.
+    /// Calculates duration from `other` to `self`.
     ///
     /// # Arguments
     ///
-    /// * `other` - An earlier [`CompactDateTime`] to measure from.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Duration)` if `other <= self`, otherwise an error.
+    /// * `other` - Earlier time to measure from
     ///
     /// # Errors
     ///
-    /// Returns [`CompactDateTimeError::PastDateTime`] if `other` is later
-    /// than `self`.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use prosody::timers::datetime::CompactDateTime;
-    /// use std::time::Duration;
-    ///
-    /// let earlier = CompactDateTime::from(1000_u32);
-    /// let later = CompactDateTime::from(2000_u32);
-    ///
-    /// assert_eq!(
-    ///     later.duration_since(earlier).unwrap(),
-    ///     Duration::from_secs(1000)
-    /// );
-    /// ```
+    /// Returns `CompactDateTimeError::PastDateTime` if `other` is later than `self`.
     pub fn duration_since(self, other: Self) -> Result<Duration, CompactDateTimeError> {
         let seconds = self
             .epoch_seconds
@@ -172,6 +63,19 @@ impl CompactDateTime {
         Ok(Duration::from_secs(u64::from(seconds)))
     }
 
+    /// Calculates the compact duration between this time and an earlier time.
+    ///
+    /// This is a more efficient version of [`duration_since`](Self::duration_since)
+    /// that returns a [`CompactDuration`] instead of a [`std::time::Duration`].
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - An earlier [`CompactDateTime`] to measure from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactDateTimeError::PastDateTime`] if `other` is later
+    /// than `self`.
     pub fn compact_duration_since(
         self,
         other: Self,
@@ -212,6 +116,15 @@ impl CompactDateTime {
         self.duration_since(Self::now()?)
     }
 
+    /// Calculates the compact duration from now until this datetime.
+    ///
+    /// More efficient version of [`duration_from_now`](Self::duration_from_now)
+    /// that returns a [`CompactDuration`] instead of a [`std::time::Duration`].
+    ///
+    /// # Errors
+    ///
+    /// - [`CompactDateTimeError::OutOfRange`] if current time is out of range.
+    /// - [`CompactDateTimeError::PastDateTime`] if `self` is in the past.
     pub fn compact_duration_from_now(self) -> Result<CompactDuration, CompactDateTimeError> {
         self.compact_duration_since(Self::now()?)
     }

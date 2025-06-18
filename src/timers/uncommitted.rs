@@ -1,18 +1,17 @@
 //! Uncommitted timer events and transaction-like semantics.
 //!
-//! This module defines the timer event abstraction used for processing fired
-//! timers that have been delivered to the application but not yet acknowledged:
+//! Defines the timer event abstraction used for processing fired timers that
+//! have been delivered to the application but not yet acknowledged:
 //!
-//! - `UncommittedTimer` – A trait providing timer metadata and transaction
+//! - [`UncommittedTimer`] - A trait providing timer metadata and transaction
 //!   operations while hiding the concrete store implementation.
-//! - `ConcreteUncommittedTimer` – The concrete implementation of
-//!   `UncommittedTimer`.
+//! - [`PendingTimer`] - The concrete implementation of [`UncommittedTimer`].
 //!
-//! It enforces a transaction-like pattern:
+//! Enforces a transaction-like pattern:
 //!
-//! 1. Delivery: timers arrive as `UncommittedTimer`
+//! 1. Delivery: timers arrive as [`UncommittedTimer`]
 //! 2. Processing: application handles the timer event
-//! 3. Acknowledgment: application calls `commit()` or `abort()`
+//! 3. Acknowledgment: application calls [`commit()`] or [`abort()`]
 //! 4. Cleanup: timers are removed from storage or left for retry
 //!
 //! Timers use at-least-once delivery and survive restarts. Successful commits
@@ -51,9 +50,9 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     /// Check if this timer is still active in the in-memory scheduler.
     fn is_active(&self) -> impl Future<Output = bool> + Send;
 
-    /// Decompose into the raw `Trigger` and the commit guard.
+    /// Decompose into the raw [`Trigger`] and the commit guard.
     ///
-    /// This is useful for advanced scenarios needing direct control over commit
+    /// Useful for advanced scenarios needing direct control over commit
     /// or abort without consuming the wrapper.
     ///
     /// # Returns
@@ -64,10 +63,9 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
 
 /// The concrete implementation of an uncommitted timer event.
 ///
-/// `PendingTimer<T>` wraps a `Trigger` and an internal transaction
-/// state. After processing, applications must call `commit()` to remove the
-/// timer from storage, or `abort()` to deactivate it in-memory while leaving
-/// persistent data.
+/// Wraps a [`Trigger`] and an internal transaction state. After processing,
+/// applications must call [`commit()`] to remove the timer from storage, or
+/// [`abort()`] to deactivate it in-memory while leaving persistent data.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
 pub struct PendingTimer<T>
@@ -77,15 +75,15 @@ where
     /// The underlying timer data: key, execution time, and tracing span.
     trigger: Trigger,
 
-    /// Transaction state and coordination with `TimerManager`.
+    /// Transaction state and coordination with [`TimerManager`].
     #[educe(Debug(ignore))]
     uncommitted: UncommittedTrigger<T>,
 }
 
-/// A wrapper around `UncommittedTrigger` that implements `Uncommitted`.
+/// A wrapper around [`UncommittedTrigger`] that implements [`Uncommitted`].
 ///
-/// This wrapper is necessary because `UncommittedTrigger` implements `Drop`
-/// and `Uncommitted` requires consuming `self`.
+/// This wrapper is necessary because [`UncommittedTrigger`] implements [`Drop`]
+/// and [`Uncommitted`] requires consuming `self`.
 pub struct UncommittedTriggerGuard<T>
 where
     T: TriggerStore,
@@ -97,7 +95,7 @@ where
 /// Internal transaction state for an uncommitted timer.
 ///
 /// Tracks whether the timer has been completed and delegates commit/abort
-/// operations to the `TimerManager`.
+/// operations to the [`TimerManager`].
 pub struct UncommittedTrigger<T>
 where
     T: TriggerStore,
@@ -123,12 +121,12 @@ where
     ///
     /// # Arguments
     ///
-    /// * `trigger` – The timer event with key, time, and tracing context.
-    /// * `manager` – The `TimerManager` that will handle commit and abort.
+    /// * `trigger` - The timer event with key, time, and tracing context.
+    /// * `manager` - The [`TimerManager`] that will handle commit and abort.
     ///
     /// # Returns
     ///
-    /// A new `ConcreteUncommittedTimer` in the pending state.
+    /// A new [`PendingTimer`] in the pending state.
     #[must_use]
     pub fn new(trigger: Trigger, manager: TimerManager<T>) -> Self {
         let key = trigger.key.clone();
@@ -151,8 +149,8 @@ where
 {
     /// Commit this timer after successful processing.
     ///
-    /// Repeated calls are ignored. This method blocks until the underlying
-    /// storage removal succeeds, retrying on errors.
+    /// Repeated calls are ignored. Blocks until the underlying storage
+    /// removal succeeds, retrying on errors.
     async fn commit(mut self) {
         self.uncommitted.commit().await;
     }
@@ -235,8 +233,8 @@ where
 
     /// Permanently remove the timer from storage and deactivate it.
     ///
-    /// This method retries indefinitely on failures, waiting `RETRY_DURATION`
-    /// between attempts. Multiple commits or aborts are ignored.
+    /// Retries indefinitely on failures, waiting [`RETRY_DURATION`] between
+    /// attempts. Multiple commits or aborts are ignored.
     pub async fn commit(&mut self) {
         if self.completed {
             warn!("timer already marked as completed; ignoring commit");
@@ -293,7 +291,7 @@ where
         self.uncommitted.is_active().await
     }
 
-    /// Decompose into the raw `Trigger` and the commit guard.
+    /// Decompose into the raw [`Trigger`] and the commit guard.
     fn into_inner(self) -> (Trigger, Self::CommitGuard) {
         (self.trigger, UncommittedTriggerGuard::new(self.uncommitted))
     }
@@ -305,7 +303,7 @@ where
 {
     /// Warn if a timer is dropped without being committed or aborted.
     ///
-    /// This helps detect resource leaks from unacknowledged timers.
+    /// Helps detect resource leaks from unacknowledged timers.
     fn drop(&mut self) {
         if !self.completed {
             warn!("timer was dropped without committing or aborting");

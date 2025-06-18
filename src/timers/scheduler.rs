@@ -1,25 +1,12 @@
 //! Asynchronous in-memory scheduler for timer triggers.
 //!
-//! This module provides `TriggerScheduler`, which manages scheduling and
-//! expiration of `Trigger` events. It accepts scheduling commands,
-//! maintains active triggers, and emits expired triggers on a receiver channel.
+//! Provides [`TriggerScheduler`] which manages scheduling and expiration of
+//! [`Trigger`] events. Accepts scheduling commands, maintains active triggers,
+//! and emits expired triggers on a receiver channel.
 //!
-//! # Overview
-//! - `TriggerScheduler::new()` returns a receiver for expired triggers and a
-//!   scheduler handle for scheduling or unscheduling triggers.
-//! - `schedule` and `unschedule` enqueue commands to insert or remove triggers.
-//! - Internally, commands are processed by `process_commands`, which drives a
-//!   `TriggerQueue` to delay triggers until their due time.
-//! - Expired triggers are sent to the subscriber via an mpsc channel.
-//!
-//! # Concurrency
-//! - Scheduling and unscheduling operations are non-blocking and use oneshot
-//!   channels to signal completion.
-//! - Trigger expiration and command processing run on a spawned Tokio task.
-//!
-//! # Active Trigger Queries
-//! You can query or deactivate active triggers directly via methods on the
-//! scheduler.
+//! The scheduler uses non-blocking operations with oneshot channels for
+//! completion signaling. Trigger expiration and command processing run
+//! on a spawned Tokio task.
 
 use crate::Key;
 use crate::timers::Trigger;
@@ -36,16 +23,16 @@ use tokio::{select, spawn};
 /// Size of the internal command and trigger channels.
 const BUFFER_SIZE: usize = 64;
 
-/// Asynchronous scheduler for timer `Trigger`s.
+/// Asynchronous scheduler for timer [`Trigger`]s.
 ///
-/// `TriggerScheduler` accepts scheduling commands and emits expired triggers
-/// on a receiver. It also tracks active triggers for membership queries.
+/// Accepts scheduling commands and emits expired triggers on a receiver.
+/// Tracks active triggers for membership queries.
 #[derive(Clone, Debug)]
 pub struct TriggerScheduler {
-    /// Transmits scheduling commands (`Add` or `Remove`) to the processor task.
+    /// Transmits scheduling commands to the processor task.
     command_tx: mpsc::Sender<Command>,
 
-    /// Set of currently active triggers, used for membership checks.
+    /// Set of currently active triggers for membership checks.
     active_triggers: ActiveTriggers,
 }
 
@@ -78,9 +65,8 @@ impl TriggerScheduler {
     /// # Returns
     ///
     /// A tuple of:
-    /// - `mpsc::Receiver<Trigger>`: yields triggers when their scheduled time
-    ///   arrives.
-    /// - `TriggerScheduler`: handle for scheduling or unscheduling triggers.
+    /// - [`mpsc::Receiver<Trigger>`]: yields triggers when their scheduled time arrives.
+    /// - [`TriggerScheduler`]: handle for scheduling or unscheduling triggers.
     pub fn new() -> (mpsc::Receiver<Trigger>, Self) {
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
         let (triggers_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
@@ -100,19 +86,19 @@ impl TriggerScheduler {
         )
     }
 
-    /// Schedule a new `Trigger` for future emission.
+    /// Schedule a new [`Trigger`] for future emission.
     ///
-    /// The trigger will be stored in the internal delay queue and emitted
-    /// on the returned receiver when its scheduled time arrives.
+    /// The trigger is stored in the internal delay queue and emitted on the
+    /// returned receiver when its scheduled time arrives.
     ///
     /// # Arguments
     ///
-    /// * `trigger` - The `Trigger` to schedule.
+    /// * `trigger` - The [`Trigger`] to schedule.
     ///
     /// # Errors
     ///
-    /// Returns `TimerSchedulerError::Shutdown` if the scheduler task has shut
-    /// down or the command channel is closed.
+    /// Returns [`TimerSchedulerError::Shutdown`] if the scheduler task has
+    /// shut down or the command channel is closed.
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
         let (result_tx, result_rx) = oneshot::channel();
         let operation = CommandOperation::Add;
@@ -130,18 +116,18 @@ impl TriggerScheduler {
         result_rx.await.map_err(|_| TimerSchedulerError::Shutdown)
     }
 
-    /// Unschedule a previously scheduled `Trigger`.
+    /// Unschedule a previously scheduled [`Trigger`].
     ///
     /// If the trigger is not present or has already expired, this is a no-op.
     ///
     /// # Arguments
     ///
-    /// * `trigger` - The `Trigger` to remove.
+    /// * `trigger` - The [`Trigger`] to remove.
     ///
     /// # Errors
     ///
-    /// Returns `TimerSchedulerError::Shutdown` if the scheduler task has shut
-    /// down or the command channel is closed.
+    /// Returns [`TimerSchedulerError::Shutdown`] if the scheduler task has
+    /// shut down or the command channel is closed.
     pub async fn unschedule(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
         let (result_tx, result_rx) = oneshot::channel();
         let operation = CommandOperation::Remove;
@@ -159,8 +145,6 @@ impl TriggerScheduler {
     }
 
     /// Returns a reference to the set of active triggers.
-    ///
-    /// You can query or scan the active triggers in the internal registry.
     pub fn active_triggers(&self) -> &ActiveTriggers {
         &self.active_triggers
     }
@@ -172,43 +156,37 @@ impl TriggerScheduler {
     ///
     /// # Arguments
     ///
-    /// * `key` - The `Key` of the trigger.
+    /// * `key` - The [`Key`] of the trigger.
     /// * `time` - The scheduled time of the trigger.
     ///
     /// # Returns
     ///
-    /// `true` if the trigger is in the active set, `false` otherwise.
+    /// `true` if the trigger is in the active set.
     pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
         self.active_triggers.contains(key, time).await
     }
 
     /// Deactivate a trigger without removing it from the persistent queue.
     ///
-    /// This removes the trigger from the active set, preventing future
-    /// `is_active` queries from returning true. It does not cancel any
-    /// pending emission.
+    /// Removes the trigger from the active set, preventing future
+    /// [`is_active`](Self::is_active) queries from returning true.
+    /// Does not cancel pending emission.
     ///
     /// # Arguments
     ///
-    /// * `key` - The `Key` of the trigger.
+    /// * `key` - The [`Key`] of the trigger.
     /// * `time` - The scheduled time of the trigger.
     pub async fn deactivate(&self, key: &Key, time: CompactDateTime) {
         self.active_triggers.remove(key, time).await;
     }
 }
 
-/// Background task that processes scheduling commands and emits expired
-/// triggers.
+/// Background task that processes scheduling commands and emits expired triggers.
 ///
-/// This loop concurrently:
-/// - Receives `Command` messages to add or remove triggers in the
-///   `TriggerQueue`.
-/// - Waits for the next expired trigger and attempts to send it on
-///   `trigger_tx`.
-/// - If the receiver is full, retains the trigger and retries sending.
-///
-/// The `trigger_to_send` buffer ensures no expired triggers are dropped
-/// when the outgoing channel is temporarily full.
+/// Concurrently receives [`Command`] messages to add or remove triggers and
+/// waits for expired triggers to send them. If the receiver is full, retains
+/// the trigger and retries sending. The `trigger_to_send` buffer ensures no
+/// expired triggers are dropped when the outgoing channel is temporarily full.
 async fn process_commands(
     mut commands: mpsc::Receiver<Command>,
     trigger_tx: mpsc::Sender<Trigger>,
@@ -256,10 +234,10 @@ async fn process_commands(
     }
 }
 
-/// Execute a scheduling command against the `TriggerQueue`.
+/// Execute a scheduling command against the [`TriggerQueue`].
 ///
 /// Insertion and removal update both the delay queue and the active set.
-/// Afterwards, signal the caller via `result_tx`.
+/// Signals the caller via `result_tx` afterward.
 async fn process_command(
     triggers: &mut TriggerQueue,
     Command {
@@ -277,7 +255,7 @@ async fn process_command(
     let _ = result_tx.send(());
 }
 
-/// Errors returned by `TriggerScheduler` methods.
+/// Errors returned by [`TriggerScheduler`] methods.
 #[derive(Debug, Error)]
 pub enum TimerSchedulerError {
     /// A datetime conversion error occurred when scheduling a trigger.

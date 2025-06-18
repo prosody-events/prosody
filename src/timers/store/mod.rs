@@ -30,6 +30,7 @@ use std::ops::RangeInclusive;
 use tokio::try_join;
 use uuid::Uuid;
 
+/// Cassandra-based persistent storage implementation.
 pub mod cassandra;
 pub mod memory;
 

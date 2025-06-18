@@ -12,6 +12,10 @@ use std::fmt::Debug;
 /// - When a trigger is added, it's correctly accessible from both key and slab
 ///   indices
 /// - Data remains consistent between the two access patterns
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_trigger_consistency<S>(store: &S, input: &TriggerTestInput) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,

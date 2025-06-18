@@ -34,21 +34,36 @@ use validator::Validate;
 mod embedded_migrator;
 mod queries;
 
+/// Configuration for Cassandra-based timer storage.
+///
+/// Provides settings for connecting to a Cassandra cluster and configuring
+/// TTL behavior for timer data persistence.
 #[derive(Builder, Clone, Educe, Validate)]
 #[educe(Debug)]
 pub struct CassandraConfiguration {
+    /// Preferred datacenter for load balancing.
     datacenter: Option<String>,
+    /// Preferred rack for load balancing.
     rack: Option<String>,
+    /// List of Cassandra node addresses.
     nodes: Vec<String>,
+    /// Keyspace name to use for timer data.
     keyspace: String,
+    /// Username for authentication.
     user: Option<String>,
 
+    /// Password for authentication (excluded from debug output).
     #[educe(Debug(ignore))]
     password: Option<String>,
 
+    /// Base TTL duration added to all timer entries.
     base_ttl: CompactDuration,
 }
 
+/// Cassandra-based implementation of [`TriggerStore`].
+///
+/// Provides persistent storage for timer triggers using Apache Cassandra
+/// with automatic schema migration and optimized TTL management.
 #[derive(Clone, Debug)]
 pub struct CassandraTriggerStore(Arc<Inner>);
 
@@ -60,6 +75,21 @@ struct Inner {
 }
 
 impl CassandraTriggerStore {
+    /// Creates a new Cassandra trigger store with the given configuration.
+    ///
+    /// Initializes the connection to Cassandra, runs schema migrations,
+    /// and prepares all required queries.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Cassandra connection and TTL configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraTriggerStoreError`] if:
+    /// - Connection to Cassandra fails
+    /// - Schema migration fails
+    /// - Query preparation fails
     pub async fn new(config: CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
         let base_ttl = config.base_ttl;
 
@@ -567,54 +597,71 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDateTime 
     }
 }
 
+/// Internal error types for Cassandra operations.
 #[derive(Debug, Error)]
 pub enum InnerError {
+    /// Failed to create Cassandra session.
     #[error(transparent)]
     Session(#[from] NewSessionError),
 
+    /// Schema migration failed.
     #[error("migration failed: {0:#}")]
     Migration(String),
 
+    /// Failed to set keyspace.
     #[error("failed to set keyspace: {0:#}")]
     UseKeyspace(#[from] UseKeyspaceError),
 
+    /// Failed to prepare statement.
     #[error("failed to prepare statement: {0:#}")]
     Prepare(#[from] PrepareError),
 
+    /// Failed to execute statement.
     #[error("failed to execute statement: {0:#}")]
     Execution(#[from] ExecutionError),
 
+    /// Invalid column type.
     #[error("invalid type: {0:#}")]
     TypeCheck(#[from] TypeCheckError),
 
+    /// Failed to retrieve the next row.
     #[error("failed to retrieve the next row: {0:#}")]
     NextRow(#[from] NextRowError),
 
+    /// Failed to retrieve the next page.
     #[error("failed to retrieve the next page: {0:#}")]
     PageExecution(#[from] PagerExecutionError),
 
+    /// Failed to retrieve the first row.
     #[error("failed to retrieve the first row: {0:#}")]
     MaybeFirstRow(#[from] MaybeFirstRowError),
 
+    /// Failed to get rows.
     #[error("failed to get rows: {0:#}")]
     IntoRows(#[from] IntoRowsResultError),
 
+    /// Rows error.
     #[error("rows error: {0:#}")]
     Rows(#[from] RowsError),
 
+    /// Expected integer type but got something else.
     #[error("expected and integer type")]
     IntExpected,
 
+    /// Segment not found in storage.
     #[error("segment not found")]
     SegmentNotFound,
 
+    /// Failed to calculate TTL duration.
     #[error("failed to calculate TTL duration")]
     TtlCalculationFailed,
 
+    /// TTL calculation overflow.
     #[error("TTL calculation overflow")]
     TtlOverflow,
 }
 
+/// Error type for Cassandra trigger store operations.
 pub struct CassandraTriggerStoreError(Box<InnerError>);
 
 impl<E> From<E> for CassandraTriggerStoreError

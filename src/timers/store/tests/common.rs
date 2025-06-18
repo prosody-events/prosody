@@ -1,3 +1,18 @@
+//! Common utilities and helper functions for `TriggerStore` testing.
+//!
+//! This module provides a comprehensive set of helper functions that simplify
+//! testing `TriggerStore` implementations. The functions abstract common
+//! operations like inserting segments, managing slabs, and verifying store
+//! state consistency across different storage backends.
+//!
+//! # Testing Philosophy
+//!
+//! The helpers focus on:
+//! - **Data verification**: Ensuring operations produce expected results
+//! - **Error handling**: Converting storage errors into test failures
+//! - **State consistency**: Verifying dual indices (time and key) remain in sync
+//! - **Cross-backend compatibility**: Working with any `TriggerStore` implementation
+
 use super::TestStoreResult;
 use crate::Key;
 use crate::timers::Trigger;
@@ -6,10 +21,14 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use futures::StreamExt;
-use std::collections::{HashMap, HashSet};
+use ahash::{HashMap, HashSet};
 use std::fmt::Debug;
 
-/// Helper function to insert a segment
+/// Helper function to insert a segment.
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn insert_segment<S>(store: &S, segment: &Segment) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -23,6 +42,10 @@ where
 }
 
 /// Helper function to verify a segment exists and matches expected values
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn verify_segment<S>(store: &S, segment: &Segment) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -43,6 +66,10 @@ where
 }
 
 /// Helper function to delete a segment and verify it's gone
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn delete_segment<S>(store: &S, segment_id: &SegmentId) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -61,6 +88,10 @@ where
 }
 
 /// Helper function to insert a slab
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn insert_slab<S>(store: &S, segment_id: &SegmentId, slab: Slab) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -74,6 +105,10 @@ where
 }
 
 /// Helper function to get and verify slabs
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn get_slabs<S>(store: &S, segment_id: &SegmentId) -> Result<HashSet<SlabId>, String>
 where
     S: TriggerStore + Send + Sync,
@@ -89,6 +124,10 @@ where
 }
 
 /// Helper function to delete a slab
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn delete_slab<S>(store: &S, segment_id: &SegmentId, slab_id: SlabId) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -102,6 +141,10 @@ where
 }
 
 /// Helper function to add a trigger
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn add_trigger<S>(store: &S, segment: &Segment, trigger: &Trigger) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -116,6 +159,10 @@ where
 }
 
 /// Helper function to get triggers by key
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn get_key_triggers<S>(
     store: &S,
     segment_id: &SegmentId,
@@ -135,6 +182,10 @@ where
 }
 
 /// Helper function to get triggers by slab
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn get_slab_triggers<S>(store: &S, slab: &Slab) -> Result<HashSet<Trigger>, String>
 where
     S: TriggerStore + Send + Sync,
@@ -150,6 +201,10 @@ where
 }
 
 /// Helper function to remove a trigger
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn remove_trigger<S>(
     store: &S,
     segment: &Segment,
@@ -169,6 +224,10 @@ where
 }
 
 /// Helper function to clear triggers for a key
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn clear_triggers_for_key<S>(
     store: &S,
     segment_id: &SegmentId,
@@ -187,6 +246,10 @@ where
 }
 
 /// Helper function to clear triggers for a slab
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn clear_slab_triggers<S>(store: &S, slab: &Slab) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -200,6 +263,11 @@ where
 }
 
 /// Helper function to verify that the store matches our expected state
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
+#[allow(clippy::implicit_hasher)]
 pub async fn verify_store_state<S>(
     store: &S,
     segment: &Segment,

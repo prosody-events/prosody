@@ -1,10 +1,11 @@
+
 use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::tests::common::{
     add_trigger, get_key_triggers, get_slab_triggers, insert_segment,
 };
 use crate::timers::store::tests::{TestStoreResult, TriggerTestInput};
-use std::collections::HashSet;
+use ahash::HashSet;
 use std::fmt::Debug;
 
 /// Tests cleanup operations and their interaction with the underlying data
@@ -14,6 +15,10 @@ use std::fmt::Debug;
 ///    triggers
 /// 2. Explicit cleanup with clear_* functions is required to remove the actual
 ///    data
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_cleanup_operations<S>(store: &S, input: &TriggerTestInput) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,

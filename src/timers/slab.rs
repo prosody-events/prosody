@@ -1,29 +1,13 @@
 //! Time-based partitioning for efficient timer storage and retrieval.
 //!
-//! This module defines the [`Slab`] type and its associated operations.
-//! A `Slab` represents a fixed-duration time window (partition) within a
-//! segment. Timers whose execution times fall into the same window are grouped
-//! into the same slab, enabling efficient range queries and storage
-//! organization.
+//! Defines the [`Slab`] type and its operations. A [`Slab`] is a fixed-duration
+//! time window within a segment. Timers whose execution times fall into the
+//! same window are grouped into the same slab, enabling efficient range queries
+//! and storage organization.
 //!
-//! # Slab Concepts
-//!
-//! - **Segment**: Logical grouping of timers (e.g., by consumer group).
-//! - **Slab ID**: Integer index computed from epoch seconds and slab size.
-//! - **Slab Size**: Duration covered by each slab (e.g., 5–60 minutes).
-//!
-//! # Slab Calculations
-//!
-//! 1. Compute the slab ID: ```text slab_id = floor(epoch_seconds /
-//!    slab_size_seconds) ```
-//! 2. Derive the time range: ```text start = slab_id * slab_size_seconds end =
-//!    start + slab_size_seconds ```
-//!
-//! # Ordering and Comparison
-//!
-//! - Slabs implement `Ord` and `PartialOrd`, ordering first by segment ID, then
-//!   by slab ID.
-//! - `SlabId` is a type alias for `u32`.
+//! Slab calculations use `slab_id = floor(epoch_seconds / slab_size_seconds)`
+//! to partition time. Slabs implement [`Ord`] and [`PartialOrd`], ordering
+//! first by segment ID, then by slab ID.
 
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -36,15 +20,9 @@ pub type SlabId = u32;
 
 /// A time-based partition of timer data within a segment.
 ///
-/// A `Slab` groups all timers whose execution times fall within the same
-/// fixed-duration window. This partitioning allows fast loading, unloading,
-/// and querying of timers by time ranges.
-///
-/// # Structure
-///
-/// - `segment_id`: Links the slab to its parent segment.
-/// - `id`: Numeric index of the slab within its segment.
-/// - `size`: Duration that this slab covers.
+/// Groups all timers whose execution times fall within the same fixed-duration
+/// window. This partitioning allows fast loading, unloading, and querying of
+/// timers by time ranges.
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Slab {
     segment_id: SegmentId,
@@ -57,13 +35,9 @@ impl Slab {
     ///
     /// # Arguments
     ///
-    /// * `segment_id` – The segment this slab belongs to.
-    /// * `id` – The numeric slab identifier within the segment.
-    /// * `size` – The duration each slab covers.
-    ///
-    /// # Returns
-    ///
-    /// A `Slab` instance configured with the given segment, ID, and size.
+    /// * `segment_id` - The segment this slab belongs to.
+    /// * `id` - The numeric slab identifier within the segment.
+    /// * `size` - The duration each slab covers.
     #[must_use]
     pub fn new(segment_id: SegmentId, id: SlabId, size: CompactDuration) -> Self {
         Slab {
@@ -77,13 +51,13 @@ impl Slab {
     ///
     /// # Arguments
     ///
-    /// * `segment_id` – The segment this slab belongs to.
-    /// * `size` – The duration each slab covers.
-    /// * `time` – The timestamp to locate.
+    /// * `segment_id` - The segment this slab belongs to.
+    /// * `size` - The duration each slab covers.
+    /// * `time` - The timestamp to locate.
     ///
     /// # Returns
     ///
-    /// A `Slab` whose time range includes `time`. If `size.seconds() == 0`,
+    /// A [`Slab`] whose time range includes `time`. If `size.seconds() == 0`,
     /// returns slab ID 0 to avoid division by zero.
     #[must_use]
     pub fn from_time(segment_id: SegmentId, size: CompactDuration, time: CompactDateTime) -> Self {
@@ -126,10 +100,6 @@ impl Slab {
     ///
     /// The range starts at `id * size` (inclusive) and extends to
     /// `start + size` (exclusive).
-    ///
-    /// # Returns
-    ///
-    /// A `Range<CompactDateTime>` corresponding to this slab's interval.
     #[must_use]
     pub fn range(&self) -> Range<CompactDateTime> {
         let size = self.size.seconds();
@@ -143,12 +113,12 @@ impl Slab {
     ///
     /// # Arguments
     ///
-    /// * `number` – Amount to add to the current slab ID.
+    /// * `number` - Amount to add to the current slab ID.
     ///
     /// # Returns
     ///
     /// - `Some(Slab)` with `id = self.id + number` if no overflow occurs.
-    /// - `None` if the addition would overflow `u32`.
+    /// - `None` if the addition would overflow [`u32`].
     #[must_use]
     pub fn add(&self, number: u32) -> Option<Slab> {
         let mut slab = self.clone();
@@ -160,12 +130,12 @@ impl Slab {
     ///
     /// # Arguments
     ///
-    /// * `number` – Amount to subtract from the current slab ID.
+    /// * `number` - Amount to subtract from the current slab ID.
     ///
     /// # Returns
     ///
     /// - `Some(Slab)` with `id = self.id - number` if no underflow occurs.
-    /// - `None` if the subtraction would underflow `u32`.
+    /// - `None` if the subtraction would underflow [`u32`].
     #[must_use]
     pub fn sub(&self, number: u32) -> Option<Slab> {
         let mut slab = self.clone();
@@ -199,9 +169,6 @@ impl Debug for Slab {
 
 impl Display for Slab {
     /// Display format: `segment_id/slab_id[start—end]`.
-    ///
-    /// Both `start` and `end` are formatted using `CompactDateTime`'s
-    /// `Display`.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let range = self.range();
         write!(

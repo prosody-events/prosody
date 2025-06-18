@@ -1,10 +1,9 @@
 //! Active trigger registry.
 //!
-//! This module provides `ActiveTriggers`, a thread-safe, in-memory registry
-//! that tracks which timer triggers are currently loaded in the scheduler.
-//! Each active trigger is identified by a `Key` and its scheduled
-//! `CompactDateTime`. The registry supports concurrent insertion, removal,
-//! membership checks, and scanning of all active trigger times.
+//! Provides [`ActiveTriggers`], a thread-safe registry tracking timer
+//! triggers currently loaded in the scheduler. Each trigger is identified
+//! by a [`Key`] and scheduled [`CompactDateTime`]. Supports concurrent
+//! insertion, removal, membership checks, and scanning.
 
 use crate::Key;
 use crate::timers::Trigger;
@@ -15,20 +14,20 @@ use std::sync::Arc;
 
 /// A concurrent registry of active timer triggers.
 ///
-/// Internally, this maps each `Key` to a `HashSet` of `CompactDateTime` values.
-/// Cloning an `ActiveTriggers` shares the same underlying registry.
+/// Maps each [`Key`] to a [`HashSet`] of [`CompactDateTime`] values.
+/// Cloning shares the same underlying registry.
 #[derive(Clone, Debug, Default)]
 pub struct ActiveTriggers(Arc<scc::HashMap<Key, HashSet<CompactDateTime>>>);
 
 impl ActiveTriggers {
     /// Inserts a trigger into the active registry.
     ///
-    /// If there is no existing entry for the trigger's `key`, a new set of
-    /// times is created. Duplicate insertions of the same time are ignored.
+    /// Creates a new set of times if no entry exists for the trigger's key.
+    /// Duplicate insertions are ignored.
     ///
     /// # Arguments
     ///
-    /// * `trigger` - The `Trigger` containing the `key` and `time` to insert.
+    /// * `trigger` - The [`Trigger`] containing the key and time to insert.
     pub async fn insert(&self, trigger: Trigger) {
         // Obtain or create the entry for this key, then insert the time.
         self.0
@@ -41,13 +40,13 @@ impl ActiveTriggers {
 
     /// Removes a trigger time for a specific key.
     ///
-    /// If removing the time leaves the set empty, the key is removed
-    /// from the registry. Removing a non-existent key or time has no effect.
+    /// Removes the key from the registry if removing the time leaves the
+    /// set empty. Removing non-existent keys or times has no effect.
     ///
     /// # Arguments
     ///
-    /// * `key`  - The `Key` from which to remove the time.
-    /// * `time` - The `CompactDateTime` to remove.
+    /// * `key` - The [`Key`] from which to remove the time.
+    /// * `time` - The [`CompactDateTime`] to remove.
     pub async fn remove(&self, key: &Key, time: CompactDateTime) {
         // Look up the entry; if it exists, remove the time and clean up.
         if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await {
@@ -64,13 +63,12 @@ impl ActiveTriggers {
     ///
     /// # Arguments
     ///
-    /// * `key`  - The `Key` to query.
-    /// * `time` - The `CompactDateTime` to check.
+    /// * `key` - The [`Key`] to query.
+    /// * `time` - The [`CompactDateTime`] to check.
     ///
     /// # Returns
     ///
-    /// `true` if the registry contains the specified time for `key`,
-    /// otherwise `false`.
+    /// `true` if the registry contains the specified time for the key.
     pub async fn contains(&self, key: &Key, time: CompactDateTime) -> bool {
         // Read the entry for the key, returning false if absent.
         self.0
@@ -81,21 +79,12 @@ impl ActiveTriggers {
 
     /// Invokes a closure for every active trigger time in the registry.
     ///
-    /// The closure `f` is called once for each stored `CompactDateTime`
-    /// across all keys. The iteration order is determined by the internal
-    /// hash map and hash set ordering.
+    /// The closure is called once for each stored [`CompactDateTime`] across
+    /// all keys. Iteration order depends on internal hash map ordering.
     ///
     /// # Arguments
     ///
-    /// * `f` - A closure that takes a `CompactDateTime`.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// active_triggers.scan_active_times(|time| {
-    ///     println!("Active trigger at: {}", time);
-    /// }).await;
-    /// ```
+    /// * `f` - A closure that takes a [`CompactDateTime`].
     pub async fn scan_active_times<F>(&self, mut f: F)
     where
         F: FnMut(CompactDateTime),

@@ -5,7 +5,7 @@ use crate::timers::store::tests::common::{
     add_trigger, insert_segment, remove_trigger, verify_store_state,
 };
 use crate::timers::store::tests::{TestStoreResult, TriggerTestInput};
-use std::collections::{HashMap, HashSet};
+use ahash::{HashMap, HashSet};
 use std::fmt::Debug;
 
 /// Tests sequential interleavings of insert and delete operations
@@ -14,6 +14,10 @@ use std::fmt::Debug;
 /// - Operations interleaved in any order arrive at the expected state
 /// - Both key and slab indices remain consistent after any sequence
 /// - Common scenarios like re-insertion and removal work as expected
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_sequential_interleavings<S>(
     store: &S,
     input: &TriggerTestInput,
@@ -30,7 +34,7 @@ where
     insert_segment(store, &input.segment).await?;
 
     // Track expected state
-    let mut expected_state: HashMap<Key, HashSet<CompactDateTime>> = HashMap::new();
+    let mut expected_state: HashMap<Key, HashSet<CompactDateTime>> = HashMap::default();
 
     // Process all triggers in a deterministic order
     let shuffled_triggers: Vec<_> = input.triggers.clone();

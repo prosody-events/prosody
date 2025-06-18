@@ -9,6 +9,10 @@ use std::fmt::Debug;
 /// This test focuses on the direct usage of low-level operations:
 /// - Slab trigger operations (insert, delete, clear)
 /// - Key trigger operations (insert, delete, clear)
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_primitive_operations<S>(store: &S, input: &TriggerTestInput) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,

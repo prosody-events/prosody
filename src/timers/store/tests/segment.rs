@@ -9,6 +9,10 @@ use std::fmt::Debug;
 /// - Insert segments
 /// - Retrieve segments with correct properties
 /// - Delete segments
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_segment_operations<S>(store: &S, input: &SegmentTestInput) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,

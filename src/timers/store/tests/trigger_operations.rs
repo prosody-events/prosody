@@ -8,12 +8,16 @@ use crate::timers::store::tests::common::{
 use crate::timers::store::tests::{
     TestStoreResult, TriggerOperation, TriggerSequence, TriggerTestInput,
 };
-use std::collections::HashSet;
+use ahash::HashSet;
 use std::fmt::Debug;
 
 use tracing::Span;
 
 /// Tests basic trigger operations: add, get, remove, clear
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_trigger_operations<S>(store: &S, input: &TriggerTestInput) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -32,7 +36,7 @@ where
     }
 
     // Verify triggers by key
-    let mut key_triggers = HashSet::new();
+    let mut key_triggers = HashSet::default();
     let all_keys: HashSet<_> = input.triggers.iter().map(|t| t.key.clone()).collect();
 
     for key in all_keys {
@@ -129,6 +133,10 @@ where
 }
 
 /// Tests sequences of operations to ensure proper state transitions
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_operation_sequences<S>(store: &S, input: &TriggerSequence) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -142,7 +150,7 @@ where
     insert_segment(store, &input.segment).await?;
 
     // Track which times should be present based on the operations
-    let mut expected_times = HashSet::new();
+    let mut expected_times = HashSet::default();
 
     // Execute the sequence of operations
     for (i, op) in input.operations.iter().enumerate() {

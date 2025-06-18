@@ -1,9 +1,9 @@
 //! Background slab loader and state management for timer preloading.
 //!
-//! This module implements the background task that preloads upcoming timer
-//! slabs from the persistent `TriggerStore` into the in-memory scheduler.
-//! It also handles cleanup of completed slabs and dynamically adjusts its
-//! preload window based on current time.
+//! Implements the background task that preloads upcoming timer slabs from
+//! the persistent [`TriggerStore`] into the in-memory scheduler. Handles
+//! cleanup of completed slabs and dynamically adjusts its preload window
+//! based on current time.
 
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::error::TimerManagerError;
@@ -24,7 +24,7 @@ use tracing::{debug, error};
 /// Shared state for the slab loader task.
 ///
 /// Tracks which slabs have been loaded and which slab IDs this loader
-/// instance currently owns (i.e., should schedule triggers for).
+/// instance currently owns (should schedule triggers for).
 pub struct State<T> {
     /// Persistent trigger store.
     pub store: T,
@@ -41,8 +41,8 @@ impl<T> State<T> {
     ///
     /// # Arguments
     ///
-    /// * `store` – The persistent `TriggerStore` implementation.
-    /// * `scheduler` – The in-memory `TriggerScheduler`.
+    /// * `store` - The persistent [`TriggerStore`] implementation.
+    /// * `scheduler` - The in-memory [`TriggerScheduler`].
     #[must_use]
     pub fn new(store: T, scheduler: TriggerScheduler) -> Self {
         Self {
@@ -59,7 +59,7 @@ impl<T> State<T> {
     ///
     /// # Arguments
     ///
-    /// * `slab_id` – The slab identifier to check.
+    /// * `slab_id` - The slab identifier to check.
     #[must_use]
     pub fn is_owned(&self, slab_id: SlabId) -> bool {
         self.max_owned.filter(|max| slab_id <= *max).is_some()
@@ -71,7 +71,7 @@ impl<T> State<T> {
     ///
     /// # Arguments
     ///
-    /// * `new_max` – The new highest slab ID to own.
+    /// * `new_max` - The new highest slab ID to own.
     pub fn extend_ownership(&mut self, new_max: SlabId) {
         if self
             .max_owned
@@ -84,8 +84,7 @@ impl<T> State<T> {
     }
 }
 
-/// Background task that continuously loads upcoming slabs and cleans up old
-/// ones.
+/// Background task that continuously loads upcoming slabs and cleans up old ones.
 ///
 /// This loop:
 /// 1. Determines a preload window based on half the slab size (minimum 30s).
@@ -97,7 +96,7 @@ impl<T> State<T> {
 ///
 /// # Type Parameters
 ///
-/// * `T` – A `TriggerStore` implementation for persistent storage.
+/// * `T` - A [`TriggerStore`] implementation for persistent storage.
 pub async fn slab_loader<T>(segment: Segment, state: SlabLock<State<T>>)
 where
     T: TriggerStore,
@@ -184,12 +183,12 @@ where
 ///
 /// # Arguments
 ///
-/// * `load_time` – The start time of the next slab.
-/// * `preload_seconds` – The configured preload window in seconds.
+/// * `load_time` - The start time of the next slab.
+/// * `preload_seconds` - The configured preload window in seconds.
 ///
 /// # Returns
 ///
-/// A `Duration` to sleep before loading the slab.
+/// A [`Duration`] to sleep before loading the slab.
 fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Duration {
     let now = match CompactDateTime::now() {
         Ok(now) => now,
@@ -231,17 +230,17 @@ fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Dura
 ///
 /// # Arguments
 ///
-/// * `state` – Locked loader state (store + scheduler).
-/// * `segment` – The segment metadata.
-/// * `slab_range` – Inclusive range of slab IDs to load.
+/// * `state` - Locked loader state (store + scheduler).
+/// * `segment` - The segment metadata.
+/// * `slab_range` - Inclusive range of slab IDs to load.
 ///
 /// # Errors
 ///
-/// Returns `TimerManagerError` if any store or scheduling operation fails.
+/// Returns [`TimerManagerError`] if any store or scheduling operation fails.
 ///
 /// # Returns
 ///
-/// A `Vec<SlabId>` of successfully loaded slab identifiers.
+/// A [`Vec<SlabId>`] of successfully loaded slab identifiers.
 async fn load_slabs<T>(
     state: &SlabLock<State<T>>,
     segment: &Segment,
@@ -280,9 +279,9 @@ where
 ///
 /// # Arguments
 ///
-/// * `state` – Locked loader state (store + scheduler).
-/// * `segment` – The segment metadata.
-/// * `loaded_slab_ids` – Mutable set of currently loaded slab IDs.
+/// * `state` - Locked loader state (store + scheduler).
+/// * `segment` - The segment metadata.
+/// * `loaded_slab_ids` - Mutable set of currently loaded slab IDs.
 ///
 /// # Errors
 ///
@@ -322,13 +321,13 @@ where
 ///
 /// # Arguments
 ///
-/// * `store` – The persistent trigger store.
-/// * `scheduler` – The in-memory scheduler.
-/// * `slab` – The slab to load triggers from.
+/// * `store` - The persistent trigger store.
+/// * `scheduler` - The in-memory scheduler.
+/// * `slab` - The slab to load triggers from.
 ///
 /// # Errors
 ///
-/// Returns `TimerManagerError` if retrieving triggers or scheduling fails.
+/// Returns [`TimerManagerError`] if retrieving triggers or scheduling fails.
 async fn load_triggers<T>(
     store: &T,
     scheduler: &TriggerScheduler,
@@ -356,12 +355,12 @@ where
 ///
 /// # Arguments
 ///
-/// * `segment` – The segment metadata.
-/// * `scheduler` – The in-memory scheduler.
+/// * `segment` - The segment metadata.
+/// * `scheduler` - The in-memory scheduler.
 ///
 /// # Returns
 ///
-/// A `HashSet<SlabId>` containing IDs of slabs with active triggers.
+/// A [`HashSet<SlabId>`] containing IDs of slabs with active triggers.
 async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> HashSet<SlabId> {
     let mut active_slab_ids = HashSet::new();
 
@@ -375,25 +374,25 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
     active_slab_ids
 }
 
-/// Retrieves or creates a `Segment` in the store.
+/// Retrieves or creates a [`Segment`] in the store.
 ///
 /// If a segment with `segment_id` exists, it is returned. Otherwise, a new
 /// segment is inserted with the given `slab_size` and `name`.
 ///
 /// # Arguments
 ///
-/// * `store` – The persistent trigger store.
-/// * `segment_id` – Unique identifier for the segment.
-/// * `slab_size` – Slab duration for time partitioning.
-/// * `name` – Human-readable name for the segment.
+/// * `store` - The persistent trigger store.
+/// * `segment_id` - Unique identifier for the segment.
+/// * `slab_size` - Slab duration for time partitioning.
+/// * `name` - Human-readable name for the segment.
 ///
 /// # Errors
 ///
-/// Returns `TimerManagerError` if any store operation fails.
+/// Returns [`TimerManagerError`] if any store operation fails.
 ///
 /// # Returns
 ///
-/// The existing or newly created `Segment` object.
+/// The existing or newly created [`Segment`] object.
 pub async fn get_or_create_segment<T>(
     store: &T,
     segment_id: crate::timers::store::SegmentId,
@@ -977,7 +976,7 @@ mod tests {
         let name = "concurrent-test";
 
         // Create multiple concurrent futures trying to create the same segment
-        let futures: Vec<_> = (0_i32..10)
+        let futures: Vec<_> = (0_i32..10_i32)
             .map(|_| {
                 let store_clone = store.clone();
                 async move {
@@ -1058,7 +1057,7 @@ mod tests {
 
         // Should wait for a very long time (1 year - 30 seconds)
         assert!(wait_time.as_secs() > 0);
-        assert_eq!(wait_time.as_secs(), large_duration as u64 - 30);
+        assert_eq!(wait_time.as_secs(), u64::from(large_duration) - 30);
         Ok(())
     }
 }

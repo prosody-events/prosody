@@ -190,7 +190,7 @@ impl Arbitrary for TriggerSequence {
 
 /// Generate comprehensive test suite for a `TriggerStore` implementation.
 ///
-/// This macro creates a full suite of property-based tests using QuickCheck to
+/// This macro creates a full suite of property-based tests using `QuickCheck` to
 /// verify that a `TriggerStore` implementation correctly handles all operations
 /// across various scenarios including concurrent access, data consistency, and
 /// error conditions.

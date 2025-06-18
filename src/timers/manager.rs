@@ -1,11 +1,11 @@
 //! Timer management and coordination for scheduled events.
 //!
-//! The `TimerManager` serves as the primary interface for scheduling, querying,
+//! The [`TimerManager`] serves as the primary interface for scheduling, querying,
 //! and canceling timers within a specific segment. It coordinates between:
-//! - **Persistent Storage**: Durable `TriggerStore` for timer metadata.
+//! - **Persistent Storage**: Durable [`TriggerStore`] for timer metadata.
 //! - **Background Slab Loader**: Preloads upcoming timer slabs.
 //! - **In-Memory Scheduler**: Precise, delay-queue based timer dispatch.
-//! - **Application**: Delivers timers as an async stream of `UncommittedTimer`.
+//! - **Application**: Delivers timers as an async stream of [`UncommittedTimer`].
 //!
 //! The manager ensures timers survive restarts, supports distributed ownership,
 //! and provides at-least-once delivery semantics for timer events.
@@ -31,19 +31,19 @@ use tracing::{Instrument, Span};
 
 /// Manages timer scheduling, storage, and delivery for a specific segment.
 ///
-/// A `TimerManager` partitions timers into time-based slabs, persists them
-/// in a `TriggerStore`, schedules them in memory, and delivers them as an
-/// async stream of `UncommittedTimer`. It supports concurrent operations
-/// and automatically cleans up resources when dropped.
+/// Partitions timers into time-based slabs, persists them in a [`TriggerStore`],
+/// schedules them in memory, and delivers them as an async stream of
+/// [`UncommittedTimer`]. Supports concurrent operations and automatically
+/// cleans up resources when dropped.
 ///
 /// # Type Parameters
 ///
-/// * `T`: The `TriggerStore` backend for persistent timer data.
+/// * `T`: The [`TriggerStore`] backend for persistent timer data.
 #[derive(Educe)]
 #[educe(Debug(bound = ""), Clone(bound()))]
 pub struct TimerManager<T>(#[educe(Debug(ignore))] Arc<TimerManagerInner<T>>);
 
-/// Internal shared state for the `TimerManager`.
+/// Internal shared state for the [`TimerManager`].
 pub struct TimerManagerInner<T> {
     /// Segment configuration (ID, name, slab size).
     segment: Segment,
@@ -57,7 +57,7 @@ where
 {
     /// Creates a new timer manager for the specified segment.
     ///
-    /// This initializes:
+    /// Initializes:
     /// 1. A persistent segment record (creating or retrieving it).
     /// 2. An in-memory scheduler and its command processing task.
     /// 3. A background slab loader task for preloading upcoming timers.
@@ -67,17 +67,17 @@ where
     /// * `segment_id` - Unique identifier for the timer segment.
     /// * `slab_size` - Duration of each time-based slab.
     /// * `name` - Human-readable name for the segment.
-    /// * `store` - Persistent `TriggerStore` implementation.
+    /// * `store` - Persistent [`TriggerStore`] implementation.
     ///
     /// # Returns
     ///
     /// On success, returns a tuple:
-    /// - A `Stream` of `UncommittedTimer<T>` delivering timer events.
-    /// - The `TimerManager<T>` instance for scheduling and management.
+    /// - A [`Stream`] of [`UncommittedTimer<T>`] delivering timer events.
+    /// - The [`TimerManager<T>`] instance for scheduling and management.
     ///
     /// # Errors
     ///
-    /// Returns `TimerManagerError` if:
+    /// Returns [`TimerManagerError`] if:
     /// - The segment metadata cannot be created or retrieved.
     /// - The scheduler fails to initialize.
     /// - The slab loader task cannot be spawned.
@@ -118,13 +118,11 @@ where
     ///
     /// # Returns
     ///
-    /// A `Vec<CompactDateTime>` of all scheduled times for `key`, sorted
-    /// in ascending order.
+    /// A [`Stream`] of all scheduled times for `key`.
     ///
     /// # Errors
     ///
-    /// Returns `TimerManagerError::Store` if the underlying storage query
-    /// fails.
+    /// Returns [`TimerManagerError::Store`] if the underlying storage query fails.
     pub fn scheduled_times(
         &self,
         key: &Key,
@@ -153,16 +151,11 @@ where
     ///
     /// # Arguments
     ///
-    /// * `key` - The entity key whose full `Trigger` records to list.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<Trigger>` of all scheduled triggers for `key`.
+    /// * `key` - The entity key whose full [`Trigger`] records to list.
     ///
     /// # Errors
     ///
-    /// Returns `TimerManagerError::Store` if the underlying storage query
-    /// fails.
+    /// Returns [`TimerManagerError::Store`] if the underlying storage query fails.
     pub async fn scheduled_triggers(
         &self,
         key: &Key,
@@ -180,20 +173,16 @@ where
 
     /// Schedules a new timer for future execution.
     ///
-    /// This inserts the timer into persistent storage and, if its slab is
-    /// currently owned, enqueues it in the in-memory scheduler.
+    /// Inserts the timer into persistent storage and, if its slab is currently
+    /// owned, enqueues it in the in-memory scheduler.
     ///
     /// # Arguments
     ///
-    /// * `trigger` - The `Trigger` to schedule (key, time, span).
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success.
+    /// * `trigger` - The [`Trigger`] to schedule (key, time, span).
     ///
     /// # Errors
     ///
-    /// Returns `TimerManagerError` if:
+    /// Returns [`TimerManagerError`] if:
     /// - The time is in the past.
     /// - The storage insert fails.
     /// - The scheduler enqueue fails.
@@ -220,22 +209,17 @@ where
 
     /// Cancels a specific scheduled timer.
     ///
-    /// This removes the timer from persistent storage and, if owned, from
-    /// the in-memory scheduler. If already delivered, the delivery is not
-    /// reversed.
+    /// Removes the timer from persistent storage and, if owned, from the
+    /// in-memory scheduler. If already delivered, the delivery is not reversed.
     ///
     /// # Arguments
     ///
-    /// * `key`  - The entity key of the timer.
+    /// * `key` - The entity key of the timer.
     /// * `time` - The scheduled execution time to cancel.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success.
     ///
     /// # Errors
     ///
-    /// Returns `TimerManagerError` if:
+    /// Returns [`TimerManagerError`] if:
     /// - The scheduler removal fails.
     /// - The storage removal fails.
     pub async fn unschedule(
@@ -268,20 +252,16 @@ where
 
     /// Cancels all timers for a specific key concurrently.
     ///
-    /// This operation queries all scheduled times for `key` and issues
-    /// `unschedule` for each in parallel, controlled by `DELETE_CONCURRENCY`.
+    /// Queries all scheduled times for `key` and issues [`unschedule`](Self::unschedule)
+    /// for each in parallel, controlled by [`DELETE_CONCURRENCY`].
     ///
     /// # Arguments
     ///
     /// * `key` - The entity key whose timers to cancel.
     ///
-    /// # Returns
-    ///
-    /// `Ok(())` if all cancellations succeed or the key had no timers.
-    ///
     /// # Errors
     ///
-    /// Returns `TimerManagerError::Store` or scheduler errors if any cancel
+    /// Returns [`TimerManagerError::Store`] or scheduler errors if any cancel
     /// operation fails.
     pub async fn unschedule_all(&self, key: &Key) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
@@ -295,8 +275,8 @@ where
 
     /// Checks if a timer is currently loaded in the in-memory scheduler.
     ///
-    /// This does not query persistent storage; a `false` return means the
-    /// timer is either not scheduled yet or not owned/loaded.
+    /// Does not query persistent storage; a `false` return means the timer is
+    /// either not scheduled yet or not owned/loaded.
     ///
     /// # Arguments
     ///
@@ -305,7 +285,7 @@ where
     ///
     /// # Returns
     ///
-    /// `true` if the timer is active in the scheduler, `false` otherwise.
+    /// `true` if the timer is active in the scheduler.
     pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
         self.0
             .state
@@ -318,21 +298,17 @@ where
 
     /// Marks a timer as completed and removes it permanently.
     ///
-    /// This deactivates the timer if owned, then deletes it from persistent
-    /// storage. Typically invoked by `UncommittedTimer::commit()`.
+    /// Deactivates the timer if owned, then deletes it from persistent storage.
+    /// Typically invoked by [`UncommittedTimer::commit()`].
     ///
     /// # Arguments
     ///
-    /// * `key`  - The entity key of the completed timer.
+    /// * `key` - The entity key of the completed timer.
     /// * `time` - The execution time of the completed timer.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success.
     ///
     /// # Errors
     ///
-    /// Returns `TimerManagerError::Store` if the storage removal fails.
+    /// Returns [`TimerManagerError::Store`] if the storage removal fails.
     pub async fn complete(
         &self,
         key: &Key,
@@ -360,12 +336,12 @@ where
 
     /// Aborts a timer delivery, deactivating it but preserving storage state.
     ///
-    /// This does not delete the timer from persistent storage; it can be
-    /// reloaded and retried later by the slab loader.
+    /// Does not delete the timer from persistent storage; it can be reloaded
+    /// and retried later by the slab loader.
     ///
     /// # Arguments
     ///
-    /// * `key`  - The entity key of the timer.
+    /// * `key` - The entity key of the timer.
     /// * `time` - The scheduled execution time to abort.
     pub async fn abort(&self, key: &Key, time: CompactDateTime) {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);

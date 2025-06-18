@@ -7,7 +7,7 @@ use crate::timers::store::tests::common::{
     add_trigger, get_key_triggers, get_slab_triggers, insert_segment,
 };
 use crate::timers::store::{Segment, TriggerStore};
-use std::collections::HashSet;
+use ahash::HashSet;
 use std::fmt::Debug;
 use tracing::Span;
 
@@ -17,6 +17,10 @@ use tracing::Span;
 /// - Triggers are correctly assigned to slabs based on their time
 /// - Boundary conditions are handled correctly (times exactly at slab edges)
 /// - Triggers can be correctly retrieved from different slabs
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_cross_slab_operations<S>(store: &S, segment: &Segment) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,

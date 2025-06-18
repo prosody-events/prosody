@@ -82,7 +82,7 @@ impl EventHandler for TimerTestHandler {
                 "schedule_timer" => {
                     // Support both absolute time and delay-based scheduling
                     if let Some(target_time_secs) =
-                        payload.get("target_time_secs").and_then(|v| v.as_u64())
+                        payload.get("target_time_secs").and_then(serde_json::Value::as_u64)
                     {
                         // Absolute time scheduling
                         let schedule_time = CompactDateTime::from(target_time_secs as u32);
@@ -92,7 +92,7 @@ impl EventHandler for TimerTestHandler {
                             info!("Scheduled timer for key {key} at time {schedule_time}");
                         }
                     } else if let Some(delay_secs) =
-                        payload.get("delay_secs").and_then(|v| v.as_u64())
+                        payload.get("delay_secs").and_then(serde_json::Value::as_u64)
                     {
                         // Delay-based scheduling
                         let delay = CompactDuration::new(delay_secs as u32);
@@ -215,7 +215,7 @@ impl TestEnvironment {
     /// Send a message with the given key and payload
     async fn send_message(&self, key: &str, payload: &Value) -> Result<()> {
         self.producer
-            .send([], self.topic.clone(), key, payload)
+            .send([], self.topic, key, payload)
             .await
             .map_err(|e| eyre!("Failed to send message: {}", e))
     }
@@ -315,7 +315,7 @@ impl TestEnvironment {
     /// Verify that no timer event occurs within the given timeout
     async fn expect_no_timer(&mut self, timeout_secs: u32) -> Result<()> {
         let timer_result = timeout(
-            Duration::from_secs(timeout_secs as u64),
+            Duration::from_secs(u64::from(timeout_secs)),
             self.timer_rx.recv(),
         )
         .await;
@@ -328,7 +328,6 @@ impl TestEnvironment {
 
     /// Verify a message event matches expected key and payload
     fn verify_message_event(
-        &self,
         event: &MessageEvent,
         expected_key: &str,
         expected_payload: &Value,
@@ -349,7 +348,7 @@ impl TestEnvironment {
     }
 
     /// Verify a timer event matches expected key
-    fn verify_timer_event(&self, event: &TimerEvent, expected_key: &str) -> Result<()> {
+    fn verify_timer_event(event: &TimerEvent, expected_key: &str) -> Result<()> {
         ensure!(
             event.key == expected_key,
             "Timer key mismatch: expected '{}', got '{}'",
@@ -364,7 +363,7 @@ impl TestEnvironment {
     }
 
     /// Verify timers are in chronological order
-    fn verify_timer_order(&self, timers: &[TimerEvent]) -> Result<()> {
+    fn verify_timer_order(timers: &[TimerEvent]) -> Result<()> {
         for i in 1..timers.len() {
             ensure!(
                 timers[i - 1].time.epoch_seconds() <= timers[i].time.epoch_seconds(),
@@ -380,7 +379,6 @@ impl TestEnvironment {
 
     /// Verify timers contain exactly the expected keys
     fn verify_timer_keys(
-        &self,
         timers: &[TimerEvent],
         expected_keys: &HashSet<String>,
     ) -> Result<()> {
@@ -393,9 +391,7 @@ impl TestEnvironment {
         );
         Ok(())
     }
-}
 
-impl TestEnvironment {
     /// Clean up resources (consumer shutdown, topic deletion)
     async fn cleanup(self) -> Result<()> {
         // Shutdown consumer first
@@ -420,8 +416,8 @@ where
 
     let result = timeout(Duration::from_secs(timeout_secs), async {
         let env = TestEnvironment::new(test_name).await?;
-        let test_result = test_fn(env).await;
-        test_result
+        
+        test_fn(env).await
     })
     .await;
 
@@ -450,11 +446,11 @@ async fn test_timer_scheduling_and_triggering() -> Result<()> {
 
         // Verify message was received
         let message_event = env.expect_message(5).await?;
-        env.verify_message_event(&message_event, key, &schedule_message)?;
+        TestEnvironment::verify_message_event(&message_event, key, &schedule_message)?;
 
         // Wait for timer to trigger
         let timer_event = env.expect_timer(5).await?;
-        env.verify_timer_event(&timer_event, key)?;
+        TestEnvironment::verify_timer_event(&timer_event, key)?;
 
         // Clean up
         env.cleanup().await?;
@@ -487,11 +483,11 @@ async fn test_same_key_multiple_timers() -> Result<()> {
 
         // Verify all timers are for the same key
         for timer_event in &received_timers {
-            env.verify_timer_event(timer_event, key)?;
+            TestEnvironment::verify_timer_event(timer_event, key)?;
         }
 
         // Verify timers triggered in chronological order
-        env.verify_timer_order(&received_timers)?;
+        TestEnvironment::verify_timer_order(&received_timers)?;
 
         // Clean up
         env.cleanup().await?;
@@ -517,7 +513,7 @@ async fn test_immediate_timer() -> Result<()> {
 
         // Wait for timer to trigger
         let timer_event = env.expect_timer(3).await?;
-        env.verify_timer_event(&timer_event, key)?;
+        TestEnvironment::verify_timer_event(&timer_event, key)?;
 
         // Verify timing accuracy (should trigger within 1-2 seconds)
         let end_time = CompactDateTime::now()?;
@@ -560,11 +556,11 @@ async fn test_timer_scheduled_time_accuracy() -> Result<()> {
 
         // Verify message was received
         let message_event = env.expect_message(5).await?;
-        env.verify_message_event(&message_event, key, &schedule_message)?;
+        TestEnvironment::verify_message_event(&message_event, key, &schedule_message)?;
 
         // Wait for timer to trigger
         let timer_event = env.expect_timer(6).await?;
-        env.verify_timer_event(&timer_event, key)?;
+        TestEnvironment::verify_timer_event(&timer_event, key)?;
 
         // Verify timer accuracy - should match exactly
         ensure!(
@@ -616,7 +612,7 @@ async fn test_timer_cancellation() -> Result<()> {
             "action": "schedule_timer",
             "delay_secs": delay_secs
         });
-        env.verify_message_event(&message_event, key, &expected_schedule_message)?;
+        TestEnvironment::verify_message_event(&message_event, key, &expected_schedule_message)?;
 
         // Cancel the timer
         env.cancel_timer(key).await?;
@@ -626,7 +622,7 @@ async fn test_timer_cancellation() -> Result<()> {
         let expected_cancel_message = json!({
             "action": "cancel_timer"
         });
-        env.verify_message_event(&cancel_message_event, key, &expected_cancel_message)?;
+        TestEnvironment::verify_message_event(&cancel_message_event, key, &expected_cancel_message)?;
 
         // Verify no timer fires (wait longer than the original delay)
         env.expect_no_timer(delay_secs + 2).await?;
@@ -660,12 +656,12 @@ async fn test_multiple_timers() -> Result<()> {
         let received_timers = env.expect_timers(timers_data.len(), 8).await?;
 
         // Verify timers are in chronological order
-        env.verify_timer_order(&received_timers)?;
+        TestEnvironment::verify_timer_order(&received_timers)?;
 
         // Verify all expected keys are present
         let expected_keys: HashSet<String> =
-            timers_data.iter().map(|(k, _)| k.to_string()).collect();
-        env.verify_timer_keys(&received_timers, &expected_keys)?;
+            timers_data.iter().map(|(k, _)| (*k).to_owned()).collect();
+        TestEnvironment::verify_timer_keys(&received_timers, &expected_keys)?;
 
         // Log all received timer events
         for timer_event in &received_timers {
@@ -705,15 +701,15 @@ async fn test_timer_different_keys() -> Result<()> {
         let received_timers = env.expect_timers(2, 6).await?;
 
         // Verify timers are in chronological order
-        env.verify_timer_order(&received_timers)?;
+        TestEnvironment::verify_timer_order(&received_timers)?;
 
         // Verify both expected keys are present
-        let expected_keys: HashSet<String> = timers.iter().map(|k| k.to_string()).collect();
-        env.verify_timer_keys(&received_timers, &expected_keys)?;
+        let expected_keys: HashSet<String> = timers.iter().map(|k| (*k).to_owned()).collect();
+        TestEnvironment::verify_timer_keys(&received_timers, &expected_keys)?;
 
         // Verify each timer has correct key
         for timer_event in &received_timers {
-            env.verify_timer_event(timer_event, &timer_event.key)?;
+            TestEnvironment::verify_timer_event(timer_event, &timer_event.key)?;
         }
 
         // Clean up

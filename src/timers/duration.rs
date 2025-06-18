@@ -1,24 +1,18 @@
 //! Compact duration representation for efficient timer calculations.
 //!
-//! This module provides `CompactDuration`, a space-efficient representation
-//! of time durations using 32-bit seconds. For timer systems that require
-//! only second-level precision, this reduces memory usage and enables fast
-//! arithmetic operations.
+//! Provides [`CompactDuration`], a space-efficient duration type using 32-bit
+//! seconds. Reduces memory usage and enables fast arithmetic for timer systems
+//! requiring only second-level precision.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::time::Duration;
 use thiserror::Error;
 
-/// A compact duration represented in seconds.
+/// A compact duration using 32-bit seconds.
 ///
-/// `CompactDuration` uses a 32-bit integer to store the number of seconds,
-/// supporting durations from 0 up to `u32::MAX` seconds (about 136 years).
-/// This is sufficient for most timer-based applications and allows efficient
-/// arithmetic and minimal memory footprint.
-///
-/// # Thread Safety
-///
-/// `CompactDuration` is `Copy`, `Send`, and `Sync`.
+/// Stores duration as seconds in a [`u32`], supporting 0 to [`u32::MAX`]
+/// seconds (~136 years). Enables efficient arithmetic with minimal memory
+/// footprint for timer systems.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct CompactDuration {
     seconds: u32,
@@ -50,55 +44,21 @@ impl CompactDuration {
     }
 
     /// Returns the number of seconds in this duration.
-    ///
-    /// # Returns
-    ///
-    /// The duration in seconds as a `u32`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use prosody::timers::duration::CompactDuration;
-    ///
-    /// let duration = CompactDuration::new(90);
-    /// assert_eq!(duration.seconds(), 90);
-    /// ```
     #[must_use]
     pub fn seconds(self) -> u32 {
         self.seconds
     }
 
-    /// Adds two durations, returning `Err` if the sum overflows `u32`.
+    /// Adds two durations with overflow checking.
     ///
     /// # Arguments
     ///
-    /// * `other` - The `CompactDuration` to add.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(sum)` if the addition fits within `u32::MAX` seconds.
-    /// * `Err(CompactDurationError::OutOfRange)` otherwise.
+    /// * `other` - The [`CompactDuration`] to add.
     ///
     /// # Errors
     ///
-    /// Returns `CompactDurationError::OutOfRange` if the result exceeds
-    /// `u32::MAX` seconds.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use prosody::timers::duration::{CompactDuration, CompactDurationError};
-    ///
-    /// let a = CompactDuration::new(1_000);
-    /// let b = CompactDuration::new(2_000);
-    /// assert_eq!(a.checked_add(b).unwrap().seconds(), 3_000);
-    ///
-    /// let max = CompactDuration::MAX;
-    /// assert!(matches!(
-    ///     max.checked_add(CompactDuration::new(1)),
-    ///     Err(CompactDurationError::OutOfRange)
-    /// ));
-    /// ```
+    /// Returns [`CompactDurationError::OutOfRange`] if the result exceeds
+    /// [`u32::MAX`] seconds.
     pub fn checked_add(self, other: Self) -> Result<Self, CompactDurationError> {
         Ok(Self {
             seconds: self
@@ -110,18 +70,7 @@ impl CompactDuration {
 }
 
 impl From<CompactDuration> for Duration {
-    /// Converts `CompactDuration` into a standard `Duration`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use prosody::timers::duration::CompactDuration;
-    /// use std::time::Duration;
-    ///
-    /// let compact = CompactDuration::new(60);
-    /// let std: Duration = compact.into();
-    /// assert_eq!(std.as_secs(), 60);
-    /// ```
+    /// Converts [`CompactDuration`] into a standard [`Duration`].
     fn from(value: CompactDuration) -> Self {
         Duration::from_secs(u64::from(value.seconds))
     }
@@ -142,37 +91,19 @@ impl From<i32> for CompactDuration {
 impl TryFrom<Duration> for CompactDuration {
     type Error = CompactDurationError;
 
-    /// Converts a standard `Duration` into `CompactDuration`, rounding
-    /// sub-second nanoseconds to the nearest whole second.
+    /// Converts a standard [`Duration`] into [`CompactDuration`].
+    ///
+    /// Rounds sub-second nanoseconds to the nearest whole second.
+    /// Nanoseconds >= 500,000,000 round up to the next second.
     ///
     /// # Arguments
     ///
-    /// * `value` - The `Duration` to convert.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(compact)` if the resulting seconds fit within `u32::MAX`.
-    /// * `Err(CompactDurationError::OutOfRange)` if overflow occurs.
+    /// * `value` - The [`Duration`] to convert.
     ///
     /// # Errors
     ///
-    /// Returns `CompactDurationError::OutOfRange` if the computed seconds
-    /// exceed `u32::MAX` or if adding one second (due to rounding) overflows.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use prosody::timers::duration::CompactDuration;
-    /// use std::time::Duration;
-    ///
-    /// // Rounds down
-    /// let d1 = Duration::new(5, 499_999_999);
-    /// assert_eq!(CompactDuration::try_from(d1).unwrap().seconds(), 5);
-    ///
-    /// // Rounds up
-    /// let d2 = Duration::new(5, 500_000_000);
-    /// assert_eq!(CompactDuration::try_from(d2).unwrap().seconds(), 6);
-    /// ```
+    /// Returns [`CompactDurationError::OutOfRange`] if the computed seconds
+    /// exceed [`u32::MAX`] or if rounding causes overflow.
     fn try_from(value: Duration) -> Result<Self, Self::Error> {
         let seconds = value.as_secs();
         let nanos = value.subsec_nanos();
@@ -192,16 +123,7 @@ impl TryFrom<Duration> for CompactDuration {
 }
 
 impl Display for CompactDuration {
-    /// Formats the duration in a human-readable form, e.g., "1h 1m 1s".
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use prosody::timers::duration::CompactDuration;
-    ///
-    /// let duration = CompactDuration::new(3661);
-    /// assert_eq!(format!("{}", duration), "1h 1m 1s");
-    /// ```
+    /// Formats the duration in a human-readable form.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let duration: Duration = (*self).into();
         let duration: humantime::Duration = duration.into();
@@ -210,16 +132,7 @@ impl Display for CompactDuration {
 }
 
 impl Debug for CompactDuration {
-    /// Displays the debug representation, e.g., `Duration(3661s)`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use prosody::timers::duration::CompactDuration;
-    ///
-    /// let duration = CompactDuration::new(3661);
-    /// assert_eq!(format!("{duration:?}"), "Duration(3661s)");
-    /// ```
+    /// Displays the debug representation.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let duration: Duration = (*self).into();
         let duration: humantime::Duration = duration.into();
@@ -227,11 +140,10 @@ impl Debug for CompactDuration {
     }
 }
 
-/// Errors that can occur when working with `CompactDuration`.
+/// Errors that can occur when working with [`CompactDuration`].
 #[derive(Clone, Debug, Error)]
 pub enum CompactDurationError {
-    /// The duration is outside the representable range of `0..=u32::MAX`
-    /// seconds.
+    /// The duration is outside the representable range of `0..=u32::MAX` seconds.
     #[error("Duration is out of range")]
     OutOfRange,
 }

@@ -27,6 +27,7 @@ Prosody is a high-level Kafka client library for Rust providing:
 - Don't use clippy to ignore lints unless told to do so by a human.
 - Prefer `use` statements over fully qualified prefixes in code.
 - Ask the human before making large, structural changes to code.
+- Modules should be documented within the module file.
 
 ## Error Handling
 

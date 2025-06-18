@@ -2,7 +2,7 @@ use crate::timers::slab::Slab;
 use crate::timers::store::tests::TestStoreResult;
 use crate::timers::store::tests::common::{delete_slab, get_slabs, insert_segment, insert_slab};
 use crate::timers::store::{Segment, TriggerStore};
-use std::collections::HashSet;
+use ahash::HashSet;
 use std::fmt::Debug;
 
 /// Tests the slab operations of a `TriggerStore` implementation.
@@ -12,6 +12,10 @@ use std::fmt::Debug;
 /// - Retrieve slab IDs
 /// - Delete slab IDs
 /// - Handle slab ID registrations independently from segment data
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
 pub async fn test_slab_operations<S>(store: &S, segment: &Segment) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
@@ -22,7 +26,7 @@ where
 
     // Generate some slab IDs to test with
     let slabs: Vec<u32> = (0..5).collect();
-    let mut inserted_slabs = HashSet::new();
+    let mut inserted_slabs = HashSet::default();
 
     // Insert slabs
     for &slab_id in &slabs {
