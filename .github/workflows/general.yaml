@@ -32,6 +32,10 @@ jobs:
           KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
           KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
           KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      cassandra:
+        image: cassandra:latest
+        ports:
+          - "9042:9042"
     steps:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
