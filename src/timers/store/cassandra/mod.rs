@@ -87,13 +87,16 @@ impl CassandraTriggerStore {
     }
 
     fn calculate_ttl(&self, time: CompactDateTime) -> i32 {
+        const MAX_TTL: i32 = 630_720_000;
+
         time.compact_duration_from_now()
             .unwrap_or(CompactDuration::MIN)
             .checked_add(self.base_ttl())
             .unwrap_or(CompactDuration::MAX)
             .seconds()
             .try_into()
-            .unwrap_or(i32::MAX)
+            .unwrap_or(MAX_TTL)
+            .min(MAX_TTL)
     }
 }
 
@@ -165,6 +168,23 @@ impl TriggerStore for CassandraTriggerStore {
     }
 
     #[instrument(skip(self))]
+    // Note: This method handles a complex edge case due to the mismatch between
+    // SlabId (u32) and the database storage (i32).
+    //
+    // Problem: SlabId is u32 (0 to 4,294,967,295) but Cassandra stores slab_id as
+    // int (i32). When we convert u32 to i32 using byte reinterpretation:
+    // - u32 values 0 to 2,147,483,647 → positive i32 values
+    // - u32 values 2,147,483,648 to 4,294,967,295 → negative i32 values
+    //
+    // This causes "wrap-around" where a range like [2,147,483,640, 2,147,483,660]
+    // becomes [2,147,483,640, -2,147,483,636] in signed representation.
+    // A single SQL query "WHERE slab_id >= start AND slab_id <= end" fails when
+    // start > end.
+    //
+    // Solution: Detect wrap-around and split into two queries:
+    // 1. slab_id >= start AND slab_id <= i32::MAX (for low u32 values, positive
+    //    i32)
+    // 2. slab_id >= i32::MIN AND slab_id <= end (for high u32 values, negative i32)
     fn get_slab_range(
         &self,
         segment_id: &SegmentId,
@@ -174,33 +194,81 @@ impl TriggerStore for CassandraTriggerStore {
         let end = i32::from_le_bytes(range.end().to_le_bytes());
 
         try_stream! {
-            let stream = self
-                .session()
-                .execute_iter(self.queries().get_slab_range.clone(), (segment_id, start, end))
-                .await?
-                .rows_stream::<(Option<i32>,)>()?;
+            // First, validate that this is a proper range in u32 space
+            // If start > end in u32 terms, this is an invalid range and we should return nothing
+            if range.start() > range.end() {
+                // Invalid range - return empty stream
+                return;
+            }
 
-            pin_mut!(stream);
-            while let Some((value,)) = stream.try_next().await? {
-                let Some(value) = value else {
-                    continue;
-                };
+            // Detect wrap-around: start > end in signed representation means the range
+            // crosses the u32/i32 boundary (around 2^31), not that it's an invalid range
+            if start > end {
+                // Wrap-around case: split into two queries to cover the full range
 
-                yield SlabId::from_le_bytes(value.to_le_bytes())
+                // Query 1: Handle the "low" u32 values that remain as positive i32 values
+                // This covers slab_id >= start up to the maximum i32 value
+                let stream1 = self
+                    .session()
+                    .execute_iter(self.queries().get_slab_range.clone(), (segment_id, start, i32::MAX))
+                    .await?
+                    .rows_stream::<(Option<i32>,)>()?;
+
+                pin_mut!(stream1);
+                while let Some((value,)) = stream1.try_next().await? {
+                    let Some(value) = value else {
+                        continue;
+                    };
+
+                    yield SlabId::from_le_bytes(value.to_le_bytes())
+                }
+
+                // Query 2: Handle the "high" u32 values that appear as negative i32 values
+                // This covers from minimum i32 value up to slab_id <= end
+                let stream2 = self
+                    .session()
+                    .execute_iter(self.queries().get_slab_range.clone(), (segment_id, i32::MIN, end))
+                    .await?
+                    .rows_stream::<(Option<i32>,)>()?;
+
+                pin_mut!(stream2);
+                while let Some((value,)) = stream2.try_next().await? {
+                    let Some(value) = value else {
+                        continue;
+                    };
+
+                    yield SlabId::from_le_bytes(value.to_le_bytes())
+                }
+            } else {
+                // Normal case: no wrap-around, single query is sufficient
+                // Both start and end have the same sign in i32 representation
+                let stream = self
+                    .session()
+                    .execute_iter(self.queries().get_slab_range.clone(), (segment_id, start, end))
+                    .await?
+                    .rows_stream::<(Option<i32>,)>()?;
+
+                pin_mut!(stream);
+                while let Some((value,)) = stream.try_next().await? {
+                    let Some(value) = value else {
+                        continue;
+                    };
+
+                    yield SlabId::from_le_bytes(value.to_le_bytes())
+                }
             }
         }
     }
 
     #[instrument(skip(self), err)]
     async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
-        let ttl_seconds = self.calculate_ttl(slab.range().end);
         self.session()
             .execute_unpaged(
                 &self.queries().insert_slab,
                 (
                     segment_id,
                     i32::from_le_bytes(slab.id().to_le_bytes()),
-                    ttl_seconds,
+                    self.calculate_ttl(slab.range().end),
                 ),
             )
             .await?;
@@ -260,7 +328,6 @@ impl TriggerStore for CassandraTriggerStore {
         self.propagator()
             .inject_context(&trigger.span.context(), &mut span_map);
 
-        let ttl_seconds = self.calculate_ttl(slab.range().end);
         self.session()
             .execute_unpaged(
                 &self.queries().insert_slab_trigger,
@@ -270,7 +337,7 @@ impl TriggerStore for CassandraTriggerStore {
                     trigger.key.as_str(),
                     trigger.time,
                     span_map,
-                    ttl_seconds,
+                    self.calculate_ttl(slab.range().end),
                 ),
             )
             .await?;
@@ -373,7 +440,6 @@ impl TriggerStore for CassandraTriggerStore {
         self.propagator()
             .inject_context(&trigger.span.context(), &mut span_map);
 
-        let ttl_seconds = self.calculate_ttl(trigger.time);
         self.session()
             .execute_unpaged(
                 &self.queries().insert_key_trigger,
@@ -382,7 +448,7 @@ impl TriggerStore for CassandraTriggerStore {
                     trigger.key.as_str(),
                     trigger.time,
                     span_map,
-                    ttl_seconds,
+                    self.calculate_ttl(trigger.time),
                 ),
             )
             .await?;
@@ -553,7 +619,15 @@ impl std::error::Error for CassandraTriggerStoreError {}
 mod test {
     use super::{CassandraConfiguration, CassandraTriggerStore};
     use crate::timers::duration::CompactDuration;
+    use crate::timers::slab::SlabId;
+    use crate::timers::store::{Segment, SegmentId, TriggerStore};
     use crate::trigger_store_tests;
+    use color_eyre::Result;
+    use futures::pin_mut;
+    use futures::stream::StreamExt;
+    use std::collections::HashSet;
+    use std::ops::RangeInclusive;
+    use uuid::Uuid;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
     trigger_store_tests!(
@@ -569,4 +643,171 @@ mod test {
         }),
         25
     );
+
+    #[tokio::test]
+    async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
+        let store = CassandraTriggerStore::new(CassandraConfiguration {
+            datacenter: None,
+            rack: None,
+            nodes: vec!["localhost:9042".to_owned()],
+            keyspace: "prosody_test".to_owned(),
+            user: None,
+            password: None,
+            base_ttl: CompactDuration::new(10 * 60),
+        })
+        .await?;
+
+        let segment_id = SegmentId::from(Uuid::new_v4());
+        let segment = Segment {
+            id: segment_id,
+            name: "test_segment".to_owned(),
+            slab_size: CompactDuration::new(60), // 1 minute slabs
+        };
+
+        // Insert the test segment
+        store.insert_segment(segment.clone()).await?;
+
+        // Test SlabId values that will cause wrap-around issues
+        let boundary = 2_147_483_648u32; // 2^31, becomes negative in i32
+        let test_slab_ids = vec![
+            boundary - 2,    // 2147483646 -> positive i32
+            boundary - 1,    // 2147483647 -> i32::MAX
+            boundary,        // 2147483648 -> i32::MIN (negative)
+            boundary + 1,    // 2147483649 -> negative i32
+            SlabId::MAX - 1, // 4294967294 -> negative i32
+            SlabId::MAX,     // 4294967295 -> -1 in i32
+        ];
+
+        // Insert test slabs
+        for &slab_id in &test_slab_ids {
+            let slab = crate::timers::slab::Slab::new(segment_id, slab_id, segment.slab_size);
+            store.insert_slab(&segment_id, slab).await?;
+        }
+
+        // Test Case 1: Range that crosses the wrap-around boundary
+        let cross_boundary_range = RangeInclusive::new(boundary - 1, boundary + 1);
+        let result: HashSet<SlabId> = store
+            .get_slab_range(&segment_id, cross_boundary_range)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<HashSet<_>, _>>()?;
+
+        let expected: HashSet<SlabId> = vec![boundary - 1, boundary, boundary + 1]
+            .into_iter()
+            .collect();
+        assert_eq!(result, expected, "Cross-boundary range failed");
+
+        // Test Case 2: Range entirely in "negative" i32 space (high u32 values)
+        let high_range = RangeInclusive::new(boundary, SlabId::MAX);
+        let result: HashSet<SlabId> = store
+            .get_slab_range(&segment_id, high_range)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<HashSet<_>, _>>()?;
+
+        let expected: HashSet<SlabId> = vec![boundary, boundary + 1, SlabId::MAX - 1, SlabId::MAX]
+            .into_iter()
+            .collect();
+        assert_eq!(result, expected, "High range (negative i32) failed");
+
+        // Test Case 3: Range entirely in "positive" i32 space (low u32 values)
+        let low_range = RangeInclusive::new(boundary - 2, boundary - 1);
+        let result: HashSet<SlabId> = store
+            .get_slab_range(&segment_id, low_range)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<HashSet<_>, _>>()?;
+
+        let expected: HashSet<SlabId> = vec![boundary - 2, boundary - 1].into_iter().collect();
+        assert_eq!(result, expected, "Low range (positive i32) failed");
+
+        // Test Case 4: Single element at boundary
+        let single_boundary_range = RangeInclusive::new(boundary, boundary);
+        let result: Vec<SlabId> = store
+            .get_slab_range(&segment_id, single_boundary_range)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(result, vec![boundary], "Single boundary element failed");
+
+        // Test Case 5: Range with maximum wrap-around (from high to low)
+        let max_wrap_range = RangeInclusive::new(SlabId::MAX - 1, boundary - 2);
+        let result: HashSet<SlabId> = store
+            .get_slab_range(&segment_id, max_wrap_range)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<HashSet<_>, _>>()?;
+
+        let expected: HashSet<SlabId> = vec![SlabId::MAX - 1, SlabId::MAX, boundary - 2]
+            .into_iter()
+            .collect();
+        assert_eq!(result, expected, "Maximum wrap-around range failed");
+
+        // Cleanup
+        store.delete_segment(&segment_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simple_wrap_around() -> Result<()> {
+        let store = CassandraTriggerStore::new(CassandraConfiguration {
+            datacenter: None,
+            rack: None,
+            nodes: vec!["localhost:9042".to_owned()],
+            keyspace: "prosody_test_simple".to_owned(),
+            user: None,
+            password: None,
+            base_ttl: CompactDuration::new(10 * 60),
+        })
+        .await?;
+
+        let segment_id = SegmentId::from(Uuid::new_v4());
+        let segment = Segment {
+            id: segment_id,
+            name: "simple_test".to_owned(),
+            slab_size: CompactDuration::new(60),
+        };
+
+        store.insert_segment(segment.clone()).await?;
+
+        // The critical boundary: 2^31 = 2,147,483,648
+        // Values below this are positive i32, values at/above are negative i32
+        let boundary = 2_147_483_648u32;
+        let test_ids = vec![boundary - 1, boundary, boundary + 1];
+
+        // Insert test slabs
+        for &slab_id in &test_ids {
+            let slab = crate::timers::slab::Slab::new(segment_id, slab_id, segment.slab_size);
+            store.insert_slab(&segment_id, slab).await?;
+        }
+
+        // Test the critical range that crosses the wrap-around boundary
+        let wrap_range = RangeInclusive::new(boundary - 1, boundary + 1);
+        let mut results = Vec::new();
+
+        let stream = store.get_slab_range(&segment_id, wrap_range);
+        pin_mut!(stream);
+        while let Some(result) = stream.next().await {
+            results.push(result?);
+        }
+
+        // Sort results for consistent comparison
+        results.sort_unstable();
+        let mut expected = test_ids.clone();
+        expected.sort_unstable();
+
+        assert_eq!(results, expected, "Wrap-around range query failed");
+
+        // Cleanup
+        store.delete_segment(&segment_id).await?;
+
+        Ok(())
+    }
 }
