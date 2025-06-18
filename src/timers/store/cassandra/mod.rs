@@ -31,7 +31,7 @@ use tracing::{info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
 
-mod embedded_migrator;
+mod migrator;
 mod queries;
 
 /// Configuration for Cassandra-based timer storage.

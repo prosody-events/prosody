@@ -1,4 +1,4 @@
-use super::embedded_migrator::EmbeddedMigrator;
+use super::migrator::EmbeddedMigrator;
 use crate::timers::store::cassandra::{CassandraConfiguration, CassandraTriggerStoreError};
 use educe::Educe;
 use scylla::client::Compression;
