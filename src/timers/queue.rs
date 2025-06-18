@@ -85,7 +85,8 @@ impl TriggerQueue {
         Some(expired.into_inner())
     }
 
-    /// Removes a scheduled [`Trigger`] from both the delay queue and the active registry.
+    /// Removes a scheduled [`Trigger`] from both the delay queue and the active
+    /// registry.
     ///
     /// If the trigger was not previously scheduled, this call has no effect.
     ///

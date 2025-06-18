@@ -1,11 +1,13 @@
 //! Timer management and coordination for scheduled events.
 //!
-//! The [`TimerManager`] serves as the primary interface for scheduling, querying,
-//! and canceling timers within a specific segment. It coordinates between:
+//! The [`TimerManager`] serves as the primary interface for scheduling,
+//! querying, and canceling timers within a specific segment. It coordinates
+//! between:
 //! - **Persistent Storage**: Durable [`TriggerStore`] for timer metadata.
 //! - **Background Slab Loader**: Preloads upcoming timer slabs.
 //! - **In-Memory Scheduler**: Precise, delay-queue based timer dispatch.
-//! - **Application**: Delivers timers as an async stream of [`UncommittedTimer`].
+//! - **Application**: Delivers timers as an async stream of
+//!   [`UncommittedTimer`].
 //!
 //! The manager ensures timers survive restarts, supports distributed ownership,
 //! and provides at-least-once delivery semantics for timer events.
@@ -31,10 +33,10 @@ use tracing::{Instrument, Span};
 
 /// Manages timer scheduling, storage, and delivery for a specific segment.
 ///
-/// Partitions timers into time-based slabs, persists them in a [`TriggerStore`],
-/// schedules them in memory, and delivers them as an async stream of
-/// [`UncommittedTimer`]. Supports concurrent operations and automatically
-/// cleans up resources when dropped.
+/// Partitions timers into time-based slabs, persists them in a
+/// [`TriggerStore`], schedules them in memory, and delivers them as an async
+/// stream of [`UncommittedTimer`]. Supports concurrent operations and
+/// automatically cleans up resources when dropped.
 ///
 /// # Type Parameters
 ///
@@ -122,7 +124,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError::Store`] if the underlying storage query fails.
+    /// Returns [`TimerManagerError::Store`] if the underlying storage query
+    /// fails.
     pub fn scheduled_times(
         &self,
         key: &Key,
@@ -155,7 +158,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`TimerManagerError::Store`] if the underlying storage query fails.
+    /// Returns [`TimerManagerError::Store`] if the underlying storage query
+    /// fails.
     pub async fn scheduled_triggers(
         &self,
         key: &Key,
@@ -252,8 +256,9 @@ where
 
     /// Cancels all timers for a specific key concurrently.
     ///
-    /// Queries all scheduled times for `key` and issues [`unschedule`](Self::unschedule)
-    /// for each in parallel, controlled by [`DELETE_CONCURRENCY`].
+    /// Queries all scheduled times for `key` and issues
+    /// [`unschedule`](Self::unschedule) for each in parallel, controlled by
+    /// [`DELETE_CONCURRENCY`].
     ///
     /// # Arguments
     ///

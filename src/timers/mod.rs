@@ -1,12 +1,13 @@
 //! Timer scheduling and management system for time-based events.
 //!
-//! This module implements a distributed timer system that schedules events for future
-//! execution with persistence and fault tolerance. The system partitions timers into
-//! time-based slabs for efficient storage and retrieval.
+//! This module implements a distributed timer system that schedules events for
+//! future execution with persistence and fault tolerance. The system partitions
+//! timers into time-based slabs for efficient storage and retrieval.
 //!
 //! # Core Components
 //!
-//! - [`Trigger`] - Timer event metadata with key, execution time, and tracing context
+//! - [`Trigger`] - Timer event metadata with key, execution time, and tracing
+//!   context
 //! - [`TimerManager`] - Primary interface for scheduling and managing timers
 //! - [`TriggerStore`] - Persistent storage abstraction for timer data
 //! - [`TriggerScheduler`] - In-memory delay queue for precise timer execution
@@ -53,9 +54,10 @@ use tracing::Span;
 
 /// Scheduled timer event containing execution metadata.
 ///
-/// Contains the key, execution time, and tracing context for a timer that will fire
-/// at a specific moment. The `span` field is excluded from equality and ordering
-/// comparisons to ensure consistent behavior across different tracing contexts.
+/// Contains the key, execution time, and tracing context for a timer that will
+/// fire at a specific moment. The `span` field is excluded from equality and
+/// ordering comparisons to ensure consistent behavior across different tracing
+/// contexts.
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {

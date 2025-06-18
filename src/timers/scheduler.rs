@@ -65,7 +65,8 @@ impl TriggerScheduler {
     /// # Returns
     ///
     /// A tuple of:
-    /// - [`mpsc::Receiver<Trigger>`]: yields triggers when their scheduled time arrives.
+    /// - [`mpsc::Receiver<Trigger>`]: yields triggers when their scheduled time
+    ///   arrives.
     /// - [`TriggerScheduler`]: handle for scheduling or unscheduling triggers.
     pub fn new() -> (mpsc::Receiver<Trigger>, Self) {
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
@@ -181,7 +182,8 @@ impl TriggerScheduler {
     }
 }
 
-/// Background task that processes scheduling commands and emits expired triggers.
+/// Background task that processes scheduling commands and emits expired
+/// triggers.
 ///
 /// Concurrently receives [`Command`] messages to add or remove triggers and
 /// waits for expired triggers to send them. If the receiver is full, retains

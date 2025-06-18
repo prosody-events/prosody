@@ -84,7 +84,8 @@ impl<T> State<T> {
     }
 }
 
-/// Background task that continuously loads upcoming slabs and cleans up old ones.
+/// Background task that continuously loads upcoming slabs and cleans up old
+/// ones.
 ///
 /// This loop:
 /// 1. Determines a preload window based on half the slab size (minimum 30s).

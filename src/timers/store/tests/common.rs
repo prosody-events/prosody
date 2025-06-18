@@ -10,8 +10,10 @@
 //! The helpers focus on:
 //! - **Data verification**: Ensuring operations produce expected results
 //! - **Error handling**: Converting storage errors into test failures
-//! - **State consistency**: Verifying dual indices (time and key) remain in sync
-//! - **Cross-backend compatibility**: Working with any `TriggerStore` implementation
+//! - **State consistency**: Verifying dual indices (time and key) remain in
+//!   sync
+//! - **Cross-backend compatibility**: Working with any `TriggerStore`
+//!   implementation
 
 use super::TestStoreResult;
 use crate::Key;
@@ -20,8 +22,8 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use futures::StreamExt;
 use ahash::{HashMap, HashSet};
+use futures::StreamExt;
 use std::fmt::Debug;
 
 /// Helper function to insert a segment.

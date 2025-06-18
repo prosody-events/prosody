@@ -9,7 +9,8 @@
 //!   transfers, and system state modifications that require exclusive access
 //!
 //! Multiple trigger operations can proceed simultaneously while slab operations
-//! have exclusive access when needed, optimizing for concurrent timer processing.
+//! have exclusive access when needed, optimizing for concurrent timer
+//! processing.
 
 use educe::Educe;
 use std::ops::{Deref, DerefMut};
@@ -26,7 +27,8 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 ///   structure (loading slabs, ownership changes, cleanup)
 ///
 /// Optimizes for the common case where multiple trigger operations can safely
-/// occur simultaneously, while ensuring structural operations have exclusive access.
+/// occur simultaneously, while ensuring structural operations have exclusive
+/// access.
 #[derive(Educe)]
 #[educe(Clone(bound()), Debug)]
 pub struct SlabLock<T> {

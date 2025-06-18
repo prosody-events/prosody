@@ -1,8 +1,8 @@
 //! Memory-efficient datetime using 32-bit epoch seconds.
 //!
-//! Provides [`CompactDateTime`] which stores timestamps as 32-bit epoch seconds,
-//! reducing memory usage for timer systems that process large volumes of events.
-//! Supports the range 1970-2106 with second-level precision.
+//! Provides [`CompactDateTime`] which stores timestamps as 32-bit epoch
+//! seconds, reducing memory usage for timer systems that process large volumes
+//! of events. Supports the range 1970-2106 with second-level precision.
 
 use crate::timers::duration::CompactDuration;
 use chrono::{DateTime, Utc};
@@ -12,9 +12,9 @@ use thiserror::Error;
 
 /// 32-bit datetime stored as epoch seconds.
 ///
-/// Stores time as seconds since Unix epoch (1970-01-01 UTC). Uses 4 bytes instead
-/// of 8+ bytes for standard datetime types. Supports range 1970-2106 with second
-/// precision. Sub-second values are rounded to nearest second.
+/// Stores time as seconds since Unix epoch (1970-01-01 UTC). Uses 4 bytes
+/// instead of 8+ bytes for standard datetime types. Supports range 1970-2106
+/// with second precision. Sub-second values are rounded to nearest second.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct CompactDateTime {
     epoch_seconds: u32,
@@ -34,7 +34,8 @@ impl CompactDateTime {
     ///
     /// # Errors
     ///
-    /// Returns `CompactDateTimeError::OutOfRange` if the system time is outside the 1970-2106 range.
+    /// Returns `CompactDateTimeError::OutOfRange` if the system time is outside
+    /// the 1970-2106 range.
     pub fn now() -> Result<Self, CompactDateTimeError> {
         Self::try_from(Utc::now())
     }
@@ -53,7 +54,8 @@ impl CompactDateTime {
     ///
     /// # Errors
     ///
-    /// Returns `CompactDateTimeError::PastDateTime` if `other` is later than `self`.
+    /// Returns `CompactDateTimeError::PastDateTime` if `other` is later than
+    /// `self`.
     pub fn duration_since(self, other: Self) -> Result<Duration, CompactDateTimeError> {
         let seconds = self
             .epoch_seconds
@@ -65,8 +67,9 @@ impl CompactDateTime {
 
     /// Calculates the compact duration between this time and an earlier time.
     ///
-    /// This is a more efficient version of [`duration_since`](Self::duration_since)
-    /// that returns a [`CompactDuration`] instead of a [`std::time::Duration`].
+    /// This is a more efficient version of
+    /// [`duration_since`](Self::duration_since) that returns a
+    /// [`CompactDuration`] instead of a [`std::time::Duration`].
     ///
     /// # Arguments
     ///

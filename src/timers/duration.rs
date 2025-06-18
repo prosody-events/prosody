@@ -143,7 +143,8 @@ impl Debug for CompactDuration {
 /// Errors that can occur when working with [`CompactDuration`].
 #[derive(Clone, Debug, Error)]
 pub enum CompactDurationError {
-    /// The duration is outside the representable range of `0..=u32::MAX` seconds.
+    /// The duration is outside the representable range of `0..=u32::MAX`
+    /// seconds.
     #[error("Duration is out of range")]
     OutOfRange,
 }
