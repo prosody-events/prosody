@@ -35,7 +35,7 @@ use tracing::{Instrument, Span};
 ///
 /// Partitions timers into time-based slabs, persists them in a
 /// [`TriggerStore`], schedules them in memory, and delivers them as an async
-/// stream of [`UncommittedTimer`]. Supports concurrent operations and
+/// stream of [`PendingTimer`]. Supports concurrent operations and
 /// automatically cleans up resources when dropped.
 ///
 /// # Type Parameters
@@ -74,7 +74,7 @@ where
     /// # Returns
     ///
     /// On success, returns a tuple:
-    /// - A [`Stream`] of [`UncommittedTimer<T>`] delivering timer events.
+    /// - A [`Stream`] of [`PendingTimer<T>`] delivering timer events.
     /// - The [`TimerManager<T>`] instance for scheduling and management.
     ///
     /// # Errors
@@ -304,7 +304,7 @@ where
     /// Marks a timer as completed and removes it permanently.
     ///
     /// Deactivates the timer if owned, then deletes it from persistent storage.
-    /// Typically invoked by [`UncommittedTimer::commit()`].
+    /// Typically invoked by `UncommittedTimer::commit()`.
     ///
     /// # Arguments
     ///

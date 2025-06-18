@@ -11,7 +11,8 @@
 //!
 //! 1. Delivery: timers arrive as [`UncommittedTimer`]
 //! 2. Processing: application handles the timer event
-//! 3. Acknowledgment: application calls [`commit()`] or [`abort()`]
+//! 3. Acknowledgment: application calls [`Uncommitted::commit()`] or
+//!    [`Uncommitted::abort()`]
 //! 4. Cleanup: timers are removed from storage or left for retry
 //!
 //! Timers use at-least-once delivery and survive restarts. Successful commits
@@ -64,8 +65,9 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
 /// The concrete implementation of an uncommitted timer event.
 ///
 /// Wraps a [`Trigger`] and an internal transaction state. After processing,
-/// applications must call [`commit()`] to remove the timer from storage, or
-/// [`abort()`] to deactivate it in-memory while leaving persistent data.
+/// applications must call [`Uncommitted::commit()`] to remove the timer from
+/// storage, or [`Uncommitted::abort()`] to deactivate it in-memory while
+/// leaving persistent data.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
 pub struct PendingTimer<T>
@@ -233,7 +235,7 @@ where
 
     /// Permanently remove the timer from storage and deactivate it.
     ///
-    /// Retries indefinitely on failures, waiting [`RETRY_DURATION`] between
+    /// Retries indefinitely on failures, waiting `RETRY_DURATION` between
     /// attempts. Multiple commits or aborts are ignored.
     pub async fn commit(&mut self) {
         if self.completed {

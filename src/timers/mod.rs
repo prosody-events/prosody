@@ -9,9 +9,9 @@
 //! - [`Trigger`] - Timer event metadata with key, execution time, and tracing
 //!   context
 //! - [`TimerManager`] - Primary interface for scheduling and managing timers
-//! - [`TriggerStore`] - Persistent storage abstraction for timer data
-//! - [`TriggerScheduler`] - In-memory delay queue for precise timer execution
-//! - [`Slab`] - Time-based partition containing related timer events
+//! - [`store::TriggerStore`] - Persistent storage abstraction for timer data
+//! - `TriggerScheduler` - In-memory delay queue for precise timer execution
+//! - `Slab` - Time-based partition containing related timer events
 //!
 //! # Example Usage
 //!
