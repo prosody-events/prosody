@@ -2,14 +2,18 @@ use crate::Key;
 use crate::propagator::new_propagator;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
+use crate::timers::duration::{CompactDuration, CompactDurationError};
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::cassandra::queries::Queries;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::util::{
+    from_duration_env_with_fallback, from_env_with_fallback, from_option_env, from_vec_env,
+};
 use async_stream::try_stream;
 use derive_builder::Builder;
 use educe::Educe;
 use futures::{Stream, TryStreamExt, pin_mut};
+use humantime::Duration;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use scylla::_macro_internal::{
     CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
@@ -34,30 +38,85 @@ use validator::Validate;
 mod migrator;
 mod queries;
 
-/// Configuration for Cassandra-based timer storage.
-///
-/// Provides settings for connecting to a Cassandra cluster and configuring
-/// TTL behavior for timer data persistence.
+/// Configuration for the Cassandra-based timer storage backend.
 #[derive(Builder, Clone, Educe, Validate)]
 #[educe(Debug)]
 pub struct CassandraConfiguration {
-    /// Preferred datacenter for load balancing.
-    datacenter: Option<String>,
-    /// Preferred rack for load balancing.
-    rack: Option<String>,
-    /// List of Cassandra node addresses.
-    nodes: Vec<String>,
-    /// Keyspace name to use for timer data.
-    keyspace: String,
-    /// Username for authentication.
-    user: Option<String>,
+    /// List of Cassandra contact nodes (hostnames or IPs).
+    ///
+    /// Environment variable: `PROSODY_CASSANDRA_NODES`
+    /// Default: None (must be specified)
+    ///
+    /// At least one Cassandra node must be provided to establish an initial
+    /// connection with the cluster. Multiple nodes improve failover behavior.
+    #[builder(default = "from_vec_env(\"PROSODY_CASSANDRA_NODES\")?", setter(into))]
+    #[validate(length(min = 1_u64))]
+    pub nodes: Vec<String>,
 
-    /// Password for authentication (excluded from debug output).
+    /// Keyspace to use for storing timer data.
+    ///
+    /// Environment variable: `PROSODY_CASSANDRA_KEYSPACE`
+    /// Default: `"prosody"`
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_CASSANDRA_KEYSPACE\", \"prosody\".to_owned())?",
+        setter(into)
+    )]
+    #[validate(length(min = 1_u64))]
+    pub keyspace: String,
+
+    /// Preferred datacenter for query routing.
+    ///
+    /// Environment variable: `PROSODY_CASSANDRA_DATACENTER`
+    /// Default: None
+    #[builder(
+        default = "from_option_env(\"PROSODY_CASSANDRA_DATACENTER\")?",
+        setter(into)
+    )]
+    pub datacenter: Option<String>,
+
+    /// Preferred rack identifier for topology-aware routing.
+    ///
+    /// Environment variable: `PROSODY_CASSANDRA_RACK`
+    /// Default: None
+    #[builder(default = "from_option_env(\"PROSODY_CASSANDRA_RACK\")?", setter(into))]
+    pub rack: Option<String>,
+
+    /// Username for authenticating with Cassandra.
+    ///
+    /// Environment variable: `PROSODY_CASSANDRA_USER`
+    /// Default: None
+    #[builder(default = "from_option_env(\"PROSODY_CASSANDRA_USER\")?", setter(into))]
+    pub user: Option<String>,
+
+    /// Password for authenticating with Cassandra.
+    ///
+    /// Environment variable: `PROSODY_CASSANDRA_PASSWORD`
+    /// Default: None
+    #[builder(
+        default = "from_option_env(\"PROSODY_CASSANDRA_PASSWORD\")?",
+        setter(into)
+    )]
     #[educe(Debug(ignore))]
-    password: Option<String>,
+    pub password: Option<String>,
 
-    /// Base TTL duration added to all timer entries.
-    base_ttl: CompactDuration,
+    /// Retention period for timer-related data in Cassandra.
+    ///
+    /// This defines how long data remain available **after** a timer has
+    /// fired. It effectively sets the window in which consumers can read
+    /// and process the timer output before the data is automatically
+    /// purged.
+    ///
+    /// Structural metadata (e.g., segment definitions) may persist beyond this
+    /// period and is not subject to TTL-based eviction.
+    ///
+    /// Environment variable: `PROSODY_CASSANDRA_RETENTION`
+    /// Default: 1 year
+    #[builder(
+        default = "Duration::from(from_duration_env_with_fallback(\"PROSODY_CASSANDRA_RETENTION\", \
+        std::time::Duration::from_secs(365 * 24 * 60 * 60))?)",
+        setter(into)
+    )]
+    pub retention: Duration,
 }
 
 /// Cassandra-based implementation of [`TriggerStore`].
@@ -91,7 +150,8 @@ impl CassandraTriggerStore {
     /// - Schema migration fails
     /// - Query preparation fails
     pub async fn new(config: CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
-        let base_ttl = config.base_ttl;
+        let base_ttl: std::time::Duration = config.retention.into();
+        let base_ttl = base_ttl.try_into()?;
 
         Ok(Self(Arc::new(Inner {
             queries: Box::pin(Queries::new(config)).await?,
@@ -119,16 +179,18 @@ impl CassandraTriggerStore {
     fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
         const MAX_TTL: i32 = 630_720_000;
 
-        Some(
-            time.compact_duration_from_now()
-                .unwrap_or(CompactDuration::MIN)
-                .checked_add(self.base_ttl())
-                .unwrap_or(CompactDuration::MAX)
-                .seconds()
-                .try_into()
-                .unwrap_or(MAX_TTL),
-        )
-        .filter(|&ttl| ttl < MAX_TTL)
+        let Ok(duration) = time.compact_duration_from_now() else {
+            // Return the base TTL if the time is in the past
+            return self.base_ttl().seconds().try_into().ok();
+        };
+
+        duration
+            .checked_add(self.base_ttl())
+            .ok()?
+            .seconds()
+            .try_into()
+            .ok()
+            .filter(|&ttl| ttl < MAX_TTL)
     }
 }
 
@@ -600,6 +662,10 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDateTime 
 /// Internal error types for Cassandra operations.
 #[derive(Debug, Error)]
 pub enum InnerError {
+    /// Invalid duration
+    #[error(transparent)]
+    Duration(#[from] CompactDurationError),
+
     /// Failed to create Cassandra session.
     #[error(transparent)]
     Session(#[from] NewSessionError),
@@ -699,6 +765,7 @@ mod test {
     use futures::stream::StreamExt;
     use std::collections::HashSet;
     use std::ops::RangeInclusive;
+    use std::time::Duration;
     use uuid::Uuid;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
@@ -711,7 +778,7 @@ mod test {
             keyspace: "prosody".to_owned(),
             user: None,
             password: None,
-            base_ttl: CompactDuration::new(10 * 60),
+            retention: Duration::from_secs(10 * 60).into(),
         }),
         25
     );
@@ -725,7 +792,7 @@ mod test {
             keyspace: "prosody_test".to_owned(),
             user: None,
             password: None,
-            base_ttl: CompactDuration::new(10 * 60),
+            retention: Duration::from_secs(10 * 60).into(),
         })
         .await?;
 
@@ -834,7 +901,7 @@ mod test {
             keyspace: "prosody_test_simple".to_owned(),
             user: None,
             password: None,
-            base_ttl: CompactDuration::new(10 * 60),
+            retention: Duration::from_secs(10 * 60).into(),
         })
         .await?;
 
