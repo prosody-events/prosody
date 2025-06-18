@@ -1,3 +1,17 @@
+//! Prepared CQL statement management for Cassandra timer storage.
+//!
+//! This module provides the [`Queries`] struct which contains all prepared
+//! Cassandra CQL statements needed for timer storage operations. Prepared
+//! statements are created once during initialization and reused for all
+//! database operations, providing better performance and security.
+//!
+//! The module handles:
+//! - Cassandra session creation and configuration
+//! - Schema migration execution via [`EmbeddedMigrator`]
+//! - Preparation of all CQL statements for CRUD operations
+//! - Load balancing and retry policy configuration
+//! - TTL and non-TTL variants of insert statements
+
 use super::migrator::EmbeddedMigrator;
 use crate::timers::store::cassandra::{CassandraConfiguration, CassandraTriggerStoreError};
 use educe::Educe;
@@ -12,6 +26,17 @@ use scylla::statement::Consistency;
 use scylla::statement::prepared::PreparedStatement;
 use std::sync::Arc;
 
+/// Container for all prepared Cassandra CQL statements used by the timer store.
+///
+/// This struct holds the Cassandra session and all prepared statements needed
+/// for timer storage operations. Prepared statements provide better performance
+/// and security compared to ad-hoc query strings.
+///
+/// The struct contains prepared statements for:
+/// - Segment management (create, read, delete)
+/// - Slab operations (insert, delete, range queries)
+/// - Trigger operations for both time-based and key-based indices
+/// - TTL and non-TTL variants for data lifecycle management
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct Queries {
@@ -77,6 +102,29 @@ pub struct Queries {
 }
 
 impl Queries {
+    /// Creates a new Queries instance with prepared statements for all timer
+    /// operations.
+    ///
+    /// This method establishes a connection to Cassandra, runs schema
+    /// migrations, and prepares all CQL statements needed for timer storage
+    /// operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `configuration` - Cassandra connection settings including nodes,
+    ///   credentials, keyspace, and load balancing preferences.
+    ///
+    /// # Returns
+    ///
+    /// A [`Queries`] instance with all prepared statements ready for use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraTriggerStoreError`] if:
+    /// - Connection to Cassandra cluster fails
+    /// - Schema migration fails
+    /// - Keyspace cannot be selected
+    /// - Statement preparation fails
     pub async fn new(
         configuration: CassandraConfiguration,
     ) -> Result<Self, CassandraTriggerStoreError> {
@@ -154,6 +202,10 @@ impl Queries {
     }
 }
 
+/// Prepares a CQL statement for inserting a new segment.
+///
+/// Creates a prepared statement for: `INSERT INTO segments (id, name,
+/// slab_size) VALUES (?, ?, ?)`
 async fn prepare_insert_segment(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -164,6 +216,10 @@ async fn prepare_insert_segment(
     .await
 }
 
+/// Prepares a CQL statement for retrieving a segment by ID.
+///
+/// Creates a prepared statement for: `SELECT name, slab_size FROM segments
+/// WHERE id = ? LIMIT 1`
 async fn prepare_get_segment(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -174,18 +230,29 @@ async fn prepare_get_segment(
     .await
 }
 
+/// Prepares a CQL statement for deleting a segment.
+///
+/// Creates a prepared statement for: `DELETE FROM segments WHERE id = ?`
 async fn prepare_delete_segment(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(session, "delete from segments where id = ?").await
 }
 
+/// Prepares a CQL statement for retrieving all slab IDs for a segment.
+///
+/// Creates a prepared statement for: `SELECT slab_id FROM segments WHERE id =
+/// ?`
 async fn prepare_get_slabs(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(session, "select slab_id from segments where id = ?").await
 }
 
+/// Prepares a CQL statement for retrieving slab IDs within a range.
+///
+/// Creates a prepared statement for: `SELECT slab_id FROM segments WHERE id = ?
+/// AND slab_id >= ? AND slab_id <= ?`
 async fn prepare_get_slab_range(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -196,6 +263,10 @@ async fn prepare_get_slab_range(
     .await
 }
 
+/// Prepares a CQL statement for inserting a slab with TTL.
+///
+/// Creates a prepared statement for: `INSERT INTO segments (id, slab_id) VALUES
+/// (?, ?) USING TTL ?`
 async fn prepare_insert_slab(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -206,12 +277,20 @@ async fn prepare_insert_slab(
     .await
 }
 
+/// Prepares a CQL statement for deleting a slab.
+///
+/// Creates a prepared statement for: `DELETE FROM segments WHERE id = ? AND
+/// slab_id = ?`
 async fn prepare_delete_slab(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(session, "delete from segments where id = ? and slab_id = ?").await
 }
 
+/// Prepares a CQL statement for retrieving all triggers in a slab.
+///
+/// Creates a prepared statement for: `SELECT key, time, span FROM slabs WHERE
+/// segment_id = ? AND id = ?`
 async fn prepare_get_slab_triggers(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -222,6 +301,10 @@ async fn prepare_get_slab_triggers(
     .await
 }
 
+/// Prepares a CQL statement for inserting a trigger into a slab with TTL.
+///
+/// Creates a prepared statement for: `INSERT INTO slabs (segment_id, id, key,
+/// time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?`
 async fn prepare_insert_slab_trigger(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -232,6 +315,10 @@ async fn prepare_insert_slab_trigger(
     .await
 }
 
+/// Prepares a CQL statement for deleting a specific trigger from a slab.
+///
+/// Creates a prepared statement for: `DELETE FROM slabs WHERE segment_id = ?
+/// AND id = ? AND key = ? AND time = ?`
 async fn prepare_delete_slab_trigger(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -242,12 +329,20 @@ async fn prepare_delete_slab_trigger(
     .await
 }
 
+/// Prepares a CQL statement for clearing all triggers from a slab.
+///
+/// Creates a prepared statement for: `DELETE FROM slabs WHERE segment_id = ?
+/// AND id = ?`
 async fn prepare_clear_slab_triggers(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(session, "delete from slabs where segment_id = ? and id = ?").await
 }
 
+/// Prepares a CQL statement for retrieving all scheduled times for a key.
+///
+/// Creates a prepared statement for: `SELECT time FROM keys WHERE segment_id =
+/// ? AND key = ?`
 async fn prepare_get_key_times(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -258,6 +353,10 @@ async fn prepare_get_key_times(
     .await
 }
 
+/// Prepares a CQL statement for retrieving all triggers for a key.
+///
+/// Creates a prepared statement for: `SELECT key, time, span FROM keys WHERE
+/// segment_id = ? AND key = ?`
 async fn prepare_get_key_triggers(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -268,6 +367,11 @@ async fn prepare_get_key_triggers(
     .await
 }
 
+/// Prepares a CQL statement for inserting a trigger into the key index with
+/// TTL.
+///
+/// Creates a prepared statement for: `INSERT INTO keys (segment_id, key, time,
+/// span) VALUES (?, ?, ?, ?) USING TTL ?`
 async fn prepare_insert_key_trigger(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -278,6 +382,10 @@ async fn prepare_insert_key_trigger(
     .await
 }
 
+/// Prepares a CQL statement for deleting a specific trigger from the key index.
+///
+/// Creates a prepared statement for: `DELETE FROM keys WHERE segment_id = ? AND
+/// key = ? AND time = ?`
 async fn prepare_delete_key_trigger(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -288,18 +396,30 @@ async fn prepare_delete_key_trigger(
     .await
 }
 
+/// Prepares a CQL statement for clearing all triggers for a key.
+///
+/// Creates a prepared statement for: `DELETE FROM keys WHERE segment_id = ? AND
+/// key = ?`
 async fn prepare_clear_key_triggers(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(session, "delete from keys where segment_id = ? and key = ?").await
 }
 
+/// Prepares a CQL statement for inserting a slab without TTL.
+///
+/// Creates a prepared statement for: `INSERT INTO segments (id, slab_id) VALUES
+/// (?, ?)`
 async fn prepare_insert_slab_no_ttl(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(session, "insert into segments (id, slab_id) values (?, ?)").await
 }
 
+/// Prepares a CQL statement for inserting a trigger into a slab without TTL.
+///
+/// Creates a prepared statement for: `INSERT INTO slabs (segment_id, id, key,
+/// time, span) VALUES (?, ?, ?, ?, ?)`
 async fn prepare_insert_slab_trigger_no_ttl(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -310,6 +430,11 @@ async fn prepare_insert_slab_trigger_no_ttl(
     .await
 }
 
+/// Prepares a CQL statement for inserting a trigger into the key index without
+/// TTL.
+///
+/// Creates a prepared statement for: `INSERT INTO keys (segment_id, key, time,
+/// span) VALUES (?, ?, ?, ?)`
 async fn prepare_insert_key_trigger_no_ttl(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -320,6 +445,20 @@ async fn prepare_insert_key_trigger_no_ttl(
     .await
 }
 
+/// Prepares a CQL statement with optimized settings.
+///
+/// Prepares the given CQL statement and applies performance optimizations:
+/// - Enables cached result metadata for better performance
+/// - Marks the statement as idempotent for safer retries
+///
+/// # Arguments
+///
+/// * `session` - The Cassandra session to use for preparation
+/// * `statement` - The CQL statement string to prepare
+///
+/// # Returns
+///
+/// A [`PreparedStatement`] ready for execution with optimizations applied.
 async fn prepare(
     session: &Session,
     statement: &str,

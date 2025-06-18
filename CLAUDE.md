@@ -23,7 +23,7 @@ Prosody is a high-level Kafka client library for Rust providing:
 - Don't add documentation examples unless they're critical to understanding the code
 - If a method doesn't have `self`, consider refactoring it to be a function unless the method pattern is idiomatic (for
   example, `new` should be a method even though it does not contain self).
-- Run `cargo clippy`, `cargo clippy --tests`, and `cargo doc` after each change and fix any lints.
+- Run `cargo clippy`, `cargo clippy --tests`, `cargo doc`, and `cargo +nightly fmt` after each change and fix any lints.
 - Don't use clippy to ignore lints unless told to do so by a human.
 - Prefer `use` statements over fully qualified prefixes in code.
 - Ask the human before making large, structural changes to code.
