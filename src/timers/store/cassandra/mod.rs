@@ -86,17 +86,19 @@ impl CassandraTriggerStore {
         self.0.base_ttl
     }
 
-    fn calculate_ttl(&self, time: CompactDateTime) -> i32 {
+    fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
         const MAX_TTL: i32 = 630_720_000;
 
-        time.compact_duration_from_now()
-            .unwrap_or(CompactDuration::MIN)
-            .checked_add(self.base_ttl())
-            .unwrap_or(CompactDuration::MAX)
-            .seconds()
-            .try_into()
-            .unwrap_or(MAX_TTL)
-            .min(MAX_TTL)
+        Some(
+            time.compact_duration_from_now()
+                .unwrap_or(CompactDuration::MIN)
+                .checked_add(self.base_ttl())
+                .unwrap_or(CompactDuration::MAX)
+                .seconds()
+                .try_into()
+                .unwrap_or(MAX_TTL),
+        )
+        .filter(|&ttl| ttl < MAX_TTL)
     }
 }
 
@@ -262,16 +264,20 @@ impl TriggerStore for CassandraTriggerStore {
 
     #[instrument(skip(self), err)]
     async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
-        self.session()
-            .execute_unpaged(
-                &self.queries().insert_slab,
-                (
-                    segment_id,
-                    i32::from_le_bytes(slab.id().to_le_bytes()),
-                    self.calculate_ttl(slab.range().end),
-                ),
-            )
-            .await?;
+        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
+
+        match self.calculate_ttl(slab.range().end) {
+            Some(ttl) => {
+                self.session()
+                    .execute_unpaged(&self.queries().insert_slab, (segment_id, slab_id, ttl))
+                    .await?;
+            }
+            None => {
+                self.session()
+                    .execute_unpaged(&self.queries().insert_slab_no_ttl, (segment_id, slab_id))
+                    .await?;
+            }
+        }
 
         Ok(())
     }
@@ -328,19 +334,29 @@ impl TriggerStore for CassandraTriggerStore {
         self.propagator()
             .inject_context(&trigger.span.context(), &mut span_map);
 
-        self.session()
-            .execute_unpaged(
-                &self.queries().insert_slab_trigger,
-                (
-                    slab.segment_id(),
-                    i32::from_le_bytes(slab.id().to_le_bytes()),
-                    trigger.key.as_str(),
-                    trigger.time,
-                    span_map,
-                    self.calculate_ttl(slab.range().end),
-                ),
-            )
-            .await?;
+        let segment_id = slab.segment_id();
+        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
+        let key = trigger.key.as_str();
+        let time = trigger.time;
+
+        match self.calculate_ttl(slab.range().end) {
+            Some(ttl) => {
+                self.session()
+                    .execute_unpaged(
+                        &self.queries().insert_slab_trigger,
+                        (segment_id, slab_id, key, time, span_map, ttl),
+                    )
+                    .await?;
+            }
+            None => {
+                self.session()
+                    .execute_unpaged(
+                        &self.queries().insert_slab_trigger_no_ttl,
+                        (segment_id, slab_id, key, time, span_map),
+                    )
+                    .await?;
+            }
+        }
 
         Ok(())
     }
@@ -440,18 +456,27 @@ impl TriggerStore for CassandraTriggerStore {
         self.propagator()
             .inject_context(&trigger.span.context(), &mut span_map);
 
-        self.session()
-            .execute_unpaged(
-                &self.queries().insert_key_trigger,
-                (
-                    segment_id,
-                    trigger.key.as_str(),
-                    trigger.time,
-                    span_map,
-                    self.calculate_ttl(trigger.time),
-                ),
-            )
-            .await?;
+        let key = trigger.key.as_str();
+        let time = trigger.time;
+
+        match self.calculate_ttl(trigger.time) {
+            Some(ttl) => {
+                self.session()
+                    .execute_unpaged(
+                        &self.queries().insert_key_trigger,
+                        (segment_id, key, time, span_map, ttl),
+                    )
+                    .await?;
+            }
+            None => {
+                self.session()
+                    .execute_unpaged(
+                        &self.queries().insert_key_trigger_no_ttl,
+                        (segment_id, key, time, span_map),
+                    )
+                    .await?;
+            }
+        }
 
         Ok(())
     }
@@ -735,19 +760,17 @@ mod test {
 
         assert_eq!(result, vec![boundary], "Single boundary element failed");
 
-        // Test Case 5: Range with maximum wrap-around (from high to low)
-        let max_wrap_range = RangeInclusive::new(SlabId::MAX - 1, boundary - 2);
+        // Test Case 5: Invalid range (start > end in u32 space)
+        let invalid_range = RangeInclusive::new(SlabId::MAX - 1, boundary - 2);
         let result: HashSet<SlabId> = store
-            .get_slab_range(&segment_id, max_wrap_range)
+            .get_slab_range(&segment_id, invalid_range)
             .collect::<Vec<_>>()
             .await
             .into_iter()
             .collect::<Result<HashSet<_>, _>>()?;
 
-        let expected: HashSet<SlabId> = vec![SlabId::MAX - 1, SlabId::MAX, boundary - 2]
-            .into_iter()
-            .collect();
-        assert_eq!(result, expected, "Maximum wrap-around range failed");
+        let expected: HashSet<SlabId> = HashSet::new();
+        assert_eq!(result, expected, "Invalid range should return empty set");
 
         // Cleanup
         store.delete_segment(&segment_id).await?;

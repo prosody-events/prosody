@@ -65,6 +65,15 @@ pub struct Queries {
 
     #[educe(Debug(ignore))]
     pub clear_key_triggers: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub insert_slab_no_ttl: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub insert_slab_trigger_no_ttl: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub insert_key_trigger_no_ttl: PreparedStatement,
 }
 
 impl Queries {
@@ -116,6 +125,9 @@ impl Queries {
         let insert_key_trigger = prepare_insert_key_trigger(&session).await?;
         let delete_key_trigger = prepare_delete_key_trigger(&session).await?;
         let clear_key_triggers = prepare_clear_key_triggers(&session).await?;
+        let insert_slab_no_ttl = prepare_insert_slab_no_ttl(&session).await?;
+        let insert_slab_trigger_no_ttl = prepare_insert_slab_trigger_no_ttl(&session).await?;
+        let insert_key_trigger_no_ttl = prepare_insert_key_trigger_no_ttl(&session).await?;
 
         Ok(Self {
             session,
@@ -135,6 +147,9 @@ impl Queries {
             insert_key_trigger,
             delete_key_trigger,
             clear_key_triggers,
+            insert_slab_no_ttl,
+            insert_slab_trigger_no_ttl,
+            insert_key_trigger_no_ttl,
         })
     }
 }
@@ -277,6 +292,32 @@ async fn prepare_clear_key_triggers(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(session, "delete from keys where segment_id = ? and key = ?").await
+}
+
+async fn prepare_insert_slab_no_ttl(
+    session: &Session,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(session, "insert into segments (id, slab_id) values (?, ?)").await
+}
+
+async fn prepare_insert_slab_trigger_no_ttl(
+    session: &Session,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        "insert into slabs (segment_id, id, key, time, span) values (?, ?, ?, ?, ?)",
+    )
+    .await
+}
+
+async fn prepare_insert_key_trigger_no_ttl(
+    session: &Session,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        "insert into keys (segment_id, key, time, span) values (?, ?, ?, ?)",
+    )
+    .await
 }
 
 async fn prepare(
