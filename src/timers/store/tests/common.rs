@@ -61,13 +61,13 @@ where
 }
 
 /// Helper function to insert a slab
-pub async fn insert_slab<S>(store: &S, segment_id: &SegmentId, slab_id: SlabId) -> TestStoreResult
+pub async fn insert_slab<S>(store: &S, segment_id: &SegmentId, slab: Slab) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
     store
-        .insert_slab(segment_id, slab_id)
+        .insert_slab(segment_id, slab)
         .await
         .map_err(|e| format!("Failed to insert slab: {e:?}"))?;
     Ok(())

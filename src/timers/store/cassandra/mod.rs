@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+
 use thiserror::Error;
 use tracing::{info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -44,6 +45,8 @@ pub struct CassandraConfiguration {
 
     #[educe(Debug(ignore))]
     password: Option<String>,
+
+    base_ttl: CompactDuration,
 }
 
 #[derive(Clone, Debug)]
@@ -53,13 +56,17 @@ pub struct CassandraTriggerStore(Arc<Inner>);
 struct Inner {
     queries: Queries,
     propagator: TextMapCompositePropagator,
+    base_ttl: CompactDuration,
 }
 
 impl CassandraTriggerStore {
     pub async fn new(config: CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
+        let base_ttl = config.base_ttl;
+
         Ok(Self(Arc::new(Inner {
             queries: Box::pin(Queries::new(config)).await?,
             propagator: new_propagator(),
+            base_ttl,
         })))
     }
 
@@ -73,6 +80,20 @@ impl CassandraTriggerStore {
 
     fn propagator(&self) -> &TextMapCompositePropagator {
         &self.0.propagator
+    }
+
+    fn base_ttl(&self) -> CompactDuration {
+        self.0.base_ttl
+    }
+
+    fn calculate_ttl(&self, time: CompactDateTime) -> i32 {
+        time.compact_duration_from_now()
+            .unwrap_or(CompactDuration::MIN)
+            .checked_add(self.base_ttl())
+            .unwrap_or(CompactDuration::MAX)
+            .seconds()
+            .try_into()
+            .unwrap_or(i32::MAX)
     }
 }
 
@@ -171,15 +192,16 @@ impl TriggerStore for CassandraTriggerStore {
     }
 
     #[instrument(skip(self), err)]
-    async fn insert_slab(
-        &self,
-        segment_id: &SegmentId,
-        slab_id: SlabId,
-    ) -> Result<(), Self::Error> {
+    async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
+        let ttl_seconds = self.calculate_ttl(slab.range().end);
         self.session()
             .execute_unpaged(
                 &self.queries().insert_slab,
-                (segment_id, i32::from_le_bytes(slab_id.to_le_bytes())),
+                (
+                    segment_id,
+                    i32::from_le_bytes(slab.id().to_le_bytes()),
+                    ttl_seconds,
+                ),
             )
             .await?;
 
@@ -238,6 +260,7 @@ impl TriggerStore for CassandraTriggerStore {
         self.propagator()
             .inject_context(&trigger.span.context(), &mut span_map);
 
+        let ttl_seconds = self.calculate_ttl(slab.range().end);
         self.session()
             .execute_unpaged(
                 &self.queries().insert_slab_trigger,
@@ -247,6 +270,7 @@ impl TriggerStore for CassandraTriggerStore {
                     trigger.key.as_str(),
                     trigger.time,
                     span_map,
+                    ttl_seconds,
                 ),
             )
             .await?;
@@ -349,10 +373,17 @@ impl TriggerStore for CassandraTriggerStore {
         self.propagator()
             .inject_context(&trigger.span.context(), &mut span_map);
 
+        let ttl_seconds = self.calculate_ttl(trigger.time);
         self.session()
             .execute_unpaged(
                 &self.queries().insert_key_trigger,
-                (segment_id, trigger.key.as_str(), trigger.time, span_map),
+                (
+                    segment_id,
+                    trigger.key.as_str(),
+                    trigger.time,
+                    span_map,
+                    ttl_seconds,
+                ),
             )
             .await?;
 
@@ -482,6 +513,15 @@ pub enum InnerError {
 
     #[error("expected and integer type")]
     IntExpected,
+
+    #[error("segment not found")]
+    SegmentNotFound,
+
+    #[error("failed to calculate TTL duration")]
+    TtlCalculationFailed,
+
+    #[error("TTL calculation overflow")]
+    TtlOverflow,
 }
 
 pub struct CassandraTriggerStoreError(Box<InnerError>);
@@ -512,6 +552,7 @@ impl std::error::Error for CassandraTriggerStoreError {}
 #[cfg(test)]
 mod test {
     use super::{CassandraConfiguration, CassandraTriggerStore};
+    use crate::timers::duration::CompactDuration;
     use crate::trigger_store_tests;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
@@ -524,6 +565,7 @@ mod test {
             keyspace: "prosody".to_owned(),
             user: None,
             password: None,
+            base_ttl: CompactDuration::new(10 * 60),
         }),
         25
     );

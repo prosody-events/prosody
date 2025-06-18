@@ -1,3 +1,4 @@
+use crate::timers::slab::Slab;
 use crate::timers::store::tests::TestStoreResult;
 use crate::timers::store::tests::common::{delete_slab, get_slabs, insert_segment, insert_slab};
 use crate::timers::store::{Segment, TriggerStore};
@@ -25,7 +26,8 @@ where
 
     // Insert slabs
     for &slab_id in &slabs {
-        insert_slab(store, &segment.id, slab_id).await?;
+        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+        insert_slab(store, &segment.id, slab).await?;
         inserted_slabs.insert(slab_id);
     }
 

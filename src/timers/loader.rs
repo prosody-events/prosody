@@ -627,7 +627,8 @@ mod tests {
         store.insert_segment(segment.clone()).await?;
 
         // Insert a slab
-        store.insert_slab(&segment.id, 1).await?;
+        let slab = Slab::new(segment.id, 1, segment.slab_size);
+        store.insert_slab(&segment.id, slab).await?;
 
         let loaded = load_slabs(&slab_lock, &segment, 1..=1).await?;
         assert_eq!(loaded, vec![1]);
@@ -651,7 +652,8 @@ mod tests {
 
         // Insert multiple slabs
         for slab_id in 1..=3 {
-            store.insert_slab(&segment.id, slab_id).await?;
+            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            store.insert_slab(&segment.id, slab).await?;
         }
 
         let mut loaded = load_slabs(&slab_lock, &segment, 1..=3).await?;
@@ -710,7 +712,8 @@ mod tests {
 
         // Insert slabs in store
         for slab_id in &loaded_slab_ids {
-            store.insert_slab(&segment.id, *slab_id).await?;
+            let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
+            store.insert_slab(&segment.id, slab).await?;
         }
 
         remove_completed_slabs(&slab_lock, &segment, &mut loaded_slab_ids).await?;
@@ -836,7 +839,8 @@ mod tests {
 
         // Insert slabs and some triggers
         for slab_id in &loaded_slab_ids {
-            store.insert_slab(&segment.id, *slab_id).await?;
+            let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
+            store.insert_slab(&segment.id, slab).await?;
         }
 
         // Add an active trigger to slab 2
@@ -874,7 +878,8 @@ mod tests {
 
         // Insert slabs beyond current ownership
         for slab_id in 6..=10 {
-            store.insert_slab(&segment.id, slab_id).await?;
+            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            store.insert_slab(&segment.id, slab).await?;
         }
 
         let result = load_slabs(&slab_lock, &segment, 6..=10).await;
@@ -906,7 +911,8 @@ mod tests {
 
         // Insert and load lower range slabs
         for slab_id in 1..=5 {
-            store.insert_slab(&segment.id, slab_id).await?;
+            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            store.insert_slab(&segment.id, slab).await?;
         }
 
         let loaded = load_slabs(&slab_lock, &segment, 1..=5).await?;

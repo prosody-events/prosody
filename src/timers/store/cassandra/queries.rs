@@ -184,7 +184,11 @@ async fn prepare_get_slab_range(
 async fn prepare_insert_slab(
     session: &Session,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(session, "insert into segments (id, slab_id) values (?, ?)").await
+    prepare(
+        session,
+        "insert into segments (id, slab_id) values (?, ?) using ttl ?",
+    )
+    .await
 }
 
 async fn prepare_delete_slab(
@@ -208,7 +212,7 @@ async fn prepare_insert_slab_trigger(
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "insert into slabs (segment_id, id, key, time, span) values (?, ?, ?, ?, ?)",
+        "insert into slabs (segment_id, id, key, time, span) values (?, ?, ?, ?, ?) using ttl ?",
     )
     .await
 }
@@ -254,7 +258,7 @@ async fn prepare_insert_key_trigger(
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "insert into keys (segment_id, key, time, span) values (?, ?, ?, ?)",
+        "insert into keys (segment_id, key, time, span) values (?, ?, ?, ?) using ttl ?",
     )
     .await
 }

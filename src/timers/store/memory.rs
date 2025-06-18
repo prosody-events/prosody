@@ -211,18 +211,14 @@ impl TriggerStore for InMemoryTriggerStore {
     /// # Errors
     ///
     /// Never returns an error.
-    async fn insert_slab(
-        &self,
-        segment_id: &SegmentId,
-        slab_id: SlabId,
-    ) -> Result<(), Self::Error> {
+    async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
         self.0
             .segment_slabs
             .entry_async(*segment_id)
             .await
             .or_default()
             .get_mut()
-            .insert(slab_id);
+            .insert(slab.id());
 
         Ok(())
     }

@@ -172,6 +172,17 @@ impl CompactDateTime {
         Ok(Duration::from_secs(u64::from(seconds)))
     }
 
+    pub fn compact_duration_since(
+        self,
+        other: Self,
+    ) -> Result<CompactDuration, CompactDateTimeError> {
+        Ok(CompactDuration::new(
+            self.epoch_seconds
+                .checked_sub(other.epoch_seconds)
+                .ok_or(CompactDateTimeError::PastDateTime)?,
+        ))
+    }
+
     /// Calculates the duration from now until this datetime.
     ///
     /// # Returns
@@ -199,6 +210,10 @@ impl CompactDateTime {
     /// ```
     pub fn duration_from_now(self) -> Result<Duration, CompactDateTimeError> {
         self.duration_since(Self::now()?)
+    }
+
+    pub fn compact_duration_from_now(self) -> Result<CompactDuration, CompactDateTimeError> {
+        self.compact_duration_since(Self::now()?)
     }
 
     /// Adds a [`CompactDuration`] to this datetime.

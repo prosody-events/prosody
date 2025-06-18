@@ -47,7 +47,7 @@ where
 
     // Register the slab
     store
-        .insert_slab(&input.segment.id, slab.id())
+        .insert_slab(&input.segment.id, slab.clone())
         .await
         .map_err(|e| format!("Failed to insert slab: {e:?}"))?;
 

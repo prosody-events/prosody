@@ -169,7 +169,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `segment_id` - The segment identifier.
-    /// * `slab_id` - The slab ID to insert.
+    /// * `slab` - The slab to insert.
     ///
     /// # Errors
     ///
@@ -177,7 +177,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn insert_slab(
         &self,
         segment_id: &SegmentId,
-        slab_id: SlabId,
+        slab: Slab,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Unregisters (deletes) a slab ID from a segment.
@@ -373,11 +373,10 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let segment_id = segment.id;
-        let slab_id = slab.id();
         async move {
             try_join!(
-                self.insert_slab(&segment_id, slab_id),
-                self.insert_slab_trigger(slab.clone(), trigger.clone()),
+                self.insert_slab(&segment_id, slab.clone()),
+                self.insert_slab_trigger(slab, trigger.clone()),
                 self.insert_key_trigger(&segment_id, trigger),
             )?;
             Ok(())
