@@ -33,6 +33,7 @@
 //! use prosody::consumer::message::ConsumerMessage;
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::timers::{Trigger, store::TriggerStore};
+//! use prosody::timers::store::cassandra::CassandraConfigurationBuilder;
 //! use prosody::high_level::mode::Mode;
 //! use prosody::high_level::{HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
@@ -88,6 +89,7 @@
 //!         .subscribed_topics(["my-topic".to_owned()]);
 //!
 //!     let retry_config = RetryConfiguration::builder();
+//!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
 //!     let client = HighLevelClient::new(
 //!         Mode::Pipeline,
@@ -95,9 +97,10 @@
 //!         &consumer_config,
 //!         &retry_config,
 //!         &FailureTopicConfigurationBuilder::default(),
+//!         &cassandra_config,
 //!     )?;
 //!
-//!     client.subscribe(MyHandler)?;
+//!     client.subscribe(MyHandler).await?;
 //!
 //!     let topic = "my-topic".into();
 //!     client.send(topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;

@@ -36,6 +36,7 @@
 //! use prosody::consumer::{
 //!     ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
 //! };
+//! use prosody::high_level::config::TriggerStoreConfiguration;
 //! use prosody::timers::{UncommittedTimer, store::TriggerStore};
 //!
 //! // Implement your message handler
@@ -79,7 +80,7 @@
 //!     .subscribed_topics(vec!["my-topic".to_string()])
 //!     .build()?;
 //!
-//! let consumer = ProsodyConsumer::new(&config, MyHandler)?;
+//! let consumer = ProsodyConsumer::new(&config, &TriggerStoreConfiguration::InMemory, MyHandler).await?;
 //!
 //! // The consumer will process messages until shutdown is called
 //! # Ok(())
