@@ -22,6 +22,7 @@ use prosody::admin::ProsodyAdminClient;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::timers::UncommittedTimer;
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
@@ -221,7 +222,11 @@ pub fn spawn_consumers(
         let handler = TestHandler { messages_tx };
 
         tasks.spawn(async move {
-            let consumer = ProsodyConsumer::new::<TestHandler>(&consumer_config, handler)?;
+            let consumer = ProsodyConsumer::new::<TestHandler>(
+                &consumer_config,
+                &TriggerStoreConfiguration::InMemory,
+                handler,
+            ).await?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?; // Wait for shutdown signal
             consumer.shutdown().await; // Shut down consumer gracefully
             Ok(())

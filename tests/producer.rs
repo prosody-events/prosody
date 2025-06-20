@@ -9,6 +9,7 @@ use prosody::admin::ProsodyAdminClient;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::timers::UncommittedTimer;
 use prosody::{Payload, Topic};
@@ -288,7 +289,14 @@ async fn test_producer_deduplication() -> Result<()> {
             .build()?;
         let (tx, rx) = channel(16);
         let handler = TestHandler { tx };
-        (ProsodyConsumer::new::<TestHandler>(&cfg, handler)?, rx)
+        (
+            ProsodyConsumer::new::<TestHandler>(
+                &cfg,
+                &TriggerStoreConfiguration::InMemory,
+                handler,
+            ).await?,
+            rx,
+        )
     };
     let (consumer_client, mut rx) = consumer;
 

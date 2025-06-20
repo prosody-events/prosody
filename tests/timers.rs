@@ -13,6 +13,7 @@ use prosody::{
     admin::ProsodyAdminClient,
     consumer::message::UncommittedMessage,
     consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
+    high_level::config::TriggerStoreConfiguration,
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::UncommittedTimer,
     timers::datetime::CompactDateTime,
@@ -192,7 +193,11 @@ impl TestEnvironment {
             .probe_port(None)
             .build()?;
 
-        let consumer = ProsodyConsumer::new(&consumer_config, handler)?;
+        let consumer = ProsodyConsumer::new(
+            &consumer_config,
+            &TriggerStoreConfiguration::InMemory,
+            handler,
+        ).await?;
 
         // Create producer
         let producer_config = ProducerConfiguration::builder()

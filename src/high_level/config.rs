@@ -17,7 +17,19 @@ use crate::consumer::{
     ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerConfigurationBuilderError,
 };
 use crate::high_level::mode::Mode;
+use crate::timers::store::cassandra::{
+    CassandraConfiguration, CassandraConfigurationBuilder, CassandraConfigurationBuilderError,
+};
 use thiserror::Error;
+
+/// Configuration for timer storage backends.
+#[derive(Debug)]
+pub enum TriggerStoreConfiguration {
+    /// In-memory storage for testing and mock mode.
+    InMemory,
+    /// Cassandra-based persistent storage.
+    Cassandra(CassandraConfiguration),
+}
 
 /// Configuration for different operational modes of the Prosody client.
 #[derive(Debug)]
@@ -28,6 +40,8 @@ pub enum ModeConfiguration {
         consumer: ConsumerConfiguration,
         /// The retry configuration.
         retry: RetryConfiguration,
+        /// The trigger store configuration.
+        trigger_store: TriggerStoreConfiguration,
     },
     /// Configuration for Low-Latency mode.
     LowLatency {
@@ -37,11 +51,15 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
+        /// The trigger store configuration.
+        trigger_store: TriggerStoreConfiguration,
     },
     /// Configuration for Best-Effort mode.
     BestEffort {
         /// The consumer configuration.
         consumer: ConsumerConfiguration,
+        /// The trigger store configuration.
+        trigger_store: TriggerStoreConfiguration,
     },
 }
 
@@ -55,6 +73,7 @@ impl ModeConfiguration {
     /// * `consumer_builder` - Builder for the consumer configuration.
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
+    /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Returns
     ///
@@ -69,21 +88,38 @@ impl ModeConfiguration {
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
+        cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Result<Self, ModeConfigurationError> {
         let consumer = consumer_builder.build()?;
         let retry = retry_builder.build()?;
 
+        // Create trigger store configuration based on mock mode
+        let trigger_store = if consumer.mock {
+            TriggerStoreConfiguration::InMemory
+        } else {
+            let cassandra_config = cassandra_builder.build()?;
+            TriggerStoreConfiguration::Cassandra(cassandra_config)
+        };
+
         Ok(match mode {
-            Mode::Pipeline => Self::Pipeline { consumer, retry },
+            Mode::Pipeline => Self::Pipeline {
+                consumer,
+                retry,
+                trigger_store,
+            },
             Mode::LowLatency => {
                 let failure_topic = failure_topic_builder.build()?;
                 Self::LowLatency {
                     consumer,
                     retry,
                     failure_topic,
+                    trigger_store,
                 }
             }
-            Mode::BestEffort => Self::BestEffort { consumer },
+            Mode::BestEffort => Self::BestEffort {
+                consumer,
+                trigger_store,
+            },
         })
     }
 
@@ -95,7 +131,7 @@ impl ModeConfiguration {
     #[must_use]
     pub fn configured_topics(&self) -> Vec<Topic> {
         match self {
-            Self::Pipeline { consumer, .. } | ModeConfiguration::BestEffort { consumer } => {
+            Self::Pipeline { consumer, .. } | ModeConfiguration::BestEffort { consumer, .. } => {
                 subscription(consumer).collect()
             }
             Self::LowLatency {
@@ -135,7 +171,7 @@ impl ModeConfiguration {
         match self {
             ModeConfiguration::Pipeline { consumer, .. }
             | ModeConfiguration::LowLatency { consumer, .. }
-            | ModeConfiguration::BestEffort { consumer } => consumer,
+            | ModeConfiguration::BestEffort { consumer, .. } => consumer,
         }
     }
 }
@@ -154,6 +190,10 @@ pub enum ModeConfigurationError {
     /// Error when the failure topic configuration is invalid.
     #[error("invalid failure topic configuration: {0:#}")]
     FailureTopic(#[from] FailureTopicConfigurationBuilderError),
+
+    /// Error when the Cassandra configuration is invalid.
+    #[error("invalid cassandra configuration: {0:#}")]
+    Cassandra(#[from] CassandraConfigurationBuilderError),
 }
 
 /// Creates an iterator over the subscribed topics in a consumer configuration.

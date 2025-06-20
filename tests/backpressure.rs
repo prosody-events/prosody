@@ -10,6 +10,7 @@ use prosody::{
     Topic,
     admin::ProsodyAdminClient,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
+    high_level::config::TriggerStoreConfiguration,
     producer::{ProducerConfiguration, ProsodyProducer},
 };
 use serde_json::json;
@@ -55,7 +56,11 @@ async fn test_backpressure() -> Result<()> {
         .build()?;
 
     let slow_handler = SlowTestHandler { messages_tx };
-    let consumer = ProsodyConsumer::new::<SlowTestHandler>(&consumer_config, slow_handler)?;
+    let consumer = ProsodyConsumer::new::<SlowTestHandler>(
+        &consumer_config,
+        &TriggerStoreConfiguration::InMemory,
+        slow_handler,
+    ).await?;
 
     // Set up the producer configuration
     let producer_config = ProducerConfiguration::builder()

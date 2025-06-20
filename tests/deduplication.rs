@@ -8,6 +8,7 @@ use prosody::{
     Topic,
     admin::ProsodyAdminClient,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
+    high_level::config::TriggerStoreConfiguration,
     producer::{ProducerConfiguration, ProsodyProducer},
 };
 use serde_json::json;
@@ -66,7 +67,11 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
 
     // Initialize the producer and consumer
     let producer = ProsodyProducer::new(&producer_config)?;
-    let consumer = ProsodyConsumer::new::<TestHandler>(&consumer_config, handler.clone())?;
+    let consumer = ProsodyConsumer::new::<TestHandler>(
+        &consumer_config,
+        &TriggerStoreConfiguration::InMemory,
+        handler.clone(),
+    ).await?;
 
     // Define two messages with identical event IDs for the deduplication test
     let key = "test-key";

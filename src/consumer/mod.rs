@@ -108,6 +108,7 @@
 
 use crate::consumer::poll::PollConfig;
 use crate::consumer::probes::ProbeServer;
+use crate::high_level::config::TriggerStoreConfiguration;
 use std::env::var;
 use std::fmt::Debug;
 use std::future::Future;
@@ -146,6 +147,8 @@ use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::producer::ProsodyProducer;
 use crate::timers::UncommittedTimer;
+use crate::timers::store::TriggerStore;
+use crate::timers::store::cassandra::{CassandraTriggerStore, CassandraTriggerStoreError};
 use crate::timers::store::memory::InMemoryTriggerStore;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
@@ -175,6 +178,13 @@ type WatermarkVersion = CachePadded<AtomicUsize>;
 /// instances. Protected by a `RwLock` to allow concurrent reads with exclusive
 /// writes.
 type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
+
+/// Consumer runtime components returned by consumer initialization.
+///
+/// Contains the partition managers and runtime state necessary for operating
+/// a consumer instance. This type alias eliminates clippy warnings about
+/// complex return types.
+type ConsumerComponents = (Arc<Managers>, Arc<Mutex<Option<RuntimeState>>>);
 
 /// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
@@ -628,7 +638,8 @@ impl ProsodyConsumer {
     ///
     /// # Arguments
     ///
-    /// * `config` - The consumer configuration.
+    /// * `consumer_config` - The consumer configuration.
+    /// * `trigger_store_config` - The trigger store configuration.
     /// * `handler_provider` - The message handler provider.
     ///
     /// # Returns
@@ -643,15 +654,16 @@ impl ProsodyConsumer {
     /// - The hostname cannot be retrieved
     /// - The Kafka consumer cannot be created
     /// - The consumer fails to subscribe to the specified topics
-    pub fn new<T>(
-        config: &ConsumerConfiguration,
+    pub async fn new<T>(
+        consumer_config: &ConsumerConfiguration,
+        trigger_store_config: &TriggerStoreConfiguration,
         handler_provider: T,
     ) -> Result<Self, ConsumerError>
     where
         T: HandlerProvider,
     {
         // Validate the configuration
-        config.validate()?;
+        consumer_config.validate()?;
 
         // Initialize shared state
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
@@ -659,7 +671,7 @@ impl ProsodyConsumer {
         let shutdown: Arc<AtomicBool> = Arc::default();
 
         // Build event type search automaton for filtering messages
-        let allowed_events = config
+        let allowed_events = consumer_config
             .allowed_events
             .as_ref()
             .map(|prefixes| {
@@ -669,78 +681,26 @@ impl ProsodyConsumer {
             })
             .transpose()?;
 
-        // Create the consumer context with the message handler and shared state
-        let context = Context::new(
-            config,
-            handler_provider,
-            InMemoryTriggerStore::new(), // todo: parameterize
-            watermark_version.clone(),
-            managers.clone(),
-            allowed_events,
-        );
-
-        // Use mock cluster for testing or real bootstrap servers
-        let bootstrap = if config.mock {
-            MOCK_CLUSTER_BOOTSTRAP.clone()
-        } else {
-            config.bootstrap_servers.join(",")
+        let (managers, runtime_state) = match trigger_store_config {
+            TriggerStoreConfiguration::InMemory => initialize_consumer(
+                consumer_config,
+                handler_provider,
+                InMemoryTriggerStore::new(),
+                watermark_version.clone(),
+                managers.clone(),
+                allowed_events,
+                shutdown.clone(),
+            )?,
+            TriggerStoreConfiguration::Cassandra(cassandra_config) => initialize_consumer(
+                consumer_config,
+                handler_provider,
+                CassandraTriggerStore::new(cassandra_config).await?,
+                watermark_version.clone(),
+                managers.clone(),
+                allowed_events,
+                shutdown.clone(),
+            )?,
         };
-
-        // Configure and create the Kafka consumer with optimal settings
-        let mut client_config = ClientConfig::new();
-        client_config
-            .set("bootstrap.servers", bootstrap)
-            .set("client.id", hostname()?)
-            .set("group.id", &config.group_id)
-            .set("enable.auto.commit", "true")
-            .set(
-                "auto.commit.interval.ms",
-                config.commit_interval.as_millis().to_string(),
-            )
-            .set("enable.auto.offset.store", "false")
-            .set("auto.offset.reset", "earliest")
-            .set("partition.assignment.strategy", "cooperative-sticky")
-            .set_log_level(RDKafkaLogLevel::Error);
-
-        let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
-
-        // Subscribe to the specified topics
-        let topics: Vec<&str> = config
-            .subscribed_topics
-            .iter()
-            .map(String::as_str)
-            .collect();
-
-        consumer.subscribe(&topics)?;
-
-        // Spawn the background polling task with monitoring
-        let poll_interval = config.poll_interval;
-        let heartbeat = Heartbeat::new("Kafka poll loop", config.stall_threshold);
-        let cloned_managers = managers.clone();
-        let cloned_heartbeat = heartbeat.clone();
-        let cloned_shutdown = shutdown.clone();
-        let poll_handle = spawn_blocking(move || {
-            poll(PollConfig {
-                poll_interval,
-                consumer,
-                watermark_version: &watermark_version,
-                managers: &cloned_managers,
-                heartbeat: &cloned_heartbeat,
-                shutdown: &cloned_shutdown,
-            });
-        });
-
-        // Start optional probe server for health monitoring
-        let probe_server = config
-            .probe_port
-            .filter(|_| !config.mock)
-            .map(|port| ProbeServer::new(port, managers.clone(), heartbeat))
-            .transpose()?;
-
-        let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
-            poll_handle,
-            probe_server,
-        })));
 
         Ok(Self {
             shutdown,
@@ -770,8 +730,9 @@ impl ProsodyConsumer {
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub fn pipeline_consumer<T>(
+    pub async fn pipeline_consumer<T>(
         consumer_config: &ConsumerConfiguration,
+        trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
@@ -781,7 +742,7 @@ impl ProsodyConsumer {
         let retry_strategy = RetryStrategy::new(retry_config)?;
         let strategy = ShutdownStrategy.and_then(retry_strategy);
         let handler = strategy.with_handler(handler);
-        Self::new(consumer_config, handler)
+        Self::new(consumer_config, trigger_store_config, handler).await
     }
 
     /// Creates a new `ProsodyConsumer` with a low-latency strategy.
@@ -811,8 +772,9 @@ impl ProsodyConsumer {
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub fn low_latency_consumer<T>(
+    pub async fn low_latency_consumer<T>(
         consumer_config: &ConsumerConfiguration,
+        trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
         topic_config: FailureTopicConfiguration,
         producer: ProsodyProducer,
@@ -832,7 +794,7 @@ impl ProsodyConsumer {
             .and_then(retry_strategy); // retry writing to failure topic
 
         let handler = strategy.with_handler(handler);
-        Self::new(consumer_config, handler)
+        Self::new(consumer_config, trigger_store_config, handler).await
     }
 
     /// Creates a new `ProsodyConsumer` with a logging strategy for failure
@@ -856,15 +818,21 @@ impl ProsodyConsumer {
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub fn best_effort_consumer<T>(
+    pub async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
+        trigger_store_config: &TriggerStoreConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         let strategy = ShutdownStrategy.and_then(LogStrategy);
-        Self::new(consumer_config, strategy.with_handler(handler))
+        Self::new(
+            consumer_config,
+            trigger_store_config,
+            strategy.with_handler(handler),
+        )
+        .await
     }
 
     /// Returns the number of currently assigned partitions.
@@ -954,6 +922,123 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
     managers.read().len() as u32
 }
 
+/// Initializes and starts consumer components for Kafka message processing.
+///
+/// This function creates and configures the core consumer infrastructure including
+/// the Kafka consumer, polling task, and optional probe server. It sets up the
+/// consumer with proper configuration, subscribes to topics, and returns the
+/// initialized components ready for message processing.
+///
+/// # Arguments
+///
+/// * `config` - The consumer configuration containing Kafka settings and processing options
+/// * `handler_provider` - Factory for creating message handlers per partition
+/// * `trigger_store` - Storage backend for timer triggers
+/// * `watermark_version` - Atomic counter for tracking offset changes
+/// * `managers` - Thread-safe storage for partition managers
+/// * `allowed_events` - Optional event type filter for message processing
+/// * `shutdown` - Atomic flag for coordinating consumer shutdown
+///
+/// # Returns
+///
+/// A Result containing the initialized consumer components (managers and runtime state)
+/// or a `ConsumerError` if initialization fails.
+///
+/// # Errors
+///
+/// This function returns an error if:
+/// - The hostname cannot be retrieved for the client ID
+/// - The Kafka consumer cannot be created with the provided configuration
+/// - Topic subscription fails
+/// - The probe server cannot be started (if enabled)
+fn initialize_consumer<T, S>(
+    config: &ConsumerConfiguration,
+    handler_provider: T,
+    trigger_store: S,
+    watermark_version: Arc<WatermarkVersion>,
+    managers: Arc<Managers>,
+    allowed_events: Option<AhoCorasick>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<ConsumerComponents, ConsumerError>
+where
+    T: HandlerProvider,
+    S: TriggerStore,
+{
+    // Create the consumer context with the message handler and shared state
+    let context = Context::new(
+        config,
+        handler_provider,
+        trigger_store,
+        watermark_version.clone(),
+        managers.clone(),
+        allowed_events,
+    );
+
+    // Use mock cluster for testing or real bootstrap servers
+    let bootstrap = if config.mock {
+        MOCK_CLUSTER_BOOTSTRAP.clone()
+    } else {
+        config.bootstrap_servers.join(",")
+    };
+
+    // Configure and create the Kafka consumer with optimal settings
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", bootstrap)
+        .set("client.id", hostname()?)
+        .set("group.id", &config.group_id)
+        .set("enable.auto.commit", "true")
+        .set(
+            "auto.commit.interval.ms",
+            config.commit_interval.as_millis().to_string(),
+        )
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("partition.assignment.strategy", "cooperative-sticky")
+        .set_log_level(RDKafkaLogLevel::Error);
+
+    let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
+
+    // Subscribe to the specified topics
+    let topics: Vec<&str> = config
+        .subscribed_topics
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    consumer.subscribe(&topics)?;
+
+    // Spawn the background polling task with monitoring
+    let poll_interval = config.poll_interval;
+    let heartbeat = Heartbeat::new("Kafka poll loop", config.stall_threshold);
+    let cloned_managers = managers.clone();
+    let cloned_heartbeat = heartbeat.clone();
+    let poll_handle = spawn_blocking(move || {
+        poll(PollConfig {
+            poll_interval,
+            consumer,
+            watermark_version: &watermark_version,
+            managers: &cloned_managers,
+            heartbeat: &cloned_heartbeat,
+            shutdown: &shutdown,
+        });
+    });
+
+    // Start optional probe server for health monitoring
+    let probe_server = config
+        .probe_port
+        .filter(|_| !config.mock)
+        .map(|port| ProbeServer::new(port, managers.clone(), heartbeat))
+        .transpose()?;
+
+    let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
+        poll_handle,
+        probe_server,
+    })));
+
+    Ok((managers, runtime_state))
+}
+
 /// Checks if any partition is stalled.
 ///
 /// A partition is considered stalled if it hasn't processed messages within
@@ -993,4 +1078,8 @@ pub enum ConsumerError {
     /// Indicates a Kafka operation failure.
     #[error("Kafka operation failed: {0:#}")]
     Kafka(#[from] KafkaError),
+
+    /// Indicates a Cassandra trigger store operation failure.
+    #[error("Cassandra operation failed: {0:#}")]
+    Cassandra(#[from] CassandraTriggerStoreError),
 }

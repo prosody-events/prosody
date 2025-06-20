@@ -8,6 +8,7 @@ use prosody::{
     Topic,
     admin::ProsodyAdminClient,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
+    high_level::config::TriggerStoreConfiguration,
     producer::{ProducerConfiguration, ProsodyProducer},
 };
 use serde_json::json;
@@ -60,8 +61,11 @@ async fn test_allowed_events_filtering() -> Result<()> {
     let (messages_tx, mut messages_rx) = channel(10);
 
     // Initialize consumer and producer
-    let consumer =
-        ProsodyConsumer::new::<TestHandler>(&consumer_config, TestHandler { messages_tx })?;
+    let consumer = ProsodyConsumer::new::<TestHandler>(
+        &consumer_config,
+        &TriggerStoreConfiguration::InMemory,
+        TestHandler { messages_tx },
+    ).await?;
     let producer = ProsodyProducer::new(&producer_config)?;
 
     let key = "test-key";

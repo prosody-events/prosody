@@ -149,12 +149,12 @@ impl CassandraTriggerStore {
     /// - Connection to Cassandra fails
     /// - Schema migration fails
     /// - Query preparation fails
-    pub async fn new(config: CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
+    pub async fn new(config: &CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
         let base_ttl: std::time::Duration = config.retention.into();
         let base_ttl = base_ttl.try_into()?;
 
         Ok(Self(Arc::new(Inner {
-            queries: Box::pin(Queries::new(config)).await?,
+            queries: Box::pin(Queries::new(config.clone())).await?,
             propagator: new_propagator(),
             base_ttl,
         })))
@@ -781,7 +781,7 @@ mod test {
     // Run the full suite of TriggerStore compliance tests on this implementation.
     trigger_store_tests!(
         CassandraTriggerStore,
-        CassandraTriggerStore::new(CassandraConfiguration {
+        CassandraTriggerStore::new(&CassandraConfiguration {
             datacenter: None,
             rack: None,
             nodes: vec!["localhost:9042".to_owned()],
@@ -795,7 +795,7 @@ mod test {
 
     #[tokio::test]
     async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
-        let store = CassandraTriggerStore::new(CassandraConfiguration {
+        let store = CassandraTriggerStore::new(&CassandraConfiguration {
             datacenter: None,
             rack: None,
             nodes: vec!["localhost:9042".to_owned()],
@@ -904,7 +904,7 @@ mod test {
 
     #[tokio::test]
     async fn test_simple_wrap_around() -> Result<()> {
-        let store = CassandraTriggerStore::new(CassandraConfiguration {
+        let store = CassandraTriggerStore::new(&CassandraConfiguration {
             datacenter: None,
             rack: None,
             nodes: vec!["localhost:9042".to_owned()],
