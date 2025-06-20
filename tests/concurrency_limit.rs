@@ -197,7 +197,8 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
         &consumer_config,
         &TriggerStoreConfiguration::InMemory,
         handler.clone(),
-    ).await?;
+    )
+    .await?;
 
     // Configure and create the producer
     let producer_config = ProducerConfiguration::builder()

@@ -65,7 +65,8 @@ async fn test_allowed_events_filtering() -> Result<()> {
         &consumer_config,
         &TriggerStoreConfiguration::InMemory,
         TestHandler { messages_tx },
-    ).await?;
+    )
+    .await?;
     let producer = ProsodyProducer::new(&producer_config)?;
 
     let key = "test-key";

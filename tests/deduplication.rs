@@ -71,7 +71,8 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
         &consumer_config,
         &TriggerStoreConfiguration::InMemory,
         handler.clone(),
-    ).await?;
+    )
+    .await?;
 
     // Define two messages with identical event IDs for the deduplication test
     let key = "test-key";

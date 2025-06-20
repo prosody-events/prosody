@@ -96,7 +96,8 @@ async fn run_scenario(
         &consumer_config,
         &TriggerStoreConfiguration::InMemory,
         TestHandler { messages_tx: tx },
-    ).await?;
+    )
+    .await?;
     let producer = ProsodyProducer::new(&producer_config)?;
 
     // Send a test message and an end-of-stream marker.

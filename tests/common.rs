@@ -226,7 +226,8 @@ pub fn spawn_consumers(
                 &consumer_config,
                 &TriggerStoreConfiguration::InMemory,
                 handler,
-            ).await?;
+            )
+            .await?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?; // Wait for shutdown signal
             consumer.shutdown().await; // Shut down consumer gracefully
             Ok(())

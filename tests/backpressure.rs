@@ -60,7 +60,8 @@ async fn test_backpressure() -> Result<()> {
         &consumer_config,
         &TriggerStoreConfiguration::InMemory,
         slow_handler,
-    ).await?;
+    )
+    .await?;
 
     // Set up the producer configuration
     let producer_config = ProducerConfiguration::builder()

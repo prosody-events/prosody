@@ -80,7 +80,8 @@
 //!     .subscribed_topics(vec!["my-topic".to_string()])
 //!     .build()?;
 //!
-//! let consumer = ProsodyConsumer::new(&config, &TriggerStoreConfiguration::InMemory, MyHandler).await?;
+//! let consumer =
+//!     ProsodyConsumer::new(&config, &TriggerStoreConfiguration::InMemory, MyHandler).await?;
 //!
 //! // The consumer will process messages until shutdown is called
 //! # Ok(())
@@ -928,14 +929,15 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
 
 /// Initializes and starts consumer components for Kafka message processing.
 ///
-/// This function creates and configures the core consumer infrastructure including
-/// the Kafka consumer, polling task, and optional probe server. It sets up the
-/// consumer with proper configuration, subscribes to topics, and returns the
-/// initialized components ready for message processing.
+/// This function creates and configures the core consumer infrastructure
+/// including the Kafka consumer, polling task, and optional probe server. It
+/// sets up the consumer with proper configuration, subscribes to topics, and
+/// returns the initialized components ready for message processing.
 ///
 /// # Arguments
 ///
-/// * `config` - The consumer configuration containing Kafka settings and processing options
+/// * `config` - The consumer configuration containing Kafka settings and
+///   processing options
 /// * `handler_provider` - Factory for creating message handlers per partition
 /// * `trigger_store` - Storage backend for timer triggers
 /// * `watermark_version` - Atomic counter for tracking offset changes
@@ -945,8 +947,8 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
 ///
 /// # Returns
 ///
-/// A Result containing the initialized consumer components (managers and runtime state)
-/// or a `ConsumerError` if initialization fails.
+/// A Result containing the initialized consumer components (managers and
+/// runtime state) or a `ConsumerError` if initialization fails.
 ///
 /// # Errors
 ///

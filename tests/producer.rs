@@ -294,7 +294,8 @@ async fn test_producer_deduplication() -> Result<()> {
                 &cfg,
                 &TriggerStoreConfiguration::InMemory,
                 handler,
-            ).await?,
+            )
+            .await?,
             rx,
         )
     };

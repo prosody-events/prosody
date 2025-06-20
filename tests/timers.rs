@@ -197,7 +197,8 @@ impl TestEnvironment {
             &consumer_config,
             &TriggerStoreConfiguration::InMemory,
             handler,
-        ).await?;
+        )
+        .await?;
 
         // Create producer
         let producer_config = ProducerConfiguration::builder()
