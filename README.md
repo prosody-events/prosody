@@ -14,6 +14,7 @@ integrated OpenTelemetry support for distributed tracing.
 
 - **Kafka Consumer**: Efficiently consume messages with support for offset management and consumer groups.
 - **Kafka Producer**: Reliably produce messages with idempotent delivery.
+- **Timer System**: Distributed scheduling with persistent storage backends (Cassandra, memory).
 - **Distributed Tracing**: Seamless integration with OpenTelemetry for enhanced observability in microservice
   architectures.
 - **Configurable**: Flexible configuration through environment variables.
@@ -39,8 +40,10 @@ use prosody::consumer::ConsumerConfiguration;
 use prosody::consumer::failure::retry::RetryConfiguration;
 use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use prosody::consumer::failure::{FallibleHandler, ClassifyError};
-use prosody::consumer::message::{ConsumerMessage, EventContext};
+use prosody::consumer::message::ConsumerMessage;
+use prosody::consumer::event_context::EventContext;
 use prosody::timers::{Trigger, store::TriggerStore};
+use prosody::timers::store::cassandra::CassandraConfigurationBuilder;
 use prosody::high_level::mode::Mode;
 use prosody::high_level::{HighLevelClient};
 use prosody::producer::ProducerConfiguration;
@@ -54,25 +57,25 @@ struct MyHandler;
 impl FallibleHandler for MyHandler {
     type Error = Infallible;
 
-    async fn on_message<T>(
+    async fn on_message<C>(
         &self,
-        context: EventContext<T>,
+        context: C,
         message: ConsumerMessage
     ) -> Result<(), Self::Error>
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         println!("Received: {message:?}");
         Ok(())
     }
 
-    async fn on_timer<T>(
+    async fn on_timer<C>(
         &self,
-        context: EventContext<T>,
+        context: C,
         trigger: Trigger,
     ) -> Result<(), Self::Error>
     where
-        T: TriggerStore,
+        C: EventContext,
     {
         println!("Timer triggered: {trigger:?}");
         Ok(())
@@ -99,16 +102,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .source_system("my-source");
 
     let retry_config = RetryConfiguration::builder();
+    let cassandra_config = CassandraConfigurationBuilder::default();
 
     let client = HighLevelClient::new(
         Mode::Pipeline,
-        &producer_config,
+        &mut producer_config,
         &consumer_config,
         &retry_config,
         &FailureTopicConfigurationBuilder::default(),
+        &cassandra_config,
     )?;
 
-    client.subscribe(MyHandler)?;
+    client.subscribe(MyHandler).await?;
 
     let topic = "my-topic".into();
     client.send(topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
@@ -169,13 +174,15 @@ The following table lists the available configuration options and their associat
 |----------------------------------|--------------------------------------------------------------------------------|--------------|----------|----------|
 | `PROSODY_ALLOWED_EVENTS`         | Allowed event type prefixes (comma-separated). All allowed if unset.           | -            | ✓        |          |
 | `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                | -            | ✓        | ✓        |
+| `PROSODY_CASSANDRA_KEYSPACE`     | Cassandra keyspace for timer storage                                           | prosody      | ✓        |          |
+| `PROSODY_CASSANDRA_RETENTION`    | How long to keep failed/unprocessed timer data                                | 30d          | ✓        |          |
 | `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                             | 1s           | ✓        |          |
 | `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                  | -            | ✓        |          |
 | `PROSODY_GROUP_ID`               | Consumer group identifier                                                      | -            | ✓        |          |
 | `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.            | 4096         | ✓        |          |
+| `PROSODY_MAX_CONCURRENCY`        | Maximum global concurrency limit                                               | 32           | ✓        |          |
 | `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure) | 8            | ✓        |          |
 | `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                  | 3            | ✓        |          |
-| `PROSODY_MAX_CONCURRENCY`        | Maximum global concurrency limit                                               | 32           | ✓        |          |
 | `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition                           | 16           | ✓        |          |
 | `PROSODY_MOCK`                   | Use mock Kafka brokers for testing                                             | false        | ✓        | ✓        |
 | `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                       | 100ms        | ✓        |          |
@@ -184,6 +191,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                            | 5m           | ✓        |          |
 | `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                   | 1s           |          | ✓        |
 | `PROSODY_SHUTDOWN_TIMEOUT`       | Timeout to wait for in-flight tasks to complete during partition shutdown      | 30s          | ✓        |          |
+| `PROSODY_SLAB_SIZE`              | Duration for timer slab partitioning                                           | 10m          | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                           | `<group id>` |          | ✓        |
 | `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m           | ✓        |          |
 | `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -            | ✓        |          |
@@ -291,6 +299,28 @@ too high could delay the detection of actual issues.
 These endpoints can be integrated with container orchestration systems like Kubernetes to manage the lifecycle of your
 application based on its health and readiness status. They provide valuable information about the consumer's state,
 helping to ensure robust and responsive Kafka-based applications.
+
+## Timer System
+
+Prosody includes a distributed timer system that allows you to schedule events for future execution. The timer system supports:
+
+- **Persistent Storage**: Timers are stored in persistent backends (Cassandra or in-memory for testing)
+- **Distributed Processing**: Multiple consumer instances can process timers from the same storage
+- **Slab-Based Partitioning**: Timers are organized into time-based slabs for efficient retrieval
+- **Automatic Cleanup**: Successfully processed timers are immediately deleted; failed timers expire after configurable period
+
+### Timer Configuration
+
+The timer system is automatically configured based on the consumer configuration:
+
+- **Mock Mode**: Uses in-memory storage for testing (`PROSODY_MOCK=true`)
+- **Production Mode**: Uses Cassandra for persistent storage
+- **Slab Size**: Configure time-based partitioning with `PROSODY_SLAB_SIZE` (default: 10 minutes)
+- **Retention**: How long to keep failed/unprocessed timer data with `PROSODY_CASSANDRA_RETENTION` (default: 30 days)
+
+### Usage in Handlers
+
+Your event handlers can receive timer events through the `on_timer` method of the `FallibleHandler` trait, as shown in the example above.
 
 ## Common Project Tasks
 

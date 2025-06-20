@@ -99,21 +99,24 @@ pub struct CassandraConfiguration {
     #[educe(Debug(ignore))]
     pub password: Option<String>,
 
-    /// Retention period for timer-related data in Cassandra.
+    /// Retention period for failed/unprocessed timer data in Cassandra.
     ///
-    /// This defines how long data remain available **after** a timer has
-    /// fired. It effectively sets the window in which consumers can read
-    /// and process the timer output before the data is automatically
-    /// purged.
+    /// This defines how long timer data remains available for timers that are
+    /// not successfully processed (aborted or failed). Successfully committed
+    /// timers are immediately deleted from storage and do not rely on this
+    /// retention period.
+    ///
+    /// The retention period is added to the timer's execution time to calculate
+    /// the Cassandra TTL, ensuring failed timers don't accumulate indefinitely.
     ///
     /// Structural metadata (e.g., segment definitions) may persist beyond this
     /// period and is not subject to TTL-based eviction.
     ///
     /// Environment variable: `PROSODY_CASSANDRA_RETENTION`
-    /// Default: 1 year
+    /// Default: 30 days
     #[builder(
         default = "Duration::from(from_duration_env_with_fallback(\"PROSODY_CASSANDRA_RETENTION\", \
-        std::time::Duration::from_secs(365 * 24 * 60 * 60))?)",
+        std::time::Duration::from_secs(30 * 24 * 60 * 60))?)",
         setter(into)
     )]
     pub retention: Duration,
