@@ -284,16 +284,17 @@ impl TriggerStore for CassandraTriggerStore {
         segment_id: &SegmentId,
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
-        let start = i32::from_le_bytes(range.start().to_le_bytes());
-        let end = i32::from_le_bytes(range.end().to_le_bytes());
-
         try_stream! {
             // First, validate that this is a proper range in u32 space
-            // If start > end in u32 terms, this is an invalid range and we should return nothing
+            // If start > end in u32 terms, this is an invalid range and we should return
+            // nothing
             if range.start() > range.end() {
                 // Invalid range - return empty stream
                 return;
             }
+
+            let start = i32::from_le_bytes(range.start().to_le_bytes());
+            let end = i32::from_le_bytes(range.end().to_le_bytes());
 
             // Detect wrap-around: start > end in signed representation means the range
             // crosses the u32/i32 boundary (around 2^31), not that it's an invalid range
@@ -304,7 +305,10 @@ impl TriggerStore for CassandraTriggerStore {
                 // This covers slab_id >= start up to the maximum i32 value
                 let stream1 = self
                     .session()
-                    .execute_iter(self.queries().get_slab_range.clone(), (segment_id, start, i32::MAX))
+                    .execute_iter(
+                        self.queries().get_slab_range.clone(),
+                        (segment_id, start, i32::MAX),
+                    )
                     .await?
                     .rows_stream::<(Option<i32>,)>()?;
 
@@ -321,7 +325,10 @@ impl TriggerStore for CassandraTriggerStore {
                 // This covers from minimum i32 value up to slab_id <= end
                 let stream2 = self
                     .session()
-                    .execute_iter(self.queries().get_slab_range.clone(), (segment_id, i32::MIN, end))
+                    .execute_iter(
+                        self.queries().get_slab_range.clone(),
+                        (segment_id, i32::MIN, end),
+                    )
                     .await?
                     .rows_stream::<(Option<i32>,)>()?;
 
@@ -338,7 +345,10 @@ impl TriggerStore for CassandraTriggerStore {
                 // Both start and end have the same sign in i32 representation
                 let stream = self
                     .session()
-                    .execute_iter(self.queries().get_slab_range.clone(), (segment_id, start, end))
+                    .execute_iter(
+                        self.queries().get_slab_range.clone(),
+                        (segment_id, start, end),
+                    )
                     .await?
                     .rows_stream::<(Option<i32>,)>()?;
 
