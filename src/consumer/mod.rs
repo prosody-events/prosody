@@ -720,6 +720,7 @@ impl ProsodyConsumer {
     /// # Arguments
     ///
     /// * `consumer_config` - The consumer configuration.
+    /// * `trigger_store_config` - The trigger store configuration.
     /// * `retry_config` - The retry configuration.
     /// * `handler` - The fallible message handler.
     ///
@@ -759,6 +760,7 @@ impl ProsodyConsumer {
     /// # Arguments
     ///
     /// * `consumer_config` - The consumer configuration.
+    /// * `trigger_store_config` - The trigger store configuration.
     /// * `retry_config` - The retry configuration.
     /// * `topic_config` - The failure topic configuration.
     /// * `producer` - The Prosody producer for sending messages to the failure
@@ -809,6 +811,7 @@ impl ProsodyConsumer {
     /// # Arguments
     ///
     /// * `consumer_config` - The consumer configuration.
+    /// * `trigger_store_config` - The trigger store configuration.
     /// * `handler` - The fallible message handler.
     ///
     /// # Returns
