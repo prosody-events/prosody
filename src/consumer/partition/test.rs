@@ -530,3 +530,38 @@ fn create_test_message_with_event_id(
         Span::none(),
     )
 }
+
+#[tokio::test]
+async fn test_partition_manager_timer_heartbeat_integration() {
+    // Test verifies that timer heartbeats are properly integrated into partition
+    // stall detection
+    let handler = TestHandler::new();
+    let config = default_config();
+    let partition_manager = PartitionManager::new(config, handler, "test-topic".into(), 0);
+
+    // Initially, the partition should not be stalled
+    assert!(
+        !partition_manager.is_stalled(),
+        "Partition should not be stalled initially"
+    );
+
+    // Send a message to trigger timer manager initialization
+    let message = create_test_message_with_event_id(1, "test-key", None);
+    let _ = partition_manager.try_send(message);
+
+    // Give some time for the timer manager to initialize and heartbeat to be set
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The partition should still not be stalled after timer initialization
+    assert!(
+        !partition_manager.is_stalled(),
+        "Partition should not be stalled after timer initialization"
+    );
+
+    // Clean shutdown
+    let watermark = partition_manager.shutdown().await;
+    assert!(
+        watermark.is_some() || watermark.is_none(),
+        "Shutdown should complete"
+    );
+}

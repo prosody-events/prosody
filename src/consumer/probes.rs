@@ -12,8 +12,8 @@
 //! routing traffic, restarting containers, or scaling deployments based on the
 //! current operational state of the service.
 
-use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::{Managers, get_assigned_partition_count, get_is_stalled};
+use crate::heartbeat::Heartbeat;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;

@@ -15,11 +15,11 @@
 //! of partition-level message processing.
 
 use crate::consumer::event_context::TimerContext;
-use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Keyed, Uncommitted};
+use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
@@ -128,8 +128,9 @@ pub struct PartitionManager {
     #[educe(Debug(ignore))]
     message_tx: Sender<ConsumerMessage>,
 
-    /// Heartbeat used to detect stalled processing loop
-    heartbeat: Heartbeat,
+    /// Heartbeat registry
+    #[educe(Debug(ignore))]
+    heartbeats: HeartbeatRegistry,
 
     /// Signals shutdown to message handlers
     #[educe(Debug(ignore))]
@@ -172,11 +173,9 @@ impl PartitionManager {
             config.watermark_version.clone(),
         );
 
-        // Create descriptive name for the heartbeat monitor
-        let name = format!("{topic}/{partition} event loop");
-
-        // Initialize heartbeat, channels, and shutdown signals
-        let heartbeat = Heartbeat::new(name, config.stall_threshold);
+        // Initialize heartbeats, channels, and shutdown signals
+        let heartbeats =
+            HeartbeatRegistry::new(format!("{topic}:{partition}"), config.stall_threshold);
         let (message_tx, message_rx) = channel(config.buffer_size);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -188,7 +187,7 @@ impl PartitionManager {
             handler,
             offsets.clone(),
             message_rx,
-            heartbeat.clone(),
+            heartbeats.clone(),
             shutdown_rx,
         ));
 
@@ -196,7 +195,7 @@ impl PartitionManager {
             partition,
             offsets,
             message_tx,
-            heartbeat,
+            heartbeats,
             shutdown_tx,
             handle,
         }
@@ -253,11 +252,13 @@ impl PartitionManager {
 
     /// Checks if message processing has stalled.
     ///
-    /// A partition is considered stalled if either:
+    /// A partition is considered stalled if any of:
     /// - The offset tracker detects uncommitted offsets beyond the stall
     ///   threshold
     /// - The message processing heartbeat hasn't been updated within the stall
     ///   threshold
+    /// - The timer system heartbeat (if present) hasn't been updated within the
+    ///   stall threshold
     ///
     /// This method is used by health monitoring systems to detect processing
     /// issues.
@@ -267,7 +268,7 @@ impl PartitionManager {
     /// `true` if messages are not being processed within the configured stall
     /// threshold, `false` otherwise
     pub fn is_stalled(&self) -> bool {
-        self.offsets.is_stalled() || self.heartbeat.is_stalled()
+        self.offsets.is_stalled() || self.heartbeats.any_stalled()
     }
 
     /// Initiates an orderly partition shutdown.
@@ -324,18 +325,20 @@ impl PartitionManager {
 /// # Arguments
 ///
 /// * `config` - The partition configuration
+/// * `partition_info` - Information about the partition being processed
 /// * `handler` - Handler that processes messages
 /// * `offsets` - Tracks offset commits and processing progress
 /// * `message_rx` - Channel receiving messages to process
-/// * `heartbeat` - Heartbeat used to detect stalled processing loop
+/// * `heartbeats` - Registry for monitoring processing and timer heartbeats
 /// * `shutdown_rx` - Channel receiving shutdown signal
+#[allow(clippy::too_many_arguments)]
 async fn handle_messages<T, S>(
     config: PartitionConfiguration<S>,
     partition_info: PartitionInfo,
     handler: T,
     offsets: OffsetTracker,
     message_rx: Receiver<ConsumerMessage>,
-    heartbeat: Heartbeat,
+    heartbeats: HeartbeatRegistry,
     shutdown_rx: watch::Receiver<bool>,
 ) where
     T: EventHandler,
@@ -373,6 +376,7 @@ async fn handle_messages<T, S>(
             config.timer_slab_size,
             &name,
             config.trigger_store.clone(),
+            heartbeats.clone(),
         )
         .await
         {
@@ -426,7 +430,7 @@ async fn handle_messages<T, S>(
     KeyManager::<UncommittedEvent<S>, _, _>::new(process, config.max_enqueued_per_key)
         .process_messages(
             combined_stream,
-            heartbeat,
+            heartbeats.register("event processor"),
             shutdown_rx.clone(),
             config.max_uncommitted,
             config.shutdown_timeout,

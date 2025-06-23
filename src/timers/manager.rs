@@ -13,6 +13,7 @@
 //! and provides at-least-once delivery semantics for timer events.
 
 use crate::Key;
+use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 
@@ -88,18 +89,23 @@ where
         slab_size: CompactDuration,
         name: &str,
         store: T,
+        heartbeats: HeartbeatRegistry,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
 
         // Initialize the in-memory scheduler.
-        let (trigger_rx, scheduler) = TriggerScheduler::new();
+        let (trigger_rx, scheduler) = TriggerScheduler::new(&heartbeats);
 
         // Share state between loader and API.
-        let state = SlabLock::new(State::new(store, scheduler));
+        let state = SlabLock::new(State::new(store, scheduler.clone()));
 
         // Spawn the background task to preload and clean slab data.
-        spawn(slab_loader(segment.clone(), state.clone()));
+        spawn(slab_loader(
+            segment.clone(),
+            state.clone(),
+            heartbeats.register("timer loader"),
+        ));
 
         // Build the manager wrapper.
         let manager = Self(Arc::new(TimerManagerInner { segment, state }));
@@ -391,9 +397,15 @@ mod tests {
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
 
-        TimerManager::new(segment_id, slab_size, "test-manager", store)
-            .await
-            .map_err(|e| eyre!("Failed to create timer manager: {}", e))
+        TimerManager::new(
+            segment_id,
+            slab_size,
+            "test-manager",
+            store,
+            HeartbeatRegistry::test(),
+        )
+        .await
+        .map_err(|e| eyre!("Failed to create timer manager: {}", e))
     }
 
     #[tokio::test]
@@ -404,7 +416,14 @@ mod tests {
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
 
-        let result = TimerManager::new(segment_id, slab_size, "test-creation", store).await;
+        let result = TimerManager::new(
+            segment_id,
+            slab_size,
+            "test-creation",
+            store,
+            HeartbeatRegistry::test(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Timer manager creation should succeed");
 

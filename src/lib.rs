@@ -233,6 +233,7 @@ use std::sync::LazyLock;
 
 pub mod admin;
 pub mod consumer;
+pub mod heartbeat;
 pub mod high_level;
 pub mod producer;
 pub mod propagator;

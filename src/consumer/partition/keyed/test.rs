@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::consumer::Keyed;
-use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::partition::keyed::KeyManager;
+use crate::heartbeat::Heartbeat;
 use ahash::HashMapExt;
 use futures::stream::iter;
 use quickcheck::{Arbitrary, Gen, TestResult};

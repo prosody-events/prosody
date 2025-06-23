@@ -30,11 +30,11 @@ use tracing::{debug, error, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::consumer::extractor::MessageExtractor;
-use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
+use crate::heartbeat::Heartbeat;
 use crate::propagator::new_propagator;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 

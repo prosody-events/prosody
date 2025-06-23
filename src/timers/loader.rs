@@ -5,6 +5,7 @@
 //! cleanup of completed slabs and dynamically adjusts its preload window
 //! based on current time.
 
+use crate::heartbeat::Heartbeat;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::TriggerScheduler;
@@ -18,6 +19,7 @@ use futures::{StreamExt, TryStreamExt};
 use std::cmp::max;
 use std::ops::RangeInclusive;
 use std::time::Duration;
+use tokio::select;
 use tokio::time::sleep;
 use tracing::{debug, error};
 
@@ -98,7 +100,13 @@ impl<T> State<T> {
 /// # Type Parameters
 ///
 /// * `T` - A [`TriggerStore`] implementation for persistent storage.
-pub async fn slab_loader<T>(segment: Segment, state: SlabLock<State<T>>)
+///
+/// # Arguments
+///
+/// * `segment` - The timer segment to manage slab loading for
+/// * `state` - Shared state containing the trigger store and scheduler
+/// * `heartbeat` - Heartbeat monitor for detecting stalled loader operations
+pub async fn slab_loader<T>(segment: Segment, state: SlabLock<State<T>>, heartbeat: Heartbeat)
 where
     T: TriggerStore,
 {
@@ -111,6 +119,9 @@ where
     let mut highest_loaded_slab_id: Option<SlabId> = None;
 
     loop {
+        // Signal that the loader is active
+        heartbeat.beat();
+
         // Compute the target time to preload (current time + preload window)
         let now = match CompactDateTime::now() {
             Ok(now) => now,
@@ -173,7 +184,11 @@ where
         let wait_time = calculate_wait_time(next_slab.range().start, preload_seconds);
         if !wait_time.is_zero() {
             debug!("Waiting {wait_time:?} before next load cycle");
-            sleep(wait_time).await;
+
+            select! {
+                () = sleep(wait_time) => {},
+                () = heartbeat.next() => {},
+            }
         }
     }
 }
@@ -429,6 +444,7 @@ where
 mod tests {
     use super::*;
     use crate::Key;
+    use crate::heartbeat::HeartbeatRegistry;
     use crate::timers::Trigger;
     use crate::timers::duration::CompactDuration;
     use crate::timers::store::Segment;
@@ -457,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn test_state_new() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
 
         assert_eq!(state.max_owned, None);
@@ -467,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn test_state_is_owned_when_none() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
 
         assert!(!state.is_owned(1));
@@ -478,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn test_state_is_owned_with_ownership() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
         state.extend_ownership(5);
@@ -494,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn test_state_extend_ownership() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
         // First extension
@@ -604,7 +620,7 @@ mod tests {
     #[allow(clippy::reversed_empty_ranges)]
     async fn test_load_slabs_empty_range() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -618,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_slabs_single_slab() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -642,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_slabs_multiple_slabs() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -669,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_triggers_empty_slab() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
         let slab = Slab::new(segment.id, 1, segment.slab_size);
 
@@ -680,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_triggers_with_triggers() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
         let slab = Slab::new(segment.id, 1, segment.slab_size);
 
@@ -699,7 +715,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_completed_slabs_no_active() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -725,7 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_slab_ids_empty_scheduler() -> Result<()> {
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
 
         let active_ids = active_slab_ids(&segment, &scheduler).await;
@@ -739,7 +755,7 @@ mod tests {
         tokio::time::pause();
 
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -747,9 +763,16 @@ mod tests {
         // Insert the segment
         store.insert_segment(segment.clone()).await?;
 
+        // Create test heartbeat
+        let test_heartbeat = Heartbeat::new("test-slab-loader", std::time::Duration::from_secs(30));
+
         // We need to spawn the slab_loader in a separate task since it runs
         // indefinitely
-        let loader_handle = tokio::spawn(slab_loader(segment.clone(), slab_lock.clone()));
+        let loader_handle = tokio::spawn(slab_loader(
+            segment.clone(),
+            slab_lock.clone(),
+            test_heartbeat,
+        ));
 
         // Give it a moment to start
         tokio::time::advance(Duration::from_millis(100)).await;
@@ -769,7 +792,7 @@ mod tests {
         tokio::time::pause();
 
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -777,8 +800,18 @@ mod tests {
         // Insert the segment
         store.insert_segment(segment.clone()).await?;
 
+        // Create test heartbeat
+        let test_heartbeat = Heartbeat::new(
+            "test-slab-loader-advancement",
+            std::time::Duration::from_secs(30),
+        );
+
         // Spawn the loader
-        let loader_handle = tokio::spawn(slab_loader(segment.clone(), slab_lock.clone()));
+        let loader_handle = tokio::spawn(slab_loader(
+            segment.clone(),
+            slab_lock.clone(),
+            test_heartbeat,
+        ));
 
         // Let it load initial slabs
         tokio::time::advance(Duration::from_millis(100)).await;
@@ -826,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_completed_slabs_with_active_triggers() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler.clone());
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -862,7 +895,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_slabs_extends_ownership_correctly() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -895,7 +928,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_slabs_preserves_higher_ownership() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -927,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn test_state_ownership_edge_cases() -> Result<()> {
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
         // Test ownership at SlabId boundaries
@@ -943,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_slab_ids_with_triggers() -> Result<()> {
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
 
         // Schedule some triggers
@@ -1011,7 +1044,7 @@ mod tests {
         tokio::time::pause();
 
         let store = InMemoryTriggerStore::new();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
@@ -1019,8 +1052,18 @@ mod tests {
         // Insert the segment
         store.insert_segment(segment.clone()).await?;
 
+        // Create test heartbeat
+        let test_heartbeat = Heartbeat::new(
+            "test-slab-loader-errors",
+            std::time::Duration::from_secs(30),
+        );
+
         // Spawn the loader
-        let loader_handle = tokio::spawn(slab_loader(segment.clone(), slab_lock.clone()));
+        let loader_handle = tokio::spawn(slab_loader(
+            segment.clone(),
+            slab_lock.clone(),
+            test_heartbeat,
+        ));
 
         // Give it time to start and handle any initial time operations
         tokio::time::advance(Duration::from_millis(50)).await;

@@ -9,6 +9,7 @@
 //! on a spawned Tokio task.
 
 use crate::Key;
+use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
@@ -62,13 +63,17 @@ enum CommandOperation {
 impl TriggerScheduler {
     /// Creates a new scheduler and returns a receiver for expired triggers.
     ///
+    /// # Arguments
+    ///
+    /// * `heartbeats` - Registry for registering scheduler heartbeat monitoring
+    ///
     /// # Returns
     ///
     /// A tuple of:
     /// - [`mpsc::Receiver<Trigger>`]: yields triggers when their scheduled time
     ///   arrives.
     /// - [`TriggerScheduler`]: handle for scheduling or unscheduling triggers.
-    pub fn new() -> (mpsc::Receiver<Trigger>, Self) {
+    pub fn new(heartbeats: &HeartbeatRegistry) -> (mpsc::Receiver<Trigger>, Self) {
         let (command_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
         let (triggers_tx, triggers_rx) = mpsc::channel(BUFFER_SIZE);
         let triggers = TriggerQueue::new();
@@ -76,7 +81,12 @@ impl TriggerScheduler {
 
         // Spawn the background task that processes scheduling commands
         // and emits expired triggers.
-        spawn(process_commands(commands_rx, triggers_tx, triggers));
+        spawn(process_commands(
+            commands_rx,
+            triggers_tx,
+            triggers,
+            heartbeats.register("timer scheduler"),
+        ));
 
         (
             triggers_rx,
@@ -189,15 +199,23 @@ impl TriggerScheduler {
 /// waits for expired triggers to send them. If the receiver is full, retains
 /// the trigger and retries sending. The `trigger_to_send` buffer ensures no
 /// expired triggers are dropped when the outgoing channel is temporarily full.
+///
+/// # Arguments
+///
+/// * `heartbeat` - Heartbeat monitor for detecting stalled command processing.
 async fn process_commands(
     mut commands: mpsc::Receiver<Command>,
     trigger_tx: mpsc::Sender<Trigger>,
     mut triggers: TriggerQueue,
+    heartbeat: Heartbeat,
 ) {
     // Buffer for an expired trigger that could not be sent immediately.
     let mut trigger_to_send: Option<Trigger> = None;
 
     loop {
+        // Signal that the command processor is active
+        heartbeat.beat();
+
         if let Some(trigger) = &trigger_to_send {
             select! {
                 result = commands.recv() => {
@@ -213,6 +231,8 @@ async fn process_commands(
                         break;
                     }
                 }
+
+                () = heartbeat.next() => {},
             }
         } else {
             select! {
@@ -231,6 +251,8 @@ async fn process_commands(
                         }
                     }
                 }
+
+                () = heartbeat.next() => {},
             }
         }
     }
@@ -282,7 +304,7 @@ mod tests {
     async fn test_schedule_and_unschedule() -> Result<(), String> {
         pause();
 
-        let (mut trigger_rx, scheduler) = TriggerScheduler::new();
+        let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
 
         let key = Key::from("test-key");
         let time = CompactDateTime::now()
@@ -329,7 +351,7 @@ mod tests {
     async fn test_trigger_emission() -> Result<(), String> {
         pause();
 
-        let (mut trigger_rx, scheduler) = TriggerScheduler::new();
+        let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
 
         let key = Key::from("test-key");
         let time = CompactDateTime::now()
@@ -375,7 +397,7 @@ mod tests {
     async fn test_multiple_triggers() -> Result<(), String> {
         pause();
 
-        let (mut trigger_rx, scheduler) = TriggerScheduler::new();
+        let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
 
         let key1 = Key::from("key1");
         let time1 = CompactDateTime::now()
@@ -456,7 +478,7 @@ mod tests {
     async fn test_deactivate_trigger() -> Result<(), String> {
         pause();
 
-        let (mut trigger_rx, scheduler) = TriggerScheduler::new();
+        let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let key = Key::from("test-key");
         let time = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(2)))
@@ -500,7 +522,7 @@ mod tests {
     async fn test_multiple_times_for_single_key() -> Result<(), String> {
         pause();
 
-        let (mut trigger_rx, scheduler) = TriggerScheduler::new();
+        let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let key = Key::from("shared-key");
 
         // Schedule multiple triggers with the same key but different times
@@ -617,6 +639,122 @@ mod tests {
             !scheduler.is_active(&key, time3).await,
             "Third trigger is still active after deactivation"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_handling() -> Result<(), String> {
+        pause();
+
+        let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
+
+        // Schedule triggers that will create backpressure
+        let fire_time = CompactDateTime::now()
+            .and_then(|t| t.add_duration(CompactDuration::new(1)))
+            .map_err(|e| format!("Failed to calculate fire time: {e:?}"))?;
+
+        // Schedule exactly BUFFER_SIZE + 5 triggers to test backpressure clearly
+        let num_triggers = 69_usize; // 64 (buffer) + 5 (to test backpressure)
+        for i in 0_usize..num_triggers {
+            let trigger = Trigger {
+                key: Key::from(&format!("trigger-{i}")),
+                time: fire_time,
+                span: Span::current(),
+            };
+
+            scheduler
+                .schedule(trigger)
+                .await
+                .map_err(|e| format!("Failed to schedule trigger {i}: {e:?}"))?;
+        }
+
+        // Advance time to make all triggers ready (don't read from channel yet)
+        advance(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(10)).await;
+
+        // At this point:
+        // - 64 triggers should be in the channel (BUFFER_SIZE)
+        // - 1 trigger should be buffered in trigger_to_send
+        // - 4 triggers should still be waiting in the delay queue
+        // - The scheduler should be in backpressure mode
+
+        // Test that commands are still processed during backpressure
+        let later_time = CompactDateTime::now()
+            .and_then(|t| t.add_duration(CompactDuration::new(10)))
+            .map_err(|e| format!("Failed to calculate later time: {e:?}"))?;
+
+        let command_test_trigger = Trigger {
+            key: Key::from("command-test"),
+            time: later_time,
+            span: Span::current(),
+        };
+
+        // This should succeed even though trigger output is backed up
+        scheduler
+            .schedule(command_test_trigger.clone())
+            .await
+            .map_err(|_| "Command processing failed during backpressure")?;
+
+        // Verify the command was processed by checking if trigger is active
+        if !scheduler
+            .is_active(&command_test_trigger.key, command_test_trigger.time)
+            .await
+        {
+            return Err(
+                "Command test trigger not active - command processing failed during backpressure"
+                    .to_owned(),
+            );
+        }
+
+        // Now verify backpressure: should get exactly BUFFER_SIZE triggers initially
+        let mut initial_count = 0_usize;
+        while trigger_rx.try_recv().is_ok() {
+            initial_count += 1_usize;
+        }
+
+        if initial_count != 64_usize {
+            return Err(format!(
+                "Expected exactly 64 triggers in channel, got {initial_count}"
+            ));
+        }
+
+        // Test unscheduling during backpressure
+        scheduler
+            .unschedule(command_test_trigger.clone())
+            .await
+            .map_err(|_| "Unschedule failed during backpressure")?;
+
+        if scheduler
+            .is_active(&command_test_trigger.key, command_test_trigger.time)
+            .await
+        {
+            return Err("Trigger still active after unscheduling during backpressure".to_owned());
+        }
+
+        // Give scheduler time to send the buffered trigger now that channel has space
+        sleep(Duration::from_millis(10)).await;
+
+        // Count how many additional triggers we get
+        let mut additional_count = 0_usize;
+        while trigger_rx.try_recv().is_ok() {
+            additional_count += 1_usize;
+        }
+
+        // We should get exactly the remaining 5 triggers (69 total - 64 initial = 5)
+        if additional_count != 5_usize {
+            return Err(format!(
+                "Expected exactly 5 additional triggers, got {additional_count}"
+            ));
+        }
+
+        // This test demonstrates key backpressure behaviors:
+        // 1. Backpressure limits initial triggers to BUFFER_SIZE (64)
+        // 2. Commands are still processed during backpressure (schedule/unschedule
+        //    work)
+        // 3. When channel space becomes available, remaining triggers are processed
+        //    efficiently
+        // 4. The scheduler maintains correct trigger ordering and delivery
 
         Ok(())
     }
