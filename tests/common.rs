@@ -11,7 +11,7 @@
 use std::cmp::max;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Formatter};
-use std::time::Duration;
+use std::time::Duration as StdDuration;
 
 use ahash::{HashMap, HashMapExt};
 use color_eyre::eyre::{Result, eyre};
@@ -25,6 +25,7 @@ use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsu
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::timers::UncommittedTimer;
+use prosody::timers::store::cassandra::CassandraConfiguration;
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{Sender, channel};
@@ -148,8 +149,8 @@ pub fn create_configs(
         .group_id("test-consumer")
         .subscribed_topics(&[topic.to_string()])
         .max_enqueued_per_key(max_enqueued_per_key.value())
-        .commit_interval(Duration::from_secs(1))
-        .stall_threshold(Duration::from_secs(60))
+        .commit_interval(StdDuration::from_secs(1))
+        .stall_threshold(StdDuration::from_secs(60))
         .probe_port(None)
         .build()?;
 
@@ -224,7 +225,7 @@ pub fn spawn_consumers(
         tasks.spawn(async move {
             let consumer = ProsodyConsumer::new::<TestHandler>(
                 &consumer_config,
-                &TriggerStoreConfiguration::InMemory,
+                &create_cassandra_trigger_store_config(),
                 handler,
             )
             .await?;
@@ -374,6 +375,29 @@ pub async fn run_test(input: TestInput) -> Result<()> {
     Ok(())
 }
 
+/// Creates a Cassandra trigger store configuration for integration tests.
+///
+/// Uses the same configuration pattern as the Cassandra store unit tests,
+/// connecting to localhost:9042 with a test keyspace.
+///
+/// # Returns
+///
+/// A `TriggerStoreConfiguration::Cassandra` configured for testing.
+#[must_use]
+pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
+    let cassandra_config = CassandraConfiguration {
+        datacenter: None,
+        rack: None,
+        nodes: vec!["localhost:9042".to_owned()],
+        keyspace: "prosody_integration_test".to_owned(),
+        user: None,
+        password: None,
+        retention: StdDuration::from_secs(10 * 60).into(),
+    };
+
+    TriggerStoreConfiguration::Cassandra(cassandra_config)
+}
+
 /// A simple test implementation of the `EventHandler` trait that forwards
 /// messages to a channel.
 #[derive(Clone, Debug)]
@@ -433,7 +457,7 @@ impl EventHandler for SlowTestHandler {
         let payload: Value = msg.payload().clone();
 
         // Simulate backpressure with a delay
-        sleep(Duration::from_secs(1)).await;
+        sleep(StdDuration::from_secs(1)).await;
 
         if let Err(e) = self.messages_tx.send((key.clone(), payload)).await {
             error!("failed to send message for key {}: {e:#}", key);

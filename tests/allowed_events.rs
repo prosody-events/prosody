@@ -8,7 +8,6 @@ use prosody::{
     Topic,
     admin::ProsodyAdminClient,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
-    high_level::config::TriggerStoreConfiguration,
     producer::{ProducerConfiguration, ProsodyProducer},
 };
 use serde_json::json;
@@ -63,7 +62,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     // Initialize consumer and producer
     let consumer = ProsodyConsumer::new::<TestHandler>(
         &consumer_config,
-        &TriggerStoreConfiguration::InMemory,
+        &common::create_cassandra_trigger_store_config(),
         TestHandler { messages_tx },
     )
     .await?;

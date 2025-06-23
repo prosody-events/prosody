@@ -11,7 +11,6 @@ use prosody::{
     consumer::event_context::EventContext,
     consumer::message::UncommittedMessage,
     consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
-    high_level::config::TriggerStoreConfiguration,
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
@@ -122,7 +121,7 @@ async fn test_timer_backpressure() -> Result<()> {
     let slow_timer_handler = SlowTimerHandler { timers_tx };
     let consumer = ProsodyConsumer::new::<SlowTimerHandler>(
         &consumer_config,
-        &TriggerStoreConfiguration::InMemory,
+        &common::create_cassandra_trigger_store_config(),
         slow_timer_handler,
     )
     .await?;

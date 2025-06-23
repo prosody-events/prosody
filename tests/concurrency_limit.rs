@@ -40,7 +40,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use color_eyre::eyre::{Result, eyre};
 use prosody::consumer::Uncommitted;
 use prosody::consumer::event_context::EventContext;
-use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::timers::UncommittedTimer;
 use prosody::{
     Topic, admin::ProsodyAdminClient, consumer::ConsumerConfiguration, consumer::EventHandler,
@@ -51,6 +50,9 @@ use serde_json::json;
 use tokio::sync::{Notify, watch};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
+
+#[path = "common.rs"]
+mod common;
 
 /// A custom event handler for testing the global concurrency limit enforcement.
 ///
@@ -195,7 +197,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     // Create the consumer with the test handler
     let consumer: ProsodyConsumer = ProsodyConsumer::new::<ConcurrencyTestHandler>(
         &consumer_config,
-        &TriggerStoreConfiguration::InMemory,
+        &common::create_cassandra_trigger_store_config(),
         handler.clone(),
     )
     .await?;

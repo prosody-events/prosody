@@ -13,7 +13,6 @@ use prosody::{
     admin::ProsodyAdminClient,
     consumer::message::UncommittedMessage,
     consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
-    high_level::config::TriggerStoreConfiguration,
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::UncommittedTimer,
     timers::datetime::CompactDateTime,
@@ -195,7 +194,7 @@ impl TestEnvironment {
 
         let consumer = ProsodyConsumer::new(
             &consumer_config,
-            &TriggerStoreConfiguration::InMemory,
+            &common::create_cassandra_trigger_store_config(),
             handler,
         )
         .await?;
