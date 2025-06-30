@@ -47,7 +47,7 @@ rand = "0.9"
 rdkafka = { version = "0.37", features = ["cmake-build", "tracing"] }
 rust-embed = { version = "8.7", features = ["include-exclude"] }
 scc = "2.3"
-scylla = { version = "1.2", features = ["chrono-04", "rustls-023"] }
+scylla = { version = "1.2", features = ["chrono-04", "openssl-010"] }
 serde = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
