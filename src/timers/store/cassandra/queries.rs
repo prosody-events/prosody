@@ -152,7 +152,7 @@ impl Queries {
             session = session.user(user, configuration.password.unwrap_or_default());
         }
 
-        let session = session.build().await?;
+        let session = Box::pin(session.build()).await?;
         let migrator = EmbeddedMigrator::new(&session, &configuration.keyspace);
         migrator.migrate().await?;
         session.use_keyspace(configuration.keyspace, true).await?;
