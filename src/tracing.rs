@@ -4,8 +4,8 @@
 //! with the tracing subscriber. It provides functionality to create a
 //! customizable tracing setup with optional additional layers.
 
-use opentelemetry::trace::{TraceError, TracerProvider};
-use opentelemetry_otlp::{SpanExporter, WithTonicConfig};
+use opentelemetry::trace::TracerProvider;
+use opentelemetry_otlp::{ExporterBuildError, SpanExporter, WithTonicConfig};
 use opentelemetry_sdk::trace::Tracer;
 use std::env;
 use thiserror::Error;
@@ -108,7 +108,7 @@ pub enum TracingError {
 
     /// Indicates a failure to initialize the trace exporter.
     #[error("failed to initialize the trace exporter: {0:#}")]
-    Exporter(#[from] TraceError),
+    Exporter(#[from] ExporterBuildError),
 
     /// Indicates a failure to set the default tracing subscriber.
     #[error("failed to set default tracing subscriber: {0:#}")]
