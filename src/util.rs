@@ -32,6 +32,38 @@ where
     parse_with_error(env_var, &value_str)
 }
 
+/// Retrieves and parses an optional environment variable.
+///
+/// If the environment variable is not set, this function returns `Ok(None)`.
+/// If it is set to "none" (case-insensitive), it also returns `Ok(None)`.
+/// Otherwise, it attempts to parse the value into type `T`.
+///
+/// # Arguments
+///
+/// * `env_var` - The name of the environment variable to retrieve.
+///
+/// # Returns
+///
+/// A `Result` containing an `Option<T>`:
+/// - `Ok(Some(value))` if the variable is set and parsed successfully.
+/// - `Ok(None)` if the variable is not set or is set to "none".
+/// - `Err(String)` if parsing fails.
+pub fn from_option_env<T>(env_var: &str) -> Result<Option<T>, String>
+where
+    T: FromStr<Err: Display>,
+{
+    let Ok(value_str) = env::var(env_var) else {
+        return Ok(None);
+    };
+
+    // Return None if the value is "none" (case-insensitive)
+    if value_str.trim().eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+
+    parse_with_error(env_var, &value_str).map(Some)
+}
+
 /// Retrieves and parses an optional environment variable with a fallback value.
 ///
 /// # Arguments

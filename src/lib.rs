@@ -30,7 +30,10 @@
 //! use prosody::consumer::failure::retry::RetryConfiguration;
 //! use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::failure::{FallibleHandler, ClassifyError};
-//! use prosody::consumer::message::{ConsumerMessage, MessageContext};
+//! use prosody::consumer::message::ConsumerMessage;
+//! use prosody::consumer::event_context::EventContext;
+//! use prosody::timers::{Trigger, store::TriggerStore};
+//! use prosody::timers::store::cassandra::CassandraConfigurationBuilder;
 //! use prosody::high_level::mode::Mode;
 //! use prosody::high_level::{HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
@@ -44,12 +47,27 @@
 //! impl FallibleHandler for MyHandler {
 //!     type Error = Infallible;
 //!
-//!     async fn on_message(
+//!     async fn on_message<C>(
 //!         &self,
-//!         context: MessageContext,
+//!         context: C,
 //!         message: ConsumerMessage
-//!     ) -> Result<(), Self::Error> {
+//!     ) -> Result<(), Self::Error>
+//!     where
+//!         C: EventContext,
+//!     {
 //!         println!("Received: {message:?}");
+//!         Ok(())
+//!     }
+//!
+//!     async fn on_timer<C>(
+//!         &self,
+//!         context: C,
+//!         trigger: Trigger,
+//!     ) -> Result<(), Self::Error>
+//!     where
+//!         C: EventContext,
+//!     {
+//!         println!("Timer triggered: {trigger:?}");
 //!         Ok(())
 //!     }
 //! }
@@ -71,6 +89,7 @@
 //!         .subscribed_topics(["my-topic".to_owned()]);
 //!
 //!     let retry_config = RetryConfiguration::builder();
+//!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
 //!     let client = HighLevelClient::new(
 //!         Mode::Pipeline,
@@ -78,9 +97,10 @@
 //!         &consumer_config,
 //!         &retry_config,
 //!         &FailureTopicConfigurationBuilder::default(),
+//!         &cassandra_config,
 //!     )?;
 //!
-//!     client.subscribe(MyHandler)?;
+//!     client.subscribe(MyHandler).await?;
 //!
 //!     let topic = "my-topic".into();
 //!     client.send(topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
@@ -213,9 +233,11 @@ use std::sync::LazyLock;
 
 pub mod admin;
 pub mod consumer;
+pub mod heartbeat;
 pub mod high_level;
 pub mod producer;
 pub mod propagator;
+pub mod timers;
 pub mod tracing;
 mod util;
 
@@ -242,7 +264,10 @@ static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
 /// The length of a UUID string (36 characters) plus one byte for length.
 const UUID_STR_LEN: usize = 36 + 1;
 
-/// The system originating a message
+/// The system originating a message.
+///
+/// Used to track which service or component generated a particular message,
+/// enabling loop detection and audit trails.
 pub type SourceSystem = Flexstr<UUID_STR_LEN>;
 
 /// An interned string representing a Kafka topic name.
@@ -278,22 +303,30 @@ pub type EventId = Flexstr<UUID_STR_LEN>;
 /// A borrowed string slice for event identifiers.
 pub type BorrowedEventId = str;
 
-/// Source system header used to prevent processing loops
+/// Source system header used to prevent processing loops.
 const SOURCE_SYSTEM_HEADER: &str = "source-system";
 
 /// Defines event identity behavior for messages that contain unique
 /// identifiers.
 ///
 /// This trait enables idempotent message processing by providing access to
-/// event identifiers that can be used to deduplicate messages.
+/// event identifiers that can be used to deduplicate messages. Implementations
+/// should extract identifiers from their internal representation and provide
+/// them in a consistent format.
+///
+/// # Usage
+///
+/// Typically used by consumers to detect and skip duplicate messages that may
+/// be delivered due to retries or network issues. The event ID should be stable
+/// across message delivery attempts.
 pub trait EventIdentity {
+    /// The type used to represent a borrowed event ID.
+    type BorrowedEventId: ?Sized;
+
     /// The type used to represent the event ID when owned.
     /// Must implement `AsRef<Self::BorrowedEventId>` and be constructible from
     /// a borrowed event ID.
     type EventId: AsRef<Self::BorrowedEventId> + for<'a> From<&'a Self::BorrowedEventId>;
-
-    /// The type used to represent a borrowed event ID.
-    type BorrowedEventId: ?Sized;
 
     /// Returns a reference to this event's identifier if one exists.
     ///
@@ -308,6 +341,12 @@ impl EventIdentity for Payload {
     type BorrowedEventId = str;
     type EventId = EventId;
 
+    /// Extracts the event ID from a JSON payload's "id" field.
+    ///
+    /// # Returns
+    ///
+    /// The string value of the "id" field if it exists and is a string,
+    /// otherwise `None`.
     fn event_id(&self) -> Option<&Self::BorrowedEventId> {
         match self.get("id")? {
             Value::String(value) => Some(value.as_str()),

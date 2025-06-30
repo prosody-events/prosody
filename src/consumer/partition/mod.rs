@@ -14,10 +14,22 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
+use crate::consumer::event_context::TimerContext;
+use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
+use crate::consumer::partition::keyed::KeyManager;
+use crate::consumer::partition::offsets::OffsetTracker;
+use crate::consumer::{EventHandler, Keyed, Uncommitted};
+use crate::heartbeat::HeartbeatRegistry;
+use crate::timers::duration::CompactDuration;
+use crate::timers::store::TriggerStore;
+use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
+use crate::{EventId, EventIdentity, Key, Offset, Partition, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
+use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
-use futures::{Stream, StreamExt};
+use futures::stream::select;
+use futures::{Stream, StreamExt, pin_mut};
 use quick_cache::unsync::Cache;
 use serde_json::Value;
 use std::future::{Ready, ready};
@@ -31,15 +43,9 @@ use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::time::sleep;
 use tracing::{debug, debug_span, error, info, info_span, instrument};
-
-use crate::consumer::heartbeat::Heartbeat;
-use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
-use crate::consumer::partition::keyed::KeyManager;
-use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{EventHandler, Keyed};
-use crate::{EventId, EventIdentity, Key, Offset, Partition, Topic};
+use uuid::Uuid;
 
 mod keyed;
 pub mod offsets;
@@ -48,13 +54,21 @@ mod util;
 #[cfg(test)]
 mod test;
 
+/// Information about the Kafka partition being processed.
+struct PartitionInfo {
+    /// The Kafka topic name.
+    topic: Topic,
+    /// The partition number within the topic.
+    partition: Partition,
+}
+
 /// Configuration settings for a partition manager.
 ///
 /// Contains all the parameters needed to configure message processing
 /// for a Kafka partition, including buffer sizes, concurrency limits,
 /// and filtering options.
 #[derive(Clone, Debug)]
-pub struct PartitionConfiguration {
+pub struct PartitionConfiguration<T> {
     /// Consumer group identifier
     pub group_id: Arc<str>,
 
@@ -84,6 +98,12 @@ pub struct PartitionConfiguration {
 
     /// Global concurrency limit
     pub global_limit: Arc<Semaphore>,
+
+    /// Timer store
+    pub trigger_store: T,
+
+    /// Timer slab size
+    pub timer_slab_size: CompactDuration,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -108,8 +128,9 @@ pub struct PartitionManager {
     #[educe(Debug(ignore))]
     message_tx: Sender<ConsumerMessage>,
 
-    /// Heartbeat used to detect stalled processing loop
-    heartbeat: Heartbeat,
+    /// Heartbeat registry
+    #[educe(Debug(ignore))]
+    heartbeats: HeartbeatRegistry,
 
     /// Signals shutdown to message handlers
     #[educe(Debug(ignore))]
@@ -133,14 +154,15 @@ impl PartitionManager {
     /// # Returns
     ///
     /// A new `PartitionManager` instance
-    pub fn new<T>(
-        config: PartitionConfiguration,
+    pub fn new<T, S>(
+        config: PartitionConfiguration<S>,
         handler: T,
         topic: Topic,
         partition: Partition,
     ) -> Self
     where
         T: EventHandler + Send + Sync + 'static,
+        S: TriggerStore,
     {
         // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
@@ -151,21 +173,21 @@ impl PartitionManager {
             config.watermark_version.clone(),
         );
 
-        // Create descriptive name for the heartbeat monitor
-        let name = format!("{topic}/{partition} event loop");
-
-        // Initialize heartbeat, channels, and shutdown signals
-        let heartbeat = Heartbeat::new(name, config.stall_threshold);
+        // Initialize heartbeats, channels, and shutdown signals
+        let heartbeats =
+            HeartbeatRegistry::new(format!("{topic}:{partition}"), config.stall_threshold);
         let (message_tx, message_rx) = channel(config.buffer_size);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Spawn the background task for message handling
+        let partition_info = PartitionInfo { topic, partition };
         let handle = spawn(handle_messages(
             config,
+            partition_info,
             handler,
             offsets.clone(),
             message_rx,
-            heartbeat.clone(),
+            heartbeats.clone(),
             shutdown_rx,
         ));
 
@@ -173,7 +195,7 @@ impl PartitionManager {
             partition,
             offsets,
             message_tx,
-            heartbeat,
+            heartbeats,
             shutdown_tx,
             handle,
         }
@@ -230,11 +252,13 @@ impl PartitionManager {
 
     /// Checks if message processing has stalled.
     ///
-    /// A partition is considered stalled if either:
+    /// A partition is considered stalled if any of:
     /// - The offset tracker detects uncommitted offsets beyond the stall
     ///   threshold
     /// - The message processing heartbeat hasn't been updated within the stall
     ///   threshold
+    /// - The timer system heartbeat (if present) hasn't been updated within the
+    ///   stall threshold
     ///
     /// This method is used by health monitoring systems to detect processing
     /// issues.
@@ -244,7 +268,7 @@ impl PartitionManager {
     /// `true` if messages are not being processed within the configured stall
     /// threshold, `false` otherwise
     pub fn is_stalled(&self) -> bool {
-        self.offsets.is_stalled() || self.heartbeat.is_stalled()
+        self.offsets.is_stalled() || self.heartbeats.any_stalled()
     }
 
     /// Initiates an orderly partition shutdown.
@@ -301,20 +325,24 @@ impl PartitionManager {
 /// # Arguments
 ///
 /// * `config` - The partition configuration
+/// * `partition_info` - Information about the partition being processed
 /// * `handler` - Handler that processes messages
 /// * `offsets` - Tracks offset commits and processing progress
 /// * `message_rx` - Channel receiving messages to process
-/// * `heartbeat` - Heartbeat used to detect stalled processing loop
+/// * `heartbeats` - Registry for monitoring processing and timer heartbeats
 /// * `shutdown_rx` - Channel receiving shutdown signal
-async fn handle_messages<T>(
-    config: PartitionConfiguration,
+#[allow(clippy::too_many_arguments)]
+async fn handle_messages<T, S>(
+    config: PartitionConfiguration<S>,
+    partition_info: PartitionInfo,
     handler: T,
     offsets: OffsetTracker,
     message_rx: Receiver<ConsumerMessage>,
-    heartbeat: Heartbeat,
+    heartbeats: HeartbeatRegistry,
     shutdown_rx: watch::Receiver<bool>,
 ) where
     T: EventHandler,
+    S: TriggerStore,
 {
     let mut highest_offset_seen = -1;
 
@@ -323,7 +351,7 @@ async fn handle_messages<T>(
         NonZeroUsize::new(config.idempotence_cache_size).map(|size| Cache::new(size.into()));
 
     // Create a processing pipeline for incoming messages
-    let stream = build_stream(
+    let message_events = build_message_stream(
         &offsets,
         message_rx,
         &config.group_id,
@@ -332,34 +360,77 @@ async fn handle_messages<T>(
         config.allowed_events.as_ref(),
     );
 
+    let name = format!(
+        "{}:{}/{}",
+        config.group_id, partition_info.topic, partition_info.partition
+    );
+    let segment_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
+
+    let (timer_stream, timer_manager) = loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
+        match TimerManager::new(
+            segment_id,
+            config.timer_slab_size,
+            &name,
+            config.trigger_store.clone(),
+            heartbeats.clone(),
+        )
+        .await
+        {
+            Ok(result) => break result,
+            Err(error) => {
+                error!("failed to initialize timer manager: {error:#}; retrying");
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+
+    let timer_events = build_timer_stream(timer_stream);
+    let combined_stream = select(message_events, timer_events);
+
     // Define how to process each message
-    let process = |message: UncommittedMessage| async {
+    let process = |event: UncommittedEvent<S>| async {
         // Acquire a semaphore to bound global concurrency
-        debug!(?message, "acquiring permit");
+        debug!(?event, "acquiring permit");
         let _permit = match config.global_limit.acquire().await {
             Ok(permit) => permit,
             Err(error) => {
                 error!(
-                    ?message,
+                    ?event,
                     "failed to acquire permit: {error:#}; aborting message"
                 );
-                message.abort();
+                event.abort().await;
                 return;
             }
         };
 
         // Process message with handler
-        debug!(?message, "permit acquired; calling handler");
-        let context = MessageContext::new(shutdown_rx.clone());
-        handler.on_message(context, message).await;
+        debug!(?event, "permit acquired; calling handler");
+        let context = TimerContext::new(
+            event.key().clone(),
+            shutdown_rx.clone(),
+            timer_manager.clone(),
+        );
+
+        match event {
+            UncommittedEvent::Message(message) => handler.on_message(context, message).await,
+            UncommittedEvent::Timer(timer) => {
+                if timer.is_active().await {
+                    handler.on_timer(context, timer).await;
+                }
+            }
+        }
     };
 
     // Create key manager to handle concurrent processing while maintaining key
     // order
-    KeyManager::new(process, config.max_enqueued_per_key)
+    KeyManager::<UncommittedEvent<S>, _, _>::new(process, config.max_enqueued_per_key)
         .process_messages(
-            stream,
-            heartbeat,
+            combined_stream,
+            heartbeats.register("event processor"),
             shutdown_rx.clone(),
             config.max_uncommitted,
             config.shutdown_timeout,
@@ -391,21 +462,61 @@ async fn handle_messages<T>(
 /// # Returns
 ///
 /// A stream of `UncommittedMessage` objects ready for processing
-fn build_stream(
+fn build_message_stream<T>(
     offsets: &OffsetTracker,
-    message_rx: Receiver<ConsumerMessage>,
+    mut message_rx: Receiver<ConsumerMessage>,
     group_id: &str,
     highest_offset_seen: &mut i64,
     idempotence_cache: &mut Option<Cache<Key, EventId>>,
     allowed_events: Option<&AhoCorasick>,
-) -> impl Stream<Item = UncommittedMessage> {
-    ReceiverStream::new(message_rx)
-        // Apply a series of filters in a pipeline
-        .filter(|message| filter_rewind(highest_offset_seen, message))
-        .filter_map(async |received| reserve_offset(offsets, received).await)
-        .filter_map(move |message| filter_loops(group_id, message))
-        .filter_map(move |message| filter_event_type(allowed_events, message))
-        .filter_map(|message| filter_duplicate(idempotence_cache, message))
+) -> impl Stream<Item = UncommittedEvent<T>>
+where
+    T: TriggerStore,
+{
+    stream! {
+        while let Some(message) = message_rx.recv().await {
+            // Apply filter_rewind - skip messages with offsets we've already processed
+            if !filter_rewind(highest_offset_seen, &message).await {
+                continue;
+            }
+
+            // Apply reserve_offset - reserve offset and convert to UncommittedMessage
+            let Some(uncommitted) = reserve_offset(offsets, message).await else {
+                continue;
+            };
+
+            // Apply filter_loops - filter out messages from same consumer group
+            let Some(uncommitted) = filter_loops(group_id, uncommitted).await else {
+                continue;
+            };
+
+            // Apply filter_event_type - filter based on allowed event types
+            let Some(uncommitted) = filter_event_type(allowed_events, uncommitted).await else {
+                continue;
+            };
+
+            // Apply filter_duplicate - filter duplicate messages based on event IDs
+            let Some(uncommitted) = filter_duplicate(idempotence_cache, uncommitted).await else {
+                continue;
+            };
+
+            yield UncommittedEvent::Message(uncommitted);
+        }
+    }
+}
+
+fn build_timer_stream<T, S>(timer_stream: S) -> impl Stream<Item = UncommittedEvent<T>>
+where
+    S: Stream<Item = PendingTimer<T>>,
+    T: TriggerStore,
+{
+    stream! {
+        pin_mut!(timer_stream);
+
+        while let Some(timer) = timer_stream.next().await {
+            yield UncommittedEvent::Timer(timer);
+        }
+    }
 }
 
 /// Filters out messages with offsets we've already processed.
@@ -487,7 +598,7 @@ async fn reserve_offset(
 ///
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
-fn filter_loops(group_id: &str, message: UncommittedMessage) -> Ready<Option<UncommittedMessage>> {
+async fn filter_loops(group_id: &str, message: UncommittedMessage) -> Option<UncommittedMessage> {
     // Check if the message comes from the same source system as our own consumer
     // group
     if message
@@ -504,11 +615,11 @@ fn filter_loops(group_id: &str, message: UncommittedMessage) -> Ready<Option<Unc
         });
 
         // Commit the message and filter it out
-        message.commit();
-        return ready(None);
+        message.commit().await;
+        return None;
     }
 
-    ready(Some(message))
+    Some(message)
 }
 
 /// Filters messages based on their event type if filtering is enabled.
@@ -525,13 +636,13 @@ fn filter_loops(group_id: &str, message: UncommittedMessage) -> Ready<Option<Unc
 ///
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
-fn filter_event_type(
+async fn filter_event_type(
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage,
-) -> Ready<Option<UncommittedMessage>> {
+) -> Option<UncommittedMessage> {
     // Extract event type from message payload if present
     let Some(event_type) = message.payload().get("type").and_then(Value::as_str) else {
-        return ready(Some(message));
+        return Some(message);
     };
 
     // Check if the event type is allowed
@@ -549,11 +660,11 @@ fn filter_event_type(
         });
 
         // Commit the message and filter it out
-        message.commit();
-        return ready(None);
+        message.commit().await;
+        return None;
     }
 
-    ready(Some(message))
+    Some(message)
 }
 
 /// Filters out duplicate messages based on their event IDs.
@@ -570,30 +681,30 @@ fn filter_event_type(
 ///
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out as a duplicate
-fn filter_duplicate(
+async fn filter_duplicate(
     idempotence_cache: &mut Option<Cache<Key, EventId>>,
     message: UncommittedMessage,
-) -> Ready<Option<UncommittedMessage>> {
+) -> Option<UncommittedMessage> {
     // Skip deduplication if no cache is configured
     let Some(idempotence_cache) = idempotence_cache else {
-        return ready(Some(message));
+        return Some(message);
     };
 
     // If the message has no event ID, remove any existing entry for this key
     let Some(event_id) = message.payload().event_id() else {
         idempotence_cache.remove(message.key());
-        return ready(Some(message));
+        return Some(message);
     };
 
     match idempotence_cache.get_mut_or_guard(message.key()) {
         // Item is not in the cache; insert it
         Err(guard) => {
             guard.insert(event_id.into());
-            ready(Some(message))
+            Some(message)
         }
 
         // Existing item could not be retrieved; skip it
-        Ok(None) => ready(Some(message)),
+        Ok(None) => Some(message),
 
         // Item is in the cache
         Ok(Some(mut value)) => {
@@ -610,12 +721,12 @@ fn filter_duplicate(
                     info!("message with id {event_id} already processed; skipping");
                 });
 
-                message.commit();
-                ready(None)
+                message.commit().await;
+                None
             } else {
                 // Update the cache with the new event ID
                 *value = event_id.into();
-                ready(Some(message))
+                Some(message)
             }
         }
     }

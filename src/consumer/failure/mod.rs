@@ -4,12 +4,13 @@
 //! and composing failure handling strategies in asynchronous
 //! message processing systems.
 
+use crate::consumer::HandlerProvider;
+use crate::consumer::event_context::EventContext;
+use crate::consumer::message::ConsumerMessage;
+use crate::timers::Trigger;
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::future::Future;
-
-use crate::consumer::HandlerProvider;
-use crate::consumer::message::{ConsumerMessage, MessageContext};
 
 pub mod log;
 pub mod retry;
@@ -96,11 +97,56 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     ///
     /// A `Future` that resolves to `Ok(())` if the message was processed
     /// successfully, or an `Err` containing the error if processing failed.
-    fn on_message(
+    fn on_message<C>(
         &self,
-        context: MessageContext,
+        context: C,
         message: ConsumerMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        C: EventContext;
+
+    /// Handles timer events with potential for failure.
+    ///
+    /// This method is called when a scheduled timer fires and is delivered to
+    /// the handler for processing. Unlike [`Self::on_message`], this method
+    /// handles timer events that contain a key, execution time, and tracing
+    /// span.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The event processing context with access to timer
+    ///   management
+    /// * `trigger` - The timer trigger containing key, time, and span
+    ///   information
+    ///
+    /// # Returns
+    ///
+    /// A [`Future`] that resolves to:
+    /// - `Ok(())` if the timer was processed successfully
+    /// - `Err(Self::Error)` if processing failed
+    ///
+    /// # Error Handling
+    ///
+    /// Errors returned by this method are classified using [`ClassifyError`] to
+    /// determine the appropriate failure handling strategy:
+    /// - **Transient errors**: May be retried with backoff
+    /// - **Permanent errors**: Logged and timer may be discarded
+    /// - **Terminal errors**: Cause processing to stop entirely
+    ///
+    /// # Implementation Requirements
+    ///
+    /// Implementations should:
+    /// - Process the timer event according to business logic
+    /// - Return appropriate error types that implement [`ClassifyError`]
+    /// - Ensure processing is idempotent where possible
+    /// - Handle the timer's tracing span for observability
+    fn on_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        C: EventContext;
 }
 
 /// A composition of two failure strategies.

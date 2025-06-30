@@ -16,13 +16,14 @@ use crate::producer::{
     ProducerError, ProsodyProducer,
 };
 use crate::propagator::new_propagator;
+use crate::timers::store::cassandra::CassandraConfigurationBuilder;
 use crate::{Payload, Topic};
 use internment::Intern;
 use opentelemetry::propagation::TextMapCompositePropagator;
-use parking_lot::Mutex;
 use std::mem::take;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tracing::info;
 
 pub mod config;
@@ -50,8 +51,8 @@ impl<T> HighLevelClient<T> {
     }
 
     /// Returns a view of the current consumer state.
-    pub fn consumer_state(&self) -> ConsumerStateView<T> {
-        ConsumerStateView(self.consumer.lock())
+    pub async fn consumer_state(&self) -> ConsumerStateView<T> {
+        ConsumerStateView(self.consumer.lock().await)
     }
 
     /// Returns a reference to the OpenTelemetry propagator.
@@ -68,6 +69,7 @@ impl<T> HighLevelClient<T> {
     /// * `consumer_builder` - Builder for the consumer configuration.
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
+    /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Errors
     ///
@@ -81,6 +83,7 @@ impl<T> HighLevelClient<T> {
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
+        cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Result<Self, HighLevelClientError> {
         // Set the producer source system to the consumer group if unspecified
         if let (None, Some(group_id)) = (
@@ -98,8 +101,13 @@ impl<T> HighLevelClient<T> {
             Mode::BestEffort => ProsodyProducer::best_effort_producer(cloned_config),
         }?;
 
-        let consumer_state =
-            ConsumerState::build(mode, consumer_builder, retry_builder, failure_topic_builder);
+        let consumer_state = ConsumerState::build(
+            mode,
+            consumer_builder,
+            retry_builder,
+            failure_topic_builder,
+            cassandra_builder,
+        );
 
         // Check for topic existence only if not in mock mode
         if !producer_config.mock {
@@ -149,11 +157,11 @@ impl<T> HighLevelClient<T> {
     /// - The consumer is unconfigured.
     /// - The consumer is already subscribed.
     /// - Consumer initialization fails.
-    pub fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
+    pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
     where
         T: FallibleHandler,
     {
-        let mut guard = self.consumer.lock();
+        let mut guard = self.consumer.lock().await;
         let consumer_ref = &mut *guard;
 
         let config = match take(consumer_ref) {
@@ -167,22 +175,44 @@ impl<T> HighLevelClient<T> {
 
         // Initialize the consumer based on the mode configuration
         let consumer = match &config {
-            ModeConfiguration::Pipeline { consumer, retry } => {
-                ProsodyConsumer::pipeline_consumer(consumer, retry.clone(), handler.clone())?
+            ModeConfiguration::Pipeline {
+                consumer,
+                retry,
+                trigger_store,
+                ..
+            } => {
+                ProsodyConsumer::pipeline_consumer(
+                    consumer,
+                    trigger_store,
+                    retry.clone(),
+                    handler.clone(),
+                )
+                .await?
             }
             ModeConfiguration::LowLatency {
                 consumer,
                 retry,
                 failure_topic,
-            } => ProsodyConsumer::low_latency_consumer(
+                trigger_store,
+                ..
+            } => {
+                ProsodyConsumer::low_latency_consumer(
+                    consumer,
+                    trigger_store,
+                    retry.clone(),
+                    failure_topic.clone(),
+                    self.producer.clone(),
+                    handler.clone(),
+                )
+                .await?
+            }
+            ModeConfiguration::BestEffort {
                 consumer,
-                retry.clone(),
-                failure_topic.clone(),
-                self.producer.clone(),
-                handler.clone(),
-            )?,
-            ModeConfiguration::BestEffort { consumer, .. } => {
-                ProsodyConsumer::best_effort_consumer(consumer, handler.clone())?
+                trigger_store,
+                ..
+            } => {
+                ProsodyConsumer::best_effort_consumer(consumer, trigger_store, handler.clone())
+                    .await?
             }
         };
 
@@ -203,7 +233,7 @@ impl<T> HighLevelClient<T> {
     /// subscribed.
     pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError> {
         let consumer = {
-            let mut guard = self.consumer.lock();
+            let mut guard = self.consumer.lock().await;
             let consumer_ref = &mut *guard;
 
             match take(consumer_ref) {
@@ -228,8 +258,8 @@ impl<T> HighLevelClient<T> {
     /// Returns the number of partitions assigned to the consumer.
     ///
     /// Returns 0 if the consumer is not in the Running state.
-    pub fn assigned_partition_count(&self) -> u32 {
-        let ConsumerState::Running { ref consumer, .. } = *self.consumer_state() else {
+    pub async fn assigned_partition_count(&self) -> u32 {
+        let ConsumerState::Running { ref consumer, .. } = *self.consumer_state().await else {
             return 0;
         };
 
@@ -239,8 +269,8 @@ impl<T> HighLevelClient<T> {
     /// Checks if the consumer is stalled.
     ///
     /// Returns `false` if the consumer is not in the Running state.
-    pub fn is_stalled(&self) -> bool {
-        let ConsumerState::Running { ref consumer, .. } = *self.consumer_state() else {
+    pub async fn is_stalled(&self) -> bool {
+        let ConsumerState::Running { ref consumer, .. } = *self.consumer_state().await else {
             return false;
         };
 

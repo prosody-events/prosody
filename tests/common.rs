@@ -6,12 +6,12 @@
 //! consumer tasks, and verifying message integrity and order in property-based
 //! tests.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::implicit_hasher)]
 
 use std::cmp::max;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Formatter};
-use std::time::Duration;
+use std::time::Duration as StdDuration;
 
 use ahash::{HashMap, HashMapExt};
 use color_eyre::eyre::{Result, eyre};
@@ -19,9 +19,13 @@ use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
 use prosody::Topic;
 use prosody::admin::ProsodyAdminClient;
-use prosody::consumer::message::{MessageContext, UncommittedMessage};
+use prosody::consumer::event_context::EventContext;
+use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::timers::UncommittedTimer;
+use prosody::timers::store::cassandra::CassandraConfiguration;
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{Sender, channel};
@@ -145,8 +149,8 @@ pub fn create_configs(
         .group_id("test-consumer")
         .subscribed_topics(&[topic.to_string()])
         .max_enqueued_per_key(max_enqueued_per_key.value())
-        .commit_interval(Duration::from_secs(1))
-        .stall_threshold(Duration::from_secs(60))
+        .commit_interval(StdDuration::from_secs(1))
+        .stall_threshold(StdDuration::from_secs(60))
         .probe_port(None)
         .build()?;
 
@@ -219,7 +223,12 @@ pub fn spawn_consumers(
         let handler = TestHandler { messages_tx };
 
         tasks.spawn(async move {
-            let consumer = ProsodyConsumer::new::<TestHandler>(&consumer_config, handler)?;
+            let consumer = ProsodyConsumer::new::<TestHandler>(
+                &consumer_config,
+                &create_cassandra_trigger_store_config(),
+                handler,
+            )
+            .await?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?; // Wait for shutdown signal
             consumer.shutdown().await; // Shut down consumer gracefully
             Ok(())
@@ -366,6 +375,29 @@ pub async fn run_test(input: TestInput) -> Result<()> {
     Ok(())
 }
 
+/// Creates a Cassandra trigger store configuration for integration tests.
+///
+/// Uses the same configuration pattern as the Cassandra store unit tests,
+/// connecting to localhost:9042 with a test keyspace.
+///
+/// # Returns
+///
+/// A `TriggerStoreConfiguration::Cassandra` configured for testing.
+#[must_use]
+pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
+    let cassandra_config = CassandraConfiguration {
+        datacenter: None,
+        rack: None,
+        nodes: vec!["localhost:9042".to_owned()],
+        keyspace: "prosody_integration_test".to_owned(),
+        user: None,
+        password: None,
+        retention: StdDuration::from_secs(10 * 60).into(),
+    };
+
+    TriggerStoreConfiguration::Cassandra(cassandra_config)
+}
+
 /// A simple test implementation of the `EventHandler` trait that forwards
 /// messages to a channel.
 #[derive(Clone, Debug)]
@@ -375,7 +407,10 @@ pub struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
+    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
+    where
+        C: EventContext,
+    {
         let (msg, uncommitted) = message.into_inner();
         let message = msg.into_value();
 
@@ -389,6 +424,13 @@ impl EventHandler for TestHandler {
         }
 
         uncommitted.commit(); // Commit message to mark as processed
+    }
+
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    where
+        C: EventContext,
+        U: UncommittedTimer,
+    {
     }
 
     async fn shutdown(self) {
@@ -406,18 +448,28 @@ pub struct SlowTestHandler {
 
 impl EventHandler for SlowTestHandler {
     #[instrument(skip(self, _context))]
-    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
+    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
+    where
+        C: EventContext,
+    {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
         let payload: Value = msg.payload().clone();
 
         // Simulate backpressure with a delay
-        sleep(Duration::from_secs(1)).await;
+        sleep(StdDuration::from_secs(1)).await;
 
         if let Err(e) = self.messages_tx.send((key.clone(), payload)).await {
             error!("failed to send message for key {}: {e:#}", key);
         }
         uncommitted.commit(); // Commit message to mark as processed
+    }
+
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    where
+        C: EventContext,
+        U: UncommittedTimer,
+    {
     }
 
     async fn shutdown(self) {

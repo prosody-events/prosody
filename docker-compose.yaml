@@ -1,7 +1,6 @@
 services:
   lgtm:
     image: grafana/otel-lgtm:0.8.1
-    container_name: lgtm
     ports:
       - "3000:3000" # Grafana UI
       - "4317:4317" # OTLP gRPC ingest
@@ -28,8 +27,13 @@ services:
       - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
       - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+  cassandra:
+    image: cassandra:latest
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
   console:
-    container_name: console
     image: docker.redpanda.com/redpandadata/console:v2.6.0
     entrypoint: /bin/sh
     command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
@@ -44,4 +48,5 @@ services:
       - kafka
 volumes:
   kafka_data:
+  cassandra_data:
   lgtm_data:

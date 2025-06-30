@@ -83,6 +83,6 @@ impl FromStr for Mode {
 #[derive(Debug, Error)]
 pub enum ModeError {
     /// Error when an unknown mode string is provided.
-    #[error("unknown mode: '{0}'")]
+    #[error("unknown mode: '{0:#}'")]
     UnknownMode(String),
 }

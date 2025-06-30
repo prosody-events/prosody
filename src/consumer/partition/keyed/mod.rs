@@ -21,8 +21,8 @@ use std::hash::Hash;
 use std::time::Duration;
 
 use crate::consumer::Keyed;
-use crate::consumer::heartbeat::Heartbeat;
 use crate::consumer::partition::util::WithValue;
+use crate::heartbeat::Heartbeat;
 use ahash::RandomState;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt, pin_mut};

@@ -6,9 +6,11 @@
 use color_eyre::eyre::{self, ensure};
 use eyre::Result;
 use prosody::admin::ProsodyAdminClient;
-use prosody::consumer::message::{MessageContext, UncommittedMessage};
+use prosody::consumer::event_context::EventContext;
+use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::timers::UncommittedTimer;
 use prosody::{Payload, Topic};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -27,12 +29,22 @@ struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message(&self, _ctx: MessageContext, msg: UncommittedMessage) {
+    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage)
+    where
+        C: EventContext,
+    {
         let (inner, uncommitted) = msg.into_inner();
         let key = inner.key().to_string();
         let payload = inner.payload().clone();
         let _ = self.tx.send((key, payload)).await;
         uncommitted.commit();
+    }
+
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    where
+        C: EventContext,
+        U: UncommittedTimer,
+    {
     }
 
     async fn shutdown(self) {}
@@ -276,7 +288,15 @@ async fn test_producer_deduplication() -> Result<()> {
             .build()?;
         let (tx, rx) = channel(16);
         let handler = TestHandler { tx };
-        (ProsodyConsumer::new::<TestHandler>(&cfg, handler)?, rx)
+        (
+            ProsodyConsumer::new::<TestHandler>(
+                &cfg,
+                &common::create_cassandra_trigger_store_config(),
+                handler,
+            )
+            .await?,
+            rx,
+        )
     };
     let (consumer_client, mut rx) = consumer;
 

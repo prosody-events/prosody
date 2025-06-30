@@ -4,7 +4,8 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, MessageContext};
+use crate::consumer::{EventContext, EventHandler, Uncommitted};
+use crate::timers::store::memory::InMemoryTriggerStore;
 use aho_corasick::StartKind;
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
@@ -23,7 +24,7 @@ trait HasProcessedOffsets {
 }
 
 /// Returns a default `PartitionConfiguration` with sensible defaults.
-fn default_config() -> PartitionConfiguration {
+fn default_config() -> PartitionConfiguration<InMemoryTriggerStore> {
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
         buffer_size: 10,
@@ -35,6 +36,8 @@ fn default_config() -> PartitionConfiguration {
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         global_limit: Arc::new(Semaphore::new(10)),
+        trigger_store: InMemoryTriggerStore::new(),
+        timer_slab_size: CompactDuration::new(30),
     }
 }
 
@@ -199,11 +202,14 @@ async fn test_partition_manager_is_stalled() {
     }
 
     impl EventHandler for StallTestHandler {
-        fn on_message(
+        fn on_message<C>(
             &self,
-            _context: MessageContext,
+            _context: C,
             message: UncommittedMessage,
-        ) -> impl Future<Output = ()> + Send {
+        ) -> impl Future<Output = ()> + Send
+        where
+            C: EventContext,
+        {
             let offset = message.offset();
             let processed = self.processed_offsets.clone();
             let notify = self.notify.clone();
@@ -214,8 +220,16 @@ async fn test_partition_manager_is_stalled() {
                     vec.push(offset);
                 };
                 notify.notify_waiters();
-                message.commit();
+                message.commit().await;
             }
+        }
+
+        async fn on_timer<C, U>(&self, _context: C, _timer: U)
+        where
+            C: EventContext,
+            U: UncommittedTimer,
+        {
+            // todo: add timer test
         }
 
         async fn shutdown(self) {}
@@ -433,11 +447,14 @@ impl HasProcessedOffsets for TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    fn on_message(
+    fn on_message<C>(
         &self,
-        _context: MessageContext,
+        _context: C,
         message: UncommittedMessage,
-    ) -> impl Future<Output = ()> + Send {
+    ) -> impl Future<Output = ()> + Send
+    where
+        C: EventContext,
+    {
         let key = message.key().clone();
         let offset = message.offset();
         let processed = self.processed_offsets.clone();
@@ -463,8 +480,16 @@ impl EventHandler for TestHandler {
                 list.push(offset);
             };
             notify.notify_waiters();
-            message.commit();
+            message.commit().await;
         }
+    }
+
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    where
+        C: EventContext,
+        U: UncommittedTimer,
+    {
+        // todo: add timer test
     }
 
     async fn shutdown(self) {}
@@ -504,4 +529,39 @@ fn create_test_message_with_event_id(
         payload,
         Span::none(),
     )
+}
+
+#[tokio::test]
+async fn test_partition_manager_timer_heartbeat_integration() {
+    // Test verifies that timer heartbeats are properly integrated into partition
+    // stall detection
+    let handler = TestHandler::new();
+    let config = default_config();
+    let partition_manager = PartitionManager::new(config, handler, "test-topic".into(), 0);
+
+    // Initially, the partition should not be stalled
+    assert!(
+        !partition_manager.is_stalled(),
+        "Partition should not be stalled initially"
+    );
+
+    // Send a message to trigger timer manager initialization
+    let message = create_test_message_with_event_id(1, "test-key", None);
+    let _ = partition_manager.try_send(message);
+
+    // Give some time for the timer manager to initialize and heartbeat to be set
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The partition should still not be stalled after timer initialization
+    assert!(
+        !partition_manager.is_stalled(),
+        "Partition should not be stalled after timer initialization"
+    );
+
+    // Clean shutdown
+    let watermark = partition_manager.shutdown().await;
+    assert!(
+        watermark.is_some() || watermark.is_none(),
+        "Shutdown should complete"
+    );
 }

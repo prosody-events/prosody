@@ -91,8 +91,12 @@ async fn run_scenario(
 
     // Set up a channel to communicate received messages.
     let (tx, mut rx) = channel(10);
-    let consumer =
-        ProsodyConsumer::new::<TestHandler>(&consumer_config, TestHandler { messages_tx: tx })?;
+    let consumer = ProsodyConsumer::new::<TestHandler>(
+        &consumer_config,
+        &common::create_cassandra_trigger_store_config(),
+        TestHandler { messages_tx: tx },
+    )
+    .await?;
     let producer = ProsodyProducer::new(&producer_config)?;
 
     // Send a test message and an end-of-stream marker.

@@ -1,11 +1,26 @@
-//! Provides a mechanism to monitor and detect stalled consumer processes.
+//! Heartbeat monitoring system for detecting stalled processing components.
 //!
-//! This module implements a heartbeat system to track activity within consumer
-//! processes, allowing detection of stalled or unresponsive components.
+//! This module provides heartbeat monitoring for both consumer partition
+//! processing and timer system operations. The heartbeat system enables
+//! detection of stalled or unresponsive components by tracking regular activity
+//! signals.
+//!
+//! # Core Components
+//!
+//! - [`Heartbeat`]: Individual monitor for a single component
+//! - [`HeartbeatRegistry`]: Collection of heartbeats with shared stall
+//!   detection
+//!
+//! # Integration Points
+//!
+//! - **Partition processing**: Monitors message processing loops for stalls
+//! - **Timer system**: Monitors slab loading and trigger scheduling operations
+//! - **Health probes**: Used by readiness/liveness endpoints for service health
 
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use humantime::format_duration;
+use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +33,74 @@ use tracing::{error, info};
 /// The heartbeat check interval is calculated as the stall threshold divided by
 /// this value, resulting in more frequent checks than the threshold itself.
 const HEARTBEAT_MARGIN: u32 = 5;
+
+/// Registry for managing multiple heartbeat monitors with a shared stall
+/// threshold.
+///
+/// Maintains a collection of heartbeats that all use the same stall detection
+/// threshold, typically representing components within the same processing
+/// context (e.g., partition, segment).
+#[derive(Educe, Clone)]
+#[educe(Debug)]
+pub struct HeartbeatRegistry {
+    base_name: String,
+    stall_threshold: Duration,
+
+    #[educe(Debug(ignore))]
+    heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
+}
+
+impl HeartbeatRegistry {
+    /// Creates a new heartbeat registry with the specified base name and stall
+    /// threshold.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_name` - Base name prefix for all heartbeats registered with this
+    ///   registry
+    /// * `stall_threshold` - Duration of inactivity before considering
+    ///   components stalled
+    #[must_use]
+    pub fn new(base_name: String, stall_threshold: Duration) -> Self {
+        Self {
+            base_name,
+            stall_threshold,
+            heartbeats: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Registers a new heartbeat with the configured stall threshold.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name suffix for this specific heartbeat
+    #[must_use]
+    pub fn register(&self, name: &str) -> Heartbeat {
+        let mut registry = self.heartbeats.lock();
+        let heartbeat = Heartbeat::new(format!("{} {name}", &self.base_name), self.stall_threshold);
+        registry.push(heartbeat.clone());
+        heartbeat
+    }
+
+    /// Checks if any registered heartbeat is currently stalled.
+    ///
+    /// # Returns
+    ///
+    /// `true` if at least one heartbeat exceeds its stall threshold, `false`
+    /// otherwise
+    pub fn any_stalled(&self) -> bool {
+        self.heartbeats.lock().iter().any(Heartbeat::is_stalled)
+    }
+
+    /// Creates a test heartbeat registry with default settings.
+    ///
+    /// Only intended for use in tests and examples.
+    #[cfg(test)]
+    #[must_use]
+    pub fn test() -> Self {
+        Self::new("test".to_owned(), Duration::from_secs(30))
+    }
+}
 
 /// A mechanism for monitoring activity and detecting stalled processes.
 ///

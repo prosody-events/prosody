@@ -8,15 +8,17 @@ use std::time::Duration;
 
 use derive_builder::Builder;
 use humantime::format_duration;
-use rand::{Rng, rng};
+use rand::Rng;
 use tokio::select;
 use tokio::time::sleep;
 use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
+use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider, Keyed};
+use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::{EventHandler, HandlerProvider, Keyed, Uncommitted};
+use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 
 /// Configuration for the retry strategy.
@@ -122,7 +124,7 @@ impl<T> RetryHandler<T> {
             self.max_delay_millis,
         );
 
-        let jitter = rng().random_range(0..exp_backoff);
+        let jitter = rand::rng().random_range(0..exp_backoff);
         Duration::from_millis(jitter)
     }
 }
@@ -161,11 +163,10 @@ where
     /// # Errors
     ///
     /// Returns the underlying handler's error if all retry attempts fail.
-    async fn on_message(
-        &self,
-        context: MessageContext,
-        message: ConsumerMessage,
-    ) -> Result<(), Self::Error> {
+    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
         let topic = message.topic();
         let partition = message.partition();
         let key = message.key();
@@ -248,6 +249,52 @@ where
             }
         }
     }
+
+    async fn on_timer<C>(&self, context: C, timer: Trigger) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        // Retry logic for a fired timer
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+            // Try handling the timer
+            let Err(error) = self.handler.on_timer(context.clone(), timer.clone()).await else {
+                return Ok(());
+            };
+            // If shutdown was requested, stop retrying
+            if context.should_shutdown() {
+                return Err(error);
+            }
+            match error.classify_error() {
+                ErrorCategory::Transient => {
+                    if attempt > self.max_retries {
+                        error!("failed to handle timer: {error:#}; maximum attempts reached");
+                        return Err(error);
+                    }
+                    let sleep_time = self.sleep_time(attempt);
+                    error!(
+                        "failed to handle timer: {error:#}; retrying after {}",
+                        format_duration(sleep_time)
+                    );
+                    select! {
+                        () = sleep(sleep_time) => {},
+                        () = context.on_shutdown() => return Err(error),
+                    }
+                }
+                ErrorCategory::Permanent => {
+                    error!("permanently failed to handle timer: {error:#}");
+                    return Err(error);
+                }
+                ErrorCategory::Terminal => {
+                    info!(
+                        "terminal condition encountered while handling timer: {error:#}; aborting"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
 }
 
 impl<T> EventHandler for RetryHandler<T>
@@ -261,7 +308,10 @@ where
     ///
     /// * `context` - The message context.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    where
+        C: EventContext,
+    {
         let topic = message.topic();
         let partition = message.partition();
         let key = message.key().to_owned();
@@ -330,6 +380,61 @@ where
                          aborting"
                     );
                     uncommitted_offset.abort();
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn on_timer<C, U>(&self, context: C, timer: U)
+    where
+        C: EventContext,
+        U: UncommittedTimer,
+    {
+        // Retry logic for an uncommitted timer
+        let (trigger, uncommitted) = timer.into_inner();
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+            // Try handling the timer
+            let Err(error) = self
+                .handler
+                .on_timer(context.clone(), trigger.clone())
+                .await
+            else {
+                uncommitted.commit().await;
+                break;
+            };
+            // If shutdown was requested, abort and stop retrying
+            if context.should_shutdown() {
+                uncommitted.abort().await;
+                break;
+            }
+            match error.classify_error() {
+                ErrorCategory::Transient => {
+                    let sleep_time = self.sleep_time(attempt);
+                    error!(
+                        "failed to handle timer: {error:#}; retrying after {}",
+                        format_duration(sleep_time)
+                    );
+                    select! {
+                        () = sleep(sleep_time) => {},
+                        () = context.on_shutdown() => {
+                            uncommitted.abort().await;
+                            break;
+                        }
+                    }
+                }
+                ErrorCategory::Permanent => {
+                    error!("permanently failed to handle timer: {error:#}; discarding timer");
+                    uncommitted.commit().await;
+                    break;
+                }
+                ErrorCategory::Terminal => {
+                    info!(
+                        "terminal condition encountered while handling timer: {error:#}; aborting"
+                    );
+                    uncommitted.abort().await;
                     break;
                 }
             }

@@ -9,11 +9,12 @@ use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ProsodyConsumer};
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::mode::Mode;
-use parking_lot::MutexGuard;
+use crate::timers::store::cassandra::CassandraConfigurationBuilder;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use thiserror::Error;
+use tokio::sync::MutexGuard;
 use tracing::info;
 
 /// A wrapper around a mutex guard for `ConsumerState`.
@@ -58,6 +59,7 @@ impl<T> ConsumerState<T> {
     /// * `consumer_builder` - Builder for the consumer configuration.
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
+    /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Returns
     ///
@@ -68,9 +70,15 @@ impl<T> ConsumerState<T> {
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
+        cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Self {
-        match ModeConfiguration::build(mode, consumer_builder, retry_builder, failure_topic_builder)
-        {
+        match ModeConfiguration::build(
+            mode,
+            consumer_builder,
+            retry_builder,
+            failure_topic_builder,
+            cassandra_builder,
+        ) {
             Ok(configuration) => Self::Configured(configuration),
             Err(error) => {
                 info!("disabling consumer: {error:#}");

@@ -13,47 +13,56 @@ license = "UNLICENSED"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/cincpro/prosody"
-version = "0.9.2"
+version = "0.10.0"
 
 [dependencies]
 ahash = "0.8"
 aho-corasick = "1.1"
+async-stream = "0.3"
+async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
 axum-extra = "0.10"
 chrono = "0.4"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
+dyn-clone = "1.0"
 educe = "0.6"
 fixedstr = { version = "0.5", features = ["flex-str"] }
 futures = "0.3"
 humantime = "2.2"
 internment = "0.8"
 nohash-hasher = "0.2"
-opentelemetry = "0.28"
-opentelemetry-otlp = { version = "0.28", features = [
+opentelemetry = "0.30"
+opentelemetry-otlp = { version = "0.30", features = [
     "grpc-tonic",
     "gzip-tonic",
     "tls",
     "tls-roots",
 ] }
-opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
 pin-project = "1.1"
 quick_cache = "0.6"
 rand = "0.9"
-rdkafka = { version = "0.37", features = ["tracing"] }
+rdkafka = { version = "0.37", features = ["cmake-build", "tracing"] }
+rust-embed = { version = "8.7", features = ["include-exclude"] }
+scc = "2.3"
+scylla = { version = "1.2", features = ["chrono-04", "rustls-023"] }
 serde = "1.0"
 serde_json = "1.0"
+sha2 = "0.10"
 simd-json = { version = "0.15", features = ["serde_impl"], optional = true }
 thiserror = "2.0"
-tokio = { version = "1.41", features = ["macros", "sync"] }
+tokio = { version = "1.45", features = ["macros", "sync"] }
 tokio-stream = "0.1"
-tonic = { version = "0.12", features = ["gzip", "tls", "tls-roots"] }
+tokio-util = { version = "0.7", features = ["time"] }
+tonic = { version = "0.13", features = ["gzip", "tls-webpki-roots"] }
 tracing = { version = "0.1", features = ["log"] }
-tracing-opentelemetry = "0.29"
+tracing-opentelemetry = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.17", features = ["v5"] }
 validator = { version = "0.20", features = ["derive"] }
-whoami = "1.5"
+whoami = "1.6"
 
 [features]
 cmake-build = ["rdkafka/cmake-build"]
@@ -69,7 +78,6 @@ itertools = "0.14"
 quickcheck = "1.0"
 quickcheck_macros = "1.1"
 reqwest = "0.12"
-scc = "2.3"
 tokio = { version = "1.44", features = ["rt-multi-thread", "test-util"] }
 uuid = { version = "1.16", features = ["v4"] }
 

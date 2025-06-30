@@ -38,20 +38,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::consumer::Uncommitted;
+use prosody::consumer::event_context::EventContext;
+use prosody::timers::UncommittedTimer;
 use prosody::{
-    Topic,
-    admin::ProsodyAdminClient,
-    consumer::ConsumerConfiguration,
-    consumer::EventHandler,
-    consumer::ProsodyConsumer,
-    consumer::message::{MessageContext, UncommittedMessage},
-    producer::ProducerConfiguration,
-    producer::ProsodyProducer,
+    Topic, admin::ProsodyAdminClient, consumer::ConsumerConfiguration, consumer::EventHandler,
+    consumer::ProsodyConsumer, consumer::message::UncommittedMessage,
+    producer::ProducerConfiguration, producer::ProsodyProducer,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
+
+#[path = "common.rs"]
+mod common;
 
 /// A custom event handler for testing the global concurrency limit enforcement.
 ///
@@ -75,7 +76,10 @@ struct ConcurrencyTestHandler {
 }
 
 impl EventHandler for ConcurrencyTestHandler {
-    async fn on_message(&self, _context: MessageContext, message: UncommittedMessage) {
+    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
+    where
+        C: EventContext,
+    {
         // Increment the current processing count and update maximum observed
         // concurrency
         let current = self.current.fetch_add(1, Ordering::AcqRel) + 1;
@@ -92,12 +96,19 @@ impl EventHandler for ConcurrencyTestHandler {
         // Mark processing as complete
         self.current.fetch_sub(1, Ordering::AcqRel);
         self.processed.fetch_add(1, Ordering::AcqRel);
-        message.commit();
+        message.commit().await;
 
         // If all expected messages have been processed, notify waiters
         if self.processed.load(Ordering::Acquire) == self.total {
             self.notify.notify_waiters();
         }
+    }
+
+    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    where
+        C: EventContext,
+        U: UncommittedTimer,
+    {
     }
 
     async fn shutdown(self) {}
@@ -184,8 +195,12 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     };
 
     // Create the consumer with the test handler
-    let consumer: ProsodyConsumer =
-        ProsodyConsumer::new::<ConcurrencyTestHandler>(&consumer_config, handler.clone())?;
+    let consumer: ProsodyConsumer = ProsodyConsumer::new::<ConcurrencyTestHandler>(
+        &consumer_config,
+        &common::create_cassandra_trigger_store_config(),
+        handler.clone(),
+    )
+    .await?;
 
     // Configure and create the producer
     let producer_config = ProducerConfiguration::builder()

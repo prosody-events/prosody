@@ -29,15 +29,16 @@ use tracing::field::Empty;
 use tracing::{debug, error, info_span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::consumer::context::Context;
 use crate::consumer::extractor::MessageExtractor;
+use crate::consumer::kafka_context::Context;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
+use crate::heartbeat::Heartbeat;
 use crate::propagator::new_propagator;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
-use crate::consumer::heartbeat::Heartbeat;
+use crate::timers::store::TriggerStore;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
 #[cfg(not(target_arch = "arm"))]
@@ -53,15 +54,16 @@ use simd_json::serde::from_reader_with_buffers;
 ///
 /// * `T` - A type implementing [`HandlerProvider`] that creates message
 ///   handlers for assigned partitions.
-pub struct PollConfig<'a, T>
+pub struct PollConfig<'a, T, S>
 where
     T: HandlerProvider,
+    S: TriggerStore,
 {
     /// Time between consecutive poll operations
     pub poll_interval: Duration,
 
     /// The configured Kafka consumer with context
-    pub consumer: BaseConsumer<Context<T>>,
+    pub consumer: BaseConsumer<Context<T, S>>,
 
     /// Reference to counter tracking watermark version changes
     pub watermark_version: &'a WatermarkVersion,
@@ -91,9 +93,10 @@ where
 /// # Arguments
 ///
 /// * `config` - The configuration for the polling process
-pub fn poll<T>(config: PollConfig<T>)
+pub fn poll<T, S>(config: PollConfig<T, S>)
 where
     T: HandlerProvider,
+    S: TriggerStore,
 {
     // Create buffers for SIMD JSON parsing if on supported platforms
     #[cfg(not(target_arch = "arm"))]
@@ -338,13 +341,14 @@ fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, manage
 /// * `watermark_version` - Counter tracking changes to committed offsets
 /// * `managers` - Collection of partition managers that track committed offsets
 /// * `last_version` - The last processed watermark version
-fn store_watermarks<T>(
-    consumer: &BaseConsumer<Context<T>>,
+fn store_watermarks<T, S>(
+    consumer: &BaseConsumer<Context<T, S>>,
     watermark_version: &WatermarkVersion,
     managers: &Managers,
     last_version: &mut usize,
 ) where
     T: HandlerProvider,
+    S: TriggerStore,
 {
     // Skip if no watermark updates have occurred
     let current_version = watermark_version.load(Ordering::Acquire);
@@ -419,13 +423,14 @@ fn store_watermarks<T>(
 /// # Errors
 ///
 /// Returns any error from the underlying Kafka pause/resume operations.
-fn pause_busy_partitions<T>(
+fn pause_busy_partitions<T, S>(
     is_paused: &mut bool,
-    consumer: &BaseConsumer<Context<T>>,
+    consumer: &BaseConsumer<Context<T, S>>,
     managers: &Managers,
 ) -> Result<(), KafkaError>
 where
     T: HandlerProvider,
+    S: TriggerStore,
 {
     let managers = managers.read();
 

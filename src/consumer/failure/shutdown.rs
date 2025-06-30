@@ -4,9 +4,11 @@
 //! partition is being revoked, ensuring proper handling of in-flight messages
 //! and preventing new message processing.
 
+use crate::consumer::event_context::EventContext;
 use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, MessageContext, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider};
+use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::{EventHandler, HandlerProvider, Uncommitted};
+use crate::timers::{Trigger, UncommittedTimer};
 use thiserror::Error;
 
 /// A strategy that checks if the partition is shutting down before running the
@@ -52,17 +54,29 @@ where
     ///
     /// Returns a `ShutdownError::Shutdown` if the partition is being revoked,
     /// or a `ShutdownError::Handler` containing the wrapped handler's error.
-    async fn on_message(
-        &self,
-        context: MessageContext,
-        message: ConsumerMessage,
-    ) -> Result<(), Self::Error> {
+    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
         if context.should_shutdown() {
             return Err(ShutdownError::Shutdown);
         }
 
         self.0
             .on_message(context, message)
+            .await
+            .map_err(ShutdownError::Handler)
+    }
+
+    async fn on_timer<C>(&self, context: C, timer: Trigger) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        if context.should_shutdown() {
+            return Err(ShutdownError::Shutdown);
+        }
+        self.0
+            .on_timer(context, timer)
             .await
             .map_err(ShutdownError::Handler)
     }
@@ -78,7 +92,10 @@ where
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message(&self, context: MessageContext, message: UncommittedMessage) {
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    where
+        C: EventContext,
+    {
         let (message, uncommitted_offset) = message.into_inner();
 
         // Check if the partition is being revoked
@@ -97,6 +114,32 @@ where
         match error.classify_error() {
             ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted_offset.commit(),
             ErrorCategory::Terminal => uncommitted_offset.abort(),
+        }
+    }
+
+    async fn on_timer<C, U>(&self, context: C, timer: U)
+    where
+        C: EventContext,
+        U: UncommittedTimer,
+    {
+        let (trigger, uncommitted) = timer.into_inner();
+
+        // Check if the partition is being revoked
+        if context.should_shutdown() {
+            uncommitted.abort().await;
+            return;
+        }
+
+        // Process the timer and handle potential errors
+        let Err(error) = self.0.on_timer(context, trigger).await else {
+            uncommitted.commit().await;
+            return;
+        };
+
+        // Commit or abort based on the error category
+        match error.classify_error() {
+            ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted.commit().await,
+            ErrorCategory::Terminal => uncommitted.abort().await,
         }
     }
 
