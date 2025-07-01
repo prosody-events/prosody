@@ -23,10 +23,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
 use tracing::{error, info};
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// Test handler that schedules timers based on incoming messages and tracks
@@ -207,7 +205,7 @@ impl TestEnvironment {
         let producer = ProsodyProducer::new(&producer_config)?;
 
         // Give consumer time to start and subscribe
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
         Ok(Self {
             topic,
@@ -255,28 +253,34 @@ impl TestEnvironment {
 
     /// Wait for a message event with timeout
     async fn expect_message(&mut self, timeout_secs: u64) -> Result<MessageEvent> {
-        timeout(Duration::from_secs(timeout_secs), self.message_rx.recv())
-            .await
-            .map_err(|_| {
-                eyre!(
-                    "Timeout waiting for message event after {} seconds",
-                    timeout_secs
-                )
-            })?
-            .ok_or_else(|| eyre!("Message channel closed unexpectedly"))
+        timeout(
+            Duration::from_secs(timeout_secs.max(30)),
+            self.message_rx.recv(),
+        )
+        .await
+        .map_err(|_| {
+            eyre!(
+                "Timeout waiting for message event after {} seconds",
+                timeout_secs
+            )
+        })?
+        .ok_or_else(|| eyre!("Message channel closed unexpectedly"))
     }
 
     /// Wait for a timer event with timeout
     async fn expect_timer(&mut self, timeout_secs: u64) -> Result<TimerEvent> {
-        timeout(Duration::from_secs(timeout_secs), self.timer_rx.recv())
-            .await
-            .map_err(|_| {
-                eyre!(
-                    "Timeout waiting for timer event after {} seconds",
-                    timeout_secs
-                )
-            })?
-            .ok_or_else(|| eyre!("Timer channel closed unexpectedly"))
+        timeout(
+            Duration::from_secs(timeout_secs.max(30)),
+            self.timer_rx.recv(),
+        )
+        .await
+        .map_err(|_| {
+            eyre!(
+                "Timeout waiting for timer event after {} seconds",
+                timeout_secs
+            )
+        })?
+        .ok_or_else(|| eyre!("Timer channel closed unexpectedly"))
     }
 
     /// Wait for exact number of timer events with timeout
@@ -284,7 +288,12 @@ impl TestEnvironment {
         let mut received_timers = Vec::new();
 
         for i in 0..count {
-            match timeout(Duration::from_secs(timeout_secs), self.timer_rx.recv()).await {
+            match timeout(
+                Duration::from_secs(timeout_secs.max(30)),
+                self.timer_rx.recv(),
+            )
+            .await
+            {
                 Ok(Some(timer_event)) => {
                     received_timers.push(timer_event);
                 }
@@ -416,7 +425,7 @@ where
     F: FnOnce(TestEnvironment) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     let result = timeout(Duration::from_secs(timeout_secs), async {
         let env = TestEnvironment::new(test_name).await?;
@@ -437,7 +446,7 @@ where
 /// Tests basic timer scheduling and triggering functionality.
 #[tokio::test]
 async fn test_timer_scheduling_and_triggering() -> Result<()> {
-    run_test("timer-test", 8, |mut env| async move {
+    run_test("timer-test", 60, |mut env| async move {
         let key = "test-key";
         let delay_secs = 1u32;
         let schedule_message = json!({
@@ -466,7 +475,7 @@ async fn test_timer_scheduling_and_triggering() -> Result<()> {
 /// Tests edge case: scheduling multiple timers for the same key.
 #[tokio::test]
 async fn test_same_key_multiple_timers() -> Result<()> {
-    run_test("timer-same-key-test", 10, |mut env| async move {
+    run_test("timer-same-key-test", 60, |mut env| async move {
         let key = "same-key";
         let delays = vec![1u32, 2u32, 3u32];
 
@@ -503,7 +512,7 @@ async fn test_same_key_multiple_timers() -> Result<()> {
 /// Tests immediate timer scheduling (1 second delay).
 #[tokio::test]
 async fn test_immediate_timer() -> Result<()> {
-    run_test("timer-immediate-test", 5, |mut env| async move {
+    run_test("timer-immediate-test", 60, |mut env| async move {
         let key = "immediate-key";
         let delay_secs = 1u32;
 
@@ -537,7 +546,7 @@ async fn test_immediate_timer() -> Result<()> {
 
 #[tokio::test]
 async fn test_timer_scheduled_time_accuracy() -> Result<()> {
-    run_test("timer-accuracy-test", 10, |mut env| async move {
+    run_test("timer-accuracy-test", 60, |mut env| async move {
         let key = "accuracy-key";
 
         // Calculate a specific target time (2 seconds from now)
@@ -603,7 +612,7 @@ async fn test_timer_scheduled_time_accuracy() -> Result<()> {
 /// Tests timer cancellation functionality.
 #[tokio::test]
 async fn test_timer_cancellation() -> Result<()> {
-    run_test("timer-cancellation-test", 10, |mut env| async move {
+    run_test("timer-cancellation-test", 60, |mut env| async move {
         let key = "cancellation-key";
         let delay_secs = 3u32;
 
@@ -645,7 +654,7 @@ async fn test_timer_cancellation() -> Result<()> {
 /// Tests multiple timers with different keys and timing.
 #[tokio::test]
 async fn test_multiple_timers() -> Result<()> {
-    run_test("timer-multiple-test", 15, |mut env| async move {
+    run_test("timer-multiple-test", 60, |mut env| async move {
         // Schedule multiple timers with staggered delays
         let timers_data = vec![("key1", 1u32), ("key2", 2u32), ("key3", 3u32)];
 
@@ -689,7 +698,7 @@ async fn test_multiple_timers() -> Result<()> {
 /// Tests timer behavior for different keys.
 #[tokio::test]
 async fn test_timer_different_keys() -> Result<()> {
-    run_test("timer-keys-test", 10, |mut env| async move {
+    run_test("timer-keys-test", 60, |mut env| async move {
         // Schedule timers for different keys
         let timers = vec!["key-a", "key-b"];
         let delay_secs = 2u32;

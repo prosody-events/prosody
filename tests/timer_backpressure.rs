@@ -19,10 +19,8 @@ use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::{Sender, channel};
 use tracing::{error, info};
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// A handler implementation that schedules timers from messages and simulates
@@ -97,7 +95,7 @@ impl EventHandler for SlowTimerHandler {
 #[tokio::test]
 async fn test_timer_backpressure() -> Result<()> {
     // Initialize the logger.
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     // Create a unique topic for the test
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();

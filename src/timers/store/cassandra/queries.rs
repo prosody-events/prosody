@@ -13,7 +13,9 @@
 //! - TTL and non-TTL variants of insert statements
 
 use super::migrator::EmbeddedMigrator;
-use crate::timers::store::cassandra::{CassandraConfiguration, CassandraTriggerStoreError};
+use crate::timers::store::cassandra::{
+    CassandraConfiguration, CassandraTriggerStoreError, TABLE_KEYS, TABLE_SEGMENTS, TABLE_SLABS,
+};
 use educe::Educe;
 use scylla::client::Compression;
 use scylla::client::execution_profile::ExecutionProfile;
@@ -155,27 +157,30 @@ impl Queries {
         let session = session.build().await?;
         let migrator = EmbeddedMigrator::new(&session, &configuration.keyspace);
         migrator.migrate().await?;
-        session.use_keyspace(configuration.keyspace, true).await?;
 
-        let insert_segment = prepare_insert_segment(&session).await?;
-        let get_segment = prepare_get_segment(&session).await?;
-        let delete_segment = prepare_delete_segment(&session).await?;
-        let get_slabs = prepare_get_slabs(&session).await?;
-        let get_slab_range = prepare_get_slab_range(&session).await?;
-        let insert_slab = prepare_insert_slab(&session).await?;
-        let delete_slab = prepare_delete_slab(&session).await?;
-        let get_slab_triggers = prepare_get_slab_triggers(&session).await?;
-        let insert_slab_trigger = prepare_insert_slab_trigger(&session).await?;
-        let delete_slab_trigger = prepare_delete_slab_trigger(&session).await?;
-        let clear_slab_triggers = prepare_clear_slab_triggers(&session).await?;
-        let get_key_times = prepare_get_key_times(&session).await?;
-        let get_key_triggers = prepare_get_key_triggers(&session).await?;
-        let insert_key_trigger = prepare_insert_key_trigger(&session).await?;
-        let delete_key_trigger = prepare_delete_key_trigger(&session).await?;
-        let clear_key_triggers = prepare_clear_key_triggers(&session).await?;
-        let insert_slab_no_ttl = prepare_insert_slab_no_ttl(&session).await?;
-        let insert_slab_trigger_no_ttl = prepare_insert_slab_trigger_no_ttl(&session).await?;
-        let insert_key_trigger_no_ttl = prepare_insert_key_trigger_no_ttl(&session).await?;
+        let keyspace = &configuration.keyspace;
+
+        let insert_segment = prepare_insert_segment(&session, keyspace).await?;
+        let get_segment = prepare_get_segment(&session, keyspace).await?;
+        let delete_segment = prepare_delete_segment(&session, keyspace).await?;
+        let get_slabs = prepare_get_slabs(&session, keyspace).await?;
+        let get_slab_range = prepare_get_slab_range(&session, keyspace).await?;
+        let insert_slab = prepare_insert_slab(&session, keyspace).await?;
+        let delete_slab = prepare_delete_slab(&session, keyspace).await?;
+        let get_slab_triggers = prepare_get_slab_triggers(&session, keyspace).await?;
+        let insert_slab_trigger = prepare_insert_slab_trigger(&session, keyspace).await?;
+        let delete_slab_trigger = prepare_delete_slab_trigger(&session, keyspace).await?;
+        let clear_slab_triggers = prepare_clear_slab_triggers(&session, keyspace).await?;
+        let get_key_times = prepare_get_key_times(&session, keyspace).await?;
+        let get_key_triggers = prepare_get_key_triggers(&session, keyspace).await?;
+        let insert_key_trigger = prepare_insert_key_trigger(&session, keyspace).await?;
+        let delete_key_trigger = prepare_delete_key_trigger(&session, keyspace).await?;
+        let clear_key_triggers = prepare_clear_key_triggers(&session, keyspace).await?;
+        let insert_slab_no_ttl = prepare_insert_slab_no_ttl(&session, keyspace).await?;
+        let insert_slab_trigger_no_ttl =
+            prepare_insert_slab_trigger_no_ttl(&session, keyspace).await?;
+        let insert_key_trigger_no_ttl =
+            prepare_insert_key_trigger_no_ttl(&session, keyspace).await?;
 
         Ok(Self {
             session,
@@ -208,10 +213,11 @@ impl Queries {
 /// slab_size) VALUES (?, ?, ?)`
 async fn prepare_insert_segment(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "insert into segments (id, name, slab_size) values (?, ?, ?)",
+        &format!("insert into {keyspace}.{TABLE_SEGMENTS} (id, name, slab_size) values (?, ?, ?)"),
     )
     .await
 }
@@ -222,10 +228,11 @@ async fn prepare_insert_segment(
 /// WHERE id = ? LIMIT 1`
 async fn prepare_get_segment(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "select name, slab_size from segments where id = ? limit 1",
+        &format!("select name, slab_size from {keyspace}.{TABLE_SEGMENTS} where id = ? limit 1"),
     )
     .await
 }
@@ -235,8 +242,13 @@ async fn prepare_get_segment(
 /// Creates a prepared statement for: `DELETE FROM segments WHERE id = ?`
 async fn prepare_delete_segment(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(session, "delete from segments where id = ?").await
+    prepare(
+        session,
+        &format!("delete from {keyspace}.{TABLE_SEGMENTS} where id = ?"),
+    )
+    .await
 }
 
 /// Prepares a CQL statement for retrieving all slab IDs for a segment.
@@ -245,8 +257,13 @@ async fn prepare_delete_segment(
 /// ?`
 async fn prepare_get_slabs(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(session, "select slab_id from segments where id = ?").await
+    prepare(
+        session,
+        &format!("select slab_id from {keyspace}.{TABLE_SEGMENTS} where id = ?"),
+    )
+    .await
 }
 
 /// Prepares a CQL statement for retrieving slab IDs within a range.
@@ -255,10 +272,14 @@ async fn prepare_get_slabs(
 /// AND slab_id >= ? AND slab_id <= ?`
 async fn prepare_get_slab_range(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "select slab_id from segments where id = ? and slab_id >= ? and slab_id <= ?",
+        &format!(
+            "select slab_id from {keyspace}.{TABLE_SEGMENTS} where id = ? and slab_id >= ? and \
+             slab_id <= ?"
+        ),
     )
     .await
 }
@@ -269,10 +290,11 @@ async fn prepare_get_slab_range(
 /// (?, ?) USING TTL ?`
 async fn prepare_insert_slab(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "insert into segments (id, slab_id) values (?, ?) using ttl ?",
+        &format!("insert into {keyspace}.{TABLE_SEGMENTS} (id, slab_id) values (?, ?) using ttl ?"),
     )
     .await
 }
@@ -283,8 +305,13 @@ async fn prepare_insert_slab(
 /// slab_id = ?`
 async fn prepare_delete_slab(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(session, "delete from segments where id = ? and slab_id = ?").await
+    prepare(
+        session,
+        &format!("delete from {keyspace}.{TABLE_SEGMENTS} where id = ? and slab_id = ?"),
+    )
+    .await
 }
 
 /// Prepares a CQL statement for retrieving all triggers in a slab.
@@ -293,10 +320,13 @@ async fn prepare_delete_slab(
 /// segment_id = ? AND id = ?`
 async fn prepare_get_slab_triggers(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "select key, time, span from slabs where segment_id = ? and id = ?",
+        &format!(
+            "select key, time, span from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ?"
+        ),
     )
     .await
 }
@@ -307,10 +337,14 @@ async fn prepare_get_slab_triggers(
 /// time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?`
 async fn prepare_insert_slab_trigger(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "insert into slabs (segment_id, id, key, time, span) values (?, ?, ?, ?, ?) using ttl ?",
+        &format!(
+            "insert into {keyspace}.{TABLE_SLABS} (segment_id, id, key, time, span) values (?, ?, \
+             ?, ?, ?) using ttl ?"
+        ),
     )
     .await
 }
@@ -321,10 +355,14 @@ async fn prepare_insert_slab_trigger(
 /// AND id = ? AND key = ? AND time = ?`
 async fn prepare_delete_slab_trigger(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "delete from slabs where segment_id = ? and id = ? and key = ? and time = ?",
+        &format!(
+            "delete from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ? and key = ? and \
+             time = ?"
+        ),
     )
     .await
 }
@@ -335,8 +373,13 @@ async fn prepare_delete_slab_trigger(
 /// AND id = ?`
 async fn prepare_clear_slab_triggers(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(session, "delete from slabs where segment_id = ? and id = ?").await
+    prepare(
+        session,
+        &format!("delete from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ?"),
+    )
+    .await
 }
 
 /// Prepares a CQL statement for retrieving all scheduled times for a key.
@@ -345,10 +388,11 @@ async fn prepare_clear_slab_triggers(
 /// ? AND key = ?`
 async fn prepare_get_key_times(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "select time from keys where segment_id = ? and key = ?",
+        &format!("select time from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ?"),
     )
     .await
 }
@@ -359,10 +403,13 @@ async fn prepare_get_key_times(
 /// segment_id = ? AND key = ?`
 async fn prepare_get_key_triggers(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "select key, time, span from keys where segment_id = ? and key = ?",
+        &format!(
+            "select key, time, span from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ?"
+        ),
     )
     .await
 }
@@ -374,10 +421,14 @@ async fn prepare_get_key_triggers(
 /// span) VALUES (?, ?, ?, ?) USING TTL ?`
 async fn prepare_insert_key_trigger(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "insert into keys (segment_id, key, time, span) values (?, ?, ?, ?) using ttl ?",
+        &format!(
+            "insert into {keyspace}.{TABLE_KEYS} (segment_id, key, time, span) values (?, ?, ?, \
+             ?) using ttl ?"
+        ),
     )
     .await
 }
@@ -388,10 +439,13 @@ async fn prepare_insert_key_trigger(
 /// key = ? AND time = ?`
 async fn prepare_delete_key_trigger(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "delete from keys where segment_id = ? and key = ? and time = ?",
+        &format!(
+            "delete from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ? and time = ?"
+        ),
     )
     .await
 }
@@ -402,8 +456,13 @@ async fn prepare_delete_key_trigger(
 /// key = ?`
 async fn prepare_clear_key_triggers(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(session, "delete from keys where segment_id = ? and key = ?").await
+    prepare(
+        session,
+        &format!("delete from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ?"),
+    )
+    .await
 }
 
 /// Prepares a CQL statement for inserting a slab without TTL.
@@ -412,8 +471,13 @@ async fn prepare_clear_key_triggers(
 /// (?, ?)`
 async fn prepare_insert_slab_no_ttl(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(session, "insert into segments (id, slab_id) values (?, ?)").await
+    prepare(
+        session,
+        &format!("insert into {keyspace}.{TABLE_SEGMENTS} (id, slab_id) values (?, ?)"),
+    )
+    .await
 }
 
 /// Prepares a CQL statement for inserting a trigger into a slab without TTL.
@@ -422,10 +486,14 @@ async fn prepare_insert_slab_no_ttl(
 /// time, span) VALUES (?, ?, ?, ?, ?)`
 async fn prepare_insert_slab_trigger_no_ttl(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "insert into slabs (segment_id, id, key, time, span) values (?, ?, ?, ?, ?)",
+        &format!(
+            "insert into {keyspace}.{TABLE_SLABS} (segment_id, id, key, time, span) values (?, ?, \
+             ?, ?, ?)"
+        ),
     )
     .await
 }
@@ -437,10 +505,13 @@ async fn prepare_insert_slab_trigger_no_ttl(
 /// span) VALUES (?, ?, ?, ?)`
 async fn prepare_insert_key_trigger_no_ttl(
     session: &Session,
+    keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        "insert into keys (segment_id, key, time, span) values (?, ?, ?, ?)",
+        &format!(
+            "insert into {keyspace}.{TABLE_KEYS} (segment_id, key, time, span) values (?, ?, ?, ?)"
+        ),
     )
     .await
 }

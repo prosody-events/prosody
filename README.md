@@ -174,8 +174,13 @@ The following table lists the available configuration options and their associat
 |----------------------------------|--------------------------------------------------------------------------------|--------------|----------|----------|
 | `PROSODY_ALLOWED_EVENTS`         | Allowed event type prefixes (comma-separated). All allowed if unset.           | -            | ✓        |          |
 | `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                | -            | ✓        | ✓        |
+| `PROSODY_CASSANDRA_DATACENTER`   | Preferred datacenter for Cassandra query routing                               | -            | ✓        |          |
 | `PROSODY_CASSANDRA_KEYSPACE`     | Cassandra keyspace for timer storage                                           | prosody      | ✓        |          |
-| `PROSODY_CASSANDRA_RETENTION`    | How long to keep failed/unprocessed timer data                                | 30d          | ✓        |          |
+| `PROSODY_CASSANDRA_NODES`        | Comma-separated list of Cassandra contact nodes (required for timer storage)   | -            | ✓        |          |
+| `PROSODY_CASSANDRA_PASSWORD`     | Password for Cassandra authentication                                          | -            | ✓        |          |
+| `PROSODY_CASSANDRA_RACK`         | Preferred rack identifier for Cassandra topology-aware routing                 | -            | ✓        |          |
+| `PROSODY_CASSANDRA_RETENTION`    | How long to keep failed/unprocessed timer data                                 | 30d          | ✓        |          |
+| `PROSODY_CASSANDRA_USER`         | Username for Cassandra authentication                                          | -            | ✓        |          |
 | `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                             | 1s           | ✓        |          |
 | `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                  | -            | ✓        |          |
 | `PROSODY_GROUP_ID`               | Consumer group identifier                                                      | -            | ✓        |          |
@@ -184,7 +189,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure) | 8            | ✓        |          |
 | `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                  | 3            | ✓        |          |
 | `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition                           | 16           | ✓        |          |
-| `PROSODY_MOCK`                   | Use mock Kafka brokers for testing                                             | false        | ✓        | ✓        |
+| `PROSODY_MOCK`                   | Use mock Kafka brokers and in-memory timer storage for testing                 | false        | ✓        | ✓        |
 | `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                       | 100ms        | ✓        |          |
 | `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.           | 8000         | ✓        |          |
 | `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                           | 20ms         | ✓        |          |
@@ -302,12 +307,14 @@ helping to ensure robust and responsive Kafka-based applications.
 
 ## Timer System
 
-Prosody includes a distributed timer system that allows you to schedule events for future execution. The timer system supports:
+Prosody includes a distributed timer system that allows you to schedule events for future execution. The timer system
+supports:
 
 - **Persistent Storage**: Timers are stored in persistent backends (Cassandra or in-memory for testing)
 - **Distributed Processing**: Multiple consumer instances can process timers from the same storage
 - **Slab-Based Partitioning**: Timers are organized into time-based slabs for efficient retrieval
-- **Automatic Cleanup**: Successfully processed timers are immediately deleted; failed timers expire after configurable period
+- **Automatic Cleanup**: Successfully processed timers are immediately deleted; failed timers expire after configurable
+  period
 
 ### Timer Configuration
 
@@ -320,7 +327,8 @@ The timer system is automatically configured based on the consumer configuration
 
 ### Usage in Handlers
 
-Your event handlers can receive timer events through the `on_timer` method of the `FallibleHandler` trait, as shown in the example above.
+Your event handlers can receive timer events through the `on_timer` method of the `FallibleHandler` trait, as shown in
+the example above.
 
 ## Common Project Tasks
 
@@ -440,8 +448,7 @@ limiting the number of in-flight messages per key and partition through bounded 
 
 ```mermaid
 flowchart TD
-    classDef subgraphStyle fill:#f5f5f5,stroke:#666
-    
+    classDef subgraphStyle fill: #f5f5f5, stroke: #666
     HLC["<a href='https://github.com/cincpro/prosody/tree/main/src/high_level/mod.rs'>HighLevelClient</a>"] --> Producer["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/mod.rs'>ProsodyProducer</a>"]
     HLC --> ConsumerMain["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/mod.rs'>ProsodyConsumer</a>"]
 
@@ -455,7 +462,6 @@ flowchart TD
         ConsumerMain --> Context["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/context.rs'>ConsumerContext</a>"]
         ConsumerMain --> PollLoop["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/poll.rs'>Poll Loop</a>"]
         ConsumerMain --> ProbeServer["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/probes.rs'>Probe Server</a>"]
-        
         Context --> PMgr
         PollLoop --> PMgr
     end
@@ -464,7 +470,6 @@ flowchart TD
         PMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/mod.rs'>Partition Manager</a>"] --> KeyMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/keyed/mod.rs'>Key Manager</a>"]
         PMgr --> OTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Offset Tracker</a>"]
         PMgr --> ICache2["<a href='https://github.com/cincpro/prosody/tree/main/src/deduplication.rs'>Idempotence Cache</a>"]
-        
         KeyMgr --> EHandler["Event Handler"]
         OTracker --> WTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Watermark Tracker</a>"]
     end
@@ -480,7 +485,6 @@ flowchart TD
     ConsumerMain -..-> LogS
     ConsumerMain -..-> ShutdownS
     ConsumerMain -..-> TopicS
-
     TopicS --> FTopic["Failure Topic"]
     Producer --> FTopic
 
@@ -489,7 +493,6 @@ flowchart TD
         Prop["<a href='https://github.com/cincpro/prosody/tree/main/src/propagator.rs'>Propagator</a>"]
         MExtract["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/extractor.rs'>Message Extractor</a>"]
         RInject["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/injector.rs'>Record Injector</a>"]
-        
         OTel --> Prop
         Prop --> MExtract
         Prop --> RInject
@@ -497,13 +500,11 @@ flowchart TD
 
     ConsumerMain -..-> OTel
     Producer -..-> OTel
-
-    %% External edges
+%% External edges
     EHandler --> RetryS
     EHandler --> LogS
     EHandler --> ShutdownS
     EHandler --> TopicS
-
-    %% Styling
-    class ProducerComponents,ConsumerComponents,PartitionComponents,FailureHandling,TracingSystem subgraphStyle
+%% Styling
+    class ProducerComponents, ConsumerComponents, PartitionComponents, FailureHandling, TracingSystem subgraphStyle
 ```

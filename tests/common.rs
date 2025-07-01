@@ -32,7 +32,9 @@ use tokio::sync::mpsc::{Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
+use tracing::level_filters::LevelFilter;
 use tracing::{error, info, instrument};
+use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
 
 /// A small, non-zero count used in tests.
@@ -475,4 +477,31 @@ impl EventHandler for SlowTestHandler {
     async fn shutdown(self) {
         info!("SlowTestHandler shutdown");
     }
+}
+
+/// Initializes logging for integration tests with scylla noise filtering.
+///
+/// Sets up a compact tracing subscriber with the scylla crate set to WARN level
+/// to reduce noise from database driver logs during testing.
+///
+/// # Errors
+///
+/// Returns an error if the tracing subscriber cannot be initialized.
+pub fn init_test_logging() -> Result<()> {
+    if fmt()
+        .compact()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_env_var("PROSODY_LOG")
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy()
+                .add_directive("scylla=warn".parse()?),
+        )
+        .try_init()
+        .is_err()
+    {
+        info!("logging already initialized");
+    }
+
+    Ok(())
 }
