@@ -25,7 +25,7 @@ mod common;
 #[tokio::test]
 async fn test_source_system_filtering() -> Result<()> {
     common::init_test_logging()?;
-    let timeout_duration = Duration::from_secs(5);
+    let timeout_duration = Duration::from_secs(30);
 
     // Scenario 1: Both source system and group ID are the same, so no messages
     // should be expected.

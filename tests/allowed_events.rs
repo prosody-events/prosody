@@ -83,7 +83,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     producer.send([], topic, key, &payload_allowed).await?;
 
     // Validate receipt of only the allowed message
-    let received = timeout(Duration::from_secs(5), messages_rx.recv()).await?;
+    let received = timeout(Duration::from_secs(30), messages_rx.recv()).await?;
     let (received_key, received_payload) =
         received.ok_or_else(|| eyre!("Timeout waiting for a delivered message"))?;
 

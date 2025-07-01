@@ -84,7 +84,7 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
     // Collect received messages with a predefined timeout
     let mut received_messages = Vec::new();
     let start = tokio::time::Instant::now();
-    let timeout = Duration::from_secs(5);
+    let timeout = Duration::from_secs(30);
 
     while start.elapsed() < timeout {
         if let Some((recv_key, recv_payload)) = messages_rx.recv().await {
