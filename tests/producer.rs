@@ -301,8 +301,8 @@ async fn test_producer_deduplication() -> Result<()> {
     let (consumer_client, mut rx) = consumer;
 
     // Common timeouts for test cases
-    let receive_timeout = Duration::from_secs(5);
-    let no_message_timeout = Duration::from_secs(1);
+    let receive_timeout = Duration::from_secs(15);
+    let no_message_timeout = Duration::from_secs(2);
 
     // Execute test cases
     case_duplicate_id_same_key(

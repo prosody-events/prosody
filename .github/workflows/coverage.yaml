@@ -28,10 +28,20 @@ jobs:
           KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
           KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
           KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+        options: >-
+          --health-cmd "kafka-topics.sh --bootstrap-server localhost:9092 --list"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 15
       cassandra:
         image: cassandra:latest
         ports:
           - "9042:9042"
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT cluster_name FROM system.local;'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
