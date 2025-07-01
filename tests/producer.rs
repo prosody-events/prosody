@@ -16,10 +16,8 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, channel};
 use tokio::time::timeout;
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// Handler that forwards messages to a channel for test verification.
@@ -259,7 +257,7 @@ async fn case_return_to_original_id(
 #[tokio::test]
 async fn test_producer_deduplication() -> Result<()> {
     // Initialize tracing for easier debugging
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     // Setup test environment with Kafka broker
     let brokers = vec!["localhost:9094".to_owned()];

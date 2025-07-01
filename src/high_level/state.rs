@@ -81,7 +81,7 @@ impl<T> ConsumerState<T> {
         ) {
             Ok(configuration) => Self::Configured(configuration),
             Err(error) => {
-                info!("disabling consumer: {error:#}");
+                info!("disabling consumer (safe to ignore if you're only producing): {error:#}");
                 Self::default()
             }
         }

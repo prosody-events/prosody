@@ -16,7 +16,10 @@
 
 #![allow(clippy::same_name_method)]
 
-use crate::timers::store::cassandra::{CassandraTriggerStoreError, InnerError};
+use crate::timers::store::cassandra::{
+    CassandraTriggerStoreError, InnerError, TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS,
+    TABLE_SLABS,
+};
 use futures::{TryStreamExt, pin_mut};
 use rust_embed::RustEmbed;
 use scylla::client::session::Session;
@@ -100,8 +103,6 @@ impl<'a> EmbeddedMigrator<'a> {
     /// - Migration validation detects corrupted files
     /// - Any migration statement execution fails
     pub async fn migrate(&self) -> Result<(), CassandraTriggerStoreError> {
-        info!("Starting database migration");
-
         if self
             .session
             .get_cluster_state()
@@ -109,27 +110,21 @@ impl<'a> EmbeddedMigrator<'a> {
             .is_none()
         {
             // Create keyspace if it doesn't exist
-            let create_keyspace_stmt = self
-                .session
-                .prepare(format!(
-                    "create keyspace if not exists {} WITH replication = {{ 'class' : \
-                     'SimpleStrategy', 'replication_factor': 1 }}",
-                    self.keyspace
-                ))
-                .await?;
-            self.session
-                .execute_unpaged(&create_keyspace_stmt, &[])
-                .await?;
+            // Use unprepared query to avoid keyspace context issues
+            let create_keyspace_cql = format!(
+                "create keyspace if not exists {} WITH replication = {{ 'class' : \
+                 'SimpleStrategy', 'replication_factor': 1 }}",
+                self.keyspace
+            );
+            self.session.query_unpaged(create_keyspace_cql, &[]).await?;
         }
-
-        self.session.use_keyspace(self.keyspace, true).await?;
 
         // Ensure migrations table exists
         self.ensure_migrations_table_exists(self.keyspace).await?;
 
         // Load and validate migrations
         debug!("Loading embedded migrations");
-        let migrations = load_embedded_migrations()?;
+        let migrations = load_embedded_migrations(self.keyspace)?;
         debug!("Loaded {} embedded migrations", migrations.len());
 
         debug!("Getting applied migrations");
@@ -143,7 +138,6 @@ impl<'a> EmbeddedMigrator<'a> {
         let pending_migrations = get_pending_migrations(&migrations, &applied_migrations);
 
         if pending_migrations.is_empty() {
-            info!("No pending migrations to apply");
             return Ok(());
         }
 
@@ -179,27 +173,25 @@ impl<'a> EmbeddedMigrator<'a> {
         let cluster_state = self.session.get_cluster_state();
         let table_exists = cluster_state
             .get_keyspace(keyspace)
-            .and_then(|ks| ks.tables.get("schema_migrations"))
+            .and_then(|ks| ks.tables.get(TABLE_SCHEMA_MIGRATIONS))
             .is_some();
 
         if table_exists {
-            debug!("schema_migrations table already exists");
+            debug!("{} table already exists", TABLE_SCHEMA_MIGRATIONS);
             return Ok(());
         }
 
-        debug!("Creating schema_migrations table");
+        debug!("Creating {} table", TABLE_SCHEMA_MIGRATIONS);
         let create_table_sql = format!(
-            "create table {keyspace}.schema_migrations (filename text primary key, checksum text, \
-             applied_at timestamp, execution_time_ms bigint) with compression = {{ 'class': \
-             'ZstdCompressor' }} and compaction = {{ 'class': 'UnifiedCompactionStrategy' }};
+            "create table {keyspace}.{TABLE_SCHEMA_MIGRATIONS} (filename text primary key, \
+             checksum text, applied_at timestamp, execution_time_ms bigint) with compression = {{ \
+             'class': 'ZstdCompressor' }} and compaction = {{ 'class': \
+             'UnifiedCompactionStrategy' }};
             "
         );
 
-        let create_table_stmt = self.session.prepare(create_table_sql).await?;
-        self.session
-            .execute_unpaged(&create_table_stmt, &[])
-            .await?;
-        debug!("schema_migrations table created successfully");
+        self.session.query_unpaged(create_table_sql, &[]).await?;
+        debug!("{} table created successfully", TABLE_SCHEMA_MIGRATIONS);
 
         // Refresh metadata to ensure the table is visible
         debug!("Refreshing cluster metadata");
@@ -233,9 +225,13 @@ impl<'a> EmbeddedMigrator<'a> {
         &self,
         keyspace: &str,
     ) -> Result<HashMap<String, AppliedMigration>, CassandraTriggerStoreError> {
-        debug!("Querying applied migrations from schema_migrations table");
+        debug!(
+            "Querying applied migrations from {} table",
+            TABLE_SCHEMA_MIGRATIONS
+        );
 
-        let select_sql = format!("select filename, checksum from {keyspace}.schema_migrations",);
+        let select_sql =
+            format!("select filename, checksum from {keyspace}.{TABLE_SCHEMA_MIGRATIONS}");
         let select_stmt = self.session.prepare(select_sql).await?;
 
         let stream = self
@@ -285,10 +281,7 @@ impl<'a> EmbeddedMigrator<'a> {
         for statement_text in statements {
             if !statement_text.trim().is_empty() {
                 debug!("Executing: {}", statement_text.trim());
-                let mut prepared = self.session.prepare(statement_text).await?;
-                prepared.set_use_cached_result_metadata(true);
-                prepared.set_is_idempotent(true);
-                self.session.execute_unpaged(&prepared, &[]).await?;
+                self.session.query_unpaged(statement_text, &[]).await?;
             }
         }
 
@@ -297,8 +290,8 @@ impl<'a> EmbeddedMigrator<'a> {
         // Record the migration as applied
         let applied_at = chrono::Utc::now();
         let insert_sql = format!(
-            "insert into {keyspace}.schema_migrations (filename, checksum, applied_at, \
-             execution_time_ms) values (?, ?, ?, ?)",
+            "insert into {keyspace}.{TABLE_SCHEMA_MIGRATIONS} (filename, checksum, applied_at, \
+             execution_time_ms) values (?, ?, ?, ?)"
         );
         let insert_stmt = self.session.prepare(insert_sql).await?;
 
@@ -338,7 +331,7 @@ impl<'a> EmbeddedMigrator<'a> {
 /// - Migration files cannot be loaded from embedded assets
 /// - File content contains invalid UTF-8
 /// - Timestamp extraction from filename fails
-fn load_embedded_migrations() -> Result<Vec<Migration>, CassandraTriggerStoreError> {
+fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, CassandraTriggerStoreError> {
     let mut migrations = Vec::new();
 
     for filename in MigrationAssets::iter() {
@@ -346,16 +339,26 @@ fn load_embedded_migrations() -> Result<Vec<Migration>, CassandraTriggerStoreErr
             InnerError::Migration(format!("Failed to load migration file: {filename}",))
         })?;
 
-        let content_str = std::str::from_utf8(content.data.as_ref()).map_err(|e| {
-            InnerError::Migration(format!("Invalid UTF-8 in migration file {filename}: {e}",))
-        })?;
+        let mut content_str = std::str::from_utf8(content.data.as_ref())
+            .map_err(|e| {
+                InnerError::Migration(format!("Invalid UTF-8 in migration file {filename}: {e}",))
+            })?
+            .to_owned();
 
-        let checksum = calculate_checksum(content_str);
+        // Perform template substitution
+        content_str = content_str
+            .replace("{{KEYSPACE}}", keyspace)
+            .replace("{{TABLE_SEGMENTS}}", TABLE_SEGMENTS)
+            .replace("{{TABLE_SLABS}}", TABLE_SLABS)
+            .replace("{{TABLE_KEYS}}", TABLE_KEYS)
+            .replace("{{TABLE_SCHEMA_MIGRATIONS}}", TABLE_SCHEMA_MIGRATIONS);
+
+        let checksum = calculate_checksum(&content_str);
         let timestamp = extract_timestamp(&filename)?;
 
         migrations.push(Migration {
             filename: filename.to_string(),
-            content: content_str.to_owned(),
+            content: content_str,
             checksum,
             timestamp,
         });

@@ -13,10 +13,8 @@ use prosody::{
 use serde_json::json;
 use tokio::sync::mpsc::channel;
 use tokio::time::{Duration, timeout};
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// Tests the event filtering functionality within Prosody consumers.
@@ -31,7 +29,7 @@ mod common;
 #[tokio::test]
 async fn test_allowed_events_filtering() -> Result<()> {
     // Initialize logging
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     // Create a unique topic to isolate the test environment
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();

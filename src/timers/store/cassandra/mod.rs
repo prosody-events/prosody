@@ -38,6 +38,19 @@ use validator::Validate;
 mod migrator;
 mod queries;
 
+/// Table name for storing segment metadata and slab IDs.
+pub const TABLE_SEGMENTS: &str = "timer_segments";
+
+/// Table name for storing timer triggers organized by time slabs.
+pub const TABLE_SLABS: &str = "timer_slabs";
+
+/// Table name for storing timer triggers indexed by key for efficient key-based
+/// lookups.
+pub const TABLE_KEYS: &str = "timer_keys";
+
+/// Table name for tracking applied database migrations.
+pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
+
 /// Configuration for the Cassandra-based timer storage backend.
 #[derive(Builder, Clone, Educe, Validate)]
 #[educe(Debug)]

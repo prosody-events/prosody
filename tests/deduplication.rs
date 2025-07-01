@@ -13,10 +13,8 @@ use prosody::{
 use serde_json::json;
 use tokio::sync::mpsc::channel;
 use tokio::time::Duration;
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// Tests the deduplication of messages with identical event IDs.
@@ -37,7 +35,7 @@ mod common;
 #[tokio::test]
 async fn test_deduplication_of_same_event_id() -> Result<()> {
     // Initialize compact tracing format
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     // Create a unique Kafka topic for isolated testing
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();

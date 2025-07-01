@@ -23,10 +23,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
 use tracing::{error, info};
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// Test handler that schedules timers based on incoming messages and tracks
@@ -416,7 +414,7 @@ where
     F: FnOnce(TestEnvironment) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     let result = timeout(Duration::from_secs(timeout_secs), async {
         let env = TestEnvironment::new(test_name).await?;

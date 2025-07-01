@@ -17,16 +17,14 @@ use prosody::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc::channel;
 use tokio::time::{Duration, timeout};
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// Tests the filtering functionality of the source system.
 #[tokio::test]
 async fn test_source_system_filtering() -> Result<()> {
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
     let timeout_duration = Duration::from_secs(5);
 
     // Scenario 1: Both source system and group ID are the same, so no messages

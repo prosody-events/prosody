@@ -1,7 +1,7 @@
 -- Migration: create_timers
 -- Timestamp: 20250613
 
-create table segments
+create table {{KEYSPACE}}.{{TABLE_SEGMENTS}}
 (
     id        uuid,
     name      text static,
@@ -12,7 +12,7 @@ create table segments
     with compression = { 'class': 'ZstdCompressor' }
      and compaction = { 'class': 'UnifiedCompactionStrategy' };
 
-create table slabs
+create table {{KEYSPACE}}.{{TABLE_SLABS}}
 (
     segment_id uuid,
     id         int,
@@ -24,7 +24,7 @@ create table slabs
     with compression = { 'class': 'ZstdCompressor' }
      and compaction = { 'class': 'UnifiedCompactionStrategy' };
 
-create table keys
+create table {{KEYSPACE}}.{{TABLE_KEYS}}
 (
     segment_id uuid,
     key        text,

@@ -13,6 +13,7 @@ use tonic::transport::ClientTlsConfig;
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::filter::ParseError;
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
@@ -49,7 +50,8 @@ where
     let env_filter = EnvFilter::builder()
         .with_env_var("PROSODY_LOG")
         .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
+        .from_env_lossy()
+        .add_directive("scylla=warn".parse()?);
 
     // Create a tracing subscriber with OpenTelemetry layer
     let telemetry = build_telemetry_layer().ok();
@@ -113,4 +115,8 @@ pub enum TracingError {
     /// Indicates a failure to set the default tracing subscriber.
     #[error("failed to set default tracing subscriber: {0:#}")]
     SetDefault(#[from] SetGlobalDefaultError),
+
+    /// Indicates a failure to parse filter directive.
+    #[error("failed to parse filter directive: {0:#}")]
+    FilterParse(#[from] ParseError),
 }

@@ -3,21 +3,20 @@
 //! received in the order they were produced per key, utilizing integration
 //! tests with Kafka, via the Prosody library.
 
-use crate::common::{TestInput, run_test};
+use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use tokio::runtime::Builder;
-use tracing_subscriber::fmt;
 
-#[path = "common.rs"]
 mod common;
+use common::{TestInput, run_test};
 
 /// Tests that messages are received in the order they were produced for each
 /// key. This function leverages property-based testing using `QuickCheck`,
 /// which generates various input scenarios to ensure correct order. It supports
 /// integration testing with Kafka through the Prosody library.
 #[test]
-fn receives_all_in_key_order() {
+fn receives_all_in_key_order() -> Result<()> {
     // Determine the number of tests to run from an environment variable,
     // defaulting to 3 if the variable is not set or invalid.
     let test_count = std::env::var("INTEGRATION_TESTS")
@@ -26,12 +25,14 @@ fn receives_all_in_key_order() {
         .unwrap_or(3);
 
     // Start tracing for logging and debugging.
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     // Use QuickCheck to run property-based tests that validate message ordering.
     QuickCheck::new()
         .tests(test_count)
         .quickcheck(prop as fn(TestInput) -> TestResult);
+
+    Ok(())
 }
 
 /// Property function for `QuickCheck` to verify message ordering.

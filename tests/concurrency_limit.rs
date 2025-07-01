@@ -48,10 +48,8 @@ use prosody::{
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// A custom event handler for testing the global concurrency limit enforcement.
@@ -159,7 +157,7 @@ async fn produce_messages(
 #[tokio::test]
 async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     // Initialize logging
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     // Create a topic with 3 partitions
     let partitions = 3;

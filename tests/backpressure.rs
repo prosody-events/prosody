@@ -16,10 +16,8 @@ use serde_json::json;
 use tokio::spawn;
 use tokio::sync::mpsc::channel;
 use tracing::{error, info};
-use tracing_subscriber::fmt;
 use uuid::Uuid;
 
-#[path = "common.rs"]
 mod common;
 
 /// Demonstrates backpressure in the message processing system by
@@ -33,7 +31,7 @@ mod common;
 #[tokio::test]
 async fn test_backpressure() -> Result<()> {
     // Initialize the logger.
-    let _ = fmt().compact().try_init();
+    common::init_test_logging()?;
 
     // Create a unique topic for the test
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
