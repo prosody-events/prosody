@@ -488,7 +488,7 @@ impl EventHandler for SlowTestHandler {
 ///
 /// Returns an error if the tracing subscriber cannot be initialized.
 pub fn init_test_logging() -> Result<()> {
-    fmt()
+    if fmt()
         .compact()
         .with_env_filter(
             EnvFilter::builder()
@@ -498,7 +498,10 @@ pub fn init_test_logging() -> Result<()> {
                 .add_directive("scylla=warn".parse()?),
         )
         .try_init()
-        .map_err(|e| eyre!("Failed to initialize tracing: {e}"))?;
+        .is_err()
+    {
+        info!("logging already initialized");
+    }
 
     Ok(())
 }
