@@ -34,18 +34,18 @@ jobs:
           KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
         options: >-
           --health-cmd "kafka-topics.sh --bootstrap-server localhost:9092 --list"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 15
       cassandra:
         image: cassandra:latest
         ports:
           - "9042:9042"
         options: >-
           --health-cmd "cqlsh -e 'SELECT cluster_name FROM system.local;'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
