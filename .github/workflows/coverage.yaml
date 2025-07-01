@@ -53,7 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run code coverage
         run: |
-          cargo tarpaulin --skip-clean --timeout 600 --jobs 1 --out Json --output-dir coverage
+          cargo tarpaulin --skip-clean --timeout 600 --jobs 1 --out Json --output-dir coverage -- --test-threads=1
           echo "COVERAGE=$(jq -r '.coverage | round' coverage/tarpaulin-report.json)" >> $GITHUB_ENV
           echo "BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_ENV
           echo "BADGE_PATH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}/coverage-badge.svg" >> $GITHUB_ENV
