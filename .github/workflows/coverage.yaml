@@ -28,10 +28,20 @@ jobs:
           KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
           KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
           KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+        options: >-
+          --health-cmd "kafka-topics.sh --bootstrap-server localhost:9092 --list"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
       cassandra:
         image: cassandra:latest
         ports:
           - "9042:9042"
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT cluster_name FROM system.local;'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -41,43 +51,6 @@ jobs:
         with:
           crate: cargo-tarpaulin
       - uses: Swatinem/rust-cache@v2
-      - name: Wait for services to be ready
-        run: |
-          echo "Waiting for Cassandra and Kafka to be ready..."
-          
-          # Wait for Cassandra
-          echo "🔍 Checking Cassandra..."
-          for i in {1..60}; do
-            if docker exec cassandra cqlsh -e "SELECT cluster_name FROM system.local;" >/dev/null 2>&1; then
-              echo "✅ Cassandra is ready after ${i} attempts (${i} seconds)"
-              break
-            elif [ $i -eq 60 ]; then
-              echo "❌ Cassandra failed to start after 60 seconds"
-              docker logs cassandra
-              exit 1
-            else
-              echo "⏳ Cassandra attempt $i: not ready yet..."
-              sleep 1
-            fi
-          done
-          
-          # Wait for Kafka
-          echo "🔍 Checking Kafka..."
-          for i in {1..60}; do
-            if docker exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1; then
-              echo "✅ Kafka is ready after ${i} attempts (${i} seconds)"
-              break
-            elif [ $i -eq 60 ]; then
-              echo "❌ Kafka failed to start after 60 seconds"
-              docker logs kafka
-              exit 1
-            else
-              echo "⏳ Kafka attempt $i: not ready yet..."
-              sleep 1
-            fi
-          done
-          
-          echo "🎉 Both services are ready!"
       - name: Run code coverage
         run: |
           cargo tarpaulin --skip-clean --timeout 300 --out Json --output-dir coverage
