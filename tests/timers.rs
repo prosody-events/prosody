@@ -253,28 +253,34 @@ impl TestEnvironment {
 
     /// Wait for a message event with timeout
     async fn expect_message(&mut self, timeout_secs: u64) -> Result<MessageEvent> {
-        timeout(Duration::from_secs(timeout_secs.max(30)), self.message_rx.recv())
-            .await
-            .map_err(|_| {
-                eyre!(
-                    "Timeout waiting for message event after {} seconds",
-                    timeout_secs
-                )
-            })?
-            .ok_or_else(|| eyre!("Message channel closed unexpectedly"))
+        timeout(
+            Duration::from_secs(timeout_secs.max(30)),
+            self.message_rx.recv(),
+        )
+        .await
+        .map_err(|_| {
+            eyre!(
+                "Timeout waiting for message event after {} seconds",
+                timeout_secs
+            )
+        })?
+        .ok_or_else(|| eyre!("Message channel closed unexpectedly"))
     }
 
     /// Wait for a timer event with timeout
     async fn expect_timer(&mut self, timeout_secs: u64) -> Result<TimerEvent> {
-        timeout(Duration::from_secs(timeout_secs.max(30)), self.timer_rx.recv())
-            .await
-            .map_err(|_| {
-                eyre!(
-                    "Timeout waiting for timer event after {} seconds",
-                    timeout_secs
-                )
-            })?
-            .ok_or_else(|| eyre!("Timer channel closed unexpectedly"))
+        timeout(
+            Duration::from_secs(timeout_secs.max(30)),
+            self.timer_rx.recv(),
+        )
+        .await
+        .map_err(|_| {
+            eyre!(
+                "Timeout waiting for timer event after {} seconds",
+                timeout_secs
+            )
+        })?
+        .ok_or_else(|| eyre!("Timer channel closed unexpectedly"))
     }
 
     /// Wait for exact number of timer events with timeout
@@ -282,7 +288,12 @@ impl TestEnvironment {
         let mut received_timers = Vec::new();
 
         for i in 0..count {
-            match timeout(Duration::from_secs(timeout_secs.max(30)), self.timer_rx.recv()).await {
+            match timeout(
+                Duration::from_secs(timeout_secs.max(30)),
+                self.timer_rx.recv(),
+            )
+            .await
+            {
                 Ok(Some(timer_event)) => {
                     received_timers.push(timer_event);
                 }
