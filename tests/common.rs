@@ -378,20 +378,18 @@ pub async fn run_test(input: TestInput) -> Result<()> {
 /// Creates a Cassandra trigger store configuration for integration tests.
 ///
 /// Uses the same configuration pattern as the Cassandra store unit tests,
-/// connecting to localhost:9042 with a unique test keyspace to avoid conflicts
-/// when multiple tests run in parallel.
+/// connecting to localhost:9042 with a test keyspace.
 ///
 /// # Returns
 ///
-/// A `TriggerStoreConfiguration::Cassandra` configured for testing with a unique keyspace.
+/// A `TriggerStoreConfiguration::Cassandra` configured for testing.
 #[must_use]
 pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
-    let keyspace = format!("prosody_test_{}", Uuid::new_v4().simple());
     let cassandra_config = CassandraConfiguration {
         datacenter: None,
         rack: None,
         nodes: vec!["localhost:9042".to_owned()],
-        keyspace,
+        keyspace: "prosody_integration_test".to_owned(),
         user: None,
         password: None,
         retention: StdDuration::from_secs(10 * 60).into(),
