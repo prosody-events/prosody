@@ -228,6 +228,7 @@ use fixedstr::Flexstr;
 use internment::Intern;
 use rdkafka::mocking::MockCluster;
 use serde_json::Value;
+use std::env;
 use std::mem::forget;
 use std::sync::LazyLock;
 
@@ -243,16 +244,24 @@ mod util;
 
 /// A lazily initialized mock Kafka cluster for testing.
 ///
-/// Creates a single shared mock cluster with 3 brokers and a test topic to
-/// facilitate testing without requiring a real Kafka cluster. The cluster is
-/// initialized the first time it's accessed and persists for the duration of
-/// the program.
+/// Creates a single shared mock cluster with 3 brokers and topics from the
+/// PROSODY_SUBSCRIBED_TOPICS environment variable to facilitate testing without
+/// requiring a real Kafka cluster. The cluster is initialized the first time
+/// it's accessed and persists for the duration of the program.
 #[allow(clippy::unwrap_used)]
 static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
     let cluster = MockCluster::new(3).unwrap();
     let bootstrap = cluster.bootstrap_servers();
 
-    cluster.create_topic("test-topic", 3, 3).unwrap();
+    // Create topics from environment variable if set
+    if let Ok(topics_str) = env::var("PROSODY_SUBSCRIBED_TOPICS") {
+        for topic in topics_str.split(',') {
+            let topic = topic.trim();
+            if !topic.is_empty() {
+                cluster.create_topic(topic, 3, 3).unwrap();
+            }
+        }
+    }
 
     // Keep cluster alive for program duration
     forget(cluster);
