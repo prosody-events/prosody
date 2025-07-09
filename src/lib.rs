@@ -245,9 +245,9 @@ mod util;
 /// A lazily initialized mock Kafka cluster for testing.
 ///
 /// Creates a single shared mock cluster with 3 brokers and topics from the
-/// PROSODY_SUBSCRIBED_TOPICS environment variable to facilitate testing without
-/// requiring a real Kafka cluster. The cluster is initialized the first time
-/// it's accessed and persists for the duration of the program.
+/// `PROSODY_SUBSCRIBED_TOPICS` environment variable to facilitate testing
+/// without requiring a real Kafka cluster. The cluster is initialized the first
+/// time it's accessed and persists for the duration of the program.
 #[allow(clippy::unwrap_used)]
 static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
     let cluster = MockCluster::new(3).unwrap();
