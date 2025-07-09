@@ -170,36 +170,58 @@ environment variables, giving you flexibility in how you set up your Kafka clien
 
 The following table lists the available configuration options and their associated environment variables:
 
-| Environment Variable             | Description                                                                    | Default      | Consumer | Producer |
-|----------------------------------|--------------------------------------------------------------------------------|--------------|----------|----------|
-| `PROSODY_ALLOWED_EVENTS`         | Allowed event type prefixes (comma-separated). All allowed if unset.           | -            | ✓        |          |
-| `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                | -            | ✓        | ✓        |
-| `PROSODY_CASSANDRA_DATACENTER`   | Preferred datacenter for Cassandra query routing                               | -            | ✓        |          |
-| `PROSODY_CASSANDRA_KEYSPACE`     | Cassandra keyspace for timer storage                                           | prosody      | ✓        |          |
-| `PROSODY_CASSANDRA_NODES`        | Comma-separated list of Cassandra contact nodes (required for timer storage)   | -            | ✓        |          |
-| `PROSODY_CASSANDRA_PASSWORD`     | Password for Cassandra authentication                                          | -            | ✓        |          |
-| `PROSODY_CASSANDRA_RACK`         | Preferred rack identifier for Cassandra topology-aware routing                 | -            | ✓        |          |
-| `PROSODY_CASSANDRA_RETENTION`    | How long to keep failed/unprocessed timer data                                 | 30d          | ✓        |          |
-| `PROSODY_CASSANDRA_USER`         | Username for Cassandra authentication                                          | -            | ✓        |          |
-| `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                             | 1s           | ✓        |          |
-| `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                  | -            | ✓        |          |
-| `PROSODY_GROUP_ID`               | Consumer group identifier                                                      | -            | ✓        |          |
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.            | 4096         | ✓        |          |
-| `PROSODY_MAX_CONCURRENCY`        | Maximum global concurrency limit                                               | 32           | ✓        |          |
-| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure) | 8            | ✓        |          |
-| `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                  | 3            | ✓        |          |
-| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition                           | 16           | ✓        |          |
-| `PROSODY_MOCK`                   | Use mock Kafka brokers and in-memory timer storage for testing                 | false        | ✓        | ✓        |
-| `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                       | 100ms        | ✓        |          |
-| `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.           | 8000         | ✓        |          |
-| `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                           | 20ms         | ✓        |          |
-| `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                            | 5m           | ✓        |          |
-| `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                   | 1s           |          | ✓        |
-| `PROSODY_SHUTDOWN_TIMEOUT`       | Timeout to wait for in-flight tasks to complete during partition shutdown      | 30s          | ✓        |          |
-| `PROSODY_SLAB_SIZE`              | Duration for timer slab partitioning                                           | 10m          | ✓        |          |
-| `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                           | `<group id>` |          | ✓        |
-| `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                          | 5m           | ✓        |          |
-| `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to                                 | -            | ✓        |          |
+| Environment Variable             | Description                                                                          | Default      | Consumer | Producer |
+|----------------------------------|--------------------------------------------------------------------------------------|--------------|----------|----------|
+| `PROSODY_ALLOWED_EVENTS`         | Allowed event type prefixes (comma-separated). All allowed if unset.                 | -            | ✓        |          |
+| `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                      | -            | ✓        | ✓        |
+| `PROSODY_CASSANDRA_DATACENTER`   | Preferred datacenter for Cassandra query routing                                     | -            | ✓        |          |
+| `PROSODY_CASSANDRA_KEYSPACE`     | Cassandra keyspace for timer storage                                                 | prosody      | ✓        |          |
+| `PROSODY_CASSANDRA_NODES`        | Comma-separated list of Cassandra contact nodes (required for timer storage)         | -            | ✓        |          |
+| `PROSODY_CASSANDRA_PASSWORD`     | Password for Cassandra authentication                                                | -            | ✓        |          |
+| `PROSODY_CASSANDRA_RACK`         | Preferred rack identifier for Cassandra topology-aware routing                       | -            | ✓        |          |
+| `PROSODY_CASSANDRA_RETENTION`    | How long to keep failed/unprocessed timer data                                       | 30d          | ✓        |          |
+| `PROSODY_CASSANDRA_USER`         | Username for Cassandra authentication                                                | -            | ✓        |          |
+| `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                                   | 1s           | ✓        |          |
+| `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                        | -            | ✓        |          |
+| `PROSODY_GROUP_ID`               | Consumer group identifier                                                            | -            | ✓        |          |
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.                  | 4096         | ✓        |          |
+| `PROSODY_MAX_CONCURRENCY`        | Maximum global concurrency limit                                                     | 32           | ✓        |          |
+| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure)       | 8            | ✓        |          |
+| `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                        | 3            | ✓        |          |
+| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition                                 | 16           | ✓        |          |
+| `PROSODY_MOCK`                   | Use mock Kafka brokers and in-memory timer storage for testing                       | false        | ✓        | ✓        |
+| `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                             | 100ms        | ✓        |          |
+| `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.                 | 8000         | ✓        |          |
+| `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                                 | 20ms         | ✓        |          |
+| `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                                  | 5m           | ✓        |          |
+| `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                         | 1s           |          | ✓        |
+| `PROSODY_SHUTDOWN_TIMEOUT`       | Timeout to wait for in-flight tasks to complete during partition shutdown            | 30s          | ✓        |          |
+| `PROSODY_SLAB_SIZE`              | Duration for timer slab partitioning                                                 | 10m          | ✓        |          |
+| `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                                 | `<group id>` |          | ✓        |
+| `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                                | 5m           | ✓        |          |
+| `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to. Also creates topics in mock cluster. | -            | ✓        |          |
+
+## Mock Mode for Testing
+
+Prosody includes a mock mode that allows you to test your application without requiring a real Kafka cluster. This is
+particularly useful for unit tests, integration tests, and local development.
+
+### Enabling Mock Mode
+
+To enable mock mode, set the `PROSODY_MOCK` environment variable to `true` or configure it programmatically. When using
+mock mode, Prosody automatically creates topics in the mock cluster based on the `PROSODY_SUBSCRIBED_TOPICS` environment
+variable. This ensures that consumers can subscribe to any topics they need without encountering "topic does not exist"
+errors.
+
+### Mock Mode Behavior
+
+In mock mode:
+
+- **Kafka Brokers**: Uses an in-memory mock Kafka cluster instead of real brokers
+- **Timer Storage**: Uses in-memory storage instead of Cassandra
+- **Topic Creation**: Automatically creates topics listed in `PROSODY_SUBSCRIBED_TOPICS`
+- **Message Processing**: Full message processing pipeline works as in production
+- **Networking**: No external network dependencies required
 
 ## Event Type Filtering
 
@@ -506,5 +528,5 @@ flowchart TD
     EHandler --> ShutdownS
     EHandler --> TopicS
 %% Styling
-    class ProducerComponents, ConsumerComponents, PartitionComponents, FailureHandling, TracingSystem subgraphStyle
+class ProducerComponents, ConsumerComponents, PartitionComponents, FailureHandling, TracingSystem subgraphStyle
 ```
