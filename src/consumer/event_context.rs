@@ -46,7 +46,7 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     /// # Returns
     ///
     /// A future that completes with `()` once shutdown is triggered.
-    fn on_shutdown(&self) -> impl Future<Output = ()> + Send;
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static;
 
     /// Schedule a new timer at the given execution time for this key.
     ///
@@ -180,7 +180,7 @@ where
         *self.shutdown_rx.borrow()
     }
 
-    fn on_shutdown(&self) -> impl Future<Output = ()> + Send {
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
         // Clone receiver so awaiting shutdown does not consume original.
         let mut shutdown_rx = self.shutdown_rx.clone();
         async move {

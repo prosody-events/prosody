@@ -42,6 +42,7 @@ use serde_json as json;
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json as json;
+use tracing::field::debug;
 use tracing::log::info;
 
 mod injector;
@@ -318,7 +319,7 @@ impl ProsodyProducer {
     /// - The Kafka send operation fails
     #[instrument(
         skip(self, topic, headers, payload),
-        fields(topic = topic.as_ref(), payload_size, partition, offset),
+        fields(topic = topic.as_ref(), payload_size, partition, offset, timestamp),
         err
     )]
     pub async fn send<'a, H>(
@@ -384,16 +385,17 @@ impl ProsodyProducer {
         }
 
         // Send the message to Kafka
-        let (partition, offset) = self
+        let delivery = self
             .producer
             .send(record, self.send_timeout)
             .await
             .map_err(|(error, _)| ProducerError::Kafka(error))?;
 
-        // Record partition and offset in the current span
+        // Record partition, offset, and timestamp in the current span
         Span::current()
-            .record("partition", partition)
-            .record("offset", offset);
+            .record("partition", delivery.partition)
+            .record("offset", delivery.offset)
+            .record("timestamp", debug(delivery.timestamp));
 
         // Update the idempotence cache if needed
         let Some(cache) = &self.idempotence_cache else {
