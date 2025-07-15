@@ -44,7 +44,7 @@ parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
 pin-project = "1.1"
 quick_cache = "0.6"
 rand = "0.9"
-rdkafka = { version = "0.37", features = ["cmake-build", "tracing"] }
+rdkafka = { version = "0.38", features = ["cmake-build", "tracing"] }
 rust-embed = { version = "8.7", features = ["include-exclude"] }
 scc = "2.3"
 scylla = { version = "1.2", features = ["chrono-04"] }
