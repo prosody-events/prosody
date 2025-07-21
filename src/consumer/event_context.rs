@@ -8,14 +8,16 @@
 //!   `TimerManager<T>` using a `TriggerStore` backend.
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
+use async_stream::try_stream;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 use educe::Educe;
 use futures::stream::iter;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
+use tokio::select;
 use tokio::sync::watch;
 use tracing::{error, info_span};
 
@@ -193,13 +195,15 @@ where
     async fn schedule(&self, time: CompactDateTime) -> Result<(), Self::Error> {
         // Wrap scheduling in a tracing span for observability.
         let span = info_span!("timer", key = %self.key, time = %time);
-        self.timers
-            .schedule(Trigger {
+
+        select! {
+            () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
+            result = self.timers.schedule(Trigger {
                 key: self.key.clone(),
                 time,
                 span,
-            })
-            .await
+            }) => result,
+        }
     }
 
     async fn clear_and_schedule(
@@ -208,42 +212,71 @@ where
     ) -> Result<(), TimerManagerError<T::Error>> {
         let span = info_span!("timer", key = %self.key, time = %time);
 
-        // Unschedule all existing triggers in parallel, linking spans.
-        iter(self.timers.scheduled_triggers(&self.key).await?)
-            .map(|trigger| {
-                let span_clone = span.clone();
-                async move {
-                    // Link new span with the original trigger's span.
-                    span_clone.follows_from(&trigger.span);
-                    self.timers.unschedule(&trigger.key, trigger.time).await
-                }
-            })
-            .buffer_unordered(DELETE_CONCURRENCY)
-            .try_collect::<()>()
-            .await?;
+        let operation = async {
+            // Get scheduled triggers
+            let triggers = self.timers.scheduled_triggers(&self.key).await?;
 
-        // Schedule exactly one new trigger.
-        self.timers
-            .schedule(Trigger {
-                key: self.key.clone(),
-                time,
-                span,
-            })
-            .await
+            // Unschedule all existing triggers in parallel, linking spans.
+            iter(triggers)
+                .map(|trigger| {
+                    let span_clone = span.clone();
+                    async move {
+                        // Link new span with the original trigger's span.
+                        span_clone.follows_from(&trigger.span);
+                        self.timers.unschedule(&trigger.key, trigger.time).await
+                    }
+                })
+                .buffer_unordered(DELETE_CONCURRENCY)
+                .try_collect::<()>()
+                .await?;
+
+            // Schedule exactly one new trigger.
+            self.timers
+                .schedule(Trigger {
+                    key: self.key.clone(),
+                    time,
+                    span,
+                })
+                .await
+        };
+
+        select! {
+            () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
+            result = operation => result,
+        }
     }
 
     async fn unschedule(&self, time: CompactDateTime) -> Result<(), TimerManagerError<T::Error>> {
-        self.timers.unschedule(&self.key, time).await
+        select! {
+            () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
+            result = self.timers.unschedule(&self.key, time) => result,
+        }
     }
 
     async fn clear_scheduled(&self) -> Result<(), TimerManagerError<T::Error>> {
-        self.timers.unschedule_all(&self.key).await
+        select! {
+            () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
+            result = self.timers.unschedule_all(&self.key) => result,
+        }
     }
 
     fn scheduled(
         &self,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        self.timers.scheduled_times(&self.key)
+        let scheduled_timers = self.timers.scheduled_times(&self.key);
+        let on_shutdown = EventContext::on_shutdown(self);
+
+        try_stream! {
+            pin_mut!(on_shutdown);
+            pin_mut!(scheduled_timers);
+
+            while let Some(time) = select! {
+                () = &mut on_shutdown => Err(TimerManagerError::Shutdown),
+                item = scheduled_timers.try_next() => item,
+            }? {
+                yield time;
+            }
+        }
     }
 }
 
