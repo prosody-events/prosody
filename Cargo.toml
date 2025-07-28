@@ -36,8 +36,10 @@ opentelemetry = "0.30"
 opentelemetry-otlp = { version = "0.30", features = [
     "grpc-tonic",
     "gzip-tonic",
-    "tls",
-    "tls-roots",
+    "http-json",
+    "reqwest-rustls-webpki-roots",
+    "tls-webpki-roots",
+    "zstd-tonic",
 ] }
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
@@ -56,7 +58,6 @@ thiserror = "2.0"
 tokio = { version = "1.45", features = ["macros", "sync"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["time"] }
-tonic = { version = "0.13", features = ["gzip", "tls-webpki-roots"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-opentelemetry = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -51,6 +51,13 @@ jobs:
         with:
           crate: cargo-tarpaulin
       - uses: Swatinem/rust-cache@v2
+      - name: Initialize Cassandra migrations
+        run: |
+          # Run the producer test first to initialize Cassandra migrations
+          # This test successfully runs migrations as seen in the logs
+          cargo test --test producer -- --test-threads=1
+        env:
+          PROSODY_BOOTSTRAP_SERVERS: localhost:9094
       - name: Run code coverage
         run: |
           cargo tarpaulin --skip-clean --timeout 3600 --out Json --output-dir coverage -- --test-threads=1

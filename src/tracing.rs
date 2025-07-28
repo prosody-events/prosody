@@ -5,11 +5,10 @@
 //! customizable tracing setup with optional additional layers.
 
 use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::{ExporterBuildError, SpanExporter, WithTonicConfig};
+use opentelemetry_otlp::{ExporterBuildError, SpanExporter};
 use opentelemetry_sdk::trace::Tracer;
 use std::env;
 use thiserror::Error;
-use tonic::transport::ClientTlsConfig;
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -39,9 +38,12 @@ pub type Identity = tracing_subscriber::layer::Identity;
 ///
 /// # Errors
 ///
-/// This function can return a `TracingError` in the following cases:
-/// - If the trace exporter initialization fails
-/// - If setting the global default subscriber fails
+/// This function returns an error if:
+/// - The OTLP endpoint is not configured via `OTEL_EXPORTER_OTLP_ENDPOINT`
+/// - An unknown protocol is specified in `OTEL_EXPORTER_OTLP_PROTOCOL`
+/// - The trace exporter initialization fails
+/// - Setting the global default subscriber fails
+/// - Filter directive parsing fails
 pub fn initialize_tracing<T>(layer: Option<T>) -> Result<(), TracingError>
 where
     T: Layer<Layered<Option<OpenTelemetryLayer<Registry, Tracer>>, Registry>> + Send + Sync,
@@ -68,19 +70,23 @@ where
 
 /// Builds the OpenTelemetry layer for the tracing subscriber.
 ///
-/// This function creates an OpenTelemetry tracer with an OTLP exporter
-/// and wraps it in a `tracing_opentelemetry::Layer`.
+/// Creates an OpenTelemetry tracer with an OTLP exporter configured via
+/// environment variables and wraps it in a [`tracing_opentelemetry::Layer`].
+/// The protocol is determined by `OTEL_EXPORTER_OTLP_PROTOCOL` (defaults to
+/// "grpc").
 ///
-/// # Returns
+/// # Environment Variables
 ///
-/// Returns `Ok(OpenTelemetryLayer<Registry, Tracer>)` if successful,
-/// or a `TracingError` if an error occurs during the process.
+/// * `OTEL_EXPORTER_OTLP_ENDPOINT` - OTLP endpoint URL (required)
+/// * `OTEL_EXPORTER_OTLP_PROTOCOL` - Transport protocol: "grpc",
+///   "http/protobuf", or "http/json" (defaults to "grpc")
 ///
 /// # Errors
 ///
-/// This function can return a `TracingError` in the following cases:
-/// - If the OTLP endpoint is not configured (`MissingOtlpEndpoint`)
-/// - If the trace exporter initialization fails (Exporter)
+/// This function returns an error if:
+/// - `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable is not set
+/// - `OTEL_EXPORTER_OTLP_PROTOCOL` contains an unsupported protocol value
+/// - The trace exporter initialization fails
 fn build_telemetry_layer() -> Result<OpenTelemetryLayer<Registry, Tracer>, TracingError> {
     // Check if the OTLP endpoint is configured
     if env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
@@ -88,13 +94,16 @@ fn build_telemetry_layer() -> Result<OpenTelemetryLayer<Registry, Tracer>, Traci
     }
 
     // Create and install the OpenTelemetry tracer
+    let protocol = env::var("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_else(|_| "grpc".to_owned());
+
+    let exporter = match protocol.as_str() {
+        "http/protobuf" | "http/json" => SpanExporter::builder().with_http().build()?,
+        "grpc" => SpanExporter::builder().with_tonic().build()?,
+        _ => return Err(TracingError::UnknownOtlpProtocol),
+    };
+
     let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_batch_exporter(
-            SpanExporter::builder()
-                .with_tonic()
-                .with_tls_config(ClientTlsConfig::default().with_native_roots())
-                .build()?,
-        )
+        .with_batch_exporter(exporter)
         .build()
         .tracer("prosody");
 
@@ -107,6 +116,13 @@ pub enum TracingError {
     /// OTLP exporter could not be configured because no endpoint was configured
     #[error("missing OTEL_EXPORTER_OTLP_ENDPOINT environment variable; can't initialize tracing")]
     MissingOtlpEndpoint,
+
+    /// Unknown OTLP protocol specified in environment variable
+    #[error(
+        "unknown OTEL_EXPORTER_OTLP_PROTOCOL value; supported values are 'grpc', 'http/protobuf', \
+         'http/json'"
+    )]
+    UnknownOtlpProtocol,
 
     /// Indicates a failure to initialize the trace exporter.
     #[error("failed to initialize the trace exporter: {0:#}")]
