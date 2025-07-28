@@ -56,7 +56,11 @@ where
         .add_directive("scylla=warn".parse()?);
 
     // Create a tracing subscriber with OpenTelemetry layer
-    let telemetry = build_telemetry_layer().ok();
+    #[allow(clippy::print_stderr, reason = "tracing is not initialized yet")]
+    let telemetry = build_telemetry_layer()
+        .inspect_err(|error| eprintln!("failed to initialize OpenTelemetry: {error}"))
+        .ok();
+
     let subscriber = Registry::default()
         .with(telemetry)
         .with(layer)
