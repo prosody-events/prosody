@@ -67,19 +67,12 @@ whoami = "1.6"
 
 [features]
 cmake-build = ["rdkafka/cmake-build"]
-curl = ["rdkafka/curl"]
-curl-static = ["rdkafka/curl-static"]
 default = ["cmake-build"]
-dynamic-linking = ["rdkafka/dynamic-linking"]
 external-lz4 = ["rdkafka/external-lz4"]
-gssapi = ["rdkafka/gssapi"]
-gssapi-vendored = ["rdkafka/gssapi-vendored"]
 libz = ["rdkafka/libz"]
 libz-static = ["rdkafka/libz-static"]
 ssl = ["rdkafka/ssl"]
 ssl-vendored = ["rdkafka/ssl-vendored"]
-zstd = ["rdkafka/zstd"]
-zstd-pkg-config = ["rdkafka/zstd-pkg-config"]
 
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
 simd-json = { version = "0.15", features = ["serde_impl"] }
