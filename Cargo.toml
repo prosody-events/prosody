@@ -68,6 +68,7 @@ whoami = "1.6"
 [features]
 cmake-build = ["rdkafka/cmake-build"]
 default = ["cmake-build"]
+external-lz4 = ["rdkafka/external-lz4"]
 
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
 simd-json = { version = "0.15", features = ["serde_impl"] }
