@@ -336,16 +336,16 @@ impl ProsodyProducer {
         let key: Key = key.into();
 
         // Handle idempotence cache logic if enabled
-        if let (Some(cache), Some(event_id)) = (&self.idempotence_cache, maybe_event_id) {
-            if matches!(
+        if let (Some(cache), Some(event_id)) = (&self.idempotence_cache, maybe_event_id)
+            && matches!(
                 cache.get(&key),
                 Some(previous_event_id) if previous_event_id == event_id
-            ) {
-                let span = info_span!("message.filtered", reason = "duplicate-event-id", event_id);
-                let _enter = span.enter();
-                info!("message with id {event_id} already produced; skipping");
-                return Ok(());
-            }
+            )
+        {
+            let span = info_span!("message.filtered", reason = "duplicate-event-id", event_id);
+            let _enter = span.enter();
+            info!("message with id {event_id} already produced; skipping");
+            return Ok(());
         }
 
         // Serialize the payload to JSON

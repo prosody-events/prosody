@@ -51,7 +51,7 @@ impl<T> HighLevelClient<T> {
     }
 
     /// Returns a view of the current consumer state.
-    pub async fn consumer_state(&self) -> ConsumerStateView<T> {
+    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T> {
         ConsumerStateView(self.consumer.lock().await)
     }
 

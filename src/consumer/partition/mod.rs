@@ -37,9 +37,8 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
-use thiserror::Error;
 use tokio::spawn;
-use tokio::sync::mpsc::error::{SendError, TrySendError};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
@@ -730,12 +729,4 @@ async fn filter_duplicate(
             }
         }
     }
-}
-
-/// Errors that can occur during partition operations.
-#[derive(Debug, Error)]
-pub enum PartitionError {
-    /// Message could not be sent because the partition was shut down
-    #[error("failed to send; partition has been shutdown")]
-    Shutdown(#[from] SendError<UncommittedMessage>),
 }
