@@ -35,11 +35,8 @@ nohash-hasher = "0.2"
 opentelemetry = "0.30"
 opentelemetry-otlp = { version = "0.30", features = [
     "grpc-tonic",
-    "gzip-tonic",
     "http-json",
-    "reqwest-rustls-webpki-roots",
-    "tls-webpki-roots",
-    "zstd-tonic",
+    "http-proto",
 ] }
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }

@@ -5,7 +5,7 @@
 //! customizable tracing setup with optional additional layers.
 
 use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::{ExporterBuildError, SpanExporter};
+use opentelemetry_otlp::{ExporterBuildError, Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::trace::Tracer;
 use std::env;
 use thiserror::Error;
@@ -98,11 +98,22 @@ fn build_telemetry_layer() -> Result<OpenTelemetryLayer<Registry, Tracer>, Traci
     }
 
     // Create and install the OpenTelemetry tracer
-    let protocol = env::var("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_else(|_| "grpc".to_owned());
+    let protocol =
+        env::var("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_else(|_| "http/protobuf".to_owned());
 
     let exporter = match protocol.as_str() {
-        "http/protobuf" | "http/json" => SpanExporter::builder().with_http().build()?,
-        "grpc" => SpanExporter::builder().with_tonic().build()?,
+        "http/protobuf" => SpanExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .build()?,
+        "http/json" => SpanExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpJson)
+            .build()?,
+        "grpc" => SpanExporter::builder()
+            .with_tonic()
+            .with_protocol(Protocol::Grpc)
+            .build()?,
         _ => return Err(TracingError::UnknownOtlpProtocol),
     };
 
