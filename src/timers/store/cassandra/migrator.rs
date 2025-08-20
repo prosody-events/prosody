@@ -20,15 +20,19 @@ use crate::timers::store::cassandra::{
     CassandraTriggerStoreError, InnerError, TABLE_KEYS, TABLE_LOCKS, TABLE_SCHEMA_MIGRATIONS,
     TABLE_SEGMENTS, TABLE_SLABS,
 };
+use chrono::Utc;
 use futures::{TryStreamExt, pin_mut};
+use rand::Rng;
 use rust_embed::RustEmbed;
 use scylla::client::session::Session;
 use scylla::statement::prepared::PreparedStatement;
 use sha2::{Digest, Sha256};
+use std::cmp::min;
 use std::collections::HashMap;
 use std::process;
 use std::str;
 use std::time::{Duration, Instant};
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use whoami::fallible::hostname;
@@ -342,6 +346,9 @@ impl<'a> EmbeddedMigrator<'a> {
     /// lock includes an expiration time and TTL for automatic cleanup of
     /// abandoned locks.
     ///
+    /// Implements retry logic with exponential backoff and jitter for transient
+    /// failures.
+    ///
     /// # Arguments
     ///
     /// * `keyspace` - The keyspace containing the locks table
@@ -355,7 +362,7 @@ impl<'a> EmbeddedMigrator<'a> {
     /// # Errors
     ///
     /// Returns [`CassandraTriggerStoreError`] if:
-    /// - Lock is already held by another process
+    /// - Lock is already held by another process after all retries
     /// - Database query fails
     async fn acquire_lock(
         &self,
@@ -363,51 +370,70 @@ impl<'a> EmbeddedMigrator<'a> {
         lock_name: &str,
         timeout: Duration,
     ) -> Result<Uuid, CassandraTriggerStoreError> {
+        const BASE_DELAY_MS: u64 = 20; // Same as PROSODY_RETRY_BASE default
+        const MAX_DELAY_MS: u64 = 30_000; // 30 seconds
+
         let owner_id = Uuid::new_v4();
-        let acquired_at = chrono::Utc::now();
-        let expires_at = acquired_at
-            + chrono::Duration::from_std(timeout).unwrap_or(chrono::Duration::minutes(10));
         let process_info = format!(
             "{}:{}",
             hostname().unwrap_or_else(|_| "unknown".to_owned()),
             process::id()
         );
+        let ttl_seconds = timeout.as_secs().min(i32::MAX as u64) as i32;
 
         debug!("Attempting to acquire '{lock_name}' lock with owner_id: {owner_id}");
 
-        let ttl_seconds = timeout.as_secs().min(i32::MAX as u64) as i32;
+        let mut attempt = 0;
 
-        let result = self
-            .session
-            .execute_unpaged(
-                &self.acquire_lock,
-                (
-                    lock_name,
-                    owner_id,
-                    acquired_at,
-                    expires_at,
-                    process_info,
-                    ttl_seconds,
-                ),
-            )
-            .await?;
+        loop {
+            let acquired_at = Utc::now();
+            let expires_at = acquired_at
+                + chrono::Duration::from_std(timeout).unwrap_or(chrono::Duration::minutes(10));
 
-        // Check if the LWT was applied (lock acquired)
-        let applied = result
-            .into_rows_result()?
-            .maybe_first_row::<(bool,)>()?
-            .is_some_and(|(applied,)| applied);
+            let result = self
+                .session
+                .execute_unpaged(
+                    &self.acquire_lock,
+                    (
+                        lock_name,
+                        owner_id,
+                        acquired_at,
+                        expires_at,
+                        &process_info,
+                        ttl_seconds,
+                    ),
+                )
+                .await?;
 
-        if applied {
-            info!("Migration lock acquired successfully with owner_id: {owner_id}",);
-            return Ok(owner_id);
+            // Check if the LWT was applied (lock acquired)
+            let applied = result
+                .into_rows_result()?
+                .maybe_first_row::<(bool,)>()?
+                .is_some_and(|(applied,)| applied);
+
+            if applied {
+                info!("Migration lock acquired successfully with owner_id: {owner_id}");
+                return Ok(owner_id);
+            }
+
+            attempt += 1;
+
+            // Calculate sleep time with exponential backoff and full jitter
+            let exp_backoff = min(
+                2u64.saturating_pow(attempt).saturating_mul(BASE_DELAY_MS),
+                MAX_DELAY_MS,
+            );
+            // Full jitter: sleep for random time between 0 and exp_backoff
+            let jitter = rand::rng().random_range(0..=exp_backoff);
+            let sleep_time = Duration::from_millis(jitter);
+
+            debug!(
+                "Lock acquisition attempt {} failed, retrying after {:?}",
+                attempt, sleep_time
+            );
+
+            sleep(sleep_time).await;
         }
-
-        Err(InnerError::Migration(
-            "Failed to acquire migration lock - another process may be running migrations"
-                .to_owned(),
-        )
-        .into())
     }
 
     /// Releases a distributed lock using the owner ID.
