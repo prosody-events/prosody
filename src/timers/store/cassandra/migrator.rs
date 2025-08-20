@@ -17,15 +17,21 @@
 #![allow(clippy::same_name_method)]
 
 use crate::timers::store::cassandra::{
-    CassandraTriggerStoreError, InnerError, TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS,
-    TABLE_SLABS,
+    CassandraTriggerStoreError, InnerError, TABLE_KEYS, TABLE_LOCKS, TABLE_SCHEMA_MIGRATIONS,
+    TABLE_SEGMENTS, TABLE_SLABS,
 };
 use futures::{TryStreamExt, pin_mut};
 use rust_embed::RustEmbed;
 use scylla::client::session::Session;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
+use whoami::fallible::hostname;
+
+/// Default timeout for migration lock acquisition.
+const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10 * 60); // 10 minutes
 
 /// Embedded migration assets containing all `.cql` migration files.
 ///
@@ -72,135 +78,380 @@ pub struct EmbeddedMigrator<'a> {
     session: &'a Session,
     /// Target keyspace name for migrations.
     keyspace: &'a str,
+    /// Prepared statement for acquiring locks.
+    acquire_lock_stmt: scylla::statement::prepared::PreparedStatement,
+    /// Prepared statement for releasing locks.
+    release_lock_stmt: scylla::statement::prepared::PreparedStatement,
 }
 
 impl<'a> EmbeddedMigrator<'a> {
     /// Creates a new migration coordinator.
     ///
+    /// Initializes the keyspace and tables if needed, and prepares lock
+    /// statements for efficient reuse during migration operations.
+    ///
     /// # Arguments
     ///
     /// * `session` - Cassandra session for executing migration statements
     /// * `keyspace` - Target keyspace name where migrations will be applied
-    pub fn new(session: &'a Session, keyspace: &'a str) -> Self {
-        Self { session, keyspace }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraTriggerStoreError`] if:
+    /// - Keyspace creation fails
+    /// - Table creation fails
+    /// - Statement preparation fails
+    pub async fn new(
+        session: &'a Session,
+        keyspace: &'a str,
+    ) -> Result<Self, CassandraTriggerStoreError> {
+        // Create keyspace if it doesn't exist
+        if session.get_cluster_state().get_keyspace(keyspace).is_none() {
+            let create_keyspace_cql = format!(
+                "create keyspace if not exists {keyspace} WITH replication = {{ 'class' : \
+                 'SimpleStrategy', 'replication_factor': 1 }}"
+            );
+            session.query_unpaged(create_keyspace_cql, &[]).await?;
+        }
+
+        // Ensure migrations and migration locks tables exist
+        Self::ensure_migration_tables_exist(session, keyspace).await?;
+
+        // Prepare lock statements once
+        let acquire_lock_sql = format!(
+            "insert into {keyspace}.{TABLE_LOCKS} (lock_name, owner_id, acquired_at, expires_at, \
+             process_info) values (?, ?, ?, ?, ?) if not exists using ttl ?"
+        );
+        let acquire_lock_stmt = session.prepare(acquire_lock_sql).await?;
+
+        let release_lock_sql =
+            format!("delete from {keyspace}.{TABLE_LOCKS} where lock_name = ? if owner_id = ?");
+        let release_lock_stmt = session.prepare(release_lock_sql).await?;
+
+        Ok(Self {
+            session,
+            keyspace,
+            acquire_lock_stmt,
+            release_lock_stmt,
+        })
     }
 
-    /// Executes the complete migration process.
+    /// Executes the complete migration process with distributed locking.
     ///
     /// This method:
     /// 1. Creates the keyspace if it doesn't exist
-    /// 2. Ensures the `schema_migrations` tracking table exists
-    /// 3. Loads all embedded migration files
-    /// 4. Validates previously applied migrations for integrity
-    /// 5. Applies any pending migrations in timestamp order
-    /// 6. Records successful migrations in the tracking table
+    /// 2. Ensures the `schema_migrations` and `locks` tables exist
+    /// 3. Performs a lightweight check for pending migrations
+    /// 4. Only acquires expensive distributed lock if migrations are needed
+    /// 5. Re-checks for pending migrations while holding the lock
+    /// 6. Applies any pending migrations in timestamp order
+    /// 7. Records successful migrations in the tracking table
+    /// 8. Releases the migration lock
     ///
     /// # Errors
     ///
     /// Returns [`CassandraTriggerStoreError`] if:
     /// - Keyspace creation fails
     /// - Migration table creation fails
+    /// - Lock acquisition fails or times out
     /// - Migration validation detects corrupted files
     /// - Any migration statement execution fails
     pub async fn migrate(&self) -> Result<(), CassandraTriggerStoreError> {
-        if self
-            .session
-            .get_cluster_state()
-            .get_keyspace(self.keyspace)
-            .is_none()
-        {
-            // Create keyspace if it doesn't exist
-            // Use unprepared query to avoid keyspace context issues
-            let create_keyspace_cql = format!(
-                "create keyspace if not exists {} WITH replication = {{ 'class' : \
-                 'SimpleStrategy', 'replication_factor': 1 }}",
-                self.keyspace
-            );
-            self.session.query_unpaged(create_keyspace_cql, &[]).await?;
-        }
-
-        // Ensure migrations table exists
-        self.ensure_migrations_table_exists(self.keyspace).await?;
-
-        // Load and validate migrations
-        debug!("Loading embedded migrations");
-        let migrations = load_embedded_migrations(self.keyspace)?;
-        debug!("Loaded {} embedded migrations", migrations.len());
-
-        debug!("Getting applied migrations");
-        let applied_migrations = self.get_applied_migrations(self.keyspace).await?;
-        debug!("Found {} applied migrations", applied_migrations.len());
-
-        // Validate existing migrations
-        validate_applied_migrations(&migrations, &applied_migrations)?;
-
-        // Apply pending migrations
-        let pending_migrations = get_pending_migrations(&migrations, &applied_migrations);
+        // Do a lightweight check first to see if there's any work to do
+        let pending_migrations = self.get_pending_migrations(self.keyspace).await?;
 
         if pending_migrations.is_empty() {
+            debug!("No pending migrations found, skipping lock acquisition");
             return Ok(());
         }
 
-        info!("Applying {} pending migrations", pending_migrations.len());
-        for migration in pending_migrations {
-            debug!("Applying migration: {}", migration.filename);
-            self.apply_migration(migration, self.keyspace).await?;
+        info!(
+            "Found {} pending migrations, acquiring migration lock",
+            pending_migrations.len()
+        );
+
+        // Only acquire lock when there's actual work to do
+        let lock_owner_id = self
+            .acquire_lock(self.keyspace, "migration", MIGRATION_LOCK_TIMEOUT)
+            .await?;
+
+        // Ensure lock is released even if migration fails
+        let migration_result = async {
+            // Re-check for pending migrations while holding the lock
+            // (another process might have applied them while we were waiting for the lock)
+            debug!("Re-checking for pending migrations while holding lock");
+            let pending_migrations = self.get_pending_migrations(self.keyspace).await?;
+
+            if pending_migrations.is_empty() {
+                debug!(
+                    "No pending migrations found after acquiring lock - another process completed \
+                     them"
+                );
+                return Ok(());
+            }
+
+            info!("Applying {} pending migrations", pending_migrations.len());
+            for migration in &pending_migrations {
+                debug!("Applying migration: {}", migration.filename);
+                self.apply_migration(migration, self.keyspace).await?;
+            }
+
+            info!("Database migration completed successfully");
+            Ok(())
+        }
+        .await;
+
+        // Always attempt to release the lock
+        if let Err(e) = self
+            .release_lock(self.keyspace, "migration", lock_owner_id)
+            .await
+        {
+            warn!("Failed to release lock: {:#}", e);
         }
 
-        info!("Database migration completed successfully");
-        Ok(())
+        migration_result
     }
 
-    /// Ensures the `schema_migrations` tracking table exists.
+    /// Ensures the `schema_migrations` and `schema_migration_locks` tables
+    /// exist.
     ///
-    /// Checks for the existence of the `schema_migrations` table and creates
-    /// it if missing. The table tracks applied migrations with their checksums
-    /// and execution metadata.
+    /// Checks for the existence of both migration tables and creates them if
+    /// missing. The `schema_migrations` table tracks applied migrations
+    /// with their checksums and execution metadata. The
+    /// `schema_migration_locks` table provides distributed locking to
+    /// prevent concurrent migration execution.
     ///
     /// # Arguments
     ///
-    /// * `keyspace` - The keyspace where the migrations table should exist
+    /// * `keyspace` - The keyspace where the migration tables should exist
     ///
     /// # Errors
     ///
     /// Returns [`CassandraTriggerStoreError`] if table creation or metadata
     /// refresh fails.
-    async fn ensure_migrations_table_exists(
-        &self,
+    async fn ensure_migration_tables_exist(
+        session: &Session,
         keyspace: &str,
     ) -> Result<(), CassandraTriggerStoreError> {
-        // Check if schema_migrations table exists using cluster metadata
-        let cluster_state = self.session.get_cluster_state();
-        let table_exists = cluster_state
+        let cluster_state = session.get_cluster_state();
+
+        // Check if schema_migrations table exists
+        let migrations_table_exists = cluster_state
             .get_keyspace(keyspace)
             .and_then(|ks| ks.tables.get(TABLE_SCHEMA_MIGRATIONS))
             .is_some();
 
-        if table_exists {
+        if migrations_table_exists {
             debug!("{} table already exists", TABLE_SCHEMA_MIGRATIONS);
+        } else {
+            debug!("Creating {} table", TABLE_SCHEMA_MIGRATIONS);
+            let create_migrations_table_sql = format!(
+                "create table if not exists {keyspace}.{TABLE_SCHEMA_MIGRATIONS} (filename text \
+                 primary key, checksum text, applied_at timestamp, execution_time_ms bigint) with \
+                 compression = {{ 'class': 'ZstdCompressor' }} and compaction = {{ 'class': \
+                 'UnifiedCompactionStrategy' }};
+                "
+            );
+            session
+                .query_unpaged(create_migrations_table_sql, &[])
+                .await?;
+            debug!("{} table created successfully", TABLE_SCHEMA_MIGRATIONS);
+        }
+
+        // Check if schema_migration_locks table exists
+        let locks_table_exists = cluster_state
+            .get_keyspace(keyspace)
+            .and_then(|ks| ks.tables.get(TABLE_LOCKS))
+            .is_some();
+
+        if locks_table_exists {
+            debug!("{} table already exists", TABLE_LOCKS);
+        } else {
+            debug!("Creating {} table", TABLE_LOCKS);
+            let create_locks_table_sql = format!(
+                "create table if not exists {keyspace}.{TABLE_LOCKS} ( lock_name text primary \
+                 key, owner_id uuid, acquired_at timestamp, expires_at timestamp, process_info \
+                 text ) with compression = {{ 'class': 'ZstdCompressor' }} and compaction = {{ \
+                 'class': 'UnifiedCompactionStrategy' }};
+                "
+            );
+            session.query_unpaged(create_locks_table_sql, &[]).await?;
+            debug!("{} table created successfully", TABLE_LOCKS);
+        }
+
+        // Refresh metadata to ensure both tables are visible
+        if !migrations_table_exists || !locks_table_exists {
+            debug!("Refreshing cluster metadata");
+            session
+                .refresh_metadata()
+                .await
+                .map_err(|e| InnerError::Migration(format!("Failed to refresh metadata: {e}")))?;
+            debug!("Metadata refresh completed");
+        }
+
+        Ok(())
+    }
+
+    /// Gets the list of pending migrations that need to be applied.
+    ///
+    /// Loads embedded migrations, queries applied migrations from the database,
+    /// validates migration integrity, and returns the list of migrations that
+    /// haven't been applied yet.
+    ///
+    /// # Arguments
+    ///
+    /// * `keyspace` - The keyspace containing the migration tracking table
+    ///
+    /// # Returns
+    ///
+    /// A vector of migrations that need to be applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraTriggerStoreError`] if:
+    /// - Migration loading or validation fails
+    /// - Database query fails
+    /// - Migration integrity validation detects corrupted files
+    async fn get_pending_migrations(
+        &self,
+        keyspace: &str,
+    ) -> Result<Vec<Migration>, CassandraTriggerStoreError> {
+        debug!("Loading embedded migrations");
+        let migrations = load_embedded_migrations(keyspace)?;
+        debug!("Loaded {} embedded migrations", migrations.len());
+
+        debug!("Getting applied migrations");
+        let applied_migrations = self.get_applied_migrations(keyspace).await?;
+        debug!("Found {} applied migrations", applied_migrations.len());
+
+        // Validate existing migrations
+        validate_applied_migrations(&migrations, &applied_migrations)?;
+
+        // Return pending migrations (convert from references to owned values)
+        let pending_migrations = get_pending_migrations(&migrations, &applied_migrations);
+        Ok(pending_migrations.into_iter().cloned().collect())
+    }
+
+    /// Acquires a distributed lock using lightweight transactions.
+    ///
+    /// Uses Cassandra's IF NOT EXISTS condition to atomically acquire a
+    /// named lock. Only one process can hold a specific lock at a time. The
+    /// lock includes an expiration time and TTL for automatic cleanup of
+    /// abandoned locks.
+    ///
+    /// # Arguments
+    ///
+    /// * `keyspace` - The keyspace containing the locks table
+    /// * `lock_name` - The name/identifier of the lock to acquire
+    /// * `timeout` - Lock timeout duration
+    ///
+    /// # Returns
+    ///
+    /// The owner ID (UUID) if lock acquisition succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraTriggerStoreError`] if:
+    /// - Lock is already held by another process
+    /// - Database query fails
+    async fn acquire_lock(
+        &self,
+        _keyspace: &str,
+        lock_name: &str,
+        timeout: Duration,
+    ) -> Result<Uuid, CassandraTriggerStoreError> {
+        let owner_id = Uuid::new_v4();
+        let acquired_at = chrono::Utc::now();
+        let expires_at = acquired_at
+            + chrono::Duration::from_std(timeout).unwrap_or(chrono::Duration::minutes(10));
+        let process_info = format!(
+            "{}:{}",
+            hostname().unwrap_or_else(|_| "unknown".to_owned()),
+            std::process::id()
+        );
+
+        debug!("Attempting to acquire '{lock_name}' lock with owner_id: {owner_id}");
+
+        let ttl_seconds = timeout.as_secs().min(i32::MAX as u64) as i32;
+
+        let result = self
+            .session
+            .execute_unpaged(
+                &self.acquire_lock_stmt,
+                (
+                    lock_name,
+                    owner_id,
+                    acquired_at,
+                    expires_at,
+                    process_info,
+                    ttl_seconds,
+                ),
+            )
+            .await?;
+
+        // Check if the LWT was applied (lock acquired)
+        let applied = result
+            .into_rows_result()?
+            .maybe_first_row::<(bool,)>()?
+            .is_some_and(|(applied,)| applied);
+
+        if applied {
+            info!("Migration lock acquired successfully with owner_id: {owner_id}",);
+            return Ok(owner_id);
+        }
+
+        Err(InnerError::Migration(
+            "Failed to acquire migration lock - another process may be running migrations"
+                .to_owned(),
+        )
+        .into())
+    }
+
+    /// Releases a distributed lock using the owner ID.
+    ///
+    /// Uses Cassandra's conditional DELETE with owner ID verification to safely
+    /// release a named lock. Only the process that acquired the lock can
+    /// release it.
+    ///
+    /// # Arguments
+    ///
+    /// * `keyspace` - The keyspace containing the locks table
+    /// * `lock_name` - The name/identifier of the lock to release
+    /// * `owner_id` - The UUID of the lock owner
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraTriggerStoreError`] if:
+    /// - Lock is not owned by the specified owner
+    /// - Database query fails
+    async fn release_lock(
+        &self,
+        _keyspace: &str,
+        lock_name: &str,
+        owner_id: Uuid,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        debug!("Releasing lock '{}' with owner_id: {}", lock_name, owner_id);
+
+        let result = self
+            .session
+            .execute_unpaged(&self.release_lock_stmt, (lock_name, owner_id))
+            .await?;
+
+        // Check if the LWT was applied (lock released)
+        let applied: bool = result
+            .into_rows_result()?
+            .maybe_first_row::<(bool,)>()?
+            .is_some_and(|(applied,)| applied);
+
+        if applied {
+            info!("Lock '{}' released successfully", lock_name);
             return Ok(());
         }
 
-        debug!("Creating {} table", TABLE_SCHEMA_MIGRATIONS);
-        let create_table_sql = format!(
-            "create table {keyspace}.{TABLE_SCHEMA_MIGRATIONS} (filename text primary key, \
-             checksum text, applied_at timestamp, execution_time_ms bigint) with compression = {{ \
-             'class': 'ZstdCompressor' }} and compaction = {{ 'class': \
-             'UnifiedCompactionStrategy' }};
-            "
+        warn!(
+            "Failed to release lock '{}' - may have been released by another process or expired",
+            lock_name
         );
-
-        self.session.query_unpaged(create_table_sql, &[]).await?;
-        debug!("{} table created successfully", TABLE_SCHEMA_MIGRATIONS);
-
-        // Refresh metadata to ensure the table is visible
-        debug!("Refreshing cluster metadata");
-        self.session
-            .refresh_metadata()
-            .await
-            .map_err(|e| InnerError::Migration(format!("Failed to refresh metadata: {e}")))?;
-        debug!("Metadata refresh completed");
-
         Ok(())
     }
 

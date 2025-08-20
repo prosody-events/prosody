@@ -89,6 +89,7 @@ missing_docs = "warn"
 unsafe_code = "forbid"
 
 [lints.clippy]
+absolute_paths = "warn"
 blocks_in_conditions = "allow"
 cargo = { level = "warn", priority = -1 }
 cast_possible_truncation = "allow"

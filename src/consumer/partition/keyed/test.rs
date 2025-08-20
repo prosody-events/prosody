@@ -30,8 +30,8 @@ struct Messages(Vec<(u8, u16)>);
 #[derive(Clone, Debug)]
 struct SimpleMessages(Vec<u8>);
 
-/// Verifies that KeyManager prevents concurrent execution of messages with the
-/// same key.
+/// Verifies that `KeyManager` prevents concurrent execution of messages with
+/// the same key.
 ///
 /// # Arguments
 ///
@@ -53,7 +53,7 @@ fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8)
     ))
 }
 
-/// Verifies that KeyManager processes messages for each key in order.
+/// Verifies that `KeyManager` processes messages for each key in order.
 ///
 /// # Arguments
 ///

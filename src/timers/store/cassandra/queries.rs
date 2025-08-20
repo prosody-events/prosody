@@ -155,7 +155,7 @@ impl Queries {
         }
 
         let session = session.build().await?;
-        let migrator = EmbeddedMigrator::new(&session, &configuration.keyspace);
+        let migrator = EmbeddedMigrator::new(&session, &configuration.keyspace).await?;
         migrator.migrate().await?;
 
         let keyspace = &configuration.keyspace;

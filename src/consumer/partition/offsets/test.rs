@@ -21,7 +21,7 @@ use tokio::time::Instant;
 #[derive(Clone, Debug)]
 struct Actions(Vec<Action>);
 
-/// Verifies that OffsetTracker correctly tracks and commits watermarks.
+/// Verifies that `OffsetTracker` correctly tracks and commits watermarks.
 ///
 /// # Arguments
 /// * `actions` - An `Actions` instance containing the test actions.

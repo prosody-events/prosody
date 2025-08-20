@@ -51,6 +51,9 @@ pub const TABLE_KEYS: &str = "timer_keys";
 /// Table name for tracking applied database migrations.
 pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
 
+/// Table name for distributed migration locking.
+pub const TABLE_LOCKS: &str = "locks";
+
 /// Configuration for the Cassandra-based timer storage backend.
 #[derive(Builder, Clone, Educe, Validate)]
 #[educe(Debug)]
