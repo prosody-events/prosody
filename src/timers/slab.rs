@@ -12,7 +12,7 @@
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::ops::Range;
 
 /// Unique identifier for a time-based slab within a segment.
@@ -162,14 +162,14 @@ impl Slab {
 
 impl Debug for Slab {
     /// Debug format: `Slab(segment_id/slab_id)`.
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "Slab({}/{})", self.segment_id, self.id)
     }
 }
 
 impl Display for Slab {
     /// Display format: `segment_id/slab_id[start—end]`.
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let range = self.range();
         write!(
             f,

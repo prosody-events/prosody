@@ -6,7 +6,7 @@
 
 use crate::timers::duration::CompactDuration;
 use chrono::{DateTime, Utc};
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -251,7 +251,7 @@ impl Display for CompactDateTime {
     /// let dt = CompactDateTime::from(0_u32);
     /// assert_eq!(dt.to_string(), "1970-01-01 00:00:00 UTC");
     /// ```
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let time: DateTime<Utc> = (*self).into();
         write!(f, "{time}")
     }
@@ -267,7 +267,7 @@ impl Debug for CompactDateTime {
     /// let dt = CompactDateTime::from(0_u32);
     /// assert_eq!(format!("{dt:?}"), "1970-01-01T00:00:00Z");
     /// ```
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let time: DateTime<Utc> = (*self).into();
         write!(f, "{time:?}")
     }

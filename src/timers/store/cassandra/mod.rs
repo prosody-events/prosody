@@ -26,9 +26,11 @@ use scylla::errors::{
     PagerExecutionError, PrepareError, RowsError, UseKeyspaceError,
 };
 use std::collections::HashMap;
-use std::fmt::Formatter;
+use std::error;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use thiserror::Error;
 use tracing::{info_span, instrument};
@@ -169,7 +171,7 @@ impl CassandraTriggerStore {
     /// - Schema migration fails
     /// - Query preparation fails
     pub async fn new(config: &CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
-        let base_ttl: std::time::Duration = config.retention.into();
+        let base_ttl: StdDuration = config.retention.into();
         let base_ttl = base_ttl.try_into()?;
 
         Ok(Self(Arc::new(Inner {
@@ -768,25 +770,25 @@ where
     }
 }
 
-impl std::fmt::Debug for CassandraTriggerStoreError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.0, f)
+impl Debug for CassandraTriggerStoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        Debug::fmt(&self.0, f)
     }
 }
 
-impl std::fmt::Display for CassandraTriggerStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
+impl Display for CassandraTriggerStoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        Display::fmt(&self.0, f)
     }
 }
 
-impl std::error::Error for CassandraTriggerStoreError {}
+impl error::Error for CassandraTriggerStoreError {}
 
 #[cfg(test)]
 mod test {
     use super::{CassandraConfiguration, CassandraTriggerStore};
     use crate::timers::duration::CompactDuration;
-    use crate::timers::slab::SlabId;
+    use crate::timers::slab::{Slab, SlabId};
     use crate::timers::store::{Segment, SegmentId, TriggerStore};
     use crate::trigger_store_tests;
     use color_eyre::Result;
@@ -848,7 +850,7 @@ mod test {
 
         // Insert test slabs
         for &slab_id in &test_slab_ids {
-            let slab = crate::timers::slab::Slab::new(segment_id, slab_id, segment.slab_size);
+            let slab = Slab::new(segment_id, slab_id, segment.slab_size);
             store.insert_slab(&segment_id, slab).await?;
         }
 
@@ -950,7 +952,7 @@ mod test {
 
         // Insert test slabs
         for &slab_id in &test_ids {
-            let slab = crate::timers::slab::Slab::new(segment_id, slab_id, segment.slab_size);
+            let slab = Slab::new(segment_id, slab_id, segment.slab_size);
             store.insert_slab(&segment_id, slab).await?;
         }
 

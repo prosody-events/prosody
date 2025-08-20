@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::runtime::Builder;
-use tokio::time::Instant;
+use tokio::task;
+use tokio::time::{Instant, advance};
 
 /// A wrapper for a vector of Actions used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
@@ -188,9 +189,9 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
                 }
                 StallAction::Wait(duration) => {
                     // Advance the simulated time
-                    tokio::time::advance(duration).await;
+                    advance(duration).await;
                     // Yield to allow background tasks to run
-                    tokio::task::yield_now().await;
+                    task::yield_now().await;
                 }
             }
 
@@ -208,7 +209,7 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
             let expected_stall = !stalled_offsets.is_empty();
 
             // Allow background tasks to run
-            tokio::task::yield_now().await;
+            task::yield_now().await;
 
             // Check if the stall state matches our expectation
             if expected_stall != tracker.is_stalled() {
@@ -226,8 +227,8 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
 
         // Advance time to trigger stall detection if necessary
         let additional_time = stall_threshold + Duration::from_millis(1);
-        tokio::time::advance(additional_time).await;
-        tokio::task::yield_now().await;
+        advance(additional_time).await;
+        task::yield_now().await;
 
         // Recompute expected_stall after advancing time
         let now = Instant::now();
@@ -238,7 +239,7 @@ fn detects_stalls(test_case: StallTestCase) -> TestResult {
         let expected_stall = !stalled_offsets.is_empty();
 
         // Allow background tasks to run
-        tokio::task::yield_now().await;
+        task::yield_now().await;
 
         // Check if the stall state matches our expectation
         if expected_stall == tracker.is_stalled() {

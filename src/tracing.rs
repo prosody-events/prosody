@@ -6,18 +6,19 @@
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{ExporterBuildError, Protocol, SpanExporter, WithExportConfig};
-use opentelemetry_sdk::trace::Tracer;
+use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer};
 use std::env;
 use thiserror::Error;
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::filter::ParseError;
+use tracing_subscriber::layer::Identity as TracingIdentity;
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// A layer that does nothing
-pub type Identity = tracing_subscriber::layer::Identity;
+pub type Identity = TracingIdentity;
 
 /// Initializes the tracing system with OpenTelemetry and OTLP exporter.
 ///
@@ -117,7 +118,7 @@ fn build_telemetry_layer() -> Result<OpenTelemetryLayer<Registry, Tracer>, Traci
         _ => return Err(TracingError::UnknownOtlpProtocol),
     };
 
-    let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+    let tracer = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .build()
         .tracer("prosody");

@@ -225,7 +225,7 @@ impl Heartbeat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{Duration, Instant as TokioInstant, sleep};
 
     #[tokio::test]
     async fn test_heartbeat_initially_active() {
@@ -260,9 +260,9 @@ mod tests {
         let threshold = Duration::from_millis(100);
         let heartbeat = Heartbeat::new("test_next", threshold);
         let expected_sleep = threshold / HEARTBEAT_MARGIN;
-        let start = tokio::time::Instant::now();
+        let start = TokioInstant::now();
         heartbeat.next().await;
-        let elapsed = tokio::time::Instant::now().duration_since(start);
+        let elapsed = TokioInstant::now().duration_since(start);
         assert!(
             elapsed >= expected_sleep,
             "next() did not sleep for the expected duration (expected at least \

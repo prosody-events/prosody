@@ -7,11 +7,12 @@
 
 use crate::heartbeat::Heartbeat;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
+use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;
-use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
@@ -132,9 +133,7 @@ where
             }
         };
 
-        let target_time = match now.add_duration(crate::timers::duration::CompactDuration::new(
-            preload_seconds,
-        )) {
+        let target_time = match now.add_duration(CompactDuration::new(preload_seconds)) {
             Ok(time) => time,
             Err(error) => {
                 error!("Failed to calculate target time: {error:#}; retrying");
@@ -411,8 +410,8 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
 /// The existing or newly created [`Segment`] object.
 pub async fn get_or_create_segment<T>(
     store: &T,
-    segment_id: crate::timers::store::SegmentId,
-    slab_size: crate::timers::duration::CompactDuration,
+    segment_id: SegmentId,
+    slab_size: CompactDuration,
     name: &str,
 ) -> Result<Segment, TimerManagerError<T::Error>>
 where
@@ -450,7 +449,10 @@ mod tests {
     use crate::timers::store::Segment;
     use crate::timers::store::memory::InMemoryTriggerStore;
     use color_eyre::eyre::{Result, eyre};
+    use futures::future;
     use std::time::Duration;
+    use tokio::task;
+    use tokio::time::{advance, pause};
     use tracing::Span;
     use uuid::Uuid;
 
@@ -529,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_calculate_wait_time_future_time() -> Result<()> {
-        tokio::time::pause();
+        pause();
 
         let now = CompactDateTime::now()?;
         let future_time = now.add_duration(CompactDuration::new(120))?; // 2 minutes from now
@@ -544,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_calculate_wait_time_within_preload_window() -> Result<()> {
-        tokio::time::pause();
+        pause();
 
         let now = CompactDateTime::now()?;
         let near_future = now.add_duration(CompactDuration::new(15))?; // 15 seconds from now
@@ -559,12 +561,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_calculate_wait_time_past_time() -> Result<()> {
-        tokio::time::pause();
+        pause();
 
         let now = CompactDateTime::now()?;
         // Advance time by 1 minute
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
+        advance(Duration::from_secs(60)).await;
+        task::yield_now().await;
 
         let past_time = now; // This is now in the past
         let preload_seconds = 30;
@@ -752,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_slab_loader_basic_operation() -> Result<()> {
-        tokio::time::pause();
+        pause();
 
         let store = InMemoryTriggerStore::new();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -764,7 +766,7 @@ mod tests {
         store.insert_segment(segment.clone()).await?;
 
         // Create test heartbeat
-        let test_heartbeat = Heartbeat::new("test-slab-loader", std::time::Duration::from_secs(30));
+        let test_heartbeat = Heartbeat::new("test-slab-loader", Duration::from_secs(30));
 
         // We need to spawn the slab_loader in a separate task since it runs
         // indefinitely
@@ -775,8 +777,8 @@ mod tests {
         ));
 
         // Give it a moment to start
-        tokio::time::advance(Duration::from_millis(100)).await;
-        tokio::task::yield_now().await;
+        advance(Duration::from_millis(100)).await;
+        task::yield_now().await;
 
         // Cancel the loader task
         loader_handle.abort();
@@ -789,7 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_slab_loader_time_advancement() -> Result<()> {
-        tokio::time::pause();
+        pause();
 
         let store = InMemoryTriggerStore::new();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -801,10 +803,8 @@ mod tests {
         store.insert_segment(segment.clone()).await?;
 
         // Create test heartbeat
-        let test_heartbeat = Heartbeat::new(
-            "test-slab-loader-advancement",
-            std::time::Duration::from_secs(30),
-        );
+        let test_heartbeat =
+            Heartbeat::new("test-slab-loader-advancement", Duration::from_secs(30));
 
         // Spawn the loader
         let loader_handle = tokio::spawn(slab_loader(
@@ -814,8 +814,8 @@ mod tests {
         ));
 
         // Let it load initial slabs
-        tokio::time::advance(Duration::from_millis(100)).await;
-        tokio::task::yield_now().await;
+        advance(Duration::from_millis(100)).await;
+        task::yield_now().await;
 
         let initial_max = {
             let state_guard = slab_lock.slab_lock().await;
@@ -823,8 +823,8 @@ mod tests {
         };
 
         // Advance time significantly to trigger more loads
-        tokio::time::advance(Duration::from_secs(120)).await; // Advance by 2 minutes
-        tokio::task::yield_now().await;
+        advance(Duration::from_secs(120)).await; // Advance by 2 minutes
+        task::yield_now().await;
 
         let final_max = {
             let state_guard = slab_lock.slab_lock().await;
@@ -843,7 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_calculate_wait_time_exact_preload_boundary() -> Result<()> {
-        tokio::time::pause();
+        pause();
 
         let now = CompactDateTime::now()?;
         let boundary_time = now.add_duration(CompactDuration::new(30))?; // Exactly 30 seconds from now
@@ -1020,7 +1020,7 @@ mod tests {
             .collect();
 
         // Wait for all futures to complete
-        let results: Vec<_> = futures::future::join_all(futures).await;
+        let results: Vec<_> = future::join_all(futures).await;
 
         // All should succeed and return the same segment
         for result in results {
@@ -1041,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_slab_loader_handles_time_errors() -> Result<()> {
-        tokio::time::pause();
+        pause();
 
         let store = InMemoryTriggerStore::new();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -1053,10 +1053,7 @@ mod tests {
         store.insert_segment(segment.clone()).await?;
 
         // Create test heartbeat
-        let test_heartbeat = Heartbeat::new(
-            "test-slab-loader-errors",
-            std::time::Duration::from_secs(30),
-        );
+        let test_heartbeat = Heartbeat::new("test-slab-loader-errors", Duration::from_secs(30));
 
         // Spawn the loader
         let loader_handle = tokio::spawn(slab_loader(
@@ -1066,8 +1063,8 @@ mod tests {
         ));
 
         // Give it time to start and handle any initial time operations
-        tokio::time::advance(Duration::from_millis(50)).await;
-        tokio::task::yield_now().await;
+        advance(Duration::from_millis(50)).await;
+        task::yield_now().await;
 
         // The loader should continue running despite any time calculation edge cases
         assert!(!loader_handle.is_finished());
@@ -1079,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_calculate_wait_time_large_values() -> Result<()> {
-        tokio::time::pause();
+        pause();
 
         let now = CompactDateTime::now()?;
 

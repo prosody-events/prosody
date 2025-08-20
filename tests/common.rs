@@ -10,7 +10,7 @@
 
 use std::cmp::max;
 use std::collections::{BTreeSet, HashSet};
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::time::Duration as StdDuration;
 
 use ahash::{HashMap, HashMapExt};
@@ -28,7 +28,7 @@ use prosody::timers::UncommittedTimer;
 use prosody::timers::store::cassandra::CassandraConfiguration;
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -62,7 +62,7 @@ impl QCArbitrary for SmallCount {
 }
 
 impl Debug for SmallCount {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }
@@ -248,7 +248,7 @@ pub fn spawn_consumers(
 /// * `expected_messages` - Map of expected key-value message pairs.
 pub fn spawn_message_verifier(
     tasks: &mut JoinSet<Result<()>>,
-    mut messages_rx: tokio::sync::mpsc::Receiver<(String, Value)>,
+    mut messages_rx: Receiver<(String, Value)>,
     shutdown_tx: watch::Sender<bool>,
     expected_messages: HashMap<u64, BTreeSet<u64>>,
 ) {

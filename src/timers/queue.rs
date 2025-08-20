@@ -150,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_trigger() -> Result<(), TimerSchedulerError> {
-        tokio::time::pause();
+        pause();
 
         let mut triggers = TriggerQueue::new();
 
@@ -175,7 +175,7 @@ mod tests {
         assert!(!triggers.active_triggers().contains(&key, time).await);
 
         // Advance time by 5 seconds to simulate the trigger's original expiration time
-        tokio::time::advance(Duration::from_secs(5)).await;
+        advance(Duration::from_secs(5)).await;
 
         // Ensure that no trigger is emitted
         assert!(triggers.next().await.is_none());

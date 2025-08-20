@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::time::{Instant, sleep, sleep_until};
 use tracing::Span;
 
 /// Helper trait for waiting on processed offsets.
@@ -214,7 +215,7 @@ async fn test_partition_manager_is_stalled() {
             let processed = self.processed_offsets.clone();
             let notify = self.notify.clone();
             async move {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                sleep(Duration::from_secs(2)).await;
                 {
                     let mut vec = processed.lock().await;
                     vec.push(offset);
@@ -259,7 +260,7 @@ async fn test_partition_manager_is_stalled() {
     );
 
     // Wait longer than the stall threshold to detect stall
-    tokio::time::sleep(stall_threshold * 2).await;
+    sleep(stall_threshold * 2).await;
 
     assert!(
         partition_manager.is_stalled(),
@@ -394,7 +395,7 @@ async fn wait_for_processed_offsets<H>(
 where
     H: HasProcessedOffsets + ?Sized,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     loop {
         {
             let processed = handler.processed_offsets().lock().await;
@@ -402,13 +403,13 @@ where
                 return Ok(());
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return Err(format!("Timeout waiting for {expected_count} messages"));
         }
         let notified = handler.notify().notified();
         tokio::select! {
             () = notified => {},
-            () = tokio::time::sleep_until(deadline) => {
+            () = sleep_until(deadline) => {
                 return Err(format!("Timeout waiting for {expected_count} messages"));
             }
         }
@@ -550,7 +551,7 @@ async fn test_partition_manager_timer_heartbeat_integration() {
     let _ = partition_manager.try_send(message);
 
     // Give some time for the timer manager to initialize and heartbeat to be set
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(100)).await;
 
     // The partition should still not be stalled after timer initialization
     assert!(

@@ -23,9 +23,12 @@ use crate::timers::store::cassandra::{
 use futures::{TryStreamExt, pin_mut};
 use rust_embed::RustEmbed;
 use scylla::client::session::Session;
+use scylla::statement::prepared::PreparedStatement;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::process;
+use std::str;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use whoami::fallible::hostname;
@@ -79,9 +82,9 @@ pub struct EmbeddedMigrator<'a> {
     /// Target keyspace name for migrations.
     keyspace: &'a str,
     /// Prepared statement for acquiring locks.
-    acquire_lock_stmt: scylla::statement::prepared::PreparedStatement,
+    acquire_lock: PreparedStatement,
     /// Prepared statement for releasing locks.
-    release_lock_stmt: scylla::statement::prepared::PreparedStatement,
+    release_lock: PreparedStatement,
 }
 
 impl<'a> EmbeddedMigrator<'a> {
@@ -131,8 +134,8 @@ impl<'a> EmbeddedMigrator<'a> {
         Ok(Self {
             session,
             keyspace,
-            acquire_lock_stmt,
-            release_lock_stmt,
+            acquire_lock: acquire_lock_stmt,
+            release_lock: release_lock_stmt,
         })
     }
 
@@ -367,7 +370,7 @@ impl<'a> EmbeddedMigrator<'a> {
         let process_info = format!(
             "{}:{}",
             hostname().unwrap_or_else(|_| "unknown".to_owned()),
-            std::process::id()
+            process::id()
         );
 
         debug!("Attempting to acquire '{lock_name}' lock with owner_id: {owner_id}");
@@ -377,7 +380,7 @@ impl<'a> EmbeddedMigrator<'a> {
         let result = self
             .session
             .execute_unpaged(
-                &self.acquire_lock_stmt,
+                &self.acquire_lock,
                 (
                     lock_name,
                     owner_id,
@@ -434,7 +437,7 @@ impl<'a> EmbeddedMigrator<'a> {
 
         let result = self
             .session
-            .execute_unpaged(&self.release_lock_stmt, (lock_name, owner_id))
+            .execute_unpaged(&self.release_lock, (lock_name, owner_id))
             .await?;
 
         // Check if the LWT was applied (lock released)
@@ -522,7 +525,7 @@ impl<'a> EmbeddedMigrator<'a> {
         migration: &Migration,
         keyspace: &str,
     ) -> Result<(), InnerError> {
-        let start_time = std::time::Instant::now();
+        let start_time = Instant::now();
 
         info!("Applying migration: {}", migration.filename);
 
@@ -590,7 +593,7 @@ fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, CassandraT
             InnerError::Migration(format!("Failed to load migration file: {filename}",))
         })?;
 
-        let mut content_str = std::str::from_utf8(content.data.as_ref())
+        let mut content_str = str::from_utf8(content.data.as_ref())
             .map_err(|e| {
                 InnerError::Migration(format!("Invalid UTF-8 in migration file {filename}: {e}",))
             })?

@@ -15,6 +15,7 @@ use prosody::{
 use serde_json::json;
 use tokio::spawn;
 use tokio::sync::mpsc::channel;
+use tokio::time::Instant;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -83,7 +84,7 @@ async fn test_backpressure() -> Result<()> {
 
     // Counter for the number of messages processed by the consumer
     let mut count = 0_u32;
-    let start_time = tokio::time::Instant::now();
+    let start_time = Instant::now();
 
     // Process messages as they are received by the slow consumer
     while messages_rx.recv().await.is_some() {

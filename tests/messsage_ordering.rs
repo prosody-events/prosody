@@ -6,6 +6,7 @@
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
+use std::env;
 use tokio::runtime::Builder;
 
 mod common;
@@ -19,7 +20,7 @@ use common::{TestInput, run_test};
 fn receives_all_in_key_order() -> Result<()> {
     // Determine the number of tests to run from an environment variable,
     // defaulting to 3 if the variable is not set or invalid.
-    let test_count = std::env::var("INTEGRATION_TESTS")
+    let test_count = env::var("INTEGRATION_TESTS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(3);

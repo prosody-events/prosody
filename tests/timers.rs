@@ -21,7 +21,7 @@ use prosody::{
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -205,7 +205,7 @@ impl TestEnvironment {
         let producer = ProsodyProducer::new(&producer_config)?;
 
         // Give consumer time to start and subscribe
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(5)).await;
 
         Ok(Self {
             topic,

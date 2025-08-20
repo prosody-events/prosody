@@ -18,6 +18,7 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::{Sender, channel};
+use tokio::time::{Instant, sleep};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -70,7 +71,7 @@ impl EventHandler for SlowTimerHandler {
         let timer_key = timer.key().to_string();
 
         // Simulate timer backpressure with a delay
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         if let Err(e) = self.timers_tx.send(timer_key.clone()).await {
             error!("failed to send timer for key {}: {e:#}", timer_key);
@@ -152,7 +153,7 @@ async fn test_timer_backpressure() -> Result<()> {
 
     // Counter for the number of timers processed by the consumer
     let mut count = 0_u32;
-    let start_time = tokio::time::Instant::now();
+    let start_time = Instant::now();
 
     // Process timers as they are received by the slow consumer
     while timers_rx.recv().await.is_some() {

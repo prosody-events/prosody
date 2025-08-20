@@ -12,7 +12,7 @@ use prosody::{
 };
 use serde_json::json;
 use tokio::sync::mpsc::channel;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod common;
@@ -83,7 +83,7 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
 
     // Collect received messages with a predefined timeout
     let mut received_messages = Vec::new();
-    let start = tokio::time::Instant::now();
+    let start = Instant::now();
     let timeout = Duration::from_secs(30);
 
     while start.elapsed() < timeout {

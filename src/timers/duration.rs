@@ -4,7 +4,7 @@
 //! seconds. Reduces memory usage and enables fast arithmetic for timer systems
 //! requiring only second-level precision.
 
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -124,7 +124,7 @@ impl TryFrom<Duration> for CompactDuration {
 
 impl Display for CompactDuration {
     /// Formats the duration in a human-readable form.
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let duration: Duration = (*self).into();
         let duration: humantime::Duration = duration.into();
         write!(f, "{duration}")
@@ -133,7 +133,7 @@ impl Display for CompactDuration {
 
 impl Debug for CompactDuration {
     /// Displays the debug representation.
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let duration: Duration = (*self).into();
         let duration: humantime::Duration = duration.into();
         write!(f, "{duration:?}")

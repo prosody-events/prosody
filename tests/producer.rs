@@ -14,7 +14,7 @@ use prosody::timers::UncommittedTimer;
 use prosody::{Payload, Topic};
 use serde_json::{Value, json};
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -23,7 +23,7 @@ mod common;
 /// Handler that forwards messages to a channel for test verification.
 #[derive(Clone)]
 struct TestHandler {
-    tx: tokio::sync::mpsc::Sender<(String, Value)>,
+    tx: Sender<(String, Value)>,
 }
 
 impl EventHandler for TestHandler {

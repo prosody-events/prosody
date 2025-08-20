@@ -373,6 +373,7 @@ mod tests {
     use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
     use std::time::Duration;
+    use tokio::task;
     use tokio::time;
     use tracing::Span;
     use uuid::Uuid;
@@ -636,7 +637,7 @@ mod tests {
 
         // Allow some time for the scheduler to process
         time::advance(Duration::from_millis(100)).await;
-        tokio::task::yield_now().await;
+        task::yield_now().await;
 
         // Check if timer is active
         let is_active = manager.is_active(&trigger.key, trigger.time).await;
@@ -750,7 +751,7 @@ mod tests {
 
         // Advance time past the trigger time
         time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
+        task::yield_now().await;
 
         if let Some(uncommitted_timer) = stream.next().await {
             let (trigger_data, _) = uncommitted_timer.into_inner();
