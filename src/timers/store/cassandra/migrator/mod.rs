@@ -201,43 +201,47 @@ impl<'a> EmbeddedMigrator<'a> {
     /// - Migration validation detects corrupted files
     /// - Any migration statement execution fails
     pub async fn migrate(&self) -> Result<(), CassandraTriggerStoreError> {
-        for attempt in 0..=MAX_MIGRATION_RETRIES {
+        let mut attempt = 0;
+
+        // Keep trying until success or max retries
+        loop {
+            attempt += 1;
+
             // Check if migrations are needed (lightweight operation)
             if !self.has_pending_migrations().await? {
-                // Silent return when no migrations needed - this is the common case
                 return Ok(());
             }
 
-            // Try to acquire lock and apply migrations
             match self.apply_migrations_with_lock().await {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt == MAX_MIGRATION_RETRIES => {
-                    tracing::error!(
-                        "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
-                    );
-                    return Err(InnerError::Migration(format!(
-                        "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
-                    ))
-                    .into());
-                }
                 Err(e) => {
-                    let sleep_duration = calculate_backoff(attempt + 1);
+                    if attempt >= MAX_MIGRATION_RETRIES {
+                        // Final attempt failed - do one last check before giving up
+                        if !self.has_pending_migrations().await? {
+                            return Ok(());
+                        }
+
+                        tracing::error!(
+                            "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
+                        );
+                        return Err(InnerError::Migration(format!(
+                            "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
+                        ))
+                        .into());
+                    }
+
+                    let sleep_duration = calculate_backoff(attempt);
                     warn!(
-                        "Migration attempt {}/{} failed: {e:#}. Retrying after {}",
-                        attempt + 1,
+                        "Migration attempt {}/{} failed: {:#}. Retrying after {}",
+                        attempt,
                         MAX_MIGRATION_RETRIES,
+                        e,
                         format_duration(sleep_duration)
                     );
                     sleep(sleep_duration).await;
                 }
             }
         }
-
-        // All retry attempts exhausted without success
-        Err(InnerError::Migration(
-            "Migration failed after exhausting all retry attempts".to_owned(),
-        )
-        .into())
     }
 
     /// Checks if there are pending migrations without acquiring a lock.
