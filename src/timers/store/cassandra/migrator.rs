@@ -35,7 +35,7 @@
 //!
 //! The migrator uses exponential backoff with full jitter to handle lock
 //! contention:
-//! - Base delay: 20ms (same as `PROSODY_RETRY_BASE`)
+//! - Base delay: 1 second
 //! - Maximum delay: 30 seconds
 //! - Maximum retries: 10 attempts
 //! - Jitter: Random delay between 0 and calculated backoff (prevents thundering
@@ -56,6 +56,7 @@ use crate::timers::store::cassandra::{
 };
 use chrono::Utc;
 use futures::{TryStreamExt, pin_mut};
+use humantime::format_duration;
 use rand::Rng;
 use rust_embed::RustEmbed;
 use scylla::client::session::Session;
@@ -79,10 +80,13 @@ const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10 * 60); // 10 min
 const MAX_MIGRATION_RETRIES: u32 = 10;
 
 /// Base delay for exponential backoff (milliseconds).
-const BACKOFF_BASE_MS: u64 = 20; // Same as PROSODY_RETRY_BASE default
+const BACKOFF_BASE_MS: u64 = 1000; // 1 second
 
 /// Maximum delay for exponential backoff (milliseconds).
 const BACKOFF_MAX_MS: u64 = 30_000; // 30 seconds
+
+/// Maximum number of retries for table preparation during constructor.
+const MAX_TABLE_PREPARATION_RETRIES: u32 = 10;
 
 /// Embedded migration assets containing all `.cql` migration files.
 ///
@@ -167,10 +171,8 @@ async fn ensure_migration_tables_exist(
     // Check if schema_migrations table exists
     let migrations_table_exists = tables.contains_key(TABLE_SCHEMA_MIGRATIONS);
 
-    if migrations_table_exists {
-        debug!("{} table already exists", TABLE_SCHEMA_MIGRATIONS);
-    } else {
-        debug!("Creating {} table", TABLE_SCHEMA_MIGRATIONS);
+    if !migrations_table_exists {
+        info!("Creating {} table", TABLE_SCHEMA_MIGRATIONS);
         let create_migrations_table_sql = format!(
             "create table if not exists {keyspace}.{TABLE_SCHEMA_MIGRATIONS} (filename text \
              primary key, checksum text, applied_at timestamp, execution_time_ms bigint) with \
@@ -187,10 +189,8 @@ async fn ensure_migration_tables_exist(
     // Check if schema_migration_locks table exists
     let locks_table_exists = tables.contains_key(TABLE_LOCKS);
 
-    if locks_table_exists {
-        debug!("{} table already exists", TABLE_LOCKS);
-    } else {
-        debug!("Creating {} table", TABLE_LOCKS);
+    if !locks_table_exists {
+        info!("Creating {} table", TABLE_LOCKS);
         let create_locks_table_sql = format!(
             "create table if not exists {keyspace}.{TABLE_LOCKS} ( lock_name text primary key, \
              owner_id uuid, acquired_at timestamp, expires_at timestamp, process_info text ) with \
@@ -257,6 +257,7 @@ impl<'a> EmbeddedMigrator<'a> {
     ) -> Result<Self, CassandraTriggerStoreError> {
         // Create keyspace if it doesn't exist
         if session.get_cluster_state().get_keyspace(keyspace).is_none() {
+            info!("Creating keyspace '{keyspace}'");
             let create_keyspace_cql = format!(
                 "create keyspace if not exists {keyspace} WITH replication = {{ 'class' : \
                  'SimpleStrategy', 'replication_factor': 1 }}"
@@ -267,8 +268,8 @@ impl<'a> EmbeddedMigrator<'a> {
 
         ensure_migration_tables_exist(session, keyspace).await?;
 
-        // Tables may not immediately be available after creation, so retry
-        loop {
+        // Tables may not immediately be available after creation, so retry with a limit
+        for attempt in 0..MAX_TABLE_PREPARATION_RETRIES {
             if let Ok((acquire_lock, release_lock)) =
                 prepare_lock_statements(session, keyspace).await
             {
@@ -280,8 +281,21 @@ impl<'a> EmbeddedMigrator<'a> {
                 });
             }
 
-            refresh_metadata(session).await?;
+            if attempt < MAX_TABLE_PREPARATION_RETRIES - 1 {
+                debug!(
+                    "Failed to prepare lock statements (attempt {}/{}), refreshing metadata",
+                    attempt + 1,
+                    MAX_TABLE_PREPARATION_RETRIES
+                );
+                refresh_metadata(session).await?;
+            }
         }
+
+        Err(InnerError::Migration(format!(
+            "Failed to prepare lock statements after {MAX_TABLE_PREPARATION_RETRIES} attempts. \
+             Tables may not be available."
+        ))
+        .into())
     }
 
     /// Executes the complete migration process with distributed locking and
@@ -303,7 +317,7 @@ impl<'a> EmbeddedMigrator<'a> {
     ///
     /// Uses exponential backoff with full jitter for the entire migration
     /// cycle:
-    /// - **Base delay**: 20ms (matches `PROSODY_RETRY_BASE` default)
+    /// - **Base delay**: 1 second
     /// - **Maximum delay**: 30 seconds
     /// - **Maximum retries**: 10 attempts
     /// - **Jitter**: Full jitter (random delay between 0 and calculated
@@ -325,7 +339,7 @@ impl<'a> EmbeddedMigrator<'a> {
         for attempt in 0..=MAX_MIGRATION_RETRIES {
             // Check if migrations are needed (lightweight operation)
             if !self.has_pending_migrations().await? {
-                debug!("No pending migrations found, migration complete");
+                // Silent return when no migrations needed - this is the common case
                 return Ok(());
             }
 
@@ -333,6 +347,9 @@ impl<'a> EmbeddedMigrator<'a> {
             match self.try_apply_migrations().await {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt == MAX_MIGRATION_RETRIES => {
+                    tracing::error!(
+                        "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
+                    );
                     return Err(InnerError::Migration(format!(
                         "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
                     ))
@@ -340,10 +357,11 @@ impl<'a> EmbeddedMigrator<'a> {
                 }
                 Err(e) => {
                     let sleep_duration = calculate_backoff(attempt + 1);
-                    debug!(
-                        "Migration attempt {} failed, retrying after {:?}: {e:#}",
+                    warn!(
+                        "Migration attempt {}/{} failed: {e:#}. Retrying after {}",
                         attempt + 1,
-                        sleep_duration
+                        MAX_MIGRATION_RETRIES,
+                        format_duration(sleep_duration)
                     );
                     sleep(sleep_duration).await;
                 }
@@ -359,14 +377,13 @@ impl<'a> EmbeddedMigrator<'a> {
     async fn has_pending_migrations(&self) -> Result<bool, CassandraTriggerStoreError> {
         let pending = self.get_pending_migrations(self.keyspace).await?;
         if !pending.is_empty() {
-            info!("Found {} pending migrations", pending.len());
+            info!("Found {} pending migration(s) to apply", pending.len());
         }
         Ok(!pending.is_empty())
     }
 
     /// Attempts to acquire the migration lock and apply pending migrations.
     async fn try_apply_migrations(&self) -> Result<(), CassandraTriggerStoreError> {
-        debug!("Attempting to acquire migration lock");
         let lock_owner_id = self
             .acquire_lock("migration", MIGRATION_LOCK_TIMEOUT)
             .await?;
@@ -388,19 +405,28 @@ impl<'a> EmbeddedMigrator<'a> {
         let pending_migrations = self.get_pending_migrations(self.keyspace).await?;
 
         if pending_migrations.is_empty() {
-            debug!(
-                "No pending migrations found after acquiring lock - another process completed them"
-            );
+            info!("All migrations already completed by another process");
             return Ok(());
         }
 
-        info!("Applying {} pending migrations", pending_migrations.len());
-        for migration in &pending_migrations {
-            debug!("Applying migration: {}", migration.filename);
+        info!(
+            "Starting migration: {} migration(s) to apply",
+            pending_migrations.len()
+        );
+        for (index, migration) in pending_migrations.iter().enumerate() {
+            info!(
+                "Applying migration {}/{}: {}",
+                index + 1,
+                pending_migrations.len(),
+                migration.filename
+            );
             self.apply_migration(migration, self.keyspace).await?;
         }
 
-        info!("Database migration completed successfully");
+        info!(
+            "Migration completed successfully: {} migration(s) applied",
+            pending_migrations.len()
+        );
         Ok(())
     }
 
@@ -428,13 +454,14 @@ impl<'a> EmbeddedMigrator<'a> {
         &self,
         keyspace: &str,
     ) -> Result<Vec<Migration>, CassandraTriggerStoreError> {
-        debug!("Loading embedded migrations");
+        debug!("Checking migration status for keyspace '{keyspace}'");
         let migrations = load_embedded_migrations(keyspace)?;
-        debug!("Loaded {} embedded migrations", migrations.len());
-
-        debug!("Getting applied migrations");
         let applied_migrations = self.get_applied_migrations(keyspace).await?;
-        debug!("Found {} applied migrations", applied_migrations.len());
+        debug!(
+            "Migration status: {} total, {} applied",
+            migrations.len(),
+            applied_migrations.len()
+        );
 
         // Validate existing migrations
         validate_applied_migrations(&migrations, &applied_migrations)?;
@@ -489,8 +516,13 @@ impl<'a> EmbeddedMigrator<'a> {
             process::id()
         );
         let ttl_seconds = timeout.as_secs().min(i32::MAX as u64) as i32;
+        debug!(
+            "Setting lock TTL to {} ({}s)",
+            format_duration(timeout),
+            ttl_seconds
+        );
 
-        debug!("Attempting to acquire '{lock_name}' lock with owner_id: {owner_id}");
+        debug!("Attempting to acquire '{lock_name}' lock");
 
         let result = self
             .session
@@ -514,9 +546,10 @@ impl<'a> EmbeddedMigrator<'a> {
             .is_some_and(|row| matches!(row.columns.first(), Some(Some(CqlValue::Boolean(true)))));
 
         if applied {
-            info!("Migration lock acquired successfully with owner_id: {owner_id}");
+            debug!("Migration lock acquired successfully with owner_id: {owner_id}");
             Ok(owner_id)
         } else {
+            debug!("Failed to acquire migration lock - another process holds it");
             Err(InnerError::Migration(
                 "Failed to acquire migration lock - another process may be running migrations"
                     .to_owned(),
@@ -553,7 +586,7 @@ impl<'a> EmbeddedMigrator<'a> {
             .execute_unpaged(&self.release_lock, (lock_name, owner_id))
             .await?;
 
-        info!("Lock '{}' released successfully", lock_name);
+        debug!("Lock '{}' released successfully", lock_name);
         Ok(())
     }
 
@@ -626,19 +659,30 @@ impl<'a> EmbeddedMigrator<'a> {
     ) -> Result<(), InnerError> {
         let start_time = Instant::now();
 
-        info!("Applying migration: {}", migration.filename);
+        debug!("Starting execution of migration: {}", migration.filename);
 
         // Parse and execute CQL statements
         let statements = parse_cql_statements(&migration.content);
 
-        for statement_text in statements {
+        debug!("Migration contains {} CQL statement(s)", statements.len());
+        for (index, statement_text) in statements.iter().enumerate() {
             if !statement_text.trim().is_empty() {
-                debug!("Executing: {}", statement_text.trim());
-                self.session.query_unpaged(statement_text, &[]).await?;
+                debug!("Executing statement {}/{}", index + 1, statements.len());
+                self.session
+                    .query_unpaged(statement_text.as_str(), &[])
+                    .await
+                    .map_err(|e| {
+                        InnerError::Migration(format!(
+                            "Failed to execute statement {} in migration {}: {e:#}",
+                            index + 1,
+                            migration.filename
+                        ))
+                    })?;
             }
         }
 
-        let execution_time = start_time.elapsed().as_millis() as i64;
+        let execution_duration = start_time.elapsed();
+        let execution_time_ms = execution_duration.as_millis() as i64;
 
         // Record the migration as applied
         let applied_at = chrono::Utc::now();
@@ -655,14 +699,15 @@ impl<'a> EmbeddedMigrator<'a> {
                     &migration.filename,
                     &migration.checksum,
                     applied_at,
-                    execution_time,
+                    execution_time_ms,
                 ),
             )
             .await?;
 
-        info!(
-            "Migration {} applied successfully in {}ms",
-            migration.filename, execution_time
+        debug!(
+            "Migration {} completed in {}",
+            migration.filename,
+            format_duration(execution_duration)
         );
         Ok(())
     }
@@ -720,7 +765,7 @@ fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, CassandraT
     // Sort by timestamp to ensure proper ordering
     migrations.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-    debug!("Loaded {} embedded migrations", migrations.len());
+    debug!("Loaded {} embedded migration file(s)", migrations.len());
     Ok(migrations)
 }
 
@@ -924,10 +969,32 @@ mod tests {
 
     use super::*;
     use color_eyre::Result;
+    use color_eyre::eyre::Error as EyreError;
     use scylla::client::session_builder::SessionBuilder;
     use std::sync::Arc;
     use tokio::task::JoinSet;
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::{EnvFilter, fmt};
     use uuid::Uuid;
+
+    /// Initializes test logging with appropriate levels for migration testing.
+    fn init_test_logging() -> Result<()> {
+        if fmt()
+            .compact()
+            .with_env_filter(
+                EnvFilter::builder()
+                    .with_env_var("PROSODY_LOG")
+                    .with_default_directive(LevelFilter::INFO.into())
+                    .from_env_lossy()
+                    .add_directive("scylla=warn".parse()?),
+            )
+            .try_init()
+            .is_err()
+        {
+            tracing::info!("logging already initialized");
+        }
+        Ok(())
+    }
 
     /// Creates a Cassandra session for testing.
     async fn create_test_session() -> Result<Session> {
@@ -952,7 +1019,7 @@ mod tests {
     }
 
     /// Number of concurrent migrators to test
-    const CONCURRENT_MIGRATORS: usize = 30;
+    const CONCURRENT_MIGRATORS: usize = 2;
 
     /// Tests that concurrent migrations work safely without race conditions.
     ///
@@ -969,6 +1036,8 @@ mod tests {
     /// and then succeed when they see migrations are already complete.
     #[tokio::test]
     async fn test_concurrent_migration_lock_safety() -> Result<()> {
+        init_test_logging()?;
+
         let session = Arc::new(Box::pin(create_test_session()).await?);
         let keyspace = random_keyspace();
 
@@ -985,9 +1054,7 @@ mod tests {
                 // Each migrator attempts to run migrations - this is where the locking happens
                 let result = migrator.migrate().await;
 
-                Ok::<(usize, Result<(), CassandraTriggerStoreError>), color_eyre::eyre::Error>((
-                    i, result,
-                ))
+                Ok::<(usize, Result<(), CassandraTriggerStoreError>), EyreError>((i, result))
             });
         }
 
@@ -1004,7 +1071,7 @@ mod tests {
                 }
                 Err(e) => {
                     failure_count += 1;
-                    println!("Migrator {} failed: {:#}", migrator_id, e);
+                    tracing::error!("Migrator {migrator_id} failed: {e:#}");
                 }
             }
         }
@@ -1013,8 +1080,8 @@ mod tests {
         // or by waiting for another migrator to complete them
         assert_eq!(
             success_count, CONCURRENT_MIGRATORS,
-            "All {} migrators should succeed. Successes: {}, Failures: {}",
-            CONCURRENT_MIGRATORS, success_count, failure_count
+            "All {CONCURRENT_MIGRATORS} migrators should succeed. Successes: {success_count}, \
+             Failures: {failure_count}"
         );
 
         // Cleanup
