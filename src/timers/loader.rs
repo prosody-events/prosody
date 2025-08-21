@@ -17,7 +17,7 @@ use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
 use futures::{StreamExt, TryStreamExt};
-use std::cmp::max;
+use rand::Rng;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 use tokio::select;
@@ -111,11 +111,10 @@ pub async fn slab_loader<T>(segment: Segment, state: SlabLock<State<T>>, heartbe
 where
     T: TriggerStore,
 {
-    const MIN_PRELOAD_SECONDS: u32 = 30;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-    // Determine preload window: half slab size or minimum
-    let preload_seconds = max(segment.slab_size.seconds() / 2, MIN_PRELOAD_SECONDS);
+    // Initialize jittered preload window
+    let mut preload_seconds = calculate_jittered_preload_seconds(segment.slab_size);
     let mut loaded_slab_ids = HashSet::new();
     let mut highest_loaded_slab_id: Option<SlabId> = None;
 
@@ -159,6 +158,9 @@ where
                     loaded_slab_ids.extend(loaded);
                     highest_loaded_slab_id = Some(target_slab_id);
                     debug!("Successfully loaded slabs up to {target_slab_id}");
+
+                    // Re-jitter preload window for next cycle
+                    preload_seconds = calculate_jittered_preload_seconds(segment.slab_size);
                 }
                 Err(error) => {
                     error!("Failed to load slabs: {error:#}; retrying in {RETRY_DELAY:?}");
@@ -205,19 +207,11 @@ where
 ///
 /// A [`Duration`] to sleep before loading the slab.
 fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Duration {
-    let now = match CompactDateTime::now() {
-        Ok(now) => now,
-        Err(error) => {
-            error!("Failed to get current time: {error:#}; loading immediately");
-            return Duration::from_secs(0);
-        }
-    };
-
-    match load_time.duration_since(now) {
+    match load_time.compact_duration_from_now() {
         Ok(duration) => {
             // If slab start is farther than preload window, wait accordingly
-            if duration.as_secs() > u64::from(preload_seconds) {
-                Duration::from_secs(duration.as_secs() - u64::from(preload_seconds))
+            if duration.seconds() > preload_seconds {
+                duration.saturating_sub(preload_seconds.into()).into()
             } else {
                 // Already within preload window
                 Duration::from_secs(0)
@@ -437,6 +431,24 @@ where
         .map_err(TimerManagerError::Store)?;
 
     Ok(segment)
+}
+
+/// Calculates a jittered preload duration between the minimum and slab size.
+///
+/// Returns a random duration between `MIN_PRELOAD_SECONDS` and the slab size,
+/// ensuring we never load less than 1 minute before a slab starts.
+///
+/// # Arguments
+///
+/// * `slab_size` - The duration of each slab.
+///
+/// # Returns
+///
+/// A jittered preload duration in seconds.
+fn calculate_jittered_preload_seconds(slab_size: CompactDuration) -> u32 {
+    const MIN_PRELOAD_SECONDS: u32 = 60;
+    let max_jitter = slab_size.seconds().saturating_sub(MIN_PRELOAD_SECONDS);
+    rand::rng().random_range(0..=max_jitter) + MIN_PRELOAD_SECONDS
 }
 
 #[cfg(test)]
