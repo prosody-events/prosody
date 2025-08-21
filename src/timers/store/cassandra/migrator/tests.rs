@@ -6,7 +6,7 @@
 //! applied exactly once without conflicts.
 
 use super::EmbeddedMigrator;
-use crate::timers::store::cassandra::CassandraTriggerStoreError;
+use crate::timers::store::cassandra::{CassandraTriggerStoreError, TABLE_LOCKS};
 use color_eyre::Result;
 use color_eyre::eyre::Error as EyreError;
 use scylla::client::session::Session;
@@ -142,7 +142,7 @@ async fn test_concurrent_migration_lock_safety() -> Result<()> {
     );
 
     // Verify that all locks have been released by checking the locks table
-    let locks_query = format!("SELECT lock_name, owner_id FROM {keyspace}.locks");
+    let locks_query = format!("SELECT lock_name, owner_id FROM {keyspace}.{TABLE_LOCKS}");
     let remaining_locks = session.query_unpaged(locks_query, &[]).await?;
     let lock_rows = remaining_locks.into_rows_result()?;
     let lock_count = lock_rows
