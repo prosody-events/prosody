@@ -23,7 +23,7 @@ pub struct LockManager<'a> {
     release_lock: PreparedStatement,
 }
 
-/// A distributed lock guard that automatically releases the lock when dropped.
+/// A distributed lock guard that requires explicit `release()` - warns on drop if not released.
 pub struct LockGuard<'a> {
     session: &'a Session,
     release_lock: &'a PreparedStatement,
@@ -77,7 +77,7 @@ impl<'a> LockManager<'a> {
     ///
     /// # Returns
     ///
-    /// A lock guard that automatically releases the lock when dropped.
+    /// A lock guard that requires explicit release.
     ///
     /// # Errors
     ///
