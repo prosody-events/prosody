@@ -114,7 +114,7 @@ where
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
     // Initialize jittered preload window
-    let mut preload_seconds = calculate_jittered_preload_seconds(segment.slab_size);
+    let mut preload_window = calculate_preload(segment.slab_size);
     let mut loaded_slab_ids = HashSet::new();
     let mut highest_loaded_slab_id: Option<SlabId> = None;
 
@@ -132,7 +132,7 @@ where
             }
         };
 
-        let target_time = match now.add_duration(CompactDuration::new(preload_seconds)) {
+        let target_time = match now.add_duration(preload_window) {
             Ok(time) => time,
             Err(error) => {
                 error!("Failed to calculate target time: {error:#}; retrying");
@@ -160,7 +160,7 @@ where
                     debug!("Successfully loaded slabs up to {target_slab_id}");
 
                     // Re-jitter preload window for next cycle
-                    preload_seconds = calculate_jittered_preload_seconds(segment.slab_size);
+                    preload_window = calculate_preload(segment.slab_size);
                 }
                 Err(error) => {
                     error!("Failed to load slabs: {error:#}; retrying in {RETRY_DELAY:?}");
@@ -182,12 +182,11 @@ where
         }
 
         // Calculate wait time until next slab needs loading
-        let wait_time = calculate_wait_time(next_slab.range().start, preload_seconds);
+        let wait_time = calculate_wait_time(next_slab.range().start, preload_window);
         if !wait_time.is_zero() {
-            debug!("Waiting {wait_time:?} before next load cycle");
-
+            debug!("Waiting {wait_time} before next load cycle");
             select! {
-                () = sleep(wait_time) => {},
+                () = sleep(wait_time.into()) => {},
                 () = heartbeat.next() => {},
             }
         }
@@ -201,20 +200,23 @@ where
 /// # Arguments
 ///
 /// * `load_time` - The start time of the next slab.
-/// * `preload_seconds` - The configured preload window in seconds.
+/// * `preload_window` - The configured preload window.
 ///
 /// # Returns
 ///
 /// A [`Duration`] to sleep before loading the slab.
-fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Duration {
+fn calculate_wait_time(
+    load_time: CompactDateTime,
+    preload_window: CompactDuration,
+) -> CompactDuration {
     match load_time.compact_duration_from_now() {
         Ok(duration) => {
-            // If slab start is farther than preload window, wait accordingly
-            if duration.seconds() > preload_seconds {
-                duration.saturating_sub(preload_seconds.into()).into()
+            if duration > preload_window {
+                // If slab start is farther than preload window, wait accordingly
+                duration.saturating_sub(preload_window)
             } else {
                 // Already within preload window
-                Duration::from_secs(0)
+                CompactDuration::MIN
             }
         }
         Err(error) => {
@@ -227,7 +229,7 @@ fn calculate_wait_time(load_time: CompactDateTime, preload_seconds: u32) -> Dura
                     error!("Error calculating time until load: {error:#}; loading immediately");
                 }
             }
-            Duration::from_secs(0)
+            CompactDuration::MIN
         }
     }
 }
@@ -445,10 +447,12 @@ where
 /// # Returns
 ///
 /// A jittered preload duration in seconds.
-fn calculate_jittered_preload_seconds(slab_size: CompactDuration) -> u32 {
-    const MIN_PRELOAD_SECONDS: u32 = 60;
-    let max_jitter = slab_size.seconds().saturating_sub(MIN_PRELOAD_SECONDS);
-    rand::rng().random_range(0..=max_jitter) + MIN_PRELOAD_SECONDS
+fn calculate_preload(slab_size: CompactDuration) -> CompactDuration {
+    const MIN_PRELOAD: CompactDuration = CompactDuration::new(60);
+
+    let max_jitter = slab_size.saturating_sub(MIN_PRELOAD);
+    CompactDuration::from(rand::rng().random_range(0..=max_jitter.seconds()))
+        .saturating_add(MIN_PRELOAD)
 }
 
 #[cfg(test)]
@@ -547,12 +551,12 @@ mod tests {
 
         let now = CompactDateTime::now()?;
         let future_time = now.add_duration(CompactDuration::new(120))?; // 2 minutes from now
-        let preload_seconds = 30;
+        let preload_window = CompactDuration::new(30);
 
-        let wait_time = calculate_wait_time(future_time, preload_seconds);
+        let wait_time = calculate_wait_time(future_time, preload_window);
 
         // Should wait for 120 - 30 = 90 seconds
-        assert_eq!(wait_time, Duration::from_secs(90));
+        assert_eq!(wait_time, CompactDuration::new(90));
         Ok(())
     }
 
@@ -562,12 +566,13 @@ mod tests {
 
         let now = CompactDateTime::now()?;
         let near_future = now.add_duration(CompactDuration::new(15))?; // 15 seconds from now
-        let preload_seconds = 30;
+        let preload_window = CompactDuration::new(30);
 
-        let wait_time = calculate_wait_time(near_future, preload_seconds);
+        let wait_time = calculate_wait_time(near_future, preload_window);
 
-        // Should not wait (return Duration::ZERO) since it's within the preload window
-        assert_eq!(wait_time, Duration::ZERO);
+        // Should not wait (return CompactDuration::MIN) since it's within the preload
+        // window
+        assert!(wait_time.is_zero());
         Ok(())
     }
 
@@ -581,12 +586,12 @@ mod tests {
         task::yield_now().await;
 
         let past_time = now; // This is now in the past
-        let preload_seconds = 30;
+        let preload_window = CompactDuration::new(30);
 
-        let wait_time = calculate_wait_time(past_time, preload_seconds);
+        let wait_time = calculate_wait_time(past_time, preload_window);
 
         // Should load immediately for past times
-        assert_eq!(wait_time, Duration::ZERO);
+        assert!(wait_time.is_zero());
         Ok(())
     }
 
@@ -859,12 +864,12 @@ mod tests {
 
         let now = CompactDateTime::now()?;
         let boundary_time = now.add_duration(CompactDuration::new(30))?; // Exactly 30 seconds from now
-        let preload_seconds = 30;
+        let preload_window = CompactDuration::new(30);
 
-        let wait_time = calculate_wait_time(boundary_time, preload_seconds);
+        let wait_time = calculate_wait_time(boundary_time, preload_window);
 
         // Should not wait since it's exactly at the boundary
-        assert_eq!(wait_time, Duration::ZERO);
+        assert!(wait_time.is_zero());
         Ok(())
     }
 
@@ -1096,21 +1101,20 @@ mod tests {
         let near_future = now.add_duration(CompactDuration::new(10))?;
         let large_preload = u32::MAX;
 
-        let wait_time = calculate_wait_time(near_future, large_preload);
+        let wait_time = calculate_wait_time(near_future, CompactDuration::new(large_preload));
 
         // Should load immediately when preload is very large
-        assert_eq!(wait_time, Duration::ZERO);
+        assert!(wait_time.is_zero());
 
         // Test with large but reasonable duration difference that won't overflow
         let large_duration = 86400 * 365; // 1 year in seconds
         let far_future = now.add_duration(CompactDuration::new(large_duration))?;
         let normal_preload = 30;
 
-        let wait_time = calculate_wait_time(far_future, normal_preload);
+        let wait_time = calculate_wait_time(far_future, CompactDuration::new(normal_preload));
 
         // Should wait for a very long time (1 year - 30 seconds)
-        assert!(wait_time.as_secs() > 0);
-        assert_eq!(wait_time.as_secs(), u64::from(large_duration) - 30);
+        assert_eq!(wait_time.seconds(), large_duration - 30);
         Ok(())
     }
 }

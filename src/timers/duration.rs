@@ -40,13 +40,13 @@ impl CompactDuration {
     /// assert_eq!(one_hour.seconds(), 3600);
     /// ```
     #[must_use]
-    pub fn new(seconds: u32) -> Self {
+    pub const fn new(seconds: u32) -> Self {
         Self { seconds }
     }
 
     /// Returns the number of seconds in this duration.
     #[must_use]
-    pub fn seconds(self) -> u32 {
+    pub const fn seconds(self) -> u32 {
         self.seconds
     }
 
@@ -138,6 +138,21 @@ impl CompactDuration {
         Self {
             seconds: self.seconds.saturating_sub(other.seconds),
         }
+    }
+
+    /// Returns `true` if this duration is zero seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use prosody::timers::duration::CompactDuration;
+    ///
+    /// assert!(CompactDuration::new(0).is_zero());
+    /// assert!(!CompactDuration::new(1).is_zero());
+    /// ```
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.seconds == 0
     }
 }
 
