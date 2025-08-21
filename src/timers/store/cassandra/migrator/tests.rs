@@ -11,6 +11,7 @@ use color_eyre::Result;
 use color_eyre::eyre::Error as EyreError;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use std::iter::Iterator;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::level_filters::LevelFilter;
@@ -138,6 +139,21 @@ async fn test_concurrent_migration_lock_safety() -> Result<()> {
             .iter()
             .map(|m| &m.filename)
             .collect::<Vec<_>>()
+    );
+
+    // Verify that all locks have been released by checking the locks table
+    let locks_query = format!("SELECT lock_name, owner_id FROM {keyspace}.locks");
+    let remaining_locks = session.query_unpaged(locks_query, &[]).await?;
+    let lock_rows = remaining_locks.into_rows_result()?;
+    let lock_count = lock_rows
+        .rows::<(String, Uuid)>()
+        .map(Iterator::count)
+        .unwrap_or(0);
+
+    assert_eq!(
+        lock_count, 0,
+        "Expected zero remaining locks after all migrators completed, but found {lock_count} \
+         active locks. This indicates a lock leak in the migration system."
     );
 
     // Cleanup

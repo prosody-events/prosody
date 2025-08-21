@@ -1,6 +1,6 @@
 //! Distributed locking for migration coordination.
 //!
-//! Provides [`MigrationLock`] which uses Cassandra lightweight transactions
+//! Provides [`LockManager`] which uses Cassandra lightweight transactions
 //! to ensure only one process applies migrations at a time across a
 //! distributed system.
 
@@ -12,18 +12,27 @@ use scylla::statement::prepared::PreparedStatement;
 use scylla::value::{CqlValue, Row};
 use std::process;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, error};
 use uuid::Uuid;
 use whoami::fallible::hostname;
 
 /// Distributed lock manager for migration coordination.
-pub struct MigrationLock<'a> {
+pub struct LockManager<'a> {
     session: &'a Session,
     acquire_lock: PreparedStatement,
     release_lock: PreparedStatement,
 }
 
-impl<'a> MigrationLock<'a> {
+/// A distributed lock guard that automatically releases the lock when dropped.
+pub struct LockGuard<'a> {
+    session: &'a Session,
+    release_lock: &'a PreparedStatement,
+    lock_name: &'a str,
+    owner_id: Uuid,
+    released: bool,
+}
+
+impl<'a> LockManager<'a> {
     /// Creates a new migration lock manager.
     ///
     /// # Arguments
@@ -68,8 +77,7 @@ impl<'a> MigrationLock<'a> {
     ///
     /// # Returns
     ///
-    /// The owner ID (UUID) if lock acquisition succeeds, or an error if the
-    /// lock is already held by another process.
+    /// A lock guard that automatically releases the lock when dropped.
     ///
     /// # Errors
     ///
@@ -78,10 +86,10 @@ impl<'a> MigrationLock<'a> {
     /// - Database query fails due to network or cluster issues
     /// - LWT result parsing fails
     pub async fn acquire(
-        &self,
-        lock_name: &str,
+        &'a self,
+        lock_name: &'a str,
         timeout: Duration,
-    ) -> Result<Uuid, CassandraTriggerStoreError> {
+    ) -> Result<LockGuard<'a>, CassandraTriggerStoreError> {
         let owner_id = Uuid::new_v4();
         let acquired_at = Utc::now();
         let expires_at = acquired_at
@@ -123,7 +131,13 @@ impl<'a> MigrationLock<'a> {
 
         if applied {
             debug!("Migration lock acquired successfully with owner_id: {owner_id}");
-            Ok(owner_id)
+            Ok(LockGuard {
+                session: self.session,
+                release_lock: &self.release_lock,
+                lock_name,
+                owner_id,
+                released: false,
+            })
         } else {
             debug!("Failed to acquire migration lock - another process holds it");
             Err(InnerError::Migration(
@@ -133,36 +147,50 @@ impl<'a> MigrationLock<'a> {
             .into())
         }
     }
+}
 
-    /// Releases a distributed lock using the owner ID.
+impl LockGuard<'_> {
+    /// Explicitly releases the lock.
     ///
-    /// Uses Cassandra's conditional DELETE with owner ID verification to safely
-    /// release a named lock. Only the process that acquired the lock can
-    /// release it.
-    ///
-    /// # Arguments
-    ///
-    /// * `lock_name` - The name/identifier of the lock to release
-    /// * `owner_id` - The UUID of the lock owner
+    /// This method consumes the guard and releases the lock. After calling
+    /// this, the guard cannot be used again and will not trigger the drop
+    /// warning.
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraTriggerStoreError`] if:
-    /// - Lock is not owned by the specified owner
-    /// - Database query fails
-    pub async fn release(
-        &self,
-        lock_name: &str,
-        owner_id: Uuid,
-    ) -> Result<(), CassandraTriggerStoreError> {
-        debug!("Releasing lock '{}' with owner_id: {}", lock_name, owner_id);
+    /// Returns [`CassandraTriggerStoreError`] if the database query fails.
+    pub async fn release(mut self) -> Result<(), CassandraTriggerStoreError> {
+        if !self.released {
+            debug!(
+                "Explicitly releasing lock '{}' with owner_id: {}",
+                self.lock_name, self.owner_id
+            );
 
-        self.session
-            .execute_unpaged(&self.release_lock, (lock_name, owner_id))
-            .await?;
+            self.session
+                .execute_unpaged(self.release_lock, (&self.lock_name, self.owner_id))
+                .await?;
 
-        debug!("Lock '{}' released successfully", lock_name);
+            self.released = true;
+            debug!("Lock '{}' released successfully", self.lock_name);
+        }
         Ok(())
+    }
+}
+
+impl Drop for LockGuard<'_> {
+    /// Warns if the lock is dropped without being explicitly released.
+    ///
+    /// This is a safety mechanism to help detect potential lock leaks.
+    /// In normal operation, locks should be explicitly released using
+    /// the `release()` method.
+    fn drop(&mut self) {
+        if !self.released {
+            error!(
+                "Lock '{}' with owner_id {} was dropped without being explicitly released! This \
+                 may indicate a lock leak.",
+                self.lock_name, self.owner_id
+            );
+        }
     }
 }
 

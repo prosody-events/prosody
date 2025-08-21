@@ -66,7 +66,7 @@ use executor::MigrationExecutor;
 use futures::{TryStreamExt, pin_mut};
 use humantime::format_duration;
 use loader::{Migration, load_embedded_migrations};
-use lock::MigrationLock;
+use lock::LockManager;
 use scylla::client::session::Session;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -95,7 +95,7 @@ pub struct EmbeddedMigrator<'a> {
     /// Target keyspace name for migrations.
     keyspace: &'a str,
     /// Migration lock manager.
-    lock_manager: MigrationLock<'a>,
+    lock_manager: LockManager<'a>,
     /// Migration executor.
     executor: MigrationExecutor<'a>,
 }
@@ -136,7 +136,7 @@ impl<'a> EmbeddedMigrator<'a> {
 
         // Tables may not immediately be available after creation, so retry with a limit
         for attempt in 0..MAX_TABLE_PREPARATION_RETRIES {
-            if let Ok(lock_manager) = MigrationLock::new(session, keyspace).await {
+            if let Ok(lock_manager) = LockManager::new(session, keyspace).await {
                 let executor = MigrationExecutor::new(session);
                 return Ok(Self {
                     session,
@@ -234,7 +234,10 @@ impl<'a> EmbeddedMigrator<'a> {
         }
 
         // All retry attempts exhausted without success
-        Err(InnerError::Migration("Migration failed after exhausting all retry attempts".to_owned()).into())
+        Err(InnerError::Migration(
+            "Migration failed after exhausting all retry attempts".to_owned(),
+        )
+        .into())
     }
 
     /// Checks if there are pending migrations without acquiring a lock.
@@ -248,17 +251,16 @@ impl<'a> EmbeddedMigrator<'a> {
 
     /// Acquires the migration lock and applies pending migrations.
     async fn apply_migrations_with_lock(&self) -> Result<(), CassandraTriggerStoreError> {
-        let lock_owner_id = self
+        let lock_guard = self
             .lock_manager
             .acquire("migration", MIGRATION_LOCK_TIMEOUT)
             .await?;
 
-        // Ensure lock is released even if migration fails
+        // Apply migrations while holding the lock
         let result = self.apply_pending_migrations().await;
 
-        if let Err(e) = self.lock_manager.release("migration", lock_owner_id).await {
-            warn!("Failed to release migration lock: {:#}", e);
-        }
+        // Explicitly release the lock
+        lock_guard.release().await?;
 
         result
     }
