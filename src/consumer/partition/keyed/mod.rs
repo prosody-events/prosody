@@ -29,6 +29,7 @@ use futures::{Stream, StreamExt, pin_mut};
 use nohash_hasher::{IntMap, IntSet};
 use tokio::select;
 use tokio::sync::watch;
+use tokio::task::coop::{Coop, cooperative};
 use tokio::time::sleep;
 use tracing::warn;
 use tracing::{debug, instrument};
@@ -53,7 +54,10 @@ type HashValue = u64;
 /// - Enables concurrent processing across different keys
 /// - Enforces per-key backpressure through configurable queue limits
 /// - Provides graceful shutdown with timeout for in-flight operations
-pub struct KeyManager<M, F, Fut> {
+pub struct KeyManager<M, F, Fut>
+where
+    Fut: Future,
+{
     /// Maximum number of messages allowed to be queued per key
     max_enqueued_per_key: usize,
 
@@ -61,7 +65,7 @@ pub struct KeyManager<M, F, Fut> {
     process: F,
 
     /// Currently executing futures with their associated hash values
-    executing: FuturesUnordered<WithValue<HashValue, Fut>>,
+    executing: FuturesUnordered<Coop<WithValue<HashValue, Fut>>>,
 
     /// Set of keys that are currently being processed
     busy: IntSet<HashValue>,
@@ -73,7 +77,10 @@ pub struct KeyManager<M, F, Fut> {
     hash_state: RandomState,
 }
 
-impl<M, F, Fut> KeyManager<M, F, Fut> {
+impl<M, F, Fut> KeyManager<M, F, Fut>
+where
+    Fut: Future,
+{
     /// Creates a new `KeyManager` with the specified processing function and
     /// queue limits.
     ///
@@ -386,7 +393,7 @@ impl<M, F, Fut> KeyManager<M, F, Fut> {
         }
 
         // Create a future for processing the message
-        let future = WithValue::new(hash_value, (self.process)(message));
+        let future = cooperative(WithValue::new(hash_value, (self.process)(message)));
 
         // Mark the key as busy and add the future to the execution queue
         self.busy.insert(hash_value);
