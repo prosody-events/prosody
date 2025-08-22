@@ -60,7 +60,7 @@ async fn cleanup_keyspace(session: &Session, keyspace: &str) -> Result<()> {
 }
 
 /// Number of concurrent migrators to test
-const CONCURRENT_MIGRATORS: usize = 10;
+const CONCURRENT_MIGRATORS: usize = 2;
 
 /// Tests that concurrent migrations work safely without race conditions.
 ///

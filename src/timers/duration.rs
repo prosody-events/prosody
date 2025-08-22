@@ -5,6 +5,7 @@
 //! requiring only second-level precision.
 
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::ops::{Add, Sub};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -39,13 +40,13 @@ impl CompactDuration {
     /// assert_eq!(one_hour.seconds(), 3600);
     /// ```
     #[must_use]
-    pub fn new(seconds: u32) -> Self {
+    pub const fn new(seconds: u32) -> Self {
         Self { seconds }
     }
 
     /// Returns the number of seconds in this duration.
     #[must_use]
-    pub fn seconds(self) -> u32 {
+    pub const fn seconds(self) -> u32 {
         self.seconds
     }
 
@@ -67,6 +68,114 @@ impl CompactDuration {
                 .ok_or(CompactDurationError::OutOfRange)?,
         })
     }
+
+    /// Adds two durations with saturation at [`Self::MAX`].
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The [`CompactDuration`] to add.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use prosody::timers::duration::CompactDuration;
+    ///
+    /// let a = CompactDuration::new(1000);
+    /// let b = CompactDuration::new(2000);
+    /// assert_eq!(a.saturating_add(b).seconds(), 3000);
+    ///
+    /// let max = CompactDuration::MAX;
+    /// let one = CompactDuration::new(1);
+    /// assert_eq!(max.saturating_add(one), CompactDuration::MAX);
+    /// ```
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            seconds: self.seconds.saturating_add(other.seconds),
+        }
+    }
+
+    /// Subtracts two durations with overflow checking.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The [`CompactDuration`] to subtract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactDurationError::OutOfRange`] if `other` is greater than
+    /// `self`, which would result in a negative duration.
+    pub fn checked_sub(self, other: Self) -> Result<Self, CompactDurationError> {
+        Ok(Self {
+            seconds: self
+                .seconds
+                .checked_sub(other.seconds)
+                .ok_or(CompactDurationError::OutOfRange)?,
+        })
+    }
+
+    /// Subtracts two durations with saturation at [`Self::MIN`].
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The [`CompactDuration`] to subtract.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use prosody::timers::duration::CompactDuration;
+    ///
+    /// let a = CompactDuration::new(3000);
+    /// let b = CompactDuration::new(1000);
+    /// assert_eq!(a.saturating_sub(b).seconds(), 2000);
+    ///
+    /// let min = CompactDuration::new(100);
+    /// let large = CompactDuration::new(1000);
+    /// assert_eq!(min.saturating_sub(large), CompactDuration::MIN);
+    /// ```
+    #[must_use]
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            seconds: self.seconds.saturating_sub(other.seconds),
+        }
+    }
+
+    /// Returns `true` if this duration is zero seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use prosody::timers::duration::CompactDuration;
+    ///
+    /// assert!(CompactDuration::new(0).is_zero());
+    /// assert!(!CompactDuration::new(1).is_zero());
+    /// ```
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.seconds == 0
+    }
+}
+
+impl Add for CompactDuration {
+    type Output = Self;
+
+    /// Adds two durations using saturating arithmetic.
+    ///
+    /// If the result would overflow, returns [`Self::MAX`].
+    fn add(self, rhs: Self) -> Self::Output {
+        self.saturating_add(rhs)
+    }
+}
+
+impl Sub for CompactDuration {
+    type Output = Self;
+
+    /// Subtracts two durations using saturating arithmetic.
+    ///
+    /// If the result would underflow, returns [`Self::MIN`].
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.saturating_sub(rhs)
+    }
 }
 
 impl From<CompactDuration> for Duration {
@@ -79,6 +188,12 @@ impl From<CompactDuration> for Duration {
 impl From<CompactDuration> for i32 {
     fn from(value: CompactDuration) -> Self {
         i32::from_le_bytes(value.seconds.to_le_bytes())
+    }
+}
+
+impl From<u32> for CompactDuration {
+    fn from(seconds: u32) -> Self {
+        CompactDuration::new(seconds)
     }
 }
 
@@ -153,6 +268,7 @@ pub enum CompactDurationError {
 mod tests {
     use super::*;
     use color_eyre::eyre::Result;
+    use quickcheck_macros::quickcheck;
     use std::time::Duration;
 
     #[test]
@@ -415,5 +531,195 @@ mod tests {
             Err(CompactDurationError::OutOfRange)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn test_add_operator() {
+        let a = CompactDuration::new(1000);
+        let b = CompactDuration::new(2000);
+        let result = a + b;
+        assert_eq!(result.seconds(), 3000);
+
+        // Test overflow saturation
+        let max = CompactDuration::MAX;
+        let one = CompactDuration::new(1);
+        let result = max + one;
+        assert_eq!(result, CompactDuration::MAX);
+    }
+
+    #[test]
+    fn test_sub_operator() {
+        let a = CompactDuration::new(3000);
+        let b = CompactDuration::new(1000);
+        let result = a - b;
+        assert_eq!(result.seconds(), 2000);
+
+        // Test underflow saturation
+        let small = CompactDuration::new(100);
+        let large = CompactDuration::new(1000);
+        let result = small - large;
+        assert_eq!(result, CompactDuration::MIN);
+    }
+
+    #[test]
+    fn test_saturating_add() {
+        let a = CompactDuration::new(1000);
+        let b = CompactDuration::new(2000);
+        assert_eq!(a.saturating_add(b).seconds(), 3000);
+
+        // Test saturation at maximum
+        let max = CompactDuration::MAX;
+        let one = CompactDuration::new(1);
+        assert_eq!(max.saturating_add(one), CompactDuration::MAX);
+
+        // Test adding zero
+        let some_duration = CompactDuration::new(1234);
+        let zero = CompactDuration::new(0);
+        assert_eq!(some_duration.saturating_add(zero), some_duration);
+    }
+
+    #[test]
+    fn test_saturating_sub() {
+        let a = CompactDuration::new(3000);
+        let b = CompactDuration::new(1000);
+        assert_eq!(a.saturating_sub(b).seconds(), 2000);
+
+        // Test saturation at minimum
+        let small = CompactDuration::new(100);
+        let large = CompactDuration::new(1000);
+        assert_eq!(small.saturating_sub(large), CompactDuration::MIN);
+
+        // Test subtracting zero
+        let some_duration = CompactDuration::new(1234);
+        let zero = CompactDuration::new(0);
+        assert_eq!(some_duration.saturating_sub(zero), some_duration);
+
+        // Test same values
+        let duration = CompactDuration::new(1234);
+        assert_eq!(duration.saturating_sub(duration), CompactDuration::MIN);
+    }
+
+    #[test]
+    fn test_checked_sub() -> Result<()> {
+        let a = CompactDuration::new(3000);
+        let b = CompactDuration::new(1000);
+        assert_eq!(a.checked_sub(b)?.seconds(), 2000);
+
+        // Test underflow error
+        let small = CompactDuration::new(100);
+        let large = CompactDuration::new(1000);
+        assert!(matches!(
+            small.checked_sub(large),
+            Err(CompactDurationError::OutOfRange)
+        ));
+
+        // Test same values
+        let duration = CompactDuration::new(1234);
+        assert_eq!(duration.checked_sub(duration)?.seconds(), 0);
+
+        // Test subtracting zero
+        let some_duration = CompactDuration::new(1234);
+        let zero = CompactDuration::new(0);
+        assert_eq!(some_duration.checked_sub(zero)?.seconds(), 1234);
+        Ok(())
+    }
+
+    #[quickcheck]
+    fn prop_add_commutative(a: CompactDuration, b: CompactDuration) -> bool {
+        a + b == b + a
+    }
+
+    #[quickcheck]
+    fn prop_add_associative(a: CompactDuration, b: CompactDuration, c: CompactDuration) -> bool {
+        (a + b) + c == a + (b + c)
+    }
+
+    #[quickcheck]
+    fn prop_add_identity(a: CompactDuration) -> bool {
+        let zero = CompactDuration::new(0);
+        a + zero == a
+    }
+
+    #[quickcheck]
+    fn prop_sub_identity(a: CompactDuration) -> bool {
+        let zero = CompactDuration::new(0);
+        a - zero == a
+    }
+
+    #[quickcheck]
+    fn prop_sub_self_is_zero(a: CompactDuration) -> bool {
+        a - a == CompactDuration::new(0)
+    }
+
+    #[quickcheck]
+    fn prop_saturating_add_monotonic(a: CompactDuration, b: CompactDuration) -> bool {
+        a.saturating_add(b) >= a && a.saturating_add(b) >= b
+    }
+
+    #[quickcheck]
+    fn prop_saturating_sub_monotonic(a: CompactDuration, b: CompactDuration) -> bool {
+        a.saturating_sub(b) <= a
+    }
+
+    #[quickcheck]
+    fn prop_checked_add_consistent_with_saturating(a: CompactDuration, b: CompactDuration) -> bool {
+        match a.checked_add(b) {
+            Ok(result) => result == a.saturating_add(b),
+            Err(_) => a.saturating_add(b) == CompactDuration::MAX,
+        }
+    }
+
+    #[quickcheck]
+    fn prop_checked_sub_consistent_with_saturating(a: CompactDuration, b: CompactDuration) -> bool {
+        match a.checked_sub(b) {
+            Ok(result) => result == a.saturating_sub(b),
+            Err(_) => a.saturating_sub(b) == CompactDuration::MIN,
+        }
+    }
+
+    #[quickcheck]
+    fn prop_add_sub_inverse_when_possible(a: CompactDuration, b: CompactDuration) -> bool {
+        // If we can add b to a and subtract b from the result, we should get back to a
+        // This only holds when there's no overflow/underflow
+        if let (Ok(_sum), Ok(diff)) = (a.checked_add(b), a.saturating_add(b).checked_sub(b)) {
+            diff == a
+        } else {
+            true // Skip cases with overflow
+        }
+    }
+
+    #[test]
+    fn test_edge_case_operations() {
+        // Test operations with MIN and MAX
+        let min = CompactDuration::MIN;
+        let max = CompactDuration::MAX;
+        let one = CompactDuration::new(1);
+
+        // MIN operations
+        assert_eq!(min + min, min);
+        assert_eq!(min - min, min);
+        assert_eq!(min + one, one);
+
+        // MAX operations
+        assert_eq!(max + one, max); // Saturates
+        assert_eq!(max - one, CompactDuration::new(u32::MAX - 1));
+        assert_eq!(max - max, min);
+
+        // Mixed operations
+        assert_eq!(max + min, max);
+        assert_eq!(max - min, max);
+        assert_eq!(min + max, max);
+    }
+
+    #[test]
+    fn test_operator_equivalence() {
+        let a = CompactDuration::new(1000);
+        let b = CompactDuration::new(500);
+
+        // Add operator should be equivalent to saturating_add
+        assert_eq!(a + b, a.saturating_add(b));
+
+        // Sub operator should be equivalent to saturating_sub
+        assert_eq!(a - b, a.saturating_sub(b));
     }
 }
