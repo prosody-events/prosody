@@ -6,7 +6,7 @@
 //! based on current time.
 
 use crate::heartbeat::Heartbeat;
-use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::TriggerScheduler;
@@ -209,29 +209,10 @@ fn calculate_wait_time(
     load_time: CompactDateTime,
     preload_window: CompactDuration,
 ) -> CompactDuration {
-    match load_time.compact_duration_from_now() {
-        Ok(duration) => {
-            if duration > preload_window {
-                // If slab start is farther than preload window, wait accordingly
-                duration.saturating_sub(preload_window)
-            } else {
-                // Already within preload window
-                CompactDuration::MIN
-            }
-        }
-        Err(error) => {
-            // Past or out-of-range times trigger immediate load
-            match error {
-                CompactDateTimeError::PastDateTime => {
-                    debug!("Load time is in the past; loading immediately");
-                }
-                CompactDateTimeError::OutOfRange => {
-                    error!("Error calculating time until load: {error:#}; loading immediately");
-                }
-            }
-            CompactDuration::MIN
-        }
-    }
+    load_time
+        .compact_duration_from_now()
+        .unwrap_or(CompactDuration::MIN)
+        .saturating_sub(preload_window)
 }
 
 /// Loads all slabs in `slab_range` and schedules their triggers.
