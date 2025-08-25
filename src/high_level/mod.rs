@@ -18,7 +18,6 @@ use crate::producer::{
 use crate::propagator::new_propagator;
 use crate::timers::store::cassandra::CassandraConfigurationBuilder;
 use crate::{Payload, Topic};
-use internment::Intern;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
 use std::time::Duration;
@@ -29,6 +28,9 @@ use tracing::info;
 pub mod config;
 pub mod mode;
 pub mod state;
+
+#[cfg(test)]
+mod tests;
 
 /// A combined client that manages both producer and consumer operations.
 #[derive(Debug)]
@@ -325,11 +327,14 @@ fn missing_topics(
     topics.sort_unstable();
     topics.dedup();
 
+    // Filter out topics that start with '^' as they are pattern-based subscriptions
+    topics.retain(|topic| !topic.starts_with('^'));
+
     for metadata_topic in metadata.topics() {
         let topic_name = metadata_topic.name();
         let Some(position) = topics
             .iter()
-            .position(|&topic| Intern::as_ref(topic) == topic_name)
+            .position(|&topic| topic.as_ref() == topic_name)
         else {
             continue;
         };
