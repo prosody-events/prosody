@@ -10,7 +10,8 @@
 
 use std::cmp::max;
 use std::collections::{BTreeSet, HashSet};
-use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::time::Duration as StdDuration;
 
 use ahash::{HashMap, HashMapExt};
@@ -20,12 +21,13 @@ use itertools::Itertools;
 use prosody::Topic;
 use prosody::admin::ProsodyAdminClient;
 use prosody::consumer::event_context::EventContext;
-use prosody::consumer::message::UncommittedMessage;
+use prosody::consumer::failure::{ClassifyError, ErrorCategory, FallibleHandler};
+use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::timers::UncommittedTimer;
 use prosody::timers::store::cassandra::CassandraConfiguration;
+use prosody::timers::{Trigger, UncommittedTimer};
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -479,6 +481,55 @@ impl EventHandler for SlowTestHandler {
     }
 }
 
+/// A test error type for `FallibleHandler` implementations.
+#[derive(Debug, Clone)]
+pub struct TestError;
+
+impl Display for TestError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "test error")
+    }
+}
+
+impl Error for TestError {}
+
+impl ClassifyError for TestError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Permanent
+    }
+}
+
+/// A test handler that implements `FallibleHandler` for high-level client
+/// testing.
+#[derive(Clone, Debug)]
+pub struct FallibleTestHandler {
+    /// Channel for transmitting received messages.
+    pub messages_tx: Sender<(String, Value)>,
+}
+
+impl FallibleHandler for FallibleTestHandler {
+    type Error = TestError;
+
+    async fn on_message<C>(&self, _context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        // Forward the message to the channel, ignoring send errors for testing
+        let _ = self
+            .messages_tx
+            .send((message.key().to_string(), message.payload().clone()))
+            .await;
+        Ok(())
+    }
+
+    async fn on_timer<C>(&self, _context: C, _timer: Trigger) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        Ok(())
+    }
+}
+
 /// Initializes logging for integration tests with scylla noise filtering.
 ///
 /// Sets up a compact tracing subscriber with the scylla crate set to WARN level
@@ -504,4 +555,47 @@ pub fn init_test_logging() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Collects exactly the expected number of messages within a timeout period.
+///
+/// # Arguments
+///
+/// * `receiver` - The channel receiver to collect messages from.
+/// * `expected_count` - Number of messages expected.
+/// * `timeout_secs` - Timeout in seconds for each message.
+///
+/// # Returns
+///
+/// A vector containing the collected messages.
+///
+/// # Errors
+///
+/// Returns an error if timeout occurs or unexpected messages are received.
+pub async fn collect_messages_with_timeout(
+    receiver: &mut Receiver<(String, Value)>,
+    expected_count: usize,
+    timeout_secs: u64,
+) -> Result<Vec<(String, Value)>> {
+    use tokio::time::{Duration, timeout};
+
+    let mut messages = Vec::with_capacity(expected_count);
+    let timeout_duration = Duration::from_secs(timeout_secs);
+
+    // Collect expected messages
+    for i in 0..expected_count {
+        let message = timeout(timeout_duration, receiver.recv())
+            .await
+            .map_err(|_| eyre!("Timeout waiting for message {}", i + 1))?
+            .ok_or_else(|| eyre!("Channel closed while waiting for message {}", i + 1))?;
+        messages.push(message);
+    }
+
+    // Verify no additional messages arrive
+    let no_extra_msg = timeout(Duration::from_secs(2), receiver.recv()).await;
+    if let Ok(Some(_)) = no_extra_msg {
+        return Err(eyre!("Unexpected extra message received"));
+    }
+
+    Ok(messages)
 }
