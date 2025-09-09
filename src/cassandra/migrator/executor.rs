@@ -4,7 +4,7 @@
 //! in the database.
 
 use super::loader::{Migration, parse_cql_statements};
-use crate::timers::store::cassandra::{InnerError, TABLE_SCHEMA_MIGRATIONS};
+use crate::cassandra::{CassandraStoreError, TABLE_SCHEMA_MIGRATIONS};
 use humantime::format_duration;
 use scylla::client::session::Session;
 use std::time::Instant;
@@ -34,13 +34,13 @@ impl<'a> MigrationExecutor<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`InnerError`] if statement execution or migration
+    /// Returns [`CassandraStoreError`] if statement execution or migration
     /// recording fails.
     pub async fn apply_migration(
         &self,
         migration: &Migration,
         keyspace: &str,
-    ) -> Result<(), InnerError> {
+    ) -> Result<(), CassandraStoreError> {
         let start_time = Instant::now();
 
         debug!("Starting execution of migration: {}", migration.filename);
@@ -56,7 +56,7 @@ impl<'a> MigrationExecutor<'a> {
                     .query_unpaged(statement_text.as_str(), &[])
                     .await
                     .map_err(|e| {
-                        InnerError::Migration(format!(
+                        CassandraStoreError::Migration(format!(
                             "Failed to execute statement {} in migration {}: {e:#}",
                             index + 1,
                             migration.filename

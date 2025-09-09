@@ -2,9 +2,7 @@
 //!
 //! Provides helper functions for retry logic and table management.
 
-use crate::timers::store::cassandra::{
-    CassandraTriggerStoreError, InnerError, TABLE_LOCKS, TABLE_SCHEMA_MIGRATIONS,
-};
+use crate::cassandra::{CassandraStoreError, TABLE_LOCKS, TABLE_SCHEMA_MIGRATIONS};
 use rand::Rng;
 use scylla::client::session::Session;
 use std::cmp::min;
@@ -53,15 +51,15 @@ pub fn calculate_backoff(attempt: u32) -> Duration {
 ///
 /// # Errors
 ///
-/// Returns [`CassandraTriggerStoreError`] if table creation fails.
+/// Returns [`CassandraStoreError`] if table creation fails.
 pub async fn ensure_migration_tables_exist(
     session: &Session,
     keyspace: &str,
-) -> Result<(), CassandraTriggerStoreError> {
+) -> Result<(), CassandraStoreError> {
     let cluster_state = session.get_cluster_state();
-    let keyspace_metadata = cluster_state.get_keyspace(keyspace).ok_or_else(|| {
-        CassandraTriggerStoreError::from(InnerError::Migration("keyspace not found".to_owned()))
-    })?;
+    let keyspace_metadata = cluster_state
+        .get_keyspace(keyspace)
+        .ok_or_else(|| CassandraStoreError::Migration("keyspace not found".to_owned()))?;
     let tables = &keyspace_metadata.tables;
 
     // Check if schema_migrations table exists
@@ -105,12 +103,12 @@ pub async fn ensure_migration_tables_exist(
 }
 
 /// Refreshes cluster metadata to ensure new tables are visible.
-pub async fn refresh_metadata(session: &Session) -> Result<(), CassandraTriggerStoreError> {
+pub async fn refresh_metadata(session: &Session) -> Result<(), CassandraStoreError> {
     debug!("Refreshing cluster metadata");
     session
         .refresh_metadata()
         .await
-        .map_err(|e| InnerError::Migration(format!("Failed to refresh metadata: {e}")))?;
+        .map_err(|e| CassandraStoreError::Migration(format!("Failed to refresh metadata: {e}")))?;
     debug!("Metadata refresh completed");
     Ok(())
 }

@@ -1,158 +1,33 @@
 use crate::Key;
-use crate::propagator::new_propagator;
+use crate::cassandra::{CassandraConfiguration, CassandraStore, CassandraStoreError};
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::{CompactDuration, CompactDurationError};
+use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::cassandra::queries::Queries;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use crate::util::{
-    from_duration_env_with_fallback, from_env_with_fallback, from_option_env, from_vec_env,
-};
 use async_stream::try_stream;
-use derive_builder::Builder;
-use educe::Educe;
 use futures::{Stream, TryStreamExt, pin_mut};
-use humantime::Duration;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
-use scylla::_macro_internal::{
-    CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
-    SerializeValue, TypeCheckError, WrittenCellProof,
-};
 use scylla::client::session::Session;
-use scylla::cluster::metadata::NativeType;
-use scylla::errors::{
-    ExecutionError, IntoRowsResultError, MaybeFirstRowError, NewSessionError, NextRowError,
-    PagerExecutionError, PrepareError, RowsError, UseKeyspaceError,
-};
 use std::collections::HashMap;
-use std::error;
-use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
 
-use thiserror::Error;
 use tokio::task::coop::cooperative;
 use tracing::{info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use validator::Validate;
 
-mod migrator;
 mod queries;
-
-/// Table name for storing segment metadata and slab IDs.
-pub const TABLE_SEGMENTS: &str = "timer_segments";
-
-/// Table name for storing timer triggers organized by time slabs.
-pub const TABLE_SLABS: &str = "timer_slabs";
-
-/// Table name for storing timer triggers indexed by key for efficient key-based
-/// lookups.
-pub const TABLE_KEYS: &str = "timer_keys";
-
-/// Table name for tracking applied database migrations.
-pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
-
-/// Table name for distributed migration locking.
-pub const TABLE_LOCKS: &str = "locks";
-
-/// Configuration for the Cassandra-based timer storage backend.
-#[derive(Builder, Clone, Educe, Validate)]
-#[educe(Debug)]
-pub struct CassandraConfiguration {
-    /// List of Cassandra contact nodes (hostnames or IPs).
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_NODES`
-    /// Default: None (must be specified)
-    ///
-    /// At least one Cassandra node must be provided to establish an initial
-    /// connection with the cluster. Multiple nodes improve failover behavior.
-    #[builder(default = "from_vec_env(\"PROSODY_CASSANDRA_NODES\")?", setter(into))]
-    #[validate(length(min = 1_u64))]
-    pub nodes: Vec<String>,
-
-    /// Keyspace to use for storing timer data.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_KEYSPACE`
-    /// Default: `"prosody"`
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_CASSANDRA_KEYSPACE\", \"prosody\".to_owned())?",
-        setter(into)
-    )]
-    #[validate(length(min = 1_u64))]
-    pub keyspace: String,
-
-    /// Preferred datacenter for query routing.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_DATACENTER`
-    /// Default: None
-    #[builder(
-        default = "from_option_env(\"PROSODY_CASSANDRA_DATACENTER\")?",
-        setter(into)
-    )]
-    pub datacenter: Option<String>,
-
-    /// Preferred rack identifier for topology-aware routing.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_RACK`
-    /// Default: None
-    #[builder(default = "from_option_env(\"PROSODY_CASSANDRA_RACK\")?", setter(into))]
-    pub rack: Option<String>,
-
-    /// Username for authenticating with Cassandra.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_USER`
-    /// Default: None
-    #[builder(default = "from_option_env(\"PROSODY_CASSANDRA_USER\")?", setter(into))]
-    pub user: Option<String>,
-
-    /// Password for authenticating with Cassandra.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_PASSWORD`
-    /// Default: None
-    #[builder(
-        default = "from_option_env(\"PROSODY_CASSANDRA_PASSWORD\")?",
-        setter(into)
-    )]
-    #[educe(Debug(ignore))]
-    pub password: Option<String>,
-
-    /// Retention period for failed/unprocessed timer data in Cassandra.
-    ///
-    /// This defines how long timer data remains available for timers that are
-    /// not successfully processed (aborted or failed). Successfully committed
-    /// timers are immediately deleted from storage and do not rely on this
-    /// retention period.
-    ///
-    /// The retention period is added to the timer's execution time to calculate
-    /// the Cassandra TTL, ensuring failed timers don't accumulate indefinitely.
-    ///
-    /// Structural metadata (e.g., segment definitions) may persist beyond this
-    /// period and is not subject to TTL-based eviction.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_RETENTION`
-    /// Default: 30 days
-    #[builder(
-        default = "Duration::from(from_duration_env_with_fallback(\"PROSODY_CASSANDRA_RETENTION\", \
-        std::time::Duration::from_secs(30 * 24 * 60 * 60))?)",
-        setter(into)
-    )]
-    pub retention: Duration,
-}
 
 /// Cassandra-based implementation of [`TriggerStore`].
 ///
 /// Provides persistent storage for timer triggers using Apache Cassandra
 /// with automatic schema migration and optimized TTL management.
 #[derive(Clone, Debug)]
-pub struct CassandraTriggerStore(Arc<Inner>);
-
-#[derive(Debug)]
-struct Inner {
-    queries: Queries,
-    propagator: TextMapCompositePropagator,
-    base_ttl: CompactDuration,
+pub struct CassandraTriggerStore {
+    store: CassandraStore,
+    queries: Arc<Queries>,
 }
 
 impl CassandraTriggerStore {
@@ -172,47 +47,26 @@ impl CassandraTriggerStore {
     /// - Schema migration fails
     /// - Query preparation fails
     pub async fn new(config: &CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
-        let base_ttl: StdDuration = config.retention.into();
-        let base_ttl = base_ttl.try_into()?;
+        let store = CassandraStore::new(config).await?;
+        let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
 
-        Ok(Self(Arc::new(Inner {
-            queries: Box::pin(Queries::new(config.clone())).await?,
-            propagator: new_propagator(),
-            base_ttl,
-        })))
+        Ok(Self { store, queries })
     }
 
     fn session(&self) -> &Session {
-        &self.0.queries.session
+        self.store.session()
     }
 
     fn queries(&self) -> &Queries {
-        &self.0.queries
+        &self.queries
     }
 
     fn propagator(&self) -> &TextMapCompositePropagator {
-        &self.0.propagator
-    }
-
-    fn base_ttl(&self) -> CompactDuration {
-        self.0.base_ttl
+        self.store.propagator()
     }
 
     fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
-        const MAX_TTL: i32 = 630_720_000;
-
-        let Ok(duration) = time.compact_duration_from_now() else {
-            // Return the base TTL if the time is in the past
-            return self.base_ttl().seconds().try_into().ok();
-        };
-
-        duration
-            .checked_add(self.base_ttl())
-            .ok()?
-            .seconds()
-            .try_into()
-            .ok()
-            .filter(|&ttl| ttl < MAX_TTL)
+        self.store.calculate_ttl(time)
     }
 }
 
@@ -639,155 +493,26 @@ impl TriggerStore for CassandraTriggerStore {
     }
 }
 
-impl SerializeValue for CompactDuration {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i32::from(*self).serialize(typ, writer)
-    }
-}
-
-impl SerializeValue for CompactDateTime {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i32::from(*self).serialize(typ, writer)
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDuration {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        match typ {
-            ColumnType::Native(NativeType::Int) => Ok(()),
-            _ => Err(TypeCheckError::new(InnerError::IntExpected)),
-        }
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        Ok(CompactDuration::from(i32::deserialize(typ, v)?))
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDateTime {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        match typ {
-            ColumnType::Native(NativeType::Int) => Ok(()),
-            _ => Err(TypeCheckError::new(InnerError::IntExpected)),
-        }
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        Ok(CompactDateTime::from(i32::deserialize(typ, v)?))
-    }
-}
-
-/// Internal error types for Cassandra operations.
-#[derive(Debug, Error)]
-pub enum InnerError {
-    /// Invalid duration
-    #[error(transparent)]
-    Duration(#[from] CompactDurationError),
-
-    /// Failed to create Cassandra session.
-    #[error(transparent)]
-    Session(#[from] NewSessionError),
-
-    /// Schema migration failed.
-    #[error("migration failed: {0:#}")]
-    Migration(String),
-
-    /// Failed to set keyspace.
-    #[error("failed to set keyspace: {0:#}")]
-    UseKeyspace(#[from] UseKeyspaceError),
-
-    /// Failed to prepare statement.
-    #[error("failed to prepare statement: {0:#}")]
-    Prepare(#[from] PrepareError),
-
-    /// Failed to execute statement.
-    #[error("failed to execute statement: {0:#}")]
-    Execution(#[from] ExecutionError),
-
-    /// Invalid column type.
-    #[error("invalid type: {0:#}")]
-    TypeCheck(#[from] TypeCheckError),
-
-    /// Failed to retrieve the next row.
-    #[error("failed to retrieve the next row: {0:#}")]
-    NextRow(#[from] NextRowError),
-
-    /// Failed to retrieve the next page.
-    #[error("failed to retrieve the next page: {0:#}")]
-    PageExecution(#[from] PagerExecutionError),
-
-    /// Failed to retrieve the first row.
-    #[error("failed to retrieve the first row: {0:#}")]
-    MaybeFirstRow(#[from] MaybeFirstRowError),
-
-    /// Failed to get rows.
-    #[error("failed to get rows: {0:#}")]
-    IntoRows(#[from] IntoRowsResultError),
-
-    /// Rows error.
-    #[error("rows error: {0:#}")]
-    Rows(#[from] RowsError),
-
-    /// Expected integer type but got something else.
-    #[error("expected and integer type")]
-    IntExpected,
-
-    /// Segment not found in storage.
-    #[error("segment not found")]
-    SegmentNotFound,
-
-    /// Failed to calculate TTL duration.
-    #[error("failed to calculate TTL duration")]
-    TtlCalculationFailed,
-
-    /// TTL calculation overflow.
-    #[error("TTL calculation overflow")]
-    TtlOverflow,
-}
-
 /// Error type for Cassandra trigger store operations.
-pub struct CassandraTriggerStoreError(Box<InnerError>);
-
-impl<E> From<E> for CassandraTriggerStoreError
-where
-    InnerError: From<E>,
-{
-    fn from(err: E) -> Self {
-        Self(Box::new(InnerError::from(err)))
-    }
-}
-
-impl Debug for CassandraTriggerStoreError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        Debug::fmt(&self.0, f)
-    }
-}
-
-impl Display for CassandraTriggerStoreError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        Display::fmt(&self.0, f)
-    }
-}
-
-impl error::Error for CassandraTriggerStoreError {}
+pub type CassandraTriggerStoreError = CassandraStoreError;
 
 #[cfg(test)]
 mod test {
     use super::{CassandraConfiguration, CassandraTriggerStore};
+    use std::time::Duration;
+
+    /// Creates a test configuration for Cassandra integration tests.
+    fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
+        CassandraConfiguration {
+            datacenter: None,
+            rack: None,
+            nodes: vec!["localhost:9042".to_owned()],
+            keyspace: keyspace.to_owned(),
+            user: None,
+            password: None,
+            retention: Duration::from_secs(10 * 60).into(),
+        }
+    }
     use crate::timers::duration::CompactDuration;
     use crate::timers::slab::{Slab, SlabId};
     use crate::timers::store::{Segment, SegmentId, TriggerStore};
@@ -797,36 +522,18 @@ mod test {
     use futures::stream::StreamExt;
     use std::collections::HashSet;
     use std::ops::RangeInclusive;
-    use std::time::Duration;
     use uuid::Uuid;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
     trigger_store_tests!(
         CassandraTriggerStore,
-        CassandraTriggerStore::new(&CassandraConfiguration {
-            datacenter: None,
-            rack: None,
-            nodes: vec!["localhost:9042".to_owned()],
-            keyspace: "prosody".to_owned(),
-            user: None,
-            password: None,
-            retention: Duration::from_secs(10 * 60).into(),
-        }),
+        CassandraTriggerStore::new(&test_cassandra_config("prosody")),
         25
     );
 
     #[tokio::test]
     async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
-        let store = CassandraTriggerStore::new(&CassandraConfiguration {
-            datacenter: None,
-            rack: None,
-            nodes: vec!["localhost:9042".to_owned()],
-            keyspace: "prosody_test".to_owned(),
-            user: None,
-            password: None,
-            retention: Duration::from_secs(10 * 60).into(),
-        })
-        .await?;
+        let store = CassandraTriggerStore::new(&test_cassandra_config("prosody_test")).await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {
@@ -926,16 +633,8 @@ mod test {
 
     #[tokio::test]
     async fn test_simple_wrap_around() -> Result<()> {
-        let store = CassandraTriggerStore::new(&CassandraConfiguration {
-            datacenter: None,
-            rack: None,
-            nodes: vec!["localhost:9042".to_owned()],
-            keyspace: "prosody_test_simple".to_owned(),
-            user: None,
-            password: None,
-            retention: Duration::from_secs(10 * 60).into(),
-        })
-        .await?;
+        let store =
+            CassandraTriggerStore::new(&test_cassandra_config("prosody_test_simple")).await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {

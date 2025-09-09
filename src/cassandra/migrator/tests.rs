@@ -5,10 +5,9 @@
 //! The distributed locking mechanism should ensure that migrations are
 //! applied exactly once without conflicts.
 
-use super::EmbeddedMigrator;
-use crate::timers::store::cassandra::{CassandraTriggerStoreError, TABLE_LOCKS};
+use super::CassandraMigrator;
+use crate::cassandra::{CassandraStoreError, TABLE_LOCKS};
 use color_eyre::Result;
-use color_eyre::eyre::Error as EyreError;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use std::iter::Iterator;
@@ -82,7 +81,7 @@ async fn test_concurrent_migration_lock_safety() -> Result<()> {
     let session = Arc::new(Box::pin(create_test_session()).await?);
     let keyspace = random_keyspace();
 
-    let mut join_set = JoinSet::new();
+    let mut join_set: JoinSet<Result<(usize, Result<(), CassandraStoreError>)>> = JoinSet::new();
 
     // Spawn multiple concurrent migration tasks
     for i in 0..CONCURRENT_MIGRATORS {
@@ -90,12 +89,12 @@ async fn test_concurrent_migration_lock_safety() -> Result<()> {
 
         join_set.spawn(async move {
             let session = Box::pin(create_test_session()).await?;
-            let migrator = EmbeddedMigrator::new(&session, &keyspace_clone).await?;
+            let migrator = CassandraMigrator::new(&session, &keyspace_clone).await?;
 
             // Each migrator attempts to run migrations - this is where the locking happens
             let result = migrator.migrate().await;
 
-            Ok::<(usize, Result<(), CassandraTriggerStoreError>), EyreError>((i, result))
+            Ok((i, result))
         });
     }
 
@@ -127,7 +126,7 @@ async fn test_concurrent_migration_lock_safety() -> Result<()> {
 
     // Verify that all migrations have been applied by checking for zero pending
     // migrations
-    let final_migrator = EmbeddedMigrator::new(&session, &keyspace).await?;
+    let final_migrator = CassandraMigrator::new(&session, &keyspace).await?;
     let pending_migrations = final_migrator.get_pending_migrations(&keyspace).await?;
     assert_eq!(
         pending_migrations.len(),

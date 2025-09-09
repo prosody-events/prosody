@@ -4,6 +4,7 @@
 //! consumption in various operational modes through the `HighLevelClient`
 //! struct.
 
+use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::failure::FallibleHandler;
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
@@ -16,7 +17,6 @@ use crate::producer::{
     ProducerError, ProsodyProducer,
 };
 use crate::propagator::new_propagator;
-use crate::timers::store::cassandra::CassandraConfigurationBuilder;
 use crate::{Payload, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;

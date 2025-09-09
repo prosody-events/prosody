@@ -33,7 +33,7 @@
 //! use prosody::consumer::message::ConsumerMessage;
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::timers::{Trigger, store::TriggerStore};
-//! use prosody::timers::store::cassandra::CassandraConfigurationBuilder;
+//! use prosody::cassandra::config::CassandraConfigurationBuilder;
 //! use prosody::high_level::mode::Mode;
 //! use prosody::high_level::{HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
@@ -233,6 +233,7 @@ use std::mem::forget;
 use std::sync::LazyLock;
 
 pub mod admin;
+pub mod cassandra;
 pub mod consumer;
 pub mod heartbeat;
 pub mod high_level;

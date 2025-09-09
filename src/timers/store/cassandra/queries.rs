@@ -12,21 +12,11 @@
 //! - Load balancing and retry policy configuration
 //! - TTL and non-TTL variants of insert statements
 
-use super::migrator::EmbeddedMigrator;
-use crate::timers::store::cassandra::{
-    CassandraConfiguration, CassandraTriggerStoreError, TABLE_KEYS, TABLE_SEGMENTS, TABLE_SLABS,
-};
+use crate::cassandra::{TABLE_KEYS, TABLE_SEGMENTS, TABLE_SLABS};
+use crate::timers::store::cassandra::CassandraTriggerStoreError;
 use educe::Educe;
-use scylla::client::Compression;
-use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
-use scylla::client::session_builder::SessionBuilder;
-use scylla::policies::load_balancing::DefaultPolicy;
-use scylla::policies::retry::DefaultRetryPolicy;
-use scylla::statement::Consistency;
-
 use scylla::statement::prepared::PreparedStatement;
-use std::sync::Arc;
 
 /// Container for all prepared Cassandra CQL statements used by the timer store.
 ///
@@ -42,9 +32,6 @@ use std::sync::Arc;
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct Queries {
-    #[educe(Debug(ignore))]
-    pub session: Session,
-
     #[educe(Debug(ignore))]
     pub insert_segment: PreparedStatement,
 
@@ -107,14 +94,13 @@ impl Queries {
     /// Creates a new Queries instance with prepared statements for all timer
     /// operations.
     ///
-    /// This method establishes a connection to Cassandra, runs schema
-    /// migrations, and prepares all CQL statements needed for timer storage
-    /// operations.
+    /// This method prepares all CQL statements needed for timer storage
+    /// operations using an existing Cassandra session.
     ///
     /// # Arguments
     ///
-    /// * `configuration` - Cassandra connection settings including nodes,
-    ///   credentials, keyspace, and load balancing preferences.
+    /// * `session` - Cassandra session to use for statement preparation
+    /// * `keyspace` - Keyspace name for statement preparation
     ///
     /// # Returns
     ///
@@ -123,67 +109,34 @@ impl Queries {
     /// # Errors
     ///
     /// Returns [`CassandraTriggerStoreError`] if:
-    /// - Connection to Cassandra cluster fails
-    /// - Schema migration fails
-    /// - Keyspace cannot be selected
     /// - Statement preparation fails
     pub async fn new(
-        configuration: CassandraConfiguration,
+        session: &Session,
+        keyspace: &str,
     ) -> Result<Self, CassandraTriggerStoreError> {
-        let mut lb_policy = DefaultPolicy::builder()
-            .token_aware(true)
-            .permit_dc_failover(true);
-
-        if let Some(dc) = configuration.datacenter {
-            lb_policy = match configuration.rack {
-                None => lb_policy.prefer_datacenter(dc),
-                Some(rack) => lb_policy.prefer_datacenter_and_rack(dc, rack),
-            }
-        }
-
-        let _profile = ExecutionProfile::builder()
-            .consistency(Consistency::LocalQuorum)
-            .load_balancing_policy(lb_policy.build())
-            .retry_policy(Arc::new(DefaultRetryPolicy::new()));
-
-        let mut session = SessionBuilder::new()
-            .known_nodes(configuration.nodes)
-            .compression(Some(Compression::Lz4));
-
-        if let Some(user) = configuration.user {
-            session = session.user(user, configuration.password.unwrap_or_default());
-        }
-
-        let session = session.build().await?;
-        let migrator = EmbeddedMigrator::new(&session, &configuration.keyspace).await?;
-        migrator.migrate().await?;
-
-        let keyspace = &configuration.keyspace;
-
-        let insert_segment = prepare_insert_segment(&session, keyspace).await?;
-        let get_segment = prepare_get_segment(&session, keyspace).await?;
-        let delete_segment = prepare_delete_segment(&session, keyspace).await?;
-        let get_slabs = prepare_get_slabs(&session, keyspace).await?;
-        let get_slab_range = prepare_get_slab_range(&session, keyspace).await?;
-        let insert_slab = prepare_insert_slab(&session, keyspace).await?;
-        let delete_slab = prepare_delete_slab(&session, keyspace).await?;
-        let get_slab_triggers = prepare_get_slab_triggers(&session, keyspace).await?;
-        let insert_slab_trigger = prepare_insert_slab_trigger(&session, keyspace).await?;
-        let delete_slab_trigger = prepare_delete_slab_trigger(&session, keyspace).await?;
-        let clear_slab_triggers = prepare_clear_slab_triggers(&session, keyspace).await?;
-        let get_key_times = prepare_get_key_times(&session, keyspace).await?;
-        let get_key_triggers = prepare_get_key_triggers(&session, keyspace).await?;
-        let insert_key_trigger = prepare_insert_key_trigger(&session, keyspace).await?;
-        let delete_key_trigger = prepare_delete_key_trigger(&session, keyspace).await?;
-        let clear_key_triggers = prepare_clear_key_triggers(&session, keyspace).await?;
-        let insert_slab_no_ttl = prepare_insert_slab_no_ttl(&session, keyspace).await?;
+        let insert_segment = prepare_insert_segment(session, keyspace).await?;
+        let get_segment = prepare_get_segment(session, keyspace).await?;
+        let delete_segment = prepare_delete_segment(session, keyspace).await?;
+        let get_slabs = prepare_get_slabs(session, keyspace).await?;
+        let get_slab_range = prepare_get_slab_range(session, keyspace).await?;
+        let insert_slab = prepare_insert_slab(session, keyspace).await?;
+        let delete_slab = prepare_delete_slab(session, keyspace).await?;
+        let get_slab_triggers = prepare_get_slab_triggers(session, keyspace).await?;
+        let insert_slab_trigger = prepare_insert_slab_trigger(session, keyspace).await?;
+        let delete_slab_trigger = prepare_delete_slab_trigger(session, keyspace).await?;
+        let clear_slab_triggers = prepare_clear_slab_triggers(session, keyspace).await?;
+        let get_key_times = prepare_get_key_times(session, keyspace).await?;
+        let get_key_triggers = prepare_get_key_triggers(session, keyspace).await?;
+        let insert_key_trigger = prepare_insert_key_trigger(session, keyspace).await?;
+        let delete_key_trigger = prepare_delete_key_trigger(session, keyspace).await?;
+        let clear_key_triggers = prepare_clear_key_triggers(session, keyspace).await?;
+        let insert_slab_no_ttl = prepare_insert_slab_no_ttl(session, keyspace).await?;
         let insert_slab_trigger_no_ttl =
-            prepare_insert_slab_trigger_no_ttl(&session, keyspace).await?;
+            prepare_insert_slab_trigger_no_ttl(session, keyspace).await?;
         let insert_key_trigger_no_ttl =
-            prepare_insert_key_trigger_no_ttl(&session, keyspace).await?;
+            prepare_insert_key_trigger_no_ttl(session, keyspace).await?;
 
         Ok(Self {
-            session,
             insert_segment,
             get_segment,
             delete_segment,

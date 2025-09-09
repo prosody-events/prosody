@@ -9,13 +9,13 @@ use color_eyre::eyre::{Result, ensure};
 use prosody::{
     Topic,
     admin::ProsodyAdminClient,
+    cassandra::config::CassandraConfigurationBuilder,
     consumer::ConsumerConfigurationBuilder,
     consumer::failure::{
         retry::RetryConfigurationBuilder, topic::FailureTopicConfigurationBuilder,
     },
     high_level::{HighLevelClient, HighLevelClientError, mode::Mode},
     producer::ProducerConfigurationBuilder,
-    timers::store::cassandra::CassandraConfigurationBuilder,
 };
 use serde_json::{Value, json};
 use std::collections::HashSet;

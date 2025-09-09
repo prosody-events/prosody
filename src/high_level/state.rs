@@ -4,12 +4,12 @@
 //! of the consumer, along with methods for building and displaying the state.
 //! It also includes a custom error type for handling state-related errors.
 
+use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ProsodyConsumer};
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::mode::Mode;
-use crate::timers::store::cassandra::CassandraConfigurationBuilder;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;

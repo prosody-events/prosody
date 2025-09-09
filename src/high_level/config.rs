@@ -6,6 +6,10 @@
 //! custom error type for handling configuration-related errors.
 
 use crate::Topic;
+use crate::cassandra::{
+    CassandraConfiguration,
+    config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
+};
 use crate::consumer::failure::retry::{
     RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
 };
@@ -17,9 +21,6 @@ use crate::consumer::{
     ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerConfigurationBuilderError,
 };
 use crate::high_level::mode::Mode;
-use crate::timers::store::cassandra::{
-    CassandraConfiguration, CassandraConfigurationBuilder, CassandraConfigurationBuilderError,
-};
 use thiserror::Error;
 
 /// Configuration for timer storage backends.

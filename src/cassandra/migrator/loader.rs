@@ -3,9 +3,8 @@
 //! Provides functionality to load embedded migration files, perform template
 //! substitution, and parse CQL statements for execution.
 
-use crate::timers::store::cassandra::{
-    CassandraTriggerStoreError, InnerError, TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS,
-    TABLE_SLABS,
+use crate::cassandra::{
+    CassandraStoreError, TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS, TABLE_SLABS,
 };
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
@@ -33,7 +32,7 @@ pub struct Migration {
 /// This struct uses the `rust-embed` crate to embed all migration files
 /// from the `src/timers/store/cassandra/migrations/` directory at compile time.
 #[derive(RustEmbed)]
-#[folder = "src/timers/store/cassandra/migrations/"]
+#[folder = "src/cassandra/migrations/"]
 #[include = "*.cql"]
 struct MigrationAssets;
 
@@ -53,23 +52,23 @@ struct MigrationAssets;
 ///
 /// # Errors
 ///
-/// Returns [`CassandraTriggerStoreError`] if:
+/// Returns [`CassandraStoreError`] if:
 /// - Migration files cannot be loaded from embedded assets
 /// - File content contains invalid UTF-8
 /// - Timestamp extraction from filename fails
-pub fn load_embedded_migrations(
-    keyspace: &str,
-) -> Result<Vec<Migration>, CassandraTriggerStoreError> {
+pub fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, CassandraStoreError> {
     let mut migrations = Vec::new();
 
     for filename in MigrationAssets::iter() {
         let content = MigrationAssets::get(filename.as_ref()).ok_or_else(|| {
-            InnerError::Migration(format!("Failed to load migration file: {filename}",))
+            CassandraStoreError::Migration(format!("Failed to load migration file: {filename}",))
         })?;
 
         let mut content_str = str::from_utf8(content.data.as_ref())
             .map_err(|e| {
-                InnerError::Migration(format!("Invalid UTF-8 in migration file {filename}: {e}",))
+                CassandraStoreError::Migration(format!(
+                    "Invalid UTF-8 in migration file {filename}: {e}",
+                ))
             })?
             .to_owned();
 
@@ -175,22 +174,21 @@ fn calculate_checksum(content: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`CassandraTriggerStoreError`] if:
+/// Returns [`CassandraStoreError`] if:
 /// - Filename is shorter than 8 characters
 /// - First 8 characters are not all digits
-fn extract_timestamp(filename: &str) -> Result<String, CassandraTriggerStoreError> {
+fn extract_timestamp(filename: &str) -> Result<String, CassandraStoreError> {
     if filename.len() < 8 {
-        return Err(InnerError::Migration(format!(
+        return Err(CassandraStoreError::Migration(format!(
             "Invalid migration filename format: {filename}",
-        ))
-        .into());
+        )));
     }
 
     let timestamp = &filename[..8];
     if !timestamp.chars().all(|c| c.is_ascii_digit()) {
-        return Err(
-            InnerError::Migration(format!("Invalid timestamp in filename: {filename}",)).into(),
-        );
+        return Err(CassandraStoreError::Migration(format!(
+            "Invalid timestamp in filename: {filename}",
+        )));
     }
 
     Ok(timestamp.to_owned())

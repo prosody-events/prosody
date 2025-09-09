@@ -1,8 +1,9 @@
 //! Embedded database schema migration system for Cassandra.
 //!
-//! Provides the [`EmbeddedMigrator`] which handles automatic schema migration
-//! for the Cassandra-based timer storage. Migrations are embedded as `.cql`
-//! files at compile time and applied automatically during store initialization.
+//! Provides the [`CassandraMigrator`] which handles automatic schema migration
+//! for all Cassandra-based storage in Prosody. Migrations are embedded as
+//! `.cql` files at compile time and applied automatically during store
+//! initialization.
 //!
 //! ## Features
 //!
@@ -59,9 +60,7 @@ mod validator;
 #[cfg(test)]
 mod tests;
 
-use crate::timers::store::cassandra::{
-    CassandraTriggerStoreError, InnerError, TABLE_SCHEMA_MIGRATIONS,
-};
+use crate::cassandra::{CassandraStoreError, TABLE_SCHEMA_MIGRATIONS};
 use executor::MigrationExecutor;
 use futures::{TryStreamExt, pin_mut};
 use humantime::format_duration;
@@ -90,7 +89,7 @@ const MAX_TABLE_PREPARATION_RETRIES: u32 = 10;
 /// Manages the complete migration lifecycle: loading embedded migrations,
 /// tracking applied migrations, validating integrity, and applying pending
 /// migrations in the correct order.
-pub struct EmbeddedMigrator<'a> {
+pub struct CassandraMigrator<'a> {
     /// Cassandra session for executing migration statements.
     session: &'a Session,
     /// Target keyspace name for migrations.
@@ -101,7 +100,7 @@ pub struct EmbeddedMigrator<'a> {
     executor: MigrationExecutor<'a>,
 }
 
-impl<'a> EmbeddedMigrator<'a> {
+impl<'a> CassandraMigrator<'a> {
     /// Creates a new migration coordinator.
     ///
     /// Initializes the keyspace and tables if needed, and prepares lock
@@ -114,14 +113,11 @@ impl<'a> EmbeddedMigrator<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraTriggerStoreError`] if:
+    /// Returns [`CassandraStoreError`] if:
     /// - Keyspace creation fails
     /// - Table creation fails
     /// - Statement preparation fails
-    pub async fn new(
-        session: &'a Session,
-        keyspace: &'a str,
-    ) -> Result<Self, CassandraTriggerStoreError> {
+    pub async fn new(session: &'a Session, keyspace: &'a str) -> Result<Self, CassandraStoreError> {
         // Create keyspace if it doesn't exist
         if session.get_cluster_state().get_keyspace(keyspace).is_none() {
             info!("Creating keyspace '{keyspace}'");
@@ -157,11 +153,10 @@ impl<'a> EmbeddedMigrator<'a> {
             }
         }
 
-        Err(InnerError::Migration(format!(
+        Err(CassandraStoreError::Migration(format!(
             "Failed to prepare lock statements after {MAX_TABLE_PREPARATION_RETRIES} attempts. \
              Tables may not be available."
-        ))
-        .into())
+        )))
     }
 
     /// Executes the complete migration process with distributed locking and
@@ -196,12 +191,12 @@ impl<'a> EmbeddedMigrator<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraTriggerStoreError`] if:
+    /// Returns [`CassandraStoreError`] if:
     /// - Migration checking fails repeatedly
     /// - Lock acquisition fails after all retries
     /// - Migration validation detects corrupted files
     /// - Any migration statement execution fails
-    pub async fn migrate(&self) -> Result<(), CassandraTriggerStoreError> {
+    pub async fn migrate(&self) -> Result<(), CassandraStoreError> {
         let mut attempt = 0;
 
         // Keep trying until success or max retries
@@ -225,10 +220,9 @@ impl<'a> EmbeddedMigrator<'a> {
                         tracing::error!(
                             "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
                         );
-                        return Err(InnerError::Migration(format!(
+                        return Err(CassandraStoreError::Migration(format!(
                             "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
-                        ))
-                        .into());
+                        )));
                     }
 
                     let sleep_duration = calculate_backoff(attempt);
@@ -246,7 +240,7 @@ impl<'a> EmbeddedMigrator<'a> {
     }
 
     /// Checks if there are pending migrations without acquiring a lock.
-    async fn has_pending_migrations(&self) -> Result<bool, CassandraTriggerStoreError> {
+    async fn has_pending_migrations(&self) -> Result<bool, CassandraStoreError> {
         let pending = self.get_pending_migrations(self.keyspace).await?;
         if !pending.is_empty() {
             info!("Found {} pending migration(s) to apply", pending.len());
@@ -255,7 +249,7 @@ impl<'a> EmbeddedMigrator<'a> {
     }
 
     /// Acquires the migration lock and applies pending migrations.
-    async fn apply_migrations_with_lock(&self) -> Result<(), CassandraTriggerStoreError> {
+    async fn apply_migrations_with_lock(&self) -> Result<(), CassandraStoreError> {
         let lock_guard = self
             .lock_manager
             .acquire("migration", MIGRATION_LOCK_TIMEOUT)
@@ -271,7 +265,7 @@ impl<'a> EmbeddedMigrator<'a> {
     }
 
     /// Applies pending migrations.
-    async fn apply_pending_migrations(&self) -> Result<(), CassandraTriggerStoreError> {
+    async fn apply_pending_migrations(&self) -> Result<(), CassandraStoreError> {
         // Re-check for pending migrations (another process might have completed them)
         debug!("Re-checking for pending migrations while holding lock");
         let pending_migrations = self.get_pending_migrations(self.keyspace).await?;
@@ -305,10 +299,21 @@ impl<'a> EmbeddedMigrator<'a> {
     }
 
     /// Gets the list of pending migrations that need to be applied.
+    ///
+    /// # Arguments
+    ///
+    /// * `keyspace` - The keyspace to check for pending migrations
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CassandraStoreError`] if:
+    /// - Failed to load embedded migrations
+    /// - Failed to query applied migrations from database
+    /// - Migration validation fails
     pub async fn get_pending_migrations(
         &self,
         keyspace: &str,
-    ) -> Result<Vec<Migration>, CassandraTriggerStoreError> {
+    ) -> Result<Vec<Migration>, CassandraStoreError> {
         debug!("Checking migration status for keyspace '{keyspace}'");
         let migrations = load_embedded_migrations(keyspace)?;
         let applied_migrations = self.get_applied_migrations(keyspace).await?;
@@ -330,7 +335,7 @@ impl<'a> EmbeddedMigrator<'a> {
     async fn get_applied_migrations(
         &self,
         keyspace: &str,
-    ) -> Result<HashMap<String, AppliedMigration>, CassandraTriggerStoreError> {
+    ) -> Result<HashMap<String, AppliedMigration>, CassandraStoreError> {
         debug!(
             "Querying applied migrations from {} table",
             TABLE_SCHEMA_MIGRATIONS
