@@ -115,6 +115,7 @@ mod tests {
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
     use crate::timers::scheduler::TimerSchedulerError;
+    use tokio::task::coop::cooperative;
     use tokio::time::{Duration, advance, pause};
     use tracing::Span;
 
@@ -142,7 +143,9 @@ mod tests {
         advance(Duration::from_secs(1)).await;
 
         // Retrieve the next expired trigger
-        let expired_trigger = triggers.next().await.expect("No expired trigger found");
+        let expired_trigger = cooperative(triggers.next())
+            .await
+            .expect("No expired trigger found");
         assert_eq!(expired_trigger, trigger);
 
         Ok(())

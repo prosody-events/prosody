@@ -29,6 +29,7 @@ use educe::Educe;
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use std::sync::Arc;
 use tokio::spawn;
+use tokio::task::coop::cooperative;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
 
@@ -150,7 +151,7 @@ where
                 .map_err(TimerManagerError::Store);
 
             pin_mut!(stream);
-            while let Some(item) = stream.try_next().await? {
+            while let Some(item) = cooperative(stream.try_next()).await? {
                 yield item;
             }
         }
