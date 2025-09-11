@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use thiserror::Error;
+use tokio::task::coop::cooperative;
 use tracing::{info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
@@ -272,7 +273,7 @@ impl TriggerStore for CassandraTriggerStore {
                 .rows_stream::<(Option<i32>,)>()?;
 
             pin_mut!(stream);
-            while let Some((value,)) = stream.try_next().await? {
+            while let Some((value,)) = cooperative(stream.try_next()).await? {
                 let Some(value) = value else {
                     continue;
                 };
@@ -334,7 +335,7 @@ impl TriggerStore for CassandraTriggerStore {
                     .rows_stream::<(Option<i32>,)>()?;
 
                 pin_mut!(stream1);
-                while let Some((value,)) = stream1.try_next().await? {
+                while let Some((value,)) = cooperative(stream1.try_next()).await? {
                     let Some(value) = value else {
                         continue;
                     };
@@ -354,7 +355,7 @@ impl TriggerStore for CassandraTriggerStore {
                     .rows_stream::<(Option<i32>,)>()?;
 
                 pin_mut!(stream2);
-                while let Some((value,)) = stream2.try_next().await? {
+                while let Some((value,)) = cooperative(stream2.try_next()).await? {
                     let Some(value) = value else {
                         continue;
                     };
@@ -374,7 +375,7 @@ impl TriggerStore for CassandraTriggerStore {
                     .rows_stream::<(Option<i32>,)>()?;
 
                 pin_mut!(stream);
-                while let Some((value,)) = stream.try_next().await? {
+                while let Some((value,)) = cooperative(stream.try_next()).await? {
                     let Some(value) = value else {
                         continue;
                     };
@@ -437,7 +438,7 @@ impl TriggerStore for CassandraTriggerStore {
                 .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
 
             pin_mut!(stream);
-            while let Some((key, time, span_map)) = stream.try_next().await? {
+            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger");
                 span.set_parent(context);
@@ -535,7 +536,7 @@ impl TriggerStore for CassandraTriggerStore {
                 .rows_stream::<(CompactDateTime,)>()?;
 
             pin_mut!(stream);
-            while let Some((time,)) = stream.try_next().await? {
+            while let Some((time,)) = cooperative(stream.try_next()).await? {
                 yield time
             }
         }
@@ -555,7 +556,7 @@ impl TriggerStore for CassandraTriggerStore {
                 .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
 
             pin_mut!(stream);
-            while let Some((key, time, span_map)) = stream.try_next().await? {
+            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_key_trigger");
                 span.set_parent(context);

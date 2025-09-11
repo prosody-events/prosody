@@ -70,6 +70,7 @@ use lock::LockManager;
 use scylla::client::session::Session;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::task::coop::cooperative;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use utils::{calculate_backoff, ensure_migration_tables_exist, refresh_metadata};
@@ -348,7 +349,7 @@ impl<'a> EmbeddedMigrator<'a> {
         let mut applied = HashMap::new();
 
         pin_mut!(stream);
-        while let Some((filename, checksum)) = stream.try_next().await? {
+        while let Some((filename, checksum)) = cooperative(stream.try_next()).await? {
             applied.insert(filename, AppliedMigration { checksum });
         }
 

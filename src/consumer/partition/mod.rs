@@ -42,6 +42,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
+use tokio::task::coop::cooperative;
 use tokio::time::sleep;
 use tracing::{debug, debug_span, error, info, info_span, instrument};
 use uuid::Uuid;
@@ -512,7 +513,7 @@ where
     stream! {
         pin_mut!(timer_stream);
 
-        while let Some(timer) = timer_stream.next().await {
+        while let Some(timer) = cooperative(timer_stream.next()).await {
             yield UncommittedEvent::Timer(timer);
         }
     }
