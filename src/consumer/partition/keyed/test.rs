@@ -172,7 +172,7 @@ async fn processes_messages_in_order_impl(
     }
 
     for (key, expected_values) in expected {
-        let Some(processed_values) = processed.get(&key) else {
+        let Some(processed_values) = processed.get_sync(&key) else {
             return TestResult::failed();
         };
 

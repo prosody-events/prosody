@@ -91,10 +91,11 @@ impl ActiveTriggers {
     {
         // For each key and its set of times, apply the callback.
         self.0
-            .scan_async(|_, times| {
+            .iter_async(|_, times| {
                 for &time in times {
                     f(time);
                 }
+                true // Continue iteration over all entries
             })
             .await;
     }
