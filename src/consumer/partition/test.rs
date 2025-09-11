@@ -293,6 +293,8 @@ async fn test_partition_manager_event_type_filtering() {
 
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
+    let test_semaphore = Arc::new(Semaphore::new(10));
+
     // 1) a disallowed event ("type": "disallowed")
     let disallowed = ConsumerMessage::new(
         None,
@@ -303,6 +305,10 @@ async fn test_partition_manager_event_type_filtering() {
         Utc::now(),
         json!({ "type": "disallowed" }),
         Span::none(),
+        test_semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("Failed to acquire permit"),
     );
     assert!(partition_manager.try_send(disallowed).is_ok());
 
@@ -316,6 +322,10 @@ async fn test_partition_manager_event_type_filtering() {
         Utc::now(),
         json!({ "type": "allowed" }),
         Span::none(),
+        test_semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("Failed to acquire permit"),
     );
     assert!(partition_manager.try_send(allowed).is_ok());
 
@@ -498,6 +508,7 @@ impl EventHandler for TestHandler {
 
 /// Helper functions to create test messages.
 fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
+    let semaphore = Arc::new(Semaphore::new(10));
     ConsumerMessage::new(
         None,
         "test-topic".into(),
@@ -507,6 +518,9 @@ fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
         Utc::now(),
         serde_json::json!({}),
         Span::none(),
+        semaphore
+            .try_acquire_owned()
+            .expect("Failed to acquire permit"),
     )
 }
 
@@ -520,6 +534,7 @@ fn create_test_message_with_event_id(
     } else {
         serde_json::json!({})
     };
+    let semaphore = Arc::new(Semaphore::new(10));
     ConsumerMessage::new(
         None,
         "test-topic".into(),
@@ -529,6 +544,9 @@ fn create_test_message_with_event_id(
         Utc::now(),
         payload,
         Span::none(),
+        semaphore
+            .try_acquire_owned()
+            .expect("Failed to acquire permit"),
     )
 }
 

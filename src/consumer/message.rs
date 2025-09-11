@@ -14,6 +14,7 @@
 use chrono::{DateTime, Utc};
 use educe::Educe;
 use std::sync::Arc;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Span, debug};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
@@ -222,7 +223,7 @@ pub struct ConsumerMessage(Arc<ConsumerMessageValue>);
 /// The full data and metadata for a consumer message.
 ///
 /// Owned by `ConsumerMessage` and shared via `Arc`.
-#[derive(Clone, Educe)]
+#[derive(Educe)]
 #[educe(Debug)]
 pub struct ConsumerMessageValue {
     /// Optional header indicating the source system that produced the message.
@@ -250,6 +251,9 @@ pub struct ConsumerMessageValue {
     /// Tracing span for this message.
     #[educe(Debug(ignore))]
     pub span: Span,
+
+    /// Permit used to bound buffering
+    permit: OwnedSemaphorePermit,
 }
 
 impl ConsumerMessage {
@@ -276,6 +280,7 @@ impl ConsumerMessage {
         timestamp: DateTime<Utc>,
         payload: Payload,
         span: Span,
+        permit: OwnedSemaphorePermit,
     ) -> Self {
         Self(Arc::new(ConsumerMessageValue {
             source_system,
@@ -286,6 +291,7 @@ impl ConsumerMessage {
             timestamp,
             payload,
             span,
+            permit,
         }))
     }
 
@@ -342,12 +348,6 @@ impl ConsumerMessage {
             inner: self,
             uncommitted_offset,
         }
-    }
-
-    /// Extracts the inner `ConsumerMessageValue`, cloning if necessary.
-    #[must_use]
-    pub fn into_value(self) -> ConsumerMessageValue {
-        Arc::unwrap_or_clone(self.0)
     }
 }
 

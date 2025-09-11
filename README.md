@@ -188,7 +188,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_MAX_CONCURRENCY`        | Maximum global concurrency limit                                                     | 32           | ✓        |          |
 | `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure)       | 8            | ✓        |          |
 | `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                        | 3            | ✓        |          |
-| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages per partition                                 | 16           | ✓        |          |
+| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages across all partitions                         | 64           | ✓        |          |
 | `PROSODY_MOCK`                   | Use mock Kafka brokers and in-memory timer storage for testing                       | false        | ✓        | ✓        |
 | `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                             | 100ms        | ✓        |          |
 | `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.                 | 8000         | ✓        |          |
@@ -424,9 +424,12 @@ graph TD
 
 5. **Polling Mechanism**: The `KafkaConsumer` uses a polling mechanism to efficiently fetch messages from Kafka brokers.
 
-6. **Partition Pausing**: If a partition becomes backed up (i.e., its queues are full), Prosody will pause consumption
-   from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in one partition
-   doesn't affect the entire consumer.
+6. **Backpressure Management**: Prosody provides multiple levels of backpressure control:
+   - **Global buffering**: A global semaphore limits the total number of messages being processed across all partitions
+   - **Partition pausing**: If a partition becomes backed up (i.e., its queues are full), Prosody will pause consumption
+     from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in one partition
+     doesn't affect the entire consumer
+   - **Per-key queuing**: Each key has bounded queues to prevent memory exhaustion
 
 ### Message Flow
 

@@ -416,12 +416,11 @@ impl EventHandler for TestHandler {
         C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
-        let message = msg.into_value();
 
         // Forward the message to the channel
         if let Err(error) = self
             .messages_tx
-            .send((message.key.to_string(), message.payload))
+            .send((msg.key().to_string(), msg.payload().clone()))
             .await
         {
             error!("failed to send message: {error:#}");
