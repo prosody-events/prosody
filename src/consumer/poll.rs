@@ -21,6 +21,7 @@ use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::util::Timeout;
 use rdkafka::{Message, Offset, Timestamp, TopicPartitionList};
 use std::str;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
@@ -43,6 +44,7 @@ use crate::timers::store::TriggerStore;
 use simd_json::Buffers;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_reader_with_buffers;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Configuration for the Kafka message polling process.
 ///
@@ -61,6 +63,9 @@ where
 {
     /// Time between consecutive poll operations
     pub poll_interval: Duration,
+
+    /// Maximum number of messages across all partitions
+    pub max_message_count: usize,
 
     /// The configured Kafka consumer with context
     pub consumer: BaseConsumer<Context<T, S>>,
@@ -83,10 +88,11 @@ where
 /// This function implements the core consumption loop that:
 /// 1. Monitors and updates heartbeats to detect stalls
 /// 2. Stores committed offsets when watermarks advance
-/// 3. Pauses partitions that have reached their capacity limit
-/// 4. Polls for new messages from Kafka
-/// 5. Processes valid messages through validation and filtering
-/// 6. Dispatches messages to their respective partition managers
+/// 3. Manages global message buffering through semaphore permits
+/// 4. Pauses partitions that have reached their capacity limit
+/// 5. Polls for new messages from Kafka
+/// 6. Processes valid messages through validation and filtering
+/// 7. Dispatches messages to their respective partition managers
 ///
 /// The loop continues until the shutdown flag is set to true.
 ///
@@ -105,6 +111,7 @@ where
     // Destructure configuration for cleaner access
     let PollConfig {
         poll_interval,
+        max_message_count,
         consumer,
         watermark_version,
         managers,
@@ -116,6 +123,7 @@ where
     let propagator = new_propagator();
     let mut last_version = watermark_version.load(Ordering::Acquire);
     let mut is_paused = false;
+    let semaphore = Arc::new(Semaphore::new(max_message_count));
 
     // Main polling loop
     while !shutdown.load(Ordering::Relaxed) {
@@ -125,8 +133,13 @@ where
         // Periodically commit watermark offsets to Kafka
         store_watermarks(&consumer, watermark_version, managers, &mut last_version);
 
+        // Attempt to acquire semaphore to buffer a new message
+        let maybe_permit = semaphore.clone().try_acquire_owned().ok();
+
         // Pause/resume partitions based on their buffer capacity
-        if let Err(error) = pause_busy_partitions(&mut is_paused, &consumer, managers) {
+        if let Err(error) =
+            pause_busy_partitions(&mut is_paused, maybe_permit.as_ref(), &consumer, managers)
+        {
             error!("error pausing busy partitions: {error:#}; retrying");
             sleep(poll_interval);
             continue;
@@ -146,6 +159,12 @@ where
             }
         };
 
+        let Some(permit) = maybe_permit else {
+            // This state means that pausing failed
+            error!("failed to acquire semaphore; discarding message");
+            continue;
+        };
+
         let topic = message.topic();
         let partition = message.partition();
         let offset = message.offset();
@@ -154,6 +173,7 @@ where
         // Process message through extraction, validation, and filtering
         let maybe_msg = process_message(
             &message,
+            permit,
             &propagator,
             #[cfg(not(target_arch = "arm"))]
             &mut buffers,
@@ -190,6 +210,7 @@ where
 /// * `None` - If the message is invalid or should be filtered out
 fn process_message(
     message: &BorrowedMessage,
+    permit: OwnedSemaphorePermit,
     propagator: &TextMapCompositePropagator,
     #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
 ) -> Option<ConsumerMessage> {
@@ -296,6 +317,7 @@ fn process_message(
         timestamp,
         payload,
         span.clone(),
+        permit,
     ))
 }
 
@@ -425,6 +447,7 @@ fn store_watermarks<T, S>(
 /// Returns any error from the underlying Kafka pause/resume operations.
 fn pause_busy_partitions<T, S>(
     is_paused: &mut bool,
+    maybe_permit: Option<&OwnedSemaphorePermit>,
     consumer: &BaseConsumer<Context<T, S>>,
     managers: &Managers,
 ) -> Result<(), KafkaError>
@@ -433,9 +456,11 @@ where
     S: TriggerStore,
 {
     let managers = managers.read();
+    let has_global_capacity = maybe_permit.is_some();
+    let has_partition_capacity = managers.values().all(PartitionManager::has_capacity);
 
     // Skip if no partitions are paused and all have capacity
-    if !*is_paused && managers.values().all(PartitionManager::has_capacity) {
+    if !*is_paused && has_global_capacity && has_partition_capacity {
         return Ok(());
     }
 
@@ -445,7 +470,7 @@ where
 
     // Categorize partitions based on their capacity
     for ((topic, partition), manager) in managers.iter() {
-        if manager.has_capacity() {
+        if has_global_capacity && manager.has_capacity() {
             resumed.add_partition(topic.as_ref(), *partition);
         } else {
             paused.add_partition(topic.as_ref(), *partition);

@@ -7,6 +7,7 @@
 //! - Per-key concurrency with ordered processing within keys
 //! - Automatic partition assignment and revocation handling
 //! - Offset management with exactly-once semantics
+//! - Global message buffering with bounded concurrency
 //! - Backpressure handling and flow control
 //! - Error handling with configurable retry strategies
 //! - Distributed tracing integration
@@ -413,15 +414,17 @@ pub struct ConsumerConfiguration {
     #[validate(range(min = 1_usize))]
     pub max_concurrency: usize,
 
-    /// Maximum number of uncommitted messages per partition.
+    /// Maximum number of uncommitted messages.
     ///
     /// Environment variable: `PROSODY_MAX_UNCOMMITTED`
-    /// Default: 16
+    /// Default: 64
     ///
-    /// Limits the number of messages in-flight from each partition.
-    /// Also determines the buffer size for message queues.
+    /// Controls the global limit of messages being processed concurrently
+    /// across all partitions. This provides backpressure when the system is
+    /// under high load by pausing message consumption when the limit is
+    /// reached. Also determines the buffer size for message queues.
     #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 16)?",
+        default = "from_env_with_fallback(\"PROSODY_MAX_UNCOMMITTED\", 64)?",
         setter(into)
     )]
     #[validate(range(min = 1_usize))]
@@ -1018,9 +1021,11 @@ where
     let heartbeat = Heartbeat::new("Kafka poll loop", config.stall_threshold);
     let cloned_managers = managers.clone();
     let cloned_heartbeat = heartbeat.clone();
+    let max_message_count = config.max_uncommitted;
     let poll_handle = spawn_blocking(move || {
         poll(PollConfig {
             poll_interval,
+            max_message_count,
             consumer,
             watermark_version: &watermark_version,
             managers: &cloned_managers,
