@@ -62,6 +62,20 @@ impl<T> HighLevelClient<T> {
         &self.propagator
     }
 
+    /// Returns the configured source system identifier.
+    ///
+    /// The source system is used to identify the originating service or
+    /// component in produced messages, enabling message tracing and loop
+    /// detection.
+    ///
+    /// # Returns
+    ///
+    /// A string slice containing the source system identifier.
+    #[must_use]
+    pub fn source_system(&self) -> &str {
+        &self.producer_config.source_system
+    }
+
     /// Creates a new `HighLevelClient` with the specified configurations.
     ///
     /// # Arguments
