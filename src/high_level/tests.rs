@@ -1,5 +1,10 @@
 use super::*;
+use crate::consumer::ConsumerConfiguration;
+use crate::consumer::failure::retry::RetryConfiguration;
+use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
+use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
+use crate::timers::store::cassandra::CassandraConfigurationBuilder;
 use color_eyre::Result;
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
@@ -145,5 +150,82 @@ fn test_missing_topics_edge_cases() -> Result<()> {
     assert!(result.contains(&Topic::from("")));
     assert!(!result.contains(&Topic::from("^")));
     assert!(!result.contains(&Topic::from("^a")));
+    Ok(())
+}
+
+/// Helper function to create a `HighLevelClient` for source system testing.
+///
+/// # Arguments
+///
+/// * `group_id` - The consumer group ID to use.
+/// * `source_system` - Optional explicit source system for the producer.
+///
+/// # Returns
+///
+/// A configured `HighLevelClient` instance.
+fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<HighLevelClient<()>> {
+    let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
+    let bootstrap = cluster.bootstrap_servers();
+    cluster.create_topic("test-topic", 1, 1)?;
+
+    // Keep cluster alive for test duration
+    forget(cluster);
+
+    // Create producer configuration
+    let mut producer_builder = ProducerConfiguration::builder();
+    producer_builder
+        .bootstrap_servers(vec![bootstrap.clone()])
+        .mock(true);
+
+    // Set source system if provided
+    if let Some(source) = source_system {
+        producer_builder.source_system(source);
+    }
+
+    // Create consumer configuration
+    let mut consumer_builder = ConsumerConfiguration::builder();
+    consumer_builder
+        .bootstrap_servers(vec![bootstrap])
+        .group_id(group_id)
+        .subscribed_topics(&["test-topic".to_owned()])
+        .mock(true);
+
+    let retry_builder = RetryConfiguration::builder();
+    let failure_topic_builder = FailureTopicConfigurationBuilder::default();
+    let cassandra_builder = CassandraConfigurationBuilder::default();
+
+    Ok(HighLevelClient::new(
+        Mode::Pipeline,
+        &mut producer_builder,
+        &consumer_builder,
+        &retry_builder,
+        &failure_topic_builder,
+        &cassandra_builder,
+    )?)
+}
+
+#[test]
+fn test_source_system_defaults_to_consumer_group() -> Result<()> {
+    let group_id = "my-test-group";
+
+    // Create client WITHOUT specifying source_system
+    let client = create_test_client(group_id, None)?;
+
+    // Verify that source_system() returns the consumer group_id
+    assert_eq!(client.source_system(), group_id);
+    Ok(())
+}
+
+#[test]
+fn test_source_system_explicit_value_preserved() -> Result<()> {
+    let explicit_source = "my-explicit-source";
+    let group_id = "my-test-group";
+
+    // Create client WITH explicit source_system
+    let client = create_test_client(group_id, Some(explicit_source))?;
+
+    // Verify that source_system() returns the explicit value, NOT group_id
+    assert_eq!(client.source_system(), explicit_source);
+    assert_ne!(client.source_system(), group_id);
     Ok(())
 }
