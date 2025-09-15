@@ -395,7 +395,7 @@ async fn handle_messages<T, S>(
     let process = |event: UncommittedEvent<S>| async {
         // Acquire a semaphore to bound global concurrency
         debug!(?event, "acquiring permit");
-        let _permit = match config.global_limit.acquire().await {
+        let permit = match config.global_limit.acquire().await {
             Ok(permit) => permit,
             Err(error) => {
                 error!(
@@ -423,6 +423,8 @@ async fn handle_messages<T, S>(
                 }
             }
         }
+
+        drop(permit);
     };
 
     // Create key manager to handle concurrent processing while maintaining key
