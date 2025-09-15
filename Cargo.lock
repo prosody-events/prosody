@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "prosody"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "ahash",
  "aho-corasick",
