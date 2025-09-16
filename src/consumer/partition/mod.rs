@@ -571,20 +571,23 @@ async fn reserve_offset(
     offsets: &OffsetTracker,
     received: ConsumerMessage,
 ) -> Option<UncommittedMessage> {
-    let span = received.span().clone();
-    let _enter = span.enter();
-
     // Attempt to reserve the offset
-    match offsets.take(received.offset()).await {
-        Ok(uncommitted_offset) => Some(received.into_uncommitted(uncommitted_offset)),
-        Err(error) => {
-            error!(
-                ?received,
-                "unable to take uncommitted offset: {error:#}; discarding message"
-            );
-            None
-        }
-    }
+    received
+        .clone()
+        .span()
+        .in_scope(|| async {
+            match offsets.take(received.offset()).await {
+                Ok(uncommitted_offset) => Some(received.into_uncommitted(uncommitted_offset)),
+                Err(error) => {
+                    error!(
+                        ?received,
+                        "unable to take uncommitted offset: {error:#}; discarding message"
+                    );
+                    None
+                }
+            }
+        })
+        .await
 }
 
 /// Filters out messages produced by the same consumer group to prevent loops.
