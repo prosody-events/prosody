@@ -34,7 +34,7 @@ use std::time::Duration as StdDuration;
 
 use thiserror::Error;
 use tokio::task::coop::cooperative;
-use tracing::{info_span, instrument};
+use tracing::{debug_span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
 
@@ -558,7 +558,7 @@ impl TriggerStore for CassandraTriggerStore {
             pin_mut!(stream);
             while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
-                let span = info_span!("fetch_key_trigger");
+                let span = debug_span!("fetch_key_trigger");
                 span.set_parent(context);
 
                 yield Trigger {
