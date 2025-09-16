@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use tokio::select;
 use tokio::sync::watch;
-use tracing::{error, info_span};
+use tracing::{Span, error};
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
@@ -193,9 +193,7 @@ where
     }
 
     async fn schedule(&self, time: CompactDateTime) -> Result<(), Self::Error> {
-        // Wrap scheduling in a tracing span for observability.
-        let span = info_span!("timer", key = %self.key, time = %time);
-
+        let span = Span::current();
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
             result = self.timers.schedule(Trigger {
@@ -210,7 +208,7 @@ where
         &self,
         time: CompactDateTime,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let span = info_span!("timer", key = %self.key, time = %time);
+        let span = Span::current();
 
         let operation = async {
             // Get scheduled triggers
