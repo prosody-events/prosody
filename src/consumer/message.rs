@@ -218,9 +218,9 @@ impl EventIdentity for UncommittedMessage {
 
 /// A RAII guard that clears a message's span when dropped.
 ///
-/// This guard ensures that OpenTelemetry spans associated with consumer messages
-/// are deterministically flushed when message processing completes. Without this,
-/// spans would depend on garbage collection timing for flushing.
+/// This guard ensures that OpenTelemetry spans associated with consumer
+/// messages are deterministically flushed when message processing completes.
+/// Without this, spans would depend on garbage collection timing for flushing.
 pub struct MessageSpanScopeGuard(ConsumerMessage);
 
 impl Drop for MessageSpanScopeGuard {
