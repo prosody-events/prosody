@@ -8,7 +8,7 @@
 //!   `TimerManager<T>` using a `TriggerStore` backend.
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -230,19 +230,16 @@ where
     }
 
     async fn schedule(&self, time: CompactDateTime) -> Result<(), Self::Error> {
-        let span = ArcSwap::new(Span::current().into()).into();
         let inner = self.inner.load();
         let Some(inner) = inner.as_ref() else {
             return Err(TimerManagerError::InvalidContext);
         };
 
+        let trigger = Trigger::new(inner.key.clone(), time, Span::current());
+
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
-            result = inner.timers.schedule(Trigger {
-                key: inner.key.clone(),
-                time,
-                span,
-            }) => result,
+            result = inner.timers.schedule(trigger) => result,
         }
     }
 
