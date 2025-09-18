@@ -443,11 +443,7 @@ impl TriggerStore for CassandraTriggerStore {
                 let span = info_span!("fetch_slab_trigger");
                 span.set_parent(context);
 
-                yield Trigger {
-                    key: key.into(),
-                    time,
-                    span,
-                }
+                yield Trigger::new(key.into(), time, span);
             }
         }
     }
@@ -455,8 +451,8 @@ impl TriggerStore for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self), err)]
     async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
         let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
-        self.propagator()
-            .inject_context(&trigger.span.context(), &mut span_map);
+        let context = trigger.span.load().context();
+        self.propagator().inject_context(&context, &mut span_map);
 
         let segment_id = slab.segment_id();
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
@@ -561,11 +557,7 @@ impl TriggerStore for CassandraTriggerStore {
                 let span = debug_span!("fetch_key_trigger");
                 span.set_parent(context);
 
-                yield Trigger {
-                    key: key.into(),
-                    time,
-                    span,
-                }
+                yield Trigger::new(key.into(), time, span);
             }
         }
     }
@@ -577,8 +569,8 @@ impl TriggerStore for CassandraTriggerStore {
         trigger: Trigger,
     ) -> Result<(), Self::Error> {
         let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
-        self.propagator()
-            .inject_context(&trigger.span.context(), &mut span_map);
+        let context = trigger.span.load().context();
+        self.propagator().inject_context(&context, &mut span_map);
 
         let key = trigger.key.as_str();
         let time = trigger.time;

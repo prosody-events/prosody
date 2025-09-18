@@ -1,3 +1,8 @@
+#![allow(
+    clippy::mutable_key_type,
+    reason = "Trigger's ArcSwap field is excluded from hash/equality via Educe"
+)]
+
 //! Common utilities and helper functions for `TriggerStore` testing.
 //!
 //! This module provides a comprehensive set of helper functions that simplify

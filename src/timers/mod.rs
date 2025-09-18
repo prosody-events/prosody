@@ -49,7 +49,9 @@
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
+use arc_swap::ArcSwap;
 use educe::Educe;
+use std::sync::Arc;
 use tracing::Span;
 
 /// Scheduled timer event containing execution metadata.
@@ -69,7 +71,33 @@ pub struct Trigger {
 
     /// Tracing span for distributed observability context.
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
-    pub span: Span,
+    pub span: Arc<ArcSwap<Span>>,
+}
+
+impl Trigger {
+    /// Creates a new timer trigger for scheduled execution.
+    ///
+    /// The span is wrapped in an [`ArcSwap`] for thread-safe access during
+    /// concurrent timer operations while preserving distributed tracing
+    /// context.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` – Entity key identifying what this timer belongs to
+    /// * `time` – When this timer should execute
+    /// * `span` – Tracing span for distributed observability context
+    ///
+    /// # Returns
+    ///
+    /// A new [`Trigger`] instance ready for scheduling.
+    #[must_use]
+    pub fn new(key: Key, time: CompactDateTime, span: Span) -> Self {
+        Self {
+            key,
+            time,
+            span: ArcSwap::from_pointee(span).into(),
+        }
+    }
 }
 
 mod active;

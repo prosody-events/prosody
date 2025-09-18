@@ -48,4 +48,9 @@ where
     /// The scheduler has been shut down and cannot process operations.
     #[error("Timer has been shutdown")]
     Shutdown,
+
+    /// The context is no longer valid because the event has already been
+    /// processed.
+    #[error("The context is no longer valid because the event has already been processed")]
+    InvalidContext,
 }

@@ -14,7 +14,7 @@
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
 
-use crate::consumer::event_context::TimerContext;
+use crate::consumer::event_context::{EventContext, TimerContext};
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
@@ -23,7 +23,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
-use crate::{EventId, EventIdentity, Key, Offset, Partition, Topic};
+use crate::{EventId, EventIdentity, Key, Offset, Partition, SpanScope, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
@@ -415,14 +415,22 @@ async fn handle_messages<T, S>(
             timer_manager.clone(),
         );
 
+        let cloned_context = context.clone();
         match event {
-            UncommittedEvent::Message(message) => handler.on_message(context, message).await,
+            UncommittedEvent::Message(message) => {
+                let _guard = message.span_scope();
+                handler.on_message(context, message).await;
+            }
             UncommittedEvent::Timer(timer) => {
                 if timer.is_active().await {
+                    let _guard = timer.span_scope();
                     handler.on_timer(context, timer).await;
                 }
             }
         }
+
+        // Prevent the context from being used outside of processing
+        cloned_context.invalidate();
     };
 
     // Create key manager to handle concurrent processing while maintaining key
@@ -540,7 +548,7 @@ fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Re
     // Skip messages with offsets we've already seen
     if offset <= *highest_offset_seen {
         debug_span!(
-            parent: message.span(),
+            parent: message.span().load().as_ref(),
             "message.filtered",
             %partition, %offset, reason = "stale"
         )
@@ -573,8 +581,8 @@ async fn reserve_offset(
 ) -> Option<UncommittedMessage> {
     // Attempt to reserve the offset
     received
-        .clone()
         .span()
+        .load()
         .in_scope(|| async {
             match offsets.take(received.offset()).await {
                 Ok(uncommitted_offset) => Some(received.into_uncommitted(uncommitted_offset)),
@@ -609,7 +617,7 @@ async fn filter_loops(group_id: &str, message: UncommittedMessage) -> Option<Unc
         .is_some_and(|source_system| source_system.as_str() == group_id)
     {
         info_span!(
-            parent: message.span(),
+            parent: message.span().load().as_ref(),
             "message.filtered",
             reason = "source-system-loop"
         )
@@ -654,7 +662,7 @@ async fn filter_event_type(
         automaton.find(input).is_none()
     }) {
         info_span!(
-            parent: message.span(),
+            parent: message.span().load().as_ref(),
             "message.filtered",
             reason = "event-type"
         )
@@ -715,7 +723,7 @@ async fn filter_duplicate(
             if value.as_str() == event_id {
                 // Record a span and skip the message
                 info_span!(
-                    parent: message.span(),
+                    parent: message.span().load().as_ref(),
                     "message.filtered",
                     reason = "duplicate-event-id",
                     event_id

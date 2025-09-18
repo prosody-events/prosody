@@ -89,7 +89,7 @@ async fn test_backpressure() -> Result<()> {
     // Process messages as they are received by the slow consumer
     while messages_rx.recv().await.is_some() {
         count += 1;
-        if count % 100 == 0 {
+        if count.is_multiple_of(100) {
             info!("Received {count} messages so far");
         }
         if count == total {
