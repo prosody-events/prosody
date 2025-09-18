@@ -49,7 +49,7 @@
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 use educe::Educe;
 use std::sync::Arc;
 use tracing::Span;
@@ -71,7 +71,7 @@ pub struct Trigger {
 
     /// Tracing span for distributed observability context.
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
-    pub span: Arc<ArcSwap<Span>>,
+    span: Arc<ArcSwap<Span>>,
 }
 
 impl Trigger {
@@ -97,6 +97,21 @@ impl Trigger {
             time,
             span: ArcSwap::from_pointee(span).into(),
         }
+    }
+
+    /// Returns the tracing span associated with this trigger.
+    ///
+    /// The span is wrapped in an atomic guard to enable interior mutability,
+    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
+    /// deterministic span flushing when timer processing completes.
+    ///
+    /// # Returns
+    ///
+    /// A guard containing the current span, which can be used for tracing
+    /// operations or span linking.
+    #[must_use]
+    pub fn span(&self) -> Guard<Arc<Span>> {
+        self.span.load()
     }
 }
 

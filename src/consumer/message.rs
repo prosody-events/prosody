@@ -11,7 +11,7 @@
 //!   data.
 //! - `ConsumerMessageValue` – The raw data behind `ConsumerMessage`.
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 use chrono::{DateTime, Utc};
 use educe::Educe;
 use std::sync::Arc;
@@ -155,9 +155,18 @@ impl UncommittedMessage {
         self.inner.payload()
     }
 
-    /// Returns the tracing `Span` associated with this message.
+    /// Returns the tracing span associated with this message.
+    ///
+    /// The span is wrapped in an atomic guard to enable interior mutability,
+    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
+    /// deterministic span flushing when message processing completes.
+    ///
+    /// # Returns
+    ///
+    /// A guard containing the current span, which can be used for tracing
+    /// operations or span linking.
     #[must_use]
-    pub fn span(&self) -> &ArcSwap<Span> {
+    pub fn span(&self) -> Guard<Arc<Span>> {
         self.inner.span()
     }
 
@@ -225,7 +234,7 @@ pub struct MessageSpanScopeGuard(ConsumerMessage);
 
 impl Drop for MessageSpanScopeGuard {
     fn drop(&mut self) {
-        self.0.span().store(Arc::new(Span::none()));
+        self.0.0.span.store(Arc::new(Span::none()));
     }
 }
 
@@ -355,10 +364,19 @@ impl ConsumerMessage {
         &self.0.payload
     }
 
-    /// Returns the tracing span for the message.
+    /// Returns the tracing span associated with this message.
+    ///
+    /// The span is wrapped in an atomic guard to enable interior mutability,
+    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
+    /// deterministic span flushing when message processing completes.
+    ///
+    /// # Returns
+    ///
+    /// A guard containing the current span, which can be used for tracing
+    /// operations or span linking.
     #[must_use]
-    pub fn span(&self) -> &ArcSwap<Span> {
-        &self.0.span
+    pub fn span(&self) -> Guard<Arc<Span>> {
+        self.0.span.load()
     }
 
     /// Convert into `UncommittedMessage` by attaching offset-tracking state.
