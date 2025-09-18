@@ -130,11 +130,7 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(1))
             .map_err(TimerSchedulerError::DateTime)?; // 1 second in the future
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;
@@ -162,11 +158,7 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(5))
             .map_err(TimerSchedulerError::DateTime)?; // 5 seconds in the future
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;
@@ -197,22 +189,14 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(1))
             .map_err(TimerSchedulerError::DateTime)?; // 1 second in the future
-        let trigger_first = Trigger {
-            key: key_first.clone(),
-            time: time_first,
-            span: Span::current(),
-        };
+        let trigger_first = Trigger::new(key_first.clone(), time_first, Span::current());
 
         let key_second = Key::from("key2");
         let time_second = CompactDateTime::now()
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(2))
             .map_err(TimerSchedulerError::DateTime)?; // 2 seconds in the future
-        let trigger_second = Trigger {
-            key: key_second.clone(),
-            time: time_second,
-            span: Span::current(),
-        };
+        let trigger_second = Trigger::new(key_second.clone(), time_second, Span::current());
 
         // Insert both triggers
         triggers.insert(trigger_first.clone()).await;
@@ -246,11 +230,7 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(5))
             .map_err(TimerSchedulerError::DateTime)?; // 5 seconds in the future
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;

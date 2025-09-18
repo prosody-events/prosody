@@ -11,6 +11,7 @@
 //!   data.
 //! - `ConsumerMessageValue` – The raw data behind `ConsumerMessage`.
 
+use arc_swap::{ArcSwap, Guard};
 use chrono::{DateTime, Utc};
 use educe::Educe;
 use std::sync::Arc;
@@ -22,7 +23,8 @@ use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::PendingTimer;
 use crate::timers::store::TriggerStore;
 use crate::{
-    BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem, Topic,
+    BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem,
+    SpanScope, Topic,
 };
 
 /// A unified event that must be explicitly committed or aborted.
@@ -153,9 +155,18 @@ impl UncommittedMessage {
         self.inner.payload()
     }
 
-    /// Returns the tracing `Span` associated with this message.
+    /// Returns the tracing span associated with this message.
+    ///
+    /// The span is wrapped in an atomic guard to enable interior mutability,
+    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
+    /// deterministic span flushing when message processing completes.
+    ///
+    /// # Returns
+    ///
+    /// A guard containing the current span, which can be used for tracing
+    /// operations or span linking.
     #[must_use]
-    pub fn span(&self) -> &Span {
+    pub fn span(&self) -> Guard<Arc<Span>> {
         self.inner.span()
     }
 
@@ -214,6 +225,27 @@ impl EventIdentity for UncommittedMessage {
     }
 }
 
+/// A RAII guard that clears a message's span when dropped.
+///
+/// This guard ensures that OpenTelemetry spans associated with consumer
+/// messages are deterministically flushed when message processing completes.
+/// Without this, spans would depend on garbage collection timing for flushing.
+pub struct MessageSpanScopeGuard(ConsumerMessage);
+
+impl Drop for MessageSpanScopeGuard {
+    fn drop(&mut self) {
+        self.0.0.span.store(Arc::new(Span::none()));
+    }
+}
+
+impl SpanScope for UncommittedMessage {
+    type Guard = MessageSpanScopeGuard;
+
+    fn span_scope(&self) -> Self::Guard {
+        MessageSpanScopeGuard(self.inner.clone())
+    }
+}
+
 /// A lightweight, clonable Kafka message without offset tracking.
 ///
 /// Internally wraps its data in an `Arc<ConsumerMessageValue>`.
@@ -250,7 +282,7 @@ pub struct ConsumerMessageValue {
 
     /// Tracing span for this message.
     #[educe(Debug(ignore))]
-    pub span: Span,
+    pub span: ArcSwap<Span>,
 
     /// Permit used to bound buffering
     permit: OwnedSemaphorePermit,
@@ -282,6 +314,7 @@ impl ConsumerMessage {
         span: Span,
         permit: OwnedSemaphorePermit,
     ) -> Self {
+        let span = ArcSwap::from_pointee(span);
         Self(Arc::new(ConsumerMessageValue {
             source_system,
             topic,
@@ -331,10 +364,19 @@ impl ConsumerMessage {
         &self.0.payload
     }
 
-    /// Returns the tracing span for the message.
+    /// Returns the tracing span associated with this message.
+    ///
+    /// The span is wrapped in an atomic guard to enable interior mutability,
+    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
+    /// deterministic span flushing when message processing completes.
+    ///
+    /// # Returns
+    ///
+    /// A guard containing the current span, which can be used for tracing
+    /// operations or span linking.
     #[must_use]
-    pub fn span(&self) -> &Span {
-        &self.0.span
+    pub fn span(&self) -> Guard<Arc<Span>> {
+        self.0.span.load()
     }
 
     /// Convert into `UncommittedMessage` by attaching offset-tracking state.

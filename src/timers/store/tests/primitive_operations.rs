@@ -1,3 +1,8 @@
+#![allow(
+    clippy::mutable_key_type,
+    reason = "Trigger's ArcSwap field is excluded from hash/equality via Educe"
+)]
+
 use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::tests::common::{get_key_triggers, get_slab_triggers, insert_segment};

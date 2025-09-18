@@ -158,7 +158,7 @@ async fn test_timer_backpressure() -> Result<()> {
     // Process timers as they are received by the slow consumer
     while timers_rx.recv().await.is_some() {
         count += 1;
-        if count % 50 == 0 {
+        if count.is_multiple_of(50) {
             info!("Processed {count} timers so far");
         }
         if count == total {

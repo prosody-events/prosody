@@ -8,15 +8,17 @@
 //!   `TimerManager<T>` using a `TriggerStore` backend.
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
+use arc_swap::ArcSwapOption;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 use educe::Educe;
-use futures::stream::iter;
-use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
+use futures::stream::{iter, once};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, pin_mut};
 use std::error::Error;
-use std::future::Future;
+use std::future::{Future, ready};
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
 use tracing::{Span, error};
@@ -104,6 +106,17 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     /// Returns `Err(Self::Error)` if any unschedule operation fails.
     fn clear_scheduled(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Invalidate this context to prevent further usage after message
+    /// processing.
+    ///
+    /// Contexts can be cloned during processing, but must be invalidated after
+    /// message completion to prevent race conditions in key-based processing
+    /// and data corruption when partition ownership changes. This ensures all
+    /// associated resources (such as tracing spans) are properly cleaned up
+    /// and the context cannot be used from language bindings where the Rust
+    /// compiler cannot enforce lifecycle constraints.
+    fn invalidate(self);
+
     /// List all scheduled execution times for timers on this key.
     ///
     /// # Returns
@@ -134,9 +147,16 @@ pub trait EventContext: Clone + Send + Sync + 'static {
 /// # Type Parameters
 ///
 /// * `T`: The `TriggerStore` implementation backing the timer manager.
-#[derive(Educe)]
-#[educe(Debug, Clone(bound()))]
+
+#[derive(Debug, Clone)]
 pub struct TimerContext<T> {
+    /// Context state
+    inner: Arc<ArcSwapOption<Inner<T>>>,
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+struct Inner<T> {
     /// Key for which timers are scoped.
     key: Key,
 
@@ -164,11 +184,17 @@ where
         shutdown_rx: watch::Receiver<bool>,
         timers: TimerManager<T>,
     ) -> Self {
-        Self {
-            key,
-            shutdown_rx,
-            timers,
-        }
+        let inner = ArcSwapOption::new(Some(
+            Inner {
+                key,
+                shutdown_rx,
+                timers,
+            }
+            .into(),
+        ))
+        .into();
+
+        Self { inner }
     }
 }
 
@@ -179,28 +205,41 @@ where
     type Error = TimerManagerError<T::Error>;
 
     fn should_shutdown(&self) -> bool {
-        *self.shutdown_rx.borrow()
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return true;
+        };
+
+        *inner.shutdown_rx.borrow()
     }
 
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-        // Clone receiver so awaiting shutdown does not consume original.
-        let mut shutdown_rx = self.shutdown_rx.clone();
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return ready(()).left_future();
+        };
+
+        let mut shutdown_rx = inner.shutdown_rx.clone();
+
         async move {
             if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
                 error!("shutdown hook failed: {error:#}");
             }
         }
+        .right_future()
     }
 
     async fn schedule(&self, time: CompactDateTime) -> Result<(), Self::Error> {
-        let span = Span::current();
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return Err(TimerManagerError::InvalidContext);
+        };
+
+        let trigger = Trigger::new(inner.key.clone(), time, Span::current());
+
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
-            result = self.timers.schedule(Trigger {
-                key: self.key.clone(),
-                time,
-                span,
-            }) => result,
+            result = inner.timers.schedule(trigger) => result,
         }
     }
 
@@ -209,10 +248,14 @@ where
         time: CompactDateTime,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return Err(TimerManagerError::InvalidContext);
+        };
 
         let operation = async {
             // Get scheduled triggers
-            let triggers = self.timers.scheduled_triggers(&self.key).await?;
+            let triggers = inner.timers.scheduled_triggers(&inner.key).await?;
 
             // Unschedule all existing triggers in parallel, linking spans.
             iter(triggers)
@@ -220,8 +263,8 @@ where
                     let span_clone = span.clone();
                     async move {
                         // Link new span with the original trigger's span.
-                        span_clone.follows_from(&trigger.span);
-                        self.timers.unschedule(&trigger.key, trigger.time).await
+                        span_clone.follows_from(trigger.span().as_ref());
+                        inner.timers.unschedule(&trigger.key, trigger.time).await
                     }
                 })
                 .buffer_unordered(DELETE_CONCURRENCY)
@@ -229,12 +272,9 @@ where
                 .await?;
 
             // Schedule exactly one new trigger.
-            self.timers
-                .schedule(Trigger {
-                    key: self.key.clone(),
-                    time,
-                    span,
-                })
+            inner
+                .timers
+                .schedule(Trigger::new(inner.key.clone(), time, span))
                 .await
         };
 
@@ -245,26 +285,52 @@ where
     }
 
     async fn unschedule(&self, time: CompactDateTime) -> Result<(), TimerManagerError<T::Error>> {
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return Err(TimerManagerError::InvalidContext);
+        };
+
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
-            result = self.timers.unschedule(&self.key, time) => result,
+            result = inner.timers.unschedule(&inner.key, time) => result,
         }
     }
 
     async fn clear_scheduled(&self) -> Result<(), TimerManagerError<T::Error>> {
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return Err(TimerManagerError::InvalidContext);
+        };
+
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
-            result = self.timers.unschedule_all(&self.key) => result,
+            result = inner.timers.unschedule_all(&inner.key) => result,
         }
+    }
+
+    fn invalidate(self) {
+        // Clear the inner state to prevent any further operations on this context.
+        // This ensures resource cleanup (spans, channels) and prevents usage after
+        // message processing completes, which could cause race conditions or
+        // corruption if partition ownership has transferred.
+        self.inner.store(None);
     }
 
     fn scheduled(
         &self,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        let scheduled_timers = self.timers.scheduled_times(&self.key);
         let on_shutdown = EventContext::on_shutdown(self);
 
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return once(ready(Err(TimerManagerError::InvalidContext))).left_stream();
+        };
+
+        let inner = Arc::clone(inner);
+
         try_stream! {
+            let scheduled_timers = inner.timers.scheduled_times(&inner.key);
+
             pin_mut!(on_shutdown);
             pin_mut!(scheduled_timers);
 
@@ -275,6 +341,7 @@ where
                 yield time;
             }
         }
+        .right_stream()
     }
 }
 

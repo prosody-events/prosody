@@ -19,14 +19,16 @@
 //! remove timers permanently; aborts deactivate them in-memory while preserving
 //! persistent state for potential reloading.
 
-use crate::Key;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
 use crate::timers::store::TriggerStore;
+use crate::{Key, SpanScope};
+use arc_swap::{ArcSwap, Guard};
 use educe::Educe;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{Span, warn};
@@ -45,8 +47,17 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     /// Scheduled execution time of this timer.
     fn time(&self) -> CompactDateTime;
 
-    /// Tracing span associated with this timer.
-    fn span(&self) -> &Span;
+    /// Returns the tracing span associated with this timer.
+    ///
+    /// The span is wrapped in an atomic guard to enable interior mutability,
+    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
+    /// deterministic span flushing when timer processing completes.
+    ///
+    /// # Returns
+    ///
+    /// A guard containing the current span, which can be used for tracing
+    /// operations or span linking.
+    fn span(&self) -> Guard<Arc<Span>>;
 
     /// Check if this timer is still active in the in-memory scheduler.
     fn is_active(&self) -> impl Future<Output = bool> + Send;
@@ -283,9 +294,18 @@ where
         self.trigger.time
     }
 
-    /// Tracing span associated with this timer.
-    fn span(&self) -> &Span {
-        &self.trigger.span
+    /// Returns the tracing span associated with this timer.
+    ///
+    /// The span is wrapped in an atomic guard to enable interior mutability,
+    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
+    /// deterministic span flushing when timer processing completes.
+    ///
+    /// # Returns
+    ///
+    /// A guard containing the current span, which can be used for tracing
+    /// operations or span linking.
+    fn span(&self) -> Guard<Arc<Span>> {
+        self.trigger.span.load()
     }
 
     /// Check if this timer is still active in the in-memory scheduler.
@@ -310,5 +330,29 @@ where
         if !self.completed {
             warn!("timer was dropped without committing or aborting");
         }
+    }
+}
+
+/// A RAII guard that clears a timer trigger's span when dropped.
+///
+/// This guard ensures that OpenTelemetry spans associated with timer triggers
+/// are deterministically flushed when timer processing completes. Without this,
+/// spans would depend on garbage collection timing for flushing.
+pub struct TriggerSpanScopeGuard(Arc<ArcSwap<Span>>);
+
+impl Drop for TriggerSpanScopeGuard {
+    fn drop(&mut self) {
+        self.0.store(Arc::new(Span::none()));
+    }
+}
+
+impl<T> SpanScope for PendingTimer<T>
+where
+    T: TriggerStore,
+{
+    type Guard = TriggerSpanScopeGuard;
+
+    fn span_scope(&self) -> Self::Guard {
+        TriggerSpanScopeGuard(self.trigger.span.clone())
     }
 }
