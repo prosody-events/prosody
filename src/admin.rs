@@ -247,5 +247,4 @@ pub enum ProsodyAdminClientError {
     /// Configuration validation error.
     #[error("Configuration validation error: {0:#}")]
     Validation(#[from] ValidationErrors),
-
 }
