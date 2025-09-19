@@ -10,7 +10,7 @@ use rdkafka::error::KafkaError;
 use thiserror::Error;
 use validator::{Validate, ValidationErrors};
 
-use crate::util::{from_option_duration_env, from_option_env, from_vec_env};
+use crate::util::{from_env, from_option_duration_env, from_option_env, from_vec_env};
 
 /// Configuration for the Kafka admin client.
 ///
@@ -62,8 +62,10 @@ impl AdminConfiguration {
 pub struct TopicConfiguration {
     /// The name of the topic to create.
     ///
-    /// This field is required and has no environment variable fallback.
-    #[builder(setter(into))]
+    /// Environment variable: `PROSODY_TOPIC_NAME`
+    /// This field is required and must be specified either via builder or
+    /// environment variable.
+    #[builder(default = "from_env(\"PROSODY_TOPIC_NAME\")?", setter(into))]
     #[validate(length(min = 1_u64))]
     pub name: String,
 
