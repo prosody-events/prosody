@@ -7,7 +7,7 @@
 use color_eyre::eyre::{Result, eyre};
 use prosody::{
     Topic,
-    admin::ProsodyAdminClient,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::event_context::{BoxEventContext, EventContext},
     consumer::message::UncommittedMessage,
     consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer, Uncommitted},
@@ -91,8 +91,16 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Setup admin client and create topic
-    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
-    admin_client.create_topic(&topic, 1, 1).await?;
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(1_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
 
     info!("Created test topic: {topic}");
 

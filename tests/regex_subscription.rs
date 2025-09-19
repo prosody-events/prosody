@@ -8,7 +8,7 @@ use crate::common::{FallibleTestHandler, collect_messages_with_timeout};
 use color_eyre::eyre::{Result, ensure};
 use prosody::{
     Topic,
-    admin::ProsodyAdminClient,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::ConsumerConfigurationBuilder,
     consumer::failure::{
         retry::RetryConfigurationBuilder, topic::FailureTopicConfigurationBuilder,
@@ -69,11 +69,19 @@ async fn create_test_topics(topic_prefix: &str) -> Result<(Vec<TestTopic>, Proso
     ];
 
     let bootstrap = vec![BOOTSTRAP_SERVER.to_owned()];
-    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap)?)?;
 
     // Create all test topics with 1 partition and 1 replica
     for topic in &topics {
-        admin_client.create_topic(&topic.name, 1, 1).await?;
+        admin_client
+            .create_topic(
+                &TopicConfiguration::builder()
+                    .name(topic.name.to_string())
+                    .partition_count(1_u16)
+                    .replication_factor(1_u16)
+                    .build()?,
+            )
+            .await?;
     }
 
     Ok((topics, admin_client))

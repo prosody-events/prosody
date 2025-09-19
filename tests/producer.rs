@@ -5,7 +5,7 @@
 
 use color_eyre::eyre::{self, ensure};
 use eyre::Result;
-use prosody::admin::ProsodyAdminClient;
+use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
@@ -262,8 +262,16 @@ async fn test_producer_deduplication() -> Result<()> {
     // Setup test environment with Kafka broker
     let brokers = vec!["localhost:9094".to_owned()];
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
-    let admin = ProsodyAdminClient::new(&brokers)?;
-    admin.create_topic(&topic, 1, 1).await?;
+    let admin = ProsodyAdminClient::new(&AdminConfiguration::new(brokers.clone())?)?;
+    admin
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(1_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
 
     // Configure producer with idempotence cache
     let producer = ProsodyProducer::new(
