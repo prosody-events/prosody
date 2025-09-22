@@ -10,7 +10,7 @@ use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::{
     Topic,
-    admin::ProsodyAdminClient,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
 };
@@ -71,8 +71,16 @@ async fn run_scenario(
     let topic_string = Uuid::new_v4().to_string();
     let topic: Topic = topic_string.as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
-    admin_client.create_topic(&topic, 1, 1).await?;
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(1_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
 
     // Build producer and consumer configurations.
     let producer_config = ProducerConfiguration::builder()

@@ -42,9 +42,14 @@ use prosody::consumer::Uncommitted;
 use prosody::consumer::event_context::EventContext;
 use prosody::timers::UncommittedTimer;
 use prosody::{
-    Topic, admin::ProsodyAdminClient, consumer::ConsumerConfiguration, consumer::EventHandler,
-    consumer::ProsodyConsumer, consumer::message::UncommittedMessage,
-    producer::ProducerConfiguration, producer::ProsodyProducer,
+    Topic,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    consumer::ConsumerConfiguration,
+    consumer::EventHandler,
+    consumer::ProsodyConsumer,
+    consumer::message::UncommittedMessage,
+    producer::ProducerConfiguration,
+    producer::ProsodyProducer,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
@@ -160,11 +165,19 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     common::init_test_logging()?;
 
     // Create a topic with 3 partitions
-    let partitions = 3;
+    let partitions = 3_u16;
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
-    admin_client.create_topic(&topic, partitions, 1).await?;
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(partitions)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
 
     // Configure test parameters
     let global_limit = 3;

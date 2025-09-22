@@ -10,7 +10,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::consumer::event_context::EventContext;
 use prosody::{
     Topic,
-    admin::ProsodyAdminClient,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::message::UncommittedMessage,
     consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
@@ -169,8 +169,16 @@ impl TestEnvironment {
     async fn new(test_name: &str) -> Result<Self> {
         let topic: Topic = format!("{}-{}", test_name, Uuid::new_v4()).as_str().into();
         let bootstrap = vec!["localhost:9094".to_owned()];
-        let admin_client = ProsodyAdminClient::new(&bootstrap)?;
-        admin_client.create_topic(&topic, 1, 1).await?;
+        let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+        admin_client
+            .create_topic(
+                &TopicConfiguration::builder()
+                    .name(topic.to_string())
+                    .partition_count(1_u16)
+                    .replication_factor(1_u16)
+                    .build()?,
+            )
+            .await?;
 
         // Set up channels for test events
         let (timer_tx, timer_rx) = channel(50);

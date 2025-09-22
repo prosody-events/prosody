@@ -19,7 +19,7 @@ use color_eyre::eyre::{Result, eyre};
 use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
 use prosody::Topic;
-use prosody::admin::ProsodyAdminClient;
+use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::failure::{ClassifyError, ErrorCategory, FallibleHandler};
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
@@ -113,10 +113,17 @@ pub struct TestInput {
 /// Returns an error if the topic creation fails.
 pub async fn create_test_topic(partition_count: SmallCount) -> Result<(Topic, ProsodyAdminClient)> {
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
-    let admin_client = ProsodyAdminClient::new(&["localhost:9094"])?;
+    let bootstrap = vec!["localhost:9094".to_owned()];
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap)?)?;
 
     admin_client
-        .create_topic(&topic, partition_count.value() as u16, 1)
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(partition_count.value() as u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
         .await?;
 
     info!("created topic: {topic}");

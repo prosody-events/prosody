@@ -8,7 +8,7 @@ use crate::common::SlowTestHandler;
 use color_eyre::eyre::Result;
 use prosody::{
     Topic,
-    admin::ProsodyAdminClient,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
 };
@@ -39,8 +39,16 @@ async fn test_backpressure() -> Result<()> {
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Setup an admin client to manage the topic creation
-    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
-    admin_client.create_topic(&topic, 4, 1).await?;
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(4_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
 
     // Use a channel with a buffer capacity to accommodate slow processing
     let (messages_tx, mut messages_rx) = channel(64);

@@ -6,7 +6,7 @@ use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::{
     Topic,
-    admin::ProsodyAdminClient,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
 };
@@ -36,8 +36,16 @@ async fn test_allowed_events_filtering() -> Result<()> {
     let bootstrap = vec!["localhost:9094".to_owned()];
 
     // Create a Kafka topic using the admin client for testing
-    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
-    admin_client.create_topic(&topic, 1, 1).await?;
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(1_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
 
     // Configure the consumer to filter allowed events only
     let consumer_config = ConsumerConfiguration::builder()
