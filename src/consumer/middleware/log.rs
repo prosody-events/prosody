@@ -1,20 +1,20 @@
-//! Logging failure handling strategy for message processing.
+//! Logging middleware for message processing.
 //!
 //! This module provides logging capabilities that wrap handlers and log errors
 //! according to their severity while maintaining the original error flow.
 
 use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::{
-    ClassifyError, ErrorCategory, FailureStrategy, FallibleEventHandler, FallibleHandler,
-};
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::{
+    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
+};
 use crate::timers::Trigger;
 use tracing::error;
 
-/// A strategy that logs failures during message processing.
+/// Middleware that logs failures during message processing.
 #[derive(Copy, Clone, Debug)]
-pub struct LogStrategy;
+pub struct LogMiddleware;
 
 /// A handler that logs failures during message processing.
 ///
@@ -23,7 +23,7 @@ pub struct LogStrategy;
 #[derive(Clone, Debug)]
 struct LogHandler<T>(T);
 
-impl FailureStrategy for LogStrategy {
+impl HandlerMiddleware for LogMiddleware {
     /// Creates a new handler that logs failures from the provided handler.
     ///
     /// # Arguments

@@ -499,11 +499,11 @@ flowchart TD
         OTracker --> WTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Watermark Tracker</a>"]
     end
 
-    subgraph FailureHandling["Failure Strategies"]
-        RetryS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/retry.rs'>Retry Strategy</a>"]
-        LogS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/log.rs'>Log Strategy</a>"]
-        ShutdownS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/shutdown.rs'>Shutdown Strategy</a>"]
-        TopicS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/topic.rs'>Failure Topic Strategy</a>"]
+    subgraph MiddlewareHandling["Middleware Components"]
+        RetryS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/retry.rs'>Retry Middleware</a>"]
+        LogS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/log.rs'>Log Middleware</a>"]
+        ShutdownS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/shutdown.rs'>Shutdown Middleware</a>"]
+        TopicS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/topic.rs'>Failure Topic Middleware</a>"]
     end
 
     ConsumerMain -..-> RetryS

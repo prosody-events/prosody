@@ -5,12 +5,12 @@
 //! struct.
 
 use crate::cassandra::config::CassandraConfigurationBuilder;
-use crate::consumer::failure::FallibleHandler;
-use crate::consumer::failure::concurrency::{
+use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::concurrency::{
     ConcurrencyLimitConfigurationBuilder, ConcurrencyLimitConfigurationBuilderError,
 };
-use crate::consumer::failure::retry::RetryConfigurationBuilder;
-use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
+use crate::consumer::middleware::retry::RetryConfigurationBuilder;
+use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ConsumerError, ProsodyConsumer};
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::mode::Mode;

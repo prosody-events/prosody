@@ -1,8 +1,8 @@
 use super::*;
 use crate::consumer::ConsumerConfiguration;
-use crate::consumer::failure::concurrency::ConcurrencyLimitConfigurationBuilder;
-use crate::consumer::failure::retry::RetryConfiguration;
-use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
+use crate::consumer::middleware::concurrency::ConcurrencyLimitConfigurationBuilder;
+use crate::consumer::middleware::retry::RetryConfiguration;
+use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::high_level::CassandraConfigurationBuilder;
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;

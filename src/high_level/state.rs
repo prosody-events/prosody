@@ -5,9 +5,9 @@
 //! It also includes a custom error type for handling state-related errors.
 
 use crate::cassandra::config::CassandraConfigurationBuilder;
-use crate::consumer::failure::concurrency::ConcurrencyLimitConfigurationBuilder;
-use crate::consumer::failure::retry::RetryConfigurationBuilder;
-use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
+use crate::consumer::middleware::concurrency::ConcurrencyLimitConfigurationBuilder;
+use crate::consumer::middleware::retry::RetryConfigurationBuilder;
+use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ProsodyConsumer};
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::mode::Mode;

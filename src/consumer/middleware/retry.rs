@@ -1,6 +1,6 @@
-//! Retry strategy for failure handling in message processing.
+//! Retry middleware for failure handling in message processing.
 //!
-//! This module provides a `RetryStrategy` that wraps handlers and retries
+//! This module provides retry middleware that wraps handlers and retries
 //! failed message processing attempts with an exponential backoff.
 
 use std::cmp::min;
@@ -15,13 +15,15 @@ use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::middleware::{
+    ClassifyError, ErrorCategory, FallibleHandler, HandlerMiddleware,
+};
 use crate::consumer::{EventHandler, HandlerProvider, Keyed, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 
-/// Configuration for the retry strategy.
+/// Configuration for retry middleware.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct RetryConfiguration {
     /// Base exponential backoff delay.
@@ -41,7 +43,7 @@ pub struct RetryConfiguration {
     /// Default: 3
     ///
     /// When composed with other retry strategies, this represents the maximum
-    /// number of retries before falling back to the next retry strategy.
+    /// number of retries before falling back to the next middleware.
     #[builder(
         default = "from_env_with_fallback(\"PROSODY_MAX_RETRIES\", 3)?",
         setter(into)
@@ -72,20 +74,20 @@ impl RetryConfiguration {
     }
 }
 
-/// A strategy that retries failed message processing attempts.
+/// Middleware that retries failed message processing attempts.
 #[derive(Clone, Debug)]
-pub struct RetryStrategy(RetryConfiguration);
+pub struct RetryMiddleware(RetryConfiguration);
 
-impl RetryStrategy {
-    /// Creates a new `RetryStrategy` with the given configuration.
+impl RetryMiddleware {
+    /// Creates a new `RetryMiddleware` with the given configuration.
     ///
     /// # Arguments
     ///
-    /// * `config` - The configuration for the retry strategy.
+    /// * `config` - The configuration for the retry middleware.
     ///
     /// # Returns
     ///
-    /// A `Result` containing the new `RetryStrategy` if the configuration is
+    /// A `Result` containing the new `RetryMiddleware` if the configuration is
     /// valid, or `ValidationErrors` if the configuration is invalid.
     ///
     /// # Errors
@@ -129,7 +131,7 @@ impl<T> RetryHandler<T> {
     }
 }
 
-impl FailureStrategy for RetryStrategy {
+impl HandlerMiddleware for RetryMiddleware {
     fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
     where
         T: FallibleHandler,

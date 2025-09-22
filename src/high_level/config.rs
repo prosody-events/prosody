@@ -10,14 +10,14 @@ use crate::cassandra::{
     CassandraConfiguration,
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
-use crate::consumer::failure::concurrency::{
+use crate::consumer::middleware::concurrency::{
     ConcurrencyLimitConfiguration, ConcurrencyLimitConfigurationBuilder,
     ConcurrencyLimitConfigurationBuilderError,
 };
-use crate::consumer::failure::retry::{
+use crate::consumer::middleware::retry::{
     RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
 };
-use crate::consumer::failure::topic::{
+use crate::consumer::middleware::topic::{
     FailureTopicConfiguration, FailureTopicConfigurationBuilder,
     FailureTopicConfigurationBuilderError,
 };

@@ -1,6 +1,6 @@
-//! Failure topic strategy for error handling in message processing.
+//! Failure topic middleware for error handling in message processing.
 //!
-//! This module provides a [`FailureTopicStrategy`] that sends failed messages
+//! This module provides middleware that sends failed messages
 //! to a designated failure topic for later analysis or reprocessing.
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -11,17 +11,17 @@ use validator::{Validate, ValidationErrors};
 
 use crate::Topic;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::{
-    ClassifyError, ErrorCategory, FailureStrategy, FallibleEventHandler, FallibleHandler,
-};
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::{
+    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
+};
 use crate::consumer::{HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
 use crate::util::from_env;
 use serde_json::json;
 
-/// Configuration for the failure topic strategy.
+/// Configuration for failure topic middleware.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct FailureTopicConfiguration {
     /// Failure topic name.
@@ -47,16 +47,16 @@ impl FailureTopicConfiguration {
     }
 }
 
-/// A strategy that sends failed messages to a designated failure topic.
+/// Middleware that sends failed messages to a designated failure topic.
 #[derive(Clone, Debug)]
-pub struct FailureTopicStrategy {
+pub struct FailureTopicMiddleware {
     config: FailureTopicConfiguration,
     producer: ProsodyProducer,
     group_id: String,
 }
 
-impl FailureTopicStrategy {
-    /// Creates a new [`FailureTopicStrategy`] with the given configuration.
+impl FailureTopicMiddleware {
+    /// Creates a new [`FailureTopicMiddleware`] with the given configuration.
     ///
     /// # Arguments
     ///
@@ -68,8 +68,8 @@ impl FailureTopicStrategy {
     /// # Returns
     ///
     /// A [`Result<Self, ValidationErrors>`] where:
-    /// - `Ok` contains the new [`FailureTopicStrategy`] when the configuration
-    ///   is valid.
+    /// - `Ok` contains the new [`FailureTopicMiddleware`] when the
+    ///   configuration is valid.
     /// - `Err` contains [`ValidationErrors`] if the configuration is invalid.
     ///
     /// # Errors
@@ -100,7 +100,7 @@ struct FailureTopicHandler<T> {
     handler: T,
 }
 
-impl FailureStrategy for FailureTopicStrategy {
+impl HandlerMiddleware for FailureTopicMiddleware {
     fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
     where
         T: FallibleHandler,

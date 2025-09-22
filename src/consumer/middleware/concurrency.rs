@@ -1,6 +1,6 @@
 //! Concurrency limit handling for message processing.
 //!
-//! This module provides a failure strategy that applies global concurrency
+//! This module provides middleware that applies global concurrency
 //! limits by acquiring semaphore permits just before handler execution,
 //! ensuring that the limit is applied as late as possible in the processing
 //! pipeline.
@@ -14,10 +14,10 @@ use validator::{Validate, ValidationErrors};
 
 use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::{
-    ClassifyError, ErrorCategory, FailureStrategy, FallibleEventHandler, FallibleHandler,
-};
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::{
+    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
+};
 use crate::timers::Trigger;
 use crate::util::from_env_with_fallback;
 
@@ -45,18 +45,18 @@ impl ConcurrencyLimitConfiguration {
     }
 }
 
-/// Failure strategy that applies global concurrency limits.
+/// Middleware that applies global concurrency limits.
 ///
-/// This strategy should be composed **first** in the failure strategy chain to
+/// This middleware should be composed **first** in the middleware chain to
 /// ensure the concurrency permit is acquired as late as possible - right before
 /// the user handler executes.
 #[derive(Clone, Debug)]
-pub struct ConcurrencyLimitStrategy {
+pub struct ConcurrencyLimitMiddleware {
     global_limit: Arc<Semaphore>,
 }
 
-impl ConcurrencyLimitStrategy {
-    /// Creates a new concurrency limit strategy.
+impl ConcurrencyLimitMiddleware {
+    /// Creates a new concurrency limit middleware.
     ///
     /// # Arguments
     ///
@@ -64,7 +64,7 @@ impl ConcurrencyLimitStrategy {
     ///
     /// # Returns
     ///
-    /// A new `ConcurrencyLimitStrategy` instance
+    /// A new `ConcurrencyLimitMiddleware` instance
     ///
     /// # Errors
     ///
@@ -107,7 +107,7 @@ where
     }
 }
 
-impl FailureStrategy for ConcurrencyLimitStrategy {
+impl HandlerMiddleware for ConcurrencyLimitMiddleware {
     fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
     where
         T: FallibleHandler,

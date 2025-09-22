@@ -138,16 +138,16 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::concurrency::{
-    ConcurrencyLimitConfiguration, ConcurrencyLimitStrategy,
-};
-use crate::consumer::failure::log::LogStrategy;
-use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
-use crate::consumer::failure::shutdown::ShutdownStrategy;
-use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
-use crate::consumer::failure::{FailureStrategy, FallibleHandler};
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
+use crate::consumer::middleware::concurrency::{
+    ConcurrencyLimitConfiguration, ConcurrencyLimitMiddleware,
+};
+use crate::consumer::middleware::log::LogMiddleware;
+use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
+use crate::consumer::middleware::shutdown::ShutdownMiddleware;
+use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
+use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::heartbeat::Heartbeat;
@@ -164,9 +164,9 @@ use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 
 pub mod event_context;
 mod extractor;
-pub mod failure;
 mod kafka_context;
 pub mod message;
+pub mod middleware;
 mod partition;
 mod poll;
 mod probes;
@@ -733,14 +733,14 @@ impl ProsodyConsumer {
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let concurrency_strategy = ConcurrencyLimitStrategy::new(&concurrency_config)?;
-        let retry_strategy = RetryStrategy::new(retry_config)?;
+        let concurrency_middleware = ConcurrencyLimitMiddleware::new(&concurrency_config)?;
+        let retry_middleware = RetryMiddleware::new(retry_config)?;
 
         // Apply concurrency limiting first, then shutdown and retry
-        let strategy = concurrency_strategy
-            .and_then(ShutdownStrategy)
-            .and_then(retry_strategy);
-        let handler = strategy.with_handler(handler);
+        let middleware = concurrency_middleware
+            .layer(ShutdownMiddleware)
+            .layer(retry_middleware);
+        let handler = middleware.with_handler(handler);
         Self::new(consumer_config, trigger_store_config, handler).await
     }
 
@@ -784,27 +784,27 @@ impl ProsodyConsumer {
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let concurrency_strategy = ConcurrencyLimitStrategy::new(&concurrency_config)?;
+        let concurrency_middleware = ConcurrencyLimitMiddleware::new(&concurrency_config)?;
         let group_id = consumer_config.group_id.clone();
-        let retry_strategy = RetryStrategy::new(retry_config)?;
-        let topic_strategy = FailureTopicStrategy::new(topic_config, group_id, producer)?;
+        let retry_middleware = RetryMiddleware::new(retry_config)?;
+        let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
 
-        // Compose strategies: concurrency → shutdown → retry → failure topic → retry
-        let strategy = concurrency_strategy // limit global concurrency first
-            .and_then(ShutdownStrategy) // stop processing if shutting down partition
-            .and_then(retry_strategy.clone()) // retry processing up to limit
-            .and_then(topic_strategy) // write to failure topic
-            .and_then(retry_strategy); // retry writing to failure topic
+        // Compose middleware: concurrency → shutdown → retry → failure topic → retry
+        let middleware = concurrency_middleware // limit global concurrency first
+            .layer(ShutdownMiddleware) // stop processing if shutting down partition
+            .layer(retry_middleware.clone()) // retry processing up to limit
+            .layer(topic_middleware) // write to failure topic
+            .layer(retry_middleware); // retry writing to failure topic
 
-        let handler = strategy.with_handler(handler);
+        let handler = middleware.with_handler(handler);
         Self::new(consumer_config, trigger_store_config, handler).await
     }
 
-    /// Creates a new `ProsodyConsumer` with a logging strategy for failure
+    /// Creates a new `ProsodyConsumer` with logging middleware for failure
     /// handling.
     ///
-    /// The best-effort strategy is the simplest approach - it tries to process
-    /// messages once, logs any failures, and moves on. This strategy should
+    /// The best-effort approach is the simplest - it tries to process
+    /// messages once, logs any failures, and moves on. This approach should
     /// only be used for development or for services where occasional
     /// message loss is acceptable.
     ///
@@ -831,16 +831,16 @@ impl ProsodyConsumer {
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let concurrency_strategy = ConcurrencyLimitStrategy::new(&concurrency_config)?;
+        let concurrency_middleware = ConcurrencyLimitMiddleware::new(&concurrency_config)?;
 
         // Apply concurrency limiting first, then shutdown and logging
-        let strategy = concurrency_strategy
-            .and_then(ShutdownStrategy)
-            .and_then(LogStrategy);
+        let middleware = concurrency_middleware
+            .layer(ShutdownMiddleware)
+            .layer(LogMiddleware);
         Self::new(
             consumer_config,
             trigger_store_config,
-            strategy.with_handler(handler),
+            middleware.with_handler(handler),
         )
         .await
     }

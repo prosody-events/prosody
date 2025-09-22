@@ -11,7 +11,7 @@ use prosody::{
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     cassandra::config::CassandraConfigurationBuilder,
     consumer::ConsumerConfigurationBuilder,
-    consumer::failure::{
+    consumer::middleware::{
         concurrency::ConcurrencyLimitConfigurationBuilder, retry::RetryConfigurationBuilder,
         topic::FailureTopicConfigurationBuilder,
     },

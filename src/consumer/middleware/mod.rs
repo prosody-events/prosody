@@ -1,8 +1,9 @@
-//! Failure handling strategies for message processing.
+//! Middleware for message processing.
 //!
-//! This module provides traits and structures for implementing
-//! and composing failure handling strategies in asynchronous
-//! message processing systems.
+//! This module provides a composable framework for handling cross-cutting
+//! concerns during message processing including failure recovery, concurrency
+//! limiting, lifecycle management, and observability. Middleware can be
+//! combined using the `layer` method to create processing pipelines.
 
 use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
@@ -50,13 +51,13 @@ pub trait ClassifyError {
     }
 }
 
-/// Defines a failure handling strategy for message processing.
-pub trait FailureStrategy {
-    /// Wraps a handler with this failure strategy.
+/// Defines middleware for message processing.
+pub trait HandlerMiddleware {
+    /// Wraps a handler with this middleware.
     ///
     /// # Arguments
     ///
-    /// * `handler` - The handler to wrap with this strategy.
+    /// * `handler` - The handler to wrap with this middleware.
     ///
     /// # Returns
     ///
@@ -66,20 +67,44 @@ pub trait FailureStrategy {
     where
         T: FallibleHandler;
 
-    /// Composes this strategy with another strategy.
+    /// Adds a middleware layer on top of this middleware (inner-to-outer
+    /// composition).
+    ///
+    /// The new middleware becomes the outermost layer in the processing stack,
+    /// executing before (and wrapping around) the existing middleware stack.
+    ///
+    /// # Execution Order
+    ///
+    /// When composing `inner.layer(outer)`, the execution flows as:
+    /// 1. `outer` middleware pre-processing
+    /// 2. `inner` middleware pre-processing
+    /// 3. User handler execution
+    /// 4. `inner` middleware post-processing
+    /// 5. `outer` middleware post-processing
     ///
     /// # Arguments
     ///
-    /// * `next_handler` - The next strategy to apply if this one fails.
+    /// * `outer_middleware` - The middleware to add as the outermost layer.
     ///
     /// # Returns
     ///
-    /// A `ComposedStrategy` combining this strategy with the next one.
-    fn and_then<T>(self, next_handler: T) -> ComposedStrategy<Self, T>
+    /// A `ComposedMiddleware` with the new middleware as the outer layer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// // Builds from inner to outer: concurrency -> shutdown -> retry
+    /// let middleware = concurrency_middleware
+    ///     .layer(shutdown_middleware) // shutdown wraps concurrency
+    ///     .layer(retry_middleware); // retry wraps shutdown+concurrency
+    ///
+    /// // Execution: retry -> shutdown -> concurrency -> handler -> concurrency -> shutdown -> retry
+    /// ```
+    fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<Self, T>
     where
         Self: Sized,
     {
-        ComposedStrategy(self, next_handler)
+        ComposedMiddleware(self, outer_middleware)
     }
 }
 
@@ -130,7 +155,7 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
     /// # Error Handling
     ///
     /// Errors returned by this method are classified using [`ClassifyError`] to
-    /// determine the appropriate failure handling strategy:
+    /// determine the appropriate failure handling approach:
     /// - **Transient errors**: May be retried with backoff
     /// - **Permanent errors**: Logged and timer may be discarded
     /// - **Terminal errors**: Cause processing to stop entirely
@@ -151,21 +176,22 @@ pub trait FallibleHandler: Clone + Send + Sync + 'static {
         C: EventContext;
 }
 
-/// A composition of two failure strategies.
+/// A composition of two middleware components.
 #[derive(Clone, Debug)]
-pub struct ComposedStrategy<S1, S2>(S1, S2);
+pub struct ComposedMiddleware<M1, M2>(M1, M2);
 
-impl<S1, S2> FailureStrategy for ComposedStrategy<S1, S2>
+impl<M1, M2> HandlerMiddleware for ComposedMiddleware<M1, M2>
 where
-    S1: FailureStrategy,
-    S2: FailureStrategy,
+    M1: HandlerMiddleware,
+    M2: HandlerMiddleware,
 {
     fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
     where
         T: FallibleHandler,
     {
-        // Apply the second strategy to the result of applying the first strategy
-        self.1.with_handler(self.0.with_handler(handler))
+        // Apply the first middleware to the result of applying the second middleware
+        // This matches Tower's pattern where M1 (outer) wraps M2 (inner)
+        self.0.with_handler(self.1.with_handler(handler))
     }
 }
 

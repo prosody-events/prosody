@@ -27,10 +27,10 @@
 //!
 //! ```no_run
 //! use prosody::consumer::ConsumerConfiguration;
-//! use prosody::consumer::failure::concurrency::ConcurrencyLimitConfigurationBuilder;
-//! use prosody::consumer::failure::retry::RetryConfiguration;
-//! use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
-//! use prosody::consumer::failure::{FallibleHandler, ClassifyError};
+//! use prosody::consumer::middleware::concurrency::ConcurrencyLimitConfigurationBuilder;
+//! use prosody::consumer::middleware::retry::RetryConfiguration;
+//! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
+//! use prosody::consumer::middleware::{FallibleHandler, ClassifyError};
 //! use prosody::consumer::message::ConsumerMessage;
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::timers::{Trigger, store::TriggerStore};

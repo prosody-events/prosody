@@ -1,4 +1,4 @@
-//! Implements a shutdown strategy for graceful partition revocation handling.
+//! Implements shutdown middleware for graceful partition revocation handling.
 //!
 //! This module provides a mechanism to stop processing messages when a Kafka
 //! partition is being revoked, ensuring proper handling of in-flight messages
@@ -6,19 +6,19 @@
 
 use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::{
-    ClassifyError, ErrorCategory, FailureStrategy, FallibleEventHandler, FallibleHandler,
-};
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::{
+    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
+};
 use crate::timers::Trigger;
 use thiserror::Error;
 
-/// A strategy that checks if the partition is shutting down before running the
-/// handler, preventing other strategies from delaying the shutdown.
+/// Middleware that checks if the partition is shutting down before running the
+/// handler, preventing other middleware from delaying the shutdown.
 #[derive(Clone, Copy, Debug)]
-pub struct ShutdownStrategy;
+pub struct ShutdownMiddleware;
 
-impl FailureStrategy for ShutdownStrategy {
+impl HandlerMiddleware for ShutdownMiddleware {
     fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
     where
         T: FallibleHandler,
