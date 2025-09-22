@@ -6,7 +6,7 @@ use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure};
 use prosody::{
     Topic,
-    admin::ProsodyAdminClient,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
 };
@@ -40,10 +40,18 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
     // Create a unique Kafka topic for isolated testing
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
 
     // Create the Kafka topic with a single partition and replica
-    admin_client.create_topic(&topic, 1, 1).await?;
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(1_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
 
     // Configure the producer and consumer for communication with the Kafka broker
     let producer_config = ProducerConfiguration::builder()

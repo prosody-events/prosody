@@ -310,11 +310,7 @@ mod tests {
         let time = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(5)))
             .map_err(|e| format!("Failed to calculate future time: {e:?}"))?;
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         // Schedule the trigger
         scheduler
@@ -357,11 +353,7 @@ mod tests {
         let time = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(2)))
             .map_err(|e| format!("Failed to calculate future time: {e:?}"))?;
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         // Schedule the trigger
         scheduler
@@ -403,21 +395,13 @@ mod tests {
         let time1 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(1)))
             .map_err(|e| format!("Failed to calculate future time for key1: {e:?}"))?;
-        let trigger1 = Trigger {
-            key: key1.clone(),
-            time: time1,
-            span: Span::current(),
-        };
+        let trigger1 = Trigger::new(key1.clone(), time1, Span::current());
 
         let key2 = Key::from("key2");
         let time2 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(3)))
             .map_err(|e| format!("Failed to calculate future time for key2: {e:?}"))?;
-        let trigger2 = Trigger {
-            key: key2.clone(),
-            time: time2,
-            span: Span::current(),
-        };
+        let trigger2 = Trigger::new(key2.clone(), time2, Span::current());
 
         // Schedule both triggers
         scheduler
@@ -484,11 +468,7 @@ mod tests {
             .and_then(|t| t.add_duration(CompactDuration::new(2)))
             .map_err(|e| format!("Failed to calculate future time: {e:?}"))?;
 
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         // Schedule the trigger
         scheduler
@@ -529,29 +509,17 @@ mod tests {
         let time1 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(1)))
             .map_err(|e| format!("Failed to calculate future time for time1: {e:?}"))?;
-        let trigger1 = Trigger {
-            key: key.clone(),
-            time: time1,
-            span: Span::current(),
-        };
+        let trigger1 = Trigger::new(key.clone(), time1, Span::current());
 
         let time2 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(3)))
             .map_err(|e| format!("Failed to calculate future time for time2: {e:?}"))?;
-        let trigger2 = Trigger {
-            key: key.clone(),
-            time: time2,
-            span: Span::current(),
-        };
+        let trigger2 = Trigger::new(key.clone(), time2, Span::current());
 
         let time3 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(5)))
             .map_err(|e| format!("Failed to calculate future time for time3: {e:?}"))?;
-        let trigger3 = Trigger {
-            key: key.clone(),
-            time: time3,
-            span: Span::current(),
-        };
+        let trigger3 = Trigger::new(key.clone(), time3, Span::current());
 
         // Schedule all triggers
         scheduler
@@ -657,11 +625,11 @@ mod tests {
         // Schedule exactly BUFFER_SIZE + 5 triggers to test backpressure clearly
         let num_triggers = 69_usize; // 64 (buffer) + 5 (to test backpressure)
         for i in 0_usize..num_triggers {
-            let trigger = Trigger {
-                key: Key::from(&format!("trigger-{i}")),
-                time: fire_time,
-                span: Span::current(),
-            };
+            let trigger = Trigger::new(
+                Key::from(&format!("trigger-{i}")),
+                fire_time,
+                Span::current(),
+            );
 
             scheduler
                 .schedule(trigger)
@@ -684,11 +652,8 @@ mod tests {
             .and_then(|t| t.add_duration(CompactDuration::new(10)))
             .map_err(|e| format!("Failed to calculate later time: {e:?}"))?;
 
-        let command_test_trigger = Trigger {
-            key: Key::from("command-test"),
-            time: later_time,
-            span: Span::current(),
-        };
+        let command_test_trigger =
+            Trigger::new(Key::from("command-test"), later_time, Span::current());
 
         // This should succeed even though trigger output is backed up
         scheduler

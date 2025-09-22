@@ -46,8 +46,8 @@ where
 
         // Use a cycle of 4 operations to test different patterns
         match i % 4 {
-            // Insert new
-            0 => {
+            // Insert new or re-insert (idempotent operation)
+            0 | 2 => {
                 add_trigger(store, &input.segment, trigger).await?;
                 key_times.insert(trigger.time);
             }
@@ -60,11 +60,6 @@ where
                     add_trigger(store, &input.segment, trigger).await?;
                     key_times.insert(trigger.time);
                 }
-            }
-            // Re-insert (idempotent operation)
-            2 => {
-                add_trigger(store, &input.segment, trigger).await?;
-                key_times.insert(trigger.time);
             }
             // Delete regardless of existence
             _ => {

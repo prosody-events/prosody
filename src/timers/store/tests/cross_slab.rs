@@ -1,3 +1,8 @@
+#![allow(
+    clippy::mutable_key_type,
+    reason = "Trigger's ArcSwap field is excluded from hash/equality via Educe"
+)]
+
 use crate::Key;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -54,11 +59,7 @@ where
 
     // Add triggers at all test times
     for &time in &test_times {
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         add_trigger(store, segment, &trigger).await?;
     }

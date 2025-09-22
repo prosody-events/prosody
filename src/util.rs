@@ -212,6 +212,37 @@ pub fn from_duration_env_with_fallback(
     parse_duration_with_error(env_var, &value_str)
 }
 
+/// Retrieves and parses an optional duration environment variable.
+///
+/// If the environment variable is not set, this function returns `Ok(None)`.
+/// If it is set to "none" (case-insensitive), it also returns `Ok(None)`.
+/// Otherwise, it attempts to parse the value as a duration using humantime.
+///
+/// # Arguments
+///
+/// * `env_var` - The name of the environment variable to retrieve.
+///
+/// # Returns
+///
+/// A `Result` containing an `Option<Duration>` or an error message.
+///
+/// # Errors
+///
+/// Returns an error if the environment variable is set but cannot be parsed as
+/// a valid duration (unless the value is "none", which returns `Ok(None)`).
+pub fn from_option_duration_env(env_var: &str) -> Result<Option<Duration>, String> {
+    let Ok(value_str) = env::var(env_var) else {
+        return Ok(None);
+    };
+
+    // Return None if the value is "none" (case-insensitive)
+    if value_str.trim().eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+
+    parse_duration_with_error(env_var, &value_str).map(Some)
+}
+
 /// Retrieves and parses an optional duration environment variable with a
 /// fallback value.
 ///

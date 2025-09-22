@@ -7,7 +7,7 @@
 use color_eyre::eyre::Result;
 use prosody::{
     Topic,
-    admin::ProsodyAdminClient,
+    admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::event_context::EventContext,
     consumer::message::UncommittedMessage,
     consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
@@ -103,8 +103,16 @@ async fn test_timer_backpressure() -> Result<()> {
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Setup an admin client to manage the topic creation
-    let admin_client = ProsodyAdminClient::new(&bootstrap)?;
-    admin_client.create_topic(&topic, 4, 1).await?;
+    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    admin_client
+        .create_topic(
+            &TopicConfiguration::builder()
+                .name(topic.to_string())
+                .partition_count(4_u16)
+                .replication_factor(1_u16)
+                .build()?,
+        )
+        .await?;
 
     // Use a channel with a buffer capacity to accommodate slow timer processing
     let (timers_tx, mut timers_rx) = channel(64);
@@ -158,7 +166,7 @@ async fn test_timer_backpressure() -> Result<()> {
     // Process timers as they are received by the slow consumer
     while timers_rx.recv().await.is_some() {
         count += 1;
-        if count % 50 == 0 {
+        if count.is_multiple_of(50) {
             info!("Processed {count} timers so far");
         }
         if count == total {

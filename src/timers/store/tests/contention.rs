@@ -37,11 +37,7 @@ where
         let time = CompactDateTime::from(1_000_i32 + i);
         all_times.push(time);
 
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         add_trigger(store, segment, &trigger).await?;
     }
@@ -82,11 +78,7 @@ where
 
     // Test the edge case of adding a trigger that was just deleted
     if let Some(&time) = all_times.first() {
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         add_trigger(store, segment, &trigger).await?;
 

@@ -49,7 +49,9 @@
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
+use arc_swap::{ArcSwap, Guard};
 use educe::Educe;
+use std::sync::Arc;
 use tracing::Span;
 
 /// Scheduled timer event containing execution metadata.
@@ -69,7 +71,48 @@ pub struct Trigger {
 
     /// Tracing span for distributed observability context.
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
-    pub span: Span,
+    span: Arc<ArcSwap<Span>>,
+}
+
+impl Trigger {
+    /// Creates a new timer trigger for scheduled execution.
+    ///
+    /// The span is wrapped in an [`ArcSwap`] for thread-safe access during
+    /// concurrent timer operations while preserving distributed tracing
+    /// context.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` – Entity key identifying what this timer belongs to
+    /// * `time` – When this timer should execute
+    /// * `span` – Tracing span for distributed observability context
+    ///
+    /// # Returns
+    ///
+    /// A new [`Trigger`] instance ready for scheduling.
+    #[must_use]
+    pub fn new(key: Key, time: CompactDateTime, span: Span) -> Self {
+        Self {
+            key,
+            time,
+            span: ArcSwap::from_pointee(span).into(),
+        }
+    }
+
+    /// Returns the tracing span associated with this trigger.
+    ///
+    /// The span is wrapped in an atomic guard to enable interior mutability,
+    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
+    /// deterministic span flushing when timer processing completes.
+    ///
+    /// # Returns
+    ///
+    /// A guard containing the current span, which can be used for tracing
+    /// operations or span linking.
+    #[must_use]
+    pub fn span(&self) -> Guard<Arc<Span>> {
+        self.span.load()
+    }
 }
 
 mod active;

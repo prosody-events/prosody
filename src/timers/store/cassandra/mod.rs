@@ -15,7 +15,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use tokio::task::coop::cooperative;
-use tracing::{info_span, instrument};
+use tracing::{debug_span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod queries;
@@ -73,7 +73,7 @@ impl CassandraTriggerStore {
 impl TriggerStore for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(
@@ -85,7 +85,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
         let row = self
             .session()
@@ -105,7 +105,7 @@ impl TriggerStore for CassandraTriggerStore {
         }))
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn delete_segment(&self, segment_id: &SegmentId) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(&self.queries().delete_segment, (segment_id,))
@@ -114,7 +114,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn get_slabs(
         &self,
         segment_id: &SegmentId,
@@ -137,7 +137,7 @@ impl TriggerStore for CassandraTriggerStore {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     // Note: This method handles a complex edge case due to the mismatch between
     // SlabId (u32) and the database storage (i32).
     //
@@ -240,7 +240,7 @@ impl TriggerStore for CassandraTriggerStore {
         }
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
@@ -260,7 +260,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn delete_slab(
         &self,
         segment_id: &SegmentId,
@@ -276,7 +276,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn get_slab_triggers(
         &self,
         slab: &Slab,
@@ -297,20 +297,16 @@ impl TriggerStore for CassandraTriggerStore {
                 let span = info_span!("fetch_slab_trigger");
                 span.set_parent(context);
 
-                yield Trigger {
-                    key: key.into(),
-                    time,
-                    span,
-                }
+                yield Trigger::new(key.into(), time, span);
             }
         }
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
         let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
-        self.propagator()
-            .inject_context(&trigger.span.context(), &mut span_map);
+        let context = trigger.span.load().context();
+        self.propagator().inject_context(&context, &mut span_map);
 
         let segment_id = slab.segment_id();
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
@@ -339,7 +335,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn delete_slab_trigger(
         &self,
         slab: &Slab,
@@ -361,7 +357,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn clear_slab_triggers(&self, slab: &Slab) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(
@@ -376,7 +372,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn get_key_times(
         &self,
         segment_id: &SegmentId,
@@ -396,7 +392,7 @@ impl TriggerStore for CassandraTriggerStore {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     fn get_key_triggers(
         &self,
         segment_id: &SegmentId,
@@ -412,27 +408,23 @@ impl TriggerStore for CassandraTriggerStore {
             pin_mut!(stream);
             while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
-                let span = info_span!("fetch_key_trigger");
+                let span = debug_span!("fetch_key_trigger");
                 span.set_parent(context);
 
-                yield Trigger {
-                    key: key.into(),
-                    time,
-                    span,
-                }
+                yield Trigger::new(key.into(), time, span);
             }
         }
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn insert_key_trigger(
         &self,
         segment_id: &SegmentId,
         trigger: Trigger,
     ) -> Result<(), Self::Error> {
         let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
-        self.propagator()
-            .inject_context(&trigger.span.context(), &mut span_map);
+        let context = trigger.span.load().context();
+        self.propagator().inject_context(&context, &mut span_map);
 
         let key = trigger.key.as_str();
         let time = trigger.time;
@@ -459,7 +451,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
@@ -476,7 +468,7 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn clear_key_triggers(
         &self,
         segment_id: &SegmentId,

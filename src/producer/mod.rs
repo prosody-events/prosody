@@ -343,8 +343,9 @@ impl ProsodyProducer {
             )
         {
             let span = info_span!("message.filtered", reason = "duplicate-event-id", event_id);
-            let _enter = span.enter();
-            info!("message with id {event_id} already produced; skipping");
+            span.in_scope(|| {
+                info!("message with id {event_id} already produced; skipping");
+            });
             return Ok(());
         }
 

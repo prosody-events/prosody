@@ -531,5 +531,5 @@ flowchart TD
     EHandler --> ShutdownS
     EHandler --> TopicS
 %% Styling
-class ProducerComponents, ConsumerComponents, PartitionComponents, FailureHandling, TracingSystem subgraphStyle
+class ProducerComponents,ConsumerComponents,PartitionComponents,FailureHandling,TracingSystem subgraphStyle
 ```

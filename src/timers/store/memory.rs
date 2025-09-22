@@ -318,11 +318,7 @@ impl TriggerStore for InMemoryTriggerStore {
             return Ok(());
         };
 
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::current(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::current());
 
         entry.get_mut().remove(&trigger);
         if entry.is_empty() {
@@ -443,11 +439,7 @@ impl TriggerStore for InMemoryTriggerStore {
             return Ok(());
         };
 
-        let trigger = Trigger {
-            key: key.clone(),
-            time,
-            span: Span::none(),
-        };
+        let trigger = Trigger::new(key.clone(), time, Span::none());
 
         entry.get_mut().remove(&trigger);
         if entry.is_empty() {
