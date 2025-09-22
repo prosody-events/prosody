@@ -27,6 +27,7 @@
 //!
 //! ```no_run
 //! use prosody::consumer::ConsumerConfiguration;
+//! use prosody::consumer::failure::concurrency::ConcurrencyLimitConfigurationBuilder;
 //! use prosody::consumer::failure::retry::RetryConfiguration;
 //! use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::failure::{FallibleHandler, ClassifyError};
@@ -89,6 +90,7 @@
 //!         .subscribed_topics(["my-topic".to_owned()]);
 //!
 //!     let retry_config = RetryConfiguration::builder();
+//!     let concurrency_config = ConcurrencyLimitConfigurationBuilder::default();
 //!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
 //!     let client = HighLevelClient::new(
@@ -97,6 +99,7 @@
 //!         &consumer_config,
 //!         &retry_config,
 //!         &FailureTopicConfigurationBuilder::default(),
+//!         &concurrency_config,
 //!         &cassandra_config,
 //!     )?;
 //!

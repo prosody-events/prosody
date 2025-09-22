@@ -138,6 +138,9 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::event_context::EventContext;
+use crate::consumer::failure::concurrency::{
+    ConcurrencyLimitConfiguration, ConcurrencyLimitStrategy,
+};
 use crate::consumer::failure::log::LogStrategy;
 use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
 use crate::consumer::failure::shutdown::ShutdownStrategy;
@@ -398,21 +401,6 @@ pub struct ConsumerConfiguration {
     )]
     #[validate(length(min = 1_u64))]
     pub allowed_events: Option<Vec<String>>,
-
-    /// Maximum global concurrency limit.
-    ///
-    /// Environment variable: `PROSODY_MAX_CONCURRENCY`
-    /// Default: 32
-    ///
-    /// Controls the maximum number of messages that can be processed
-    /// concurrently across all partitions. This helps prevent resource
-    /// exhaustion.
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MAX_CONCURRENCY\", 32)?",
-        setter(into)
-    )]
-    #[validate(range(min = 1_usize))]
-    pub max_concurrency: usize,
 
     /// Maximum number of uncommitted messages.
     ///
@@ -739,13 +727,19 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
+        concurrency_config: ConcurrencyLimitConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
+        let concurrency_strategy = ConcurrencyLimitStrategy::new(&concurrency_config)?;
         let retry_strategy = RetryStrategy::new(retry_config)?;
-        let strategy = ShutdownStrategy.and_then(retry_strategy);
+
+        // Apply concurrency limiting first, then shutdown and retry
+        let strategy = concurrency_strategy
+            .and_then(ShutdownStrategy)
+            .and_then(retry_strategy);
         let handler = strategy.with_handler(handler);
         Self::new(consumer_config, trigger_store_config, handler).await
     }
@@ -783,18 +777,21 @@ impl ProsodyConsumer {
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
         topic_config: FailureTopicConfiguration,
+        concurrency_config: ConcurrencyLimitConfiguration,
         producer: ProsodyProducer,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
+        let concurrency_strategy = ConcurrencyLimitStrategy::new(&concurrency_config)?;
         let group_id = consumer_config.group_id.clone();
         let retry_strategy = RetryStrategy::new(retry_config)?;
         let topic_strategy = FailureTopicStrategy::new(topic_config, group_id, producer)?;
 
-        // Compose strategies: shutdown → retry → failure topic → retry
-        let strategy = ShutdownStrategy // stop processing if shutting down partition
+        // Compose strategies: concurrency → shutdown → retry → failure topic → retry
+        let strategy = concurrency_strategy // limit global concurrency first
+            .and_then(ShutdownStrategy) // stop processing if shutting down partition
             .and_then(retry_strategy.clone()) // retry processing up to limit
             .and_then(topic_strategy) // write to failure topic
             .and_then(retry_strategy); // retry writing to failure topic
@@ -828,12 +825,18 @@ impl ProsodyConsumer {
     pub async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
+        concurrency_config: ConcurrencyLimitConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let strategy = ShutdownStrategy.and_then(LogStrategy);
+        let concurrency_strategy = ConcurrencyLimitStrategy::new(&concurrency_config)?;
+
+        // Apply concurrency limiting first, then shutdown and logging
+        let strategy = concurrency_strategy
+            .and_then(ShutdownStrategy)
+            .and_then(LogStrategy);
         Self::new(
             consumer_config,
             trigger_store_config,

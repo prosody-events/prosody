@@ -6,12 +6,14 @@
 
 use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::ConsumerMessage;
-use crate::timers::Trigger;
+use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::{EventHandler, Uncommitted};
+use crate::timers::{Trigger, UncommittedTimer};
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::future::Future;
 
+pub mod concurrency;
 pub mod log;
 pub mod retry;
 pub mod shutdown;
@@ -171,4 +173,89 @@ impl ClassifyError for Infallible {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Terminal
     }
+}
+
+/// Provides default `EventHandler` implementation for types that implement
+/// `FallibleHandler`.
+///
+/// This trait implements the standard failure handling pattern:
+/// 1. Extract inner message/timer and uncommitted offset/timer
+/// 2. Call the `FallibleHandler` method
+/// 3. Commit on success or handle errors based on classification
+///
+/// Types can override the default implementations to add custom behavior like
+/// logging or custom error handling.
+pub trait FallibleEventHandler: FallibleHandler {
+    /// Called when message processing fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `error` - The error that occurred during processing
+    fn on_message_error(&self, _error: &Self::Error) {}
+
+    /// Called when timer processing fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `error` - The error that occurred during processing
+    fn on_timer_error(&self, _error: &Self::Error) {}
+}
+
+/// Default `EventHandler` implementation for any type that implements
+/// `FallibleEventHandler`.
+impl<T> EventHandler for T
+where
+    T: FallibleEventHandler,
+    T::Error: ClassifyError,
+{
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    where
+        C: EventContext,
+    {
+        let (inner_message, uncommitted_offset) = message.into_inner();
+
+        // Attempt to process the message
+        let Err(error) = FallibleHandler::on_message(self, context, inner_message).await else {
+            uncommitted_offset.commit();
+            return;
+        };
+
+        // Call error handler
+        self.on_message_error(&error);
+
+        // Handle offset management based on error category
+        match error.classify_error() {
+            ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted_offset.commit(),
+            ErrorCategory::Terminal => uncommitted_offset.abort(),
+        }
+    }
+
+    async fn on_timer<C, U>(&self, context: C, timer: U)
+    where
+        C: EventContext,
+        U: UncommittedTimer,
+    {
+        let (trigger, uncommitted_timer) = timer.into_inner();
+
+        // Attempt to process the timer
+        let Err(error) = FallibleHandler::on_timer(self, context, trigger).await else {
+            uncommitted_timer.commit().await;
+            return;
+        };
+
+        // Call error handler
+        self.on_timer_error(&error);
+
+        // Handle timer management based on error category
+        match error.classify_error() {
+            ErrorCategory::Transient | ErrorCategory::Permanent => {
+                uncommitted_timer.commit().await;
+            }
+            ErrorCategory::Terminal => {
+                uncommitted_timer.abort().await;
+            }
+        }
+    }
+
+    async fn shutdown(self) {}
 }

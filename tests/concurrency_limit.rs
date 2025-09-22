@@ -184,12 +184,12 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     let total_messages = 30;
     let num_keys = 30;
 
-    // Configure the consumer with the global concurrency limit
+    // Configure the consumer (concurrency limit will be set via environment
+    // variable)
     let consumer_config = ConsumerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
         .group_id("test-global-concurrency-consumer-multi")
         .subscribed_topics(&[topic.to_string()])
-        .max_concurrency(global_limit)
         .build()?;
 
     // Create a watch channel for controlling message handlers

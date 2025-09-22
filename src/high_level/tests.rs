@@ -1,5 +1,6 @@
 use super::*;
 use crate::consumer::ConsumerConfiguration;
+use crate::consumer::failure::concurrency::ConcurrencyLimitConfigurationBuilder;
 use crate::consumer::failure::retry::RetryConfiguration;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use crate::high_level::CassandraConfigurationBuilder;
@@ -192,6 +193,7 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Hig
 
     let retry_builder = RetryConfiguration::builder();
     let failure_topic_builder = FailureTopicConfigurationBuilder::default();
+    let concurrency_builder = ConcurrencyLimitConfigurationBuilder::default();
     let cassandra_builder = CassandraConfigurationBuilder::default();
 
     Ok(HighLevelClient::new(
@@ -200,6 +202,7 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Hig
         &consumer_builder,
         &retry_builder,
         &failure_topic_builder,
+        &concurrency_builder,
         &cassandra_builder,
     )?)
 }

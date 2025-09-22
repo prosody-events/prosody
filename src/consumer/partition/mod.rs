@@ -40,7 +40,7 @@ use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
@@ -95,9 +95,6 @@ pub struct PartitionConfiguration<T> {
 
     /// Shared counter tracking watermark updates
     pub watermark_version: Arc<CachePadded<AtomicUsize>>,
-
-    /// Global concurrency limit
-    pub global_limit: Arc<Semaphore>,
 
     /// Timer store
     pub trigger_store: T,
@@ -393,22 +390,8 @@ async fn handle_messages<T, S>(
 
     // Define how to process each message
     let process = |event: UncommittedEvent<S>| async {
-        // Acquire a semaphore to bound global concurrency
-        debug!(?event, "acquiring permit");
-        let permit = match config.global_limit.acquire().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                error!(
-                    ?event,
-                    "failed to acquire permit: {error:#}; aborting message"
-                );
-                event.abort().await;
-                return;
-            }
-        };
-
         // Process message with handler
-        debug!(?event, "permit acquired; calling handler");
+        debug!(?event, "calling handler");
         let context = TimerContext::new(
             event.key().clone(),
             shutdown_rx.clone(),
@@ -431,7 +414,6 @@ async fn handle_messages<T, S>(
 
         // Prevent the context from being used outside of processing
         cloned_context.invalidate();
-        drop(permit);
     };
 
     // Create key manager to handle concurrent processing while maintaining key

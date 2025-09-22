@@ -6,6 +6,9 @@
 
 use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::failure::FallibleHandler;
+use crate::consumer::failure::concurrency::{
+    ConcurrencyLimitConfigurationBuilder, ConcurrencyLimitConfigurationBuilderError,
+};
 use crate::consumer::failure::retry::RetryConfigurationBuilder;
 use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ConsumerError, ProsodyConsumer};
@@ -85,6 +88,8 @@ impl<T> HighLevelClient<T> {
     /// * `consumer_builder` - Builder for the consumer configuration.
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
+    /// * `concurrency_builder` - Builder for the concurrency limit
+    ///   configuration.
     /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Errors
@@ -99,6 +104,7 @@ impl<T> HighLevelClient<T> {
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
+        concurrency_builder: &ConcurrencyLimitConfigurationBuilder,
         cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Result<Self, HighLevelClientError> {
         // Set the producer source system to the consumer group if unspecified
@@ -122,6 +128,7 @@ impl<T> HighLevelClient<T> {
             consumer_builder,
             retry_builder,
             failure_topic_builder,
+            concurrency_builder,
             cassandra_builder,
         );
 
@@ -189,11 +196,14 @@ impl<T> HighLevelClient<T> {
             }
         };
 
+        // Use concurrency configuration from mode config
+
         // Initialize the consumer based on the mode configuration
         let consumer = match &config {
             ModeConfiguration::Pipeline {
                 consumer,
                 retry,
+                concurrency,
                 trigger_store,
                 ..
             } => {
@@ -201,6 +211,7 @@ impl<T> HighLevelClient<T> {
                     consumer,
                     trigger_store,
                     retry.clone(),
+                    concurrency.clone(),
                     handler.clone(),
                 )
                 .await?
@@ -209,6 +220,7 @@ impl<T> HighLevelClient<T> {
                 consumer,
                 retry,
                 failure_topic,
+                concurrency,
                 trigger_store,
                 ..
             } => {
@@ -217,6 +229,7 @@ impl<T> HighLevelClient<T> {
                     trigger_store,
                     retry.clone(),
                     failure_topic.clone(),
+                    concurrency.clone(),
                     self.producer.clone(),
                     handler.clone(),
                 )
@@ -224,11 +237,17 @@ impl<T> HighLevelClient<T> {
             }
             ModeConfiguration::BestEffort {
                 consumer,
+                concurrency,
                 trigger_store,
                 ..
             } => {
-                ProsodyConsumer::best_effort_consumer(consumer, trigger_store, handler.clone())
-                    .await?
+                ProsodyConsumer::best_effort_consumer(
+                    consumer,
+                    trigger_store,
+                    concurrency.clone(),
+                    handler.clone(),
+                )
+                .await?
             }
         };
 
@@ -376,6 +395,10 @@ pub enum HighLevelClientError {
     /// Error when initializing the consumer fails.
     #[error("failed to initialize consumer: {0:#}")]
     Consumer(#[from] ConsumerError),
+
+    /// Error when the concurrency limit configuration is invalid.
+    #[error("invalid concurrency limit configuration: {0:#}")]
+    ConcurrencyLimitConfiguration(#[from] ConcurrencyLimitConfigurationBuilderError),
 
     /// Error when attempting to use an unconfigured consumer.
     #[error("unconfigured consumer; client does not have a valid consumer configuration")]

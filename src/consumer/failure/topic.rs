@@ -11,11 +11,13 @@ use validator::{Validate, ValidationErrors};
 
 use crate::Topic;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider, Keyed, Uncommitted};
+use crate::consumer::failure::{
+    ClassifyError, ErrorCategory, FailureStrategy, FallibleEventHandler, FallibleHandler,
+};
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::{HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
-use crate::timers::{Trigger, UncommittedTimer};
+use crate::timers::Trigger;
 use crate::util::from_env;
 use serde_json::json;
 
@@ -245,60 +247,7 @@ where
     }
 }
 
-impl<T> EventHandler for FailureTopicHandler<T>
-where
-    T: FallibleHandler,
-{
-    /// Handles an uncommitted message, committing the offset after processing.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The context of the message being processed.
-    /// * `message` - The uncommitted message to be processed.
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
-    where
-        C: EventContext,
-    {
-        let (message, uncommitted_offset) = message.into_inner();
-
-        // Attempt to handle the message and send to failure topic if it fails
-        let Err(error) = FallibleHandler::on_message(self, context, message).await else {
-            uncommitted_offset.commit();
-            return;
-        };
-
-        // Commit or abort the offset based on the error category
-        match error.classify_error() {
-            ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted_offset.commit(),
-            ErrorCategory::Terminal => uncommitted_offset.abort(),
-        }
-    }
-
-    async fn on_timer<C, U>(&self, context: C, timer: U)
-    where
-        C: EventContext,
-        U: UncommittedTimer,
-    {
-        let (trigger, uncommitted_timer) = timer.into_inner();
-        // Attempt to handle the timer and send to failure topic if it fails
-        let Err(error) = FallibleHandler::on_timer(self, context, trigger.clone()).await else {
-            uncommitted_timer.commit().await;
-            return;
-        };
-        // Commit or abort based on the error category
-        match error.classify_error() {
-            ErrorCategory::Transient | ErrorCategory::Permanent => {
-                uncommitted_timer.commit().await;
-            }
-            ErrorCategory::Terminal => {
-                uncommitted_timer.abort().await;
-            }
-        }
-    }
-
-    /// Shuts down the handler.
-    async fn shutdown(self) {}
-}
+impl<T> FallibleEventHandler for FailureTopicHandler<T> where T: FallibleHandler {}
 
 /// Errors that can occur during failure topic handling.
 #[derive(Debug, Error)]

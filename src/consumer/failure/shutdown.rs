@@ -4,11 +4,13 @@
 //! partition is being revoked, ensuring proper handling of in-flight messages
 //! and preventing new message processing.
 
+use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::{ClassifyError, ErrorCategory, FailureStrategy, FallibleHandler};
-use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider, Uncommitted};
-use crate::timers::{Trigger, UncommittedTimer};
+use crate::consumer::failure::{
+    ClassifyError, ErrorCategory, FailureStrategy, FallibleEventHandler, FallibleHandler,
+};
+use crate::consumer::message::ConsumerMessage;
+use crate::timers::Trigger;
 use thiserror::Error;
 
 /// A strategy that checks if the partition is shutting down before running the
@@ -82,70 +84,7 @@ where
     }
 }
 
-impl<T> EventHandler for ShutdownHandler<T>
-where
-    T: FallibleHandler,
-{
-    /// Handles message processing with shutdown checks.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The context of the message being processed.
-    /// * `message` - The uncommitted message to be processed.
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
-    where
-        C: EventContext,
-    {
-        let (message, uncommitted_offset) = message.into_inner();
-
-        // Check if the partition is being revoked
-        if context.should_shutdown() {
-            uncommitted_offset.abort();
-            return;
-        }
-
-        // Process the message and handle potential errors
-        let Err(error) = self.0.on_message(context, message).await else {
-            uncommitted_offset.commit();
-            return;
-        };
-
-        // Commit or abort the offset based on the error category
-        match error.classify_error() {
-            ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted_offset.commit(),
-            ErrorCategory::Terminal => uncommitted_offset.abort(),
-        }
-    }
-
-    async fn on_timer<C, U>(&self, context: C, timer: U)
-    where
-        C: EventContext,
-        U: UncommittedTimer,
-    {
-        let (trigger, uncommitted) = timer.into_inner();
-
-        // Check if the partition is being revoked
-        if context.should_shutdown() {
-            uncommitted.abort().await;
-            return;
-        }
-
-        // Process the timer and handle potential errors
-        let Err(error) = self.0.on_timer(context, trigger).await else {
-            uncommitted.commit().await;
-            return;
-        };
-
-        // Commit or abort based on the error category
-        match error.classify_error() {
-            ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted.commit().await,
-            ErrorCategory::Terminal => uncommitted.abort().await,
-        }
-    }
-
-    /// Implements shutdown behavior for the handler.
-    async fn shutdown(self) {}
-}
+impl<T> FallibleEventHandler for ShutdownHandler<T> where T: FallibleHandler {}
 
 /// Represents errors that can occur during shutdown handling.
 #[derive(Debug, Error)]

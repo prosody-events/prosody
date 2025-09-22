@@ -36,7 +36,6 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStore> {
         shutdown_timeout: Duration::from_secs(1),
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
-        global_limit: Arc::new(Semaphore::new(10)),
         trigger_store: InMemoryTriggerStore::new(),
         timer_slab_size: CompactDuration::new(30),
     }
@@ -164,7 +163,6 @@ async fn test_partition_manager_max_uncommitted() {
     let max_uncommitted = 5;
     let mut config = default_config();
     config.max_uncommitted = max_uncommitted;
-    config.global_limit = Arc::new(Semaphore::new(max_uncommitted));
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send more messages than max_uncommitted

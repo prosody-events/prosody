@@ -12,7 +12,8 @@ use prosody::{
     cassandra::config::CassandraConfigurationBuilder,
     consumer::ConsumerConfigurationBuilder,
     consumer::failure::{
-        retry::RetryConfigurationBuilder, topic::FailureTopicConfigurationBuilder,
+        concurrency::ConcurrencyLimitConfigurationBuilder, retry::RetryConfigurationBuilder,
+        topic::FailureTopicConfigurationBuilder,
     },
     high_level::{HighLevelClient, HighLevelClientError, mode::Mode},
     producer::ProducerConfigurationBuilder,
@@ -108,6 +109,7 @@ fn create_high_level_client(
 
     let retry_builder = RetryConfigurationBuilder::default();
     let failure_topic_builder = FailureTopicConfigurationBuilder::default();
+    let concurrency_builder = ConcurrencyLimitConfigurationBuilder::default();
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
@@ -117,6 +119,7 @@ fn create_high_level_client(
         &consumer_builder,
         &retry_builder,
         &failure_topic_builder,
+        &concurrency_builder,
         &cassandra_builder,
     )
 }

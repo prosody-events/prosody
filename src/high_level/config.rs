@@ -10,6 +10,10 @@ use crate::cassandra::{
     CassandraConfiguration,
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
+use crate::consumer::failure::concurrency::{
+    ConcurrencyLimitConfiguration, ConcurrencyLimitConfigurationBuilder,
+    ConcurrencyLimitConfigurationBuilderError,
+};
 use crate::consumer::failure::retry::{
     RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
 };
@@ -41,6 +45,8 @@ pub enum ModeConfiguration {
         consumer: ConsumerConfiguration,
         /// The retry configuration.
         retry: RetryConfiguration,
+        /// The concurrency limit configuration.
+        concurrency: ConcurrencyLimitConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -52,6 +58,8 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
+        /// The concurrency limit configuration.
+        concurrency: ConcurrencyLimitConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -59,6 +67,8 @@ pub enum ModeConfiguration {
     BestEffort {
         /// The consumer configuration.
         consumer: ConsumerConfiguration,
+        /// The concurrency limit configuration.
+        concurrency: ConcurrencyLimitConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -74,6 +84,8 @@ impl ModeConfiguration {
     /// * `consumer_builder` - Builder for the consumer configuration.
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
+    /// * `concurrency_builder` - Builder for the concurrency limit
+    ///   configuration.
     /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Returns
@@ -89,10 +101,12 @@ impl ModeConfiguration {
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
+        concurrency_builder: &ConcurrencyLimitConfigurationBuilder,
         cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Result<Self, ModeConfigurationError> {
         let consumer = consumer_builder.build()?;
         let retry = retry_builder.build()?;
+        let concurrency = concurrency_builder.build()?;
 
         // Create trigger store configuration based on mock mode
         let trigger_store = if consumer.mock {
@@ -106,6 +120,7 @@ impl ModeConfiguration {
             Mode::Pipeline => Self::Pipeline {
                 consumer,
                 retry,
+                concurrency,
                 trigger_store,
             },
             Mode::LowLatency => {
@@ -114,11 +129,13 @@ impl ModeConfiguration {
                     consumer,
                     retry,
                     failure_topic,
+                    concurrency,
                     trigger_store,
                 }
             }
             Mode::BestEffort => Self::BestEffort {
                 consumer,
+                concurrency,
                 trigger_store,
             },
         })
@@ -132,7 +149,7 @@ impl ModeConfiguration {
     #[must_use]
     pub fn configured_topics(&self) -> Vec<Topic> {
         match self {
-            Self::Pipeline { consumer, .. } | ModeConfiguration::BestEffort { consumer, .. } => {
+            Self::Pipeline { consumer, .. } | Self::BestEffort { consumer, .. } => {
                 subscription(consumer).collect()
             }
             Self::LowLatency {
@@ -170,9 +187,9 @@ impl ModeConfiguration {
     #[must_use]
     pub fn consumer_config(&self) -> &ConsumerConfiguration {
         match self {
-            ModeConfiguration::Pipeline { consumer, .. }
-            | ModeConfiguration::LowLatency { consumer, .. }
-            | ModeConfiguration::BestEffort { consumer, .. } => consumer,
+            Self::Pipeline { consumer, .. }
+            | Self::LowLatency { consumer, .. }
+            | Self::BestEffort { consumer, .. } => consumer,
         }
     }
 }
@@ -191,6 +208,10 @@ pub enum ModeConfigurationError {
     /// Error when the failure topic configuration is invalid.
     #[error("invalid failure topic configuration: {0:#}")]
     FailureTopic(#[from] FailureTopicConfigurationBuilderError),
+
+    /// Error when the concurrency limit configuration is invalid.
+    #[error("invalid concurrency limit configuration: {0:#}")]
+    ConcurrencyLimit(#[from] ConcurrencyLimitConfigurationBuilderError),
 
     /// Error when the Cassandra configuration is invalid.
     #[error("invalid cassandra configuration: {0:#}")]

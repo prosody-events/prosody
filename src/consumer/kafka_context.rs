@@ -21,7 +21,6 @@ use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
@@ -96,7 +95,6 @@ where
             shutdown_timeout: config.shutdown_timeout,
             stall_threshold: config.stall_threshold,
             watermark_version,
-            global_limit: Arc::new(Semaphore::new(config.max_concurrency)),
             trigger_store,
             timer_slab_size,
         };
