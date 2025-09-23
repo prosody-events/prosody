@@ -24,7 +24,7 @@ use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
 use crate::timers::store::TriggerStore;
-use crate::{Key, SpanScope};
+use crate::{Key, ProcessScope};
 use arc_swap::{ArcSwap, Guard};
 use educe::Educe;
 use std::future::Future;
@@ -333,26 +333,25 @@ where
     }
 }
 
-/// A RAII guard that clears a timer trigger's span when dropped.
+/// RAII guard that releases timer processing resources (spans) on drop.
 ///
-/// This guard ensures that OpenTelemetry spans associated with timer triggers
-/// are deterministically flushed when timer processing completes. Without this,
-/// spans would depend on garbage collection timing for flushing.
-pub struct TriggerSpanScopeGuard(Arc<ArcSwap<Span>>);
+/// Ensures deterministic cleanup when timer processing completes, rather than
+/// waiting for unpredictable garbage collection timing.
+pub struct TriggerProcessGuard(Arc<ArcSwap<Span>>);
 
-impl Drop for TriggerSpanScopeGuard {
+impl Drop for TriggerProcessGuard {
     fn drop(&mut self) {
         self.0.store(Arc::new(Span::none()));
     }
 }
 
-impl<T> SpanScope for PendingTimer<T>
+impl<T> ProcessScope for PendingTimer<T>
 where
     T: TriggerStore,
 {
-    type Guard = TriggerSpanScopeGuard;
+    type Guard = TriggerProcessGuard;
 
-    fn span_scope(&self) -> Self::Guard {
-        TriggerSpanScopeGuard(self.trigger.span.clone())
+    fn process_scope(&self) -> Self::Guard {
+        TriggerProcessGuard(self.trigger.span.clone())
     }
 }

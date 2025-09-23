@@ -364,23 +364,15 @@ impl EventIdentity for Payload {
     }
 }
 
-/// Provides a mechanism to force OpenTelemetry spans to flush after processing.
+/// Manages processing resources (spans and permits) for deterministic cleanup.
 ///
-/// This trait addresses the issue where cloned messages and triggers depend on
-/// external garbage collectors for spans to flush. By providing a guard that
-/// clears the span on drop, it ensures spans are flushed deterministically
-/// when processing completes.
-pub trait SpanScope {
-    /// The guard type that manages span lifecycle.
-    ///
-    /// When the guard is dropped, it should clear the associated span to
-    /// trigger OpenTelemetry span flushing.
+/// Ensures tracing spans and semaphore permits are released immediately when
+/// processing completes, rather than waiting for unpredictable garbage
+/// collection.
+pub trait ProcessScope {
+    /// Guard that releases processing resources on drop.
     type Guard;
 
-    /// Creates a guard that will clear the span when dropped.
-    ///
-    /// # Returns
-    ///
-    /// A guard that implements `Drop` to clear the span and force flushing.
-    fn span_scope(&self) -> Self::Guard;
+    /// Creates a guard that releases resources when processing completes.
+    fn process_scope(&self) -> Self::Guard;
 }
