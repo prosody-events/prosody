@@ -285,6 +285,7 @@ pub struct ConsumerMessageValue {
     pub span: ArcSwap<Span>,
 
     /// Permit used to bound buffering
+    #[educe(Debug(ignore))]
     permit: OwnedSemaphorePermit,
 }
 
