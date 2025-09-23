@@ -25,7 +25,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
 use crate::timers::store::TriggerStore;
 use crate::{Key, ProcessScope};
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
 use educe::Educe;
 use std::future::Future;
 use std::sync::Arc;
@@ -49,15 +49,8 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
 
     /// Returns the tracing span associated with this timer.
     ///
-    /// The span is wrapped in an atomic guard to enable interior mutability,
-    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
-    /// deterministic span flushing when timer processing completes.
-    ///
-    /// # Returns
-    ///
-    /// A guard containing the current span, which can be used for tracing
-    /// operations or span linking.
-    fn span(&self) -> Guard<Arc<Span>>;
+    /// Returns `Span::none()` if processing resources have been released.
+    fn span(&self) -> Span;
 
     /// Check if this timer is still active in the in-memory scheduler.
     fn is_active(&self) -> impl Future<Output = bool> + Send;
@@ -296,16 +289,9 @@ where
 
     /// Returns the tracing span associated with this timer.
     ///
-    /// The span is wrapped in an atomic guard to enable interior mutability,
-    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
-    /// deterministic span flushing when timer processing completes.
-    ///
-    /// # Returns
-    ///
-    /// A guard containing the current span, which can be used for tracing
-    /// operations or span linking.
-    fn span(&self) -> Guard<Arc<Span>> {
-        self.trigger.span.load()
+    /// Returns `Span::none()` if processing resources have been released.
+    fn span(&self) -> Span {
+        self.trigger.span.load().as_ref().clone()
     }
 
     /// Check if this timer is still active in the in-memory scheduler.

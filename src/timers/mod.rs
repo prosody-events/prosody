@@ -49,7 +49,7 @@
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
 use educe::Educe;
 use std::sync::Arc;
 use tracing::Span;
@@ -101,17 +101,11 @@ impl Trigger {
 
     /// Returns the tracing span associated with this trigger.
     ///
-    /// The span is wrapped in an atomic guard to enable interior mutability,
-    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
-    /// deterministic span flushing when timer processing completes.
-    ///
-    /// # Returns
-    ///
-    /// A guard containing the current span, which can be used for tracing
-    /// operations or span linking.
+    /// Returns the current span for tracing operations or span linking.
     #[must_use]
-    pub fn span(&self) -> Guard<Arc<Span>> {
-        self.span.load()
+    pub fn span(&self) -> Span {
+        let span = self.span.load();
+        span.as_ref().clone()
     }
 }
 
