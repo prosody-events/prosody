@@ -11,7 +11,7 @@
 //!   data.
 //! - `ConsumerMessageValue` – The raw data behind `ConsumerMessage`.
 
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
 use educe::Educe;
 use std::sync::Arc;
@@ -23,8 +23,8 @@ use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::PendingTimer;
 use crate::timers::store::TriggerStore;
 use crate::{
-    BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, SourceSystem,
-    SpanScope, Topic,
+    BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, ProcessScope,
+    SourceSystem, Topic,
 };
 
 /// A unified event that must be explicitly committed or aborted.
@@ -157,16 +157,9 @@ impl UncommittedMessage {
 
     /// Returns the tracing span associated with this message.
     ///
-    /// The span is wrapped in an atomic guard to enable interior mutability,
-    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
-    /// deterministic span flushing when message processing completes.
-    ///
-    /// # Returns
-    ///
-    /// A guard containing the current span, which can be used for tracing
-    /// operations or span linking.
+    /// Returns `Span::none()` if processing resources have been released.
     #[must_use]
-    pub fn span(&self) -> Guard<Arc<Span>> {
+    pub fn span(&self) -> Span {
         self.inner.span()
     }
 
@@ -179,6 +172,10 @@ impl UncommittedMessage {
     #[must_use]
     pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
         (self.inner, self.uncommitted_offset)
+    }
+
+    fn processing_state(&self) -> Arc<ArcSwapOption<ProcessingState>> {
+        self.inner.0.processing_state.clone()
     }
 }
 
@@ -225,24 +222,23 @@ impl EventIdentity for UncommittedMessage {
     }
 }
 
-/// A RAII guard that clears a message's span when dropped.
+/// RAII guard that releases processing resources (spans and permits) on drop.
 ///
-/// This guard ensures that OpenTelemetry spans associated with consumer
-/// messages are deterministically flushed when message processing completes.
-/// Without this, spans would depend on garbage collection timing for flushing.
-pub struct MessageSpanScopeGuard(ConsumerMessage);
+/// Ensures deterministic cleanup when message processing completes, rather than
+/// waiting for unpredictable garbage collection timing.
+pub struct MessageProcessGuard(Arc<ArcSwapOption<ProcessingState>>);
 
-impl Drop for MessageSpanScopeGuard {
+impl Drop for MessageProcessGuard {
     fn drop(&mut self) {
-        self.0.0.span.store(Arc::new(Span::none()));
+        self.0.store(None);
     }
 }
 
-impl SpanScope for UncommittedMessage {
-    type Guard = MessageSpanScopeGuard;
+impl ProcessScope for UncommittedMessage {
+    type Guard = MessageProcessGuard;
 
-    fn span_scope(&self) -> Self::Guard {
-        MessageSpanScopeGuard(self.inner.clone())
+    fn process_scope(&self) -> Self::Guard {
+        MessageProcessGuard(self.processing_state())
     }
 }
 
@@ -251,6 +247,17 @@ impl SpanScope for UncommittedMessage {
 /// Internally wraps its data in an `Arc<ConsumerMessageValue>`.
 #[derive(Clone, Debug)]
 pub struct ConsumerMessage(Arc<ConsumerMessageValue>);
+
+#[derive(Educe)]
+#[educe(Debug)]
+struct ProcessingState {
+    /// Tracing span for this message.
+    #[educe(Debug(ignore))]
+    span: Span,
+
+    /// Permit used to bound buffering
+    permit: OwnedSemaphorePermit,
+}
 
 /// The full data and metadata for a consumer message.
 ///
@@ -280,13 +287,9 @@ pub struct ConsumerMessageValue {
     #[educe(Debug(ignore))]
     pub payload: Payload,
 
-    /// Tracing span for this message.
+    /// Processing state containing span and semaphore permit.
     #[educe(Debug(ignore))]
-    pub span: ArcSwap<Span>,
-
-    /// Permit used to bound buffering
-    #[educe(Debug(ignore))]
-    permit: OwnedSemaphorePermit,
+    processing_state: Arc<ArcSwapOption<ProcessingState>>,
 }
 
 impl ConsumerMessage {
@@ -302,6 +305,7 @@ impl ConsumerMessage {
     /// * `timestamp` – Broker timestamp.
     /// * `payload` – Message payload as JSON.
     /// * `span` – Tracing span for distributed context.
+    /// * `permit` – Semaphore permit for backpressure management.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -315,7 +319,8 @@ impl ConsumerMessage {
         span: Span,
         permit: OwnedSemaphorePermit,
     ) -> Self {
-        let span = ArcSwap::from_pointee(span);
+        let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
+
         Self(Arc::new(ConsumerMessageValue {
             source_system,
             topic,
@@ -324,8 +329,7 @@ impl ConsumerMessage {
             key,
             timestamp,
             payload,
-            span,
-            permit,
+            processing_state,
         }))
     }
 
@@ -367,17 +371,13 @@ impl ConsumerMessage {
 
     /// Returns the tracing span associated with this message.
     ///
-    /// The span is wrapped in an atomic guard to enable interior mutability,
-    /// allowing the span to be replaced (e.g., with `Span::none()`) to force
-    /// deterministic span flushing when message processing completes.
-    ///
-    /// # Returns
-    ///
-    /// A guard containing the current span, which can be used for tracing
-    /// operations or span linking.
+    /// Returns `Span::none()` if processing resources have been released.
     #[must_use]
-    pub fn span(&self) -> Guard<Arc<Span>> {
-        self.0.span.load()
+    pub fn span(&self) -> Span {
+        let state = self.0.processing_state.load();
+        state
+            .as_deref()
+            .map_or_else(Span::none, |state| state.span.clone())
     }
 
     /// Convert into `UncommittedMessage` by attaching offset-tracking state.

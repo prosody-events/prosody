@@ -263,7 +263,7 @@ where
                     let span_clone = span.clone();
                     async move {
                         // Link new span with the original trigger's span.
-                        span_clone.follows_from(trigger.span().as_ref());
+                        span_clone.follows_from(trigger.span());
                         inner.timers.unschedule(&trigger.key, trigger.time).await
                     }
                 })

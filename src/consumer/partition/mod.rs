@@ -23,7 +23,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
-use crate::{EventId, EventIdentity, Key, Offset, Partition, SpanScope, Topic};
+use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
@@ -401,12 +401,12 @@ async fn handle_messages<T, S>(
         let cloned_context = context.clone();
         match event {
             UncommittedEvent::Message(message) => {
-                let _guard = message.span_scope();
+                let _guard = message.process_scope();
                 handler.on_message(context, message).await;
             }
             UncommittedEvent::Timer(timer) => {
                 if timer.is_active().await {
-                    let _guard = timer.span_scope();
+                    let _guard = timer.process_scope();
                     handler.on_timer(context, timer).await;
                 }
             }
@@ -531,7 +531,7 @@ fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Re
     // Skip messages with offsets we've already seen
     if offset <= *highest_offset_seen {
         debug_span!(
-            parent: message.span().as_ref(),
+            parent: message.span(),
             "message.filtered",
             %partition, %offset, reason = "stale"
         )
@@ -599,7 +599,7 @@ async fn filter_loops(group_id: &str, message: UncommittedMessage) -> Option<Unc
         .is_some_and(|source_system| source_system.as_str() == group_id)
     {
         info_span!(
-            parent: message.span().as_ref(),
+            parent: message.span(),
             "message.filtered",
             reason = "source-system-loop"
         )
@@ -644,7 +644,7 @@ async fn filter_event_type(
         automaton.find(input).is_none()
     }) {
         info_span!(
-            parent: message.span().as_ref(),
+            parent: message.span(),
             "message.filtered",
             reason = "event-type"
         )
@@ -705,7 +705,7 @@ async fn filter_duplicate(
             if value.as_str() == event_id {
                 // Record a span and skip the message
                 info_span!(
-                    parent: message.span().as_ref(),
+                    parent: message.span(),
                     "message.filtered",
                     reason = "duplicate-event-id",
                     event_id
