@@ -152,6 +152,8 @@ use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::heartbeat::Heartbeat;
 use crate::producer::ProsodyProducer;
+use crate::telemetry::Telemetry;
+use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::cassandra::{CassandraTriggerStore, CassandraTriggerStoreError};
@@ -661,6 +663,8 @@ impl ProsodyConsumer {
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
         let managers: Arc<Managers> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
+        let telemetry = Telemetry::new();
+        let telemetry_sender = telemetry.sender();
 
         // Build event type search automaton for filtering messages
         let allowed_events = consumer_config
@@ -674,24 +678,28 @@ impl ProsodyConsumer {
             .transpose()?;
 
         let (managers, runtime_state) = match trigger_store_config {
-            TriggerStoreConfiguration::InMemory => initialize_consumer(
-                consumer_config,
+            TriggerStoreConfiguration::InMemory => initialize_consumer(ConsumerInitParams {
+                config: consumer_config.clone(),
                 handler_provider,
-                InMemoryTriggerStore::new(),
-                watermark_version.clone(),
-                managers.clone(),
+                trigger_store: InMemoryTriggerStore::new(),
+                watermark_version: watermark_version.clone(),
+                managers: managers.clone(),
                 allowed_events,
-                shutdown.clone(),
-            )?,
-            TriggerStoreConfiguration::Cassandra(cassandra_config) => initialize_consumer(
-                consumer_config,
-                handler_provider,
-                CassandraTriggerStore::new(cassandra_config).await?,
-                watermark_version.clone(),
-                managers.clone(),
-                allowed_events,
-                shutdown.clone(),
-            )?,
+                telemetry: telemetry_sender,
+                shutdown: shutdown.clone(),
+            })?,
+            TriggerStoreConfiguration::Cassandra(cassandra_config) => {
+                initialize_consumer(ConsumerInitParams {
+                    config: consumer_config.clone(),
+                    handler_provider,
+                    trigger_store: CassandraTriggerStore::new(cassandra_config).await?,
+                    watermark_version: watermark_version.clone(),
+                    managers: managers.clone(),
+                    allowed_events,
+                    telemetry: telemetry_sender,
+                    shutdown: shutdown.clone(),
+                })?
+            }
         };
 
         Ok(Self {
@@ -952,6 +960,30 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
 ///
 /// # Returns
 ///
+/// Parameters for initializing a consumer
+struct ConsumerInitParams<T, S>
+where
+    T: HandlerProvider,
+    S: TriggerStore,
+{
+    config: ConsumerConfiguration,
+    handler_provider: T,
+    trigger_store: S,
+    watermark_version: Arc<WatermarkVersion>,
+    managers: Arc<Managers>,
+    allowed_events: Option<AhoCorasick>,
+    telemetry: TelemetrySender,
+    shutdown: Arc<AtomicBool>,
+}
+
+/// Initializes a Prosody consumer with the provided parameters.
+///
+/// # Arguments
+///
+/// * `params` - Consumer initialization parameters
+///
+/// # Returns
+///
 /// A Result containing the initialized consumer components (managers and
 /// runtime state) or a `ConsumerError` if initialization fails.
 ///
@@ -963,13 +995,7 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
 /// - Topic subscription fails
 /// - The probe server cannot be started (if enabled)
 fn initialize_consumer<T, S>(
-    config: &ConsumerConfiguration,
-    handler_provider: T,
-    trigger_store: S,
-    watermark_version: Arc<WatermarkVersion>,
-    managers: Arc<Managers>,
-    allowed_events: Option<AhoCorasick>,
-    shutdown: Arc<AtomicBool>,
+    params: ConsumerInitParams<T, S>,
 ) -> Result<ConsumerComponents, ConsumerError>
 where
     T: HandlerProvider,
@@ -977,19 +1003,20 @@ where
 {
     // Create the consumer context with the message handler and shared state
     let context = Context::new(
-        config,
-        handler_provider,
-        trigger_store,
-        watermark_version.clone(),
-        managers.clone(),
-        allowed_events,
+        &params.config,
+        params.handler_provider,
+        params.trigger_store,
+        params.watermark_version.clone(),
+        params.managers.clone(),
+        params.allowed_events,
+        params.telemetry,
     );
 
     // Use mock cluster for testing or real bootstrap servers
-    let bootstrap = if config.mock {
+    let bootstrap = if params.config.mock {
         MOCK_CLUSTER_BOOTSTRAP.clone()
     } else {
-        config.bootstrap_servers.join(",")
+        params.config.bootstrap_servers.join(",")
     };
 
     // Configure and create the Kafka consumer with optimal settings
@@ -997,11 +1024,11 @@ where
     client_config
         .set("bootstrap.servers", bootstrap)
         .set("client.id", hostname()?)
-        .set("group.id", &config.group_id)
+        .set("group.id", &params.config.group_id)
         .set("enable.auto.commit", "true")
         .set(
             "auto.commit.interval.ms",
-            config.commit_interval.as_millis().to_string(),
+            params.config.commit_interval.as_millis().to_string(),
         )
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
@@ -1011,7 +1038,8 @@ where
     let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
 
     // Subscribe to the specified topics
-    let topics: Vec<&str> = config
+    let topics: Vec<&str> = params
+        .config
         .subscribed_topics
         .iter()
         .map(String::as_str)
@@ -1020,28 +1048,29 @@ where
     consumer.subscribe(&topics)?;
 
     // Spawn the background polling task with monitoring
-    let poll_interval = config.poll_interval;
-    let heartbeat = Heartbeat::new("Kafka poll loop", config.stall_threshold);
-    let cloned_managers = managers.clone();
+    let poll_interval = params.config.poll_interval;
+    let heartbeat = Heartbeat::new("Kafka poll loop", params.config.stall_threshold);
+    let cloned_managers = params.managers.clone();
     let cloned_heartbeat = heartbeat.clone();
-    let max_message_count = config.max_uncommitted;
+    let max_message_count = params.config.max_uncommitted;
     let poll_handle = spawn_blocking(move || {
         poll(PollConfig {
             poll_interval,
             max_message_count,
             consumer,
-            watermark_version: &watermark_version,
+            watermark_version: &params.watermark_version,
             managers: &cloned_managers,
             heartbeat: &cloned_heartbeat,
-            shutdown: &shutdown,
+            shutdown: &params.shutdown,
         });
     });
 
     // Start optional probe server for health monitoring
-    let probe_server = config
+    let probe_server = params
+        .config
         .probe_port
-        .filter(|_| !config.mock)
-        .map(|port| ProbeServer::new(port, managers.clone(), heartbeat))
+        .filter(|_| !params.config.mock)
+        .map(|port| ProbeServer::new(port, params.managers.clone(), heartbeat))
         .transpose()?;
 
     let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
@@ -1049,7 +1078,7 @@ where
         probe_server,
     })));
 
-    Ok((managers, runtime_state))
+    Ok((params.managers, runtime_state))
 }
 
 /// Checks if any partition is stalled.

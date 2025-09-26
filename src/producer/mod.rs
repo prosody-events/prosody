@@ -355,7 +355,7 @@ impl ProsodyProducer {
 
         // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
-            .key(key.as_str())
+            .key(key.as_ref())
             .payload(&serialized)
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 

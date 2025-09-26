@@ -42,6 +42,7 @@ opentelemetry-otlp = { version = "0.30", features = [
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
 pin-project = "1.1"
+quanta = "0.12"
 quick_cache = "0.6"
 rand = "0.9"
 rdkafka = { version = "0.38", features = ["tracing"] }

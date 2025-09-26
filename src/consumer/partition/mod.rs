@@ -20,6 +20,7 @@ use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
@@ -156,6 +157,7 @@ impl PartitionManager {
         handler: T,
         topic: Topic,
         partition: Partition,
+        telemetry: TelemetryPartitionSender,
     ) -> Self
     where
         T: EventHandler + Send + Sync + 'static,

@@ -233,7 +233,7 @@ use rdkafka::mocking::MockCluster;
 use serde_json::Value;
 use std::env;
 use std::mem::forget;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 pub mod admin;
 pub mod cassandra;
@@ -242,6 +242,7 @@ pub mod heartbeat;
 pub mod high_level;
 pub mod producer;
 pub mod propagator;
+mod telemetry;
 pub mod timers;
 pub mod tracing;
 mod util;
@@ -294,9 +295,8 @@ pub type Partition = i32;
 
 /// A compact string optimized for UUID-length keys.
 ///
-/// Uses `Flexstr` to efficiently store message keys up to UUID length without
-/// heap allocation.
-pub type Key = Flexstr<UUID_STR_LEN>;
+/// Uses an Arc so the key can be cheaply cloned
+pub type Key = Arc<str>;
 
 /// A JSON value containing a Kafka message's content.
 ///

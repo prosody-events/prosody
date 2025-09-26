@@ -185,7 +185,7 @@ impl Uncommitted for UncommittedMessage {
         debug!(
             topic = self.topic().as_ref(),
             partition = self.partition(),
-            key = self.key().as_str(),
+            key = self.key().as_ref(),
             offset = self.offset(),
             "committing message"
         );
@@ -197,7 +197,7 @@ impl Uncommitted for UncommittedMessage {
         debug!(
             topic = self.topic().as_ref(),
             partition = self.partition(),
-            key = self.key().as_str(),
+            key = self.key().as_ref(),
             offset = self.offset(),
             "aborting message"
         );

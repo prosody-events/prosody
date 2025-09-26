@@ -310,7 +310,7 @@ impl TriggerStore for CassandraTriggerStore {
 
         let segment_id = slab.segment_id();
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
-        let key = trigger.key.as_str();
+        let key = trigger.key.as_ref();
         let time = trigger.time;
 
         match self.calculate_ttl(slab.range().end) {
@@ -348,7 +348,7 @@ impl TriggerStore for CassandraTriggerStore {
                 (
                     slab.segment_id(),
                     i32::from_le_bytes(slab.id().to_le_bytes()),
-                    key.as_str(),
+                    key.as_ref(),
                     time,
                 ),
             )
@@ -381,7 +381,7 @@ impl TriggerStore for CassandraTriggerStore {
         try_stream! {
             let stream = self
                 .session()
-                .execute_iter(self.queries().get_key_times.clone(), (segment_id, key.as_str()))
+                .execute_iter(self.queries().get_key_times.clone(), (segment_id, key.as_ref()))
                 .await?
                 .rows_stream::<(CompactDateTime,)>()?;
 
@@ -401,7 +401,7 @@ impl TriggerStore for CassandraTriggerStore {
         try_stream! {
             let stream = self
                 .session()
-                .execute_iter(self.queries().get_key_triggers.clone(), (segment_id, key.as_str()))
+                .execute_iter(self.queries().get_key_triggers.clone(), (segment_id, key.as_ref()))
                 .await?
                 .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
 
@@ -426,7 +426,7 @@ impl TriggerStore for CassandraTriggerStore {
         let context = trigger.span.load().context();
         self.propagator().inject_context(&context, &mut span_map);
 
-        let key = trigger.key.as_str();
+        let key = trigger.key.as_ref();
         let time = trigger.time;
 
         match self.calculate_ttl(trigger.time) {
@@ -461,7 +461,7 @@ impl TriggerStore for CassandraTriggerStore {
         self.session()
             .execute_unpaged(
                 &self.queries().delete_key_trigger,
-                (segment_id, key.as_str(), time),
+                (segment_id, key.as_ref(), time),
             )
             .await?;
 
@@ -477,7 +477,7 @@ impl TriggerStore for CassandraTriggerStore {
         self.session()
             .execute_unpaged(
                 &self.queries().clear_key_triggers,
-                (segment_id, key.as_str()),
+                (segment_id, key.as_ref()),
             )
             .await?;
 

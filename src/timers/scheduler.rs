@@ -626,7 +626,7 @@ mod tests {
         let num_triggers = 69_usize; // 64 (buffer) + 5 (to test backpressure)
         for i in 0_usize..num_triggers {
             let trigger = Trigger::new(
-                Key::from(&format!("trigger-{i}")),
+                Key::from(format!("trigger-{i}")),
                 fire_time,
                 Span::current(),
             );

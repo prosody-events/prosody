@@ -196,7 +196,7 @@ where
                         // Log the final failure and return the error
                         error!(
                             partition,
-                            key = key.as_str(),
+                            key = key.as_ref(),
                             offset,
                             attempt,
                             topic = topic.as_ref(),
@@ -210,7 +210,7 @@ where
                     // Log the failure and retry information
                     error!(
                         partition,
-                        key = key.as_str(),
+                        key = key.as_ref(),
                         offset,
                         attempt,
                         topic = topic.as_ref(),
@@ -228,7 +228,7 @@ where
                 ErrorCategory::Permanent => {
                     error!(
                         partition,
-                        key = key.as_str(),
+                        key = key.as_ref(),
                         offset,
                         attempt,
                         topic = topic.as_ref(),
@@ -239,7 +239,7 @@ where
                 ErrorCategory::Terminal => {
                     info!(
                         partition,
-                        key = key.as_str(),
+                        key = key.as_ref(),
                         offset,
                         attempt,
                         topic = topic.as_ref(),
@@ -343,7 +343,7 @@ where
                     let sleep_time = self.sleep_time(attempt);
                     error!(
                         partition,
-                        key = key.as_str(),
+                        key = key.as_ref(),
                         offset,
                         attempt,
                         topic = topic.as_ref(),
@@ -362,7 +362,7 @@ where
                 ErrorCategory::Permanent => {
                     error!(
                         partition,
-                        key = key.as_str(),
+                        key = key.as_ref(),
                         offset,
                         attempt,
                         topic = topic.as_ref(),
@@ -374,7 +374,7 @@ where
                 ErrorCategory::Terminal => {
                     info!(
                         partition,
-                        key = key.as_str(),
+                        key = key.as_ref(),
                         offset,
                         attempt,
                         topic = topic.as_ref(),

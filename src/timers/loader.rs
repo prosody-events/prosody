@@ -462,7 +462,7 @@ mod tests {
     }
 
     fn create_test_trigger(key: u64, time: CompactDateTime) -> Trigger {
-        Trigger::new(Key::from(&format!("key-{key}")), time, Span::current())
+        Trigger::new(Key::from(format!("key-{key}")), time, Span::current())
     }
 
     #[tokio::test]

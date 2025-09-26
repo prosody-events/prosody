@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 use crate::Topic;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
+use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 
@@ -53,6 +54,8 @@ where
 
     /// Thread-safe storage for partition managers
     managers: Arc<Managers>,
+
+    telemetry: TelemetrySender,
 }
 
 impl<T, S> Context<T, S>
@@ -79,6 +82,7 @@ where
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers>,
         allowed_events: Option<AhoCorasick>,
+        telemetry: TelemetrySender,
     ) -> Self {
         let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
             error!("invalid timer slab size: {error:#}; using default");
@@ -103,6 +107,7 @@ where
             config,
             handler_provider,
             managers,
+            telemetry,
         }
     }
 }
@@ -149,7 +154,9 @@ where
                 for element in partitions.elements() {
                     let topic = Topic::from(element.topic());
                     let partition = element.partition();
+
                     info!("assigning {topic}:{partition}");
+                    self.telemetry.partition_assigned(topic, partition);
 
                     let mut managers = self.managers.write();
 
@@ -165,8 +172,13 @@ where
                         .handler_for_partition(topic, partition);
 
                     // Initialize new partition manager
-                    let manager =
-                        PartitionManager::new(self.config.clone(), handler, topic, partition);
+                    let manager = PartitionManager::new(
+                        self.config.clone(),
+                        handler,
+                        topic,
+                        partition,
+                        self.telemetry.for_partition(topic, partition),
+                    );
 
                     vacant.insert(manager);
                     debug!("{topic}:{partition} assigned");
@@ -194,6 +206,8 @@ where
 
                     // Queue shutdown task
                     shutdown_futures.push(manager.shutdown());
+
+                    self.telemetry.partition_revoked(topic, partition);
                 }
 
                 // Wait for all shutdowns to complete concurrently
