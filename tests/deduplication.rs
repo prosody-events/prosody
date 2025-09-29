@@ -8,6 +8,7 @@ use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::{ConsumerConfiguration, ProsodyConsumer},
+    consumer::middleware::CloneProvider,
     producer::{ProducerConfiguration, ProsodyProducer},
 };
 use serde_json::json;
@@ -72,10 +73,10 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
 
     // Initialize the producer and consumer
     let producer = ProsodyProducer::new(&producer_config)?;
-    let consumer = ProsodyConsumer::new::<TestHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        handler.clone(),
+        CloneProvider::new(handler.clone()),
     )
     .await?;
 

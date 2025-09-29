@@ -147,7 +147,7 @@ use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::shutdown::ShutdownMiddleware;
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
-use crate::consumer::middleware::{CloneProvider, FallibleHandler, HandlerMiddleware};
+use crate::consumer::middleware::{FallibleCloneProvider, FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::heartbeat::Heartbeat;
@@ -735,7 +735,7 @@ impl ProsodyConsumer {
             .layer(ShutdownMiddleware)
             .layer(retry_middleware);
 
-        let provider = CloneProvider::new(handler);
+        let provider = FallibleCloneProvider::new(handler);
         let provider = middleware.with_provider(provider);
 
         Self::new(consumer_config, trigger_store_config, provider).await
@@ -793,7 +793,7 @@ impl ProsodyConsumer {
             .layer(topic_middleware) // write to failure topic
             .layer(retry_middleware); // retry writing to failure topic
 
-        let provider = CloneProvider::new(handler);
+        let provider = FallibleCloneProvider::new(handler);
         let provider = middleware.with_provider(provider);
 
         Self::new(consumer_config, trigger_store_config, provider).await
@@ -837,7 +837,7 @@ impl ProsodyConsumer {
             .layer(ShutdownMiddleware)
             .layer(LogMiddleware);
 
-        let provider = CloneProvider::new(handler);
+        let provider = FallibleCloneProvider::new(handler);
         let provider = middleware.with_provider(provider);
 
         Self::new(consumer_config, trigger_store_config, provider).await

@@ -12,6 +12,7 @@ use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::{ConsumerConfiguration, ProsodyConsumer},
+    consumer::middleware::CloneProvider,
     producer::{ProducerConfiguration, ProsodyProducer},
 };
 use serde_json::{Value, json};
@@ -97,10 +98,10 @@ async fn run_scenario(
 
     // Set up a channel to communicate received messages.
     let (tx, mut rx) = channel(10);
-    let consumer = ProsodyConsumer::new::<TestHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        TestHandler { messages_tx: tx },
+        CloneProvider::new(TestHandler { messages_tx: tx }),
     )
     .await?;
     let producer = ProsodyProducer::new(&producer_config)?;

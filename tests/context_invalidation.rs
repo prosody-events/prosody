@@ -11,6 +11,7 @@ use prosody::{
     consumer::event_context::{BoxEventContext, EventContext},
     consumer::message::UncommittedMessage,
     consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer, Uncommitted},
+    consumer::middleware::CloneProvider,
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
@@ -119,10 +120,10 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
         .build()?;
 
     // Create consumer
-    let consumer = ProsodyConsumer::new::<ContextInvalidationHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        handler,
+        CloneProvider::new(handler),
     )
     .await?;
 

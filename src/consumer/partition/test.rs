@@ -5,18 +5,16 @@ use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{EventContext, EventHandler, Uncommitted};
-use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::store::memory::InMemoryTriggerStore;
 use aho_corasick::StartKind;
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
-use quanta::Clock;
 use serde_json::json;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::Span;
 
@@ -41,13 +39,6 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStore> {
         trigger_store: InMemoryTriggerStore::new(),
         timer_slab_size: CompactDuration::new(30),
     }
-}
-
-/// Creates a dummy telemetry sender for tests.
-fn create_dummy_telemetry() -> TelemetryPartitionSender {
-    let (tx, _rx) = mpsc::channel(1);
-    let clock = Clock::new();
-    TelemetryPartitionSender::new("test-topic".into(), 0, tx, clock)
 }
 
 #[tokio::test]

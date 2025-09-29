@@ -10,6 +10,7 @@ use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::{ConsumerConfiguration, ProsodyConsumer},
+    consumer::middleware::CloneProvider,
     producer::{ProducerConfiguration, ProsodyProducer},
 };
 use serde_json::json;
@@ -62,10 +63,10 @@ async fn test_backpressure() -> Result<()> {
         .build()?;
 
     let slow_handler = SlowTestHandler { messages_tx };
-    let consumer = ProsodyConsumer::new::<SlowTestHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        slow_handler,
+        CloneProvider::new(slow_handler),
     )
     .await?;
 

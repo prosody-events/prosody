@@ -48,6 +48,7 @@ use prosody::{
     consumer::EventHandler,
     consumer::ProsodyConsumer,
     consumer::message::UncommittedMessage,
+    consumer::middleware::CloneProvider,
     producer::ProducerConfiguration,
     producer::ProsodyProducer,
 };
@@ -206,10 +207,10 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     };
 
     // Create the consumer with the test handler
-    let consumer: ProsodyConsumer = ProsodyConsumer::new::<ConcurrencyTestHandler>(
+    let consumer: ProsodyConsumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        handler.clone(),
+        CloneProvider::new(handler.clone()),
     )
     .await?;
 

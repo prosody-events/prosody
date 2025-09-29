@@ -9,6 +9,7 @@ use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration}
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+use prosody::consumer::middleware::CloneProvider;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::timers::UncommittedTimer;
 use prosody::{Payload, Topic};
@@ -295,10 +296,10 @@ async fn test_producer_deduplication() -> Result<()> {
         let (tx, rx) = channel(16);
         let handler = TestHandler { tx };
         (
-            ProsodyConsumer::new::<TestHandler>(
+            ProsodyConsumer::new(
                 &cfg,
                 &common::create_cassandra_trigger_store_config(),
-                handler,
+                CloneProvider::new(handler),
             )
             .await?,
             rx,

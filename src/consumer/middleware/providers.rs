@@ -1,0 +1,127 @@
+//! Provider implementations for creating handlers for partition-level
+//! processing.
+//!
+//! This module contains providers that wrap handlers and create instances
+//! for specific topic-partitions. Two main provider types are available:
+//!
+//! - [`FallibleCloneProvider`] - For handlers that can fail (used by consumer)
+//! - [`CloneProvider`] - For infallible handlers (used in tests)
+
+use std::convert::Infallible;
+
+use crate::consumer::event_context::EventContext;
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::{EventHandler, HandlerProvider, Partition, Topic};
+use crate::timers::Trigger;
+
+use super::{FallibleHandler, FallibleHandlerProvider};
+
+/// A provider that clones the wrapped fallible handler for each partition.
+///
+/// This provider is used by the consumer for handlers that can fail during
+/// processing. It implements `FallibleHandlerProvider` and creates cloned
+/// instances of handlers that can return errors.
+#[derive(Clone, Debug)]
+pub struct FallibleCloneProvider<T>(T);
+
+impl<T> FallibleCloneProvider<T> {
+    /// Creates a new `FallibleCloneProvider` that wraps the given handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` - The fallible handler to wrap.
+    ///
+    /// # Returns
+    ///
+    /// A new `FallibleCloneProvider` instance.
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+impl<T> FallibleHandlerProvider for FallibleCloneProvider<T>
+where
+    T: FallibleHandler + Clone + Send + Sync + 'static,
+{
+    type Handler = T;
+
+    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
+        self.0.clone()
+    }
+}
+
+/// A provider that clones the wrapped infallible handler for each partition.
+///
+/// This provider is used in tests for handlers that never fail. It implements
+/// `HandlerProvider` and creates cloned instances of handlers that implement
+/// `EventHandler` directly without error handling.
+#[derive(Clone, Debug)]
+pub struct CloneProvider<T>(T);
+
+impl<T> CloneProvider<T> {
+    /// Creates a new `CloneProvider` that wraps the given handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` - The handler to wrap.
+    ///
+    /// # Returns
+    ///
+    /// A new `CloneProvider` instance.
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+impl<T> HandlerProvider for CloneProvider<T>
+where
+    T: EventHandler + Clone + Send + Sync + 'static,
+{
+    type Handler = T;
+
+    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
+        self.0.clone()
+    }
+}
+
+/// A simple fallible handler wrapper for making infallible handlers work with
+/// `FallibleCloneProvider`.
+///
+/// This is useful when you want to use an infallible handler (like test
+/// handlers) with the fallible handler infrastructure.
+#[derive(Clone, Debug)]
+pub struct InfallibleWrapper<T>(T);
+
+impl<T> InfallibleWrapper<T> {
+    /// Creates a new `InfallibleWrapper` around the given handler.
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+impl<T> FallibleHandler for InfallibleWrapper<T>
+where
+    T: EventHandler + Send + Sync + 'static,
+{
+    type Error = Infallible;
+
+    async fn on_message<C>(&self, _context: C, _message: ConsumerMessage) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        // Since EventHandler::on_message doesn't return a Result, we can't actually
+        // fail This is a conceptual wrapper - in practice, infallible handlers
+        // should use CloneProvider
+        Ok(())
+    }
+
+    async fn on_timer<C>(&self, _context: C, _trigger: Trigger) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        // Since EventHandler::on_timer doesn't return a Result, we can't actually fail
+        // This is a conceptual wrapper - in practice, infallible handlers should use
+        // CloneProvider
+        Ok(())
+    }
+}

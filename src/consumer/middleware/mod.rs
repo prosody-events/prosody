@@ -84,10 +84,14 @@ use crate::{Partition, Topic};
 
 pub mod concurrency;
 pub mod log;
+pub mod providers;
 pub mod retry;
 pub mod shutdown;
 pub mod telemetry;
 pub mod topic;
+
+// Re-export providers for backwards compatibility and convenience
+pub use providers::{CloneProvider, FallibleCloneProvider};
 
 /// Categorizes errors in message processing.
 #[derive(Copy, Clone, Debug)]
@@ -282,14 +286,6 @@ pub trait FallibleHandler: Send + Sync + 'static {
         C: EventContext;
 }
 
-/// A provider that clones the wrapped handler for each partition.
-///
-/// This provider is useful when you have a handler that can be safely cloned
-/// and you want to use the same handler instance logic across multiple
-/// partitions.
-#[derive(Clone, Debug)]
-pub struct CloneProvider<T>(T);
-
 /// A composition of two middleware components.
 #[derive(Clone, Debug)]
 pub struct ComposedMiddleware<M1, M2>(M1, M2);
@@ -320,21 +316,6 @@ pub trait FallibleEventHandler: FallibleHandler {
     fn on_timer_error(&self, _error: &Self::Error) {}
 }
 
-impl<T> CloneProvider<T> {
-    /// Creates a new `CloneProvider` that wraps the given handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `inner` - The handler to wrap.
-    ///
-    /// # Returns
-    ///
-    /// A new `CloneProvider` instance.
-    pub fn new(inner: T) -> Self {
-        Self(inner)
-    }
-}
-
 impl<M1, M2> HandlerMiddleware for ComposedMiddleware<M1, M2>
 where
     M1: HandlerMiddleware,
@@ -349,46 +330,6 @@ where
         // Apply the first middleware to the result of applying the second middleware
         // This matches Tower's pattern where M1 (outer) wraps M2 (inner)
         self.0.with_provider(self.1.with_provider(provider))
-    }
-}
-
-impl<T> FallibleHandlerProvider for CloneProvider<T>
-where
-    T: FallibleHandler + Clone + Send + Sync + 'static,
-{
-    type Handler = T;
-
-    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
-        self.0.clone()
-    }
-}
-
-impl<T> FallibleHandler for CloneProvider<T>
-where
-    T: FallibleHandler,
-{
-    type Error = T::Error;
-
-    fn on_message<C>(
-        &self,
-        context: C,
-        message: ConsumerMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
-    where
-        C: EventContext,
-    {
-        self.0.on_message(context, message)
-    }
-
-    fn on_timer<C>(
-        &self,
-        context: C,
-        trigger: Trigger,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
-    where
-        C: EventContext,
-    {
-        self.0.on_timer(context, trigger)
     }
 }
 
