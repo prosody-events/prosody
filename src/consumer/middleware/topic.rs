@@ -13,7 +13,8 @@ use crate::Topic;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
+    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
+    HandlerMiddleware,
 };
 use crate::consumer::{HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
@@ -94,7 +95,7 @@ impl FailureTopicMiddleware {
 
 /// A provider that wraps handlers with failure topic functionality.
 #[derive(Clone, Debug)]
-struct FailureTopicProvider<T> {
+pub struct FailureTopicProvider<T> {
     provider: T,
     config: FailureTopicConfiguration,
     producer: ProsodyProducer,
@@ -103,7 +104,7 @@ struct FailureTopicProvider<T> {
 
 /// A handler wrapped with failure topic functionality.
 #[derive(Clone, Debug)]
-struct FailureTopicHandler<T> {
+pub struct FailureTopicHandler<T> {
     topic: Topic,
     producer: ProsodyProducer,
     group_id: String,
@@ -111,16 +112,33 @@ struct FailureTopicHandler<T> {
 }
 
 impl HandlerMiddleware for FailureTopicMiddleware {
-    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    type Provider<T: FallibleHandlerProvider> = FailureTopicProvider<T>;
+
+    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: HandlerProvider,
-        T::Handler: FallibleHandler,
+        T: FallibleHandlerProvider,
     {
         FailureTopicProvider {
             provider,
             config: self.config.clone(),
             producer: self.producer.clone(),
             group_id: self.group_id.clone(),
+        }
+    }
+}
+
+impl<T> FallibleHandlerProvider for FailureTopicProvider<T>
+where
+    T: FallibleHandlerProvider,
+{
+    type Handler = FailureTopicHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: TopicType, partition: Partition) -> Self::Handler {
+        FailureTopicHandler {
+            topic: self.config.failure_topic.as_str().into(),
+            producer: self.producer.clone(),
+            group_id: self.group_id.clone(),
+            handler: self.provider.handler_for_partition(topic, partition),
         }
     }
 }

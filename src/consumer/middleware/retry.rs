@@ -17,7 +17,7 @@ use validator::{Validate, ValidationErrors};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleHandler, HandlerMiddleware,
+    ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::consumer::{EventHandler, HandlerProvider, Keyed, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
@@ -103,18 +103,30 @@ impl RetryMiddleware {
 
 /// A provider that retries failed message processing attempts.
 #[derive(Clone, Debug)]
-struct RetryProvider<T> {
+pub struct RetryProvider<T> {
     provider: T,
     config: RetryConfiguration,
 }
 
 /// A handler wrapped with retry functionality.
 #[derive(Clone, Debug)]
-struct RetryHandler<T> {
+pub struct RetryHandler<T> {
     base_delay_millis: u64,
     max_delay_millis: u64,
     max_retries: u32,
     handler: T,
+}
+
+impl<T> RetryProvider<T> {
+    /// Creates a retry handler for the given topic and partition.
+    fn create_handler<H>(&self, handler: H) -> RetryHandler<H> {
+        RetryHandler {
+            base_delay_millis: self.config.base.as_millis() as u64,
+            max_delay_millis: self.config.max_delay.as_millis() as u64,
+            max_retries: self.config.max_retries,
+            handler,
+        }
+    }
 }
 
 impl<T> RetryHandler<T> {
@@ -140,10 +152,11 @@ impl<T> RetryHandler<T> {
 }
 
 impl HandlerMiddleware for RetryMiddleware {
-    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    type Provider<T: FallibleHandlerProvider> = RetryProvider<T>;
+
+    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: HandlerProvider,
-        T::Handler: FallibleHandler,
+        T: FallibleHandlerProvider,
     {
         RetryProvider {
             provider,
@@ -152,19 +165,26 @@ impl HandlerMiddleware for RetryMiddleware {
     }
 }
 
-impl<T> HandlerProvider for RetryProvider<T>
+impl<T> FallibleHandlerProvider for RetryProvider<T>
 where
-    T: HandlerProvider<Handler: FallibleHandler>,
+    T: FallibleHandlerProvider,
 {
     type Handler = RetryHandler<T::Handler>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        RetryHandler {
-            base_delay_millis: self.config.base.as_millis() as u64,
-            max_delay_millis: self.config.max_delay.as_millis() as u64,
-            max_retries: self.config.max_retries,
-            handler: self.provider.handler_for_partition(topic, partition),
-        }
+        self.create_handler(self.provider.handler_for_partition(topic, partition))
+    }
+}
+
+impl<T> HandlerProvider for RetryProvider<T>
+where
+    T: HandlerProvider,
+    T::Handler: FallibleHandler,
+{
+    type Handler = RetryHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        self.create_handler(self.provider.handler_for_partition(topic, partition))
     }
 }
 

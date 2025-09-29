@@ -8,7 +8,8 @@ use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
+    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
+    HandlerMiddleware,
 };
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -25,6 +26,12 @@ struct ShutdownProvider<T> {
     provider: T,
 }
 
+/// A fallible provider that wraps handlers with shutdown functionality.
+#[derive(Clone, Debug)]
+pub struct FallibleShutdownProvider<T> {
+    provider: T,
+}
+
 /// Wraps a handler with shutdown functionality.
 ///
 /// This struct adds shutdown checks to the wrapped handler's message
@@ -36,12 +43,39 @@ pub struct ShutdownHandler<T> {
 }
 
 impl HandlerMiddleware for ShutdownMiddleware {
-    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    type Provider<T: FallibleHandlerProvider> = FallibleShutdownProvider<T>;
+
+    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: HandlerProvider,
-        T::Handler: FallibleHandler,
+        T: FallibleHandlerProvider,
     {
-        ShutdownProvider { provider }
+        FallibleShutdownProvider { provider }
+    }
+}
+
+impl<T> FallibleHandlerProvider for FallibleShutdownProvider<T>
+where
+    T: FallibleHandlerProvider,
+{
+    type Handler = ShutdownHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        ShutdownHandler {
+            handler: self.provider.handler_for_partition(topic, partition),
+        }
+    }
+}
+
+impl<T> HandlerProvider for FallibleShutdownProvider<T>
+where
+    T: HandlerProvider<Handler: FallibleHandler>,
+{
+    type Handler = ShutdownHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        ShutdownHandler {
+            handler: self.provider.handler_for_partition(topic, partition),
+        }
     }
 }
 

@@ -53,22 +53,47 @@ pub trait ClassifyError {
     }
 }
 
-/// Defines middleware for message processing.
-pub trait HandlerMiddleware {
-    /// Wraps a handler with this middleware.
+/// Provides fallible handlers for processing messages from specific partitions.
+///
+/// This trait is similar to `HandlerProvider` but is designed to work with
+/// fallible handlers that can return errors during processing. It allows
+/// creating handlers that can fail and be composed with middleware that
+/// handles these failures.
+pub trait FallibleHandlerProvider: Send + Sync + 'static {
+    /// The type of fallible handler provided.
+    type Handler: FallibleHandler + Send + Sync + 'static;
+
+    /// Creates a fallible handler for a specific topic and partition.
     ///
     /// # Arguments
     ///
-    /// * `handler` - The handler to wrap with this middleware.
+    /// * `topic` - The topic of the partition.
+    /// * `partition` - The partition number.
     ///
     /// # Returns
     ///
-    /// A new handler that implements both `HandlerProvider` and
-    /// `FallibleHandler`.
-    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    /// A handler instance for processing messages from the specified
+    /// topic-partition.
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler;
+}
+
+/// Defines middleware for message processing.
+pub trait HandlerMiddleware {
+    type Provider<T: FallibleHandlerProvider>: FallibleHandlerProvider;
+
+    /// Wraps a handler provider with this middleware.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The fallible handler provider to wrap with this
+    ///   middleware.
+    ///
+    /// # Returns
+    ///
+    /// A new provider that implements `FallibleHandlerProvider`.
+    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: HandlerProvider,
-        T::Handler: FallibleHandler;
+        T: FallibleHandlerProvider;
 
     /// Adds a middleware layer on top of this middleware (inner-to-outer
     /// composition).
@@ -103,11 +128,11 @@ pub trait HandlerMiddleware {
     ///
     /// // Execution: retry -> shutdown -> concurrency -> handler -> concurrency -> shutdown -> retry
     /// ```
-    fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<Self, T>
+    fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self>
     where
         Self: Sized,
     {
-        ComposedMiddleware(self, outer_middleware)
+        ComposedMiddleware(outer_middleware, self)
     }
 }
 
@@ -188,10 +213,11 @@ where
     M1: HandlerMiddleware,
     M2: HandlerMiddleware,
 {
-    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    type Provider<T: FallibleHandlerProvider> = M1::Provider<M2::Provider<T>>;
+
+    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: HandlerProvider,
-        T::Handler: FallibleHandler,
+        T: FallibleHandlerProvider,
     {
         // Apply the first middleware to the result of applying the second middleware
         // This matches Tower's pattern where M1 (outer) wraps M2 (inner)
@@ -290,12 +316,37 @@ where
     async fn shutdown(self) {}
 }
 
+/// A provider that clones the wrapped handler for each partition.
+///
+/// This provider is useful when you have a handler that can be safely cloned
+/// and you want to use the same handler instance logic across multiple
+/// partitions.
 #[derive(Clone, Debug)]
 pub struct CloneProvider<T>(T);
 
 impl<T> CloneProvider<T> {
+    /// Creates a new `CloneProvider` that wraps the given handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` - The handler to wrap.
+    ///
+    /// # Returns
+    ///
+    /// A new `CloneProvider` instance.
     pub fn new(inner: T) -> Self {
         Self(inner)
+    }
+}
+
+impl<T> FallibleHandlerProvider for CloneProvider<T>
+where
+    T: FallibleHandler + Clone + Send + Sync + 'static,
+{
+    type Handler = T;
+
+    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
+        self.0.clone()
     }
 }
 

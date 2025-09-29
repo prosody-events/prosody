@@ -8,7 +8,9 @@ use crate::consumer::HandlerProvider;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::{FallibleEventHandler, FallibleHandler, HandlerMiddleware};
+use crate::consumer::middleware::{
+    FallibleEventHandler, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
+};
 use crate::telemetry::{Telemetry, partition::TelemetryPartitionSender};
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -21,7 +23,7 @@ pub struct TelemetryMiddleware {
 
 /// A provider that records telemetry events during message processing.
 #[derive(Clone, Debug)]
-struct TelemetryProvider<T> {
+pub struct TelemetryProvider<T> {
     provider: T,
     telemetry: Telemetry,
 }
@@ -31,7 +33,7 @@ struct TelemetryProvider<T> {
 /// Wraps another handler and adds telemetry recording capabilities while
 /// preserving the original processing behavior and error handling.
 #[derive(Clone, Debug)]
-struct TelemetryHandler<T> {
+pub struct TelemetryHandler<T> {
     handler: T,
     sender: TelemetryPartitionSender,
 }
@@ -49,14 +51,30 @@ impl TelemetryMiddleware {
 }
 
 impl HandlerMiddleware for TelemetryMiddleware {
-    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    type Provider<T: FallibleHandlerProvider> = TelemetryProvider<T>;
+
+    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: HandlerProvider,
-        T::Handler: FallibleHandler,
+        T: FallibleHandlerProvider,
     {
         TelemetryProvider {
             provider,
             telemetry: self.telemetry.clone(),
+        }
+    }
+}
+
+impl<T> FallibleHandlerProvider for TelemetryProvider<T>
+where
+    T: FallibleHandlerProvider,
+{
+    type Handler = TelemetryHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        let partition_sender = self.telemetry.partition_sender(topic, partition);
+        TelemetryHandler {
+            handler: self.provider.handler_for_partition(topic, partition),
+            sender: partition_sender,
         }
     }
 }

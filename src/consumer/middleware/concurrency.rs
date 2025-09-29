@@ -16,7 +16,8 @@ use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
+    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
+    HandlerMiddleware,
 };
 use crate::timers::Trigger;
 use crate::util::from_env_with_fallback;
@@ -46,19 +47,17 @@ pub struct ConcurrencyLimitMiddleware {
 
 /// A provider that enforces global concurrency limits.
 #[derive(Clone, Debug)]
-struct ConcurrencyLimitProvider<T> {
+pub struct ConcurrencyLimitProvider<T> {
     provider: T,
     global_limit: Arc<Semaphore>,
 }
 
 /// A handler that enforces global concurrency limits.
 #[derive(Clone, Debug)]
-struct ConcurrencyLimitHandler<T> {
+pub struct ConcurrencyLimitHandler<T> {
     handler: T,
     global_limit: Arc<Semaphore>,
 }
-
-// === IMPLEMENTATIONS (highest-level to lowest-level dependencies) ===
 
 impl ConcurrencyLimitConfiguration {
     /// Creates a new [`ConcurrencyLimitConfigurationBuilder`].
@@ -94,13 +93,28 @@ impl ConcurrencyLimitMiddleware {
 }
 
 impl HandlerMiddleware for ConcurrencyLimitMiddleware {
-    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    type Provider<T: FallibleHandlerProvider> = ConcurrencyLimitProvider<T>;
+
+    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: HandlerProvider,
-        T::Handler: FallibleHandler,
+        T: FallibleHandlerProvider,
     {
         ConcurrencyLimitProvider {
             provider,
+            global_limit: self.global_limit.clone(),
+        }
+    }
+}
+
+impl<T> FallibleHandlerProvider for ConcurrencyLimitProvider<T>
+where
+    T: FallibleHandlerProvider,
+{
+    type Handler = ConcurrencyLimitHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        ConcurrencyLimitHandler {
+            handler: self.provider.handler_for_partition(topic, partition),
             global_limit: self.global_limit.clone(),
         }
     }
