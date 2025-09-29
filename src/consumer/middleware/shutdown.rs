@@ -6,13 +6,13 @@
 
 use thiserror::Error;
 
+use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
     HandlerMiddleware,
 };
-use crate::consumer::HandlerProvider;
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
 
@@ -23,13 +23,7 @@ pub struct ShutdownMiddleware;
 
 /// A provider that wraps handlers with shutdown functionality.
 #[derive(Clone, Debug)]
-struct ShutdownProvider<T> {
-    provider: T,
-}
-
-/// A fallible provider that wraps handlers with shutdown functionality.
-#[derive(Clone, Debug)]
-pub struct FallibleShutdownProvider<T> {
+pub struct ShutdownProvider<T> {
     provider: T,
 }
 
@@ -44,32 +38,19 @@ pub struct ShutdownHandler<T> {
 }
 
 impl HandlerMiddleware for ShutdownMiddleware {
-    type Provider<T: FallibleHandlerProvider> = FallibleShutdownProvider<T>;
+    type Provider<T: FallibleHandlerProvider> = ShutdownProvider<T>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
     {
-        FallibleShutdownProvider { provider }
+        ShutdownProvider { provider }
     }
 }
 
-impl<T> FallibleHandlerProvider for FallibleShutdownProvider<T>
+impl<T> FallibleHandlerProvider for ShutdownProvider<T>
 where
     T: FallibleHandlerProvider,
-{
-    type Handler = ShutdownHandler<T::Handler>;
-
-    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        ShutdownHandler {
-            handler: self.provider.handler_for_partition(topic, partition),
-        }
-    }
-}
-
-impl<T> HandlerProvider for FallibleShutdownProvider<T>
-where
-    T: HandlerProvider<Handler: FallibleHandler>,
 {
     type Handler = ShutdownHandler<T::Handler>;
 

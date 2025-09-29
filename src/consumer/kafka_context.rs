@@ -172,13 +172,8 @@ where
                         .handler_for_partition(topic, partition);
 
                     // Initialize new partition manager
-                    let manager = PartitionManager::new(
-                        self.config.clone(),
-                        handler,
-                        topic,
-                        partition,
-                        self.telemetry.for_partition(topic, partition),
-                    );
+                    let manager =
+                        PartitionManager::new(self.config.clone(), handler, topic, partition);
 
                     vacant.insert(manager);
                     debug!("{topic}:{partition} assigned");

@@ -18,9 +18,10 @@
 //!
 //! ## Middleware Composition
 //!
-//! Middleware are composed from inner to outer using the `layer` method, creating
-//! a bidirectional execution flow where each middleware can intercept both the
-//! request (on the way to the handler) and the response (on the way back).
+//! Middleware are composed from inner to outer using the `layer` method,
+//! creating a bidirectional execution flow where each middleware can intercept
+//! both the request (on the way to the handler) and the response (on the way
+//! back).
 //!
 //! ```rust
 //! use prosody::consumer::middleware::*;
@@ -53,20 +54,23 @@
 //! This bidirectional flow allows each middleware to:
 //! - **Transform requests** before they reach inner layers
 //! - **Handle responses** and errors as they bubble back up
-//! - **Short-circuit execution** (e.g., validation failures, shutdown conditions)
+//! - **Short-circuit execution** (e.g., validation failures, shutdown
+//!   conditions)
 //! - **Add side effects** (e.g., logging, metrics, external notifications)
 //! - **Manage resources** (e.g., acquire/release permits, connections)
 //! - **Implement retry logic** with backoff and error classification
 //!
 //! ## Error Classification
 //!
-//! The middleware system uses structured error classification via [`ErrorCategory`]:
+//! The middleware system uses structured error classification via
+//! [`ErrorCategory`]:
 //!
 //! - **Transient** - Temporary failures that should be retried
 //! - **Permanent** - Business logic errors that should not be retried
 //! - **Terminal** - System-level failures requiring immediate shutdown
 //!
-//! Each middleware respects these classifications to determine appropriate handling behavior.
+//! Each middleware respects these classifications to determine appropriate
+//! handling behavior.
 
 use std::convert::Infallible;
 use std::fmt::Display;
@@ -196,8 +200,8 @@ pub trait HandlerMiddleware {
     /// ```rust
     /// // Builds from inner to outer: inner -> middle -> outer
     /// let middleware = inner_middleware
-    ///     .layer(middle_middleware)  // middle wraps inner
-    ///     .layer(outer_middleware);  // outer wraps middle+inner
+    ///     .layer(middle_middleware) // middle wraps inner
+    ///     .layer(outer_middleware); // outer wraps middle+inner
     ///
     /// // Request:  outer → middle → inner → handler
     /// // Response: handler → inner → middle → outer

@@ -13,13 +13,13 @@ use tokio::sync::{AcquireError, Semaphore};
 use tracing::debug;
 use validator::{Validate, ValidationErrors};
 
+use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
     HandlerMiddleware,
 };
-use crate::consumer::HandlerProvider;
 use crate::timers::Trigger;
 use crate::util::from_env_with_fallback;
 use crate::{Partition, Topic};
