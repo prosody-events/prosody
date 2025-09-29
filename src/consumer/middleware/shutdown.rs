@@ -11,6 +11,7 @@ use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
 };
 use crate::timers::Trigger;
+use crate::{Partition, Topic};
 use thiserror::Error;
 
 /// Middleware that checks if the partition is shutting down before running the
@@ -18,13 +19,10 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug)]
 pub struct ShutdownMiddleware;
 
-impl HandlerMiddleware for ShutdownMiddleware {
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
-    where
-        T: FallibleHandler,
-    {
-        ShutdownHandler(handler)
-    }
+/// A provider that wraps handlers with shutdown functionality.
+#[derive(Clone, Debug)]
+struct ShutdownProvider<T> {
+    provider: T,
 }
 
 /// Wraps a handler with shutdown functionality.
@@ -33,7 +31,32 @@ impl HandlerMiddleware for ShutdownMiddleware {
 /// processing, ensuring that no new messages are processed when a
 /// partition is being revoked.
 #[derive(Clone, Debug)]
-pub struct ShutdownHandler<T>(T);
+pub struct ShutdownHandler<T> {
+    handler: T,
+}
+
+impl HandlerMiddleware for ShutdownMiddleware {
+    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    where
+        T: HandlerProvider,
+        T::Handler: FallibleHandler,
+    {
+        ShutdownProvider { provider }
+    }
+}
+
+impl<T> HandlerProvider for ShutdownProvider<T>
+where
+    T: HandlerProvider<Handler: FallibleHandler>,
+{
+    type Handler = ShutdownHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        ShutdownHandler {
+            handler: self.provider.handler_for_partition(topic, partition),
+        }
+    }
+}
 
 impl<T> FallibleHandler for ShutdownHandler<T>
 where
@@ -64,7 +87,7 @@ where
             return Err(ShutdownError::Shutdown);
         }
 
-        self.0
+        self.handler
             .on_message(context, message)
             .await
             .map_err(ShutdownError::Handler)
@@ -77,7 +100,7 @@ where
         if context.should_shutdown() {
             return Err(ShutdownError::Shutdown);
         }
-        self.0
+        self.handler
             .on_timer(context, timer)
             .await
             .map_err(ShutdownError::Handler)

@@ -122,19 +122,6 @@ impl TelemetrySender {
         });
     }
 
-    pub fn handler_returned(&self, topic: Topic, partition: Partition, key: Key) {
-        let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
-            timestamp,
-            topic,
-            partition,
-            data: Data::Key(KeyEvent {
-                key,
-                state: KeyState::HandlerReturned,
-            }),
-        });
-    }
-
     pub fn middleware_exited(&self, topic: Topic, partition: Partition, key: Key) {
         let timestamp = self.clock.now();
         let _ = self.tx.try_send(TelemetryEvent {

@@ -147,7 +147,7 @@ use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::shutdown::ShutdownMiddleware;
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
-use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use crate::consumer::middleware::{CloneProvider, FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::heartbeat::Heartbeat;
@@ -335,20 +335,6 @@ pub trait EventHandler {
     ///
     /// A future that resolves when the shutdown is complete.
     fn shutdown(self) -> impl Future<Output = ()> + Send;
-}
-
-/// Implements `HandlerProvider` for any `EventHandler` that is clonable.
-///
-/// This allows a single handler instance to be used for all partitions.
-impl<T> HandlerProvider for T
-where
-    T: EventHandler + Clone + Send + Sync + 'static,
-{
-    type Handler = Self;
-
-    fn handler_for_partition(&self, _: Topic, _: Partition) -> Self::Handler {
-        self.clone()
-    }
 }
 
 /// Configuration for the Kafka consumer.
@@ -748,8 +734,11 @@ impl ProsodyConsumer {
         let middleware = concurrency_middleware
             .layer(ShutdownMiddleware)
             .layer(retry_middleware);
-        let handler = middleware.with_handler(handler);
-        Self::new(consumer_config, trigger_store_config, handler).await
+
+        let provider = CloneProvider::new(handler);
+        let provider = middleware.with_provider(provider);
+
+        Self::new(consumer_config, trigger_store_config, provider).await
     }
 
     /// Creates a new `ProsodyConsumer` with a low-latency strategy.
@@ -804,8 +793,10 @@ impl ProsodyConsumer {
             .layer(topic_middleware) // write to failure topic
             .layer(retry_middleware); // retry writing to failure topic
 
-        let handler = middleware.with_handler(handler);
-        Self::new(consumer_config, trigger_store_config, handler).await
+        let provider = CloneProvider::new(handler);
+        let provider = middleware.with_provider(provider);
+
+        Self::new(consumer_config, trigger_store_config, provider).await
     }
 
     /// Creates a new `ProsodyConsumer` with logging middleware for failure
@@ -845,12 +836,11 @@ impl ProsodyConsumer {
         let middleware = concurrency_middleware
             .layer(ShutdownMiddleware)
             .layer(LogMiddleware);
-        Self::new(
-            consumer_config,
-            trigger_store_config,
-            middleware.with_handler(handler),
-        )
-        .await
+
+        let provider = CloneProvider::new(handler);
+        let provider = middleware.with_provider(provider);
+
+        Self::new(consumer_config, trigger_store_config, provider).await
     }
 
     /// Returns the number of currently assigned partitions.

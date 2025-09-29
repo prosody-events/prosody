@@ -5,16 +5,25 @@
 //! observability and monitoring purposes.
 
 use crate::consumer::HandlerProvider;
+use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{FallibleEventHandler, FallibleHandler, HandlerMiddleware};
-use crate::telemetry::sender::TelemetrySender;
+use crate::telemetry::{Telemetry, partition::TelemetryPartitionSender};
 use crate::timers::Trigger;
+use crate::{Partition, Topic};
 
 /// Middleware that records telemetry events during message processing.
 #[derive(Clone, Debug)]
 pub struct TelemetryMiddleware {
-    sender: TelemetrySender,
+    telemetry: Telemetry,
+}
+
+/// A provider that records telemetry events during message processing.
+#[derive(Clone, Debug)]
+struct TelemetryProvider<T> {
+    provider: T,
+    telemetry: Telemetry,
 }
 
 /// A handler that records telemetry events during message processing.
@@ -24,35 +33,45 @@ pub struct TelemetryMiddleware {
 #[derive(Clone, Debug)]
 struct TelemetryHandler<T> {
     handler: T,
-    sender: TelemetrySender,
+    sender: TelemetryPartitionSender,
 }
 
 impl TelemetryMiddleware {
-    /// Creates a new `TelemetryMiddleware` with the provided telemetry sender.
+    /// Creates a new `TelemetryMiddleware` with the provided telemetry system.
     ///
     /// # Arguments
     ///
-    /// * `sender` - The telemetry sender for recording handler events
+    /// * `telemetry` - The telemetry system for creating partition senders
     #[must_use]
-    pub fn new(sender: TelemetrySender) -> Self {
-        Self { sender }
+    pub fn new(telemetry: Telemetry) -> Self {
+        Self { telemetry }
     }
 }
 
 impl HandlerMiddleware for TelemetryMiddleware {
-    /// Creates a new handler that records telemetry events from the provided
-    /// handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `handler` - The handler to wrap with telemetry recording capabilities
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
+    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
     where
-        T: FallibleHandler,
+        T: HandlerProvider,
+        T::Handler: FallibleHandler,
     {
+        TelemetryProvider {
+            provider,
+            telemetry: self.telemetry.clone(),
+        }
+    }
+}
+
+impl<T> HandlerProvider for TelemetryProvider<T>
+where
+    T: HandlerProvider<Handler: FallibleHandler>,
+{
+    type Handler = TelemetryHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        let partition_sender = self.telemetry.partition_sender(topic, partition);
         TelemetryHandler {
-            handler,
-            sender: self.sender.clone(),
+            handler: self.provider.handler_for_partition(topic, partition),
+            sender: partition_sender,
         }
     }
 }
@@ -69,7 +88,6 @@ where
     /// - `HandlerInvoked` when the handler is called
     /// - `HandlerSucceeded` when the handler completes successfully
     /// - `HandlerFailed` when the handler returns an error
-    /// - `HandlerReturned` when the handler completes (success or failure)
     ///
     /// # Arguments
     ///
@@ -83,27 +101,21 @@ where
     where
         C: EventContext,
     {
-        todo!()
-        // let topic = message.topic();
-        // let partition = message.partition();
-        // let key = message.key().clone();
-        //
-        // // Record handler invocation
-        // self.sender.handler_invoked(topic, partition, key.clone());
-        //
-        // // Process the message with the wrapped handler
-        // let result = self.handler.on_message(context, message).await;
-        //
-        // // Record success or failure
-        // match &result {
-        //     Ok(()) => self.sender.handler_succeeded(topic, partition,
-        // key.clone()),     Err(_) => self.sender.handler_failed(topic,
-        // partition, key.clone()), }
-        //
-        // // Always record that the handler returned
-        // self.sender.handler_returned(topic, partition, key.clone());
-        //
-        // result
+        let key = message.key().clone();
+
+        // Record handler invocation
+        self.sender.handler_invoked(key.clone());
+
+        // Process the message with the wrapped handler
+        let result = self.handler.on_message(context, message).await;
+
+        // Record success or failure
+        match &result {
+            Ok(()) => self.sender.handler_succeeded(key),
+            Err(_) => self.sender.handler_failed(key),
+        }
+
+        result
     }
 
     /// Processes a timer and records telemetry events for handler lifecycle.
@@ -112,7 +124,6 @@ where
     /// - `HandlerInvoked` when the handler is called
     /// - `HandlerSucceeded` when the handler completes successfully
     /// - `HandlerFailed` when the handler returns an error
-    /// - `HandlerReturned` when the handler completes (success or failure)
     ///
     /// # Arguments
     ///
@@ -126,27 +137,21 @@ where
     where
         C: EventContext,
     {
-        todo!()
-        // let topic = trigger.topic;
-        // let partition = trigger.partition;
-        // let key = trigger.key.clone();
-        //
-        // // Record handler invocation
-        // self.sender.handler_invoked(topic, partition, key.clone());
-        //
-        // // Process the timer with the wrapped handler
-        // let result = self.handler.on_timer(context, trigger).await;
-        //
-        // // Record success or failure
-        // match &result {
-        //     Ok(_) => self.sender.handler_succeeded(topic, partition,
-        // key.clone()),     Err(_) => self.sender.handler_failed(topic,
-        // partition, key.clone()), }
-        //
-        // // Always record that the handler returned
-        // self.sender.handler_returned(topic, partition, key);
-        //
-        // result
+        let key = trigger.key.clone();
+
+        // Record handler invocation
+        self.sender.handler_invoked(key.clone());
+
+        // Process the timer with the wrapped handler
+        let result = self.handler.on_timer(context, trigger).await;
+
+        // Record success or failure
+        match &result {
+            Ok(()) => self.sender.handler_succeeded(key),
+            Err(_) => self.sender.handler_failed(key),
+        }
+
+        result
     }
 }
 

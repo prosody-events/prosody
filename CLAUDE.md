@@ -513,6 +513,51 @@ make reset      # Clean up containers/volumes
 - Use `LazyLock` for expensive static initialization
 - Environment variable parsing with typed fallbacks in builders
 
+### File Organization
+
+**Topologically sort declarations by dependencies within files:**
+
+1. **Constants** - at the top
+2. **Statics** - after constants
+3. **Types** - ordered highest-level to lowest-level dependencies
+4. **Implementations** - ordered highest-level to lowest-level dependencies
+5. **Functions** - standalone functions after implementations
+6. **Errors** - at the bottom
+
+```rust
+const MAX_RETRIES: usize = 3;
+
+static GLOBAL_CONFIG: LazyLock<Configuration> = LazyLock::new(|| {
+    Configuration::default()
+});
+
+#[derive(Debug)]
+pub struct Configuration {
+    max_permits: usize,
+}
+
+#[derive(Debug)]
+pub struct Manager {
+    config: Configuration,
+}
+
+impl Configuration {
+    pub fn new() -> Self { /* ... */ }
+}
+
+impl Manager {
+    pub fn new(config: Configuration) -> Self { /* ... */ }
+}
+
+pub fn helper_function() { /* ... */ }
+
+#[derive(Debug, Error)]
+pub enum ManagerError {
+    #[error("Configuration error")]
+    Config,
+}
+```
+
 ## Development Best Practices
 
 - Always run `cargo clippy --tests` and fix the lints after changes.

@@ -182,7 +182,7 @@ impl<T> HighLevelClient<T> {
     /// - Consumer initialization fails.
     pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
     where
-        T: FallibleHandler,
+        T: FallibleHandler + Clone,
     {
         let mut guard = self.consumer.lock().await;
         let consumer_ref = &mut *guard;

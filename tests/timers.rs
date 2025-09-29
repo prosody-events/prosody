@@ -12,6 +12,7 @@ use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::message::UncommittedMessage,
+    consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::UncommittedTimer,
@@ -189,6 +190,7 @@ impl TestEnvironment {
             timer_tx,
             message_tx,
         };
+        let handler_provider = CloneProvider::new(handler);
 
         let group_id = format!("{}-consumer-{}", test_name, Uuid::new_v4());
         let consumer_config = ConsumerConfiguration::builder()
@@ -201,7 +203,7 @@ impl TestEnvironment {
         let consumer = ProsodyConsumer::new(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
-            handler,
+            handler_provider,
         )
         .await?;
 

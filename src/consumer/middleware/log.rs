@@ -10,30 +10,48 @@ use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, HandlerMiddleware,
 };
 use crate::timers::Trigger;
+use crate::{Partition, Topic};
 use tracing::error;
 
 /// Middleware that logs failures during message processing.
 #[derive(Copy, Clone, Debug)]
 pub struct LogMiddleware;
 
+/// A provider that logs failures during message processing.
+#[derive(Clone, Debug)]
+struct LogProvider<T> {
+    provider: T,
+}
+
 /// A handler that logs failures during message processing.
 ///
 /// Wraps another handler and adds logging capabilities while preserving the
 /// original error handling behavior.
 #[derive(Clone, Debug)]
-struct LogHandler<T>(T);
+struct LogHandler<T> {
+    handler: T,
+}
 
 impl HandlerMiddleware for LogMiddleware {
-    /// Creates a new handler that logs failures from the provided handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `handler` - The handler to wrap with logging capabilities
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
+    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
     where
-        T: FallibleHandler,
+        T: HandlerProvider,
+        T::Handler: FallibleHandler,
     {
-        LogHandler(handler)
+        LogProvider { provider }
+    }
+}
+
+impl<T> HandlerProvider for LogProvider<T>
+where
+    T: HandlerProvider<Handler: FallibleHandler>,
+{
+    type Handler = LogHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        LogHandler {
+            handler: self.provider.handler_for_partition(topic, partition),
+        }
     }
 }
 
@@ -43,22 +61,12 @@ where
 {
     type Error = T::Error;
 
-    /// Processes a message and logs any errors that occur.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The context of the message being processed
-    /// * `message` - The message to process
-    ///
-    /// # Errors
-    ///
-    /// Returns the original error from the wrapped handler after logging it
     async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the message with the wrapped handler
-        let Err(error) = self.0.on_message(context, message).await else {
+        let Err(error) = self.handler.on_message(context, message).await else {
             return Ok(());
         };
 
@@ -83,7 +91,7 @@ where
         C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
-        let Err(error) = self.0.on_timer(context, trigger).await else {
+        let Err(error) = self.handler.on_timer(context, trigger).await else {
             return Ok(());
         };
 
@@ -104,35 +112,4 @@ where
     }
 }
 
-impl<T> FallibleEventHandler for LogHandler<T>
-where
-    T: FallibleHandler,
-{
-    fn on_message_error(&self, error: &Self::Error) {
-        match error.classify_error() {
-            ErrorCategory::Transient => {
-                error!("transient error occurred during processing: {error:#}; discarding message");
-            }
-            ErrorCategory::Permanent => {
-                error!("permanent error occurred during processing: {error:#}; discarding message");
-            }
-            ErrorCategory::Terminal => {
-                error!("terminal error occurred during processing: {error:#}; aborting processing");
-            }
-        }
-    }
-
-    fn on_timer_error(&self, error: &Self::Error) {
-        match error.classify_error() {
-            ErrorCategory::Transient => {
-                error!("transient error occurred during processing: {error:#}; discarding timer");
-            }
-            ErrorCategory::Permanent => {
-                error!("permanent error occurred during processing: {error:#}; discarding timer");
-            }
-            ErrorCategory::Terminal => {
-                error!("terminal error occurred during processing: {error:#}; aborting processing");
-            }
-        }
-    }
-}
+impl<T> FallibleEventHandler for LogHandler<T> where T: FallibleHandler {}

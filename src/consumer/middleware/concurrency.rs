@@ -20,6 +20,7 @@ use crate::consumer::middleware::{
 };
 use crate::timers::Trigger;
 use crate::util::from_env_with_fallback;
+use crate::{Partition, Topic};
 
 /// Configuration for global concurrency limiting.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -33,6 +34,32 @@ pub struct ConcurrencyLimitConfiguration {
     pub max_permits: usize,
 }
 
+/// Middleware that applies global concurrency limits.
+///
+/// This middleware should be composed **first** in the middleware chain to
+/// ensure the concurrency permit is acquired as late as possible - right before
+/// the user handler executes.
+#[derive(Clone, Debug)]
+pub struct ConcurrencyLimitMiddleware {
+    global_limit: Arc<Semaphore>,
+}
+
+/// A provider that enforces global concurrency limits.
+#[derive(Clone, Debug)]
+struct ConcurrencyLimitProvider<T> {
+    provider: T,
+    global_limit: Arc<Semaphore>,
+}
+
+/// A handler that enforces global concurrency limits.
+#[derive(Clone, Debug)]
+struct ConcurrencyLimitHandler<T> {
+    handler: T,
+    global_limit: Arc<Semaphore>,
+}
+
+// === IMPLEMENTATIONS (highest-level to lowest-level dependencies) ===
+
 impl ConcurrencyLimitConfiguration {
     /// Creates a new [`ConcurrencyLimitConfigurationBuilder`].
     ///
@@ -43,16 +70,6 @@ impl ConcurrencyLimitConfiguration {
     pub fn builder() -> ConcurrencyLimitConfigurationBuilder {
         ConcurrencyLimitConfigurationBuilder::default()
     }
-}
-
-/// Middleware that applies global concurrency limits.
-///
-/// This middleware should be composed **first** in the middleware chain to
-/// ensure the concurrency permit is acquired as late as possible - right before
-/// the user handler executes.
-#[derive(Clone, Debug)]
-pub struct ConcurrencyLimitMiddleware {
-    global_limit: Arc<Semaphore>,
 }
 
 impl ConcurrencyLimitMiddleware {
@@ -76,44 +93,28 @@ impl ConcurrencyLimitMiddleware {
     }
 }
 
-/// A handler that enforces global concurrency limits.
-#[derive(Clone, Debug)]
-struct ConcurrencyLimitHandler<T> {
-    handler: T,
-    global_limit: Arc<Semaphore>,
-}
-
-/// Error type for concurrency limit failures.
-#[derive(Debug, Error)]
-pub enum ConcurrencyLimitError<E> {
-    /// Error from the wrapped handler.
-    #[error(transparent)]
-    Handler(E),
-
-    /// Error from permit acquisition (semaphore closed).
-    #[error("Failed to acquire concurrency permit: {0:#}")]
-    PermitAcquisition(#[from] AcquireError),
-}
-
-impl<E> ClassifyError for ConcurrencyLimitError<E>
-where
-    E: ClassifyError,
-{
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            ConcurrencyLimitError::Handler(error) => error.classify_error(),
-            ConcurrencyLimitError::PermitAcquisition(_) => ErrorCategory::Terminal,
+impl HandlerMiddleware for ConcurrencyLimitMiddleware {
+    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
+    where
+        T: HandlerProvider,
+        T::Handler: FallibleHandler,
+    {
+        ConcurrencyLimitProvider {
+            provider,
+            global_limit: self.global_limit.clone(),
         }
     }
 }
 
-impl HandlerMiddleware for ConcurrencyLimitMiddleware {
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
-    where
-        T: FallibleHandler,
-    {
+impl<T> HandlerProvider for ConcurrencyLimitProvider<T>
+where
+    T: HandlerProvider<Handler: FallibleHandler>,
+{
+    type Handler = ConcurrencyLimitHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         ConcurrencyLimitHandler {
-            handler,
+            handler: self.provider.handler_for_partition(topic, partition),
             global_limit: self.global_limit.clone(),
         }
     }
@@ -159,3 +160,27 @@ where
 }
 
 impl<T> FallibleEventHandler for ConcurrencyLimitHandler<T> where T: FallibleHandler {}
+
+impl<E> ClassifyError for ConcurrencyLimitError<E>
+where
+    E: ClassifyError,
+{
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            ConcurrencyLimitError::Handler(error) => error.classify_error(),
+            ConcurrencyLimitError::PermitAcquisition(_) => ErrorCategory::Terminal,
+        }
+    }
+}
+
+/// Error type for concurrency limit failures.
+#[derive(Debug, Error)]
+pub enum ConcurrencyLimitError<E> {
+    /// Error from the wrapped handler.
+    #[error(transparent)]
+    Handler(E),
+
+    /// Error from permit acquisition (semaphore closed).
+    #[error("Failed to acquire concurrency permit: {0:#}")]
+    PermitAcquisition(#[from] AcquireError),
+}

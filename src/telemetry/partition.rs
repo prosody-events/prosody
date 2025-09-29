@@ -134,19 +134,6 @@ impl TelemetryPartitionSender {
         });
     }
 
-    pub fn handler_returned(&self, key: Key) {
-        let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
-            timestamp,
-            topic: self.topic,
-            partition: self.partition,
-            data: Data::Key(KeyEvent {
-                key,
-                state: KeyState::HandlerReturned,
-            }),
-        });
-    }
-
     pub fn middleware_exited(&self, key: Key) {
         let timestamp = self.clock.now();
         let _ = self.tx.try_send(TelemetryEvent {

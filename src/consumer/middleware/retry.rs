@@ -22,6 +22,7 @@ use crate::consumer::middleware::{
 use crate::consumer::{EventHandler, HandlerProvider, Keyed, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
+use crate::{Partition, Topic};
 
 /// Configuration for retry middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -100,6 +101,13 @@ impl RetryMiddleware {
     }
 }
 
+/// A provider that retries failed message processing attempts.
+#[derive(Clone, Debug)]
+struct RetryProvider<T> {
+    provider: T,
+    config: RetryConfiguration,
+}
+
 /// A handler wrapped with retry functionality.
 #[derive(Clone, Debug)]
 struct RetryHandler<T> {
@@ -132,15 +140,30 @@ impl<T> RetryHandler<T> {
 }
 
 impl HandlerMiddleware for RetryMiddleware {
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
+    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
     where
-        T: FallibleHandler,
+        T: HandlerProvider,
+        T::Handler: FallibleHandler,
     {
+        RetryProvider {
+            provider,
+            config: self.0.clone(),
+        }
+    }
+}
+
+impl<T> HandlerProvider for RetryProvider<T>
+where
+    T: HandlerProvider<Handler: FallibleHandler>,
+{
+    type Handler = RetryHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         RetryHandler {
-            base_delay_millis: self.0.base.as_millis() as u64,
-            max_delay_millis: self.0.max_delay.as_millis() as u64,
-            max_retries: self.0.max_retries,
-            handler,
+            base_delay_millis: self.config.base.as_millis() as u64,
+            max_delay_millis: self.config.max_delay.as_millis() as u64,
+            max_retries: self.config.max_retries,
+            handler: self.provider.handler_for_partition(topic, partition),
         }
     }
 }

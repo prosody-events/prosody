@@ -10,6 +10,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{EventHandler, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
+use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::future::Future;
@@ -18,6 +19,7 @@ pub mod concurrency;
 pub mod log;
 pub mod retry;
 pub mod shutdown;
+pub mod telemetry;
 pub mod topic;
 
 /// Categorizes errors in message processing.
@@ -63,9 +65,10 @@ pub trait HandlerMiddleware {
     ///
     /// A new handler that implements both `HandlerProvider` and
     /// `FallibleHandler`.
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
+    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
     where
-        T: FallibleHandler;
+        T: HandlerProvider,
+        T::Handler: FallibleHandler;
 
     /// Adds a middleware layer on top of this middleware (inner-to-outer
     /// composition).
@@ -109,7 +112,7 @@ pub trait HandlerMiddleware {
 }
 
 /// Defines a handler that can fail during message processing.
-pub trait FallibleHandler: Clone + Send + Sync + 'static {
+pub trait FallibleHandler: Send + Sync + 'static {
     /// The error type returned by this handler.
     type Error: ClassifyError + Display + Send;
 
@@ -185,13 +188,14 @@ where
     M1: HandlerMiddleware,
     M2: HandlerMiddleware,
 {
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
+    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
     where
-        T: FallibleHandler,
+        T: HandlerProvider,
+        T::Handler: FallibleHandler,
     {
         // Apply the first middleware to the result of applying the second middleware
         // This matches Tower's pattern where M1 (outer) wraps M2 (inner)
-        self.0.with_handler(self.1.with_handler(handler))
+        self.0.with_provider(self.1.with_provider(provider))
     }
 }
 
@@ -285,3 +289,54 @@ where
 
     async fn shutdown(self) {}
 }
+
+#[derive(Clone, Debug)]
+pub struct CloneProvider<T>(T);
+
+impl<T> CloneProvider<T> {
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+impl<T> HandlerProvider for CloneProvider<T>
+where
+    T: FallibleHandler + Clone + Send + Sync + 'static,
+{
+    type Handler = Self;
+
+    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> FallibleHandler for CloneProvider<T>
+where
+    T: FallibleHandler,
+{
+    type Error = T::Error;
+
+    fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        C: EventContext,
+    {
+        self.0.on_message(context, message)
+    }
+
+    fn on_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        C: EventContext,
+    {
+        self.0.on_timer(context, trigger)
+    }
+}
+
+impl<T> FallibleEventHandler for CloneProvider<T> where T: FallibleHandler {}

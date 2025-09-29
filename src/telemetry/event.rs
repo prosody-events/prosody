@@ -34,6 +34,5 @@ pub enum KeyState {
     HandlerInvoked,    // User handler function is called
     HandlerSucceeded,  // User handler completed successfully
     HandlerFailed,     // User handler returned an error
-    HandlerReturned,   // User handler function has returned
     MiddlewareExited,  // Middleware layer completes processing
 }

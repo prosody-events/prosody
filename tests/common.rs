@@ -23,7 +23,7 @@ use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration}
 use prosody::cassandra::config::CassandraConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
-use prosody::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
+use prosody::consumer::middleware::{ClassifyError, CloneProvider, ErrorCategory, FallibleHandler};
 use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
@@ -232,12 +232,13 @@ pub fn spawn_consumers(
         let mut shutdown_rx = shutdown_rx.clone();
 
         let handler = TestHandler { messages_tx };
+        let handler_provider = CloneProvider::new(handler);
 
         tasks.spawn(async move {
-            let consumer = ProsodyConsumer::new::<TestHandler>(
+            let consumer = ProsodyConsumer::new(
                 &consumer_config,
                 &create_cassandra_trigger_store_config(),
-                handler,
+                handler_provider,
             )
             .await?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?; // Wait for shutdown signal

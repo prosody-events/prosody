@@ -19,6 +19,7 @@ use crate::consumer::{HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
 use crate::util::from_env;
+use crate::{Partition, Topic as TopicType};
 use serde_json::json;
 
 /// Configuration for failure topic middleware.
@@ -91,6 +92,15 @@ impl FailureTopicMiddleware {
     }
 }
 
+/// A provider that wraps handlers with failure topic functionality.
+#[derive(Clone, Debug)]
+struct FailureTopicProvider<T> {
+    provider: T,
+    config: FailureTopicConfiguration,
+    producer: ProsodyProducer,
+    group_id: String,
+}
+
 /// A handler wrapped with failure topic functionality.
 #[derive(Clone, Debug)]
 struct FailureTopicHandler<T> {
@@ -101,15 +111,32 @@ struct FailureTopicHandler<T> {
 }
 
 impl HandlerMiddleware for FailureTopicMiddleware {
-    fn with_handler<T>(&self, handler: T) -> impl HandlerProvider + FallibleHandler
+    fn with_provider<T>(&self, provider: T) -> impl HandlerProvider<Handler: FallibleHandler>
     where
-        T: FallibleHandler,
+        T: HandlerProvider,
+        T::Handler: FallibleHandler,
     {
+        FailureTopicProvider {
+            provider,
+            config: self.config.clone(),
+            producer: self.producer.clone(),
+            group_id: self.group_id.clone(),
+        }
+    }
+}
+
+impl<T> HandlerProvider for FailureTopicProvider<T>
+where
+    T: HandlerProvider<Handler: FallibleHandler>,
+{
+    type Handler = FailureTopicHandler<T::Handler>;
+
+    fn handler_for_partition(&self, topic: TopicType, partition: Partition) -> Self::Handler {
         FailureTopicHandler {
             topic: self.config.failure_topic.as_str().into(),
             producer: self.producer.clone(),
             group_id: self.group_id.clone(),
-            handler,
+            handler: self.provider.handler_for_partition(topic, partition),
         }
     }
 }
