@@ -3,16 +3,17 @@
 //! This module provides logging capabilities that wrap handlers and log errors
 //! according to their severity while maintaining the original error flow.
 
-use crate::consumer::HandlerProvider;
+use tracing::error;
+
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
     HandlerMiddleware,
 };
+use crate::consumer::HandlerProvider;
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
-use tracing::error;
 
 /// Middleware that logs failures during message processing.
 #[derive(Copy, Clone, Debug)]

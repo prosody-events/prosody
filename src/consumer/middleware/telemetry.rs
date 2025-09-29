@@ -4,13 +4,12 @@
 //! handler lifecycle events (invoked, returned, succeeded, failed) for
 //! observability and monitoring purposes.
 
-use crate::consumer::HandlerProvider;
-use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     FallibleEventHandler, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
+use crate::consumer::{HandlerProvider, Keyed};
 use crate::telemetry::{Telemetry, partition::TelemetryPartitionSender};
 use crate::timers::Trigger;
 use crate::{Partition, Topic};

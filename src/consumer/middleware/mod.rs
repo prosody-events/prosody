@@ -1,19 +1,82 @@
 //! Middleware for message processing.
 //!
 //! This module provides a composable framework for handling cross-cutting
-//! concerns during message processing including failure recovery, concurrency
-//! limiting, lifecycle management, and observability. Middleware can be
-//! combined using the `layer` method to create processing pipelines.
+//! concerns during message processing including retry logic, concurrency
+//! limiting, shutdown handling, telemetry recording, failure topic routing,
+//! and logging. Middleware components can be combined using the `layer` method
+//! to create processing pipelines.
+//!
+//! ## Available Middleware
+//!
+//! See the individual middleware modules for specific implementations:
+//! - **`concurrency`** - Global concurrency limiting with semaphore permits
+//! - **`retry`** - Exponential backoff retry logic for transient failures
+//! - **`shutdown`** - Graceful partition revocation handling
+//! - **`telemetry`** - Handler lifecycle event recording for observability
+//! - **`topic`** - Failure topic routing for permanent failures
+//! - **`log`** - Error logging with severity-based categorization
+//!
+//! ## Middleware Composition
+//!
+//! Middleware are composed from inner to outer using the `layer` method, creating
+//! a bidirectional execution flow where each middleware can intercept both the
+//! request (on the way to the handler) and the response (on the way back).
+//!
+//! ```rust
+//! use prosody::consumer::middleware::*;
+//!
+//! // Compose middleware from innermost to outermost
+//! let middleware = inner_middleware
+//!     .layer(middle_middleware)
+//!     .layer(outer_middleware);
+//! ```
+//!
+//! ### Execution Flow Pattern
+//!
+//! Each middleware wraps the inner layers, creating an "onion" pattern where
+//! execution flows through all layers to reach the handler, then back out:
+//!
+//! **Request Path (outer → inner):**
+//! 1. `OuterMiddleware` - Pre-processing, setup, validation
+//! 2. `MiddleMiddleware` - Transformation, routing decisions
+//! 3. `InnerMiddleware` - Resource acquisition, final checks
+//! 4. **User Handler** - Actual message/timer processing
+//!
+//! **Response Path (inner → outer):**
+//! 4. **User Handler** - Returns success or error result
+//! 3. `InnerMiddleware` - Resource cleanup, immediate error handling
+//! 2. `MiddleMiddleware` - Error classification, retry logic, side effects
+//! 1. `OuterMiddleware` - Final error handling, logging, reporting
+//!
+//! ### Middleware Capabilities
+//!
+//! This bidirectional flow allows each middleware to:
+//! - **Transform requests** before they reach inner layers
+//! - **Handle responses** and errors as they bubble back up
+//! - **Short-circuit execution** (e.g., validation failures, shutdown conditions)
+//! - **Add side effects** (e.g., logging, metrics, external notifications)
+//! - **Manage resources** (e.g., acquire/release permits, connections)
+//! - **Implement retry logic** with backoff and error classification
+//!
+//! ## Error Classification
+//!
+//! The middleware system uses structured error classification via [`ErrorCategory`]:
+//!
+//! - **Transient** - Temporary failures that should be retried
+//! - **Permanent** - Business logic errors that should not be retried
+//! - **Terminal** - System-level failures requiring immediate shutdown
+//!
+//! Each middleware respects these classifications to determine appropriate handling behavior.
 
-use crate::consumer::HandlerProvider;
-use crate::consumer::event_context::EventContext;
-use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, Uncommitted};
-use crate::timers::{Trigger, UncommittedTimer};
-use crate::{Partition, Topic};
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::future::Future;
+
+use crate::consumer::event_context::EventContext;
+use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::{EventHandler, HandlerProvider, Uncommitted};
+use crate::timers::{Trigger, UncommittedTimer};
+use crate::{Partition, Topic};
 
 pub mod concurrency;
 pub mod log;
@@ -79,6 +142,7 @@ pub trait FallibleHandlerProvider: Send + Sync + 'static {
 
 /// Defines middleware for message processing.
 pub trait HandlerMiddleware {
+    /// The provider type that wraps another fallible handler provider.
     type Provider<T: FallibleHandlerProvider>: FallibleHandlerProvider;
 
     /// Wraps a handler provider with this middleware.
@@ -99,16 +163,25 @@ pub trait HandlerMiddleware {
     /// composition).
     ///
     /// The new middleware becomes the outermost layer in the processing stack,
-    /// executing before (and wrapping around) the existing middleware stack.
+    /// creating a bidirectional wrapper around the existing middleware stack.
     ///
-    /// # Execution Order
+    /// # Execution Flow
     ///
-    /// When composing `inner.layer(outer)`, the execution flows as:
-    /// 1. `outer` middleware pre-processing
-    /// 2. `inner` middleware pre-processing
+    /// When composing `inner.layer(outer)`, execution flows through both
+    /// request and response phases:
+    ///
+    /// **Request Phase (outer → inner):**
+    /// 1. `outer` middleware request handling
+    /// 2. `inner` middleware request handling
     /// 3. User handler execution
-    /// 4. `inner` middleware post-processing
-    /// 5. `outer` middleware post-processing
+    ///
+    /// **Response Phase (inner → outer):**
+    /// 3. User handler returns result/error
+    /// 2. `inner` middleware response handling
+    /// 1. `outer` middleware response handling
+    ///
+    /// Each middleware can transform the request, short-circuit execution,
+    /// handle errors, and add side effects on both phases.
     ///
     /// # Arguments
     ///
@@ -120,13 +193,14 @@ pub trait HandlerMiddleware {
     ///
     /// # Example
     ///
-    /// ```
-    /// // Builds from inner to outer: concurrency -> shutdown -> retry
-    /// let middleware = concurrency_middleware
-    ///     .layer(shutdown_middleware) // shutdown wraps concurrency
-    ///     .layer(retry_middleware); // retry wraps shutdown+concurrency
+    /// ```rust
+    /// // Builds from inner to outer: inner -> middle -> outer
+    /// let middleware = inner_middleware
+    ///     .layer(middle_middleware)  // middle wraps inner
+    ///     .layer(outer_middleware);  // outer wraps middle+inner
     ///
-    /// // Execution: retry -> shutdown -> concurrency -> handler -> concurrency -> shutdown -> retry
+    /// // Request:  outer → middle → inner → handler
+    /// // Response: handler → inner → middle → outer
     /// ```
     fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self>
     where
@@ -204,32 +278,17 @@ pub trait FallibleHandler: Send + Sync + 'static {
         C: EventContext;
 }
 
+/// A provider that clones the wrapped handler for each partition.
+///
+/// This provider is useful when you have a handler that can be safely cloned
+/// and you want to use the same handler instance logic across multiple
+/// partitions.
+#[derive(Clone, Debug)]
+pub struct CloneProvider<T>(T);
+
 /// A composition of two middleware components.
 #[derive(Clone, Debug)]
 pub struct ComposedMiddleware<M1, M2>(M1, M2);
-
-impl<M1, M2> HandlerMiddleware for ComposedMiddleware<M1, M2>
-where
-    M1: HandlerMiddleware,
-    M2: HandlerMiddleware,
-{
-    type Provider<T: FallibleHandlerProvider> = M1::Provider<M2::Provider<T>>;
-
-    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
-    where
-        T: FallibleHandlerProvider,
-    {
-        // Apply the first middleware to the result of applying the second middleware
-        // This matches Tower's pattern where M1 (outer) wraps M2 (inner)
-        self.0.with_provider(self.1.with_provider(provider))
-    }
-}
-
-impl ClassifyError for Infallible {
-    fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Terminal
-    }
-}
 
 /// Provides default `EventHandler` implementation for types that implement
 /// `FallibleHandler`.
@@ -257,8 +316,91 @@ pub trait FallibleEventHandler: FallibleHandler {
     fn on_timer_error(&self, _error: &Self::Error) {}
 }
 
-/// Default `EventHandler` implementation for any type that implements
-/// `FallibleEventHandler`.
+impl<T> CloneProvider<T> {
+    /// Creates a new `CloneProvider` that wraps the given handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` - The handler to wrap.
+    ///
+    /// # Returns
+    ///
+    /// A new `CloneProvider` instance.
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+impl<M1, M2> HandlerMiddleware for ComposedMiddleware<M1, M2>
+where
+    M1: HandlerMiddleware,
+    M2: HandlerMiddleware,
+{
+    type Provider<T: FallibleHandlerProvider> = M1::Provider<M2::Provider<T>>;
+
+    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
+    where
+        T: FallibleHandlerProvider,
+    {
+        // Apply the first middleware to the result of applying the second middleware
+        // This matches Tower's pattern where M1 (outer) wraps M2 (inner)
+        self.0.with_provider(self.1.with_provider(provider))
+    }
+}
+
+impl<T> FallibleHandlerProvider for CloneProvider<T>
+where
+    T: FallibleHandler + Clone + Send + Sync + 'static,
+{
+    type Handler = T;
+
+    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
+        self.0.clone()
+    }
+}
+
+impl<T> HandlerProvider for CloneProvider<T>
+where
+    T: FallibleHandler + Clone + Send + Sync + 'static,
+{
+    type Handler = Self;
+
+    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> FallibleHandler for CloneProvider<T>
+where
+    T: FallibleHandler,
+{
+    type Error = T::Error;
+
+    fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        C: EventContext,
+    {
+        self.0.on_message(context, message)
+    }
+
+    fn on_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        C: EventContext,
+    {
+        self.0.on_timer(context, trigger)
+    }
+}
+
+impl<T> FallibleEventHandler for CloneProvider<T> where T: FallibleHandler {}
+
 impl<T> EventHandler for T
 where
     T: FallibleEventHandler,
@@ -316,78 +458,8 @@ where
     async fn shutdown(self) {}
 }
 
-/// A provider that clones the wrapped handler for each partition.
-///
-/// This provider is useful when you have a handler that can be safely cloned
-/// and you want to use the same handler instance logic across multiple
-/// partitions.
-#[derive(Clone, Debug)]
-pub struct CloneProvider<T>(T);
-
-impl<T> CloneProvider<T> {
-    /// Creates a new `CloneProvider` that wraps the given handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `inner` - The handler to wrap.
-    ///
-    /// # Returns
-    ///
-    /// A new `CloneProvider` instance.
-    pub fn new(inner: T) -> Self {
-        Self(inner)
+impl ClassifyError for Infallible {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Terminal
     }
 }
-
-impl<T> FallibleHandlerProvider for CloneProvider<T>
-where
-    T: FallibleHandler + Clone + Send + Sync + 'static,
-{
-    type Handler = T;
-
-    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
-        self.0.clone()
-    }
-}
-
-impl<T> HandlerProvider for CloneProvider<T>
-where
-    T: FallibleHandler + Clone + Send + Sync + 'static,
-{
-    type Handler = Self;
-
-    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
-        Self(self.0.clone())
-    }
-}
-
-impl<T> FallibleHandler for CloneProvider<T>
-where
-    T: FallibleHandler,
-{
-    type Error = T::Error;
-
-    fn on_message<C>(
-        &self,
-        context: C,
-        message: ConsumerMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
-    where
-        C: EventContext,
-    {
-        self.0.on_message(context, message)
-    }
-
-    fn on_timer<C>(
-        &self,
-        context: C,
-        trigger: Trigger,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
-    where
-        C: EventContext,
-    {
-        self.0.on_timer(context, trigger)
-    }
-}
-
-impl<T> FallibleEventHandler for CloneProvider<T> where T: FallibleHandler {}

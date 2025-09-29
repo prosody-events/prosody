@@ -5,20 +5,21 @@
 //! ensuring that the limit is applied as late as possible in the processing
 //! pipeline.
 
-use derive_builder::Builder;
 use std::sync::Arc;
+
+use derive_builder::Builder;
 use thiserror::Error;
 use tokio::sync::{AcquireError, Semaphore};
 use tracing::debug;
 use validator::{Validate, ValidationErrors};
 
-use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
     HandlerMiddleware,
 };
+use crate::consumer::HandlerProvider;
 use crate::timers::Trigger;
 use crate::util::from_env_with_fallback;
 use crate::{Partition, Topic};
@@ -57,6 +58,18 @@ pub struct ConcurrencyLimitProvider<T> {
 pub struct ConcurrencyLimitHandler<T> {
     handler: T,
     global_limit: Arc<Semaphore>,
+}
+
+/// Error type for concurrency limit failures.
+#[derive(Debug, Error)]
+pub enum ConcurrencyLimitError<E> {
+    /// Error from the wrapped handler.
+    #[error(transparent)]
+    Handler(E),
+
+    /// Error from permit acquisition (semaphore closed).
+    #[error("Failed to acquire concurrency permit: {0:#}")]
+    PermitAcquisition(#[from] AcquireError),
 }
 
 impl ConcurrencyLimitConfiguration {
@@ -185,16 +198,4 @@ where
             ConcurrencyLimitError::PermitAcquisition(_) => ErrorCategory::Terminal,
         }
     }
-}
-
-/// Error type for concurrency limit failures.
-#[derive(Debug, Error)]
-pub enum ConcurrencyLimitError<E> {
-    /// Error from the wrapped handler.
-    #[error(transparent)]
-    Handler(E),
-
-    /// Error from permit acquisition (semaphore closed).
-    #[error("Failed to acquire concurrency permit: {0:#}")]
-    PermitAcquisition(#[from] AcquireError),
 }

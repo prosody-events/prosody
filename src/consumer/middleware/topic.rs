@@ -5,11 +5,11 @@
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use derive_builder::Builder;
+use serde_json::json;
 use thiserror::Error;
 use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
-use crate::Topic;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
@@ -20,8 +20,7 @@ use crate::consumer::{HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
 use crate::util::from_env;
-use crate::{Partition, Topic as TopicType};
-use serde_json::json;
+use crate::{Partition, Topic, Topic as TopicType};
 
 /// Configuration for failure topic middleware.
 #[derive(Builder, Clone, Debug, Validate)]

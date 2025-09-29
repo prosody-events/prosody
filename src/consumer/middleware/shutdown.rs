@@ -4,16 +4,17 @@
 //! partition is being revoked, ensuring proper handling of in-flight messages
 //! and preventing new message processing.
 
-use crate::consumer::HandlerProvider;
+use thiserror::Error;
+
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
     HandlerMiddleware,
 };
+use crate::consumer::HandlerProvider;
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
-use thiserror::Error;
 
 /// Middleware that checks if the partition is shutting down before running the
 /// handler, preventing other middleware from delaying the shutdown.
