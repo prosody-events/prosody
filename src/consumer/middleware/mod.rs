@@ -78,7 +78,7 @@ use std::future::Future;
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, HandlerProvider, Uncommitted};
+use crate::consumer::{EventHandler, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::{Partition, Topic};
 
@@ -363,17 +363,6 @@ where
     }
 }
 
-impl<T> HandlerProvider for CloneProvider<T>
-where
-    T: FallibleHandler + Clone + Send + Sync + 'static,
-{
-    type Handler = Self;
-
-    fn handler_for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Handler {
-        Self(self.0.clone())
-    }
-}
-
 impl<T> FallibleHandler for CloneProvider<T>
 where
     T: FallibleHandler,
@@ -402,8 +391,6 @@ where
         self.0.on_timer(context, trigger)
     }
 }
-
-impl<T> FallibleEventHandler for CloneProvider<T> where T: FallibleHandler {}
 
 impl<T> EventHandler for T
 where

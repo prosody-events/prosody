@@ -178,8 +178,7 @@ where
 
 impl<T> HandlerProvider for RetryProvider<T>
 where
-    T: HandlerProvider,
-    T::Handler: FallibleHandler,
+    T: FallibleHandlerProvider,
 {
     type Handler = RetryHandler<T::Handler>;
 

@@ -55,13 +55,7 @@ async fn test_partition_manager_capacity() {
     let handler = TestHandler::new();
     let mut config = default_config();
     config.buffer_size = 5;
-    let partition_manager = PartitionManager::new(
-        config,
-        handler.clone(),
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send messages up to buffer capacity
     for i in 0..5u8 {
@@ -87,13 +81,7 @@ async fn test_partition_manager_ordering() {
     let handler = TestHandler::new();
     let mut config = default_config();
     config.max_enqueued_per_key = 2;
-    let partition_manager = PartitionManager::new(
-        config,
-        handler.clone(),
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send messages with the same key and increasing offsets
     let offsets = vec![0, 1, 2, 3];
@@ -124,13 +112,7 @@ async fn test_partition_manager_ordering() {
 async fn test_partition_manager_concurrent_processing() {
     let handler = TestHandler::new();
     let config = default_config();
-    let partition_manager = PartitionManager::new(
-        config,
-        handler.clone(),
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send messages with different keys
     for i in 0..5_u8 {
@@ -161,13 +143,7 @@ async fn test_partition_manager_concurrent_processing() {
 async fn test_partition_manager_watermark() {
     let handler = TestHandler::new();
     let config = default_config();
-    let partition_manager = PartitionManager::new(
-        config,
-        handler.clone(),
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send sequential messages
     for i in 0..5 {
@@ -196,13 +172,7 @@ async fn test_partition_manager_max_uncommitted() {
     let max_uncommitted = 5;
     let mut config = default_config();
     config.max_uncommitted = max_uncommitted;
-    let partition_manager = PartitionManager::new(
-        config,
-        handler.clone(),
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send more messages than max_uncommitted
     for i in 0..(max_uncommitted + 5) {
@@ -287,13 +257,7 @@ async fn test_partition_manager_is_stalled() {
     let mut config = default_config();
     let stall_threshold = Duration::from_millis(100);
     config.stall_threshold = stall_threshold;
-    let partition_manager = PartitionManager::new(
-        config,
-        handler.clone(),
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send a message that is delayed in processing
     let message = create_test_message(0, "key");
@@ -334,13 +298,7 @@ async fn test_partition_manager_event_type_filtering() {
             .expect("Invalid event pattern"),
     );
 
-    let partition_manager = PartitionManager::new(
-        config,
-        handler.clone(),
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     let test_semaphore = Arc::new(Semaphore::new(10));
 
@@ -398,13 +356,7 @@ async fn test_partition_manager_deduplication() {
     let handler = TestHandler::new();
     let mut config = default_config();
     config.idempotence_cache_size = 100;
-    let partition_manager = PartitionManager::new(
-        config,
-        handler.clone(),
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send messages with the same key and event ID
     let key = "key";
@@ -611,13 +563,7 @@ async fn test_partition_manager_timer_heartbeat_integration() {
     // stall detection
     let handler = TestHandler::new();
     let config = default_config();
-    let partition_manager = PartitionManager::new(
-        config,
-        handler,
-        "test-topic".into(),
-        0,
-        create_dummy_telemetry(),
-    );
+    let partition_manager = PartitionManager::new(config, handler, "test-topic".into(), 0);
 
     // Initially, the partition should not be stalled
     assert!(

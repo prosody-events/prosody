@@ -13,12 +13,10 @@ use tokio::sync::{AcquireError, Semaphore};
 use tracing::debug;
 use validator::{Validate, ValidationErrors};
 
-use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
-    HandlerMiddleware,
+    ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::timers::Trigger;
 use crate::util::from_env_with_fallback;
@@ -70,6 +68,18 @@ pub enum ConcurrencyLimitError<E> {
     /// Error from permit acquisition (semaphore closed).
     #[error("Failed to acquire concurrency permit: {0:#}")]
     PermitAcquisition(#[from] AcquireError),
+}
+
+impl<E> ClassifyError for ConcurrencyLimitError<E>
+where
+    E: ClassifyError,
+{
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            ConcurrencyLimitError::Handler(error) => error.classify_error(),
+            ConcurrencyLimitError::PermitAcquisition(_) => ErrorCategory::Terminal,
+        }
+    }
 }
 
 impl ConcurrencyLimitConfiguration {
@@ -133,20 +143,6 @@ where
     }
 }
 
-impl<T> HandlerProvider for ConcurrencyLimitProvider<T>
-where
-    T: HandlerProvider<Handler: FallibleHandler>,
-{
-    type Handler = ConcurrencyLimitHandler<T::Handler>;
-
-    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        ConcurrencyLimitHandler {
-            handler: self.provider.handler_for_partition(topic, partition),
-            global_limit: self.global_limit.clone(),
-        }
-    }
-}
-
 impl<T> FallibleHandler for ConcurrencyLimitHandler<T>
 where
     T: FallibleHandler,
@@ -183,19 +179,5 @@ where
             .on_timer(context, trigger)
             .await
             .map_err(ConcurrencyLimitError::Handler)
-    }
-}
-
-impl<T> FallibleEventHandler for ConcurrencyLimitHandler<T> where T: FallibleHandler {}
-
-impl<E> ClassifyError for ConcurrencyLimitError<E>
-where
-    E: ClassifyError,
-{
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            ConcurrencyLimitError::Handler(error) => error.classify_error(),
-            ConcurrencyLimitError::PermitAcquisition(_) => ErrorCategory::Terminal,
-        }
     }
 }

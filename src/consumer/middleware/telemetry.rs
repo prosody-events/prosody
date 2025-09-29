@@ -4,12 +4,10 @@
 //! handler lifecycle events (invoked, returned, succeeded, failed) for
 //! observability and monitoring purposes.
 
+use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::{
-    FallibleEventHandler, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
-};
-use crate::consumer::{HandlerProvider, Keyed};
+use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::telemetry::{Telemetry, partition::TelemetryPartitionSender};
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -66,21 +64,6 @@ impl HandlerMiddleware for TelemetryMiddleware {
 impl<T> FallibleHandlerProvider for TelemetryProvider<T>
 where
     T: FallibleHandlerProvider,
-{
-    type Handler = TelemetryHandler<T::Handler>;
-
-    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        let partition_sender = self.telemetry.partition_sender(topic, partition);
-        TelemetryHandler {
-            handler: self.provider.handler_for_partition(topic, partition),
-            sender: partition_sender,
-        }
-    }
-}
-
-impl<T> HandlerProvider for TelemetryProvider<T>
-where
-    T: HandlerProvider<Handler: FallibleHandler>,
 {
     type Handler = TelemetryHandler<T::Handler>;
 
@@ -171,5 +154,3 @@ where
         result
     }
 }
-
-impl<T> FallibleEventHandler for TelemetryHandler<T> where T: FallibleHandler {}

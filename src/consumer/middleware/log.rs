@@ -60,7 +60,7 @@ where
 
 impl<T> HandlerProvider for LogProvider<T>
 where
-    T: HandlerProvider<Handler: FallibleHandler>,
+    T: FallibleHandlerProvider,
 {
     type Handler = LogHandler<T::Handler>;
 
@@ -128,4 +128,35 @@ where
     }
 }
 
-impl<T> FallibleEventHandler for LogHandler<T> where T: FallibleHandler {}
+impl<T> FallibleEventHandler for LogHandler<T>
+where
+    T: FallibleHandler,
+{
+    fn on_message_error(&self, error: &Self::Error) {
+        match error.classify_error() {
+            ErrorCategory::Transient => {
+                error!("transient error occurred during processing: {error:#}; discarding message");
+            }
+            ErrorCategory::Permanent => {
+                error!("permanent error occurred during processing: {error:#}; discarding message");
+            }
+            ErrorCategory::Terminal => {
+                error!("terminal error occurred during processing: {error:#}; aborting processing");
+            }
+        }
+    }
+
+    fn on_timer_error(&self, error: &Self::Error) {
+        match error.classify_error() {
+            ErrorCategory::Transient => {
+                error!("transient error occurred during processing: {error:#}; discarding timer");
+            }
+            ErrorCategory::Permanent => {
+                error!("permanent error occurred during processing: {error:#}; discarding timer");
+            }
+            ErrorCategory::Terminal => {
+                error!("terminal error occurred during processing: {error:#}; aborting processing");
+            }
+        }
+    }
+}

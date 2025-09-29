@@ -242,10 +242,12 @@ pub mod heartbeat;
 pub mod high_level;
 pub mod producer;
 pub mod propagator;
-mod telemetry;
 pub mod timers;
 pub mod tracing;
 mod util;
+
+#[allow(dead_code, unused_variables)] // TODO: remove
+mod telemetry;
 
 /// A lazily initialized mock Kafka cluster for testing.
 ///

@@ -10,13 +10,12 @@ use thiserror::Error;
 use tracing::{error, info};
 use validator::{Validate, ValidationErrors};
 
+use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
-    HandlerMiddleware,
+    ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
-use crate::consumer::{HandlerProvider, Keyed};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
 use crate::util::from_env;
@@ -129,22 +128,6 @@ impl HandlerMiddleware for FailureTopicMiddleware {
 impl<T> FallibleHandlerProvider for FailureTopicProvider<T>
 where
     T: FallibleHandlerProvider,
-{
-    type Handler = FailureTopicHandler<T::Handler>;
-
-    fn handler_for_partition(&self, topic: TopicType, partition: Partition) -> Self::Handler {
-        FailureTopicHandler {
-            topic: self.config.failure_topic.as_str().into(),
-            producer: self.producer.clone(),
-            group_id: self.group_id.clone(),
-            handler: self.provider.handler_for_partition(topic, partition),
-        }
-    }
-}
-
-impl<T> HandlerProvider for FailureTopicProvider<T>
-where
-    T: HandlerProvider<Handler: FallibleHandler>,
 {
     type Handler = FailureTopicHandler<T::Handler>;
 
@@ -290,8 +273,6 @@ where
         Ok(())
     }
 }
-
-impl<T> FallibleEventHandler for FailureTopicHandler<T> where T: FallibleHandler {}
 
 /// Errors that can occur during failure topic handling.
 #[derive(Debug, Error)]

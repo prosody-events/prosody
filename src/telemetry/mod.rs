@@ -22,9 +22,15 @@ pub struct Telemetry {
     clock: Clock,
 }
 
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Telemetry {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(TELEMETRY_CHANNEL_CAPACITY);
+        let (tx, _rx) = mpsc::channel(TELEMETRY_CHANNEL_CAPACITY);
         let clock = Clock::new();
         Self { tx, clock }
     }

@@ -6,12 +6,10 @@
 
 use thiserror::Error;
 
-use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleEventHandler, FallibleHandler, FallibleHandlerProvider,
-    HandlerMiddleware,
+    ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
@@ -51,19 +49,6 @@ impl HandlerMiddleware for ShutdownMiddleware {
 impl<T> FallibleHandlerProvider for ShutdownProvider<T>
 where
     T: FallibleHandlerProvider,
-{
-    type Handler = ShutdownHandler<T::Handler>;
-
-    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        ShutdownHandler {
-            handler: self.provider.handler_for_partition(topic, partition),
-        }
-    }
-}
-
-impl<T> HandlerProvider for ShutdownProvider<T>
-where
-    T: HandlerProvider<Handler: FallibleHandler>,
 {
     type Handler = ShutdownHandler<T::Handler>;
 
@@ -122,8 +107,6 @@ where
             .map_err(ShutdownError::Handler)
     }
 }
-
-impl<T> FallibleEventHandler for ShutdownHandler<T> where T: FallibleHandler {}
 
 /// Represents errors that can occur during shutdown handling.
 #[derive(Debug, Error)]
