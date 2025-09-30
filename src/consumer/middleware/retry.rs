@@ -48,7 +48,7 @@ use humantime::format_duration;
 use rand::Rng;
 use tokio::select;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
@@ -376,6 +376,14 @@ where
             }
         }
     }
+
+    async fn shutdown(self) {
+        debug!("shutting down retry handler");
+
+        // No retry-specific state to clean up (timers are handled by tokio)
+        // Cascade shutdown to the inner handler
+        self.handler.shutdown().await;
+    }
 }
 
 impl<T> EventHandler for RetryHandler<T>
@@ -523,5 +531,11 @@ where
     }
 
     /// Performs any necessary shutdown operations for the handler.
-    async fn shutdown(self) {}
+    async fn shutdown(self) {
+        debug!("shutting down retry handler");
+
+        // No retry-specific state to clean up (timers are handled by tokio)
+        // Cascade shutdown to the inner handler
+        self.handler.shutdown().await;
+    }
 }

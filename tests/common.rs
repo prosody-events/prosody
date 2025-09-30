@@ -535,6 +535,10 @@ impl FallibleHandler for FallibleTestHandler {
     {
         Ok(())
     }
+
+    async fn shutdown(self) {
+        // No cleanup needed for test handler
+    }
 }
 
 /// Initializes logging for integration tests with scylla noise filtering.

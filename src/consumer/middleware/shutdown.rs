@@ -41,6 +41,7 @@
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 
 use thiserror::Error;
+use tracing::debug;
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
@@ -141,6 +142,14 @@ where
             .on_timer(context, timer)
             .await
             .map_err(ShutdownError::Handler)
+    }
+
+    async fn shutdown(self) {
+        debug!("shutting down shutdown middleware handler");
+
+        // No shutdown-specific state to clean up (signals are external)
+        // Cascade shutdown to the inner handler
+        self.handler.shutdown().await;
     }
 }
 

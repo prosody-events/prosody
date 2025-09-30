@@ -37,6 +37,8 @@
 //!     .into_provider(handler);
 //! ```
 
+use tracing::debug;
+
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
@@ -185,5 +187,13 @@ where
         }
 
         result
+    }
+
+    async fn shutdown(self) {
+        debug!("shutting down telemetry handler");
+
+        // No telemetry-specific state to clean up (sender is shared)
+        // Cascade shutdown to the inner handler
+        self.handler.shutdown().await;
     }
 }

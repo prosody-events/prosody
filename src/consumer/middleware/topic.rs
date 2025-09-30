@@ -45,7 +45,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use derive_builder::Builder;
 use serde_json::json;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use validator::{Validate, ValidationErrors};
 
 use crate::consumer::Keyed;
@@ -309,6 +309,14 @@ where
             .await?;
 
         Ok(())
+    }
+
+    async fn shutdown(self) {
+        debug!("shutting down failure topic handler");
+
+        // No failure topic-specific state to clean up (producer is shared)
+        // Cascade shutdown to the inner handler
+        self.handler.shutdown().await;
     }
 }
 

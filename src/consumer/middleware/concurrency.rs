@@ -211,4 +211,12 @@ where
             .await
             .map_err(ConcurrencyLimitError::Handler)
     }
+
+    async fn shutdown(self) {
+        debug!("shutting down concurrency limit handler");
+
+        // No concurrency-specific state to clean up (semaphore is shared)
+        // Cascade shutdown to the inner handler
+        self.handler.shutdown().await;
+    }
 }

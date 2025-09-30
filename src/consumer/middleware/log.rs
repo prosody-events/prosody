@@ -35,7 +35,7 @@
 //!
 //! [`ErrorCategory`]: crate::consumer::middleware::ErrorCategory
 
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
@@ -157,6 +157,14 @@ where
         }
 
         Err(error)
+    }
+
+    async fn shutdown(self) {
+        debug!("shutting down log handler");
+
+        // No log-specific state to clean up (logging is stateless)
+        // Cascade shutdown to the inner handler
+        self.handler.shutdown().await;
     }
 }
 

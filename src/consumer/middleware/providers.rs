@@ -163,4 +163,9 @@ where
         // CloneProvider
         Ok(())
     }
+
+    async fn shutdown(self) {
+        // Cascade shutdown to the wrapped EventHandler
+        self.0.shutdown().await;
+    }
 }

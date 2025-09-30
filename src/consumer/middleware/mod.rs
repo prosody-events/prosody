@@ -341,6 +341,35 @@ pub trait FallibleHandler: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         C: EventContext;
+
+    /// Shuts down the handler and cleans up any resources.
+    ///
+    /// This method is called when a Kafka partition is being revoked or the
+    /// consumer is shutting down. It allows handlers (including middleware) to:
+    /// - Clean up accumulated state
+    /// - Close connections or file handles
+    /// - Flush pending operations
+    /// - Release resources
+    ///
+    /// For middleware implementations, this should:
+    /// 1. Clean up middleware-specific state
+    /// 2. Cascade shutdown to the inner handler
+    ///
+    /// # Arguments
+    ///
+    /// Takes ownership of `self` to ensure exclusive access during cleanup.
+    ///
+    /// # Returns
+    ///
+    /// A [`Future`] that resolves when shutdown is complete.
+    ///
+    /// # Implementation Requirements
+    ///
+    /// - **Infallible**: Shutdown should not fail - handle errors gracefully
+    /// - **Idempotent**: Safe to call multiple times
+    /// - **Complete**: Ensure all resources are cleaned up before returning
+    /// - **Cascade**: Middleware should shutdown inner handlers
+    fn shutdown(self) -> impl Future<Output = ()> + Send;
 }
 
 /// A composition of two middleware components.
@@ -444,7 +473,9 @@ where
         }
     }
 
-    async fn shutdown(self) {}
+    async fn shutdown(self) {
+        FallibleHandler::shutdown(self).await;
+    }
 }
 
 impl ClassifyError for Infallible {
