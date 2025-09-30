@@ -11,8 +11,8 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
-    consumer::{ConsumerConfiguration, ProsodyConsumer},
     consumer::middleware::CloneProvider,
+    consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
 };
 use serde_json::{Value, json};

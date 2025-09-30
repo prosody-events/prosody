@@ -1,76 +1,102 @@
-//! Middleware for message processing.
+//! Composable middleware framework for message processing.
 //!
-//! This module provides a composable framework for handling cross-cutting
-//! concerns during message processing including retry logic, concurrency
-//! limiting, shutdown handling, telemetry recording, failure topic routing,
-//! and logging. Middleware components can be combined using the `layer` method
-//! to create processing pipelines.
+//! This module provides a middleware architecture for building message
+//! processing pipelines from reusable components. Each middleware handles a
+//! specific cross-cutting concern (retries, concurrency limiting, logging)
+//! independently.
 //!
-//! ## Available Middleware
+//! # Architecture Overview
 //!
-//! See the individual middleware modules for specific implementations:
-//! - **`concurrency`** - Global concurrency limiting with semaphore permits
-//! - **`retry`** - Exponential backoff retry logic for transient failures
-//! - **`shutdown`** - Graceful partition revocation handling
-//! - **`telemetry`** - Handler lifecycle event recording for observability
-//! - **`topic`** - Failure topic routing for permanent failures
-//! - **`log`** - Error logging with severity-based categorization
+//! The middleware system transforms your business logic through three layers:
 //!
-//! ## Middleware Composition
+//! ```text
+//! Handler → Provider → Middleware Stack → Consumer
+//!   │         │           │                │
+//!   │         │           │                └─ Kafka partition management
+//!   │         │           └─ Cross-cutting concerns
+//!   │         └─ Factory pattern for per-partition instances
+//!   └─ Your business logic
+//! ```
 //!
-//! Middleware are composed from inner to outer using the `layer` method,
-//! creating a bidirectional execution flow where each middleware can intercept
-//! both the request (on the way to the handler) and the response (on the way
-//! back).
+//! ## Components
+//!
+//! - **Handler**: Your business logic implementing
+//!   [`crate::consumer::EventHandler`] or [`FallibleHandler`]
+//! - **Provider**: Factory creating handler instances per partition
+//!   ([`crate::consumer::HandlerProvider`], [`FallibleHandlerProvider`])
+//! - **Middleware**: Composable layers implementing [`HandlerMiddleware`]
+//!
+//! ## Why Middleware?
+//!
+//! Message processing requires many cross-cutting concerns: retries,
+//! concurrency limits, error logging, dead letter queues, graceful shutdown,
+//! and telemetry.
+//!
+//! Middleware provides:
+//! - **Separation of concerns** - Each middleware has one responsibility
+//! - **Composability** - Mix and match as needed
+//! - **Reusability** - Same middleware works with any handler
+//! - **Testability** - Test business logic and infrastructure separately
+//!
+//! # Available Middleware
+//!
+//! | Middleware | Purpose |
+//! |------------|---------|
+//! | [`concurrency`] | Global concurrency limiting |
+//! | [`retry`] | Exponential backoff for transient failures |
+//! | [`shutdown`] | Graceful partition revocation |
+//! | [`telemetry`] | Handler lifecycle observability |
+//! | [`topic`] | Dead letter queue routing |
+//! | [`log`] | Error categorization and logging |
+//!
+//! # Usage
+//!
+//! Compose middleware using [`HandlerMiddleware::layer`] and finalize with
+//! [`HandlerMiddleware::into_provider`]:
 //!
 //! ```rust
 //! use prosody::consumer::middleware::*;
 //!
-//! // Compose middleware from innermost to outermost
-//! let middleware = inner_middleware
+//! // Basic composition pattern
+//! let provider = inner_middleware
 //!     .layer(middle_middleware)
-//!     .layer(outer_middleware);
+//!     .layer(outer_middleware)
+//!     .into_provider(my_handler);
 //! ```
 //!
-//! ### Execution Flow Pattern
+//! ## Real Example: Production Pipeline
 //!
-//! Each middleware wraps the inner layers, creating an "onion" pattern where
-//! execution flows through all layers to reach the handler, then back out:
+//! ```rust
+//! use prosody::consumer::middleware::*;
 //!
-//! **Request Path (outer → inner):**
-//! 1. `OuterMiddleware` - Pre-processing, setup, validation
-//! 2. `MiddleMiddleware` - Transformation, routing decisions
-//! 3. `InnerMiddleware` - Resource acquisition, final checks
-//! 4. **User Handler** - Actual message/timer processing
+//! // Low-latency consumer with full error handling
+//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//!     .layer(ShutdownMiddleware)
+//!     .layer(RetryMiddleware::new(retry_config))
+//!     .layer(FailureTopicMiddleware::new(topic_config, producer))
+//!     .layer(RetryMiddleware::new(retry_config))
+//!     .into_provider(my_business_handler);
+//! ```
 //!
-//! **Response Path (inner → outer):**
-//! 4. **User Handler** - Returns success or error result
-//! 3. `InnerMiddleware` - Resource cleanup, immediate error handling
-//! 2. `MiddleMiddleware` - Error classification, retry logic, side effects
-//! 1. `OuterMiddleware` - Final error handling, logging, reporting
+//! ## Execution Flow
 //!
-//! ### Middleware Capabilities
+//! Middleware creates an "onion" pattern with bidirectional execution:
 //!
-//! This bidirectional flow allows each middleware to:
-//! - **Transform requests** before they reach inner layers
-//! - **Handle responses** and errors as they bubble back up
-//! - **Short-circuit execution** (e.g., validation failures, shutdown
-//!   conditions)
-//! - **Add side effects** (e.g., logging, metrics, external notifications)
-//! - **Manage resources** (e.g., acquire/release permits, connections)
-//! - **Implement retry logic** with backoff and error classification
+//! ```text
+//! Request:  Outer → Middle → Inner → Handler
+//! Response: Handler → Inner → Middle → Outer
+//! ```
+//!
+//! Each layer can transform requests, handle responses, short-circuit
+//! execution, add side effects, or manage resources.
 //!
 //! ## Error Classification
 //!
-//! The middleware system uses structured error classification via
-//! [`ErrorCategory`]:
+//! Middleware uses [`ErrorCategory`] for structured error handling:
 //!
-//! - **Transient** - Temporary failures that should be retried
-//! - **Permanent** - Business logic errors that should not be retried
-//! - **Terminal** - System-level failures requiring immediate shutdown
-//!
-//! Each middleware respects these classifications to determine appropriate
-//! handling behavior.
+//! - [`ErrorCategory::Transient`] - Retry with backoff
+//! - [`ErrorCategory::Permanent`] - Don't retry, may route to dead letter queue
+//! - [`ErrorCategory::Terminal`] - System failure, abort processing
 
 use std::convert::Infallible;
 use std::fmt::Display;
@@ -166,6 +192,37 @@ pub trait HandlerMiddleware {
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider;
+
+    /// Transforms this middleware stack into a provider by consuming the stack
+    /// and terminating it with a fallible handler wrapped in a
+    /// `FallibleCloneProvider`.
+    ///
+    /// This method converts the middleware stack (which implements
+    /// `HandlerMiddleware`) into a provider (which implements
+    /// `FallibleHandlerProvider`) by terminating the stack with the given
+    /// handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `handler` - The fallible handler to use as the innermost component.
+    ///
+    /// # Returns
+    ///
+    /// A provider that implements `FallibleHandlerProvider`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let middleware = RetryMiddleware::new(config);
+    /// let provider = middleware.into_provider(my_handler);
+    /// ```
+    fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
+    where
+        Self: Sized,
+        H: FallibleHandler + Clone + Send + Sync + 'static,
+    {
+        self.with_provider(FallibleCloneProvider::new(handler))
+    }
 
     /// Adds a middleware layer on top of this middleware (inner-to-outer
     /// composition).

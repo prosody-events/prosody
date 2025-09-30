@@ -1,9 +1,40 @@
-//! Concurrency limit handling for message processing.
+//! Global concurrency limiting middleware.
 //!
-//! This module provides middleware that applies global concurrency
-//! limits by acquiring semaphore permits just before handler execution,
-//! ensuring that the limit is applied as late as possible in the processing
-//! pipeline.
+//! Enforces a semaphore-based limit on concurrent message/timer processing
+//! across all partitions. Position as the **outermost** middleware layer for
+//! system-wide backpressure.
+//!
+//! # Execution Order
+//!
+//! **Request Path:**
+//! 1. **Acquire semaphore permit** - Blocks if global limit reached
+//! 2. Pass control to inner middleware layers
+//!
+//! **Response Path:**
+//! 1. Receive result from inner layers
+//! 2. **Release semaphore permit** - Always occurs via RAII guard
+//!
+//! # Key Features
+//!
+//! - **System Protection**: Prevents overload by limiting total concurrent
+//!   operations
+//! - **Fair Access**: Semaphore ensures equitable resource distribution across
+//!   partitions
+//! - **Late Acquisition**: Permit acquired immediately before handler execution
+//! - **Guaranteed Release**: Permit released even on panic or error
+//!
+//! # Usage
+//!
+//! Position as outermost middleware for optimal backpressure:
+//!
+//! ```rust
+//! use prosody::consumer::middleware::*;
+//!
+//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//!     .layer(ShutdownMiddleware)
+//!     .layer(RetryMiddleware::new(retry_config))
+//!     .into_provider(handler);
+//! ```
 
 use std::sync::Arc;
 

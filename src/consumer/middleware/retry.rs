@@ -1,7 +1,44 @@
-//! Retry middleware for failure handling in message processing.
+//! Exponential backoff retry middleware.
 //!
-//! This module provides retry middleware that wraps handlers and retries
-//! failed message processing attempts with an exponential backoff.
+//! Automatically retries transient failures using exponential backoff with
+//! jitter. Only retries [`ErrorCategory::Transient`] errors - permanent and
+//! terminal errors are passed through immediately.
+//!
+//! # Execution Order
+//!
+//! **Request Path:**
+//! 1. Pass control to inner middleware layers
+//!
+//! **Response Path:**
+//! 1. Receive result from inner layers
+//! 2. **If error is transient**: Sleep with exponential backoff and retry
+//! 3. **If error is permanent/terminal**: Pass through immediately
+//! 4. **If max retries exceeded**: Pass through final error
+//!
+//! # Retry Logic
+//!
+//! - **Initial delay**: Starts with configured base delay
+//! - **Exponential growth**: Each retry doubles the delay (with jitter)
+//! - **Maximum delay**: Capped at configured maximum
+//! - **Jitter**: Adds randomness to prevent thundering herd
+//! - **Cancellation**: Respects shutdown signals during retry delays
+//!
+//! # Usage
+//!
+//! Often used multiple times in a pipeline for different failure points:
+//!
+//! ```rust
+//! use prosody::consumer::middleware::*;
+//!
+//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//!     .layer(ShutdownMiddleware)
+//!     .layer(RetryMiddleware::new(retry_config)) // Retry handler failures
+//!     .layer(FailureTopicMiddleware::new(topic_config, producer))
+//!     .layer(RetryMiddleware::new(retry_config)) // Retry DLQ writes
+//!     .into_provider(handler);
+//! ```
+//!
+//! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 
 use std::cmp::min;
 use std::time::Duration;

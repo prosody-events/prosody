@@ -147,7 +147,7 @@ use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::shutdown::ShutdownMiddleware;
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
-use crate::consumer::middleware::{FallibleCloneProvider, FallibleHandler, HandlerMiddleware};
+use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::heartbeat::Heartbeat;
@@ -731,12 +731,10 @@ impl ProsodyConsumer {
         let retry_middleware = RetryMiddleware::new(retry_config)?;
 
         // Apply concurrency limiting first, then shutdown and retry
-        let middleware = concurrency_middleware
+        let provider = concurrency_middleware
             .layer(ShutdownMiddleware)
-            .layer(retry_middleware);
-
-        let provider = FallibleCloneProvider::new(handler);
-        let provider = middleware.with_provider(provider);
+            .layer(retry_middleware)
+            .into_provider(handler);
 
         Self::new(consumer_config, trigger_store_config, provider).await
     }
@@ -787,14 +785,12 @@ impl ProsodyConsumer {
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
 
         // Compose middleware: concurrency → shutdown → retry → failure topic → retry
-        let middleware = concurrency_middleware // limit global concurrency first
+        let provider = concurrency_middleware // limit global concurrency first
             .layer(ShutdownMiddleware) // stop processing if shutting down partition
             .layer(retry_middleware.clone()) // retry processing up to limit
             .layer(topic_middleware) // write to failure topic
-            .layer(retry_middleware); // retry writing to failure topic
-
-        let provider = FallibleCloneProvider::new(handler);
-        let provider = middleware.with_provider(provider);
+            .layer(retry_middleware) // retry writing to failure topic
+            .into_provider(handler);
 
         Self::new(consumer_config, trigger_store_config, provider).await
     }
@@ -833,12 +829,10 @@ impl ProsodyConsumer {
         let concurrency_middleware = ConcurrencyLimitMiddleware::new(&concurrency_config)?;
 
         // Apply concurrency limiting first, then shutdown and logging
-        let middleware = concurrency_middleware
+        let provider = concurrency_middleware
             .layer(ShutdownMiddleware)
-            .layer(LogMiddleware);
-
-        let provider = FallibleCloneProvider::new(handler);
-        let provider = middleware.with_provider(provider);
+            .layer(LogMiddleware)
+            .into_provider(handler);
 
         Self::new(consumer_config, trigger_store_config, provider).await
     }

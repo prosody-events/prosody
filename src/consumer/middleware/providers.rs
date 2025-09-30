@@ -1,11 +1,32 @@
-//! Provider implementations for creating handlers for partition-level
-//! processing.
+//! Basic handler providers for partition processing.
 //!
-//! This module contains providers that wrap handlers and create instances
-//! for specific topic-partitions. Two main provider types are available:
+//! Provides simple cloning-based providers that create handler instances for
+//! each Kafka topic-partition. These are the fundamental building blocks used
+//! by middleware to create per-partition handlers.
 //!
-//! - [`FallibleCloneProvider`] - For handlers that can fail (used by consumer)
-//! - [`CloneProvider`] - For infallible handlers (used in tests)
+//! # Available Providers
+//!
+//! - [`FallibleCloneProvider`] - For handlers returning `Result<(), E>`
+//!   (production)
+//! - [`CloneProvider`] - For infallible handlers (tests and simple cases)
+//! - [`InfallibleWrapper`] - Adapts infallible handlers to work with fallible
+//!   middleware
+//!
+//! # Usage
+//!
+//! Providers are typically created automatically via
+//! [`crate::consumer::middleware::HandlerMiddleware::into_provider`],
+//! but can be used directly:
+//!
+//! ```rust
+//! use prosody::consumer::middleware::providers::*;
+//!
+//! // For fallible handlers
+//! let provider = FallibleCloneProvider::new(my_fallible_handler);
+//!
+//! // For infallible handlers
+//! let provider = CloneProvider::new(my_event_handler);
+//! ```
 
 use std::convert::Infallible;
 
@@ -36,6 +57,15 @@ impl<T> FallibleCloneProvider<T> {
     /// A new `FallibleCloneProvider` instance.
     pub fn new(inner: T) -> Self {
         Self(inner)
+    }
+}
+
+impl<T> From<T> for FallibleCloneProvider<T>
+where
+    T: FallibleHandler + Clone + Send + Sync + 'static,
+{
+    fn from(inner: T) -> Self {
+        Self::new(inner)
     }
 }
 
@@ -70,6 +100,15 @@ impl<T> CloneProvider<T> {
     /// A new `CloneProvider` instance.
     pub fn new(inner: T) -> Self {
         Self(inner)
+    }
+}
+
+impl<T> From<T> for CloneProvider<T>
+where
+    T: EventHandler + Clone + Send + Sync + 'static,
+{
+    fn from(inner: T) -> Self {
+        Self::new(inner)
     }
 }
 

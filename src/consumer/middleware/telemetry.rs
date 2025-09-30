@@ -1,8 +1,41 @@
-//! Telemetry middleware for message processing.
+//! Handler lifecycle telemetry middleware.
 //!
-//! This module provides telemetry capabilities that wrap handlers and record
-//! handler lifecycle events (invoked, returned, succeeded, failed) for
-//! observability and monitoring purposes.
+//! Records handler invocation events for observability and monitoring. Captures
+//! metrics like execution time, success/failure rates, and error
+//! classifications without affecting the processing flow.
+//!
+//! # Execution Order
+//!
+//! **Request Path:**
+//! 1. **Record handler invocation** - Log start of processing
+//! 2. Pass control to inner middleware layers
+//!
+//! **Response Path:**
+//! 1. Receive result from inner layers
+//! 2. **Record handler completion** - Log success/failure and timing
+//! 3. Pass original result through unchanged
+//!
+//! # Telemetry Events
+//!
+//! - **Handler Invoked**: When processing begins
+//! - **Handler Succeeded**: When processing completes successfully
+//! - **Handler Failed**: When processing fails (with error category)
+//! - **Execution Time**: Duration of processing
+//! - **Partition Context**: Which topic-partition was processed
+//!
+//! # Usage
+//!
+//! Position for comprehensive visibility across the processing pipeline:
+//!
+//! ```rust
+//! use prosody::consumer::middleware::*;
+//!
+//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//!     .layer(TelemetryMiddleware::new()) // Monitor entire pipeline
+//!     .layer(ShutdownMiddleware)
+//!     .layer(RetryMiddleware::new(retry_config))
+//!     .into_provider(handler);
+//! ```
 
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;

@@ -1,7 +1,39 @@
-//! Logging middleware for message processing.
+//! Error logging middleware.
 //!
-//! This module provides logging capabilities that wrap handlers and log errors
-//! according to their severity while maintaining the original error flow.
+//! Logs handler failures based on [`ErrorCategory`] classification while
+//! preserving the original error flow. Typically positioned as an outer layer
+//! for comprehensive error visibility.
+//!
+//! # Execution Order
+//!
+//! **Request Path:**
+//! 1. Pass control to inner middleware layers (no-op)
+//!
+//! **Response Path:**
+//! 1. Receive result from inner layers
+//! 2. **Log error if present** - Categorizes and logs with appropriate severity
+//! 3. Pass original result through unchanged
+//!
+//! # Error Classification
+//!
+//! - **Transient errors**: Logged as errors with context for retry analysis
+//! - **Permanent errors**: Logged as errors indicating business logic issues
+//! - **Terminal errors**: Logged as errors indicating system failures
+//!
+//! # Usage
+//!
+//! Position as outer middleware for complete error visibility:
+//!
+//! ```rust
+//! use prosody::consumer::middleware::*;
+//!
+//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//!     .layer(ShutdownMiddleware)
+//!     .layer(LogMiddleware) // Logs all errors from inner layers
+//!     .into_provider(handler);
+//! ```
+//!
+//! [`ErrorCategory`]: crate::consumer::middleware::ErrorCategory
 
 use tracing::error;
 

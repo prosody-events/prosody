@@ -1,8 +1,44 @@
-//! Implements shutdown middleware for graceful partition revocation handling.
+//! Graceful shutdown middleware for partition revocation.
 //!
-//! This module provides a mechanism to stop processing messages when a Kafka
-//! partition is being revoked, ensuring proper handling of in-flight messages
-//! and preventing new message processing.
+//! Monitors partition revocation signals and immediately stops processing new
+//! messages when a partition is being revoked. Returns terminal errors to abort
+//! processing gracefully.
+//!
+//! # Execution Order
+//!
+//! **Request Path:**
+//! 1. **Check shutdown signal** - Return terminal error if partition being
+//!    revoked
+//! 2. Pass control to inner middleware layers (if not shutting down)
+//!
+//! **Response Path:**
+//! 1. Receive result from inner layers
+//! 2. Pass result through unchanged
+//!
+//! # Shutdown Behavior
+//!
+//! - **Signal Detection**: Monitors [`EventContext::is_shutdown_requested`]
+//! - **Immediate Stop**: Returns [`ShutdownError`] when revocation detected
+//! - **Terminal Classification**: Error classified as
+//!   [`ErrorCategory::Terminal`]
+//! - **Graceful Abort**: Allows in-flight operations to complete
+//!
+//! # Usage
+//!
+//! Position early in middleware stack to prevent unnecessary processing during
+//! shutdown:
+//!
+//! ```rust
+//! use prosody::consumer::middleware::*;
+//!
+//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//!     .layer(ShutdownMiddleware) // Check shutdown early
+//!     .layer(RetryMiddleware::new(retry_config))
+//!     .into_provider(handler);
+//! ```
+//!
+//! [`EventContext::is_shutdown_requested`]: crate::consumer::event_context::EventContext
+//! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 
 use thiserror::Error;
 

@@ -10,8 +10,8 @@ use prosody::{
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::event_context::{BoxEventContext, EventContext},
     consumer::message::UncommittedMessage,
-    consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer, Uncommitted},
     consumer::middleware::CloneProvider,
+    consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer, Uncommitted},
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };

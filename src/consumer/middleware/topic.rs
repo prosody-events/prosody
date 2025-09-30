@@ -1,7 +1,45 @@
-//! Failure topic middleware for error handling in message processing.
+//! Dead letter queue (failure topic) middleware.
 //!
-//! This module provides middleware that sends failed messages
-//! to a designated failure topic for later analysis or reprocessing.
+//! Routes permanently failed messages to a designated failure topic for later
+//! analysis or reprocessing. Only handles [`ErrorCategory::Permanent`] errors -
+//! transient errors pass through for potential retry by outer layers.
+//!
+//! # Execution Order
+//!
+//! **Request Path:**
+//! 1. Pass control to inner middleware layers
+//!
+//! **Response Path:**
+//! 1. Receive result from inner layers
+//! 2. **If error is permanent**: Send message to failure topic with metadata
+//! 3. **If error is transient/terminal**: Pass through unchanged
+//! 4. **If failure topic write fails**: Return that error for outer retry
+//!    middleware
+//!
+//! # Failure Topic Message Format
+//!
+//! Messages sent to the failure topic include:
+//! - **Original message**: Complete original payload and headers
+//! - **Error metadata**: Error message, timestamp, source topic/partition
+//! - **Consumer metadata**: Group ID and processing context
+//! - **Correlation ID**: For tracking and debugging
+//!
+//! # Usage
+//!
+//! Typically positioned between retry layers for sophisticated error handling:
+//!
+//! ```rust
+//! use prosody::consumer::middleware::*;
+//!
+//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//!     .layer(ShutdownMiddleware)
+//!     .layer(RetryMiddleware::new(retry_config)) // Retry handler failures
+//!     .layer(FailureTopicMiddleware::new(topic_config, producer)) // Route to DLQ
+//!     .layer(RetryMiddleware::new(retry_config)) // Retry DLQ writes
+//!     .into_provider(handler);
+//! ```
+//!
+//! [`ErrorCategory::Permanent`]: crate::consumer::middleware::ErrorCategory::Permanent
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use derive_builder::Builder;
