@@ -54,8 +54,15 @@
 //! Compose middleware using [`HandlerMiddleware::layer`] and finalize with
 //! [`HandlerMiddleware::into_provider`]:
 //!
-//! ```rust
-//! use prosody::consumer::middleware::*;
+//! ```rust,no_run
+//! # use prosody::consumer::middleware::*;
+//! # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
+//! # use prosody::consumer::middleware::shutdown::ShutdownMiddleware;
+//! # let retry_config = RetryConfiguration::builder().build().unwrap();
+//! # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
+//! # let middle_middleware = ShutdownMiddleware;
+//! # let outer_middleware = ShutdownMiddleware;
+//! # let my_handler = || {};
 //!
 //! // Basic composition pattern
 //! let provider = inner_middleware
@@ -66,15 +73,26 @@
 //!
 //! ## Real Example: Production Pipeline
 //!
-//! ```rust
-//! use prosody::consumer::middleware::*;
+//! ```rust,no_run
+//! # use prosody::consumer::middleware::*;
+//! # use prosody::consumer::middleware::concurrency::*;
+//! # use prosody::consumer::middleware::retry::*;
+//! # use prosody::consumer::middleware::topic::*;
+//! # use prosody::consumer::middleware::shutdown::*;
+//! # use prosody::producer::{ProsodyProducer, ProducerConfiguration};
+//! # let config = ConcurrencyLimitConfigurationBuilder::default().build().unwrap();
+//! # let retry_config = RetryConfiguration::builder().build().unwrap();
+//! # let topic_config = FailureTopicConfiguration::builder().failure_topic("dlq").build().unwrap();
+//! # let producer_config = ProducerConfiguration::builder().build().unwrap();
+//! # let producer = ProsodyProducer::new(producer_config).unwrap();
+//! # let my_business_handler = || {};
 //!
 //! // Low-latency consumer with full error handling
-//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//! let provider = ConcurrencyLimitMiddleware::new(&config).unwrap()
 //!     .layer(ShutdownMiddleware)
-//!     .layer(RetryMiddleware::new(retry_config))
-//!     .layer(FailureTopicMiddleware::new(topic_config, producer))
-//!     .layer(RetryMiddleware::new(retry_config))
+//!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap())
+//!     .layer(FailureTopicMiddleware::new(topic_config, "group".to_string(), producer).unwrap())
+//!     .layer(RetryMiddleware::new(retry_config).unwrap())
 //!     .into_provider(my_business_handler);
 //! ```
 //!
@@ -212,8 +230,12 @@ pub trait HandlerMiddleware {
     ///
     /// # Example
     ///
-    /// ```rust
-    /// let middleware = RetryMiddleware::new(config);
+    /// ```rust,no_run
+    /// # use prosody::consumer::middleware::retry::*;
+    /// # use prosody::consumer::middleware::HandlerMiddleware;
+    /// # let config = RetryConfiguration::builder().build().unwrap();
+    /// # let my_handler = || {};
+    /// let middleware = RetryMiddleware::new(config).unwrap();
     /// let provider = middleware.into_provider(my_handler);
     /// ```
     fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
@@ -258,7 +280,14 @@ pub trait HandlerMiddleware {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,no_run
+    /// # use prosody::consumer::middleware::*;
+    /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
+    /// # use prosody::consumer::middleware::shutdown::ShutdownMiddleware;
+    /// # let retry_config = RetryConfiguration::builder().build().unwrap();
+    /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
+    /// # let middle_middleware = ShutdownMiddleware;
+    /// # let outer_middleware = ShutdownMiddleware;
     /// // Builds from inner to outer: inner -> middle -> outer
     /// let middleware = inner_middleware
     ///     .layer(middle_middleware) // middle wraps inner

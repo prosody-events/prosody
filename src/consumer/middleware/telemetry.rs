@@ -27,13 +27,33 @@
 //!
 //! Position for comprehensive visibility across the processing pipeline:
 //!
-//! ```rust
-//! use prosody::consumer::middleware::*;
+//! ```rust,no_run
+//! # use prosody::consumer::middleware::concurrency::*;
+//! # use prosody::consumer::middleware::retry::*;
+//! # use prosody::consumer::middleware::telemetry::*;
+//! # use prosody::consumer::middleware::shutdown::*;
+//! # use prosody::consumer::middleware::*;
+//! # use prosody::consumer::message::ConsumerMessage;
+//! # use prosody::consumer::event_context::EventContext;
+//! # use prosody::timers::Trigger;
+//! # use std::convert::Infallible;
+//! # #[derive(Clone)]
+//! # struct MyHandler;
+//! # impl FallibleHandler for MyHandler {
+//! #     type Error = Infallible;
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_timer<C>(&self, _: C, _: Trigger) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn shutdown(self) {}
+//! # }
+//! # let config = ConcurrencyLimitConfigurationBuilder::default().build().unwrap();
+//! # let retry_config = RetryConfiguration::builder().build().unwrap();
+//! # let telemetry = Default::default();
+//! # let handler = MyHandler;
 //!
-//! let provider = ConcurrencyLimitMiddleware::new(&config)
-//!     .layer(TelemetryMiddleware::new()) // Monitor entire pipeline
+//! let provider = ConcurrencyLimitMiddleware::new(&config).unwrap()
+//!     .layer(TelemetryMiddleware::new(telemetry)) // Monitor entire pipeline
 //!     .layer(ShutdownMiddleware)
-//!     .layer(RetryMiddleware::new(retry_config))
+//!     .layer(RetryMiddleware::new(retry_config).unwrap())
 //!     .into_provider(handler);
 //! ```
 

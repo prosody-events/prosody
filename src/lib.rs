@@ -71,6 +71,10 @@
 //!         println!("Timer triggered: {trigger:?}");
 //!         Ok(())
 //!     }
+//!
+//!     async fn shutdown(self) {
+//!         println!("Handler shutting down");
+//!     }
 //! }
 //!
 //! #[tokio::main]

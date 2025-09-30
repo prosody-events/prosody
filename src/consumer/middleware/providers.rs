@@ -18,8 +18,10 @@
 //! [`crate::consumer::middleware::HandlerMiddleware::into_provider`],
 //! but can be used directly:
 //!
-//! ```rust
-//! use prosody::consumer::middleware::providers::*;
+//! ```rust,no_run
+//! # use prosody::consumer::middleware::providers::*;
+//! # let my_fallible_handler = || {};
+//! # let my_event_handler = || {};
 //!
 //! // For fallible handlers
 //! let provider = FallibleCloneProvider::new(my_fallible_handler);
