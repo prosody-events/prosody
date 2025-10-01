@@ -18,21 +18,25 @@
 //! ```rust,no_run
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::consumer::message::UncommittedMessage;
-//! use prosody::consumer::{EventHandler, Keyed, Uncommitted};
+//! use prosody::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 //! use prosody::timers::store::TriggerStore;
 //! use prosody::timers::{Trigger, UncommittedTimer};
 //!
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
-//!     async fn on_message<C>(&self, _context: C, _message: UncommittedMessage)
-//!     where
+//!     async fn on_message<C>(
+//!         &self,
+//!         _context: C,
+//!         _message: UncommittedMessage,
+//!         _demand_type: DemandType,
+//!     ) where
 //!         C: EventContext,
 //!     {
 //!         // Process regular messages
 //!     }
 //!
-//!     async fn on_timer<C, T>(&self, context: C, timer: T)
+//!     async fn on_timer<C, T>(&self, context: C, timer: T, _demand_type: DemandType)
 //!     where
 //!         C: EventContext,
 //!         T: UncommittedTimer,

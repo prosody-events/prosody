@@ -33,6 +33,7 @@
 //! # use prosody::consumer::middleware::telemetry::*;
 //! # use prosody::consumer::middleware::shutdown::*;
 //! # use prosody::consumer::middleware::*;
+//! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::message::ConsumerMessage;
 //! # use prosody::consumer::event_context::EventContext;
 //! # use prosody::timers::Trigger;

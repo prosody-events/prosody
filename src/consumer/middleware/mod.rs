@@ -57,12 +57,25 @@
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
-//! # use prosody::consumer::middleware::shutdown::ShutdownMiddleware;
+//! # use prosody::consumer::middleware::shutdown::*;
+//! # use prosody::consumer::DemandType;
+//! # use prosody::consumer::event_context::EventContext;
+//! # use prosody::consumer::message::ConsumerMessage;
+//! # use prosody::timers::Trigger;
+//! # use std::convert::Infallible;
+//! # #[derive(Clone)]
+//! # struct MyHandler;
+//! # impl FallibleHandler for MyHandler {
+//! #     type Error = Infallible;
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn shutdown(self) {}
+//! # }
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
 //! # let middle_middleware = ShutdownMiddleware;
 //! # let outer_middleware = ShutdownMiddleware;
-//! # let my_handler = || {};
+//! # let my_handler = MyHandler;
 //!
 //! // Basic composition pattern
 //! let provider = inner_middleware
@@ -80,18 +93,31 @@
 //! # use prosody::consumer::middleware::topic::*;
 //! # use prosody::consumer::middleware::shutdown::*;
 //! # use prosody::producer::{ProsodyProducer, ProducerConfiguration};
+//! # use prosody::consumer::DemandType;
+//! # use prosody::consumer::event_context::EventContext;
+//! # use prosody::consumer::message::ConsumerMessage;
+//! # use prosody::timers::Trigger;
+//! # use std::convert::Infallible;
+//! # #[derive(Clone)]
+//! # struct MyHandler;
+//! # impl FallibleHandler for MyHandler {
+//! #     type Error = Infallible;
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn shutdown(self) {}
+//! # }
 //! # let config = ConcurrencyLimitConfigurationBuilder::default().build().unwrap();
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let topic_config = FailureTopicConfiguration::builder().failure_topic("dlq").build().unwrap();
-//! # let producer_config = ProducerConfiguration::builder().build().unwrap();
-//! # let producer = ProsodyProducer::new(producer_config).unwrap();
-//! # let my_business_handler = || {};
+//! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
+//! # let producer = ProsodyProducer::new(&producer_config).unwrap();
+//! # let my_business_handler = MyHandler;
 //!
 //! // Low-latency consumer with full error handling
 //! let provider = ConcurrencyLimitMiddleware::new(&config).unwrap()
 //!     .layer(ShutdownMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap())
-//!     .layer(FailureTopicMiddleware::new(topic_config, "group".to_string(), producer).unwrap())
+//!     .layer(FailureTopicMiddleware::new(topic_config, "consumer-group".to_string(), producer).unwrap())
 //!     .layer(RetryMiddleware::new(retry_config).unwrap())
 //!     .into_provider(my_business_handler);
 //! ```
@@ -231,10 +257,23 @@ pub trait HandlerMiddleware {
     /// # Example
     ///
     /// ```rust,no_run
+    /// # use prosody::consumer::middleware::*;
     /// # use prosody::consumer::middleware::retry::*;
-    /// # use prosody::consumer::middleware::HandlerMiddleware;
+    /// # use prosody::consumer::DemandType;
+    /// # use prosody::consumer::event_context::EventContext;
+    /// # use prosody::consumer::message::ConsumerMessage;
+    /// # use prosody::timers::Trigger;
+    /// # use std::convert::Infallible;
+    /// # #[derive(Clone)]
+    /// # struct MyHandler;
+    /// # impl FallibleHandler for MyHandler {
+    /// #     type Error = Infallible;
+    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn shutdown(self) {}
+    /// # }
     /// # let config = RetryConfiguration::builder().build().unwrap();
-    /// # let my_handler = || {};
+    /// # let my_handler = MyHandler;
     /// let middleware = RetryMiddleware::new(config).unwrap();
     /// let provider = middleware.into_provider(my_handler);
     /// ```

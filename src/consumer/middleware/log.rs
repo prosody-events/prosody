@@ -24,10 +24,28 @@
 //!
 //! Position as outer middleware for complete error visibility:
 //!
-//! ```rust
-//! use prosody::consumer::middleware::*;
+//! ```rust,no_run
+//! # use prosody::consumer::middleware::*;
+//! # use prosody::consumer::middleware::concurrency::*;
+//! # use prosody::consumer::middleware::log::*;
+//! # use prosody::consumer::middleware::shutdown::*;
+//! # use prosody::consumer::DemandType;
+//! # use prosody::consumer::event_context::EventContext;
+//! # use prosody::consumer::message::ConsumerMessage;
+//! # use prosody::timers::Trigger;
+//! # use std::convert::Infallible;
+//! # #[derive(Clone)]
+//! # struct MyHandler;
+//! # impl FallibleHandler for MyHandler {
+//! #     type Error = Infallible;
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn shutdown(self) {}
+//! # }
+//! # let config = ConcurrencyLimitConfigurationBuilder::default().build().unwrap();
+//! # let handler = MyHandler;
 //!
-//! let provider = ConcurrencyLimitMiddleware::new(&config)
+//! let provider = ConcurrencyLimitMiddleware::new(&config).unwrap()
 //!     .layer(ShutdownMiddleware)
 //!     .layer(LogMiddleware) // Logs all errors from inner layers
 //!     .into_provider(handler);

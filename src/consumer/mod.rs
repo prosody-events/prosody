@@ -34,6 +34,7 @@
 //! ```
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::consumer::message::UncommittedMessage;
+//! use prosody::consumer::middleware::CloneProvider;
 //! use prosody::consumer::{
 //!     ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
 //! };
@@ -85,8 +86,12 @@
 //!     .subscribed_topics(vec!["my-topic".to_string()])
 //!     .build()?;
 //!
-//! let consumer =
-//!     ProsodyConsumer::new(&config, &TriggerStoreConfiguration::InMemory, MyHandler).await?;
+//! let consumer = ProsodyConsumer::new(
+//!     &config,
+//!     &TriggerStoreConfiguration::InMemory,
+//!     CloneProvider::new(MyHandler),
+//! )
+//! .await?;
 //!
 //! // The consumer will process messages until shutdown is called
 //! # Ok(())
