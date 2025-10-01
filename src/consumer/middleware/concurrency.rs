@@ -44,6 +44,7 @@ use tokio::sync::{AcquireError, Semaphore};
 use tracing::debug;
 use validator::{Validate, ValidationErrors};
 
+use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
@@ -180,7 +181,12 @@ where
 {
     type Error = ConcurrencyLimitError<T::Error>;
 
-    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -191,12 +197,17 @@ where
 
         // Call the wrapped handler
         self.handler
-            .on_message(context, message)
+            .on_message(context, message, demand_type)
             .await
             .map_err(ConcurrencyLimitError::Handler)
     }
 
-    async fn on_timer<C>(&self, context: C, trigger: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -207,7 +218,7 @@ where
 
         // Call the wrapped handler
         self.handler
-            .on_timer(context, trigger)
+            .on_timer(context, trigger, demand_type)
             .await
             .map_err(ConcurrencyLimitError::Handler)
     }

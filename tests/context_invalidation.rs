@@ -11,7 +11,7 @@ use prosody::{
     consumer::event_context::{BoxEventContext, EventContext},
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer, Uncommitted},
+    consumer::{ConsumerConfiguration, DemandType, EventHandler, ProsodyConsumer, Uncommitted},
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
@@ -38,7 +38,7 @@ impl ContextInvalidationHandler {
 }
 
 impl EventHandler for ContextInvalidationHandler {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage, _demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -58,7 +58,7 @@ impl EventHandler for ContextInvalidationHandler {
         // When this method returns, the context should be invalidated
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,

@@ -1,3 +1,4 @@
+use crate::consumer::DemandType;
 use crate::telemetry::event::{
     Data, KeyEvent, KeyState, PartitionEvent, PartitionState, TelemetryEvent,
 };
@@ -70,7 +71,13 @@ impl TelemetrySender {
         });
     }
 
-    pub fn middleware_entered(&self, topic: Topic, partition: Partition, key: Key) {
+    pub fn middleware_entered(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        key: Key,
+        demand_type: DemandType,
+    ) {
         let timestamp = self.clock.now();
         let _ = self.tx.try_send(TelemetryEvent {
             timestamp,
@@ -78,12 +85,19 @@ impl TelemetrySender {
             partition,
             data: Data::Key(KeyEvent {
                 key,
+                demand_type,
                 state: KeyState::MiddlewareEntered,
             }),
         });
     }
 
-    pub fn handler_invoked(&self, topic: Topic, partition: Partition, key: Key) {
+    pub fn handler_invoked(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        key: Key,
+        demand_type: DemandType,
+    ) {
         let timestamp = self.clock.now();
         let _ = self.tx.try_send(TelemetryEvent {
             timestamp,
@@ -91,12 +105,19 @@ impl TelemetrySender {
             partition,
             data: Data::Key(KeyEvent {
                 key,
+                demand_type,
                 state: KeyState::HandlerInvoked,
             }),
         });
     }
 
-    pub fn handler_succeeded(&self, topic: Topic, partition: Partition, key: Key) {
+    pub fn handler_succeeded(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        key: Key,
+        demand_type: DemandType,
+    ) {
         let timestamp = self.clock.now();
         let _ = self.tx.try_send(TelemetryEvent {
             timestamp,
@@ -104,12 +125,19 @@ impl TelemetrySender {
             partition,
             data: Data::Key(KeyEvent {
                 key,
+                demand_type,
                 state: KeyState::HandlerSucceeded,
             }),
         });
     }
 
-    pub fn handler_failed(&self, topic: Topic, partition: Partition, key: Key) {
+    pub fn handler_failed(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        key: Key,
+        demand_type: DemandType,
+    ) {
         let timestamp = self.clock.now();
         let _ = self.tx.try_send(TelemetryEvent {
             timestamp,
@@ -117,12 +145,19 @@ impl TelemetrySender {
             partition,
             data: Data::Key(KeyEvent {
                 key,
+                demand_type,
                 state: KeyState::HandlerFailed,
             }),
         });
     }
 
-    pub fn middleware_exited(&self, topic: Topic, partition: Partition, key: Key) {
+    pub fn middleware_exited(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        key: Key,
+        demand_type: DemandType,
+    ) {
         let timestamp = self.clock.now();
         let _ = self.tx.try_send(TelemetryEvent {
             timestamp,
@@ -130,6 +165,7 @@ impl TelemetrySender {
             partition,
             data: Data::Key(KeyEvent {
                 key,
+                demand_type,
                 state: KeyState::MiddlewareExited,
             }),
         });

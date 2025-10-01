@@ -122,7 +122,7 @@ use std::future::Future;
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventHandler, Uncommitted};
+use crate::consumer::{DemandType, EventHandler, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::{Partition, Topic};
 
@@ -315,6 +315,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     ///
     /// * `context` - The context of the message being processed.
     /// * `message` - The message to be processed.
+    /// * `demand_type` - Whether this is normal processing or failure retry.
     ///
     /// # Returns
     ///
@@ -324,6 +325,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         &self,
         context: C,
         message: ConsumerMessage,
+        demand_type: DemandType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         C: EventContext;
@@ -341,6 +343,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     ///   management
     /// * `trigger` - The timer trigger containing key, time, and span
     ///   information
+    /// * `demand_type` - Whether this is normal processing or failure retry.
     ///
     /// # Returns
     ///
@@ -367,6 +370,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         &self,
         context: C,
         trigger: Trigger,
+        demand_type: DemandType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         C: EventContext;
@@ -453,14 +457,16 @@ where
     T: FallibleEventHandler,
     T::Error: ClassifyError,
 {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
     where
         C: EventContext,
     {
         let (inner_message, uncommitted_offset) = message.into_inner();
 
         // Attempt to process the message
-        let Err(error) = FallibleHandler::on_message(self, context, inner_message).await else {
+        let Err(error) =
+            FallibleHandler::on_message(self, context, inner_message, demand_type).await
+        else {
             uncommitted_offset.commit();
             return;
         };
@@ -475,7 +481,7 @@ where
         }
     }
 
-    async fn on_timer<C, U>(&self, context: C, timer: U)
+    async fn on_timer<C, U>(&self, context: C, timer: U, demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -483,7 +489,8 @@ where
         let (trigger, uncommitted_timer) = timer.into_inner();
 
         // Attempt to process the timer
-        let Err(error) = FallibleHandler::on_timer(self, context, trigger).await else {
+        let Err(error) = FallibleHandler::on_timer(self, context, trigger, demand_type).await
+        else {
             uncommitted_timer.commit().await;
             return;
         };

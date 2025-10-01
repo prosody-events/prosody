@@ -37,6 +37,7 @@
 
 use tracing::{debug, error};
 
+use crate::consumer::DemandType;
 use crate::consumer::HandlerProvider;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
@@ -109,12 +110,17 @@ where
 {
     type Error = T::Error;
 
-    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the message with the wrapped handler
-        let Err(error) = self.handler.on_message(context, message).await else {
+        let Err(error) = self.handler.on_message(context, message, demand_type).await else {
             return Ok(());
         };
 
@@ -134,12 +140,17 @@ where
         Err(error)
     }
 
-    async fn on_timer<C>(&self, context: C, trigger: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
-        let Err(error) = self.handler.on_timer(context, trigger).await else {
+        let Err(error) = self.handler.on_timer(context, trigger, demand_type).await else {
             return Ok(());
         };
 

@@ -1,3 +1,4 @@
+use crate::consumer::DemandType;
 use crate::{Key, Partition, Topic};
 use quanta::Instant;
 
@@ -19,6 +20,7 @@ pub struct PartitionEvent {
 
 pub struct KeyEvent {
     pub key: Key,
+    pub demand_type: DemandType,
     pub state: KeyState,
 }
 

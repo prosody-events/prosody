@@ -34,7 +34,7 @@ use std::convert::Infallible;
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::{EventHandler, HandlerProvider, Partition, Topic};
+use crate::consumer::{DemandType, EventHandler, HandlerProvider, Partition, Topic};
 use crate::timers::Trigger;
 
 use super::{FallibleHandler, FallibleHandlerProvider};
@@ -146,7 +146,12 @@ where
 {
     type Error = Infallible;
 
-    async fn on_message<C>(&self, _context: C, _message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -156,7 +161,12 @@ where
         Ok(())
     }
 
-    async fn on_timer<C>(&self, _context: C, _trigger: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        _context: C,
+        _trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {

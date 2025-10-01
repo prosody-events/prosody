@@ -56,7 +56,7 @@ use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
-use crate::consumer::{EventHandler, HandlerProvider, Keyed, Uncommitted};
+use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Partition, Topic};
@@ -236,6 +236,7 @@ where
     ///
     /// * `context` - The message context.
     /// * `message` - The consumer message to be processed.
+    /// * `demand_type` - Whether this is normal processing or failure retry.
     ///
     /// # Returns
     ///
@@ -244,7 +245,12 @@ where
     /// # Errors
     ///
     /// Returns the underlying handler's error if all retry attempts fail.
-    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -256,9 +262,16 @@ where
 
         loop {
             attempt = attempt.saturating_add(1);
+            // Use the original demand type for the first attempt, failure demand for
+            // retries
+            let current_demand_type = if attempt == 1 {
+                demand_type
+            } else {
+                DemandType::Failure
+            };
             let Err(error) = self
                 .handler
-                .on_message(context.clone(), message.clone())
+                .on_message(context.clone(), message.clone(), current_demand_type)
                 .await
             else {
                 return Ok(());
@@ -331,7 +344,12 @@ where
         }
     }
 
-    async fn on_timer<C>(&self, context: C, timer: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        context: C,
+        timer: Trigger,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -339,8 +357,19 @@ where
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
+            // Use the original demand type for the first attempt, failure demand for
+            // retries
+            let current_demand_type = if attempt == 1 {
+                demand_type
+            } else {
+                DemandType::Failure
+            };
             // Try handling the timer
-            let Err(error) = self.handler.on_timer(context.clone(), timer.clone()).await else {
+            let Err(error) = self
+                .handler
+                .on_timer(context.clone(), timer.clone(), current_demand_type)
+                .await
+            else {
                 return Ok(());
             };
             // If shutdown was requested, stop retrying
@@ -397,7 +426,8 @@ where
     ///
     /// * `context` - The message context.
     /// * `message` - The uncommitted message to be processed.
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    /// * `demand_type` - Whether this is normal processing or failure retry.
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -410,9 +440,16 @@ where
 
         loop {
             attempt = attempt.saturating_add(1);
+            // Use the original demand type for the first attempt, failure demand for
+            // retries
+            let current_demand_type = if attempt == 1 {
+                demand_type
+            } else {
+                DemandType::Failure
+            };
             let Err(error) = self
                 .handler
-                .on_message(context.clone(), message.clone())
+                .on_message(context.clone(), message.clone(), current_demand_type)
                 .await
             else {
                 uncommitted_offset.commit();
@@ -475,7 +512,7 @@ where
         }
     }
 
-    async fn on_timer<C, U>(&self, context: C, timer: U)
+    async fn on_timer<C, U>(&self, context: C, timer: U, demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -485,10 +522,17 @@ where
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
+            // Use the original demand type for the first attempt, failure demand for
+            // retries
+            let current_demand_type = if attempt == 1 {
+                demand_type
+            } else {
+                DemandType::Failure
+            };
             // Try handling the timer
             let Err(error) = self
                 .handler
-                .on_timer(context.clone(), trigger.clone())
+                .on_timer(context.clone(), trigger.clone(), current_demand_type)
                 .await
             else {
                 uncommitted.commit().await;

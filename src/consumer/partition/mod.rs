@@ -18,7 +18,7 @@ use crate::consumer::event_context::{EventContext, TimerContext};
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{EventHandler, Keyed, Uncommitted};
+use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
@@ -402,12 +402,14 @@ async fn handle_messages<T, S>(
         match event {
             UncommittedEvent::Message(message) => {
                 let _guard = message.process_scope();
-                handler.on_message(context, message).await;
+                handler
+                    .on_message(context, message, DemandType::Normal)
+                    .await;
             }
             UncommittedEvent::Timer(timer) => {
                 if timer.is_active().await {
                     let _guard = timer.process_scope();
-                    handler.on_timer(context, timer).await;
+                    handler.on_timer(context, timer, DemandType::Normal).await;
                 }
             }
         }

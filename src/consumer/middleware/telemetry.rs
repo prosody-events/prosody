@@ -41,8 +41,8 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage) -> Result<(), Self::Error> { Ok(()) }
-//! #     async fn on_timer<C>(&self, _: C, _: Trigger) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
 //! # let config = ConcurrencyLimitConfigurationBuilder::default().build().unwrap();
@@ -59,6 +59,7 @@
 
 use tracing::debug;
 
+use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
@@ -152,22 +153,27 @@ where
     /// # Errors
     ///
     /// Returns the original error from the wrapped handler
-    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
         let key = message.key().clone();
 
         // Record handler invocation
-        self.sender.handler_invoked(key.clone());
+        self.sender.handler_invoked(key.clone(), demand_type);
 
         // Process the message with the wrapped handler
-        let result = self.handler.on_message(context, message).await;
+        let result = self.handler.on_message(context, message, demand_type).await;
 
         // Record success or failure
         match &result {
-            Ok(()) => self.sender.handler_succeeded(key),
-            Err(_) => self.sender.handler_failed(key),
+            Ok(()) => self.sender.handler_succeeded(key, demand_type),
+            Err(_) => self.sender.handler_failed(key, demand_type),
         }
 
         result
@@ -188,22 +194,27 @@ where
     /// # Errors
     ///
     /// Returns the original error from the wrapped handler
-    async fn on_timer<C>(&self, context: C, trigger: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
         let key = trigger.key.clone();
 
         // Record handler invocation
-        self.sender.handler_invoked(key.clone());
+        self.sender.handler_invoked(key.clone(), demand_type);
 
         // Process the timer with the wrapped handler
-        let result = self.handler.on_timer(context, trigger).await;
+        let result = self.handler.on_timer(context, trigger, demand_type).await;
 
         // Record success or failure
         match &result {
-            Ok(()) => self.sender.handler_succeeded(key),
-            Err(_) => self.sender.handler_failed(key),
+            Ok(()) => self.sender.handler_succeeded(key, demand_type),
+            Err(_) => self.sender.handler_failed(key, demand_type),
         }
 
         result

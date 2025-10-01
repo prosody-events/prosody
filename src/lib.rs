@@ -31,6 +31,7 @@
 //! use prosody::consumer::middleware::retry::RetryConfiguration;
 //! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::middleware::{FallibleHandler, ClassifyError};
+//! use prosody::consumer::DemandType;
 //! use prosody::consumer::message::ConsumerMessage;
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::timers::{Trigger, store::TriggerStore};
@@ -51,7 +52,8 @@
 //!     async fn on_message<C>(
 //!         &self,
 //!         context: C,
-//!         message: ConsumerMessage
+//!         message: ConsumerMessage,
+//!         _demand_type: DemandType
 //!     ) -> Result<(), Self::Error>
 //!     where
 //!         C: EventContext,
@@ -64,6 +66,7 @@
 //!         &self,
 //!         context: C,
 //!         trigger: Trigger,
+//!         _demand_type: DemandType,
 //!     ) -> Result<(), Self::Error>
 //!     where
 //!         C: EventContext,

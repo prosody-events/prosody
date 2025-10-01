@@ -9,7 +9,7 @@ use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration}
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::middleware::CloneProvider;
-use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::timers::UncommittedTimer;
 use prosody::{Payload, Topic};
@@ -28,7 +28,7 @@ struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage)
+    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage, _demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -39,7 +39,7 @@ impl EventHandler for TestHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,

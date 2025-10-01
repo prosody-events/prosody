@@ -43,6 +43,7 @@
 use thiserror::Error;
 use tracing::debug;
 
+use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{
@@ -117,7 +118,12 @@ where
     ///
     /// Returns a `ShutdownError::Shutdown` if the partition is being revoked,
     /// or a `ShutdownError::Handler` containing the wrapped handler's error.
-    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -126,12 +132,17 @@ where
         }
 
         self.handler
-            .on_message(context, message)
+            .on_message(context, message, demand_type)
             .await
             .map_err(ShutdownError::Handler)
     }
 
-    async fn on_timer<C>(&self, context: C, timer: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        context: C,
+        timer: Trigger,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -139,7 +150,7 @@ where
             return Err(ShutdownError::Shutdown);
         }
         self.handler
-            .on_timer(context, timer)
+            .on_timer(context, timer, demand_type)
             .await
             .map_err(ShutdownError::Handler)
     }

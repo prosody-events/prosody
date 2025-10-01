@@ -4,7 +4,7 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventContext, EventHandler, Uncommitted};
+use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::timers::store::memory::InMemoryTriggerStore;
 use aho_corasick::StartKind;
 use chrono::Utc;
@@ -205,6 +205,7 @@ async fn test_partition_manager_is_stalled() {
             &self,
             _context: C,
             message: UncommittedMessage,
+            _demand_type: DemandType,
         ) -> impl Future<Output = ()> + Send
         where
             C: EventContext,
@@ -223,7 +224,7 @@ async fn test_partition_manager_is_stalled() {
             }
         }
 
-        async fn on_timer<C, U>(&self, _context: C, _timer: U)
+        async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
         where
             C: EventContext,
             U: UncommittedTimer,
@@ -460,6 +461,7 @@ impl EventHandler for TestHandler {
         &self,
         _context: C,
         message: UncommittedMessage,
+        _demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
         C: EventContext,
@@ -493,7 +495,7 @@ impl EventHandler for TestHandler {
         }
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,

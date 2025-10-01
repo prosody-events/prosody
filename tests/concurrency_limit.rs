@@ -45,10 +45,10 @@ use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::ConsumerConfiguration,
-    consumer::EventHandler,
     consumer::ProsodyConsumer,
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
+    consumer::{DemandType, EventHandler},
     producer::ProducerConfiguration,
     producer::ProsodyProducer,
 };
@@ -80,8 +80,12 @@ struct ConcurrencyTestHandler {
 }
 
 impl EventHandler for ConcurrencyTestHandler {
-    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
-    where
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         // Increment the current processing count and update maximum observed
@@ -108,7 +112,7 @@ impl EventHandler for ConcurrencyTestHandler {
         }
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,

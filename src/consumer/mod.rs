@@ -35,7 +35,7 @@
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::consumer::message::UncommittedMessage;
 //! use prosody::consumer::{
-//!     ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
+//!     ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
 //! };
 //! use prosody::high_level::config::TriggerStoreConfiguration;
 //! use prosody::timers::{UncommittedTimer, store::TriggerStore};
@@ -45,8 +45,12 @@
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
-//!     async fn on_message<C>(&self, context: C, message: UncommittedMessage)
-//!     where
+//!     async fn on_message<C>(
+//!         &self,
+//!         context: C,
+//!         message: UncommittedMessage,
+//!         _demand_type: DemandType,
+//!     ) where
 //!         C: EventContext,
 //!     {
 //!         // Process the message
@@ -56,7 +60,7 @@
 //!         message.commit().await;
 //!     }
 //!
-//!     async fn on_timer<C, U>(&self, context: C, timer: U)
+//!     async fn on_timer<C, U>(&self, context: C, timer: U, _demand_type: DemandType)
 //!     where
 //!         C: EventContext,
 //!         U: UncommittedTimer,
@@ -198,6 +202,22 @@ const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 
 /// Defines a type with an associated key.
 ///
+/// Represents the type of demand being processed.
+///
+/// Demand types allow the system to distinguish between normal processing
+/// and failure handling scenarios, enabling different processing behaviors
+/// for the same event type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemandType {
+    /// Normal demand represents the initial processing attempt of an event.
+    Normal,
+
+    /// Failure demand represents retry processing after a previous failure.
+    /// This is typically created by retry middleware when an event fails
+    /// and needs to be reprocessed.
+    Failure,
+}
+
 /// This trait is implemented by message types that have a key field,
 /// allowing key-based message routing and processing.
 pub trait Keyed {
@@ -286,6 +306,7 @@ pub trait EventHandler {
     /// * `context` - The message context providing metadata and shutdown
     ///   notification.
     /// * `message` - The uncommitted message to process.
+    /// * `demand_type` - Whether this is normal processing or failure retry.
     ///
     /// # Returns
     ///
@@ -294,6 +315,7 @@ pub trait EventHandler {
         &self,
         context: C,
         message: UncommittedMessage,
+        demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
         C: EventContext;
@@ -310,6 +332,7 @@ pub trait EventHandler {
     /// * `context` - The event processing context with access to timer
     ///   management
     /// * `timer` - The uncommitted timer event that fired
+    /// * `demand_type` - Whether this is normal processing or failure retry.
     ///
     /// # Processing Requirements
     ///
@@ -321,7 +344,12 @@ pub trait EventHandler {
     ///
     /// A future that resolves when timer processing is complete. Note that
     /// this future completing does not automatically commit the timer.
-    fn on_timer<C, T>(&self, context: C, timer: T) -> impl Future<Output = ()> + Send
+    fn on_timer<C, T>(
+        &self,
+        context: C,
+        timer: T,
+        demand_type: DemandType,
+    ) -> impl Future<Output = ()> + Send
     where
         C: EventContext,
         T: UncommittedTimer;

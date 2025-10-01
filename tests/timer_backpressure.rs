@@ -11,7 +11,7 @@ use prosody::{
     consumer::event_context::EventContext,
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
+    consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
@@ -34,7 +34,7 @@ pub struct SlowTimerHandler {
 }
 
 impl EventHandler for SlowTimerHandler {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage, _demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -64,7 +64,7 @@ impl EventHandler for SlowTimerHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<C, U>(&self, _context: C, timer: U)
+    async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,

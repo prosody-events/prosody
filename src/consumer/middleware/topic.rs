@@ -48,6 +48,7 @@ use thiserror::Error;
 use tracing::{debug, error, info};
 use validator::{Validate, ValidationErrors};
 
+use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
@@ -204,7 +205,12 @@ where
     /// Returns a `FailureTopicError::Handler` if the wrapped handler fails with
     /// a terminal error. Returns a `FailureTopicError::Producer` if sending
     /// to the failure topic fails.
-    async fn on_message<C>(&self, context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -218,7 +224,11 @@ where
             .to_rfc3339_opts(SecondsFormat::AutoSi, true);
 
         // Attempt to process the message with the wrapped handler
-        let Err(error) = self.handler.on_message(context, message.clone()).await else {
+        let Err(error) = self
+            .handler
+            .on_message(context, message.clone(), demand_type)
+            .await
+        else {
             return Ok(());
         };
 
@@ -263,12 +273,21 @@ where
         Ok(())
     }
 
-    async fn on_timer<C>(&self, context: C, timer: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        context: C,
+        timer: Trigger,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
-        let Err(error) = self.handler.on_timer(context, timer.clone()).await else {
+        let Err(error) = self
+            .handler
+            .on_timer(context, timer.clone(), demand_type)
+            .await
+        else {
             return Ok(());
         };
 

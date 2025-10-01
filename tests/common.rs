@@ -24,7 +24,7 @@ use prosody::cassandra::config::CassandraConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
 use prosody::consumer::middleware::{ClassifyError, CloneProvider, ErrorCategory, FallibleHandler};
-use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::timers::{Trigger, UncommittedTimer};
@@ -419,8 +419,12 @@ pub struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
-    where
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
@@ -437,7 +441,7 @@ impl EventHandler for TestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -458,9 +462,14 @@ pub struct SlowTestHandler {
 }
 
 impl EventHandler for SlowTestHandler {
+    #[allow(clippy::used_underscore_binding)]
     #[instrument(skip(self, _context))]
-    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
-    where
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
@@ -476,7 +485,7 @@ impl EventHandler for SlowTestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -517,7 +526,12 @@ pub struct FallibleTestHandler {
 impl FallibleHandler for FallibleTestHandler {
     type Error = TestError;
 
-    async fn on_message<C>(&self, _context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -529,7 +543,12 @@ impl FallibleHandler for FallibleTestHandler {
         Ok(())
     }
 
-    async fn on_timer<C>(&self, _context: C, _timer: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        _context: C,
+        _timer: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
