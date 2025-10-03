@@ -555,7 +555,7 @@ pub struct ConsumerConfiguration {
     pub probe_port: Option<u16>,
 
     #[builder(
-        default = "from_duration_env_with_fallback(\"PROSODY_SLAB_SIZE\", Duration::from_secs(10 \
+        default = "from_duration_env_with_fallback(\"PROSODY_SLAB_SIZE\", Duration::from_secs(60 \
                    * 60))?",
         setter(into)
     )]
@@ -827,8 +827,6 @@ impl ProsodyConsumer {
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
         let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
 
-        // Telemetry first (innermost), then retries, failure topic, shutdown, scheduler
-        // (outermost)
         let provider = telemetry_middleware // record handler lifecycle events
             .layer(scheduler_middleware) // fair scheduler with global concurrency limit
             .layer(ShutdownMiddleware) // stop processing if shutting down partition

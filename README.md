@@ -196,7 +196,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                                  | 5m           | ✓        |          |
 | `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                         | 1s           |          | ✓        |
 | `PROSODY_SHUTDOWN_TIMEOUT`       | Timeout to wait for in-flight tasks to complete during partition shutdown            | 30s          | ✓        |          |
-| `PROSODY_SLAB_SIZE`              | Duration for timer slab partitioning                                                 | 10m          | ✓        |          |
+| `PROSODY_SLAB_SIZE`              | Duration for timer slab partitioning                                                 | 1h           | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                                 | `<group id>` |          | ✓        |
 | `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                                | 5m           | ✓        |          |
 | `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to. Also creates topics in mock cluster. | -            | ✓        |          |
@@ -425,11 +425,13 @@ graph TD
 5. **Polling Mechanism**: The `KafkaConsumer` uses a polling mechanism to efficiently fetch messages from Kafka brokers.
 
 6. **Backpressure Management**: Prosody provides multiple levels of backpressure control:
-   - **Global buffering**: A global semaphore limits the total number of messages being processed across all partitions
-   - **Partition pausing**: If a partition becomes backed up (i.e., its queues are full), Prosody will pause consumption
-     from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in one partition
-     doesn't affect the entire consumer
-   - **Per-key queuing**: Each key has bounded queues to prevent memory exhaustion
+    - **Global buffering**: A global semaphore limits the total number of messages being processed across all partitions
+    - **Partition pausing**: If a partition becomes backed up (i.e., its queues are full), Prosody will pause
+      consumption
+      from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in one
+      partition
+      doesn't affect the entire consumer
+    - **Per-key queuing**: Each key has bounded queues to prevent memory exhaustion
 
 ### Message Flow
 
@@ -531,5 +533,5 @@ flowchart TD
     EHandler --> ShutdownS
     EHandler --> TopicS
 %% Styling
-class ProducerComponents,ConsumerComponents,PartitionComponents,FailureHandling,TracingSystem subgraphStyle
+    class ProducerComponents, ConsumerComponents, PartitionComponents, FailureHandling, TracingSystem subgraphStyle
 ```
