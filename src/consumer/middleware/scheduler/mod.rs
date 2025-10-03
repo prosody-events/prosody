@@ -17,7 +17,7 @@ use crate::util::from_env_with_fallback;
 use crate::{Partition, Topic};
 
 mod decay;
-mod dispatch;
+pub mod dispatch;
 
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct SchedulerConfiguration {

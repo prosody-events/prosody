@@ -44,19 +44,20 @@ const FAIRNESS_WEIGHT: f64 = 1.0;
 #[derive(Debug, StructOfArray)]
 #[soa_derive(Debug)]
 #[allow(clippy::multiple_inherent_impl)]
-struct Task {
-    timestamp: Instant,
-    key: Key,
-    demand_type: DemandType,
-    tx: oneshot::Sender<OwnedSemaphorePermit>,
+pub struct Task {
+    pub timestamp: Instant,
+    pub key: Key,
+    pub demand_type: DemandType,
+    pub key_time: Option<DecayingDuration120>,
+    pub tx: oneshot::Sender<OwnedSemaphorePermit>,
 }
 
-struct Selector {
+pub struct Selector {
     tasks: TaskVec,
+    pub success_time: DecayingDuration120,
+    pub failure_time: DecayingDuration120,
     invocation_times: HashMap<Key, Instant, RandomState>,
-    success_time: DecayingDuration120,
-    failure_time: DecayingDuration120,
-    key_times: Cache<Key, DecayingDuration120>,
+    pub key_times: Cache<Key, DecayingDuration120>,
 }
 
 impl Dispatcher {
@@ -83,6 +84,7 @@ impl Dispatcher {
             timestamp: Instant::now(),
             key,
             demand_type,
+            key_time: None,
             tx,
         };
         self.tx
@@ -132,18 +134,26 @@ async fn run_event_loop(
     }
 }
 
+impl Default for Selector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Selector {
-    fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             tasks: TaskVec::default(),
-            invocation_times: HashMap::default(),
             success_time: Duration::ZERO.into(),
             failure_time: Duration::ZERO.into(),
+            invocation_times: HashMap::default(),
             key_times: Cache::new(8_192),
         }
     }
 
-    fn enqueue_task(&mut self, task: Task) {
+    pub fn enqueue_task(&mut self, mut task: Task) {
+        task.key_time = self.key_times.get(&task.key).copied();
         self.tasks.push(task);
     }
 
@@ -187,62 +197,53 @@ impl Selector {
         !self.tasks.is_empty()
     }
 
-    fn get_next_task(&mut self) -> Option<Task> {
-        if self.tasks.is_empty() {
-            return None;
-        }
-
+    pub fn get_next_task(&mut self) -> Option<Task> {
         let now = Instant::now();
+        let success_time = self.success_time;
+        let failure_time = self.failure_time;
 
         // Single pass: find best task in each class simultaneously
-        // Key insight: partial_priority = key_vt_micros - wait_urgency_micros preserves
-        // ordering within each class since class_avg is constant per class
-        let (normal_best, failure_best) = soa_zip!(&self.tasks, [timestamp, key, demand_type])
-            .enumerate()
-            .fold(
-                (None, None),
-                |(n_best, f_best), (index, (timestamp, key, demand_type))| {
-                    let key_vt_micros = self.key_times.get(key).map_or(0.0_f64, |vt| {
+        let (normal_best, failure_best) =
+            soa_zip!(&self.tasks, [timestamp, key, key_time, demand_type])
+                .enumerate()
+                .fold(
+                    (None, None),
+                    |(n_best, f_best), (index, (timestamp, key, key_time, demand_type))| {
                         #[allow(clippy::cast_precision_loss)]
-                        {
-                            vt.at(now).as_micros() as f64
+                        let key_vt_micros =
+                            key_time.map_or(0.0_f64, |vt| vt.at(now).as_micros() as f64);
+
+                        let wait_time = (now - *timestamp).as_secs_f64();
+                        let wait_ratio = (wait_time / MAX_WAIT_SECS).min(1.0);
+                        let wait_urgency_micros =
+                            WAIT_WEIGHT * wait_ratio.powi(2) * 1_000_000.0_f64;
+
+                        let partial_priority = key_vt_micros - wait_urgency_micros;
+
+                        match demand_type {
+                            DemandType::Normal => (
+                                update_min_priority(n_best, index, partial_priority, *timestamp),
+                                f_best,
+                            ),
+                            DemandType::Failure => (
+                                n_best,
+                                update_min_priority(f_best, index, partial_priority, *timestamp),
+                            ),
                         }
-                    });
-
-                    let wait_time = (now - *timestamp).as_secs_f64();
-                    let wait_ratio = (wait_time / MAX_WAIT_SECS).min(1.0_f64);
-                    // Convert wait urgency to microseconds to match key_vt units
-                    let wait_urgency_micros =
-                        WAIT_WEIGHT * wait_ratio * wait_ratio * 1_000_000.0_f64;
-
-                    // Partial priority in microseconds (class_avg subtracted later for display)
-                    // Ordering preserved within class since class_avg is constant
-                    let partial_priority = key_vt_micros - wait_urgency_micros;
-
-                    match demand_type {
-                        DemandType::Normal => (
-                            update_min_priority(n_best, index, partial_priority, *timestamp),
-                            f_best,
-                        ),
-                        DemandType::Failure => (
-                            n_best,
-                            update_min_priority(f_best, index, partial_priority, *timestamp),
-                        ),
-                    }
-                },
-            );
+                    },
+                );
 
         // Select based on class scores with fallback
-        let selected_index = match (normal_best.map(|(i, ..)| i), failure_best.map(|(i, ..)| i)) {
-            (Some(n), Some(f)) => {
-                let normal_score = self.success_time.at(now).as_secs_f64() / NORMAL_WEIGHT;
-                let failure_score = self.failure_time.at(now).as_secs_f64() / FAILURE_WEIGHT;
-                Some(if normal_score <= failure_score { n } else { f })
+        let selected_index = match (normal_best, failure_best) {
+            (Some((n, ..)), Some((f, ..))) => {
+                let normal_score = success_time.at(now).as_secs_f64() / NORMAL_WEIGHT;
+                let failure_score = failure_time.at(now).as_secs_f64() / FAILURE_WEIGHT;
+                if normal_score <= failure_score { n } else { f }
             }
-            (Some(n), None) => Some(n),
-            (None, Some(f)) => Some(f),
-            (None, None) => None,
-        }?;
+            (Some((n, ..)), None) => n,
+            (None, Some((f, ..))) => f,
+            (None, None) => return None,
+        };
 
         Some(self.tasks.swap_remove(selected_index))
     }
@@ -261,7 +262,8 @@ impl Selector {
     }
 }
 
-/// Updates the minimum priority task candidate if the new one has lower partial priority.
+/// Updates the minimum priority task candidate if the new one has lower partial
+/// priority.
 ///
 /// Partial priority is in microseconds: `key_vt_micros - wait_urgency_micros`.
 /// Class average is subtracted later, so ordering within class is preserved.
@@ -315,6 +317,7 @@ mod tests {
             timestamp: Instant::now() - Duration::from_secs(age_secs),
             key: Key::from(key),
             demand_type,
+            key_time: None,
             tx,
         }
     }
