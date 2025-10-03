@@ -53,7 +53,6 @@ serde = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
 simd-json = { version = "0.16", features = ["serde_impl"], optional = true }
-soa_derive = "0.14"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["macros", "sync"] }
 tokio-stream = "0.1"
@@ -79,7 +78,6 @@ simd-json = { version = "0.16", features = ["serde_impl"] }
 
 [dev-dependencies]
 color-eyre = "0.6"
-criterion = "0.5"
 derive-quickcheck-arbitrary = "0.1"
 itertools = "0.14"
 quickcheck = "1.0"
@@ -87,10 +85,6 @@ quickcheck_macros = "1.1"
 reqwest = "0.12"
 tokio = { version = "1.44", features = ["rt-multi-thread", "test-util"] }
 uuid = { version = "1.16", features = ["v4"] }
-
-[[bench]]
-name = "dispatch"
-harness = false
 
 [lints.rust]
 missing_docs = "warn"

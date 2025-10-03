@@ -515,4 +515,166 @@ mod tests {
 
         assert!(d1.at(t3).as_secs_f64() < d2.at(t3).as_secs_f64());
     }
+
+    #[test]
+    fn test_add_with_different_measured_at_times() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(60);
+
+        let d1 = TestDecayingDuration::from_secs(100, t0);
+        let d2 = TestDecayingDuration::from_secs(100, t1);
+
+        let sum = d1 + d2;
+
+        assert_eq!(sum.measured_at, t1, "Result should use max measured_at");
+
+        let expected = d1.at(t1).as_secs_f64() + d2.at(t1).as_secs_f64();
+        let actual = sum.at(t1).as_secs_f64();
+        assert!(
+            (actual - expected).abs() < 0.1_f64,
+            "Sum should decay d1 to t1 before adding"
+        );
+    }
+
+    #[test]
+    fn test_sub_with_different_measured_at_times() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(60);
+
+        let d1 = TestDecayingDuration::from_secs(100, t0);
+        let d2 = TestDecayingDuration::from_secs(30, t1);
+
+        let diff = d1 - d2;
+
+        assert_eq!(diff.measured_at, t1, "Result should use max measured_at");
+
+        let expected = d1.at(t1).as_secs_f64() - d2.at(t1).as_secs_f64();
+        let actual = diff.at(t1).as_secs_f64();
+        assert!(
+            (actual - expected).abs() < 0.1_f64,
+            "Difference should decay d1 to t1 before subtracting"
+        );
+    }
+
+    #[test]
+    fn test_equality_with_different_measured_at() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(60);
+
+        let d1 = TestDecayingDuration::from_secs(100, t0);
+        let d2 = TestDecayingDuration::from_secs(50, t1);
+
+        assert_eq!(d1, d2, "Equal decayed values should be equal");
+    }
+
+    #[test]
+    fn test_ordering_with_different_measured_at() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(60);
+
+        let d1 = TestDecayingDuration::from_secs(100, t0);
+        let d2 = TestDecayingDuration::from_secs(60, t1);
+
+        assert!(d1 < d2, "d1 decays to 50, d2 is 60");
+        assert!(d2 > d1);
+    }
+
+    #[test]
+    fn test_at_with_past_instant() {
+        let now = Instant::now();
+        let future = now + Duration::from_secs(10);
+        let d = TestDecayingDuration::from_secs(100, future);
+
+        let result = d.at(now);
+
+        assert_eq!(
+            result,
+            Duration::from_secs(100),
+            "Querying before measurement time should not decay"
+        );
+    }
+
+    #[test]
+    fn test_zero_decay_at_measurement_time() {
+        let now = Instant::now();
+        let d = TestDecayingDuration::from_secs(42, now);
+
+        let result = d.at(now);
+
+        assert_eq!(
+            result,
+            Duration::from_secs(42),
+            "No decay should occur at measurement time"
+        );
+    }
+
+    #[test]
+    fn test_from_micros_overflow() {
+        let now = Instant::now();
+        let d = TestDecayingDuration::from_micros(u64::MAX, now);
+
+        assert!(
+            d.at(now).as_nanos() > 0,
+            "Should saturate instead of overflow"
+        );
+    }
+
+    #[test]
+    fn test_from_millis_overflow() {
+        let now = Instant::now();
+        let d = TestDecayingDuration::from_millis(u64::MAX, now);
+
+        assert!(
+            d.at(now).as_nanos() > 0,
+            "Should saturate instead of overflow"
+        );
+    }
+
+    #[test]
+    fn test_from_secs_overflow() {
+        let now = Instant::now();
+        let d = TestDecayingDuration::from_secs(u64::MAX, now);
+
+        assert!(
+            d.at(now).as_nanos() > 0,
+            "Should saturate instead of overflow"
+        );
+    }
+
+    #[test]
+    fn test_add_saturating_overflow() {
+        let now = Instant::now();
+        let d1 = TestDecayingDuration::from_nanos(u64::MAX - 100, now);
+        let d2 = TestDecayingDuration::from_nanos(1000, now);
+
+        let sum = d1 + d2;
+
+        assert_eq!(
+            sum.at(now).as_nanos(),
+            u128::from(u64::MAX),
+            "Addition should saturate at u64::MAX"
+        );
+    }
+
+    #[test]
+    fn test_add_assign_duration() {
+        let now = Instant::now();
+        let mut d = TestDecayingDuration::from_secs(10, now);
+
+        d += Duration::from_secs(5);
+
+        let measured = d.at(Instant::now());
+        assert!((measured.as_secs_f64() - 15.0_f64).abs() < 0.1_f64);
+    }
+
+    #[test]
+    fn test_sub_assign_duration() {
+        let now = Instant::now();
+        let mut d = TestDecayingDuration::from_secs(10, now);
+
+        d -= Duration::from_secs(3);
+
+        let measured = d.at(Instant::now());
+        assert!((measured.as_secs_f64() - 7.0_f64).abs() < 0.1_f64);
+    }
 }

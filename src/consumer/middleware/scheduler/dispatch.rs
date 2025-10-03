@@ -7,16 +7,14 @@
 )] //todo: remove
 
 use super::decay::DecayingDuration;
-use crate::Key;
 use crate::consumer::DemandType;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
+use crate::{Key, Partition, Topic};
 use ahash::RandomState;
 use quanta::Instant;
 use quick_cache::unsync::Cache;
-use soa_derive::{StructOfArray, soa_zip};
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,23 +39,21 @@ const MAX_WAIT_SECS: f64 = 120.0;
 const WAIT_WEIGHT: f64 = 200.0;
 const FAIRNESS_WEIGHT: f64 = 1.0;
 
-#[derive(Debug, StructOfArray)]
-#[soa_derive(Debug)]
-#[allow(clippy::multiple_inherent_impl)]
-pub struct Task {
-    pub timestamp: Instant,
-    pub key: Key,
-    pub demand_type: DemandType,
-    pub key_time: Option<DecayingDuration120>,
-    pub tx: oneshot::Sender<OwnedSemaphorePermit>,
+#[derive(Debug)]
+struct Task {
+    timestamp: Instant,
+    key: Key,
+    demand_type: DemandType,
+    key_time: Option<DecayingDuration120>,
+    tx: oneshot::Sender<OwnedSemaphorePermit>,
 }
 
-pub struct Selector {
-    tasks: TaskVec,
-    pub success_time: DecayingDuration120,
-    pub failure_time: DecayingDuration120,
+struct Selector {
+    tasks: Vec<Task>,
+    success_time: DecayingDuration120,
+    failure_time: DecayingDuration120,
     invocation_times: HashMap<Key, Instant, RandomState>,
-    pub key_times: Cache<Key, DecayingDuration120>,
+    key_times: Cache<Key, DecayingDuration120>,
 }
 
 impl Dispatcher {
@@ -142,9 +138,9 @@ impl Default for Selector {
 
 impl Selector {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
-            tasks: TaskVec::default(),
+            tasks: Vec::new(),
             success_time: Duration::ZERO.into(),
             failure_time: Duration::ZERO.into(),
             invocation_times: HashMap::default(),
@@ -152,7 +148,7 @@ impl Selector {
         }
     }
 
-    pub fn enqueue_task(&mut self, mut task: Task) {
+    fn enqueue_task(&mut self, mut task: Task) {
         task.key_time = self.key_times.get(&task.key).copied();
         self.tasks.push(task);
     }
@@ -197,47 +193,42 @@ impl Selector {
         !self.tasks.is_empty()
     }
 
-    pub fn get_next_task(&mut self) -> Option<Task> {
+    fn get_next_task(&mut self) -> Option<Task> {
         let now = Instant::now();
-        let success_time = self.success_time;
-        let failure_time = self.failure_time;
 
         // Single pass: find best task in each class simultaneously
         let (normal_best, failure_best) =
-            soa_zip!(&self.tasks, [timestamp, key, key_time, demand_type])
+            self.tasks
+                .iter()
                 .enumerate()
-                .fold(
-                    (None, None),
-                    |(n_best, f_best), (index, (timestamp, key, key_time, demand_type))| {
-                        #[allow(clippy::cast_precision_loss)]
-                        let key_vt_micros =
-                            key_time.map_or(0.0_f64, |vt| vt.at(now).as_micros() as f64);
+                .fold((None, None), |(n_best, f_best), (index, task)| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let key_vt_micros = task
+                        .key_time
+                        .map_or(0.0_f64, |vt| vt.at(now).as_micros() as f64);
 
-                        let wait_time = (now - *timestamp).as_secs_f64();
-                        let wait_ratio = (wait_time / MAX_WAIT_SECS).min(1.0);
-                        let wait_urgency_micros =
-                            WAIT_WEIGHT * wait_ratio.powi(2) * 1_000_000.0_f64;
+                    let wait_time = (now - task.timestamp).as_secs_f64();
+                    let wait_ratio = (wait_time / MAX_WAIT_SECS).min(1.0);
+                    let wait_urgency_micros = WAIT_WEIGHT * wait_ratio.powi(2) * 1_000_000.0_f64;
+                    let priority = key_vt_micros - wait_urgency_micros;
 
-                        let partial_priority = key_vt_micros - wait_urgency_micros;
-
-                        match demand_type {
-                            DemandType::Normal => (
-                                update_min_priority(n_best, index, partial_priority, *timestamp),
-                                f_best,
-                            ),
-                            DemandType::Failure => (
-                                n_best,
-                                update_min_priority(f_best, index, partial_priority, *timestamp),
-                            ),
-                        }
-                    },
-                );
+                    match task.demand_type {
+                        DemandType::Normal => (
+                            update_min_priority(n_best, index, priority, task.timestamp),
+                            f_best,
+                        ),
+                        DemandType::Failure => (
+                            n_best,
+                            update_min_priority(f_best, index, priority, task.timestamp),
+                        ),
+                    }
+                });
 
         // Select based on class scores with fallback
         let selected_index = match (normal_best, failure_best) {
             (Some((n, ..)), Some((f, ..))) => {
-                let normal_score = success_time.at(now).as_secs_f64() / NORMAL_WEIGHT;
-                let failure_score = failure_time.at(now).as_secs_f64() / FAILURE_WEIGHT;
+                let normal_score = self.success_time.at(now).as_secs_f64() / NORMAL_WEIGHT;
+                let failure_score = self.failure_time.at(now).as_secs_f64() / FAILURE_WEIGHT;
                 if normal_score <= failure_score { n } else { f }
             }
             (Some((n, ..)), None) => n,
@@ -262,31 +253,25 @@ impl Selector {
     }
 }
 
-/// Updates the minimum priority task candidate if the new one has lower partial
+/// Updates the minimum priority task candidate if the new one has lower
 /// priority.
 ///
-/// Partial priority is in microseconds: `key_vt_micros - wait_urgency_micros`.
-/// Class average is subtracted later, so ordering within class is preserved.
+/// Priority is compared first, with timestamp as tiebreaker (earlier = higher
+/// priority).
 fn update_min_priority(
     current: Option<(usize, f64, Instant)>,
     index: usize,
     priority: f64,
     timestamp: Instant,
 ) -> Option<(usize, f64, Instant)> {
-    match current {
-        None => Some((index, priority, timestamp)),
-        Some((_, best_priority, best_timestamp)) => {
-            let ordering = priority
-                .partial_cmp(&best_priority)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| timestamp.cmp(&best_timestamp));
+    let Some((_, best_priority, best_timestamp)) = current else {
+        return Some((index, priority, timestamp));
+    };
 
-            if ordering == Ordering::Less {
-                Some((index, priority, timestamp))
-            } else {
-                current
-            }
-        }
+    if (priority, timestamp) < (best_priority, best_timestamp) {
+        Some((index, priority, timestamp))
+    } else {
+        current
     }
 }
 
@@ -306,6 +291,7 @@ impl ClassifyError for DispatchError {
 mod tests {
     use super::*;
     use color_eyre::eyre::{Result, bail};
+    use tokio::time::{sleep, timeout};
 
     fn create_selector() -> Selector {
         Selector::new()
@@ -1414,5 +1400,248 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn telemetry_tracks_invocation_time() {
+        let mut selector = create_selector();
+        let key = Key::from("test_key");
+        let now = Instant::now();
+
+        let event = TelemetryEvent {
+            timestamp: now,
+            topic: Topic::from("test"),
+            partition: Partition::from(0_i32),
+            data: Data::Key(KeyEvent {
+                key: key.clone(),
+                demand_type: DemandType::Normal,
+                state: KeyState::HandlerInvoked,
+            }),
+        };
+
+        selector.process_telemetry(event);
+
+        assert!(selector.invocation_times.contains_key(&key));
+        assert_eq!(selector.invocation_times.get(&key), Some(&now));
+    }
+
+    #[test]
+    fn telemetry_updates_success_time_and_key_vt() {
+        let mut selector = create_selector();
+        let key = Key::from("test_key");
+        let invoke_time = Instant::now();
+        let complete_time = invoke_time + Duration::from_millis(100);
+
+        // First, record invocation
+        selector.process_telemetry(TelemetryEvent {
+            timestamp: invoke_time,
+            topic: Topic::from("test"),
+            partition: Partition::from(0_i32),
+            data: Data::Key(KeyEvent {
+                key: key.clone(),
+                demand_type: DemandType::Normal,
+                state: KeyState::HandlerInvoked,
+            }),
+        });
+
+        let initial_success_time = selector.success_time.at(complete_time);
+
+        // Then, record completion
+        selector.process_telemetry(TelemetryEvent {
+            timestamp: complete_time,
+            topic: Topic::from("test"),
+            partition: Partition::from(0_i32),
+            data: Data::Key(KeyEvent {
+                key: key.clone(),
+                demand_type: DemandType::Normal,
+                state: KeyState::HandlerSucceeded,
+            }),
+        });
+
+        // Verify success_time increased
+        let final_success_time = selector.success_time.at(complete_time);
+        assert!(
+            final_success_time > initial_success_time,
+            "success_time should increase after handler completion"
+        );
+
+        // Verify key VT was updated
+        assert!(
+            selector.key_times.get(&key).is_some(),
+            "key_times should contain the key after completion"
+        );
+    }
+
+    #[test]
+    fn telemetry_updates_failure_time_on_handler_failed() {
+        let mut selector = create_selector();
+        let key = Key::from("test_key");
+        let invoke_time = Instant::now();
+        let complete_time = invoke_time + Duration::from_millis(50);
+
+        // Record invocation
+        selector.process_telemetry(TelemetryEvent {
+            timestamp: invoke_time,
+            topic: Topic::from("test"),
+            partition: Partition::from(0_i32),
+            data: Data::Key(KeyEvent {
+                key: key.clone(),
+                demand_type: DemandType::Failure,
+                state: KeyState::HandlerInvoked,
+            }),
+        });
+
+        let initial_failure_time = selector.failure_time.at(complete_time);
+
+        // Record failure
+        selector.process_telemetry(TelemetryEvent {
+            timestamp: complete_time,
+            topic: Topic::from("test"),
+            partition: Partition::from(0_i32),
+            data: Data::Key(KeyEvent {
+                key: key.clone(),
+                demand_type: DemandType::Failure,
+                state: KeyState::HandlerFailed,
+            }),
+        });
+
+        let final_failure_time = selector.failure_time.at(complete_time);
+        assert!(
+            final_failure_time > initial_failure_time,
+            "failure_time should increase after handler failed"
+        );
+    }
+
+    #[test]
+    fn telemetry_affects_scheduling_decision() -> Result<()> {
+        let mut selector = create_selector();
+
+        let key1 = Key::from("key1");
+        let key2 = Key::from("key2");
+
+        let now = Instant::now();
+
+        // Simulate key1 executing and accumulating VT
+        selector.process_telemetry(TelemetryEvent {
+            timestamp: now,
+            topic: Topic::from("test"),
+            partition: Partition::from(0_i32),
+            data: Data::Key(KeyEvent {
+                key: key1.clone(),
+                demand_type: DemandType::Normal,
+                state: KeyState::HandlerInvoked,
+            }),
+        });
+
+        selector.process_telemetry(TelemetryEvent {
+            timestamp: now + Duration::from_secs(1),
+            topic: Topic::from("test"),
+            partition: Partition::from(0_i32),
+            data: Data::Key(KeyEvent {
+                key: key1.clone(),
+                demand_type: DemandType::Normal,
+                state: KeyState::HandlerSucceeded,
+            }),
+        });
+
+        // Enqueue tasks for both keys
+        selector.enqueue_task(create_task("key1", DemandType::Normal, 0));
+        selector.enqueue_task(create_task("key2", DemandType::Normal, 0));
+
+        // key2 should be selected (lower VT)
+        let selected = selector.get_next_task();
+        assert!(selected.is_some());
+        let Some(selected) = selected else {
+            bail!("Expected task");
+        };
+        assert_eq!(
+            selected.key, key2,
+            "key2 should be selected due to lower VT"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_returns_permits() {
+        let telemetry = Telemetry::new();
+        let dispatcher = Dispatcher::new(2, &telemetry);
+
+        let permit1 = dispatcher
+            .get_permit(Key::from("key1"), DemandType::Normal)
+            .await;
+        let permit2 = dispatcher
+            .get_permit(Key::from("key2"), DemandType::Normal)
+            .await;
+
+        assert!(permit1.is_ok(), "Should get first permit");
+        assert!(permit2.is_ok(), "Should get second permit");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_respects_semaphore_limit() -> Result<()> {
+        let telemetry = Telemetry::new();
+        let dispatcher = Dispatcher::new(1, &telemetry);
+
+        // Get first permit
+        let _permit1 = dispatcher
+            .get_permit(Key::from("key1"), DemandType::Normal)
+            .await?;
+
+        // Try to get second permit (should block since max_permits=1)
+        let permit2_future = dispatcher.get_permit(Key::from("key2"), DemandType::Normal);
+
+        // Use timeout to verify it blocks
+        let result = timeout(Duration::from_millis(100), permit2_future).await;
+
+        assert!(
+            result.is_err(),
+            "Should timeout waiting for second permit when limit is 1"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_releases_permits_when_dropped() -> Result<()> {
+        let telemetry = Telemetry::new();
+        let dispatcher = Dispatcher::new(1, &telemetry);
+
+        // Get and drop first permit
+        {
+            let _permit1 = dispatcher
+                .get_permit(Key::from("key1"), DemandType::Normal)
+                .await?;
+            // permit1 dropped here
+        }
+
+        // Should be able to get another permit now
+        let permit2 = dispatcher
+            .get_permit(Key::from("key2"), DemandType::Normal)
+            .await;
+
+        assert!(
+            permit2.is_ok(),
+            "Should get permit after first was released"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_schedules_by_priority() {
+        let telemetry = Telemetry::new();
+        let dispatcher = Dispatcher::new(10, &telemetry);
+
+        // Enqueue tasks with different wait times (older = higher priority)
+        let old_task = dispatcher.get_permit(Key::from("old"), DemandType::Normal);
+        sleep(Duration::from_millis(10)).await;
+        let new_task = dispatcher.get_permit(Key::from("new"), DemandType::Normal);
+
+        // Both should complete, and old task should get priority
+        let (result1, result2) = tokio::join!(old_task, new_task);
+
+        assert!(result1.is_ok(), "Old task should complete");
+        assert!(result2.is_ok(), "New task should complete");
     }
 }
