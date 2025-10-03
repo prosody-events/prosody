@@ -1,4 +1,8 @@
-#![allow(dead_code, missing_docs, unused_variables, clippy::missing_errors_doc)] //todo: remove
+//! Fair work-conserving scheduler for handler concurrency control.
+//!
+//! Enforces global concurrency limits while prioritizing keys by accumulated
+//! virtual time, preventing monopolization by high-throughput keys and ensuring
+//! timely execution of waiting tasks through urgency boosting.
 
 use derive_builder::Builder;
 use thiserror::Error;
@@ -19,41 +23,61 @@ use crate::{Partition, Topic};
 mod decay;
 mod dispatch;
 
+/// Configuration for the scheduler middleware.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct SchedulerConfiguration {
+    /// Maximum number of concurrent handler invocations across all keys.
+    ///
+    /// Tasks block until a permit becomes available. Lower values reduce peak
+    /// load but may increase latency; higher values improve throughput but
+    /// risk resource exhaustion.
     #[builder(default = "from_env_with_fallback(\"PROSODY_MAX_CONCURRENCY\", 32)?")]
     #[validate(range(min = 1_usize))]
     pub max_permits: usize,
 }
 
+/// Middleware that applies fair scheduling to handler invocations.
+///
+/// Wraps handlers to enforce concurrency limits and priority-based dispatch.
 #[derive(Clone, Debug)]
 pub struct SchedulerMiddleware {
     dispatcher: Dispatcher,
 }
 
+/// Provider that creates scheduled handlers for each partition.
 #[derive(Clone, Debug)]
 pub struct SchedulerProvider<T> {
     provider: T,
     dispatcher: Dispatcher,
 }
 
+/// Handler wrapper that acquires scheduler permits before delegating to inner
+/// handler.
+///
+/// Permits are released automatically when the handler completes, allowing
+/// other tasks to proceed.
 #[derive(Clone, Debug)]
 pub struct SchedulerHandler<T> {
     handler: T,
     dispatcher: Dispatcher,
 }
 
+/// Errors that can occur during scheduled handler execution.
 #[derive(Debug, Error)]
 pub enum SchedulerError<E> {
+    /// The inner handler returned an error.
     #[error(transparent)]
     Handler(E),
 
+    /// Failed to acquire a permit from the scheduler.
     #[error("Failed to acquire scheduler permit: {0:#}")]
     PermitAcquisition(#[from] DispatchError),
 }
 
+/// Errors that can occur during scheduler initialization.
 #[derive(Debug, Error)]
 pub enum SchedulerInitError {
+    /// Configuration validation failed.
     #[error("Invalid configuration: {0}")]
     Validation(#[from] ValidationErrors),
 }
@@ -71,6 +95,7 @@ where
 }
 
 impl SchedulerConfiguration {
+    /// Creates a builder for constructing [`SchedulerConfiguration`].
     #[must_use]
     pub fn builder() -> SchedulerConfigurationBuilder {
         SchedulerConfigurationBuilder::default()
@@ -78,6 +103,11 @@ impl SchedulerConfiguration {
 }
 
 impl SchedulerMiddleware {
+    /// Creates a new scheduler middleware with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid.
     pub fn new(
         config: &SchedulerConfiguration,
         telemetry: &Telemetry,

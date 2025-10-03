@@ -1,3 +1,8 @@
+//! Exponentially decaying durations for virtual time accounting.
+//!
+//! Prevents starvation by allowing older execution times to gradually lose
+//! influence in scheduling decisions through exponential decay.
+
 #![allow(clippy::cast_precision_loss)]
 
 use quanta::Instant;
@@ -6,6 +11,12 @@ use std::iter::Sum;
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 use std::time::Duration;
 
+/// A duration that exponentially decays over time using base-2 exponential
+/// decay.
+///
+/// Tracks when a value was measured and automatically applies decay when
+/// queried, preventing unbounded growth of virtual time while maintaining
+/// fairness over recent execution history.
 #[derive(Clone, Copy, Debug)]
 pub struct DecayingDuration<const HALF_LIFE_SECS: u64> {
     value_nanos: u64,

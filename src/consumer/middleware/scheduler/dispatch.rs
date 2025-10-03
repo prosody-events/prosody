@@ -1,17 +1,15 @@
-#![allow(
-    dead_code,
-    missing_docs,
-    unused_variables,
-    clippy::missing_errors_doc,
-    clippy::same_name_method
-)] //todo: remove
+//! Priority-based task dispatcher with virtual time fairness.
+//!
+//! Maintains per-key virtual time to prevent high-throughput keys from
+//! monopolizing execution while boosting urgency for long-waiting tasks to
+//! prevent starvation.
 
 use super::decay::DecayingDuration;
+use crate::Key;
 use crate::consumer::DemandType;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
-use crate::{Key, Partition, Topic};
 use ahash::RandomState;
 use quanta::Instant;
 use quick_cache::unsync::Cache;
@@ -24,30 +22,51 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio::{select, spawn};
 use tracing::warn;
 
+/// Dispatches handler permits using virtual time fairness and urgency boosting.
+///
+/// Coordinates with telemetry to track per-key execution times and prioritizes
+/// tasks to prevent starvation and monopolization.
 #[derive(Clone, Debug)]
 pub struct Dispatcher {
     tx: mpsc::Sender<Task>,
 }
 
 type DecayingDuration120 = DecayingDuration<120>;
-type Best = Option<(usize, f64, Instant)>;
 
-const NORMAL_WEIGHT: f64 = 0.7;
+/// Target proportion of bandwidth for failure tasks.
 const FAILURE_WEIGHT: f64 = 0.3;
 
-const MAX_WAIT_SECS: f64 = 120.0;
-const WAIT_WEIGHT: f64 = 200.0;
-const FAIRNESS_WEIGHT: f64 = 1.0;
+/// Target proportion of bandwidth for normal (non-failure) tasks.
+const NORMAL_WEIGHT: f64 = 1.0 - FAILURE_WEIGHT;
 
+/// Maximum wait time before urgency reaches maximum boost.
+const MAX_WAIT_SECS: f64 = 120.0;
+
+/// Multiplier for wait urgency boost, preventing indefinite starvation.
+const WAIT_WEIGHT: f64 = 200.0;
+
+/// A pending task awaiting a permit.
 #[derive(Debug)]
 struct Task {
+    /// When this task was enqueued.
     timestamp: Instant,
+    /// The key this task belongs to.
     key: Key,
+    /// Whether this is normal processing or failure handling.
     demand_type: DemandType,
+    /// Cached virtual time for this key, avoiding `HashMap` lookup during
+    /// selection.
     key_time: Option<DecayingDuration120>,
+    /// Channel to send the permit back to the waiting handler.
     tx: oneshot::Sender<OwnedSemaphorePermit>,
 }
 
+/// Selects the next task to execute based on virtual time fairness and wait
+/// urgency.
+///
+/// Tracks per-key and per-class virtual time to ensure fair scheduling while
+/// preventing starvation through quadratic urgency boosting for long-waiting
+/// tasks.
 struct Selector {
     tasks: Vec<Task>,
     success_time: DecayingDuration120,
@@ -255,9 +274,6 @@ impl Selector {
 
 /// Updates the minimum priority task candidate if the new one has lower
 /// priority.
-///
-/// Priority is compared first, with timestamp as tiebreaker (earlier = higher
-/// priority).
 fn update_min_priority(
     current: Option<(usize, f64, Instant)>,
     index: usize,
@@ -275,8 +291,11 @@ fn update_min_priority(
     }
 }
 
+/// Errors that can occur when requesting a permit from the dispatcher.
 #[derive(Debug, Error)]
 pub enum DispatchError {
+    /// The dispatcher event loop has terminated, no more permits will be
+    /// issued.
     #[error("dispatcher has been shutdown")]
     Shutdown,
 }
@@ -290,6 +309,7 @@ impl ClassifyError for DispatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Partition, Topic};
     use color_eyre::eyre::{Result, bail};
     use tokio::time::{sleep, timeout};
 
@@ -502,7 +522,6 @@ mod tests {
     #[test]
     fn class_proportions_converge() -> Result<()> {
         let mut selector = create_selector();
-        let mut normal_count = 0_i32;
         let mut failure_count = 0_i32;
 
         for i in 0_i32..1000_i32 {
@@ -519,7 +538,6 @@ mod tests {
             match selected.demand_type {
                 DemandType::Normal => {
                     selector.success_time += duration;
-                    normal_count += 1_i32;
                 }
                 DemandType::Failure => {
                     selector.failure_time += duration;
@@ -1100,9 +1118,7 @@ mod tests {
             // Burst pattern: failure keys re-enqueue every time, normal only every 5th
             // iteration
             let key_str = task.key.to_string();
-            if failure_keys.contains(&key_str) {
-                selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
-            } else if i % 5_i32 == 0_i32 {
+            if failure_keys.contains(&key_str) || i % 5_i32 == 0_i32 {
                 selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
             }
         }
@@ -1140,9 +1156,7 @@ mod tests {
             // Burst pattern: normal keys re-enqueue every time, failure only every 5th
             // iteration
             let key_str = task.key.to_string();
-            if normal_keys.contains(&key_str) {
-                selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
-            } else if i % 5_i32 == 0_i32 {
+            if normal_keys.contains(&key_str) || i % 5_i32 == 0_i32 {
                 selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
             }
         }
