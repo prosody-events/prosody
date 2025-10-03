@@ -13,6 +13,7 @@ use prosody::{
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
     timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
 use serde_json::json;
@@ -131,6 +132,7 @@ async fn test_timer_backpressure() -> Result<()> {
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(slow_timer_handler),
+        Telemetry::new(),
     )
     .await?;
 

@@ -10,12 +10,12 @@ use crate::cassandra::{
     CassandraConfiguration,
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
-use crate::consumer::middleware::concurrency::{
-    ConcurrencyLimitConfiguration, ConcurrencyLimitConfigurationBuilder,
-    ConcurrencyLimitConfigurationBuilderError,
-};
 use crate::consumer::middleware::retry::{
     RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
+};
+use crate::consumer::middleware::scheduler::{
+    SchedulerConfiguration, SchedulerConfigurationBuilder, SchedulerConfigurationBuilderError,
+    SchedulerInitError,
 };
 use crate::consumer::middleware::topic::{
     FailureTopicConfiguration, FailureTopicConfigurationBuilder,
@@ -45,8 +45,8 @@ pub enum ModeConfiguration {
         consumer: ConsumerConfiguration,
         /// The retry configuration.
         retry: RetryConfiguration,
-        /// The concurrency limit configuration.
-        concurrency: ConcurrencyLimitConfiguration,
+        /// The scheduler configuration.
+        scheduler: SchedulerConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -58,8 +58,8 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
-        /// The concurrency limit configuration.
-        concurrency: ConcurrencyLimitConfiguration,
+        /// The scheduler configuration.
+        scheduler: SchedulerConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -67,8 +67,8 @@ pub enum ModeConfiguration {
     BestEffort {
         /// The consumer configuration.
         consumer: ConsumerConfiguration,
-        /// The concurrency limit configuration.
-        concurrency: ConcurrencyLimitConfiguration,
+        /// The scheduler configuration.
+        scheduler: SchedulerConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -84,8 +84,7 @@ impl ModeConfiguration {
     /// * `consumer_builder` - Builder for the consumer configuration.
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
-    /// * `concurrency_builder` - Builder for the concurrency limit
-    ///   configuration.
+    /// * `scheduler_builder` - Builder for the scheduler configuration.
     /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Returns
@@ -101,12 +100,12 @@ impl ModeConfiguration {
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
-        concurrency_builder: &ConcurrencyLimitConfigurationBuilder,
+        scheduler_builder: &SchedulerConfigurationBuilder,
         cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Result<Self, ModeConfigurationError> {
         let consumer = consumer_builder.build()?;
         let retry = retry_builder.build()?;
-        let concurrency = concurrency_builder.build()?;
+        let scheduler = scheduler_builder.build()?;
 
         // Create trigger store configuration based on mock mode
         let trigger_store = if consumer.mock {
@@ -120,7 +119,7 @@ impl ModeConfiguration {
             Mode::Pipeline => Self::Pipeline {
                 consumer,
                 retry,
-                concurrency,
+                scheduler,
                 trigger_store,
             },
             Mode::LowLatency => {
@@ -129,13 +128,13 @@ impl ModeConfiguration {
                     consumer,
                     retry,
                     failure_topic,
-                    concurrency,
+                    scheduler,
                     trigger_store,
                 }
             }
             Mode::BestEffort => Self::BestEffort {
                 consumer,
-                concurrency,
+                scheduler,
                 trigger_store,
             },
         })
@@ -209,9 +208,13 @@ pub enum ModeConfigurationError {
     #[error("invalid failure topic configuration: {0:#}")]
     FailureTopic(#[from] FailureTopicConfigurationBuilderError),
 
-    /// Error when the concurrency limit configuration is invalid.
-    #[error("invalid concurrency limit configuration: {0:#}")]
-    ConcurrencyLimit(#[from] ConcurrencyLimitConfigurationBuilderError),
+    /// Error when the scheduler configuration builder fails.
+    #[error("invalid scheduler configuration: {0:#}")]
+    SchedulerConfigurationBuilder(#[from] SchedulerConfigurationBuilderError),
+
+    /// Error when the scheduler initialization fails.
+    #[error("scheduler initialization failed: {0:#}")]
+    Scheduler(#[from] SchedulerInitError),
 
     /// Error when the Cassandra configuration is invalid.
     #[error("invalid cassandra configuration: {0:#}")]

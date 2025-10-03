@@ -1,3 +1,5 @@
+//! Partition-scoped telemetry sender for consumer lifecycle events.
+
 use crate::consumer::DemandType;
 use crate::telemetry::event::{
     Data, KeyEvent, KeyState, PartitionEvent, PartitionState, TelemetryEvent,
@@ -7,6 +9,10 @@ use educe::Educe;
 use quanta::Clock;
 use tokio::sync::broadcast;
 
+/// Telemetry sender pre-configured for a specific partition.
+///
+/// Emits telemetry events for partition and key lifecycle events
+/// without requiring topic/partition parameters.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct TelemetryPartitionSender {
@@ -35,6 +41,7 @@ impl TelemetryPartitionSender {
         }
     }
 
+    /// Emits a partition paused event.
     pub fn partition_paused(&self) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -47,6 +54,7 @@ impl TelemetryPartitionSender {
         });
     }
 
+    /// Emits a partition resumed event.
     pub fn partition_resumed(&self) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -59,6 +67,7 @@ impl TelemetryPartitionSender {
         });
     }
 
+    /// Emits a partition assigned event.
     pub fn partition_assigned(&self) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -71,6 +80,7 @@ impl TelemetryPartitionSender {
         });
     }
 
+    /// Emits a partition revoked event.
     pub fn partition_revoked(&self) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -83,6 +93,7 @@ impl TelemetryPartitionSender {
         });
     }
 
+    /// Emits a middleware entered event for the given key.
     pub fn middleware_entered(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -97,6 +108,7 @@ impl TelemetryPartitionSender {
         });
     }
 
+    /// Emits a handler invoked event for the given key.
     pub fn handler_invoked(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -111,6 +123,7 @@ impl TelemetryPartitionSender {
         });
     }
 
+    /// Emits a handler succeeded event for the given key.
     pub fn handler_succeeded(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -125,6 +138,7 @@ impl TelemetryPartitionSender {
         });
     }
 
+    /// Emits a handler failed event for the given key.
     pub fn handler_failed(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -139,6 +153,7 @@ impl TelemetryPartitionSender {
         });
     }
 
+    /// Emits a middleware exited event for the given key.
     pub fn middleware_exited(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {

@@ -26,12 +26,13 @@
 //!
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
-//! # use prosody::consumer::middleware::concurrency::*;
 //! # use prosody::consumer::middleware::log::*;
+//! # use prosody::consumer::middleware::scheduler::*;
 //! # use prosody::consumer::middleware::shutdown::*;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
 //! # use prosody::consumer::message::ConsumerMessage;
+//! # use prosody::telemetry::Telemetry;
 //! # use prosody::timers::Trigger;
 //! # use std::convert::Infallible;
 //! # #[derive(Clone)]
@@ -42,10 +43,11 @@
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
-//! # let config = ConcurrencyLimitConfigurationBuilder::default().build().unwrap();
+//! # let config = SchedulerConfigurationBuilder::default().build().unwrap();
+//! # let telemetry = Telemetry::default();
 //! # let handler = MyHandler;
 //!
-//! let provider = ConcurrencyLimitMiddleware::new(&config).unwrap()
+//! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
 //!     .layer(ShutdownMiddleware)
 //!     .layer(LogMiddleware) // Logs all errors from inner layers
 //!     .into_provider(handler);

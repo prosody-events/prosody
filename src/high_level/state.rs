@@ -5,8 +5,8 @@
 //! It also includes a custom error type for handling state-related errors.
 
 use crate::cassandra::config::CassandraConfigurationBuilder;
-use crate::consumer::middleware::concurrency::ConcurrencyLimitConfigurationBuilder;
 use crate::consumer::middleware::retry::RetryConfigurationBuilder;
+use crate::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ProsodyConsumer};
 use crate::high_level::config::ModeConfiguration;
@@ -60,8 +60,7 @@ impl<T> ConsumerState<T> {
     /// * `consumer_builder` - Builder for the consumer configuration.
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
-    /// * `concurrency_builder` - Builder for the concurrency limit
-    ///   configuration.
+    /// * `scheduler_builder` - Builder for the scheduler configuration.
     /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Returns
@@ -73,7 +72,7 @@ impl<T> ConsumerState<T> {
         consumer_builder: &ConsumerConfigurationBuilder,
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
-        concurrency_builder: &ConcurrencyLimitConfigurationBuilder,
+        scheduler_builder: &SchedulerConfigurationBuilder,
         cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Self {
         match ModeConfiguration::build(
@@ -81,7 +80,7 @@ impl<T> ConsumerState<T> {
             consumer_builder,
             retry_builder,
             failure_topic_builder,
-            concurrency_builder,
+            scheduler_builder,
             cassandra_builder,
         ) {
             Ok(configuration) => Self::Configured(configuration),

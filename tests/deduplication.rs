@@ -10,6 +10,7 @@ use prosody::{
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
 };
 use serde_json::json;
 use tokio::sync::mpsc::channel;
@@ -77,6 +78,7 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(handler.clone()),
+        Telemetry::new(),
     )
     .await?;
 

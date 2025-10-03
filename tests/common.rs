@@ -27,6 +27,7 @@ use prosody::consumer::middleware::{ClassifyError, CloneProvider, ErrorCategory,
 use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::telemetry::Telemetry;
 use prosody::timers::{Trigger, UncommittedTimer};
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
@@ -239,6 +240,7 @@ pub fn spawn_consumers(
                 &consumer_config,
                 &create_cassandra_trigger_store_config(),
                 handler_provider,
+                Telemetry::new(),
             )
             .await?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?; // Wait for shutdown signal

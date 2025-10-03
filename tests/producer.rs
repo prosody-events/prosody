@@ -11,6 +11,7 @@ use prosody::consumer::message::UncommittedMessage;
 use prosody::consumer::middleware::CloneProvider;
 use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::telemetry::Telemetry;
 use prosody::timers::UncommittedTimer;
 use prosody::{Payload, Topic};
 use serde_json::{Value, json};
@@ -300,6 +301,7 @@ async fn test_producer_deduplication() -> Result<()> {
                 &cfg,
                 &common::create_cassandra_trigger_store_config(),
                 CloneProvider::new(handler),
+                Telemetry::new(),
             )
             .await?,
             rx,

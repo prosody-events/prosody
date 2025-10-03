@@ -27,8 +27,8 @@
 //!
 //! ```no_run
 //! use prosody::consumer::ConsumerConfiguration;
-//! use prosody::consumer::middleware::concurrency::ConcurrencyLimitConfigurationBuilder;
 //! use prosody::consumer::middleware::retry::RetryConfiguration;
+//! use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 //! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::middleware::{FallibleHandler, ClassifyError};
 //! use prosody::consumer::DemandType;
@@ -97,7 +97,7 @@
 //!         .subscribed_topics(["my-topic".to_owned()]);
 //!
 //!     let retry_config = RetryConfiguration::builder();
-//!     let concurrency_config = ConcurrencyLimitConfigurationBuilder::default();
+//!     let scheduler_config = SchedulerConfigurationBuilder::default();
 //!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
 //!     let client = HighLevelClient::new(
@@ -106,7 +106,7 @@
 //!         &consumer_config,
 //!         &retry_config,
 //!         &FailureTopicConfigurationBuilder::default(),
-//!         &concurrency_config,
+//!         &scheduler_config,
 //!         &cassandra_config,
 //!     )?;
 //!
@@ -249,12 +249,10 @@ pub mod heartbeat;
 pub mod high_level;
 pub mod producer;
 pub mod propagator;
+pub mod telemetry;
 pub mod timers;
 pub mod tracing;
 mod util;
-
-#[allow(dead_code, unused_variables)] // TODO: remove
-mod telemetry;
 
 /// A lazily initialized mock Kafka cluster for testing.
 ///

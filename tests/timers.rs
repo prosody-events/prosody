@@ -15,6 +15,7 @@ use prosody::{
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
     timers::UncommittedTimer,
     timers::datetime::CompactDateTime,
     timers::duration::CompactDuration,
@@ -204,6 +205,7 @@ impl TestEnvironment {
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
             handler_provider,
+            Telemetry::new(),
         )
         .await?;
 

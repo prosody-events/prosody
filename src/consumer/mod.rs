@@ -39,6 +39,7 @@
 //!     ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
 //! };
 //! use prosody::high_level::config::TriggerStoreConfiguration;
+//! use prosody::telemetry::Telemetry;
 //! use prosody::timers::{UncommittedTimer, store::TriggerStore};
 //!
 //! // Implement your message handler
@@ -86,10 +87,13 @@
 //!     .subscribed_topics(vec!["my-topic".to_string()])
 //!     .build()?;
 //!
+//! let telemetry = Telemetry::new();
+//!
 //! let consumer = ProsodyConsumer::new(
 //!     &config,
 //!     &TriggerStoreConfiguration::InMemory,
 //!     CloneProvider::new(MyHandler),
+//!     telemetry,
 //! )
 //! .await?;
 //!
@@ -149,11 +153,11 @@ use whoami::fallible::hostname;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
-use crate::consumer::middleware::concurrency::{
-    ConcurrencyLimitConfiguration, ConcurrencyLimitMiddleware,
-};
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
+use crate::consumer::middleware::scheduler::{
+    SchedulerConfiguration, SchedulerInitError, SchedulerMiddleware,
+};
 use crate::consumer::middleware::shutdown::ShutdownMiddleware;
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
@@ -671,6 +675,7 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         handler_provider: T,
+        telemetry: Telemetry,
     ) -> Result<Self, ConsumerError>
     where
         T: HandlerProvider,
@@ -682,7 +687,6 @@ impl ProsodyConsumer {
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
         let managers: Arc<Managers> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
-        let telemetry = Telemetry::new();
         let telemetry_sender = telemetry.sender();
 
         // Build event type search automaton for filtering messages
@@ -754,22 +758,23 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
-        concurrency_config: ConcurrencyLimitConfiguration,
+        scheduler_config: SchedulerConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let concurrency_middleware = ConcurrencyLimitMiddleware::new(&concurrency_config)?;
+        let telemetry = Telemetry::new();
+        let scheduler_middleware = SchedulerMiddleware::new(&scheduler_config, &telemetry)?;
         let retry_middleware = RetryMiddleware::new(retry_config)?;
 
-        // Apply concurrency limiting first, then shutdown and retry
-        let provider = concurrency_middleware
+        // Apply scheduler first, then shutdown and retry
+        let provider = scheduler_middleware
             .layer(ShutdownMiddleware)
             .layer(retry_middleware)
             .into_provider(handler);
 
-        Self::new(consumer_config, trigger_store_config, provider).await
+        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
     }
 
     /// Creates a new `ProsodyConsumer` with a low-latency strategy.
@@ -805,27 +810,28 @@ impl ProsodyConsumer {
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
         topic_config: FailureTopicConfiguration,
-        concurrency_config: ConcurrencyLimitConfiguration,
+        scheduler_config: SchedulerConfiguration,
         producer: ProsodyProducer,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let concurrency_middleware = ConcurrencyLimitMiddleware::new(&concurrency_config)?;
+        let telemetry = Telemetry::new();
+        let scheduler_middleware = SchedulerMiddleware::new(&scheduler_config, &telemetry)?;
         let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
 
-        // Compose middleware: concurrency → shutdown → retry → failure topic → retry
-        let provider = concurrency_middleware // limit global concurrency first
+        // Compose middleware: scheduler → shutdown → retry → failure topic → retry
+        let provider = scheduler_middleware // fair scheduler with global concurrency limit
             .layer(ShutdownMiddleware) // stop processing if shutting down partition
             .layer(retry_middleware.clone()) // retry processing up to limit
             .layer(topic_middleware) // write to failure topic
             .layer(retry_middleware) // retry writing to failure topic
             .into_provider(handler);
 
-        Self::new(consumer_config, trigger_store_config, provider).await
+        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
     }
 
     /// Creates a new `ProsodyConsumer` with logging middleware for failure
@@ -853,21 +859,22 @@ impl ProsodyConsumer {
     pub async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
-        concurrency_config: ConcurrencyLimitConfiguration,
+        scheduler_config: SchedulerConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let concurrency_middleware = ConcurrencyLimitMiddleware::new(&concurrency_config)?;
+        let telemetry = Telemetry::new();
+        let scheduler_middleware = SchedulerMiddleware::new(&scheduler_config, &telemetry)?;
 
-        // Apply concurrency limiting first, then shutdown and logging
-        let provider = concurrency_middleware
+        // Apply scheduler first, then shutdown and logging
+        let provider = scheduler_middleware
             .layer(ShutdownMiddleware)
             .layer(LogMiddleware)
             .into_provider(handler);
 
-        Self::new(consumer_config, trigger_store_config, provider).await
+        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
     }
 
     /// Returns the number of currently assigned partitions.
@@ -1141,4 +1148,8 @@ pub enum ConsumerError {
     /// Indicates a Cassandra trigger store operation failure.
     #[error("Cassandra operation failed: {0:#}")]
     Cassandra(#[from] CassandraTriggerStoreError),
+
+    /// Indicates a scheduler initialization failure.
+    #[error("Scheduler initialization failed: {0:#}")]
+    Scheduler(#[from] SchedulerInitError),
 }

@@ -1,3 +1,5 @@
+//! Global telemetry sender for consumer lifecycle events.
+
 use crate::consumer::DemandType;
 use crate::telemetry::event::{
     Data, KeyEvent, KeyState, PartitionEvent, PartitionState, TelemetryEvent,
@@ -8,6 +10,10 @@ use educe::Educe;
 use quanta::Clock;
 use tokio::sync::broadcast;
 
+/// Global telemetry sender for emitting lifecycle events.
+///
+/// Emits telemetry events for partition and key lifecycle events
+/// across any topic and partition.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
 pub struct TelemetrySender {
@@ -23,6 +29,7 @@ impl TelemetrySender {
         Self { tx, clock }
     }
 
+    /// Emits a partition paused event.
     pub fn partition_paused(&self, topic: Topic, partition: Partition) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -35,6 +42,7 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a partition resumed event.
     pub fn partition_resumed(&self, topic: Topic, partition: Partition) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -47,6 +55,7 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a partition assigned event.
     pub fn partition_assigned(&self, topic: Topic, partition: Partition) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -59,6 +68,7 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a partition revoked event.
     pub fn partition_revoked(&self, topic: Topic, partition: Partition) {
         let timestamp = self.clock.now();
         let _ = self.tx.send(TelemetryEvent {
@@ -71,6 +81,7 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a middleware entered event for the given key.
     pub fn middleware_entered(
         &self,
         topic: Topic,
@@ -91,6 +102,7 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a handler invoked event for the given key.
     pub fn handler_invoked(
         &self,
         topic: Topic,
@@ -111,6 +123,7 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a handler succeeded event for the given key.
     pub fn handler_succeeded(
         &self,
         topic: Topic,
@@ -131,6 +144,7 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a handler failed event for the given key.
     pub fn handler_failed(
         &self,
         topic: Topic,
@@ -151,6 +165,7 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a middleware exited event for the given key.
     pub fn middleware_exited(
         &self,
         topic: Topic,
@@ -171,6 +186,10 @@ impl TelemetrySender {
         });
     }
 
+    /// Creates a partition-scoped telemetry sender.
+    ///
+    /// Returns a sender pre-configured for a specific topic and partition.
+    #[must_use]
     pub fn for_partition(&self, topic: Topic, partition: Partition) -> TelemetryPartitionSender {
         TelemetryPartitionSender::new(topic, partition, self.tx.clone(), self.clock.clone())
     }

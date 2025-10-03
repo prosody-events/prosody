@@ -12,6 +12,7 @@ use prosody::{
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
 };
 use serde_json::json;
 use tokio::spawn;
@@ -67,6 +68,7 @@ async fn test_backpressure() -> Result<()> {
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(slow_handler),
+        Telemetry::new(),
     )
     .await?;
 

@@ -42,7 +42,7 @@
 //!
 //! | Middleware | Purpose |
 //! |------------|---------|
-//! | [`concurrency`] | Global concurrency limiting |
+//! | [`scheduler`] | Fair work-conserving scheduler with global concurrency limits |
 //! | [`retry`] | Exponential backoff for transient failures |
 //! | [`shutdown`] | Graceful partition revocation |
 //! | [`telemetry`] | Handler lifecycle observability |
@@ -88,14 +88,15 @@
 //!
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
-//! # use prosody::consumer::middleware::concurrency::*;
 //! # use prosody::consumer::middleware::retry::*;
+//! # use prosody::consumer::middleware::scheduler::*;
 //! # use prosody::consumer::middleware::topic::*;
 //! # use prosody::consumer::middleware::shutdown::*;
 //! # use prosody::producer::{ProsodyProducer, ProducerConfiguration};
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
 //! # use prosody::consumer::message::ConsumerMessage;
+//! # use prosody::telemetry::Telemetry;
 //! # use prosody::timers::Trigger;
 //! # use std::convert::Infallible;
 //! # #[derive(Clone)]
@@ -106,15 +107,16 @@
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
-//! # let config = ConcurrencyLimitConfigurationBuilder::default().build().unwrap();
+//! # let config = SchedulerConfigurationBuilder::default().build().unwrap();
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let topic_config = FailureTopicConfiguration::builder().failure_topic("dlq").build().unwrap();
 //! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
 //! # let producer = ProsodyProducer::new(&producer_config).unwrap();
+//! # let telemetry = Telemetry::default();
 //! # let my_business_handler = MyHandler;
 //!
 //! // Low-latency consumer with full error handling
-//! let provider = ConcurrencyLimitMiddleware::new(&config).unwrap()
+//! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
 //!     .layer(ShutdownMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap())
 //!     .layer(FailureTopicMiddleware::new(topic_config, "consumer-group".to_string(), producer).unwrap())

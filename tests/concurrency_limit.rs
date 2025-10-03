@@ -51,6 +51,7 @@ use prosody::{
     consumer::{DemandType, EventHandler},
     producer::ProducerConfiguration,
     producer::ProsodyProducer,
+    telemetry::Telemetry,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
@@ -215,6 +216,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(handler.clone()),
+        Telemetry::new(),
     )
     .await?;
 

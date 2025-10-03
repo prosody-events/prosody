@@ -14,6 +14,7 @@ use prosody::{
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc::channel;
@@ -102,6 +103,7 @@ async fn run_scenario(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(TestHandler { messages_tx: tx }),
+        Telemetry::new(),
     )
     .await?;
     let producer = ProsodyProducer::new(&producer_config)?;

@@ -13,6 +13,7 @@ use prosody::{
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, DemandType, EventHandler, ProsodyConsumer, Uncommitted},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
     timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
 use serde_json::json;
@@ -124,6 +125,7 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(handler),
+        Telemetry::new(),
     )
     .await?;
 
