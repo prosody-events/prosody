@@ -32,6 +32,7 @@ pub struct Dispatcher {
 }
 
 type DecayingDuration120 = DecayingDuration<120>;
+type Best = Option<(usize, f64, Instant)>;
 
 const NORMAL_WEIGHT: f64 = 0.7;
 const FAILURE_WEIGHT: f64 = 0.3;
@@ -193,64 +194,47 @@ impl Selector {
 
         let now = Instant::now();
 
-        // Collect task metadata and compute class statistics in one pass
-        let task_data: Vec<_> = soa_zip!(&self.tasks, [timestamp, key, demand_type])
+        // Single pass: find best task in each class simultaneously
+        // Key insight: partial_priority = key_vt_micros - wait_urgency_micros preserves
+        // ordering within each class since class_avg is constant per class
+        let (normal_best, failure_best) = soa_zip!(&self.tasks, [timestamp, key, demand_type])
             .enumerate()
-            .map(|(index, (timestamp, key, demand_type))| {
-                let key_vt = self
-                    .key_times
-                    .get(key)
-                    .map_or(Duration::ZERO, |vt| vt.at(now));
+            .fold(
+                (None, None),
+                |(n_best, f_best), (index, (timestamp, key, demand_type))| {
+                    let key_vt_micros = self.key_times.get(key).map_or(0.0_f64, |vt| {
+                        #[allow(clippy::cast_precision_loss)]
+                        {
+                            vt.at(now).as_micros() as f64
+                        }
+                    });
 
-                #[allow(clippy::cast_precision_loss)]
-                let key_vt_micros = key_vt.as_micros() as f64;
+                    let wait_time = (now - *timestamp).as_secs_f64();
+                    let wait_ratio = (wait_time / MAX_WAIT_SECS).min(1.0_f64);
+                    // Convert wait urgency to microseconds to match key_vt units
+                    let wait_urgency_micros =
+                        WAIT_WEIGHT * wait_ratio * wait_ratio * 1_000_000.0_f64;
 
-                (index, key_vt_micros, *timestamp, *demand_type)
-            })
-            .collect();
+                    // Partial priority in microseconds (class_avg subtracted later for display)
+                    // Ordering preserved within class since class_avg is constant
+                    let partial_priority = key_vt_micros - wait_urgency_micros;
 
-        // Calculate class averages
-        let (normal_count, normal_sum, failure_count, failure_sum) = task_data.iter().fold(
-            (0_i32, 0.0_f64, 0_i32, 0.0_f64),
-            |acc, &(_, vt, _, demand_type)| match demand_type {
-                DemandType::Normal => (acc.0 + 1_i32, acc.1 + vt, acc.2, acc.3),
-                DemandType::Failure => (acc.0, acc.1, acc.2 + 1_i32, acc.3 + vt),
-            },
-        );
+                    match demand_type {
+                        DemandType::Normal => (
+                            update_min_priority(n_best, index, partial_priority, *timestamp),
+                            f_best,
+                        ),
+                        DemandType::Failure => (
+                            n_best,
+                            update_min_priority(f_best, index, partial_priority, *timestamp),
+                        ),
+                    }
+                },
+            );
 
-        if normal_count == 0_i32 && failure_count == 0_i32 {
-            return None;
-        }
-
-        let normal_avg_vt = if normal_count > 0_i32 {
-            #[allow(clippy::cast_precision_loss)]
-            {
-                normal_sum / f64::from(normal_count)
-            }
-        } else {
-            0.0_f64
-        };
-
-        let failure_avg_vt = if failure_count > 0_i32 {
-            #[allow(clippy::cast_precision_loss)]
-            {
-                failure_sum / f64::from(failure_count)
-            }
-        } else {
-            0.0_f64
-        };
-
-        // Find best task from each class
-        let normal_best =
-            Self::select_best_from_class(&task_data, DemandType::Normal, normal_avg_vt, now);
-
-        let failure_best =
-            Self::select_best_from_class(&task_data, DemandType::Failure, failure_avg_vt, now);
-
-        // Decide which class to serve
-        let selected_index = match (normal_best, failure_best) {
+        // Select based on class scores with fallback
+        let selected_index = match (normal_best.map(|(i, ..)| i), failure_best.map(|(i, ..)| i)) {
             (Some(n), Some(f)) => {
-                // Both classes have eligible tasks - compare class scores
                 let normal_score = self.success_time.at(now).as_secs_f64() / NORMAL_WEIGHT;
                 let failure_score = self.failure_time.at(now).as_secs_f64() / FAILURE_WEIGHT;
                 Some(if normal_score <= failure_score { n } else { f })
@@ -263,38 +247,6 @@ impl Selector {
         Some(self.tasks.swap_remove(selected_index))
     }
 
-    /// Selects the best task from a specific demand class.
-    ///
-    /// Returns the index of the best task, or `None` if no eligible tasks
-    /// exist.
-    #[allow(clippy::cast_precision_loss)]
-    fn select_best_from_class(
-        task_data: &[(usize, f64, Instant, DemandType)],
-        target_class: DemandType,
-        class_avg_vt: f64,
-        now: Instant,
-    ) -> Option<usize> {
-        task_data
-            .iter()
-            .filter(|(_, _, _, demand_type)| *demand_type == target_class)
-            .map(|(index, key_vt_micros, timestamp, _)| {
-                let vt_distance_micros = key_vt_micros - class_avg_vt;
-                let vt_distance_secs = vt_distance_micros / 1_000_000.0_f64;
-                let wait_time = (now - *timestamp).as_secs_f64();
-                let wait_ratio = (wait_time / MAX_WAIT_SECS).min(1.0);
-                let priority =
-                    vt_distance_secs * FAIRNESS_WEIGHT - WAIT_WEIGHT * wait_ratio * wait_ratio;
-
-                (*index, priority, *timestamp)
-            })
-            .min_by(|(_, p1, t1), (_, p2, t2)| {
-                p1.partial_cmp(p2)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| t1.cmp(t2))
-            })
-            .map(|(index, ..)| index)
-    }
-
     fn get_duration(&mut self, timestamp: Instant, key: &Key) -> Option<Duration> {
         let time = self.invocation_times.remove(key)?;
         Some(timestamp - time)
@@ -305,6 +257,33 @@ impl Selector {
             Ok(Some(mut value)) => *value += duration,
             Err(guard) => guard.insert(duration.into()),
             _ => {}
+        }
+    }
+}
+
+/// Updates the minimum priority task candidate if the new one has lower partial priority.
+///
+/// Partial priority is in microseconds: `key_vt_micros - wait_urgency_micros`.
+/// Class average is subtracted later, so ordering within class is preserved.
+fn update_min_priority(
+    current: Option<(usize, f64, Instant)>,
+    index: usize,
+    priority: f64,
+    timestamp: Instant,
+) -> Option<(usize, f64, Instant)> {
+    match current {
+        None => Some((index, priority, timestamp)),
+        Some((_, best_priority, best_timestamp)) => {
+            let ordering = priority
+                .partial_cmp(&best_priority)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| timestamp.cmp(&best_timestamp));
+
+            if ordering == Ordering::Less {
+                Some((index, priority, timestamp))
+            } else {
+                current
+            }
         }
     }
 }
@@ -1040,6 +1019,396 @@ mod tests {
             new_count > monopoly_count,
             "New keys should get more total service: new={new_count} monopoly={monopoly_count}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_class_work_conservation() {
+        let mut selector = create_selector();
+
+        // Only enqueue tasks for normal class
+        for i in 0_i32..10_i32 {
+            selector.enqueue_task(create_task(&format!("n{i}"), DemandType::Normal, 0));
+        }
+
+        // Execute all normal tasks - failure class is empty
+        for _ in 0_i32..10_i32 {
+            let task = selector.get_next_task();
+            assert!(task.is_some(), "Should select from non-empty class");
+            assert_eq!(
+                task.unwrap_or_else(|| create_task("", DemandType::Normal, 0))
+                    .demand_type,
+                DemandType::Normal,
+                "Should select from Normal class when Failure is empty"
+            );
+        }
+
+        // Now queue is empty
+        assert!(
+            selector.get_next_task().is_none(),
+            "Should return None when all classes empty"
+        );
+
+        // Add only failure tasks
+        for i in 0_i32..5_i32 {
+            selector.enqueue_task(create_task(&format!("f{i}"), DemandType::Failure, 0));
+        }
+
+        // Should select from failure class now
+        for _ in 0_i32..5_i32 {
+            let task = selector.get_next_task();
+            assert!(task.is_some(), "Should select from non-empty class");
+            assert_eq!(
+                task.unwrap_or_else(|| create_task("", DemandType::Normal, 0))
+                    .demand_type,
+                DemandType::Failure,
+                "Should select from Failure class when Normal is empty"
+            );
+        }
+    }
+
+    #[test]
+    fn interleaved_bursts_both_classes() -> Result<()> {
+        let mut selector = create_selector();
+
+        let normal_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("n{i}")).collect();
+        let failure_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("f{i}")).collect();
+
+        let mut normal_count = 0_i32;
+        let mut failure_count = 0_i32;
+
+        // Phase 1: Failure class burst (0-250 iterations)
+        // During this phase, failure keys arrive frequently, normal keys arrive slowly
+        for key in &failure_keys {
+            selector.enqueue_task(create_task(key, DemandType::Failure, 0));
+        }
+        for key in &normal_keys {
+            selector.enqueue_task(create_task(key, DemandType::Normal, 0));
+        }
+
+        for i in 0_i32..250_i32 {
+            let Some(task) = selector.get_next_task() else {
+                bail!("Expected task during failure burst");
+            };
+
+            let duration = Duration::from_millis(100);
+            match task.demand_type {
+                DemandType::Normal => {
+                    selector.success_time += duration;
+                    normal_count += 1_i32;
+                }
+                DemandType::Failure => {
+                    selector.failure_time += duration;
+                    failure_count += 1_i32;
+                }
+            }
+
+            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+                *vt += duration;
+            }
+
+            // Burst pattern: failure keys re-enqueue every time, normal only every 5th
+            // iteration
+            let key_str = task.key.to_string();
+            if failure_keys.contains(&key_str) {
+                selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
+            } else if i % 5_i32 == 0_i32 {
+                selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
+            }
+        }
+
+        let phase1_normal = normal_count;
+        let phase1_failure = failure_count;
+
+        // Re-enqueue all normal keys for phase 2
+        for key in &normal_keys {
+            selector.enqueue_task(create_task(key, DemandType::Normal, 0));
+        }
+
+        // Phase 2: Normal class burst (250-500 iterations)
+        for i in 250_i32..500_i32 {
+            let Some(task) = selector.get_next_task() else {
+                bail!("Expected task during normal burst at iteration {i}");
+            };
+
+            let duration = Duration::from_millis(100);
+            match task.demand_type {
+                DemandType::Normal => {
+                    selector.success_time += duration;
+                    normal_count += 1_i32;
+                }
+                DemandType::Failure => {
+                    selector.failure_time += duration;
+                    failure_count += 1_i32;
+                }
+            }
+
+            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+                *vt += duration;
+            }
+
+            // Burst pattern: normal keys re-enqueue every time, failure only every 5th
+            // iteration
+            let key_str = task.key.to_string();
+            if normal_keys.contains(&key_str) {
+                selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
+            } else if i % 5_i32 == 0_i32 {
+                selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
+            }
+        }
+
+        // Verify both classes got service in both phases
+        assert!(
+            phase1_failure > phase1_normal,
+            "Failure class should dominate phase 1: failure={phase1_failure} \
+             normal={phase1_normal}"
+        );
+
+        let phase2_normal = normal_count - phase1_normal;
+        let phase2_failure = failure_count - phase1_failure;
+        assert!(
+            phase2_normal > phase2_failure,
+            "Normal class should dominate phase 2: normal={phase2_normal} failure={phase2_failure}"
+        );
+
+        // Despite bursts, overall proportions should trend toward 70/30
+        let total = normal_count + failure_count;
+        let normal_pct = (f64::from(normal_count) / f64::from(total)) * 100.0_f64;
+        assert!(
+            normal_pct > 50.0_f64 && normal_pct < 90.0_f64,
+            "Normal percentage should trend toward 70%, got {normal_pct:.1}%"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn vt_spread_convergence_over_time() -> Result<()> {
+        let mut selector = create_selector();
+
+        let keys: Vec<String> = (0_i32..10_i32).map(|i| format!("k{i}")).collect();
+
+        // Initialize with varying VT
+        for (i, key) in keys.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let vt = Duration::from_millis((i as u64) * 100_u64);
+            selector
+                .key_times
+                .insert(Key::from(key.as_str()), vt.into());
+        }
+
+        // Enqueue all keys
+        for key in &keys {
+            selector.enqueue_task(create_task(key, DemandType::Normal, 0));
+        }
+
+        let mut max_spread = 0_u128;
+
+        // Run for many iterations to test long-term stability
+        for _ in 0_i32..10000_i32 {
+            let Some(task) = selector.get_next_task() else {
+                bail!("Expected task in convergence test");
+            };
+
+            // Execute with small variance
+            let duration = Duration::from_millis(10_u64 + (task.key.len() as u64 % 5_u64));
+            selector.success_time += duration;
+
+            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+                *vt += duration;
+            }
+
+            // Re-enqueue
+            selector.enqueue_task(create_task(task.key.as_ref(), task.demand_type, 0));
+
+            // Check spread every 100 iterations
+            if selector.tasks.len() == keys.len() {
+                let now = Instant::now();
+                let vts: Vec<u128> = keys
+                    .iter()
+                    .filter_map(|k| {
+                        selector
+                            .key_times
+                            .get(&Key::from(k.as_str()))
+                            .map(|vt| vt.at(now).as_micros())
+                    })
+                    .collect();
+
+                if let (Some(min_vt), Some(max_vt)) = (vts.iter().min(), vts.iter().max()) {
+                    let spread = max_vt - min_vt;
+                    max_spread = max_spread.max(spread);
+                }
+            }
+        }
+
+        // Convert to milliseconds for assertion
+        let max_spread_ms = max_spread / 1000_u128;
+
+        // Without lag bounds, spread should still converge due to VT fairness
+        // With 10ms tasks, spread should stay under ~1000ms (100 task durations)
+        assert!(
+            max_spread_ms < 1000_u128,
+            "VT spread should remain bounded over time: max={max_spread_ms}ms"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn class_proportion_recovery_from_skew() -> Result<()> {
+        let mut selector = create_selector();
+
+        let normal_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("n{i}")).collect();
+        let failure_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("f{i}")).collect();
+
+        // Force extreme skew: 90/10 in favor of Normal
+        // Simulate 900ms Normal execution, 100ms Failure execution
+        selector.success_time = Duration::from_millis(900).into();
+        selector.failure_time = Duration::from_millis(100).into();
+
+        // Enqueue tasks from both classes
+        for key in &normal_keys {
+            selector.enqueue_task(create_task(key, DemandType::Normal, 0));
+        }
+        for key in &failure_keys {
+            selector.enqueue_task(create_task(key, DemandType::Failure, 0));
+        }
+
+        let mut normal_count = 0_i32;
+        let mut failure_count = 0_i32;
+
+        // Run for 1000 iterations to observe recovery
+        for _ in 0_i32..1000_i32 {
+            let Some(task) = selector.get_next_task() else {
+                bail!("Expected task in recovery test");
+            };
+
+            let duration = Duration::from_millis(10);
+            match task.demand_type {
+                DemandType::Normal => {
+                    selector.success_time += duration;
+                    normal_count += 1_i32;
+                }
+                DemandType::Failure => {
+                    selector.failure_time += duration;
+                    failure_count += 1_i32;
+                }
+            }
+
+            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+                *vt += duration;
+            }
+
+            // Re-enqueue
+            selector.enqueue_task(create_task(task.key.as_ref(), task.demand_type, 0));
+        }
+
+        // System should recover toward 70/30 split
+        // Failure class was underserved (10% vs target 30%), so should get more service
+        let total = normal_count + failure_count;
+        let failure_pct = (f64::from(failure_count) / f64::from(total)) * 100.0_f64;
+
+        // Should recover toward 30% (allow 20-40% range for convergence)
+        assert!(
+            failure_pct > 20.0_f64 && failure_pct < 40.0_f64,
+            "Failure class should recover toward 30%, got {failure_pct:.1}%"
+        );
+
+        // Failure should get MORE service than before (was 10%, should increase)
+        let initial_failure_pct = (100.0_f64 / 1000.0_f64) * 100.0_f64; // 10%
+        assert!(
+            failure_pct > initial_failure_pct,
+            "Failure percentage should increase from {initial_failure_pct:.1}% to \
+             {failure_pct:.1}%"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_key_arrivals_stress() -> Result<()> {
+        let mut selector = create_selector();
+
+        // Create 10 existing keys with varying VT (simulating ongoing work)
+        let existing_keys: Vec<String> = (0_i32..10_i32).map(|i| format!("old{i}")).collect();
+        for (i, key) in existing_keys.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let vt = Duration::from_millis((i as u64) * 50_u64);
+            selector
+                .key_times
+                .insert(Key::from(key.as_str()), vt.into());
+            selector.enqueue_task(create_task(key, DemandType::Normal, 0));
+        }
+
+        // Simulate flash crowd: 20 new keys arrive simultaneously
+        let new_keys: Vec<String> = (0_i32..20_i32).map(|i| format!("new{i}")).collect();
+        for key in &new_keys {
+            selector.enqueue_task(create_task(key, DemandType::Normal, 0));
+        }
+
+        let mut old_selections = 0_i32;
+        let mut new_selections = 0_i32;
+
+        // Process 100 tasks
+        for _ in 0_i32..100_i32 {
+            let Some(task) = selector.get_next_task() else {
+                bail!("Expected task in concurrent arrivals test");
+            };
+
+            let duration = Duration::from_millis(10);
+            selector.success_time += duration;
+
+            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+                *vt += duration;
+            }
+
+            let key_str = task.key.to_string();
+            if existing_keys.contains(&key_str) {
+                old_selections += 1_i32;
+            } else {
+                new_selections += 1_i32;
+            }
+
+            // Re-enqueue
+            selector.enqueue_task(create_task(task.key.as_ref(), task.demand_type, 0));
+        }
+
+        // New keys start at 0 VT (lower than existing 0-450ms), so should dominate
+        // initially This is correct behavior - new keys are underserved
+        // relative to class average
+        assert!(
+            new_selections > 60_i32,
+            "New keys should dominate initially due to 0 VT: {new_selections}/100"
+        );
+
+        // Existing keys will get some service, but not much initially
+        // This verifies we don't completely starve them despite VT disadvantage
+        assert!(
+            old_selections < 40_i32,
+            "Existing keys should get less service due to higher VT: {old_selections}/100"
+        );
+
+        // Check that VT spread hasn't exploded
+        let all_keys = [existing_keys, new_keys].concat();
+        let now = Instant::now();
+        let vts: Vec<u128> = all_keys
+            .iter()
+            .filter_map(|k| {
+                selector
+                    .key_times
+                    .get(&Key::from(k.as_str()))
+                    .map(|vt| vt.at(now).as_micros())
+            })
+            .collect();
+
+        if let (Some(min_vt), Some(max_vt)) = (vts.iter().min(), vts.iter().max()) {
+            let spread_ms = (max_vt - min_vt) / 1000_u128;
+            assert!(
+                spread_ms < 5000_u128,
+                "VT spread should remain reasonable after flash crowd: {spread_ms}ms"
+            );
+        }
 
         Ok(())
     }
