@@ -1,15 +1,12 @@
 use crate::telemetry::event::TelemetryEvent;
-use crate::telemetry::handler::handle_events;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::telemetry::sender::TelemetrySender;
 use crate::{Partition, Topic};
 use educe::Educe;
 use quanta::Clock;
-use tokio::spawn;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
-mod event;
-mod handler;
+pub mod event;
 pub mod partition;
 pub mod sender;
 
@@ -19,7 +16,7 @@ const TELEMETRY_CHANNEL_CAPACITY: usize = 8096;
 #[educe(Debug)]
 pub struct Telemetry {
     #[educe(Debug(ignore))]
-    tx: mpsc::Sender<TelemetryEvent>,
+    tx: broadcast::Sender<TelemetryEvent>,
 
     #[educe(Debug(ignore))]
     clock: Clock,
@@ -33,11 +30,14 @@ impl Default for Telemetry {
 
 impl Telemetry {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(TELEMETRY_CHANNEL_CAPACITY);
+        let (tx, _rx) = broadcast::channel(TELEMETRY_CHANNEL_CAPACITY);
         let clock = Clock::new();
 
-        spawn(handle_events(rx));
         Self { tx, clock }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<TelemetryEvent> {
+        self.tx.subscribe()
     }
 
     pub fn sender(&self) -> TelemetrySender {

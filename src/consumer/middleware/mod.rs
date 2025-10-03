@@ -156,6 +156,7 @@ pub mod concurrency;
 pub mod log;
 pub mod providers;
 pub mod retry;
+pub mod scheduler;
 pub mod shutdown;
 pub mod telemetry;
 pub mod topic;

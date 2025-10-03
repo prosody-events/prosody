@@ -53,6 +53,7 @@ serde = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
 simd-json = { version = "0.16", features = ["serde_impl"], optional = true }
+soa_derive = "0.14"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["macros", "sync"] }
 tokio-stream = "0.1"

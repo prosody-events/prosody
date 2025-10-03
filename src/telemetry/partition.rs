@@ -5,7 +5,7 @@ use crate::telemetry::event::{
 use crate::{Key, Partition, Topic};
 use educe::Educe;
 use quanta::Clock;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 #[derive(Clone, Educe)]
 #[educe(Debug)]
@@ -14,7 +14,7 @@ pub struct TelemetryPartitionSender {
     partition: Partition,
 
     #[educe(Debug(ignore))]
-    tx: mpsc::Sender<TelemetryEvent>,
+    tx: broadcast::Sender<TelemetryEvent>,
 
     #[educe(Debug(ignore))]
     clock: Clock,
@@ -24,7 +24,7 @@ impl TelemetryPartitionSender {
     pub(crate) fn new(
         topic: Topic,
         partition: Partition,
-        tx: mpsc::Sender<TelemetryEvent>,
+        tx: broadcast::Sender<TelemetryEvent>,
         clock: Clock,
     ) -> Self {
         Self {
@@ -37,7 +37,7 @@ impl TelemetryPartitionSender {
 
     pub fn partition_paused(&self) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
@@ -49,7 +49,7 @@ impl TelemetryPartitionSender {
 
     pub fn partition_resumed(&self) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
@@ -61,7 +61,7 @@ impl TelemetryPartitionSender {
 
     pub fn partition_assigned(&self) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
@@ -73,7 +73,7 @@ impl TelemetryPartitionSender {
 
     pub fn partition_revoked(&self) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
@@ -85,7 +85,7 @@ impl TelemetryPartitionSender {
 
     pub fn middleware_entered(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
@@ -99,7 +99,7 @@ impl TelemetryPartitionSender {
 
     pub fn handler_invoked(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
@@ -113,7 +113,7 @@ impl TelemetryPartitionSender {
 
     pub fn handler_succeeded(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
@@ -127,7 +127,7 @@ impl TelemetryPartitionSender {
 
     pub fn handler_failed(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
@@ -141,7 +141,7 @@ impl TelemetryPartitionSender {
 
     pub fn middleware_exited(&self, key: Key, demand_type: DemandType) {
         let timestamp = self.clock.now();
-        let _ = self.tx.try_send(TelemetryEvent {
+        let _ = self.tx.send(TelemetryEvent {
             timestamp,
             topic: self.topic,
             partition: self.partition,
