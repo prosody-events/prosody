@@ -159,6 +159,7 @@ use crate::consumer::middleware::scheduler::{
     SchedulerConfiguration, SchedulerInitError, SchedulerMiddleware,
 };
 use crate::consumer::middleware::shutdown::ShutdownMiddleware;
+use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
@@ -767,9 +768,11 @@ impl ProsodyConsumer {
         let telemetry = Telemetry::new();
         let scheduler_middleware = SchedulerMiddleware::new(&scheduler_config, &telemetry)?;
         let retry_middleware = RetryMiddleware::new(retry_config)?;
+        let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
 
-        // Apply scheduler first, then shutdown and retry
-        let provider = scheduler_middleware
+        // Telemetry (innermost, closest to handler), then scheduler, shutdown, retry
+        let provider = telemetry_middleware
+            .layer(scheduler_middleware)
             .layer(ShutdownMiddleware)
             .layer(retry_middleware)
             .into_provider(handler);
@@ -822,13 +825,16 @@ impl ProsodyConsumer {
         let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
+        let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
 
-        // Compose middleware: scheduler → shutdown → retry → failure topic → retry
-        let provider = scheduler_middleware // fair scheduler with global concurrency limit
+        // Telemetry first (innermost), then retries, failure topic, shutdown, scheduler
+        // (outermost)
+        let provider = telemetry_middleware // record handler lifecycle events
+            .layer(scheduler_middleware) // fair scheduler with global concurrency limit
             .layer(ShutdownMiddleware) // stop processing if shutting down partition
-            .layer(retry_middleware.clone()) // retry processing up to limit
+            .layer(retry_middleware.clone()) // retry writing to failure topic
             .layer(topic_middleware) // write to failure topic
-            .layer(retry_middleware) // retry writing to failure topic
+            .layer(retry_middleware) // retry processing up to limit
             .into_provider(handler);
 
         Self::new(consumer_config, trigger_store_config, provider, telemetry).await
@@ -867,9 +873,12 @@ impl ProsodyConsumer {
     {
         let telemetry = Telemetry::new();
         let scheduler_middleware = SchedulerMiddleware::new(&scheduler_config, &telemetry)?;
+        let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
 
-        // Apply scheduler first, then shutdown and logging
-        let provider = scheduler_middleware
+        // Telemetry first (innermost, closest to handler), then logging, shutdown,
+        // scheduler
+        let provider = telemetry_middleware
+            .layer(scheduler_middleware)
             .layer(ShutdownMiddleware)
             .layer(LogMiddleware)
             .into_provider(handler);
