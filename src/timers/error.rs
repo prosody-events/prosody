@@ -45,9 +45,13 @@ where
     #[error("Timer is inactive")]
     Inactive,
 
-    /// The scheduler has been shut down and cannot process operations.
-    #[error("Timer has been shutdown")]
+    /// The partition has been shut down and cannot process operations.
+    #[error("Partition has been shutdown")]
     Shutdown,
+
+    /// Message processing has been cancelled.
+    #[error("Message processing has been cancelled")]
+    Cancelled,
 
     /// The context is no longer valid because the event has already been
     /// processed.

@@ -42,15 +42,26 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     /// Error type returned by timer-related operations.
     type Error: Error + Send + Sync + 'static;
 
-    /// Returns `true` if a shutdown signal has already been issued.
+    /// Returns `true` if a partition shutdown signal has been issued.
     fn should_shutdown(&self) -> bool;
 
-    /// Returns a future that resolves when a shutdown signal is received.
+    /// Returns `true` if this message processing has been cancelled.
+    fn should_cancel(&self) -> bool;
+
+    /// Returns a future that resolves when a partition shutdown signal is
+    /// received.
     ///
     /// # Returns
     ///
-    /// A future that completes with `()` once shutdown is triggered.
+    /// A future that completes with `()` once partition shutdown is triggered.
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static;
+
+    /// Returns a future that resolves when message processing is cancelled.
+    ///
+    /// # Returns
+    ///
+    /// A future that completes with `()` once cancellation is triggered.
+    fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static;
 
     /// Schedule a new timer at the given execution time for this key.
     ///
@@ -161,13 +172,13 @@ struct Inner<T> {
     key: Key,
 
     #[educe(Debug(ignore))]
-    partition_shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 
     #[educe(Debug(ignore))]
-    message_shutdown_tx: watch::Sender<bool>,
+    message_cancel_tx: watch::Sender<bool>,
 
     #[educe(Debug(ignore))]
-    message_shutdown_rx: watch::Receiver<bool>,
+    message_cancel_rx: watch::Receiver<bool>,
 
     #[educe(Debug(ignore))]
     timers: TimerManager<T>,
@@ -190,13 +201,13 @@ where
         shutdown_rx: watch::Receiver<bool>,
         timers: TimerManager<T>,
     ) -> Self {
-        let (message_shutdown_tx, message_shutdown_rx) = watch::channel(false);
+        let (message_cancel_tx, message_cancel_rx) = watch::channel(false);
         let inner = ArcSwapOption::new(Some(
             Inner {
                 key,
-                partition_shutdown_rx: shutdown_rx,
-                message_shutdown_tx,
-                message_shutdown_rx,
+                shutdown_rx,
+                message_cancel_tx,
+                message_cancel_rx,
                 timers,
             }
             .into(),
@@ -219,7 +230,16 @@ where
             return true;
         };
 
-        *inner.message_shutdown_rx.borrow() || *inner.partition_shutdown_rx.borrow()
+        *inner.shutdown_rx.borrow()
+    }
+
+    fn should_cancel(&self) -> bool {
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return true;
+        };
+
+        *inner.message_cancel_rx.borrow()
     }
 
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -228,17 +248,27 @@ where
             return ready(()).left_future();
         };
 
-        let mut partition_shutdown_rx = inner.partition_shutdown_rx.clone();
-        let mut message_shutdown_rx = inner.message_shutdown_rx.clone();
+        let mut shutdown_rx = inner.shutdown_rx.clone();
 
         async move {
-            let result = select! {
-                result = message_shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => result,
-                result = partition_shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => result,
-            };
-
-            if let Err(error) = result {
+            if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
                 error!("shutdown hook failed: {error:#}");
+            }
+        }
+        .right_future()
+    }
+
+    fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return ready(()).left_future();
+        };
+
+        let mut message_cancel_rx = inner.message_cancel_rx.clone();
+
+        async move {
+            if let Err(error) = message_cancel_rx.wait_for(|is_shutdown| *is_shutdown).await {
+                error!("message cancellation hook failed: {error:#}");
             }
         }
         .right_future()
@@ -254,6 +284,7 @@ where
 
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
+            () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
             result = inner.timers.schedule(trigger) => result,
         }
     }
@@ -295,6 +326,7 @@ where
 
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
+            () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
             result = operation => result,
         }
     }
@@ -307,6 +339,7 @@ where
 
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
+            () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
             result = inner.timers.unschedule(&inner.key, time) => result,
         }
     }
@@ -319,15 +352,16 @@ where
 
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
+            () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
             result = inner.timers.unschedule_all(&inner.key) => result,
         }
     }
 
     fn invalidate(self) {
-        // Signal shutdown to notify processors waiting on futures from `on_shutdown`
-        // to cancel processing.
+        // Signal cancellation to notify processors waiting on futures from `on_cancel`
+        // to abort ongoing operations.
         if let Some(inner) = self.inner.load().as_ref() {
-            let _ = inner.message_shutdown_tx.send(true);
+            let _ = inner.message_cancel_tx.send(true);
         }
 
         // Clear the inner state to prevent any further operations on this context.
@@ -341,6 +375,7 @@ where
         &self,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
         let on_shutdown = EventContext::on_shutdown(self);
+        let on_cancel = EventContext::on_cancel(self);
 
         let inner = self.inner.load();
         let Some(inner) = inner.as_ref() else {
@@ -353,10 +388,12 @@ where
             let scheduled_timers = inner.timers.scheduled_times(&inner.key);
 
             pin_mut!(on_shutdown);
+            pin_mut!(on_cancel);
             pin_mut!(scheduled_timers);
 
             while let Some(time) = select! {
                 () = &mut on_shutdown => Err(TimerManagerError::Shutdown),
+                () = &mut on_cancel => Err(TimerManagerError::Cancelled),
                 item = scheduled_timers.try_next() => item,
             }? {
                 yield time;
@@ -382,8 +419,11 @@ pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 /// check.
 #[async_trait]
 pub trait DynEventContext: DynClone + Send + Sync + 'static {
-    /// Async wait for shutdown signal.
+    /// Async wait for partition shutdown signal.
     async fn on_shutdown(&self);
+
+    /// Async wait for message cancellation signal.
+    async fn on_cancel(&self);
 
     /// Schedule a timer for the current key.
     ///
@@ -418,8 +458,11 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxError>> + Send + 'static>>;
 
-    /// Synchronously check if shutdown has been requested.
+    /// Synchronously check if partition shutdown has been requested.
     fn should_shutdown(&self) -> bool;
+
+    /// Synchronously check if message cancellation has been requested.
+    fn should_cancel(&self) -> bool;
 }
 
 dyn_clone::clone_trait_object!(DynEventContext);
@@ -432,6 +475,10 @@ where
 {
     async fn on_shutdown(&self) {
         EventContext::on_shutdown(self).await;
+    }
+
+    async fn on_cancel(&self) {
+        EventContext::on_cancel(self).await;
     }
 
     async fn schedule(&self, time: CompactDateTime) -> Result<(), BoxError> {
@@ -466,5 +513,9 @@ where
 
     fn should_shutdown(&self) -> bool {
         EventContext::should_shutdown(self)
+    }
+
+    fn should_cancel(&self) -> bool {
+        EventContext::should_cancel(self)
     }
 }
