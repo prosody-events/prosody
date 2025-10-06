@@ -29,6 +29,7 @@
 //! use prosody::consumer::ConsumerConfiguration;
 //! use prosody::consumer::middleware::retry::RetryConfiguration;
 //! use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
+//! use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 //! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::middleware::{FallibleHandler, ClassifyError};
 //! use prosody::consumer::DemandType;
@@ -37,7 +38,7 @@
 //! use prosody::timers::{Trigger, store::TriggerStore};
 //! use prosody::cassandra::config::CassandraConfigurationBuilder;
 //! use prosody::high_level::mode::Mode;
-//! use prosody::high_level::{HighLevelClient};
+//! use prosody::high_level::{ConsumerBuilders, HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
 //! use serde_json::json;
 //! use std::convert::Infallible;
@@ -96,17 +97,19 @@
 //!         .group_id("my-group")
 //!         .subscribed_topics(["my-topic".to_owned()]);
 //!
-//!     let retry_config = RetryConfiguration::builder();
-//!     let scheduler_config = SchedulerConfigurationBuilder::default();
+//!     let consumer_builders = ConsumerBuilders {
+//!         consumer: consumer_config,
+//!         retry: RetryConfiguration::builder(),
+//!         failure_topic: FailureTopicConfigurationBuilder::default(),
+//!         scheduler: SchedulerConfigurationBuilder::default(),
+//!         timeout: TimeoutConfigurationBuilder::default(),
+//!     };
 //!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
 //!     let client = HighLevelClient::new(
 //!         Mode::Pipeline,
 //!         &mut producer_config,
-//!         &consumer_config,
-//!         &retry_config,
-//!         &FailureTopicConfigurationBuilder::default(),
-//!         &scheduler_config,
+//!         &consumer_builders,
 //!         &cassandra_config,
 //!     )?;
 //!

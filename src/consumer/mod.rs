@@ -160,6 +160,9 @@ use crate::consumer::middleware::scheduler::{
 };
 use crate::consumer::middleware::shutdown::ShutdownMiddleware;
 use crate::consumer::middleware::telemetry::TelemetryMiddleware;
+use crate::consumer::middleware::timeout::{
+    TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
+};
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
@@ -621,6 +624,19 @@ impl ConsumerConfigurationBuilder {
     }
 }
 
+/// Configuration for middleware common to all consumer types.
+///
+/// Contains configurations for the telemetry, timeout, scheduler, and shutdown
+/// middleware that are applied to all consumer types (pipeline, low-latency,
+/// and best-effort).
+#[derive(Clone, Debug)]
+pub struct CommonMiddlewareConfiguration {
+    /// Scheduler configuration for fair work-conserving dispatch.
+    pub scheduler: SchedulerConfiguration,
+    /// Timeout configuration for handler execution limits.
+    pub timeout: TimeoutConfiguration,
+}
+
 /// High-level Kafka consumer implementation.
 ///
 /// `ProsodyConsumer` is the main entry point for consuming messages from Kafka
@@ -645,6 +661,48 @@ pub struct ProsodyConsumer {
     /// Runtime state of the consumer.
     #[educe(Debug(ignore))]
     runtime_state: Arc<Mutex<Option<RuntimeState>>>,
+}
+
+/// Builds the common middleware stack applied to all consumer types.
+///
+/// Creates and layers the following middleware in order (innermost to
+/// outermost):
+/// 1. Telemetry middleware - records handler lifecycle events
+/// 2. Timeout middleware - enforces handler execution timeout
+/// 3. Scheduler middleware - fair work-conserving dispatch with concurrency
+///    limits
+/// 4. Shutdown middleware - stops processing during partition shutdown
+///
+/// # Arguments
+///
+/// * `config` - Common middleware configuration containing scheduler and
+///   timeout settings
+/// * `stall_threshold` - Duration from consumer config used to calculate
+///   default timeout
+/// * `telemetry` - Telemetry system for observability
+///
+/// # Returns
+///
+/// A middleware stack that can be further layered with consumer-specific
+/// middleware
+///
+/// # Errors
+///
+/// Returns a `ConsumerError` if middleware initialization fails
+fn build_common_middleware(
+    config: &CommonMiddlewareConfiguration,
+    stall_threshold: Duration,
+    telemetry: &Telemetry,
+) -> Result<impl HandlerMiddleware, ConsumerError> {
+    let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, telemetry)?;
+    let timeout_middleware = TimeoutMiddleware::new(&config.timeout, stall_threshold)?;
+    let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
+
+    // Layer common middleware: telemetry -> timeout -> scheduler -> shutdown
+    Ok(telemetry_middleware
+        .layer(timeout_middleware)
+        .layer(scheduler_middleware)
+        .layer(ShutdownMiddleware))
 }
 
 impl ProsodyConsumer {
@@ -759,21 +817,19 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
-        scheduler_config: SchedulerConfiguration,
+        common_config: &CommonMiddlewareConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         let telemetry = Telemetry::new();
-        let scheduler_middleware = SchedulerMiddleware::new(&scheduler_config, &telemetry)?;
         let retry_middleware = RetryMiddleware::new(retry_config)?;
-        let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
+        let common_middleware =
+            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
 
-        // Telemetry (innermost, closest to handler), then scheduler, shutdown, retry
-        let provider = telemetry_middleware
-            .layer(scheduler_middleware)
-            .layer(ShutdownMiddleware)
+        // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then retry
+        let provider = common_middleware
             .layer(retry_middleware)
             .into_provider(handler);
 
@@ -813,7 +869,7 @@ impl ProsodyConsumer {
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
         topic_config: FailureTopicConfiguration,
-        scheduler_config: SchedulerConfiguration,
+        common_config: &CommonMiddlewareConfiguration,
         producer: ProsodyProducer,
         handler: T,
     ) -> Result<Self, ConsumerError>
@@ -821,18 +877,16 @@ impl ProsodyConsumer {
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         let telemetry = Telemetry::new();
-        let scheduler_middleware = SchedulerMiddleware::new(&scheduler_config, &telemetry)?;
         let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
-        let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
+        let common_middleware =
+            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
 
-        let provider = telemetry_middleware // record handler lifecycle events
-            .layer(scheduler_middleware) // fair scheduler with global concurrency limit
-            .layer(ShutdownMiddleware) // stop processing if shutting down partition
-            .layer(retry_middleware.clone()) // retry writing to failure topic
+        let provider = common_middleware
+            .layer(retry_middleware.clone()) // retry the task a fixed number of times
             .layer(topic_middleware) // write to failure topic
-            .layer(retry_middleware) // retry processing up to limit
+            .layer(retry_middleware) // retry writing to the failure topic indefinitely
             .into_provider(handler);
 
         Self::new(consumer_config, trigger_store_config, provider, telemetry).await
@@ -863,21 +917,18 @@ impl ProsodyConsumer {
     pub async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
-        scheduler_config: SchedulerConfiguration,
+        common_config: &CommonMiddlewareConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         let telemetry = Telemetry::new();
-        let scheduler_middleware = SchedulerMiddleware::new(&scheduler_config, &telemetry)?;
-        let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
+        let common_middleware =
+            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
 
-        // Telemetry first (innermost, closest to handler), then logging, shutdown,
-        // scheduler
-        let provider = telemetry_middleware
-            .layer(scheduler_middleware)
-            .layer(ShutdownMiddleware)
+        // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then log
+        let provider = common_middleware
             .layer(LogMiddleware)
             .into_provider(handler);
 
@@ -1159,4 +1210,8 @@ pub enum ConsumerError {
     /// Indicates a scheduler initialization failure.
     #[error("Scheduler initialization failed: {0:#}")]
     Scheduler(#[from] SchedulerInitError),
+
+    /// Indicates a timeout middleware initialization failure.
+    #[error("Timeout initialization failed: {0:#}")]
+    Timeout(#[from] TimeoutInitError),
 }

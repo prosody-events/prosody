@@ -13,9 +13,9 @@ use prosody::{
     consumer::ConsumerConfigurationBuilder,
     consumer::middleware::{
         retry::RetryConfigurationBuilder, scheduler::SchedulerConfigurationBuilder,
-        topic::FailureTopicConfigurationBuilder,
+        timeout::TimeoutConfigurationBuilder, topic::FailureTopicConfigurationBuilder,
     },
-    high_level::{HighLevelClient, HighLevelClientError, mode::Mode},
+    high_level::{ConsumerBuilders, HighLevelClient, HighLevelClientError, mode::Mode},
     producer::ProducerConfigurationBuilder,
 };
 use serde_json::{Value, json};
@@ -107,19 +107,20 @@ fn create_high_level_client(
         .probe_port(None)
         .subscribed_topics(vec![regex_pattern]);
 
-    let retry_builder = RetryConfigurationBuilder::default();
-    let failure_topic_builder = FailureTopicConfigurationBuilder::default();
-    let scheduler_builder = SchedulerConfigurationBuilder::default();
+    let consumer_builders = ConsumerBuilders {
+        consumer: consumer_builder,
+        retry: RetryConfigurationBuilder::default(),
+        failure_topic: FailureTopicConfigurationBuilder::default(),
+        scheduler: SchedulerConfigurationBuilder::default(),
+        timeout: TimeoutConfigurationBuilder::default(),
+    };
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
     HighLevelClient::new(
         Mode::BestEffort,
         &mut producer_builder,
-        &consumer_builder,
-        &retry_builder,
-        &failure_topic_builder,
-        &scheduler_builder,
+        &consumer_builders,
         &cassandra_builder,
     )
 }

@@ -161,7 +161,13 @@ struct Inner<T> {
     key: Key,
 
     #[educe(Debug(ignore))]
-    shutdown_rx: watch::Receiver<bool>,
+    partition_shutdown_rx: watch::Receiver<bool>,
+
+    #[educe(Debug(ignore))]
+    message_shutdown_tx: watch::Sender<bool>,
+
+    #[educe(Debug(ignore))]
+    message_shutdown_rx: watch::Receiver<bool>,
 
     #[educe(Debug(ignore))]
     timers: TimerManager<T>,
@@ -184,10 +190,13 @@ where
         shutdown_rx: watch::Receiver<bool>,
         timers: TimerManager<T>,
     ) -> Self {
+        let (message_shutdown_tx, message_shutdown_rx) = watch::channel(false);
         let inner = ArcSwapOption::new(Some(
             Inner {
                 key,
-                shutdown_rx,
+                partition_shutdown_rx: shutdown_rx,
+                message_shutdown_tx,
+                message_shutdown_rx,
                 timers,
             }
             .into(),
@@ -210,7 +219,7 @@ where
             return true;
         };
 
-        *inner.shutdown_rx.borrow()
+        *inner.message_shutdown_rx.borrow() || *inner.partition_shutdown_rx.borrow()
     }
 
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -219,10 +228,16 @@ where
             return ready(()).left_future();
         };
 
-        let mut shutdown_rx = inner.shutdown_rx.clone();
+        let mut partition_shutdown_rx = inner.partition_shutdown_rx.clone();
+        let mut message_shutdown_rx = inner.message_shutdown_rx.clone();
 
         async move {
-            if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
+            let result = select! {
+                result = message_shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => result,
+                result = partition_shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => result,
+            };
+
+            if let Err(error) = result {
                 error!("shutdown hook failed: {error:#}");
             }
         }
@@ -309,6 +324,12 @@ where
     }
 
     fn invalidate(self) {
+        // Signal shutdown to notify processors waiting on futures from `on_shutdown`
+        // to cancel processing.
+        if let Some(inner) = self.inner.load().as_ref() {
+            let _ = inner.message_shutdown_tx.send(true);
+        }
+
         // Clear the inner state to prevent any further operations on this context.
         // This ensures resource cleanup (spans, channels) and prevents usage after
         // message processing completes, which could cause race conditions or

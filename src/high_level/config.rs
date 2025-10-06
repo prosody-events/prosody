@@ -14,15 +14,18 @@ use crate::consumer::middleware::retry::{
     RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
 };
 use crate::consumer::middleware::scheduler::{
-    SchedulerConfiguration, SchedulerConfigurationBuilder, SchedulerConfigurationBuilderError,
-    SchedulerInitError,
+    SchedulerConfigurationBuilder, SchedulerConfigurationBuilderError, SchedulerInitError,
+};
+use crate::consumer::middleware::timeout::{
+    TimeoutConfigurationBuilder, TimeoutConfigurationBuilderError,
 };
 use crate::consumer::middleware::topic::{
     FailureTopicConfiguration, FailureTopicConfigurationBuilder,
     FailureTopicConfigurationBuilderError,
 };
 use crate::consumer::{
-    ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerConfigurationBuilderError,
+    CommonMiddlewareConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
+    ConsumerConfigurationBuilderError,
 };
 use crate::high_level::mode::Mode;
 use thiserror::Error;
@@ -45,8 +48,8 @@ pub enum ModeConfiguration {
         consumer: ConsumerConfiguration,
         /// The retry configuration.
         retry: RetryConfiguration,
-        /// The scheduler configuration.
-        scheduler: SchedulerConfiguration,
+        /// Common middleware configuration (scheduler, timeout).
+        common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -58,8 +61,8 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
-        /// The scheduler configuration.
-        scheduler: SchedulerConfiguration,
+        /// Common middleware configuration (scheduler, timeout).
+        common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -67,8 +70,8 @@ pub enum ModeConfiguration {
     BestEffort {
         /// The consumer configuration.
         consumer: ConsumerConfiguration,
-        /// The scheduler configuration.
-        scheduler: SchedulerConfiguration,
+        /// Common middleware configuration (scheduler, timeout).
+        common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -85,6 +88,7 @@ impl ModeConfiguration {
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
     /// * `scheduler_builder` - Builder for the scheduler configuration.
+    /// * `timeout_builder` - Builder for the timeout configuration.
     /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Returns
@@ -101,11 +105,16 @@ impl ModeConfiguration {
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
         scheduler_builder: &SchedulerConfigurationBuilder,
+        timeout_builder: &TimeoutConfigurationBuilder,
         cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Result<Self, ModeConfigurationError> {
         let consumer = consumer_builder.build()?;
         let retry = retry_builder.build()?;
         let scheduler = scheduler_builder.build()?;
+        let timeout = timeout_builder.build()?;
+
+        // Build common middleware configuration
+        let common = CommonMiddlewareConfiguration { scheduler, timeout };
 
         // Create trigger store configuration based on mock mode
         let trigger_store = if consumer.mock {
@@ -119,7 +128,7 @@ impl ModeConfiguration {
             Mode::Pipeline => Self::Pipeline {
                 consumer,
                 retry,
-                scheduler,
+                common,
                 trigger_store,
             },
             Mode::LowLatency => {
@@ -128,13 +137,13 @@ impl ModeConfiguration {
                     consumer,
                     retry,
                     failure_topic,
-                    scheduler,
+                    common,
                     trigger_store,
                 }
             }
             Mode::BestEffort => Self::BestEffort {
                 consumer,
-                scheduler,
+                common,
                 trigger_store,
             },
         })
@@ -215,6 +224,10 @@ pub enum ModeConfigurationError {
     /// Error when the scheduler initialization fails.
     #[error("scheduler initialization failed: {0:#}")]
     Scheduler(#[from] SchedulerInitError),
+
+    /// Error when the timeout configuration builder fails.
+    #[error("invalid timeout configuration: {0:#}")]
+    TimeoutConfigurationBuilder(#[from] TimeoutConfigurationBuilderError),
 
     /// Error when the Cassandra configuration is invalid.
     #[error("invalid cassandra configuration: {0:#}")]

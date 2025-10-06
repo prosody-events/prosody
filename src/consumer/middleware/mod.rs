@@ -161,6 +161,7 @@ pub mod retry;
 pub mod scheduler;
 pub mod shutdown;
 pub mod telemetry;
+pub mod timeout;
 pub mod topic;
 
 // Re-export providers for backwards compatibility and convenience

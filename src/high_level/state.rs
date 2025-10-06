@@ -7,6 +7,7 @@
 use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::middleware::retry::RetryConfigurationBuilder;
 use crate::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
+use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ProsodyConsumer};
 use crate::high_level::config::ModeConfiguration;
@@ -61,6 +62,7 @@ impl<T> ConsumerState<T> {
     /// * `retry_builder` - Builder for the retry configuration.
     /// * `failure_topic_builder` - Builder for the failure topic configuration.
     /// * `scheduler_builder` - Builder for the scheduler configuration.
+    /// * `timeout_builder` - Builder for the timeout configuration.
     /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Returns
@@ -73,6 +75,7 @@ impl<T> ConsumerState<T> {
         retry_builder: &RetryConfigurationBuilder,
         failure_topic_builder: &FailureTopicConfigurationBuilder,
         scheduler_builder: &SchedulerConfigurationBuilder,
+        timeout_builder: &TimeoutConfigurationBuilder,
         cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Self {
         match ModeConfiguration::build(
@@ -81,6 +84,7 @@ impl<T> ConsumerState<T> {
             retry_builder,
             failure_topic_builder,
             scheduler_builder,
+            timeout_builder,
             cassandra_builder,
         ) {
             Ok(configuration) => Self::Configured(configuration),
