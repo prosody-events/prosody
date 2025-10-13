@@ -6,12 +6,13 @@
 
 use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
 use crate::consumer::middleware::retry::RetryConfigurationBuilder;
 use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, SchedulerInitError};
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ConsumerError, ProsodyConsumer};
-use crate::high_level::config::ModeConfiguration;
+use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams};
 use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::producer::{
@@ -48,6 +49,8 @@ pub struct ConsumerBuilders {
     pub failure_topic: FailureTopicConfigurationBuilder,
     /// Scheduler middleware configuration builder.
     pub scheduler: SchedulerConfigurationBuilder,
+    /// Monopolization middleware configuration builder.
+    pub monopolization: MonopolizationConfigurationBuilder,
     /// Timeout middleware configuration builder.
     pub timeout: TimeoutConfigurationBuilder,
 }
@@ -134,15 +137,16 @@ impl<T> HighLevelClient<T> {
             Mode::BestEffort => ProsodyProducer::best_effort_producer(cloned_config),
         }?;
 
-        let consumer_state = ConsumerState::build(
+        let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
             mode,
-            &consumer_builders.consumer,
-            &consumer_builders.retry,
-            &consumer_builders.failure_topic,
-            &consumer_builders.scheduler,
-            &consumer_builders.timeout,
+            consumer_builder: &consumer_builders.consumer,
+            retry_builder: &consumer_builders.retry,
+            failure_topic_builder: &consumer_builders.failure_topic,
+            scheduler_builder: &consumer_builders.scheduler,
+            monopolization_builder: &consumer_builders.monopolization,
+            timeout_builder: &consumer_builders.timeout,
             cassandra_builder,
-        );
+        });
 
         // Check for topic existence only if not in mock mode
         if !producer_config.mock {
@@ -213,14 +217,15 @@ impl<T> HighLevelClient<T> {
             ModeConfiguration::Pipeline {
                 consumer,
                 retry,
+                monopolization,
                 common,
                 trigger_store,
-                ..
             } => {
                 ProsodyConsumer::pipeline_consumer(
                     consumer,
                     trigger_store,
                     retry.clone(),
+                    monopolization.clone(),
                     common,
                     handler.clone(),
                 )

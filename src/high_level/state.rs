@@ -4,14 +4,8 @@
 //! of the consumer, along with methods for building and displaying the state.
 //! It also includes a custom error type for handling state-related errors.
 
-use crate::cassandra::config::CassandraConfigurationBuilder;
-use crate::consumer::middleware::retry::RetryConfigurationBuilder;
-use crate::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
-use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
-use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
-use crate::consumer::{ConsumerConfigurationBuilder, ProsodyConsumer};
-use crate::high_level::config::ModeConfiguration;
-use crate::high_level::mode::Mode;
+use crate::consumer::ProsodyConsumer;
+use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
@@ -57,36 +51,15 @@ impl<T> ConsumerState<T> {
     ///
     /// # Arguments
     ///
-    /// * `mode` - The operating mode for the consumer.
-    /// * `consumer_builder` - Builder for the consumer configuration.
-    /// * `retry_builder` - Builder for the retry configuration.
-    /// * `failure_topic_builder` - Builder for the failure topic configuration.
-    /// * `scheduler_builder` - Builder for the scheduler configuration.
-    /// * `timeout_builder` - Builder for the timeout configuration.
-    /// * `cassandra_builder` - Builder for the Cassandra configuration.
+    /// * `params` - The build parameters containing all required configuration
+    ///   builders.
     ///
     /// # Returns
     ///
     /// Returns a `ConsumerState::Configured` if the build is successful,
     /// otherwise returns `ConsumerState::Unconfigured`.
-    pub(crate) fn build(
-        mode: Mode,
-        consumer_builder: &ConsumerConfigurationBuilder,
-        retry_builder: &RetryConfigurationBuilder,
-        failure_topic_builder: &FailureTopicConfigurationBuilder,
-        scheduler_builder: &SchedulerConfigurationBuilder,
-        timeout_builder: &TimeoutConfigurationBuilder,
-        cassandra_builder: &CassandraConfigurationBuilder,
-    ) -> Self {
-        match ModeConfiguration::build(
-            mode,
-            consumer_builder,
-            retry_builder,
-            failure_topic_builder,
-            scheduler_builder,
-            timeout_builder,
-            cassandra_builder,
-        ) {
+    pub(crate) fn build(params: &ModeConfigurationBuildParams) -> Self {
+        match ModeConfiguration::build(params) {
             Ok(configuration) => Self::Configured(configuration),
             Err(error) => {
                 info!("disabling consumer (safe to ignore if you're only producing): {error:#}");

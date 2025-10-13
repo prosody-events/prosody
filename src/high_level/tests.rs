@@ -1,5 +1,6 @@
 use super::*;
 use crate::consumer::ConsumerConfiguration;
+use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
 use crate::consumer::middleware::retry::RetryConfiguration;
 use crate::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
@@ -197,6 +198,7 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Hig
         retry: RetryConfiguration::builder(),
         failure_topic: FailureTopicConfigurationBuilder::default(),
         scheduler: SchedulerConfigurationBuilder::default(),
+        monopolization: MonopolizationConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
     };
     let cassandra_builder = CassandraConfigurationBuilder::default();

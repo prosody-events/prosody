@@ -103,7 +103,9 @@ pub struct MonopolizationConfiguration {
 /// Middleware that detects and prevents key-level execution monopolies.
 #[derive(Clone)]
 pub struct MonopolizationMiddleware {
-    config: MonopolizationConfiguration,
+    monopolization_threshold: f64,
+    window_duration: Duration,
+    failure_rate_threshold: f64,
     reference_instant: Instant,
     key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
     failure_rate: Arc<AtomicF64>,
@@ -113,7 +115,9 @@ pub struct MonopolizationMiddleware {
 #[derive(Clone)]
 pub struct MonopolizationProvider<T> {
     provider: T,
-    config: MonopolizationConfiguration,
+    monopolization_threshold: f64,
+    window_duration: Duration,
+    failure_rate_threshold: f64,
     reference_instant: Instant,
     key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
     failure_rate: Arc<AtomicF64>,
@@ -152,7 +156,7 @@ impl MonopolizationMiddleware {
     ///
     /// Returns an error if the configuration validation fails.
     pub fn new(
-        config: MonopolizationConfiguration,
+        config: &MonopolizationConfiguration,
         telemetry: &Telemetry,
     ) -> Result<Self, MonopolizationInitError> {
         config.validate()?;
@@ -175,7 +179,9 @@ impl MonopolizationMiddleware {
         ));
 
         Ok(Self {
-            config,
+            monopolization_threshold: config.monopolization_threshold,
+            window_duration,
+            failure_rate_threshold: config.failure_rate_threshold,
             reference_instant,
             key_intervals,
             failure_rate,
@@ -192,7 +198,9 @@ impl HandlerMiddleware for MonopolizationMiddleware {
     {
         MonopolizationProvider {
             provider,
-            config: self.config.clone(),
+            monopolization_threshold: self.monopolization_threshold,
+            window_duration: self.window_duration,
+            failure_rate_threshold: self.failure_rate_threshold,
             reference_instant: self.reference_instant,
             key_intervals: Arc::clone(&self.key_intervals),
             failure_rate: Arc::clone(&self.failure_rate),
@@ -212,9 +220,9 @@ where
             reference_instant: self.reference_instant,
             key_intervals: Arc::clone(&self.key_intervals),
             failure_rate: Arc::clone(&self.failure_rate),
-            monopolization_threshold: self.config.monopolization_threshold,
-            window_duration: Duration::from_secs(self.config.window_duration_secs),
-            failure_rate_threshold: self.config.failure_rate_threshold,
+            monopolization_threshold: self.monopolization_threshold,
+            window_duration: self.window_duration,
+            failure_rate_threshold: self.failure_rate_threshold,
         }
     }
 }
@@ -662,7 +670,7 @@ mod tests {
             .window_duration_secs(300)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -713,7 +721,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -772,7 +780,7 @@ mod tests {
             .failure_rate_threshold(0.5)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -871,7 +879,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -950,7 +958,7 @@ mod tests {
             .window_duration_secs(10)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -1038,7 +1046,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -1116,7 +1124,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -1176,7 +1184,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -1229,7 +1237,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -1280,7 +1288,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -1332,7 +1340,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),
@@ -1383,7 +1391,7 @@ mod tests {
             .window_duration_secs(100)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
         let mock_handler = MockHandler::new();
         let provider = MockProvider {
             handler: mock_handler.clone(),

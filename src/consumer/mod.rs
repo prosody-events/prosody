@@ -154,6 +154,9 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::log::LogMiddleware;
+use crate::consumer::middleware::monopolization::{
+    MonopolizationConfiguration, MonopolizationInitError, MonopolizationMiddleware,
+};
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::scheduler::{
     SchedulerConfiguration, SchedulerInitError, SchedulerMiddleware,
@@ -796,13 +799,16 @@ impl ProsodyConsumer {
     ///
     /// Pipeline processing emphasizes reliability with automatic retries on
     /// failure. Messages that fail processing will be retried with
-    /// exponential backoff.
+    /// exponential backoff. Includes monopolization detection to prevent
+    /// single keys from consuming excessive processing time.
     ///
     /// # Arguments
     ///
     /// * `consumer_config` - The consumer configuration.
     /// * `trigger_store_config` - The trigger store configuration.
     /// * `retry_config` - The retry configuration.
+    /// * `monopolization_config` - The monopolization detection configuration.
+    /// * `common_config` - The common middleware configuration.
     /// * `handler` - The fallible message handler.
     ///
     /// # Returns
@@ -817,6 +823,7 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
+        monopolization_config: MonopolizationConfiguration,
         common_config: &CommonMiddlewareConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
@@ -825,11 +832,15 @@ impl ProsodyConsumer {
     {
         let telemetry = Telemetry::new();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
+        let monopolization_middleware =
+            MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
         let common_middleware =
             build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
 
-        // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then retry
+        // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then
+        // monopolization then retry
         let provider = common_middleware
+            .layer(monopolization_middleware)
             .layer(retry_middleware)
             .into_provider(handler);
 
@@ -1214,4 +1225,8 @@ pub enum ConsumerError {
     /// Indicates a timeout middleware initialization failure.
     #[error("Timeout initialization failed: {0:#}")]
     Timeout(#[from] TimeoutInitError),
+
+    /// Indicates a monopolization middleware initialization failure.
+    #[error("Monopolization initialization failed: {0:#}")]
+    Monopolization(#[from] MonopolizationInitError),
 }
