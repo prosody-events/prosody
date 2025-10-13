@@ -533,7 +533,7 @@ static GLOBAL_CONFIG: LazyLock<Configuration> = LazyLock::new(|| {
 
 #[derive(Debug)]
 pub struct Configuration {
-    max_permits: usize,
+    max_concurrency: usize,
 }
 
 #[derive(Debug)]

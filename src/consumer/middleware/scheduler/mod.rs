@@ -5,6 +5,7 @@
 //! timely execution of waiting tasks through urgency boosting.
 
 use derive_builder::Builder;
+use std::time::Duration;
 use thiserror::Error;
 use validator::{Validate, ValidationErrors};
 
@@ -17,7 +18,7 @@ use crate::consumer::middleware::{
 use crate::consumer::{DemandType, Keyed};
 use crate::telemetry::Telemetry;
 use crate::timers::Trigger;
-use crate::util::from_env_with_fallback;
+use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Partition, Topic};
 
 mod decay;
@@ -26,14 +27,131 @@ mod dispatch;
 /// Configuration for the scheduler middleware.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct SchedulerConfiguration {
-    /// Maximum number of concurrent handler invocations across all keys.
+    /// Maximum number of handler invocations executing concurrently.
     ///
-    /// Tasks block until a permit becomes available. Lower values reduce peak
-    /// load but may increase latency; higher values improve throughput but
-    /// risk resource exhaustion.
+    /// This is a hard limit enforced by a semaphore. When this many handlers
+    /// are executing, new tasks queue until a permit becomes available. The
+    /// scheduler then selects the next task based on virtual time fairness
+    /// and wait urgency.
+    ///
+    /// Lower values reduce peak resource usage at the cost of increased
+    /// queuing delay. Higher values increase parallelism and throughput
+    /// but consume more system resources.
+    ///
+    /// Environment variable: `PROSODY_MAX_CONCURRENCY`
+    /// Default: 32
     #[builder(default = "from_env_with_fallback(\"PROSODY_MAX_CONCURRENCY\", 32)?")]
     #[validate(range(min = 1_usize))]
-    pub max_permits: usize,
+    pub max_concurrency: usize,
+
+    /// Target proportion of execution time for failure/retry task processing.
+    ///
+    /// This controls bandwidth allocation between Normal and Failure task
+    /// classes. Value represents the target fraction of total EXECUTION TIME
+    /// (not task count) that should be spent on Failure tasks. Normal tasks
+    /// receive the remaining `1.0 - failure_weight` proportion.
+    ///
+    /// The scheduler uses class-level time accounting to achieve this target:
+    /// it selects from the underserved class (lowest `time / weight` ratio),
+    /// causing execution time proportions to converge toward the target over
+    /// time.
+    ///
+    /// Example: With `failure_weight = 0.3`, if Failure tasks take 10x longer
+    /// than Normal tasks, Failure will get ~10x fewer executions but still
+    /// achieve 30% of total execution time.
+    ///
+    /// Environment variable: `PROSODY_SCHEDULER_FAILURE_WEIGHT`
+    /// Default: 0.3 (30% of execution time for failures)
+    #[builder(default = "from_env_with_fallback(\"PROSODY_SCHEDULER_FAILURE_WEIGHT\", 0.3)?")]
+    #[validate(range(min = 0.0_f64, max = 1.0_f64))]
+    pub failure_weight: f64,
+
+    /// Wait duration at which urgency boost reaches maximum intensity.
+    ///
+    /// This parameter controls how quickly wait urgency ramps up. The urgency
+    /// boost uses quadratic scaling: `urgency = wait_weight * (t / T)²` where
+    /// `t` is actual wait time and `T` is this parameter.
+    ///
+    /// - At 50% of `max_wait_secs`: task gets 25% of maximum urgency boost
+    /// - At 100% of `max_wait_secs`: task gets 100% of maximum urgency boost
+    /// - Beyond `max_wait_secs`: urgency is capped at maximum
+    ///
+    /// **Shorter values** make the scheduler more responsive to wait time,
+    /// with urgency ramping up faster. This prioritizes starvation prevention
+    /// but may reduce long-term fairness.
+    ///
+    /// **Longer values** make urgency ramp up slower, giving more weight to
+    /// virtual time fairness. This improves long-term fairness but may allow
+    /// longer wait times before intervention.
+    ///
+    /// Environment variable: `PROSODY_SCHEDULER_MAX_WAIT_SECS`
+    /// Default: 2 minutes
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_SCHEDULER_MAX_WAIT_SECS\", \
+                   Duration::from_secs(120))?",
+        setter(into)
+    )]
+    pub max_wait_secs: Duration,
+
+    /// Maximum urgency boost (in seconds of virtual time) for waiting tasks.
+    ///
+    /// This is the "weight" in the priority formula that balances virtual time
+    /// fairness against starvation prevention. When a task waits for
+    /// `max_wait_secs`, it receives an urgency boost equivalent to this many
+    /// seconds of negative virtual time, making it more likely to be selected.
+    ///
+    /// The priority formula is: `priority = key_vt - urgency_boost` where
+    /// `urgency_boost = wait_weight * (wait_time / max_wait_secs)² * 1e6 μs`.
+    /// Lower priority values are selected first.
+    ///
+    /// **Higher values** increase the importance of wait time relative to
+    /// virtual time fairness. Tasks will be selected sooner based on how long
+    /// they've waited, even if they have high virtual time. This aggressively
+    /// prevents starvation but may allow temporary monopolization.
+    ///
+    /// **Lower values** increase the importance of virtual time fairness
+    /// relative to wait time. Keys with high accumulated execution time remain
+    /// deprioritized longer. This ensures stricter fairness but may allow
+    /// longer wait times.
+    ///
+    /// Example: With default `wait_weight = 200.0` and `max_wait_secs = 120s`,
+    /// a task waiting 120s gets priority equivalent to a key with 200s less
+    /// virtual time.
+    ///
+    /// Environment variable: `PROSODY_SCHEDULER_WAIT_WEIGHT`
+    /// Default: 200.0 seconds
+    #[builder(default = "from_env_with_fallback(\"PROSODY_SCHEDULER_WAIT_WEIGHT\", 200.0)?")]
+    #[validate(range(min = 0.0_f64))]
+    pub wait_weight: f64,
+
+    /// LRU cache capacity for tracking per-key virtual time.
+    ///
+    /// Virtual time (VT) represents accumulated execution time for each key.
+    /// The scheduler uses VT to ensure fairness: keys with lower VT get
+    /// priority. This cache stores VT for recently active keys.
+    ///
+    /// When the cache is full and a new key arrives, the least recently used
+    /// key's VT is evicted. If that key returns later, it starts fresh at
+    /// VT = 0, giving it high priority. This is intentional: keys absent from
+    /// the cache haven't been consuming resources recently.
+    ///
+    /// **Larger caches** can track more distinct keys simultaneously, reducing
+    /// cache misses and providing more accurate long-term fairness across many
+    /// keys. Memory usage: ~64 bytes per entry.
+    ///
+    /// **Smaller caches** use less memory but cause more keys to start fresh
+    /// at VT = 0, which may give temporary priority advantages to keys that
+    /// were previously monopolizers if they weren't accessed recently enough
+    /// to stay in cache.
+    ///
+    /// Note: Virtual times use exponential decay (120s half-life) so old VT
+    /// accumulations lose influence over ~5 minutes regardless of cache size.
+    ///
+    /// Environment variable: `PROSODY_SCHEDULER_CACHE_SIZE`
+    /// Default: 8192 keys
+    #[builder(default = "from_env_with_fallback(\"PROSODY_SCHEDULER_CACHE_SIZE\", 8_192)?")]
+    #[validate(range(min = 1_usize))]
+    pub cache_size: usize,
 }
 
 /// Middleware that applies fair scheduling to handler invocations.
@@ -113,7 +231,7 @@ impl SchedulerMiddleware {
         telemetry: &Telemetry,
     ) -> Result<Self, SchedulerInitError> {
         config.validate()?;
-        let dispatcher = Dispatcher::new(config.max_permits, telemetry);
+        let dispatcher = Dispatcher::new(config, telemetry);
         Ok(Self { dispatcher })
     }
 }

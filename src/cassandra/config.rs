@@ -5,7 +5,7 @@ use crate::util::{
 };
 use derive_builder::Builder;
 use educe::Educe;
-use humantime::Duration;
+use std::time::Duration;
 use validator::Validate;
 
 /// Configuration for Cassandra connectivity across all Prosody components.
@@ -78,8 +78,8 @@ pub struct CassandraConfiguration {
     /// Environment variable: `PROSODY_CASSANDRA_RETENTION`
     /// Default: 30 days
     #[builder(
-        default = "Duration::from(from_duration_env_with_fallback(\"PROSODY_CASSANDRA_RETENTION\", \
-        std::time::Duration::from_secs(30 * 24 * 60 * 60))?)",
+        default = "from_duration_env_with_fallback(\"PROSODY_CASSANDRA_RETENTION\", \
+                   Duration::from_secs(30 * 24 * 60 * 60))?",
         setter(into)
     )]
     pub retention: Duration,

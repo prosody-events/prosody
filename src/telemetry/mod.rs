@@ -72,4 +72,13 @@ impl Telemetry {
     pub fn partition_sender(&self, topic: Topic, partition: Partition) -> TelemetryPartitionSender {
         TelemetryPartitionSender::new(topic, partition, self.tx.clone(), self.clock.clone())
     }
+
+    /// Emits a raw telemetry event with custom timestamp.
+    ///
+    /// This method is intended for testing and allows full control
+    /// over event timing for testing purposes.
+    #[doc(hidden)]
+    pub fn test_emit(&self, event: event::TelemetryEvent) {
+        let _ = self.tx.send(event);
+    }
 }

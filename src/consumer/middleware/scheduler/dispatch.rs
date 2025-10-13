@@ -4,6 +4,7 @@
 //! monopolizing execution while boosting urgency for long-waiting tasks to
 //! prevent starvation.
 
+use super::SchedulerConfiguration;
 use super::decay::DecayingDuration;
 use crate::Key;
 use crate::consumer::DemandType;
@@ -12,8 +13,8 @@ use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
 use ahash::RandomState;
 use quanta::Instant;
+use quick_cache::UnitWeighter;
 use quick_cache::unsync::Cache;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -32,18 +33,6 @@ pub struct Dispatcher {
 }
 
 type DecayingDuration120 = DecayingDuration<120>;
-
-/// Target proportion of bandwidth for failure tasks.
-const FAILURE_WEIGHT: f64 = 0.3;
-
-/// Target proportion of bandwidth for normal (non-failure) tasks.
-const NORMAL_WEIGHT: f64 = 1.0 - FAILURE_WEIGHT;
-
-/// Maximum wait time before urgency reaches maximum boost.
-const MAX_WAIT_SECS: f64 = 120.0;
-
-/// Multiplier for wait urgency boost, preventing indefinite starvation.
-const WAIT_WEIGHT: f64 = 200.0;
 
 /// A pending task awaiting a permit.
 #[derive(Debug)]
@@ -71,16 +60,20 @@ struct Selector {
     tasks: Vec<Task>,
     success_time: DecayingDuration120,
     failure_time: DecayingDuration120,
-    invocation_times: HashMap<Key, Instant, RandomState>,
-    key_times: Cache<Key, DecayingDuration120>,
+    invocation_times: Cache<Key, Instant, UnitWeighter, RandomState>,
+    key_times: Cache<Key, DecayingDuration120, UnitWeighter, RandomState>,
+    failure_weight: f64,
+    normal_weight: f64,
+    max_wait_secs: f64,
+    wait_weight: f64,
 }
 
 impl Dispatcher {
-    pub fn new(max_permits: usize, telemetry: &Telemetry) -> Self {
-        let (tx, rx) = mpsc::channel(max_permits);
-        let selector = Selector::new();
+    pub fn new(config: &SchedulerConfiguration, telemetry: &Telemetry) -> Self {
+        let (tx, rx) = mpsc::channel(config.max_concurrency);
+        let selector = Selector::new(config);
         spawn(run_event_loop(
-            max_permits,
+            config.max_concurrency,
             selector,
             rx,
             telemetry.subscribe(),
@@ -112,12 +105,12 @@ impl Dispatcher {
 }
 
 async fn run_event_loop(
-    max_permits: usize,
+    max_concurrency: usize,
     mut selector: Selector,
     mut tasks: mpsc::Receiver<Task>,
     mut telemetry: broadcast::Receiver<TelemetryEvent>,
 ) {
-    let permits = Arc::new(Semaphore::new(max_permits));
+    let permits = Arc::new(Semaphore::new(max_concurrency));
 
     loop {
         select! {
@@ -149,21 +142,19 @@ async fn run_event_loop(
     }
 }
 
-impl Default for Selector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Selector {
     #[must_use]
-    fn new() -> Self {
+    fn new(config: &SchedulerConfiguration) -> Self {
         Self {
             tasks: Vec::new(),
             success_time: Duration::ZERO.into(),
             failure_time: Duration::ZERO.into(),
-            invocation_times: HashMap::default(),
-            key_times: Cache::new(8_192),
+            invocation_times: Cache::new(config.max_concurrency),
+            key_times: Cache::new(config.cache_size),
+            failure_weight: config.failure_weight,
+            normal_weight: 1.0 - config.failure_weight,
+            max_wait_secs: config.max_wait_secs.as_secs_f64(),
+            wait_weight: config.wait_weight,
         }
     }
 
@@ -227,8 +218,9 @@ impl Selector {
                         .map_or(0.0_f64, |vt| vt.at(now).as_micros() as f64);
 
                     let wait_time = (now - task.timestamp).as_secs_f64();
-                    let wait_ratio = (wait_time / MAX_WAIT_SECS).min(1.0);
-                    let wait_urgency_micros = WAIT_WEIGHT * wait_ratio.powi(2) * 1_000_000.0_f64;
+                    let wait_ratio = (wait_time / self.max_wait_secs).min(1.0);
+                    let wait_urgency_micros =
+                        self.wait_weight * wait_ratio.powi(2) * 1_000_000.0_f64;
                     let priority = key_vt_micros - wait_urgency_micros;
 
                     match task.demand_type {
@@ -246,8 +238,8 @@ impl Selector {
         // Select based on class scores with fallback
         let selected_index = match (normal_best, failure_best) {
             (Some((n, ..)), Some((f, ..))) => {
-                let normal_score = self.success_time.at(now).as_secs_f64() / NORMAL_WEIGHT;
-                let failure_score = self.failure_time.at(now).as_secs_f64() / FAILURE_WEIGHT;
+                let normal_score = self.success_time.at(now).as_secs_f64() / self.normal_weight;
+                let failure_score = self.failure_time.at(now).as_secs_f64() / self.failure_weight;
                 if normal_score <= failure_score { n } else { f }
             }
             (Some((n, ..)), None) => n,
@@ -259,7 +251,7 @@ impl Selector {
     }
 
     fn get_duration(&mut self, timestamp: Instant, key: &Key) -> Option<Duration> {
-        let time = self.invocation_times.remove(key)?;
+        let (_, time) = self.invocation_times.remove(key)?;
         Some(timestamp - time)
     }
 
@@ -313,8 +305,9 @@ mod tests {
     use color_eyre::eyre::{Result, bail};
     use tokio::time::{sleep, timeout};
 
-    fn create_selector() -> Selector {
-        Selector::new()
+    fn create_selector() -> Result<Selector> {
+        let config = SchedulerConfiguration::builder().build()?;
+        Ok(Selector::new(&config))
     }
 
     fn create_task(key: &str, demand_type: DemandType, age_secs: u64) -> Task {
@@ -329,14 +322,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_queue_returns_none() {
-        let mut selector = create_selector();
+    fn empty_queue_returns_none() -> Result<()> {
+        let mut selector = create_selector()?;
         assert!(selector.get_next_task().is_none());
+        Ok(())
     }
 
     #[test]
-    fn single_task_returns_that_task() {
-        let mut selector = create_selector();
+    fn single_task_returns_that_task() -> Result<()> {
+        let mut selector = create_selector()?;
         let task = create_task("key1", DemandType::Normal, 0);
         let expected_key = task.key.clone();
         selector.enqueue_task(task);
@@ -346,11 +340,12 @@ mod tests {
         if let Some(task) = selected {
             assert_eq!(task.key, expected_key);
         }
+        Ok(())
     }
 
     #[test]
     fn only_normal_tasks_selects_normal() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
         selector.enqueue_task(create_task("key1", DemandType::Normal, 0));
         selector.enqueue_task(create_task("key2", DemandType::Normal, 0));
 
@@ -363,7 +358,7 @@ mod tests {
 
     #[test]
     fn only_failure_tasks_selects_failure() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
         selector.enqueue_task(create_task("key1", DemandType::Failure, 0));
         selector.enqueue_task(create_task("key2", DemandType::Failure, 0));
 
@@ -376,7 +371,7 @@ mod tests {
 
     #[test]
     fn selects_lower_vt_within_class() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         selector
             .key_times
@@ -399,7 +394,7 @@ mod tests {
 
     #[test]
     fn fifo_tiebreaking_when_vt_equal() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         selector.enqueue_task(create_task("key1", DemandType::Normal, 2));
         selector.enqueue_task(create_task("key2", DemandType::Normal, 1));
@@ -415,7 +410,7 @@ mod tests {
 
     #[test]
     fn new_key_starts_at_zero_vt() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         selector
             .key_times
@@ -435,7 +430,7 @@ mod tests {
 
     #[test]
     fn underserved_class_wins() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         selector.success_time = Duration::from_millis(700).into();
         selector.failure_time = Duration::from_millis(100).into();
@@ -454,7 +449,7 @@ mod tests {
 
     #[test]
     fn overserved_class_loses() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         selector.success_time = Duration::from_millis(100).into();
         selector.failure_time = Duration::from_millis(700).into();
@@ -473,7 +468,7 @@ mod tests {
 
     #[test]
     fn wait_urgency_overrides_low_vt() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         selector
             .key_times
@@ -498,7 +493,7 @@ mod tests {
 
     #[test]
     fn extreme_wait_guarantees_selection() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         selector.enqueue_task(create_task("waiting_key", DemandType::Normal, 10));
 
@@ -521,7 +516,7 @@ mod tests {
 
     #[test]
     fn class_proportions_converge() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
         let mut failure_count = 0_i32;
 
         for i in 0_i32..1000_i32 {
@@ -555,8 +550,8 @@ mod tests {
     }
 
     #[test]
-    fn flash_crowd_with_wait_urgency() {
-        let mut selector = create_selector();
+    fn flash_crowd_with_wait_urgency() -> Result<()> {
+        let mut selector = create_selector()?;
 
         // Old keys have moderate VT and significant wait time
         for i in 0_i32..10_i32 {
@@ -595,11 +590,12 @@ mod tests {
             new_keys_selected > 0_i32,
             "New keys should also get scheduled"
         );
+        Ok(())
     }
 
     #[test]
     fn single_key_monopoly_handled() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         for _ in 0_i32..10_i32 {
             selector.enqueue_task(create_task("monopoly_key", DemandType::Normal, 0));
@@ -615,8 +611,8 @@ mod tests {
     }
 
     #[test]
-    fn vt_spread_bounded_within_class() {
-        let mut selector = create_selector();
+    fn vt_spread_bounded_within_class() -> Result<()> {
+        let mut selector = create_selector()?;
 
         for i in 0_u64..10_u64 {
             let key = format!("key_{i}");
@@ -640,11 +636,12 @@ mod tests {
             let spread = max_vt - min_vt;
             assert!(spread < 10_000, "VT spread too large: {spread} ms");
         }
+        Ok(())
     }
 
     #[test]
-    fn mixed_demand_types_both_served() {
-        let mut selector = create_selector();
+    fn mixed_demand_types_both_served() -> Result<()> {
+        let mut selector = create_selector()?;
 
         for i in 0_i32..50_i32 {
             selector.enqueue_task(create_task(&format!("n{i}"), DemandType::Normal, 0));
@@ -673,11 +670,12 @@ mod tests {
 
         assert!(normal_served, "Normal tasks should be served");
         assert!(failure_served, "Failure tasks should be served");
+        Ok(())
     }
 
     #[test]
     fn burst_traffic_failure_surge() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         // Start with balanced load - 5 keys per class, continuous tasks
         let normal_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("n{i}")).collect();
@@ -761,7 +759,7 @@ mod tests {
 
     #[test]
     fn heterogeneous_task_durations() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         // Create keys with different task characteristics
         // Fast keys: 10ms, Slow keys: 100ms
@@ -834,7 +832,7 @@ mod tests {
 
     #[test]
     fn long_tail_extreme_outlier() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         // One very slow key, multiple fast keys
         let slow_key = "slow_outlier";
@@ -917,7 +915,7 @@ mod tests {
 
     #[test]
     fn monopoly_recovery_high_vt_key() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         // Create one "monopoly" key with extreme VT from past monopoly
         let monopoly_key = "monopoly";
@@ -1031,8 +1029,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_class_work_conservation() {
-        let mut selector = create_selector();
+    fn empty_class_work_conservation() -> Result<()> {
+        let mut selector = create_selector()?;
 
         // Only enqueue tasks for normal class
         for i in 0_i32..10_i32 {
@@ -1073,11 +1071,12 @@ mod tests {
                 "Should select from Failure class when Normal is empty"
             );
         }
+        Ok(())
     }
 
     #[test]
     fn interleaved_bursts_both_classes() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         let normal_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("n{i}")).collect();
         let failure_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("f{i}")).collect();
@@ -1188,7 +1187,7 @@ mod tests {
 
     #[test]
     fn vt_spread_convergence_over_time() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         let keys: Vec<String> = (0_i32..10_i32).map(|i| format!("k{i}")).collect();
 
@@ -1260,7 +1259,7 @@ mod tests {
 
     #[test]
     fn class_proportion_recovery_from_skew() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         let normal_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("n{i}")).collect();
         let failure_keys: Vec<String> = (0_i32..5_i32).map(|i| format!("f{i}")).collect();
@@ -1331,7 +1330,7 @@ mod tests {
 
     #[test]
     fn concurrent_key_arrivals_stress() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         // Create 10 existing keys with varying VT (simulating ongoing work)
         let existing_keys: Vec<String> = (0_i32..10_i32).map(|i| format!("old{i}")).collect();
@@ -1417,8 +1416,8 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tracks_invocation_time() {
-        let mut selector = create_selector();
+    fn telemetry_tracks_invocation_time() -> Result<()> {
+        let mut selector = create_selector()?;
         let key = Key::from("test_key");
         let now = Instant::now();
 
@@ -1437,11 +1436,12 @@ mod tests {
 
         assert!(selector.invocation_times.contains_key(&key));
         assert_eq!(selector.invocation_times.get(&key), Some(&now));
+        Ok(())
     }
 
     #[test]
-    fn telemetry_updates_success_time_and_key_vt() {
-        let mut selector = create_selector();
+    fn telemetry_updates_success_time_and_key_vt() -> Result<()> {
+        let mut selector = create_selector()?;
         let key = Key::from("test_key");
         let invoke_time = Instant::now();
         let complete_time = invoke_time + Duration::from_millis(100);
@@ -1484,11 +1484,12 @@ mod tests {
             selector.key_times.get(&key).is_some(),
             "key_times should contain the key after completion"
         );
+        Ok(())
     }
 
     #[test]
-    fn telemetry_updates_failure_time_on_handler_failed() {
-        let mut selector = create_selector();
+    fn telemetry_updates_failure_time_on_handler_failed() -> Result<()> {
+        let mut selector = create_selector()?;
         let key = Key::from("test_key");
         let invoke_time = Instant::now();
         let complete_time = invoke_time + Duration::from_millis(50);
@@ -1524,11 +1525,12 @@ mod tests {
             final_failure_time > initial_failure_time,
             "failure_time should increase after handler failed"
         );
+        Ok(())
     }
 
     #[test]
     fn telemetry_affects_scheduling_decision() -> Result<()> {
-        let mut selector = create_selector();
+        let mut selector = create_selector()?;
 
         let key1 = Key::from("key1");
         let key2 = Key::from("key2");
@@ -1577,9 +1579,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatcher_returns_permits() {
+    async fn dispatcher_returns_permits() -> Result<()> {
         let telemetry = Telemetry::new();
-        let dispatcher = Dispatcher::new(2, &telemetry);
+        let config = SchedulerConfiguration::builder()
+            .max_concurrency(2)
+            .build()?;
+        let dispatcher = Dispatcher::new(&config, &telemetry);
 
         let permit1 = dispatcher
             .get_permit(Key::from("key1"), DemandType::Normal)
@@ -1590,19 +1595,23 @@ mod tests {
 
         assert!(permit1.is_ok(), "Should get first permit");
         assert!(permit2.is_ok(), "Should get second permit");
+        Ok(())
     }
 
     #[tokio::test]
     async fn dispatcher_respects_semaphore_limit() -> Result<()> {
         let telemetry = Telemetry::new();
-        let dispatcher = Dispatcher::new(1, &telemetry);
+        let config = SchedulerConfiguration::builder()
+            .max_concurrency(1)
+            .build()?;
+        let dispatcher = Dispatcher::new(&config, &telemetry);
 
         // Get first permit
         let _permit1 = dispatcher
             .get_permit(Key::from("key1"), DemandType::Normal)
             .await?;
 
-        // Try to get second permit (should block since max_permits=1)
+        // Try to get second permit (should block since max_concurrency=1)
         let permit2_future = dispatcher.get_permit(Key::from("key2"), DemandType::Normal);
 
         // Use timeout to verify it blocks
@@ -1619,7 +1628,10 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_releases_permits_when_dropped() -> Result<()> {
         let telemetry = Telemetry::new();
-        let dispatcher = Dispatcher::new(1, &telemetry);
+        let config = SchedulerConfiguration::builder()
+            .max_concurrency(1)
+            .build()?;
+        let dispatcher = Dispatcher::new(&config, &telemetry);
 
         // Get and drop first permit
         {
@@ -1643,9 +1655,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatcher_schedules_by_priority() {
+    async fn dispatcher_schedules_by_priority() -> Result<()> {
         let telemetry = Telemetry::new();
-        let dispatcher = Dispatcher::new(10, &telemetry);
+        let config = SchedulerConfiguration::builder()
+            .max_concurrency(10)
+            .build()?;
+        let dispatcher = Dispatcher::new(&config, &telemetry);
 
         // Enqueue tasks with different wait times (older = higher priority)
         let old_task = dispatcher.get_permit(Key::from("old"), DemandType::Normal);
@@ -1657,5 +1672,6 @@ mod tests {
 
         assert!(result1.is_ok(), "Old task should complete");
         assert!(result2.is_ok(), "New task should complete");
+        Ok(())
     }
 }

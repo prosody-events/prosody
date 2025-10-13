@@ -26,7 +26,6 @@ use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
 use scylla::statement::Consistency;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
 use thiserror::Error;
 
 pub mod config;
@@ -91,8 +90,7 @@ impl CassandraStore {
         let migrator = CassandraMigrator::new(&session, &config.keyspace).await?;
         migrator.migrate().await?;
 
-        let base_ttl: StdDuration = config.retention.into();
-        let base_ttl = base_ttl.try_into()?;
+        let base_ttl = config.retention.try_into()?;
 
         Ok(Self {
             inner: Arc::new(Inner {

@@ -406,7 +406,7 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
         keyspace: "prosody_integration_test".to_owned(),
         user: None,
         password: None,
-        retention: StdDuration::from_secs(10 * 60).into(),
+        retention: StdDuration::from_secs(10 * 60),
     };
 
     TriggerStoreConfiguration::Cassandra(cassandra_config)

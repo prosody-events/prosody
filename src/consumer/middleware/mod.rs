@@ -48,6 +48,7 @@
 //! | [`telemetry`] | Handler lifecycle observability |
 //! | [`topic`] | Dead letter queue routing |
 //! | [`log`] | Error categorization and logging |
+//! | [`monopolization`] | Detects and prevents key-level execution monopolies |
 //!
 //! # Usage
 //!
@@ -156,6 +157,7 @@ use crate::{Partition, Topic};
 
 pub mod concurrency;
 pub mod log;
+pub mod monopolization;
 pub mod providers;
 pub mod retry;
 pub mod scheduler;

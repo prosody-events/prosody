@@ -502,7 +502,7 @@ mod test {
             keyspace: keyspace.to_owned(),
             user: None,
             password: None,
-            retention: Duration::from_secs(10 * 60).into(),
+            retention: Duration::from_secs(10 * 60),
         }
     }
     use crate::timers::duration::CompactDuration;

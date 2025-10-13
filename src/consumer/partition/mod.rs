@@ -24,12 +24,14 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
+use ahash::RandomState;
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::stream::select;
 use futures::{Stream, StreamExt, pin_mut};
+use quick_cache::UnitWeighter;
 use quick_cache::unsync::Cache;
 use serde_json::Value;
 use std::future::{Ready, ready};
@@ -460,7 +462,7 @@ fn build_message_stream<T>(
     mut message_rx: Receiver<ConsumerMessage>,
     group_id: &str,
     highest_offset_seen: &mut i64,
-    idempotence_cache: &mut Option<Cache<Key, EventId>>,
+    idempotence_cache: &mut Option<Cache<Key, EventId, UnitWeighter, RandomState>>,
     allowed_events: Option<&AhoCorasick>,
 ) -> impl Stream<Item = UncommittedEvent<T>>
 where
@@ -677,7 +679,7 @@ async fn filter_event_type(
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out as a duplicate
 async fn filter_duplicate(
-    idempotence_cache: &mut Option<Cache<Key, EventId>>,
+    idempotence_cache: &mut Option<Cache<Key, EventId, UnitWeighter, RandomState>>,
     message: UncommittedMessage,
 ) -> Option<UncommittedMessage> {
     // Skip deduplication if no cache is configured
