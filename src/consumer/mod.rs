@@ -184,6 +184,7 @@ use crate::util::{
 };
 use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 
+pub mod decode;
 pub mod event_context;
 mod extractor;
 mod kafka_context;

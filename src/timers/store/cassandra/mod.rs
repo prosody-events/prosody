@@ -15,7 +15,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use tokio::task::coop::cooperative;
-use tracing::{debug_span, info_span, instrument};
+use tracing::{debug_span, error, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod queries;
@@ -295,7 +295,9 @@ impl TriggerStore for CassandraTriggerStore {
             while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger");
-                span.set_parent(context);
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
 
                 yield Trigger::new(key.into(), time, span);
             }
@@ -409,7 +411,9 @@ impl TriggerStore for CassandraTriggerStore {
             while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
                 let span = debug_span!("fetch_key_trigger");
-                span.set_parent(context);
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
 
                 yield Trigger::new(key.into(), time, span);
             }

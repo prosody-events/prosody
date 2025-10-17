@@ -24,10 +24,16 @@ Prosody is a high-level Kafka client library for Rust providing:
 - If a method doesn't have `self`, consider refactoring it to be a function unless the method pattern is idiomatic (for
   example, `new` should be a method even though it does not contain self).
 - Run `cargo clippy`, `cargo clippy --tests`, `cargo doc`, and `cargo +nightly fmt` after each change and fix any lints.
-- Don't use clippy to ignore lints unless told to do so by a human.
+- **CRITICAL: Clippy lints and warnings are NEVER acceptable.** You may NEVER use `#[allow(...)]` or any other mechanism to suppress clippy warnings without explicit human permission. All warnings must be fixed by addressing the underlying issue.
 - Prefer `use` statements over fully qualified prefixes in code.
 - Ask the human before making large, structural changes to code.
 - Modules should be documented within the module file.
+- **CRITICAL: Never claim to have "found the issue" without rigorous proof.** Always gather evidence (logs, test results,
+  reproducible behavior) before making claims. Jumping to conclusions wastes time and erodes trust. When debugging:
+  1. Gather evidence first (run tests, collect logs, verify behavior)
+  2. Form hypothesis based on evidence
+  3. Test hypothesis with experiments
+  4. Only claim success after verification
 
 ## Error Handling
 
