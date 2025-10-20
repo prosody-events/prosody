@@ -33,6 +33,7 @@ fn loader_config() -> LoaderConfiguration {
         bootstrap_servers: vec!["localhost:9094".to_owned()],
         group_id: "prosody-test".to_owned(),
         max_permits: 10,
+        cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
         poll_interval: Duration::from_secs(1),
         seek_timeout: Duration::from_secs(5),
         discard_threshold: 10,
@@ -122,7 +123,11 @@ async fn test_load_valid_offset() -> color_eyre::Result<()> {
         let loader = KafkaLoader::new(loader_config())?;
 
         // Load offset 5
-        let result = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[5])).await??;
+        let result = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[5]),
+        )
+        .await??;
 
         assert_eq!(result.offset(), offsets[5]);
         assert_eq!(result.partition(), 0_i32);
@@ -151,7 +156,11 @@ async fn test_load_sequential_offsets() -> color_eyre::Result<()> {
 
         // Load offsets 5, 6, 7 in sequence
         for &offset in &offsets[5..8] {
-            let result = timeout(Duration::from_secs(10), loader.load(topic, 0, offset)).await??;
+            let result = timeout(
+                Duration::from_secs(10),
+                loader.load_message(topic, 0, offset),
+            )
+            .await??;
             assert_eq!(result.offset(), offset);
         }
 
@@ -184,7 +193,11 @@ async fn test_multiple_concurrent_requests() -> color_eyre::Result<()> {
             let loader = Arc::clone(&loader);
             let offset = offsets[i];
             handles.push(tokio::spawn(async move {
-                timeout(Duration::from_secs(10), loader.load(topic, 0, offset)).await
+                timeout(
+                    Duration::from_secs(10),
+                    loader.load_message(topic, 0, offset),
+                )
+                .await
             }));
         }
 
@@ -222,7 +235,11 @@ async fn test_load_deleted_offset() -> color_eyre::Result<()> {
         let loader = KafkaLoader::new(loader_config())?;
 
         // Try to load deleted offset 25
-        let result = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[25])).await?;
+        let result = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[25]),
+        )
+        .await?;
 
         let Err(KafkaLoaderError::OffsetDeleted(t, p, requested, lso)) = result else {
             color_eyre::eyre::bail!("Expected OffsetDeleted error, got: {result:?}");
@@ -269,13 +286,25 @@ async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
         let offset_60 = offsets[60];
 
         let h1 = tokio::spawn(async move {
-            timeout(Duration::from_secs(10), loader1.load(topic, 0, offset_10)).await
+            timeout(
+                Duration::from_secs(10),
+                loader1.load_message(topic, 0, offset_10),
+            )
+            .await
         });
         let h2 = tokio::spawn(async move {
-            timeout(Duration::from_secs(10), loader2.load(topic, 0, offset_20)).await
+            timeout(
+                Duration::from_secs(10),
+                loader2.load_message(topic, 0, offset_20),
+            )
+            .await
         });
         let h3 = tokio::spawn(async move {
-            timeout(Duration::from_secs(10), loader3.load(topic, 0, offset_60)).await
+            timeout(
+                Duration::from_secs(10),
+                loader3.load_message(topic, 0, offset_60),
+            )
+            .await
         });
 
         let (r1, r2, r3) = tokio::join!(h1, h2, h3);
@@ -327,7 +356,11 @@ async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
         let loader = KafkaLoader::new(loader_config())?;
 
         // Try to load offset at LSO (50)
-        let result = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[50])).await??;
+        let result = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[50]),
+        )
+        .await??;
 
         assert_eq!(result.offset(), offsets[50]);
 
@@ -359,7 +392,11 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
 
         // NOW request the deleted offset 40
         let offset_40 = offsets[40];
-        let result = timeout(Duration::from_secs(15), loader.load(topic, 0, offset_40)).await?;
+        let result = timeout(
+            Duration::from_secs(15),
+            loader.load_message(topic, 0, offset_40),
+        )
+        .await?;
 
         let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, lso)) = result else {
             color_eyre::eyre::bail!("Expected OffsetDeleted, got: {result:?}");
@@ -395,7 +432,11 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
         let loader = KafkaLoader::new(loader_config())?;
 
         // Load valid offset after LSO
-        let result = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[50])).await??;
+        let result = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[50]),
+        )
+        .await??;
 
         assert_eq!(result.offset(), offsets[50]);
 
@@ -424,8 +465,11 @@ async fn test_sparse_offset_requests() -> color_eyre::Result<()> {
 
         // Request sparse offsets
         for &idx in &[10, 50, 90] {
-            let result =
-                timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[idx])).await??;
+            let result = timeout(
+                Duration::from_secs(10),
+                loader.load_message(topic, 0, offsets[idx]),
+            )
+            .await??;
             assert_eq!(result.offset(), offsets[idx]);
         }
 
@@ -453,15 +497,27 @@ async fn test_backwards_seek() -> color_eyre::Result<()> {
         let loader = KafkaLoader::new(loader_config())?;
 
         // Load offset 80 (position will be at 81)
-        let msg1 = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[80])).await??;
+        let msg1 = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[80]),
+        )
+        .await??;
         assert_eq!(msg1.offset(), offsets[80]);
 
         // Now load offset 30 (should seek backwards)
-        let msg2 = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[30])).await??;
+        let msg2 = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[30]),
+        )
+        .await??;
         assert_eq!(msg2.offset(), offsets[30]);
 
         // Verify we can continue reading forward
-        let msg3 = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[31])).await??;
+        let msg3 = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[31]),
+        )
+        .await??;
         assert_eq!(msg3.offset(), offsets[31]);
 
         Ok(())
@@ -489,6 +545,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
             bootstrap_servers: vec!["localhost:9094".to_owned()],
             group_id: "prosody-test".to_owned(),
             max_permits: 10,
+            cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
             poll_interval: Duration::from_secs(1),
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 5, // Small threshold for testing
@@ -496,15 +553,27 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         let loader = KafkaLoader::new(config)?;
 
         // Load offset 50 (position will be at 51)
-        let msg1 = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[50])).await??;
+        let msg1 = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[50]),
+        )
+        .await??;
         assert_eq!(msg1.offset(), offsets[50]);
 
         // Load offset 55 (51 + 4 = 55, within threshold, should NOT seek)
-        let msg2 = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[55])).await??;
+        let msg2 = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[55]),
+        )
+        .await??;
         assert_eq!(msg2.offset(), offsets[55]);
 
         // Load offset 70 (56 + 14 = 70, beyond threshold, should seek)
-        let msg3 = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[70])).await??;
+        let msg3 = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[70]),
+        )
+        .await??;
         assert_eq!(msg3.offset(), offsets[70]);
 
         Ok(())
@@ -539,7 +608,7 @@ async fn test_concurrent_same_offset_requests() -> color_eyre::Result<()> {
             handles.push(tokio::spawn(async move {
                 timeout(
                     Duration::from_secs(10),
-                    loader.load(topic, 0, target_offset),
+                    loader.load_message(topic, 0, target_offset),
                 )
                 .await
             }));
@@ -585,7 +654,11 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
         let loader = KafkaLoader::new(loader_config())?;
 
         // Try to load deleted offset (should trigger seek failure and recovery)
-        let result = timeout(Duration::from_secs(15), loader.load(topic, 0, offsets[25])).await?;
+        let result = timeout(
+            Duration::from_secs(15),
+            loader.load_message(topic, 0, offsets[25]),
+        )
+        .await?;
 
         // Should get OffsetDeleted error
         let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, _)) = result else {
@@ -594,7 +667,11 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
         assert_eq!(requested, offsets[25]);
 
         // Verify loader recovered and can load valid offsets
-        let msg = timeout(Duration::from_secs(10), loader.load(topic, 0, offsets[60])).await??;
+        let msg = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets[60]),
+        )
+        .await??;
         assert_eq!(msg.offset(), offsets[60]);
 
         Ok(())
@@ -635,7 +712,11 @@ async fn test_decode_error() -> color_eyre::Result<()> {
         let loader = KafkaLoader::new(loader_config())?;
 
         // Try to load the malformed message
-        let result = timeout(Duration::from_secs(10), loader.load(topic, 0, bad_offset)).await?;
+        let result = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, bad_offset),
+        )
+        .await?;
 
         // Should get DecodeError
         let Err(KafkaLoaderError::DecodeError(t, p, offset)) = result else {
@@ -688,7 +769,11 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
         for _ in 0_i32..3_i32 {
             let loader = Arc::clone(&loader);
             handles.push(tokio::spawn(async move {
-                timeout(Duration::from_secs(10), loader.load(topic, 0, bad_offset)).await
+                timeout(
+                    Duration::from_secs(10),
+                    loader.load_message(topic, 0, bad_offset),
+                )
+                .await
             }));
         }
 
@@ -742,11 +827,19 @@ async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<(
         let offset_10 = offsets[10];
 
         let h1 = tokio::spawn(async move {
-            timeout(Duration::from_secs(10), loader1.load(topic, 0, offset_70)).await
+            timeout(
+                Duration::from_secs(10),
+                loader1.load_message(topic, 0, offset_70),
+            )
+            .await
         });
         let h2 = tokio::spawn(async move {
             // Short timeout - if infinite loop, this will timeout
-            timeout(Duration::from_secs(15), loader2.load(topic, 0, offset_10)).await
+            timeout(
+                Duration::from_secs(15),
+                loader2.load_message(topic, 0, offset_10),
+            )
+            .await
         });
 
         // Wait for both
@@ -763,6 +856,80 @@ async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<(
         };
         assert_eq!(requested, offset_10);
         assert!(lso >= offsets[50]);
+
+        Ok(())
+    }
+    .await;
+
+    delete_topic(&topic_name).await?;
+    result
+}
+
+/// Test: Cache permit exhaustion with many concurrent loads
+///
+/// This test stresses the cache permit system by launching many concurrent
+/// cache misses that exceed cache capacity. With `cache_size=2`, loading 10
+/// different offsets concurrently should cause cache evictions which must
+/// properly release cache permits to avoid deadlock.
+///
+/// **Deadlock Risk:** If cache eviction doesn't release permits before the
+/// next acquire blocks, threads will deadlock waiting for permits that are
+/// held by cached messages that can't be evicted.
+#[tokio::test]
+async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+
+    let topic_name = test_topic("cache_permits");
+    create_topic(&topic_name).await?;
+
+    let result = async {
+        let offsets = produce_messages(&topic_name, 50).await?;
+        let topic = Topic::from(topic_name.as_str());
+
+        // Small cache to force evictions
+        let config = LoaderConfiguration {
+            bootstrap_servers: vec!["localhost:9094".to_owned()],
+            group_id: "prosody-test".to_owned(),
+            max_permits: 20, // Allow many concurrent loads
+            cache_size: 2,   // But only 2 cache permits
+            poll_interval: Duration::from_secs(1),
+            seek_timeout: Duration::from_secs(5),
+            discard_threshold: 10,
+        };
+        let loader = Arc::new(KafkaLoader::new(config)?);
+
+        // Launch 10 concurrent loads for DIFFERENT offsets
+        // This will cause 8+ cache evictions since cache_size=2
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let loader = Arc::clone(&loader);
+            let offset = offsets[i * 4]; // Spread out offsets
+            handles.push(tokio::spawn(async move {
+                timeout(
+                    Duration::from_secs(15),
+                    loader.load_message(topic, 0, offset),
+                )
+                .await
+            }));
+        }
+
+        // All loads should complete without deadlock
+        let results = join_all(handles).await;
+        let mut messages = Vec::new();
+        for result in results {
+            let msg = result???;
+            messages.push(msg);
+        }
+
+        // Verify we got all 10 messages
+        assert_eq!(messages.len(), 10);
+
+        // Hold onto all messages to keep load permits held
+        // This tests that cache permits are separate from load permits
+        for (idx, msg) in messages.iter().enumerate() {
+            let expected_offset = offsets[idx * 4];
+            assert_eq!(msg.offset(), expected_offset);
+        }
 
         Ok(())
     }

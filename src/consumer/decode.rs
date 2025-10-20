@@ -19,9 +19,9 @@ use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{Message, Timestamp};
 use std::str;
-use tokio::sync::OwnedSemaphorePermit;
+use std::sync::Arc;
 use tracing::field::Empty;
-use tracing::{error, info_span};
+use tracing::{Span, error, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(not(target_arch = "arm"))]
@@ -30,10 +30,24 @@ use simd_json::Buffers;
 use simd_json::serde::from_reader_with_buffers;
 
 use crate::consumer::extractor::MessageExtractor;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::ConsumerMessageValue;
 use crate::{Payload, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
-/// Decodes and validates a Kafka message into a `ConsumerMessage`.
+/// A decoded Kafka message without processing state.
+///
+/// Contains the immutable message data and the receive span for tracing
+/// lineage, but no semaphore permit. This allows separating the decode
+/// lifecycle from caching and processing lifecycles.
+#[derive(Clone, Debug)]
+pub struct DecodedMessage {
+    /// Shared immutable message data
+    pub value: Arc<ConsumerMessageValue>,
+
+    /// Span for tracing lineage
+    pub span: Span,
+}
+
+/// Decodes and validates a Kafka message into a `DecodedMessage`.
 ///
 /// This function performs comprehensive message processing:
 /// 1. Creates a tracing span with message metadata for observability
@@ -42,23 +56,24 @@ use crate::{Payload, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 /// 4. Extracts and validates the message key
 /// 5. Resolves the message timestamp from Kafka metadata
 ///
+/// The decoded message contains immutable data and the receive span but no
+/// semaphore permit, allowing the caller to manage permit lifecycle separately.
+///
 /// # Arguments
 ///
 /// * `message` - The Kafka message to decode
-/// * `permit` - Semaphore permit for backpressure management
 /// * `propagator` - Distributed tracing context propagator
 /// * `buffers` - (Non-ARM only) Buffers for SIMD JSON parsing
 ///
 /// # Returns
 ///
-/// * `Some(ConsumerMessage)` - A validated, parsed message with tracing context
+/// * `Some(DecodedMessage)` - A validated, parsed message with tracing context
 /// * `None` - If the message is invalid or missing required fields
 pub fn decode_message(
     message: &BorrowedMessage,
-    permit: OwnedSemaphorePermit,
     propagator: &TextMapCompositePropagator,
     #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
-) -> Option<ConsumerMessage> {
+) -> Option<DecodedMessage> {
     // Extract basic message coordinates
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
@@ -66,7 +81,7 @@ pub fn decode_message(
 
     // Create and configure tracing span with distributed context
     let context = propagator.extract(&MessageExtractor::new(message));
-    let span = info_span!(
+    let receive_span = info_span!(
         "receive",
         partition,
         offset,
@@ -77,11 +92,11 @@ pub fn decode_message(
         event_type = Empty,
     );
 
-    if let Err(error) = span.set_parent(context) {
+    if let Err(error) = receive_span.set_parent(context) {
         error!("failed to set parent span: {error:#}");
     }
 
-    let _enter = span.enter();
+    let enter = receive_span.enter();
 
     // Extract source system header if present
     let source_system = extract_source_system(message);
@@ -91,7 +106,7 @@ pub fn decode_message(
         error!("missing payload; discarding message");
         return None;
     };
-    span.record("payload_size", payload_data.len());
+    receive_span.record("payload_size", payload_data.len());
 
     let payload = parse_payload(
         payload_data,
@@ -107,7 +122,7 @@ pub fn decode_message(
 
     let key = match str::from_utf8(key_data) {
         Ok(key_str) => {
-            span.record("key", key_str);
+            receive_span.record("key", key_str);
             key_str.into()
         }
         Err(error) => {
@@ -119,8 +134,8 @@ pub fn decode_message(
     // Determine message timestamp based on available metadata
     let timestamp = resolve_timestamp(message);
 
-    // Create and return complete consumer message
-    Some(ConsumerMessage::new(
+    // Create and return decoded message (without permit)
+    let value = Arc::new(ConsumerMessageValue {
         source_system,
         topic,
         partition,
@@ -128,9 +143,15 @@ pub fn decode_message(
         key,
         timestamp,
         payload,
-        span.clone(),
-        permit,
-    ))
+    });
+
+    // Exit the span context before moving the span into the result
+    drop(enter);
+
+    Some(DecodedMessage {
+        value,
+        span: receive_span,
+    })
 }
 
 /// Extracts the source system header from a Kafka message.

@@ -33,15 +33,14 @@
 //! This approach avoids upfront offset validation (which requires metadata
 //! queries) and lets rdkafka handle offset recovery automatically.
 
-#![allow(dead_code)]
-
-use crate::consumer::decode::decode_message;
+use crate::consumer::decode::{DecodedMessage, decode_message};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::propagator::new_propagator;
 use crate::{Offset, Partition, Topic};
 use ahash::HashMap;
 use opentelemetry::propagation::TextMapCompositePropagator;
+use quick_cache::sync::Cache;
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::{KafkaError, KafkaResult, RDKafkaErrorCode};
@@ -50,15 +49,15 @@ use rdkafka::util::Timeout;
 use rdkafka::{Message, TopicPartitionList};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
-use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{io, mem};
 use thiserror::Error;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::spawn_blocking;
-use tracing::{debug, error, warn};
-use validator::Validate;
+use tracing::field::Empty;
+use tracing::{Span, debug, error, instrument, warn};
 use whoami::fallible::hostname;
 
 #[cfg(not(target_arch = "arm"))]
@@ -67,22 +66,13 @@ use simd_json::Buffers;
 #[cfg(test)]
 mod tests;
 
-/// A response channel paired with a semaphore permit for backpressure.
-struct Response {
-    sender: oneshot::Sender<Result<ConsumerMessage, KafkaLoaderError>>,
-    permit: OwnedSemaphorePermit,
-}
-
 /// Multiple response channels waiting for the same offset, with one shared
 /// permit.
 ///
 /// When multiple callers request the same offset, only one permit is needed for
 /// decoding. Subsequent callers' permits are dropped, but they still acquire
 /// permits initially to maintain backpressure semantics.
-struct Responses {
-    permit: OwnedSemaphorePermit,
-    senders: SmallVec<[oneshot::Sender<Result<ConsumerMessage, KafkaLoaderError>>; 1]>,
-}
+type Responses = SmallVec<[oneshot::Sender<Result<DecodedMessage, KafkaLoaderError>>; 1]>;
 
 /// Active load requests indexed by topic-partition, then by offset.
 ///
@@ -94,27 +84,31 @@ type ActiveRequests = HashMap<(Topic, Partition), BTreeMap<Offset, Responses>>;
 ///
 /// Controls performance characteristics and resource usage of the defer
 /// middleware loader that loads failed messages for retry.
-#[derive(Clone, Debug, Validate)]
+#[derive(Clone, Debug)]
 pub struct LoaderConfiguration {
     /// Kafka broker addresses.
     ///
     /// List of host:port pairs for initial connection to the Kafka cluster.
-    #[validate(length(min = 1_u64))]
     pub bootstrap_servers: Vec<String>,
 
     /// Consumer group ID base name.
     ///
     /// The loader will append `-deferred-loader` to create a unique group
     /// ID, ensuring no conflicts with the primary consumer.
-    #[validate(length(min = 1_u64))]
     pub group_id: String,
 
     /// Maximum number of concurrent message decoding operations.
     ///
     /// Controls the size of the semaphore used for decoding permits
     /// and the capacity of the request channel.
-    #[validate(range(min = 1_usize))]
     pub max_permits: usize,
+
+    /// Maximum number of messages to cache.
+    ///
+    /// The cache uses S3-FIFO eviction policy which quickly evicts "one-hit
+    /// wonders" while keeping frequently accessed items. Cache capacity is
+    /// managed purely by `quick_cache`'s internal mechanisms.
+    pub cache_size: usize,
 
     /// Interval between poll operations when no messages are available.
     pub poll_interval: Duration,
@@ -133,7 +127,6 @@ pub struct LoaderConfiguration {
     /// - Kafka seeks: ~10-100ms (network round trips, index lookups)
     /// - Reading 100 messages: ~1-10ms (sequential, already buffered)
     /// - Bandwidth cost: ~10-100KB per 100 messages
-    #[validate(range(min = 0_i64))]
     pub discard_threshold: i64,
 }
 
@@ -142,10 +135,12 @@ pub struct LoaderConfiguration {
 /// Uses a dedicated Kafka consumer with manual partition assignment to load
 /// specific messages without interfering with the primary consumer's group
 /// coordination. A background polling thread fulfills load requests and
-/// semaphore-based permits provide backpressure.
+/// semaphore-based permits provide backpressure. Messages are cached to avoid
+/// redundant Kafka reads.
 pub struct KafkaLoader {
     tx: mpsc::Sender<Request>,
     semaphore: Arc<Semaphore>,
+    cache: Arc<Cache<(Topic, Partition, Offset), DecodedMessage>>,
 }
 
 impl KafkaLoader {
@@ -174,16 +169,8 @@ impl KafkaLoader {
     /// - Configuration validation fails
     /// - Consumer creation fails
     pub fn new(config: LoaderConfiguration) -> Result<Self, KafkaLoaderError> {
-        // Validate configuration
-        config
-            .validate()
-            .map_err(|e| KafkaLoaderError::Configuration(e.to_string()))?;
-
-        // Create unique instance identifier from hostname or UUID
-        let client_id = hostname().unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-
-        // Create consumer with configuration optimized for random access
-        let group_id = format!("{}-deferred-loader", config.group_id);
+        let group_id = format!("{}-deferred", config.group_id);
+        let client_id = hostname().map_err(|error| KafkaLoaderError::Hostname(Arc::new(error)))?;
 
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
@@ -198,16 +185,23 @@ impl KafkaLoader {
 
         let (tx, rx) = mpsc::channel(config.max_permits);
         let semaphore = Arc::new(Semaphore::new(config.max_permits));
+        let cache = Arc::new(Cache::new(config.cache_size));
 
         spawn_blocking(move || poll_loop(rx, &consumer, &config));
 
-        Ok(Self { tx, semaphore })
+        Ok(Self {
+            tx,
+            semaphore,
+            cache,
+        })
     }
 
     /// Loads a specific message from Kafka by offset.
     ///
-    /// Acquires a semaphore permit, sends a load request to the background
-    /// thread, and waits for the message to be decoded.
+    /// Checks the cache first for a fast path. Cache hits return immediately,
+    /// while cache misses load from Kafka and populate the cache. In both
+    /// cases, returns a new message instance with a deferred span that has a
+    /// `follows_from` relationship to the original span.
     ///
     /// # Arguments
     ///
@@ -223,36 +217,88 @@ impl KafkaLoader {
     /// - The response channel is closed (loader shut down)
     /// - The message cannot be found or decoded
     /// - A Kafka error occurs during loading
-    pub async fn load(
+    #[instrument(skip(self), fields(cached = Empty), err)]
+    pub async fn load_message(
         &self,
         topic: Topic,
         partition: Partition,
         offset: Offset,
     ) -> Result<ConsumerMessage, KafkaLoaderError> {
-        // Acquire permit for backpressure
-        let permit = self
+        let span = Span::current();
+
+        // Acquire load permit for the returned message (backpressure)
+        let load_permit = self
             .semaphore
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| KafkaLoaderError::LoaderShutdown)?;
 
+        let cache_key = (topic, partition, offset);
+
+        // Get decoded message from cache or load from Kafka
+        let decoded_message = if let Some(cached) = self.cache.get(&cache_key) {
+            span.record("cached", true);
+            cached
+        } else {
+            span.record("cached", false);
+            self.load_from_kafka(topic, partition, offset).await?
+        };
+
+        span.follows_from(&decoded_message.span);
+
+        // Create consumer message from decoded message with load permit
+        Ok(ConsumerMessage::from_decoded(
+            decoded_message.value,
+            span,
+            load_permit,
+        ))
+    }
+
+    /// Loads a message from Kafka and caches the decoded result.
+    ///
+    /// Acquires a temporary decode permit from `self.semaphore` for the decode
+    /// operation. The decoded message (without any permit) is cached. Cache
+    /// capacity is managed purely by `quick_cache`'s internal S3-FIFO eviction.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic containing the message
+    /// * `partition` - The partition containing the message
+    /// * `offset` - The exact offset of the message
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Kafka loading fails or the loader is shut down.
+    #[instrument(skip(self), level = "debug", err)]
+    async fn load_from_kafka(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+    ) -> Result<DecodedMessage, KafkaLoaderError> {
         // Create response channel
         let (tx, rx) = oneshot::channel();
 
-        // Send load request
+        // Send load request with decode permit
         self.tx
             .send(Request {
                 topic,
                 partition,
                 offset,
-                response: Response { sender: tx, permit },
+                tx,
             })
             .await
             .map_err(|_| KafkaLoaderError::LoaderShutdown)?;
 
-        // Wait for response
-        rx.await.map_err(|_| KafkaLoaderError::LoaderShutdown)?
+        // Wait for decoded message (decode permit was dropped in poll loop)
+        let decoded = rx.await.map_err(|_| KafkaLoaderError::LoaderShutdown)??;
+
+        // Cache the decoded message (no permit needed, quick_cache manages capacity)
+        let cache_key = (topic, partition, offset);
+        self.cache.insert(cache_key, decoded.clone());
+
+        Ok(decoded)
     }
 }
 
@@ -261,7 +307,7 @@ struct Request {
     topic: Topic,
     partition: Partition,
     offset: Offset,
-    response: Response,
+    tx: oneshot::Sender<Result<DecodedMessage, KafkaLoaderError>>,
 }
 
 /// Background polling loop that fulfills load requests.
@@ -386,13 +432,13 @@ fn process_poll_result(
     // LAZY VALIDATION: Detect deleted offsets
     // If we received offset N but have requests for offsets < N, those offsets
     // were deleted (LSO moved forward due to retention/compaction).
-    // Experiments show: assign() with deleted offset auto-resets to LSO.
+    // assign() with deleted offset auto-resets to LSO.
     let mut deleted_offsets = partition_requests.split_off(&msg_offset);
     mem::swap(&mut deleted_offsets, partition_requests);
     // Now `deleted_offsets` has < msg_offset, `partition_requests` has >=
     // msg_offset
 
-    for (deleted_offset, Responses { senders, .. }) in deleted_offsets {
+    for (deleted_offset, senders) in deleted_offsets {
         warn!(
             "offset {deleted_offset} in {}/{msg_partition} was deleted (LSO >= {msg_offset})",
             msg_topic.as_ref()
@@ -405,7 +451,7 @@ fn process_poll_result(
     }
 
     // Check if this offset has active requests
-    let Some(Responses { permit, senders }) = partition_requests.remove(&msg_offset) else {
+    let Some(senders) = partition_requests.remove(&msg_offset) else {
         // No active requests for this offset - discard without decoding
         debug!(
             "discarding intermediate message: {}/{}/{}",
@@ -423,19 +469,19 @@ fn process_poll_result(
         msg_topic.as_ref(),
     );
 
-    // Decode using the permit
-    let consumer_message = decode_message(
+    // Decode message (permit dropped after decode)
+    let decoded_message = decode_message(
         &message,
-        permit,
         propagator,
         #[cfg(not(target_arch = "arm"))]
         buffers,
     );
 
-    // Send to all requesters
-    if let Some(msg) = consumer_message {
+    // Send decoded message to all requesters (they'll create ConsumerMessage with
+    // their own permits)
+    if let Some(decoded) = decoded_message {
         for sender in senders {
-            let _ = sender.send(Ok(msg.clone()));
+            let _ = sender.send(Ok(decoded.clone()));
         }
     } else {
         // Decoding failed - send error to all
@@ -481,14 +527,14 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
         topic,
         partition,
         offset,
-        response: Response { sender, permit },
+        tx,
     } = request;
 
     debug!("Handling request for {topic}/{partition}:{offset}");
 
     if let Err(error) = assign_if_needed(active, consumer, topic, partition, offset) {
         error!("Failed to assign {topic}/{partition}:{offset}: {error:#}");
-        let _ = sender.send(Err(KafkaLoaderError::Kafka(error)));
+        let _ = tx.send(Err(KafkaLoaderError::Kafka(error)));
         return;
     }
 
@@ -498,12 +544,12 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
         Entry::Vacant(entry) => {
             // First request for this offset - use the permit
             let mut senders = SmallVec::new();
-            senders.push(sender);
-            entry.insert(Responses { permit, senders });
+            senders.push(tx);
+            entry.insert(senders);
         }
         Entry::Occupied(mut entry) => {
             // Subsequent request - just add sender, permit drops
-            entry.get_mut().senders.push(sender);
+            entry.get_mut().push(tx);
         }
     }
 }
@@ -553,11 +599,15 @@ fn seek_to_first_active_offset(
                 _ => None,
             });
 
-        let should_seek = match current_position {
-            Some(pos) if pos + discard_threshold >= min_offset && pos <= min_offset => false,
-            Some(pos) if pos > min_offset => true,
-            Some(_) | None => true,
-        };
+        // Avoid expensive seeks when close enough to read sequentially.
+        // Seek (~10-100ms) vs sequential read of N messages (~1-10ms):
+        // - Don't seek: within threshold and before target (sequential read cheaper)
+        // - Seek: past target (backward), too far behind, or unknown position
+        let should_seek = current_position.is_none_or(|position| {
+            let past_target = position > min_offset;
+            let too_far_behind = position + discard_threshold < min_offset;
+            past_target || too_far_behind
+        });
 
         debug!(
             "Seek decision for {}/{}: min_offset={}, current_pos={:?}, should_seek={}",
@@ -678,38 +728,49 @@ fn unassign_partition(
     Ok(())
 }
 
+/// Errors that can occur during Kafka message loading.
 #[derive(Clone, Debug, Error)]
 pub enum KafkaLoaderError {
+    /// The requested message was not found at the specified offset.
     #[error("Message {0}/{1}:{2} not found")]
     NotFound(Topic, Partition, Offset),
 
+    /// Failed to decode the message payload.
     #[error("Failed to decode message {0}/{1}:{2}")]
     DecodeError(Topic, Partition, Offset),
 
+    /// The loader has been shut down and cannot process requests.
     #[error("Loader has shut down")]
     LoaderShutdown,
 
+    /// The requested offset has been deleted due to retention or compaction.
+    ///
+    /// Contains the topic, partition, requested offset, and current log start
+    /// offset.
     #[error(
         "Offset {2} has been deleted from partition {0}/{1} (log start offset: {3}). The \
          requested message no longer exists due to retention or compaction."
     )]
     OffsetDeleted(Topic, Partition, Offset, Offset),
 
-    #[error("Configuration error: {0}")]
-    Configuration(String),
-
+    /// Failed to create the Kafka consumer.
     #[error("Failed to create Kafka consumer: {0}")]
     ConsumerCreation(KafkaError),
 
+    /// A Kafka operation error occurred.
     #[error("Kafka error: {0:#}")]
     Kafka(KafkaError),
+
+    /// Failed to retrieve the hostname for the consumer client ID.
+    #[error("failed to get hostname: {0:#}")]
+    Hostname(Arc<io::Error>),
 }
 
 impl ClassifyError for KafkaLoaderError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             // Terminal errors - system cannot operate
-            Self::LoaderShutdown | Self::Configuration(_) | Self::ConsumerCreation(_) => {
+            Self::LoaderShutdown | Self::ConsumerCreation(_) | Self::Hostname(_) => {
                 ErrorCategory::Terminal
             }
 
@@ -743,7 +804,7 @@ fn classify_kafka_error(error: &KafkaError) -> ErrorCategory {
         | KafkaError::OffsetFetch(code)
         | KafkaError::AdminOp(code)
         | KafkaError::StoreOffset(code)
-        | KafkaError::SetPartitionOffset(code) => classify_rdkafka_error_code(*code),
+        | KafkaError::SetPartitionOffset(code) => classify_kafka_error_code(*code),
 
         // Client creation and configuration errors are terminal - loader cannot operate
         KafkaError::ClientCreation(_) | KafkaError::ClientConfig(..) => ErrorCategory::Terminal,
@@ -760,7 +821,7 @@ fn classify_kafka_error(error: &KafkaError) -> ErrorCategory {
 /// Note: [`RDKafkaErrorCode`] is marked `#[non_exhaustive]`, so a wildcard is
 /// required. New error codes added by rdkafka will be treated as transient by
 /// default, since the loader is reloading messages that previously existed.
-fn classify_rdkafka_error_code(code: RDKafkaErrorCode) -> ErrorCategory {
+fn classify_kafka_error_code(code: RDKafkaErrorCode) -> ErrorCategory {
     match code {
         // Permanent authorization and configuration errors
         RDKafkaErrorCode::TopicAuthorizationFailed

@@ -2,41 +2,33 @@
 //! monopolies.
 //!
 //! Detects when a single key monopolizes handler execution time (>90% over 5
-//! minutes) and returns an error for monopolizing keys when the system is
-//! otherwise healthy.
+//! minutes) and returns an error for monopolizing keys.
 //!
 //! # Execution
 //!
 //! **Request Path:**
-//! 1. Check if system is healthy (failure rate < threshold)
-//! 2. Check if current key is monopolizing execution time
-//! 3. Return error for monopolizing keys, otherwise proceed to inner handler
+//! 1. Check if current key is monopolizing execution time
+//! 2. Return error for monopolizing keys, otherwise proceed to inner handler
 //!
 //! **Background Processing:**
 //! - Tracks execution intervals per key using `IntervalSet<u64>`
-//! - Maintains rolling 5-minute window of invocations and failures
-//! - Updates failure rate atomically on each completion
+//! - Maintains rolling 5-minute window of execution intervals
 //!
 //! # Configuration
 //!
 //! - `monopolization_threshold`: Execution time ratio threshold (default: 0.9
 //!   for 90%)
 //! - `window_duration`: Rolling window duration (default: 5 minutes)
-//! - `failure_rate_threshold`: Failure rate threshold to skip checks (default:
-//!   0.9)
 
 use ahash::RandomState;
 use derive_builder::Builder;
 use interval::IntervalSet;
 use interval::interval_set::ToIntervalSet;
 use interval::prelude::{Bounded, Intersection, Union};
-use portable_atomic::AtomicF64;
 use quanta::Instant;
 use quick_cache::UnitWeighter;
 use quick_cache::sync::Cache;
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::spawn;
@@ -77,17 +69,6 @@ pub struct MonopolizationConfiguration {
     #[builder(default = "from_env_with_fallback(\"PROSODY_MONOPOLIZATION_WINDOW\", 300)?")]
     pub window_duration_secs: u64,
 
-    /// Failure rate threshold to skip monopolization checks.
-    ///
-    /// If the failure rate exceeds this threshold, monopolization checks
-    /// are skipped as the system is considered unhealthy.
-    ///
-    /// Environment variable: `PROSODY_FAILURE_RATE_THRESHOLD`
-    /// Default: 0.9 (90%)
-    #[builder(default = "from_env_with_fallback(\"PROSODY_FAILURE_RATE_THRESHOLD\", 0.9)?")]
-    #[validate(range(min = 0.0_f64, max = 1.0_f64))]
-    pub failure_rate_threshold: f64,
-
     /// LRU cache size for tracking key execution intervals.
     ///
     /// Each entry stores the execution interval set for a key. When the cache
@@ -105,10 +86,8 @@ pub struct MonopolizationConfiguration {
 pub struct MonopolizationMiddleware {
     monopolization_threshold: f64,
     window_duration: Duration,
-    failure_rate_threshold: f64,
     reference_instant: Instant,
     key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
-    failure_rate: Arc<AtomicF64>,
 }
 
 /// Provider that creates monopolization handlers for each partition.
@@ -117,10 +96,8 @@ pub struct MonopolizationProvider<T> {
     provider: T,
     monopolization_threshold: f64,
     window_duration: Duration,
-    failure_rate_threshold: f64,
     reference_instant: Instant,
     key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
-    failure_rate: Arc<AtomicF64>,
 }
 
 /// Handler wrapper that checks for monopolization before delegating to inner
@@ -130,10 +107,8 @@ pub struct MonopolizationHandler<T> {
     handler: T,
     reference_instant: Instant,
     key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
-    failure_rate: Arc<AtomicF64>,
     monopolization_threshold: f64,
     window_duration: Duration,
-    failure_rate_threshold: f64,
 }
 
 impl MonopolizationConfiguration {
@@ -163,17 +138,14 @@ impl MonopolizationMiddleware {
 
         let reference_instant = Instant::now();
         let key_intervals = Arc::new(Cache::new(config.cache_size));
-        let failure_rate = Arc::new(AtomicF64::new(0.0));
 
         let telemetry_rx = telemetry.subscribe();
         let key_intervals_clone = Arc::clone(&key_intervals);
-        let failure_rate_clone = Arc::clone(&failure_rate);
         let window_duration = Duration::from_secs(config.window_duration_secs);
 
         spawn(run_event_loop(
             reference_instant,
             key_intervals_clone,
-            failure_rate_clone,
             window_duration,
             telemetry_rx,
         ));
@@ -181,10 +153,8 @@ impl MonopolizationMiddleware {
         Ok(Self {
             monopolization_threshold: config.monopolization_threshold,
             window_duration,
-            failure_rate_threshold: config.failure_rate_threshold,
             reference_instant,
             key_intervals,
-            failure_rate,
         })
     }
 }
@@ -200,10 +170,8 @@ impl HandlerMiddleware for MonopolizationMiddleware {
             provider,
             monopolization_threshold: self.monopolization_threshold,
             window_duration: self.window_duration,
-            failure_rate_threshold: self.failure_rate_threshold,
             reference_instant: self.reference_instant,
             key_intervals: Arc::clone(&self.key_intervals),
-            failure_rate: Arc::clone(&self.failure_rate),
         }
     }
 }
@@ -219,10 +187,8 @@ where
             handler: self.provider.handler_for_partition(topic, partition),
             reference_instant: self.reference_instant,
             key_intervals: Arc::clone(&self.key_intervals),
-            failure_rate: Arc::clone(&self.failure_rate),
             monopolization_threshold: self.monopolization_threshold,
             window_duration: self.window_duration,
-            failure_rate_threshold: self.failure_rate_threshold,
         }
     }
 }
@@ -286,25 +252,15 @@ where
         key: &Key,
         now: Instant,
     ) -> Option<MonopolizationError<T::Error>> {
-        let failure_rate = self.failure_rate.load(Ordering::Relaxed);
-
         let _span = debug_span!(
             "check_monopolization",
             key = %key,
-            failure_rate_pct = %format!("{:.1}%", failure_rate * 100.0_f64),
-            failure_rate_threshold_pct = %format!("{:.1}%", self.failure_rate_threshold * 100.0_f64),
             monopolization_threshold_pct = %format!("{:.1}%", self.monopolization_threshold * 100.0_f64),
             window_secs = self.window_duration.as_secs(),
         )
             .entered();
 
         debug!("Checking key for monopolization");
-
-        // Skip check if system failure rate is too high
-        if failure_rate >= self.failure_rate_threshold {
-            debug!("Skipping monopolization check: system failure rate exceeds threshold");
-            return None;
-        }
 
         let intervals = self.key_intervals.get(key)?;
 
@@ -339,7 +295,6 @@ where
                 percentage,
                 threshold: self.monopolization_threshold * 100.0_f64,
                 window_secs: self.window_duration.as_secs(),
-                failure_rate: failure_rate * 100.0_f64,
             }
         })
     }
@@ -348,13 +303,10 @@ where
 async fn run_event_loop(
     reference_instant: Instant,
     key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
-    failure_rate: Arc<AtomicF64>,
     window_duration: Duration,
     mut telemetry_rx: broadcast::Receiver<TelemetryEvent>,
 ) {
     let window_nanos = window_duration.as_nanos() as u64;
-    let mut successes = VecDeque::new();
-    let mut failures = VecDeque::new();
 
     loop {
         let event = match telemetry_rx.recv().await {
@@ -395,38 +347,6 @@ async fn run_event_loop(
                 if let Some(intervals) = key_intervals.get(&key) {
                     key_intervals.insert(key.clone(), intervals.intersection(&window_interval_set));
                 }
-
-                if matches!(state, KeyState::HandlerSucceeded) {
-                    successes.push_back(elapsed_nanos);
-                } else {
-                    failures.push_back(elapsed_nanos);
-                }
-
-                while let Some(&oldest) = successes.front() {
-                    if elapsed_nanos.saturating_sub(oldest) > window_nanos {
-                        successes.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-
-                while let Some(&oldest) = failures.front() {
-                    if elapsed_nanos.saturating_sub(oldest) > window_nanos {
-                        failures.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-
-                let total = successes.len() + failures.len();
-                let failed = failures.len();
-                #[allow(clippy::cast_precision_loss)]
-                let rate = if total > 0 {
-                    failed as f64 / total as f64
-                } else {
-                    0.0_f64
-                };
-                failure_rate.store(rate, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -443,10 +363,9 @@ pub enum MonopolizationError<E> {
     /// A key has monopolized execution time.
     #[error(
         "Key '{key}' monopolized {percentage:.1}% of execution time over {window_secs}s window \
-         (threshold: {threshold:.1}%, system failure rate: {failure_rate:.1}%). This key is \
-         consuming an excessive amount of processing time, preventing other keys from being \
-         processed efficiently. Consider investigating why this key requires significantly more \
-         processing time than others."
+         (threshold: {threshold:.1}%). This key is consuming an excessive amount of processing \
+         time, preventing other keys from being processed efficiently. Consider investigating why \
+         this key requires significantly more processing time than others."
     )]
     Monopolization {
         /// The key that monopolized execution.
@@ -458,8 +377,6 @@ pub enum MonopolizationError<E> {
         /// The window duration in seconds over which monopolization was
         /// detected.
         window_secs: u64,
-        /// The current system failure rate at time of detection.
-        failure_rate: f64,
     },
 }
 
@@ -595,15 +512,6 @@ mod tests {
 
         assert!(config.validate().is_err(), "Should reject threshold > 1.0");
 
-        let config = MonopolizationConfiguration::builder()
-            .failure_rate_threshold(-0.1)
-            .build()?;
-
-        assert!(
-            config.validate().is_err(),
-            "Should reject negative threshold"
-        );
-
         let config = MonopolizationConfiguration::builder().build()?;
         assert!(config.validate().is_ok(), "Should accept valid defaults");
 
@@ -617,7 +525,6 @@ mod tests {
             percentage: 95.0,
             threshold: 90.0,
             window_secs: 300,
-            failure_rate: 5.0,
         };
 
         assert!(
@@ -634,7 +541,6 @@ mod tests {
             percentage: 95.5,
             threshold: 90.0,
             window_secs: 300,
-            failure_rate: 5.0,
         };
 
         let message = error.to_string();
@@ -650,10 +556,6 @@ mod tests {
         assert!(
             message.contains("300s"),
             "Error should include window duration in seconds"
-        );
-        assert!(
-            message.contains("5.0%"),
-            "Error should include failure rate"
         );
         assert!(
             message.contains("preventing other keys from being processed efficiently"),
@@ -766,106 +668,6 @@ mod tests {
                 "Monopolization percentage should be > 90%"
             );
         }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_high_failure_rate_skips_monopolization_check() -> Result<()> {
-        let telemetry = Telemetry::new();
-
-        let config = MonopolizationConfiguration::builder()
-            .monopolization_threshold(0.9)
-            .window_duration_secs(100)
-            .failure_rate_threshold(0.5)
-            .build()?;
-
-        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-        let mock_handler = MockHandler::new();
-        let provider = MockProvider {
-            handler: mock_handler.clone(),
-        };
-
-        let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
-
-        let key: Key = "test-key".into();
-        let reference_instant = handler.reference_instant;
-
-        let mut current_time = reference_instant;
-
-        for i in 0_i32..10_i32 {
-            let start = current_time;
-            let end = start + Duration::from_secs(1);
-
-            telemetry.test_emit(create_key_event(
-                "test-topic".into(),
-                0,
-                format!("key-{i}").into(),
-                KeyState::HandlerInvoked,
-                start,
-            ));
-
-            let state = if i < 6_i32 {
-                KeyState::HandlerFailed
-            } else {
-                KeyState::HandlerSucceeded
-            };
-
-            telemetry.test_emit(create_key_event(
-                "test-topic".into(),
-                0,
-                format!("key-{i}").into(),
-                state,
-                end,
-            ));
-
-            current_time = end + Duration::from_millis(100);
-        }
-
-        sleep(Duration::from_millis(50)).await;
-
-        let failure_rate = handler.failure_rate.load(Ordering::Relaxed);
-        assert!(
-            failure_rate > 0.5_f64,
-            "Failure rate should be > 50% (6/10), got {failure_rate:.2}"
-        );
-
-        // Create a monopolizing key that would normally trigger an error
-        // Check at a time closer to the failures so they're still in the window
-        let check_time = current_time + Duration::from_secs(5);
-        let start = current_time;
-        let end = start + Duration::from_secs(95);
-
-        telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
-            KeyState::HandlerInvoked,
-            start,
-        ));
-
-        telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
-            KeyState::HandlerSucceeded,
-            end,
-        ));
-
-        sleep(Duration::from_millis(50)).await;
-
-        // Check at check_time (16s) instead of end (106s) so failures are still in
-        // window
-        let final_failure_rate = handler.failure_rate.load(Ordering::Relaxed);
-        let result = handler.check_monopolization(&key, check_time);
-        assert!(
-            result.is_none(),
-            "High failure rate ({:.2} threshold={}) should skip monopolization check even for \
-             monopolizing key",
-            final_failure_rate,
-            handler.failure_rate_threshold
-        );
 
         Ok(())
     }
@@ -1034,84 +836,6 @@ mod tests {
                 "Old interval should be outside window"
             );
         }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_success_and_failure_tracking() -> Result<()> {
-        let telemetry = Telemetry::new();
-
-        let config = MonopolizationConfiguration::builder()
-            .window_duration_secs(100)
-            .build()?;
-
-        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-        let mock_handler = MockHandler::new();
-        let provider = MockProvider {
-            handler: mock_handler.clone(),
-        };
-
-        let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
-
-        let reference_instant = handler.reference_instant;
-        let mut current_time = reference_instant;
-
-        for i in 0_i32..5_i32 {
-            let start = current_time;
-            let end = start + Duration::from_secs(1);
-
-            telemetry.test_emit(create_key_event(
-                "test-topic".into(),
-                0,
-                format!("key-{i}").into(),
-                KeyState::HandlerInvoked,
-                start,
-            ));
-
-            telemetry.test_emit(create_key_event(
-                "test-topic".into(),
-                0,
-                format!("key-{i}").into(),
-                KeyState::HandlerSucceeded,
-                end,
-            ));
-
-            current_time = end + Duration::from_millis(100);
-        }
-
-        for i in 5_i32..8_i32 {
-            let start = current_time;
-            let end = start + Duration::from_secs(1);
-
-            telemetry.test_emit(create_key_event(
-                "test-topic".into(),
-                0,
-                format!("key-{i}").into(),
-                KeyState::HandlerInvoked,
-                start,
-            ));
-
-            telemetry.test_emit(create_key_event(
-                "test-topic".into(),
-                0,
-                format!("key-{i}").into(),
-                KeyState::HandlerFailed,
-                end,
-            ));
-
-            current_time = end + Duration::from_millis(100);
-        }
-
-        sleep(Duration::from_millis(10)).await;
-
-        let failure_rate = handler.failure_rate.load(Ordering::Relaxed);
-        let expected_rate = 3.0_f64 / 8.0_f64;
-        assert!(
-            (failure_rate - expected_rate).abs() < 0.01_f64,
-            "Failure rate should be 3/8 = 0.375 (3 failures, 5 successes)"
-        );
 
         Ok(())
     }

@@ -162,16 +162,17 @@ where
         debug!(topic, partition, offset, "received message");
 
         // Decode message through extraction, validation, and filtering
-        let maybe_msg = decode_message(
+        let maybe_decoded = decode_message(
             &message,
-            permit,
             &propagator,
             #[cfg(not(target_arch = "arm"))]
             &mut buffers,
         );
 
-        // Dispatch valid messages to their partition manager
-        if let Some(consumer_message) = maybe_msg {
+        // Create consumer message with processing state and dispatch
+        if let Some(decoded) = maybe_decoded {
+            let consumer_message =
+                ConsumerMessage::from_decoded(decoded.value, decoded.span, permit);
             dispatch_with_retry(consumer_message, poll_interval, managers);
         }
 
