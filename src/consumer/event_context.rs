@@ -257,6 +257,12 @@ where
             // Get scheduled triggers
             let triggers = inner.timers.scheduled_triggers(&inner.key).await?;
 
+            // Schedule exactly one new trigger.
+            inner
+                .timers
+                .schedule(Trigger::new(inner.key.clone(), time, span.clone()))
+                .await?;
+
             // Unschedule all existing triggers in parallel, linking spans.
             iter(triggers)
                 .map(|trigger| {
@@ -269,12 +275,6 @@ where
                 })
                 .buffer_unordered(DELETE_CONCURRENCY)
                 .try_collect::<()>()
-                .await?;
-
-            // Schedule exactly one new trigger.
-            inner
-                .timers
-                .schedule(Trigger::new(inner.key.clone(), time, span))
                 .await
         };
 
