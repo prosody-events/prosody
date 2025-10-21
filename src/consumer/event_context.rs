@@ -21,7 +21,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
-use tokio_stream::StreamExt;
 use tracing::{Span, error};
 
 use crate::Key;
