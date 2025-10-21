@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
+use tokio_stream::StreamExt;
 use tracing::{Span, error};
 
 use crate::Key;
@@ -255,7 +256,8 @@ where
 
         let operation = async {
             // Get scheduled triggers
-            let triggers = inner.timers.scheduled_triggers(&inner.key).await?;
+            let mut triggers_to_delete = inner.timers.scheduled_triggers(&inner.key).await?;
+            triggers_to_delete.retain(|trigger| trigger.time != time);
 
             // Schedule exactly one new trigger.
             inner
@@ -264,7 +266,7 @@ where
                 .await?;
 
             // Unschedule all existing triggers in parallel, linking spans.
-            iter(triggers)
+            iter(triggers_to_delete)
                 .map(|trigger| {
                     let span_clone = span.clone();
                     async move {
