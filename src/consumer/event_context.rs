@@ -301,10 +301,17 @@ where
 
         let operation = async {
             // Get scheduled triggers
-            let triggers = inner.timers.scheduled_triggers(&inner.key).await?;
+            let mut triggers_to_delete = inner.timers.scheduled_triggers(&inner.key).await?;
+            triggers_to_delete.retain(|trigger| trigger.time != time);
+
+            // Schedule exactly one new trigger.
+            inner
+                .timers
+                .schedule(Trigger::new(inner.key.clone(), time, span.clone()))
+                .await?;
 
             // Unschedule all existing triggers in parallel, linking spans.
-            iter(triggers)
+            iter(triggers_to_delete)
                 .map(|trigger| {
                     let span_clone = span.clone();
                     async move {
@@ -315,12 +322,6 @@ where
                 })
                 .buffer_unordered(DELETE_CONCURRENCY)
                 .try_collect::<()>()
-                .await?;
-
-            // Schedule exactly one new trigger.
-            inner
-                .timers
-                .schedule(Trigger::new(inner.key.clone(), time, span))
                 .await
         };
 

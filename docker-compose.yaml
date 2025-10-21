@@ -11,11 +11,11 @@ services:
       GF_PATHS_DATA: /data/grafana
 
   kafka:
-    image: docker.io/bitnami/kafka:3.7
+    image: docker.io/bitnamilegacy/kafka:3.7
     ports:
       - "9094:9094"
     volumes:
-      - "kafka_data:/bitnami"
+      - "kafka_data:/bitnamilegacy"
     environment:
       # KRaft settings
       - KAFKA_CFG_NODE_ID=0
@@ -28,7 +28,7 @@ services:
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
       - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      test: [ "CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list" ]
       interval: 15s
       timeout: 10s
       retries: 15
@@ -39,7 +39,7 @@ services:
     volumes:
       - cassandra_data:/var/lib/cassandra
     healthcheck:
-      test: ["CMD-SHELL", "cqlsh -e 'SELECT cluster_name FROM system.local;'"]
+      test: [ "CMD-SHELL", "cqlsh -e 'SELECT cluster_name FROM system.local;'" ]
       interval: 15s
       timeout: 10s
       retries: 15
