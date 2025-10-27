@@ -613,7 +613,7 @@ where
 }
 
 /// Helper: Collect triggers from multiple slabs, avoiding duplicates if slabs
-/// are the same. Fetches both Application and DeferRetry timer types.
+/// are the same. Fetches all triggers across all timer types.
 async fn collect_triggers_from_slabs<S>(store: &S, slabs: &[Slab]) -> Result<Vec<Trigger>, String>
 where
     S: TriggerStore + Send + Sync,
@@ -625,21 +625,14 @@ where
     for slab in slabs {
         // Only fetch if we haven't seen this slab ID yet
         if seen_slab_ids.insert(slab.id()) {
-            // Fetch both Application and DeferRetry triggers
-            let app_triggers: Vec<_> = store
-                .get_slab_triggers(slab, TimerType::Application)
+            // Fetch all triggers across all timer types efficiently
+            let triggers: Vec<_> = store
+                .get_slab_triggers_all_types(slab)
                 .try_collect()
                 .await
-                .map_err(|e| format!("Failed to get Application triggers from slab: {e:?}"))?;
+                .map_err(|e| format!("Failed to get triggers from slab: {e:?}"))?;
 
-            let defer_triggers: Vec<_> = store
-                .get_slab_triggers(slab, TimerType::DeferRetry)
-                .try_collect()
-                .await
-                .map_err(|e| format!("Failed to get DeferRetry triggers from slab: {e:?}"))?;
-
-            all_triggers.extend(app_triggers);
-            all_triggers.extend(defer_triggers);
+            all_triggers.extend(triggers);
         }
     }
 

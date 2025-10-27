@@ -14,7 +14,7 @@ use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{SEGMENT_VERSION_V2, Segment, SegmentId, TriggerStore};
-use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY, TimerType};
+use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
 use futures::{StreamExt, TryStreamExt};
@@ -329,21 +329,9 @@ async fn load_triggers<T>(
 where
     T: TriggerStore,
 {
-    // Load Application timers
+    // Load all triggers across all timer types efficiently
     store
-        .get_slab_triggers(&slab, TimerType::Application)
-        .map_err(TimerManagerError::Store)
-        .try_for_each_concurrent(LOAD_CONCURRENCY, |trigger| async move {
-            scheduler
-                .schedule(trigger)
-                .await
-                .map_err(TimerManagerError::Scheduler)
-        })
-        .await?;
-
-    // Load DeferRetry timers
-    store
-        .get_slab_triggers(&slab, TimerType::DeferRetry)
+        .get_slab_triggers_all_types(&slab)
         .map_err(TimerManagerError::Store)
         .try_for_each_concurrent(LOAD_CONCURRENCY, |trigger| async move {
             scheduler

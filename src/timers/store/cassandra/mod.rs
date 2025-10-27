@@ -452,6 +452,69 @@ impl TriggerStore for CassandraTriggerStore {
         }
     }
 
+    #[instrument(level = "debug", skip(self))]
+    fn get_slab_triggers_all_types(
+        &self,
+        slab: &Slab,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        let segment_id = slab.segment_id();
+        let slab_size = slab.size().seconds() as i32;
+        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
+
+        try_stream! {
+            let stream = self
+                .session()
+                .execute_iter(
+                    self.queries().get_slab_triggers_all_types.clone(),
+                    (segment_id, slab_size, slab_id),
+                )
+                .await?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
+
+            pin_mut!(stream);
+            while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
+                let context = self.propagator().extract(&span_map);
+                let span = info_span!("fetch_slab_trigger_all_types");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
+
+                let timer_type = TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                yield Trigger::new(key.into(), time, timer_type, span);
+            }
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn get_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        try_stream! {
+            let stream = self
+                .session()
+                .execute_iter(
+                    self.queries().get_key_triggers_all_types.clone(),
+                    (segment_id, key.as_ref()),
+                )
+                .await?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
+
+            pin_mut!(stream);
+            while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
+                let context = self.propagator().extract(&span_map);
+                let span = debug_span!("fetch_key_trigger_all_types");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
+
+                let timer_type = TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                yield Trigger::new(key.into(), time, timer_type, span);
+            }
+        }
+    }
+
     #[instrument(level = "debug", skip(self), err)]
     async fn insert_key_trigger(
         &self,

@@ -27,8 +27,8 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
-use ahash::{HashMap, HashSet, HashSetExt};
-use futures::StreamExt;
+use ahash::{HashMap, HashSet};
+use futures::{StreamExt, TryStreamExt};
 use std::fmt::Debug;
 
 /// Helper function to insert a segment.
@@ -206,7 +206,7 @@ where
         .map_err(|e| format!("Error retrieving key triggers for {timer_type:?}: {e:?}"))
 }
 
-/// Helper function to get ALL triggers for a key (both Application and DeferRetry)
+/// Helper function to get ALL triggers for a key (both Application and `DeferRetry`)
 ///
 /// # Errors
 ///
@@ -220,15 +220,14 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let mut all_times = HashSet::new();
-
-    let app_times = get_key_triggers_by_type(store, segment_id, key, TimerType::Application).await?;
-    let defer_times = get_key_triggers_by_type(store, segment_id, key, TimerType::DeferRetry).await?;
-
-    all_times.extend(app_times);
-    all_times.extend(defer_times);
-
-    Ok(all_times)
+    store
+        .get_key_triggers_all_types(segment_id, key)
+        .map_ok(|trigger| trigger.time)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| format!("Error retrieving all key times: {e:?}"))
 }
 
 /// Helper function to get triggers by slab (Application timers only)
@@ -267,7 +266,7 @@ where
         .map_err(|e| format!("Error retrieving slab triggers for {timer_type:?}: {e:?}"))
 }
 
-/// Helper function to get ALL triggers from a slab (both Application and DeferRetry)
+/// Helper function to get ALL triggers from a slab (both Application and `DeferRetry`)
 ///
 /// # Errors
 ///
@@ -277,15 +276,13 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let mut all_triggers = HashSet::new();
-
-    let app_triggers = get_slab_triggers_by_type(store, slab, TimerType::Application).await?;
-    let defer_triggers = get_slab_triggers_by_type(store, slab, TimerType::DeferRetry).await?;
-
-    all_triggers.extend(app_triggers);
-    all_triggers.extend(defer_triggers);
-
-    Ok(all_triggers)
+    store
+        .get_slab_triggers_all_types(slab)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| format!("Error retrieving all slab triggers: {e:?}"))
 }
 
 /// Helper function to remove a trigger

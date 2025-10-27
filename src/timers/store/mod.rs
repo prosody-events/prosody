@@ -318,6 +318,24 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         slab: &Slab,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Streams ALL triggers within a slab across all timer types.
+    ///
+    /// This is the primary method for querying slab triggers, matching
+    /// Cassandra's ability to query an entire partition. More efficient than
+    /// separately querying each timer type.
+    ///
+    /// # Arguments
+    ///
+    /// * `slab` - The slab descriptor.
+    ///
+    /// # Returns
+    ///
+    /// A stream of all triggers in the slab, regardless of timer type.
+    fn get_slab_triggers_all_types(
+        &self,
+        slab: &Slab,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
+
     // === Key trigger (entity-based index) operations ===
 
     /// Streams all scheduled times for a given key and timer type.
@@ -410,6 +428,26 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         timer_type: TimerType,
         key: &Key,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Streams ALL triggers for a given key across all timer types.
+    ///
+    /// This is the primary method for querying key triggers, matching
+    /// Cassandra's ability to query an entire partition. More efficient than
+    /// separately querying each timer type.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier.
+    /// * `key` - The entity key.
+    ///
+    /// # Returns
+    ///
+    /// A stream of all triggers for the key, regardless of timer type.
+    fn get_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     // === Composite operations ===
 

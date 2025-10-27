@@ -74,6 +74,12 @@ pub struct Queries {
     pub get_key_triggers: PreparedStatement,
 
     #[educe(Debug(ignore))]
+    pub get_slab_triggers_all_types: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub get_key_triggers_all_types: PreparedStatement,
+
+    #[educe(Debug(ignore))]
     pub insert_key_trigger: PreparedStatement,
 
     #[educe(Debug(ignore))]
@@ -151,6 +157,10 @@ impl Queries {
         let clear_slab_triggers = prepare_clear_slab_triggers(session, keyspace).await?;
         let get_key_times = prepare_get_key_times(session, keyspace).await?;
         let get_key_triggers = prepare_get_key_triggers(session, keyspace).await?;
+        let get_slab_triggers_all_types =
+            prepare_get_slab_triggers_all_types(session, keyspace).await?;
+        let get_key_triggers_all_types =
+            prepare_get_key_triggers_all_types(session, keyspace).await?;
         let insert_key_trigger = prepare_insert_key_trigger(session, keyspace).await?;
         let delete_key_trigger = prepare_delete_key_trigger(session, keyspace).await?;
         let clear_key_triggers = prepare_clear_key_triggers(session, keyspace).await?;
@@ -183,6 +193,8 @@ impl Queries {
             clear_slab_triggers,
             get_key_times,
             get_key_triggers,
+            get_slab_triggers_all_types,
+            get_key_triggers_all_types,
             insert_key_trigger,
             delete_key_trigger,
             clear_key_triggers,
@@ -421,6 +433,50 @@ async fn prepare_get_key_triggers(
         &format!(
             "select key, time, timer_type, span from {keyspace}.{TABLE_TYPED_KEYS} where \
              segment_id = ? and key = ? and timer_type = ?"
+        ),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for retrieving ALL triggers in a slab across all
+/// timer types.
+///
+/// Creates a prepared statement for: `SELECT key, time, timer_type, span FROM
+/// timer_typed_slabs WHERE segment_id = ? AND slab_size = ? AND id = ?`
+///
+/// This queries the entire partition without filtering by `timer_type`, matching
+/// Cassandra's efficient partition query capability.
+async fn prepare_get_slab_triggers_all_types(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!(
+            "select key, time, timer_type, span from {keyspace}.{TABLE_TYPED_SLABS} where \
+             segment_id = ? and slab_size = ? and id = ?"
+        ),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for retrieving ALL triggers for a key across all
+/// timer types.
+///
+/// Creates a prepared statement for: `SELECT key, time, timer_type, span FROM
+/// timer_typed_keys WHERE segment_id = ? AND key = ?`
+///
+/// This queries the entire partition without filtering by `timer_type`, matching
+/// Cassandra's efficient partition query capability.
+async fn prepare_get_key_triggers_all_types(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!(
+            "select key, time, timer_type, span from {keyspace}.{TABLE_TYPED_KEYS} where \
+             segment_id = ? and key = ?"
         ),
     )
     .await
