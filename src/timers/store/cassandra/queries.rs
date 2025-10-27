@@ -312,10 +312,12 @@ async fn prepare_delete_slab(
     .await
 }
 
-/// Prepares a CQL statement for retrieving all triggers in a slab.
+/// Prepares a CQL statement for retrieving all triggers of a specific type in a
+/// slab.
 ///
-/// Creates a prepared statement for: `SELECT key, time, type, span FROM
-/// timer_typed_slabs WHERE segment_id = ? AND slab_size = ? AND id = ?`
+/// Creates a prepared statement for: `SELECT key, time, timer_type, span FROM
+/// timer_typed_slabs WHERE segment_id = ? AND slab_size = ? AND id = ? AND
+/// timer_type = ?`
 async fn prepare_get_slab_triggers(
     session: &Session,
     keyspace: &str,
@@ -323,8 +325,8 @@ async fn prepare_get_slab_triggers(
     prepare(
         session,
         &format!(
-            "select key, time, type, span from {keyspace}.{TABLE_TYPED_SLABS} where segment_id = \
-             ? and slab_size = ? and id = ?"
+            "select key, time, timer_type, span from {keyspace}.{TABLE_TYPED_SLABS} where \
+             segment_id = ? and slab_size = ? and id = ? and timer_type = ?"
         ),
     )
     .await
@@ -333,8 +335,8 @@ async fn prepare_get_slab_triggers(
 /// Prepares a CQL statement for inserting a trigger into a slab with TTL.
 ///
 /// Creates a prepared statement for: `INSERT INTO timer_typed_slabs
-/// (segment_id, slab_size, id, key, time, type, span) VALUES (?, ?, ?, ?, ?, ?,
-/// ?) USING TTL ?`
+/// (segment_id, slab_size, id, timer_type, key, time, span) VALUES (?, ?, ?, ?,
+/// ?, ?, ?) USING TTL ?`
 async fn prepare_insert_slab_trigger(
     session: &Session,
     keyspace: &str,
@@ -342,8 +344,8 @@ async fn prepare_insert_slab_trigger(
     prepare(
         session,
         &format!(
-            "insert into {keyspace}.{TABLE_TYPED_SLABS} (segment_id, slab_size, id, key, time, \
-             type, span) values (?, ?, ?, ?, ?, ?, ?) using ttl ?"
+            "insert into {keyspace}.{TABLE_TYPED_SLABS} (segment_id, slab_size, id, timer_type, \
+             key, time, span) values (?, ?, ?, ?, ?, ?, ?) using ttl ?"
         ),
     )
     .await
@@ -352,7 +354,8 @@ async fn prepare_insert_slab_trigger(
 /// Prepares a CQL statement for deleting a specific trigger from a slab.
 ///
 /// Creates a prepared statement for: `DELETE FROM timer_typed_slabs WHERE
-/// segment_id = ? AND slab_size = ? AND id = ? AND key = ? AND time = ?`
+/// segment_id = ? AND slab_size = ? AND id = ? AND timer_type = ? AND key = ?
+/// AND time = ?`
 async fn prepare_delete_slab_trigger(
     session: &Session,
     keyspace: &str,
@@ -361,7 +364,7 @@ async fn prepare_delete_slab_trigger(
         session,
         &format!(
             "delete from {keyspace}.{TABLE_TYPED_SLABS} where segment_id = ? and slab_size = ? \
-             and id = ? and key = ? and time = ?"
+             and id = ? and timer_type = ? and key = ? and time = ?"
         ),
     )
     .await
@@ -385,25 +388,30 @@ async fn prepare_clear_slab_triggers(
     .await
 }
 
-/// Prepares a CQL statement for retrieving all scheduled times for a key.
+/// Prepares a CQL statement for retrieving all scheduled times for a key and
+/// timer type.
 ///
 /// Creates a prepared statement for: `SELECT time FROM timer_typed_keys WHERE
-/// segment_id = ? AND key = ?`
+/// segment_id = ? AND key = ? AND timer_type = ?`
 async fn prepare_get_key_times(
     session: &Session,
     keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        &format!("select time from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? and key = ?"),
+        &format!(
+            "select time from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? and key = ? and \
+             timer_type = ?"
+        ),
     )
     .await
 }
 
-/// Prepares a CQL statement for retrieving all triggers for a key.
+/// Prepares a CQL statement for retrieving all triggers for a key and timer
+/// type.
 ///
-/// Creates a prepared statement for: `SELECT key, time, type, span FROM
-/// timer_typed_keys WHERE segment_id = ? AND key = ?`
+/// Creates a prepared statement for: `SELECT key, time, timer_type, span FROM
+/// timer_typed_keys WHERE segment_id = ? AND key = ? AND timer_type = ?`
 async fn prepare_get_key_triggers(
     session: &Session,
     keyspace: &str,
@@ -411,8 +419,8 @@ async fn prepare_get_key_triggers(
     prepare(
         session,
         &format!(
-            "select key, time, type, span from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? \
-             and key = ?"
+            "select key, time, timer_type, span from {keyspace}.{TABLE_TYPED_KEYS} where \
+             segment_id = ? and key = ? and timer_type = ?"
         ),
     )
     .await
@@ -422,7 +430,7 @@ async fn prepare_get_key_triggers(
 /// TTL.
 ///
 /// Creates a prepared statement for: `INSERT INTO timer_typed_keys (segment_id,
-/// key, time, type, span) VALUES (?, ?, ?, ?, ?) USING TTL ?`
+/// key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?`
 async fn prepare_insert_key_trigger(
     session: &Session,
     keyspace: &str,
@@ -430,8 +438,8 @@ async fn prepare_insert_key_trigger(
     prepare(
         session,
         &format!(
-            "insert into {keyspace}.{TABLE_TYPED_KEYS} (segment_id, key, time, type, span) values \
-             (?, ?, ?, ?, ?) using ttl ?"
+            "insert into {keyspace}.{TABLE_TYPED_KEYS} (segment_id, key, timer_type, time, span) \
+             values (?, ?, ?, ?, ?) using ttl ?"
         ),
     )
     .await
@@ -440,7 +448,7 @@ async fn prepare_insert_key_trigger(
 /// Prepares a CQL statement for deleting a specific trigger from the key index.
 ///
 /// Creates a prepared statement for: `DELETE FROM timer_typed_keys WHERE
-/// segment_id = ? AND key = ? AND time = ?`
+/// segment_id = ? AND key = ? AND timer_type = ? AND time = ?`
 async fn prepare_delete_key_trigger(
     session: &Session,
     keyspace: &str,
@@ -448,24 +456,27 @@ async fn prepare_delete_key_trigger(
     prepare(
         session,
         &format!(
-            "delete from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? and key = ? and time \
-             = ?"
+            "delete from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? and key = ? and \
+             timer_type = ? and time = ?"
         ),
     )
     .await
 }
 
-/// Prepares a CQL statement for clearing all triggers for a key.
+/// Prepares a CQL statement for clearing all triggers for a key and timer type.
 ///
 /// Creates a prepared statement for: `DELETE FROM timer_typed_keys WHERE
-/// segment_id = ? AND key = ?`
+/// segment_id = ? AND key = ? AND timer_type = ?`
 async fn prepare_clear_key_triggers(
     session: &Session,
     keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
-        &format!("delete from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? and key = ?"),
+        &format!(
+            "delete from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? and key = ? and \
+             timer_type = ?"
+        ),
     )
     .await
 }
@@ -488,8 +499,8 @@ async fn prepare_insert_slab_no_ttl(
 /// Prepares a CQL statement for inserting a trigger into a slab without TTL.
 ///
 /// Creates a prepared statement for: `INSERT INTO timer_typed_slabs
-/// (segment_id, slab_size, id, key, time, type, span) VALUES (?, ?, ?, ?, ?, ?,
-/// ?)`
+/// (segment_id, slab_size, id, timer_type, key, time, span) VALUES (?, ?, ?, ?,
+/// ?, ?, ?)`
 async fn prepare_insert_slab_trigger_no_ttl(
     session: &Session,
     keyspace: &str,
@@ -497,8 +508,8 @@ async fn prepare_insert_slab_trigger_no_ttl(
     prepare(
         session,
         &format!(
-            "insert into {keyspace}.{TABLE_TYPED_SLABS} (segment_id, slab_size, id, key, time, \
-             type, span) values (?, ?, ?, ?, ?, ?, ?)"
+            "insert into {keyspace}.{TABLE_TYPED_SLABS} (segment_id, slab_size, id, timer_type, \
+             key, time, span) values (?, ?, ?, ?, ?, ?, ?)"
         ),
     )
     .await
@@ -508,7 +519,7 @@ async fn prepare_insert_slab_trigger_no_ttl(
 /// TTL.
 ///
 /// Creates a prepared statement for: `INSERT INTO timer_typed_keys (segment_id,
-/// key, time, type, span) VALUES (?, ?, ?, ?, ?)`
+/// key, timer_type, time, span) VALUES (?, ?, ?, ?, ?)`
 async fn prepare_insert_key_trigger_no_ttl(
     session: &Session,
     keyspace: &str,
@@ -516,8 +527,8 @@ async fn prepare_insert_key_trigger_no_ttl(
     prepare(
         session,
         &format!(
-            "insert into {keyspace}.{TABLE_TYPED_KEYS} (segment_id, key, time, type, span) values \
-             (?, ?, ?, ?, ?)"
+            "insert into {keyspace}.{TABLE_TYPED_KEYS} (segment_id, key, timer_type, time, span) \
+             values (?, ?, ?, ?, ?)"
         ),
     )
     .await
@@ -634,7 +645,8 @@ async fn prepare_insert_slab_trigger_v1(
     prepare(
         session,
         &format!(
-            "insert into {keyspace}.{TABLE_SLABS} (segment_id, id, key, time, span) values (?, ?, ?, ?, ?)"
+            "insert into {keyspace}.{TABLE_SLABS} (segment_id, id, key, time, span) values (?, ?, \
+             ?, ?, ?)"
         ),
     )
     .await

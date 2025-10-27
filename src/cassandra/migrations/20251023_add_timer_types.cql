@@ -10,11 +10,11 @@ create table {{KEYSPACE}}.{{TABLE_TYPED_SLABS}}
     segment_id uuid,
     slab_size  int,
     id         int,
+    timer_type tinyint,
     key        text,
     time       int,
-    type       tinyint,
     span       frozen<map<text, text>>,
-    primary key ((segment_id, slab_size, id), key, time)
+    primary key ((segment_id, slab_size, id), timer_type, key, time)
 )
     with compression = { 'class': 'ZstdCompressor' }
      and compaction = { 'class': 'UnifiedCompactionStrategy' };
@@ -24,10 +24,10 @@ create table {{KEYSPACE}}.{{TABLE_TYPED_KEYS}}
 (
     segment_id uuid,
     key        text,
+    timer_type tinyint,
     time       int,
-    type       tinyint,
     span       frozen<map<text, text>>,
-    primary key ((segment_id, key), time)
+    primary key ((segment_id, key), timer_type, time)
 )
     with compression = { 'class': 'ZstdCompressor' }
      and compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'T2' };

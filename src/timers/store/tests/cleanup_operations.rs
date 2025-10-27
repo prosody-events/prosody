@@ -3,6 +3,7 @@
     reason = "Trigger's ArcSwap field is excluded from hash/equality via Educe"
 )]
 
+use crate::timers::TimerType;
 use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::tests::common::{
@@ -115,7 +116,12 @@ where
 
     // Clear triggers for the key
     store
-        .clear_triggers_for_key(&input.segment.id, &key_trigger.key, input.segment.slab_size)
+        .clear_triggers_for_key(
+            &input.segment.id,
+            TimerType::Application,
+            &key_trigger.key,
+            input.segment.slab_size,
+        )
         .await
         .map_err(|e| format!("Failed to clear triggers for key: {e:?}"))?;
 

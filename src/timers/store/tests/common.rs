@@ -22,12 +22,12 @@
 
 use super::TestStoreResult;
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use ahash::{HashMap, HashSet};
+use crate::timers::{TimerType, Trigger};
+use ahash::{HashMap, HashSet, HashSetExt};
 use futures::StreamExt;
 use std::fmt::Debug;
 
@@ -165,7 +165,7 @@ where
     Ok(())
 }
 
-/// Helper function to get triggers by key
+/// Helper function to get triggers by key (Application timers only)
 ///
 /// # Errors
 ///
@@ -179,16 +179,59 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
+    get_key_triggers_by_type(store, segment_id, key, TimerType::Application).await
+}
+
+/// Helper function to get triggers by key for a specific timer type
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
+pub async fn get_key_triggers_by_type<S>(
+    store: &S,
+    segment_id: &SegmentId,
+    key: &Key,
+    timer_type: TimerType,
+) -> Result<HashSet<CompactDateTime>, String>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
     store
-        .get_key_times(segment_id, key)
+        .get_key_times(segment_id, timer_type, key)
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<HashSet<_>, _>>()
-        .map_err(|e| format!("Error retrieving key triggers: {e:?}"))
+        .map_err(|e| format!("Error retrieving key triggers for {timer_type:?}: {e:?}"))
 }
 
-/// Helper function to get triggers by slab
+/// Helper function to get ALL triggers for a key (both Application and DeferRetry)
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
+pub async fn get_key_triggers_all_types<S>(
+    store: &S,
+    segment_id: &SegmentId,
+    key: &Key,
+) -> Result<HashSet<CompactDateTime>, String>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let mut all_times = HashSet::new();
+
+    let app_times = get_key_triggers_by_type(store, segment_id, key, TimerType::Application).await?;
+    let defer_times = get_key_triggers_by_type(store, segment_id, key, TimerType::DeferRetry).await?;
+
+    all_times.extend(app_times);
+    all_times.extend(defer_times);
+
+    Ok(all_times)
+}
+
+/// Helper function to get triggers by slab (Application timers only)
 ///
 /// # Errors
 ///
@@ -198,13 +241,51 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
+    get_slab_triggers_by_type(store, slab, TimerType::Application).await
+}
+
+/// Helper function to get triggers by slab for a specific timer type
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
+pub async fn get_slab_triggers_by_type<S>(
+    store: &S,
+    slab: &Slab,
+    timer_type: TimerType,
+) -> Result<HashSet<Trigger>, String>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
     store
-        .get_slab_triggers(slab)
+        .get_slab_triggers(slab, timer_type)
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<HashSet<_>, _>>()
-        .map_err(|e| format!("Error retrieving slab triggers: {e:?}"))
+        .map_err(|e| format!("Error retrieving slab triggers for {timer_type:?}: {e:?}"))
+}
+
+/// Helper function to get ALL triggers from a slab (both Application and DeferRetry)
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
+pub async fn get_slab_triggers_all_types<S>(store: &S, slab: &Slab) -> Result<HashSet<Trigger>, String>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let mut all_triggers = HashSet::new();
+
+    let app_triggers = get_slab_triggers_by_type(store, slab, TimerType::Application).await?;
+    let defer_triggers = get_slab_triggers_by_type(store, slab, TimerType::DeferRetry).await?;
+
+    all_triggers.extend(app_triggers);
+    all_triggers.extend(defer_triggers);
+
+    Ok(all_triggers)
 }
 
 /// Helper function to remove a trigger
@@ -224,7 +305,7 @@ where
 {
     let slab = Slab::from_time(segment.id, segment.slab_size, time);
     store
-        .remove_trigger(segment, &slab, key, time)
+        .remove_trigger(segment, &slab, key, time, TimerType::Application)
         .await
         .map_err(|e| format!("Failed to remove trigger: {e:?}"))?;
     Ok(())
@@ -246,7 +327,7 @@ where
     S::Error: Debug,
 {
     store
-        .clear_triggers_for_key(segment_id, key, slab_size)
+        .clear_triggers_for_key(segment_id, TimerType::Application, key, slab_size)
         .await
         .map_err(|e| format!("Failed to clear triggers for key: {e:?}"))?;
     Ok(())

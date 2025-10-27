@@ -23,7 +23,7 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::{DELETE_CONCURRENCY, Trigger};
+use crate::timers::{DELETE_CONCURRENCY, TimerType, Trigger};
 use educe::Educe;
 use futures::{Stream, TryStreamExt};
 use std::cmp::Ordering;
@@ -248,18 +248,21 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
 
     // === Slab trigger (time-based index) operations ===
 
-    /// Streams all triggers within a slab's time range.
+    /// Streams all triggers of a specific type within a slab's time range.
     ///
     /// # Arguments
     ///
-    /// * `slab` - The slab descriptor.
+    /// * `slab` - The slab descriptor (contains `segment_id`, `slab_size`,
+    ///   `slab_id`).
+    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
     ///
     /// # Returns
     ///
-    /// A stream of triggers in that slab.
+    /// A stream of triggers of the specified type in that slab.
     fn get_slab_triggers(
         &self,
         slab: &Slab,
+        timer_type: TimerType,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     /// Inserts a trigger into the slab index.
@@ -283,6 +286,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `slab` - The slab descriptor.
+    /// * `timer_type` - The timer type (Application or `DeferRetry`).
     /// * `key` - The trigger's entity key.
     /// * `time` - The trigger's scheduled time.
     ///
@@ -292,13 +296,15 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn delete_slab_trigger(
         &self,
         slab: &Slab,
+        timer_type: TimerType,
         key: &Key,
         time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Clears all triggers from a slab's index.
+    /// Clears all triggers from a slab's index across ALL timer types.
     ///
-    /// Typically used after all timers in that slab have fired.
+    /// This method clears both Application and `DeferRetry` timers in the slab.
+    /// Used for `slab_size` migration and cleanup operations.
     ///
     /// # Arguments
     ///
@@ -314,35 +320,40 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
 
     // === Key trigger (entity-based index) operations ===
 
-    /// Streams all scheduled times for a given key.
+    /// Streams all scheduled times for a given key and timer type.
     ///
     /// # Arguments
     ///
     /// * `segment_id` - The segment identifier.
+    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
     /// * `key` - The entity key.
     ///
     /// # Returns
     ///
-    /// A stream of times when the key has triggers scheduled.
+    /// A stream of times when the key has triggers of the specified type
+    /// scheduled.
     fn get_key_times(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
 
-    /// Streams all triggers for a given key.
+    /// Streams all triggers for a given key and timer type.
     ///
     /// # Arguments
     ///
     /// * `segment_id` - The segment identifier.
+    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
     /// * `key` - The entity key.
     ///
     /// # Returns
     ///
-    /// A stream of full trigger records for the key.
+    /// A stream of full trigger records for the key and type.
     fn get_key_triggers(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
@@ -367,6 +378,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `segment_id` - The segment identifier.
+    /// * `timer_type` - The timer type (Application or `DeferRetry`).
     /// * `key` - The entity key.
     /// * `time` - The scheduled time.
     ///
@@ -376,15 +388,17 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
         time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Clears all triggers for a specific key.
+    /// Clears all triggers for a specific key and timer type.
     ///
     /// # Arguments
     ///
     /// * `segment_id` - The segment identifier.
+    /// * `timer_type` - The timer type to clear (Application or `DeferRetry`).
     /// * `key` - The entity key.
     ///
     /// # Errors
@@ -393,6 +407,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn clear_key_triggers(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -442,6 +457,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// * `slab` - The slab descriptor.
     /// * `key` - The trigger's entity key.
     /// * `time` - The trigger's scheduled time.
+    /// * `timer_type` - The timer type (Application or `DeferRetry`).
     ///
     /// # Errors
     ///
@@ -452,21 +468,24 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         slab: &Slab,
         key: &Key,
         time: CompactDateTime,
+        timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
             try_join!(
-                self.delete_slab_trigger(slab, key, time),
-                self.delete_key_trigger(&segment.id, key, time),
+                self.delete_slab_trigger(slab, timer_type, key, time),
+                self.delete_key_trigger(&segment.id, timer_type, key, time),
             )?;
             Ok(())
         }
     }
 
-    /// Removes all triggers for a key, clearing both slab and key indices.
+    /// Removes all triggers for a key and timer type, clearing both slab and
+    /// key indices.
     ///
     /// # Arguments
     ///
     /// * `segment_id` - The segment identifier.
+    /// * `timer_type` - The timer type to clear (Application or `DeferRetry`).
     /// * `key` - The entity key.
     /// * `slab_size` - Slab duration used to locate each time's slab.
     ///
@@ -477,24 +496,29 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn clear_triggers_for_key(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
         slab_size: CompactDuration,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         // pull the stream, then delete per time, then final clear
         let segment_id_copy = *segment_id;
         let key_clone = key.clone();
-        let stream = self.get_key_times(segment_id, key);
+        let stream = self.get_key_times(segment_id, timer_type, key);
 
         async move {
             stream
                 .try_for_each_concurrent(DELETE_CONCURRENCY, move |time| {
                     let key_clone = key.clone();
                     let slab = Slab::from_time(segment_id_copy, slab_size, time);
-                    async move { self.delete_slab_trigger(&slab, &key_clone, time).await }
+                    async move {
+                        self.delete_slab_trigger(&slab, timer_type, &key_clone, time)
+                            .await
+                    }
                 })
                 .await?;
 
-            self.clear_key_triggers(&segment_id_copy, &key_clone).await
+            self.clear_key_triggers(&segment_id_copy, timer_type, &key_clone)
+                .await
         }
     }
 

@@ -13,8 +13,8 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::migration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::tests::TestStoreResult;
-use crate::timers::store::tests::common::{add_trigger, get_key_triggers, get_slab_triggers};
+use crate::timers::store::tests::{TestStoreResult, common};
+use crate::timers::store::tests::common::{add_trigger, get_slab_triggers};
 use crate::timers::store::{
     SEGMENT_VERSION_V1, SEGMENT_VERSION_V2, Segment, SegmentId, TriggerStore, TriggerV1,
 };
@@ -96,13 +96,20 @@ where
         span: info_span!("version_update_trigger"),
     };
 
-    store.insert_slab_v1(&v1_segment.id, slab_id).await
+    store
+        .insert_slab_v1(&v1_segment.id, slab_id)
+        .await
         .map_err(|e| format!("Failed to insert v1 slab: {e:?}"))?;
-    store.insert_slab_trigger_v1(&v1_segment.id, slab_id, trigger_v1).await
+    store
+        .insert_slab_trigger_v1(&v1_segment.id, slab_id, trigger_v1)
+        .await
         .map_err(|e| format!("Failed to insert v1 trigger: {e:?}"))?;
 
     // Verify v1 data exists
-    let v1_slabs: Vec<_> = store.get_slabs_v1(&v1_segment.id).try_collect().await
+    let v1_slabs: Vec<_> = store
+        .get_slabs_v1(&v1_segment.id)
+        .try_collect()
+        .await
         .map_err(|e| format!("Failed to get v1 slabs: {e:?}"))?;
 
     if v1_slabs.is_empty() {
@@ -177,7 +184,7 @@ where
 
     // Verify trigger is stored with correct type
     let slab = Slab::from_time(v2_segment.id, v2_segment.slab_size, trigger.time);
-    let slab_triggers = get_slab_triggers(store, &slab).await?;
+    let slab_triggers = common::get_slab_triggers_by_type(store, &slab, TimerType::DeferRetry).await?;
 
     let found = slab_triggers.iter().any(|t| {
         t.key == trigger.key && t.time == trigger.time && t.timer_type == TimerType::DeferRetry
@@ -231,15 +238,15 @@ where
     let defer_trigger = Trigger::new(key.clone(), time2, TimerType::DeferRetry, Span::current());
     add_trigger(store, &v2_segment, &defer_trigger).await?;
 
-    // Verify both triggers exist
-    let key_times = get_key_triggers(store, &v2_segment.id, &key).await?;
+    // Verify both triggers exist (need to check both timer types)
+    let key_times = common::get_key_triggers_all_types(store, &v2_segment.id, &key).await?;
     if !key_times.contains(&time1) || !key_times.contains(&time2) {
         return Err("Both timer types should be present for key".to_owned());
     }
 
     // Verify they have correct types via slab retrieval
     let slab1 = Slab::from_time(v2_segment.id, v2_segment.slab_size, time1);
-    let slab1_triggers = get_slab_triggers(store, &slab1).await?;
+    let slab1_triggers = common::get_slab_triggers_by_type(store, &slab1, TimerType::Application).await?;
 
     let app_found = slab1_triggers
         .iter()
@@ -250,7 +257,7 @@ where
     }
 
     let slab2 = Slab::from_time(v2_segment.id, v2_segment.slab_size, time2);
-    let slab2_triggers = get_slab_triggers(store, &slab2).await?;
+    let slab2_triggers = common::get_slab_triggers_by_type(store, &slab2, TimerType::DeferRetry).await?;
 
     let defer_found = slab2_triggers
         .iter()
@@ -525,10 +532,7 @@ where
         .map_err(|e| format!("Failed to get v1 triggers: {e:?}"))?;
 
     if retrieved.len() != 2 {
-        return Err(format!(
-            "Expected 2 triggers, got {}",
-            retrieved.len()
-        ));
+        return Err(format!("Expected 2 triggers, got {}", retrieved.len()));
     }
 
     // Verify both triggers are present (ignoring span in comparison)
@@ -570,14 +574,16 @@ where
 
     for slab_id in slab_ids {
         let slab = Slab::new(*segment_id, slab_id, slab_size);
-        let triggers = get_slab_triggers(store, &slab).await?;
+        // Get both Application and DeferRetry triggers
+        let triggers = common::get_slab_triggers_all_types(store, &slab).await?;
         all_triggers.extend(triggers);
     }
 
     Ok(all_triggers)
 }
 
-/// Helper: Insert a trigger to both slab and key indices with slab registration.
+/// Helper: Insert a trigger to both slab and key indices with slab
+/// registration.
 async fn insert_trigger_fully<S>(
     store: &S,
     segment_id: &SegmentId,
@@ -606,11 +612,9 @@ where
     Ok(())
 }
 
-/// Helper: Collect triggers from multiple slabs, avoiding duplicates if slabs are the same.
-async fn collect_triggers_from_slabs<S>(
-    store: &S,
-    slabs: &[Slab],
-) -> Result<Vec<Trigger>, String>
+/// Helper: Collect triggers from multiple slabs, avoiding duplicates if slabs
+/// are the same. Fetches both Application and DeferRetry timer types.
+async fn collect_triggers_from_slabs<S>(store: &S, slabs: &[Slab]) -> Result<Vec<Trigger>, String>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
@@ -621,13 +625,21 @@ where
     for slab in slabs {
         // Only fetch if we haven't seen this slab ID yet
         if seen_slab_ids.insert(slab.id()) {
-            let triggers: Vec<_> = store
-                .get_slab_triggers(slab)
+            // Fetch both Application and DeferRetry triggers
+            let app_triggers: Vec<_> = store
+                .get_slab_triggers(slab, TimerType::Application)
                 .try_collect()
                 .await
-                .map_err(|e| format!("Failed to get triggers from slab: {e:?}"))?;
+                .map_err(|e| format!("Failed to get Application triggers from slab: {e:?}"))?;
 
-            all_triggers.extend(triggers);
+            let defer_triggers: Vec<_> = store
+                .get_slab_triggers(slab, TimerType::DeferRetry)
+                .try_collect()
+                .await
+                .map_err(|e| format!("Failed to get DeferRetry triggers from slab: {e:?}"))?;
+
+            all_triggers.extend(app_triggers);
+            all_triggers.extend(defer_triggers);
         }
     }
 
@@ -719,27 +731,45 @@ where
     };
 
     // Insert slabs
-    store.insert_slab_v1(&v1_segment.id, slab_id_1).await
+    store
+        .insert_slab_v1(&v1_segment.id, slab_id_1)
+        .await
         .map_err(|e| format!("Failed to insert slab 1: {e:?}"))?;
-    store.insert_slab_v1(&v1_segment.id, slab_id_2).await
+    store
+        .insert_slab_v1(&v1_segment.id, slab_id_2)
+        .await
         .map_err(|e| format!("Failed to insert slab 2: {e:?}"))?;
-    store.insert_slab_v1(&v1_segment.id, slab_id_3).await
+    store
+        .insert_slab_v1(&v1_segment.id, slab_id_3)
+        .await
         .map_err(|e| format!("Failed to insert slab 3: {e:?}"))?;
 
     // Insert triggers
-    store.insert_slab_trigger_v1(&v1_segment.id, slab_id_1, trigger1.clone()).await
+    store
+        .insert_slab_trigger_v1(&v1_segment.id, slab_id_1, trigger1.clone())
+        .await
         .map_err(|e| format!("Failed to insert trigger 1: {e:?}"))?;
-    store.insert_slab_trigger_v1(&v1_segment.id, slab_id_2, trigger2.clone()).await
+    store
+        .insert_slab_trigger_v1(&v1_segment.id, slab_id_2, trigger2.clone())
+        .await
         .map_err(|e| format!("Failed to insert trigger 2: {e:?}"))?;
-    store.insert_slab_trigger_v1(&v1_segment.id, slab_id_3, trigger3.clone()).await
+    store
+        .insert_slab_trigger_v1(&v1_segment.id, slab_id_3, trigger3.clone())
+        .await
         .map_err(|e| format!("Failed to insert trigger 3: {e:?}"))?;
 
     // Verify v1 data is present
-    let v1_slabs: Vec<_> = store.get_slabs_v1(&v1_segment.id).try_collect().await
+    let v1_slabs: Vec<_> = store
+        .get_slabs_v1(&v1_segment.id)
+        .try_collect()
+        .await
         .map_err(|e| format!("Failed to get v1 slabs: {e:?}"))?;
 
     if v1_slabs.len() < 2 {
-        return Err(format!("Expected at least 2 v1 slabs, got {}", v1_slabs.len()));
+        return Err(format!(
+            "Expected at least 2 v1 slabs, got {}",
+            v1_slabs.len()
+        ));
     }
 
     // Run migration
@@ -762,8 +792,7 @@ where
     }
 
     // Verify all triggers migrated to v2
-    let triggers_after =
-        get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
+    let triggers_after = get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
 
     if triggers_after.len() != 3 {
         return Err(format!(
@@ -780,9 +809,10 @@ where
     ];
 
     for (key, time) in expected_triggers {
-        if !triggers_after.iter().any(|t| {
-            t.key == key && t.time == time && t.timer_type == TimerType::Application
-        }) {
+        if !triggers_after
+            .iter()
+            .any(|t| t.key == key && t.time == time && t.timer_type == TimerType::Application)
+        {
             return Err(format!(
                 "Trigger lost during migration: key={key}, time={time}"
             ));
@@ -851,17 +881,26 @@ where
     };
 
     // Insert v1 slabs and triggers
-    store.insert_slab_v1(&v1_segment.id, slab_id_1).await
+    store
+        .insert_slab_v1(&v1_segment.id, slab_id_1)
+        .await
         .map_err(|e| format!("Failed to insert slab 1: {e:?}"))?;
-    store.insert_slab_v1(&v1_segment.id, slab_id_2).await
+    store
+        .insert_slab_v1(&v1_segment.id, slab_id_2)
+        .await
         .map_err(|e| format!("Failed to insert slab 2: {e:?}"))?;
 
-    store.insert_slab_trigger_v1(&v1_segment.id, slab_id_1, trigger1_v1.clone()).await
+    store
+        .insert_slab_trigger_v1(&v1_segment.id, slab_id_1, trigger1_v1.clone())
+        .await
         .map_err(|e| format!("Failed to insert trigger 1: {e:?}"))?;
-    store.insert_slab_trigger_v1(&v1_segment.id, slab_id_2, trigger2_v1.clone()).await
+    store
+        .insert_slab_trigger_v1(&v1_segment.id, slab_id_2, trigger2_v1.clone())
+        .await
         .map_err(|e| format!("Failed to insert trigger 2: {e:?}"))?;
 
-    // Simulate partial v2 writes (crash scenario: only trigger1 written to v2, version not updated)
+    // Simulate partial v2 writes (crash scenario: only trigger1 written to v2,
+    // version not updated)
     let trigger1_v2 = Trigger::new(
         trigger1_v1.key.clone(),
         trigger1_v1.time,
@@ -916,11 +955,18 @@ where
     let all_triggers = get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
 
     if all_triggers.len() != 2 {
-        return Err(format!("Expected 2 triggers after migration, got {}", all_triggers.len()));
+        return Err(format!(
+            "Expected 2 triggers after migration, got {}",
+            all_triggers.len()
+        ));
     }
 
-    let has_trigger1 = all_triggers.iter().any(|t| t.key == trigger1_v1.key && t.time == trigger1_v1.time);
-    let has_trigger2 = all_triggers.iter().any(|t| t.key == trigger2_v1.key && t.time == trigger2_v1.time);
+    let has_trigger1 = all_triggers
+        .iter()
+        .any(|t| t.key == trigger1_v1.key && t.time == trigger1_v1.time);
+    let has_trigger2 = all_triggers
+        .iter()
+        .any(|t| t.key == trigger2_v1.key && t.time == trigger2_v1.time);
 
     if !has_trigger1 {
         return Err("Trigger1 lost after migration retry - data loss!".to_owned());
@@ -1064,7 +1110,8 @@ where
         // The key point is that v2 data is accessible
     } else {
         // V1 data is orphaned but doesn't break the system
-        // This is the scenario we're testing - system works correctly with orphaned v1 data
+        // This is the scenario we're testing - system works correctly with
+        // orphaned v1 data
     }
 
     Ok(())
@@ -1112,9 +1159,13 @@ where
         span: info_span!("idempotent_trigger"),
     };
 
-    store.insert_slab_v1(&v1_segment.id, slab_id).await
+    store
+        .insert_slab_v1(&v1_segment.id, slab_id)
+        .await
         .map_err(|e| format!("Failed to insert slab: {e:?}"))?;
-    store.insert_slab_trigger_v1(&v1_segment.id, slab_id, trigger_v1.clone()).await
+    store
+        .insert_slab_trigger_v1(&v1_segment.id, slab_id, trigger_v1.clone())
+        .await
         .map_err(|e| format!("Failed to insert trigger: {e:?}"))?;
 
     // Run migration first time
@@ -1134,9 +1185,13 @@ where
     }
 
     // Verify data migrated
-    let triggers_after_first = get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
+    let triggers_after_first =
+        get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
     if triggers_after_first.len() != 1 {
-        return Err(format!("Expected 1 trigger after first migration, got {}", triggers_after_first.len()));
+        return Err(format!(
+            "Expected 1 trigger after first migration, got {}",
+            triggers_after_first.len()
+        ));
     }
 
     // Run migration second time (should be no-op since version already v2)
@@ -1161,12 +1216,19 @@ where
     }
 
     // Verify data still present and unchanged
-    let triggers_after_second = get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
+    let triggers_after_second =
+        get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
     if triggers_after_second.len() != 1 {
-        return Err(format!("Expected 1 trigger after second migration, got {}", triggers_after_second.len()));
+        return Err(format!(
+            "Expected 1 trigger after second migration, got {}",
+            triggers_after_second.len()
+        ));
     }
 
-    if !triggers_after_second.iter().any(|t| t.key == trigger_v1.key && t.time == trigger_v1.time) {
+    if !triggers_after_second
+        .iter()
+        .any(|t| t.key == trigger_v1.key && t.time == trigger_v1.time)
+    {
         return Err("Trigger data changed after second migration".to_owned());
     }
 
@@ -1191,10 +1253,7 @@ where
 ///
 /// Returns an error if any store operation fails or if the migration does not
 /// complete successfully.
-pub async fn test_crash_before_slab_size_update<S>(
-    store: &S,
-    segment: &Segment,
-) -> TestStoreResult
+pub async fn test_crash_before_slab_size_update<S>(store: &S, segment: &Segment) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
@@ -1296,14 +1355,22 @@ where
         ));
     }
 
-    verify_trigger_exists(&all_triggers, &"slab-crash-key-1".into(), TimerType::Application)?;
-    verify_trigger_exists(&all_triggers, &"slab-crash-key-2".into(), TimerType::DeferRetry)?;
+    verify_trigger_exists(
+        &all_triggers,
+        &"slab-crash-key-1".into(),
+        TimerType::Application,
+    )?;
+    verify_trigger_exists(
+        &all_triggers,
+        &"slab-crash-key-2".into(),
+        TimerType::DeferRetry,
+    )?;
 
     Ok(())
 }
 
-/// Tests crash recovery for `slab_size` migration: system crashes after `slab_size`
-/// update but before cleanup.
+/// Tests crash recovery for `slab_size` migration: system crashes after
+/// `slab_size` update but before cleanup.
 ///
 /// Scenario:
 /// 1. All triggers written to new `slab_size` slabs
@@ -1399,7 +1466,7 @@ where
 
     // Verify trigger is accessible in new slab
     let triggers_new: Vec<_> = store
-        .get_slab_triggers(&new_slab)
+        .get_slab_triggers(&new_slab, TimerType::Application)
         .try_collect()
         .await
         .map_err(|e| format!("Failed to get triggers from new slab: {e:?}"))?;

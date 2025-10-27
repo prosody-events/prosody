@@ -3,6 +3,7 @@
     reason = "Trigger's ArcSwap field is excluded from hash/equality via Educe"
 )]
 
+use crate::timers::TimerType;
 use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::tests::common::{get_key_triggers, get_slab_triggers, insert_segment};
@@ -51,7 +52,12 @@ where
     }
 
     store
-        .delete_slab_trigger(&slab, &sample_trigger.key, sample_trigger.time)
+        .delete_slab_trigger(
+            &slab,
+            TimerType::Application,
+            &sample_trigger.key,
+            sample_trigger.time,
+        )
         .await
         .map_err(|e| format!("Failed to delete slab trigger: {e:?}"))?;
 
@@ -96,7 +102,12 @@ where
     }
 
     store
-        .delete_key_trigger(&input.segment.id, &sample_trigger.key, sample_trigger.time)
+        .delete_key_trigger(
+            &input.segment.id,
+            TimerType::Application,
+            &sample_trigger.key,
+            sample_trigger.time,
+        )
         .await
         .map_err(|e| format!("Failed to delete key trigger: {e:?}"))?;
 
@@ -112,7 +123,11 @@ where
         .map_err(|e| format!("Failed to insert key trigger for full test: {e:?}"))?;
 
     let full_triggers: Vec<_> = store
-        .get_key_triggers(&input.segment.id, &sample_trigger.key)
+        .get_key_triggers(
+            &input.segment.id,
+            TimerType::Application,
+            &sample_trigger.key,
+        )
         .try_collect()
         .await
         .map_err(|e| format!("Failed to get full key triggers: {e:?}"))?;
@@ -123,7 +138,12 @@ where
 
     // Clean up for next test
     store
-        .delete_key_trigger(&input.segment.id, &sample_trigger.key, sample_trigger.time)
+        .delete_key_trigger(
+            &input.segment.id,
+            TimerType::Application,
+            &sample_trigger.key,
+            sample_trigger.time,
+        )
         .await
         .map_err(|e| format!("Failed to clean up key trigger: {e:?}"))?;
 
@@ -140,7 +160,11 @@ where
 
         // Clear all triggers for the key
         store
-            .clear_key_triggers(&input.segment.id, &sample_trigger.key)
+            .clear_key_triggers(
+                &input.segment.id,
+                TimerType::Application,
+                &sample_trigger.key,
+            )
             .await
             .map_err(|e| format!("Failed to clear key triggers: {e:?}"))?;
 

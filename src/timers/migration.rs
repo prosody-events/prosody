@@ -282,12 +282,20 @@ where
     for old_slab_id in &old_slab_ids {
         let old_slab = Slab::new(segment_id, *old_slab_id, old_slab_size);
 
-        // Read triggers from old slab
-        let triggers: Vec<Trigger> = store
-            .get_slab_triggers(&old_slab)
-            .try_collect()
+        // Read triggers from old slab (both Application and DeferRetry)
+        let app_triggers = store
+            .get_slab_triggers(&old_slab, TimerType::Application)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(TimerManagerError::Store)?;
+
+        let defer_triggers = store
+            .get_slab_triggers(&old_slab, TimerType::DeferRetry)
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(TimerManagerError::Store)?;
+
+        let triggers: Vec<Trigger> = app_triggers.into_iter().chain(defer_triggers).collect();
 
         debug!(
             "Migrating {} triggers from old slab {old_slab_id}",

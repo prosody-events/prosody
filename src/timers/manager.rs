@@ -147,7 +147,7 @@ where
 
             let stream = state
                 .store
-                .get_key_times(&segment_id, &key)
+                .get_key_times(&segment_id, TimerType::Application, &key)
                 .map_err(TimerManagerError::Store);
 
             pin_mut!(stream);
@@ -176,7 +176,7 @@ where
             .trigger_lock()
             .await
             .store
-            .get_key_triggers(&self.0.segment.id, key)
+            .get_key_triggers(&self.0.segment.id, TimerType::Application, key)
             .map_err(TimerManagerError::Store)
             .try_collect()
             .await
@@ -252,7 +252,7 @@ where
         // Remove from persistent storage.
         state
             .store
-            .remove_trigger(&self.0.segment, &slab, key, time)
+            .remove_trigger(&self.0.segment, &slab, key, time, TimerType::Application)
             .await
             .map_err(TimerManagerError::Store)
     }
@@ -335,7 +335,7 @@ where
         // Remove from storage.
         state
             .store
-            .remove_trigger(&self.0.segment, &slab, key, time)
+            .remove_trigger(&self.0.segment, &slab, key, time, TimerType::Application)
             .await
             .map_err(TimerManagerError::Store)?;
 
