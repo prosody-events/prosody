@@ -105,8 +105,8 @@ impl ActiveTriggers {
 mod tests {
     use super::*;
     use crate::Key;
-    use crate::timers::Trigger;
     use crate::timers::datetime::CompactDateTime;
+    use crate::timers::{TimerType, Trigger};
     use tokio::test;
 
     #[test]
@@ -115,7 +115,12 @@ mod tests {
 
         let key = Key::from("test-key");
         let time = CompactDateTime::from(12345u32);
-        let trigger = Trigger::new(key.clone(), time, tracing::Span::current());
+        let trigger = Trigger::new(
+            key.clone(),
+            time,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
 
         // Initially, the trigger should not be present
         assert!(!active_triggers.contains(&key, time).await);
@@ -133,7 +138,12 @@ mod tests {
 
         let key = Key::from("test-key");
         let time = CompactDateTime::from(12345u32);
-        let trigger = Trigger::new(key.clone(), time, tracing::Span::current());
+        let trigger = Trigger::new(
+            key.clone(),
+            time,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
 
         // Insert the trigger
         active_triggers.insert(trigger.clone()).await;
@@ -156,8 +166,18 @@ mod tests {
         let time1 = CompactDateTime::from(12345u32);
         let time2 = CompactDateTime::from(67890u32);
 
-        let trigger1 = Trigger::new(key.clone(), time1, tracing::Span::current());
-        let trigger2 = Trigger::new(key.clone(), time2, tracing::Span::current());
+        let trigger1 = Trigger::new(
+            key.clone(),
+            time1,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
+        let trigger2 = Trigger::new(
+            key.clone(),
+            time2,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
 
         // Insert both triggers
         active_triggers.insert(trigger1.clone()).await;
@@ -191,8 +211,18 @@ mod tests {
         let time1 = CompactDateTime::from(11111u32);
         let time2 = CompactDateTime::from(22222u32);
 
-        let trigger1 = Trigger::new(key1.clone(), time1, tracing::Span::current());
-        let trigger2 = Trigger::new(key2.clone(), time2, tracing::Span::current());
+        let trigger1 = Trigger::new(
+            key1.clone(),
+            time1,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
+        let trigger2 = Trigger::new(
+            key2.clone(),
+            time2,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
 
         // Insert triggers for different keys
         active_triggers.insert(trigger1.clone()).await;
@@ -226,15 +256,30 @@ mod tests {
 
         // Insert multiple triggers
         active_triggers
-            .insert(Trigger::new(key1.clone(), time1, tracing::Span::current()))
+            .insert(Trigger::new(
+                key1.clone(),
+                time1,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
             .await;
 
         active_triggers
-            .insert(Trigger::new(key1.clone(), time2, tracing::Span::current()))
+            .insert(Trigger::new(
+                key1.clone(),
+                time2,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
             .await;
 
         active_triggers
-            .insert(Trigger::new(key2.clone(), time3, tracing::Span::current()))
+            .insert(Trigger::new(
+                key2.clone(),
+                time3,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
             .await;
 
         // Collect all active times using scan_active_times
@@ -266,7 +311,12 @@ mod tests {
         active_triggers.remove(&key, time).await; // Should not panic
 
         // Test remove on non-existent time for existing key
-        let trigger = Trigger::new(key.clone(), time, tracing::Span::current());
+        let trigger = Trigger::new(
+            key.clone(),
+            time,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
         active_triggers.insert(trigger).await;
 
         let other_time = CompactDateTime::from(99999u32);

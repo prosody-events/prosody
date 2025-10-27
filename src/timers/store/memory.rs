@@ -18,12 +18,12 @@
 //! in [`BTreeSet`] to maintain sorted order where needed.
 
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use async_stream::try_stream;
+use crate::timers::store::{Segment, SegmentId, TriggerStore, TriggerV1};
+use crate::timers::{TimerType, Trigger};
+use async_stream::{stream, try_stream};
 use futures::TryStreamExt;
 use futures::stream::Stream;
 use scc::HashMap;
@@ -55,23 +55,33 @@ pub struct InMemoryTriggerStore(Arc<Inner>);
 
 /// Internal state for `InMemoryTriggerStore`.
 ///
-/// Maintains four concurrent maps to support dual indexing and segment
-/// management.
+/// Maintains concurrent maps to support dual indexing, segment management,
+/// and v1 schema compatibility during migration.
 #[derive(Debug, Default)]
 struct Inner {
-    /// Maps each segment ID to its (name, `slab_size`).
-    segments: HashMap<SegmentId, (String, CompactDuration)>,
+    /// Maps each segment ID to its (name, `slab_size`, version).
+    segments: HashMap<SegmentId, (String, CompactDuration, Option<u8>)>,
 
     /// Maps each segment ID to its active set of slab IDs.
     segment_slabs: HashMap<SegmentId, BTreeSet<SlabId>>,
 
-    /// Time-based index: maps each `Slab` to the set of `Trigger`s in that
-    /// slab.
-    slab_triggers: HashMap<Slab, BTreeSet<Trigger>>,
+    /// V2 time-based index: maps (`segment_id`, `slab_size`, `slab_id`) to
+    /// triggers. Matches v2 `timer_typed_slabs` table PK: ((`segment_id`,
+    /// `slab_size`, `id`), `key`, `time`, `type`).
+    slab_triggers: HashMap<(SegmentId, CompactDuration, SlabId), BTreeSet<Trigger>>,
 
     /// Key-based index: maps (segment, key) to the set of `Trigger`s for that
     /// key.
     key_triggers: HashMap<(SegmentId, Key), BTreeSet<Trigger>>,
+
+    /// V1 time-based index: maps (`segment_id`, `slab_id`) to triggers.
+    /// Matches v1 `timer_slabs` table PK: ((`segment_id`, `id`), `key`,
+    /// `time`).
+    slab_triggers_v1: HashMap<(SegmentId, SlabId), BTreeSet<TriggerV1>>,
+
+    /// V1 key-based index: maps (`segment_id`, key) to triggers.
+    /// Matches v1 `timer_keys` table PK: ((`segment_id`, `key`), `time`).
+    key_triggers_v1: HashMap<(SegmentId, Key), BTreeSet<TriggerV1>>,
 }
 
 impl InMemoryTriggerStore {
@@ -105,7 +115,10 @@ impl TriggerStore for InMemoryTriggerStore {
     async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
         self.0
             .segments
-            .upsert_async(segment.id, (segment.name, segment.slab_size))
+            .upsert_async(
+                segment.id,
+                (segment.name, segment.slab_size, segment.version),
+            )
             .await;
 
         Ok(())
@@ -124,11 +137,12 @@ impl TriggerStore for InMemoryTriggerStore {
     /// * Never returns `Err`.
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
         Ok(self.0.segments.get_async(segment_id).await.map(|e| {
-            let (name, slab_size) = e.get();
+            let (name, slab_size, version) = e.get();
             Segment {
                 id: *segment_id,
                 name: name.clone(),
                 slab_size: *slab_size,
+                version: *version,
             }
         }))
     }
@@ -264,8 +278,13 @@ impl TriggerStore for InMemoryTriggerStore {
     ///
     /// A stream of `Trigger`. Never yields an error.
     fn get_slab_triggers(&self, slab: &Slab) -> impl Stream<Item = Result<Trigger, Self::Error>> {
+        let segment_id = *slab.segment_id();
+        let slab_size = slab.size();
+        let slab_id = slab.id();
+
         try_stream! {
-            let Some(set) = self.0.slab_triggers.get_async(slab).await else {
+            let key = (segment_id, slab_size, slab_id);
+            let Some(set) = self.0.slab_triggers.get_async(&key).await else {
                 return;
             };
 
@@ -286,9 +305,11 @@ impl TriggerStore for InMemoryTriggerStore {
     ///
     /// Never returns an error.
     async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
+        let key = (*slab.segment_id(), slab.size(), slab.id());
+
         self.0
             .slab_triggers
-            .entry_async(slab)
+            .entry_async(key)
             .await
             .or_default()
             .get_mut()
@@ -314,11 +335,13 @@ impl TriggerStore for InMemoryTriggerStore {
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
-        let Some(mut entry) = self.0.slab_triggers.get_async(slab).await else {
+        let slab_key = (*slab.segment_id(), slab.size(), slab.id());
+
+        let Some(mut entry) = self.0.slab_triggers.get_async(&slab_key).await else {
             return Ok(());
         };
 
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         entry.get_mut().remove(&trigger);
         if entry.is_empty() {
@@ -338,7 +361,8 @@ impl TriggerStore for InMemoryTriggerStore {
     ///
     /// Never returns an error.
     async fn clear_slab_triggers(&self, slab: &Slab) -> Result<(), Self::Error> {
-        self.0.slab_triggers.remove_async(slab).await;
+        let key = (*slab.segment_id(), slab.size(), slab.id());
+        self.0.slab_triggers.remove_async(&key).await;
         Ok(())
     }
 
@@ -439,7 +463,7 @@ impl TriggerStore for InMemoryTriggerStore {
             return Ok(());
         };
 
-        let trigger = Trigger::new(key.clone(), time, Span::none());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::none());
 
         entry.get_mut().remove(&trigger);
         if entry.is_empty() {
@@ -462,6 +486,176 @@ impl TriggerStore for InMemoryTriggerStore {
     async fn clear_key_triggers(&self, segment: &SegmentId, key: &Key) -> Result<(), Self::Error> {
         let map_key = (*segment, key.clone());
         self.0.key_triggers.remove_async(&map_key).await;
+        Ok(())
+    }
+
+    // -- V1 migration methods --
+
+    /// Update segment metadata including version and slab size.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment to update.
+    /// * `new_version` - New schema version (1 or 2).
+    /// * `new_slab_size` - New slab size for the segment.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error.
+    async fn update_segment_version(
+        &self,
+        segment_id: &SegmentId,
+        new_version: u8,
+        new_slab_size: CompactDuration,
+    ) -> Result<(), Self::Error> {
+        if let Some(entry) = self.0.segments.get_async(segment_id).await {
+            let (name, ..) = entry.get();
+            let name = name.clone();
+            drop(entry);
+            self.0
+                .segments
+                .upsert_async(*segment_id, (name, new_slab_size, Some(new_version)))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn insert_slab_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> Result<(), Self::Error> {
+        let segment_id = *segment_id;
+        self.0
+            .segment_slabs
+            .entry_async(segment_id)
+            .await
+            .or_insert_with(BTreeSet::new)
+            .get_mut()
+            .insert(slab_id);
+        Ok(())
+    }
+
+    async fn insert_slab_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        trigger: TriggerV1,
+    ) -> Result<(), Self::Error> {
+        let key = (*segment_id, slab_id);
+        self.0
+            .slab_triggers_v1
+            .entry_async(key)
+            .await
+            .or_insert_with(BTreeSet::new)
+            .get_mut()
+            .insert(trigger);
+        Ok(())
+    }
+
+    /// Stream all v1 slab IDs for a segment.
+    ///
+    /// V1 has no segment tracking, returns empty stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment to query.
+    ///
+    /// # Returns
+    ///
+    /// Stream of slab IDs that have data for this segment.
+    ///
+    /// Uses the `segment_slabs` tracking map.
+    fn get_slabs_v1(
+        &self,
+        segment_id: &SegmentId,
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
+        let segment_id = *segment_id;
+        let store = self.clone();
+
+        stream! {
+            let slab_ids = store
+                .0
+                .segment_slabs
+                .get_async(&segment_id)
+                .await
+                .map(|entry| entry.get().clone())
+                .unwrap_or_default();
+
+            for slab_id in slab_ids {
+                yield Ok(slab_id);
+            }
+        }
+    }
+
+    /// Stream all v1 triggers within a slab.
+    ///
+    /// V1 `timer_slabs` table uses PK `((segment_id, id), key, time)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment ID.
+    /// * `slab_id` - Slab ID.
+    ///
+    /// # Returns
+    ///
+    /// A stream of `TriggerV1`. Never yields an error.
+    fn get_slab_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Stream<Item = Result<TriggerV1, Self::Error>> + Send {
+        try_stream! {
+            let key = (*segment_id, slab_id);
+            let Some(entry) = self.0.slab_triggers_v1.get_async(&key).await else {
+                return;
+            };
+
+            for trigger in entry.iter() {
+                yield trigger.clone();
+            }
+        }
+    }
+
+    /// Delete a v1 slab from v1 `timer_slabs` table.
+    ///
+    /// V1 table uses PK `((segment_id, id), key, time)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment ID.
+    /// * `slab_id` - Slab ID to delete.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error.
+    async fn delete_slab_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> Result<(), Self::Error> {
+        let key = (*segment_id, slab_id);
+        self.0.slab_triggers_v1.remove_async(&key).await;
+        Ok(())
+    }
+
+    /// Clear all v1 triggers for a specific key.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment ID.
+    /// * `key` - Entity key to clear.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error.
+    async fn clear_key_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> Result<(), Self::Error> {
+        let map_key = (*segment_id, key.clone());
+        self.0.key_triggers_v1.remove_async(&map_key).await;
         Ok(())
     }
 }

@@ -23,7 +23,7 @@ use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use crate::timers::{DELETE_CONCURRENCY, PendingTimer, Trigger};
+use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerType, Trigger};
 use async_stream::try_stream;
 use educe::Educe;
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
@@ -245,7 +245,7 @@ where
 
         // Remove from in-memory scheduler if owned.
         if state.is_owned(slab_id) {
-            let trigger = Trigger::new(key.clone(), time, Span::current());
+            let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
             state.scheduler.unschedule(trigger).await?;
         }
 
@@ -379,7 +379,12 @@ mod tests {
     fn create_test_trigger(key: &str, seconds_offset: u32) -> Result<Trigger> {
         let time = CompactDateTime::now()?.add_duration(CompactDuration::new(seconds_offset))?;
 
-        Ok(Trigger::new(Key::from(key), time, Span::current()))
+        Ok(Trigger::new(
+            Key::from(key),
+            time,
+            TimerType::Application,
+            Span::current(),
+        ))
     }
 
     /// Helper function to set up a timer manager for testing
@@ -620,7 +625,12 @@ mod tests {
         // Create a timer that should be immediately active (very soon)
         let now = CompactDateTime::now()?;
         let near_future = now.add_duration(CompactDuration::new(10))?;
-        let trigger = Trigger::new(Key::from("active-test"), near_future, Span::current());
+        let trigger = Trigger::new(
+            Key::from("active-test"),
+            near_future,
+            TimerType::Application,
+            Span::current(),
+        );
 
         manager.schedule(trigger.clone()).await?;
 
@@ -730,7 +740,12 @@ mod tests {
         // Schedule a timer for immediate execution
         let now = CompactDateTime::now()?;
         let immediate_time = now.add_duration(CompactDuration::new(1))?;
-        let trigger = Trigger::new(Key::from("stream-test"), immediate_time, Span::current());
+        let trigger = Trigger::new(
+            Key::from("stream-test"),
+            immediate_time,
+            TimerType::Application,
+            Span::current(),
+        );
 
         manager.schedule(trigger.clone()).await?;
 
@@ -824,9 +839,24 @@ mod tests {
 
         // Schedule multiple timers for the same time but different keys
         let triggers = vec![
-            Trigger::new(Key::from("key-1"), base_time, Span::current()),
-            Trigger::new(Key::from("key-2"), base_time, Span::current()),
-            Trigger::new(Key::from("key-3"), base_time, Span::current()),
+            Trigger::new(
+                Key::from("key-1"),
+                base_time,
+                TimerType::Application,
+                Span::current(),
+            ),
+            Trigger::new(
+                Key::from("key-2"),
+                base_time,
+                TimerType::Application,
+                Span::current(),
+            ),
+            Trigger::new(
+                Key::from("key-3"),
+                base_time,
+                TimerType::Application,
+                Span::current(),
+            ),
         ];
 
         for trigger in &triggers {
@@ -853,15 +883,24 @@ mod tests {
 
         // Test with minimum time (current time)
         let now = CompactDateTime::now()?;
-        let trigger_now = Trigger::new(Key::from("boundary-now"), now, Span::current());
+        let trigger_now = Trigger::new(
+            Key::from("boundary-now"),
+            now,
+            TimerType::Application,
+            Span::current(),
+        );
 
         let result = manager.schedule(trigger_now.clone()).await;
         assert!(result.is_ok(), "Scheduling at current time should succeed");
 
         // Test with far future time
         let far_future = now.add_duration(CompactDuration::new(86400 * 365))?; // 1 year
-        let trigger_future =
-            Trigger::new(Key::from("boundary-future"), far_future, Span::current());
+        let trigger_future = Trigger::new(
+            Key::from("boundary-future"),
+            far_future,
+            TimerType::Application,
+            Span::current(),
+        );
 
         let result = manager.schedule(trigger_future.clone()).await;
         assert!(result.is_ok(), "Scheduling far in future should succeed");

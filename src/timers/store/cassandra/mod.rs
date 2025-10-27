@@ -1,11 +1,11 @@
 use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore, CassandraStoreError};
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::cassandra::queries::Queries;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::timers::store::{Segment, SegmentId, TriggerStore, TriggerV1};
+use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
@@ -78,7 +78,12 @@ impl TriggerStore for CassandraTriggerStore {
         self.session()
             .execute_unpaged(
                 &self.queries().insert_segment,
-                (segment.id, segment.name, segment.slab_size),
+                (
+                    segment.id,
+                    segment.name,
+                    segment.slab_size,
+                    segment.version.map(|v| v as i8),
+                ),
             )
             .await?;
 
@@ -92,9 +97,9 @@ impl TriggerStore for CassandraTriggerStore {
             .execute_unpaged(&self.queries().get_segment, (segment_id,))
             .await?
             .into_rows_result()?
-            .maybe_first_row::<(String, CompactDuration)>()?;
+            .maybe_first_row::<(String, CompactDuration, Option<i8>)>()?;
 
-        let Some((name, slab_size)) = row else {
+        let Some((name, slab_size, version)) = row else {
             return Ok(None);
         };
 
@@ -102,6 +107,7 @@ impl TriggerStore for CassandraTriggerStore {
             id: *segment_id,
             name,
             slab_size,
+            version: version.map(|v| v as u8),
         }))
     }
 
@@ -282,24 +288,29 @@ impl TriggerStore for CassandraTriggerStore {
         slab: &Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let segment_id = slab.segment_id();
+        let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
         try_stream! {
             let stream = self
                 .session()
-                .execute_iter(self.queries().get_slab_triggers.clone(), (segment_id, slab_id))
+                .execute_iter(
+                    self.queries().get_slab_triggers.clone(),
+                    (segment_id, slab_size, slab_id),
+                )
                 .await?
-                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
 
             pin_mut!(stream);
-            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, timer_type, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                yield Trigger::new(key.into(), time, span);
+                let timer_type = TimerType::try_from(timer_type).unwrap_or(TimerType::Application);
+                yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
     }
@@ -311,16 +322,20 @@ impl TriggerStore for CassandraTriggerStore {
         self.propagator().inject_context(&context, &mut span_map);
 
         let segment_id = slab.segment_id();
+        let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
         let key = trigger.key.as_ref();
         let time = trigger.time;
+        let timer_type = i8::from(trigger.timer_type);
 
         match self.calculate_ttl(slab.range().end) {
             Some(ttl) => {
                 self.session()
                     .execute_unpaged(
                         &self.queries().insert_slab_trigger,
-                        (segment_id, slab_id, key, time, span_map, ttl),
+                        (
+                            segment_id, slab_size, slab_id, key, time, timer_type, span_map, ttl,
+                        ),
                     )
                     .await?;
             }
@@ -328,7 +343,9 @@ impl TriggerStore for CassandraTriggerStore {
                 self.session()
                     .execute_unpaged(
                         &self.queries().insert_slab_trigger_no_ttl,
-                        (segment_id, slab_id, key, time, span_map),
+                        (
+                            segment_id, slab_size, slab_id, key, time, timer_type, span_map,
+                        ),
                     )
                     .await?;
             }
@@ -349,6 +366,7 @@ impl TriggerStore for CassandraTriggerStore {
                 &self.queries().delete_slab_trigger,
                 (
                     slab.segment_id(),
+                    slab.size().seconds() as i32,
                     i32::from_le_bytes(slab.id().to_le_bytes()),
                     key.as_ref(),
                     time,
@@ -366,6 +384,7 @@ impl TriggerStore for CassandraTriggerStore {
                 &self.queries().clear_slab_triggers,
                 (
                     slab.segment_id(),
+                    slab.size().seconds() as i32,
                     i32::from_le_bytes(slab.id().to_le_bytes()),
                 ),
             )
@@ -405,17 +424,18 @@ impl TriggerStore for CassandraTriggerStore {
                 .session()
                 .execute_iter(self.queries().get_key_triggers.clone(), (segment_id, key.as_ref()))
                 .await?
-                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
 
             pin_mut!(stream);
-            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, timer_type, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
                 let span = debug_span!("fetch_key_trigger");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                yield Trigger::new(key.into(), time, span);
+                let timer_type = TimerType::try_from(timer_type).unwrap_or(TimerType::Application);
+                yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
     }
@@ -432,13 +452,14 @@ impl TriggerStore for CassandraTriggerStore {
 
         let key = trigger.key.as_ref();
         let time = trigger.time;
+        let timer_type = i8::from(trigger.timer_type);
 
         match self.calculate_ttl(trigger.time) {
             Some(ttl) => {
                 self.session()
                     .execute_unpaged(
                         &self.queries().insert_key_trigger,
-                        (segment_id, key, time, span_map, ttl),
+                        (segment_id, key, time, timer_type, span_map, ttl),
                     )
                     .await?;
             }
@@ -446,7 +467,7 @@ impl TriggerStore for CassandraTriggerStore {
                 self.session()
                     .execute_unpaged(
                         &self.queries().insert_key_trigger_no_ttl,
-                        (segment_id, key, time, span_map),
+                        (segment_id, key, time, timer_type, span_map),
                     )
                     .await?;
             }
@@ -481,6 +502,173 @@ impl TriggerStore for CassandraTriggerStore {
         self.session()
             .execute_unpaged(
                 &self.queries().clear_key_triggers,
+                (segment_id, key.as_ref()),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    // -- V1 migration methods --
+
+    /// Updates the segment's version field after v1 to v2 migration.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn update_segment_version(
+        &self,
+        segment_id: &SegmentId,
+        new_version: u8,
+        new_slab_size: CompactDuration,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(
+                &self.queries().update_segment_version,
+                (new_version as i8, new_slab_size.seconds() as i32, segment_id),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn insert_slab_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(&self.queries().insert_slab_v1, (segment_id, slab_id as i32))
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_slab_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        trigger: TriggerV1,
+    ) -> Result<(), Self::Error> {
+        // Extract span context from tracing::Span
+        // For v1 test data, we use an empty span map since this is test-only
+        let span_map: HashMap<String, String> = HashMap::new();
+
+        self.session()
+            .execute_unpaged(
+                &self.queries().insert_slab_trigger_v1,
+                (
+                    segment_id,
+                    slab_id as i32,
+                    trigger.key.as_ref(),
+                    trigger.time,
+                    span_map,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Streams slab IDs from v1 schema.
+    ///
+    /// Enumerates active v1 slabs for a segment.
+    ///
+    /// Queries the segments table which stores one row per active slab.
+    ///
+    /// Note: Cassandra returns NULL for clustering columns when a partition has
+    /// only static columns. We handle this by deserializing to Option<i32>
+    /// and filtering.
+    #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id))]
+    fn get_slabs_v1(
+        &self,
+        segment_id: &SegmentId,
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
+        let segment_id = *segment_id;
+
+        try_stream! {
+            let stream = self
+                .session()
+                .execute_iter(
+                    self.queries().get_slabs_v1.clone(),
+                    (segment_id,),
+                )
+                .await?
+                .rows_stream::<(Option<i32>,)>()?;
+
+            pin_mut!(stream);
+            while let Some((slab_id_opt,)) = cooperative(stream.try_next()).await? {
+                // Filter out NULL slab_ids (partitions with only static columns)
+                if let Some(slab_id) = slab_id_opt {
+                    yield SlabId::from_le_bytes(slab_id.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    /// Streams v1 triggers from a slab.
+    ///
+    /// Queries the v1 `timer_slabs` table with PK `((segment_id, id), key,
+    /// time)`.
+    #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id, slab_id = %slab_id))]
+    fn get_slab_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Stream<Item = Result<TriggerV1, Self::Error>> + Send {
+        let segment_id = *segment_id;
+        let slab_id = i32::from_le_bytes(slab_id.to_le_bytes());
+
+        try_stream! {
+            let stream = self
+                .session()
+                .execute_iter(
+                    self.queries().get_slab_triggers_v1.clone(),
+                    (segment_id, slab_id),
+                )
+                .await?
+                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
+
+            pin_mut!(stream);
+            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
+                let context = self.propagator().extract(&span_map);
+                let span = info_span!("fetch_slab_trigger_v1");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
+
+                yield TriggerV1 {
+                    key: key.into(),
+                    time,
+                    span,
+                };
+            }
+        }
+    }
+
+    /// Deletes a v1 slab from the `timer_slabs` table.
+    ///
+    /// Uses v1 PK `((segment_id, id), key, time)`.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn delete_slab_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(&self.queries().delete_slab_v1, (segment_id, slab_id as i32))
+            .await?;
+
+        Ok(())
+    }
+
+    /// Clears v1 triggers for a key from the `timer_keys` table.
+    ///
+    /// Uses v1 partition key (`segment_id`, key).
+    #[instrument(level = "debug", skip(self), err)]
+    async fn clear_key_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(
+                &self.queries().clear_key_triggers_v1,
                 (segment_id, key.as_ref()),
             )
             .await?;
@@ -536,6 +724,7 @@ mod test {
             id: segment_id,
             name: "test_segment".to_owned(),
             slab_size: CompactDuration::new(60), // 1 minute slabs
+            version: None,
         };
 
         // Insert the test segment
@@ -637,6 +826,7 @@ mod test {
             id: segment_id,
             name: "simple_test".to_owned(),
             slab_size: CompactDuration::new(60),
+            version: None,
         };
 
         store.insert_segment(segment.clone()).await?;

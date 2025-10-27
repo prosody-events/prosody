@@ -20,6 +20,7 @@
 //! persistent state for potential reloading.
 
 use crate::consumer::{Keyed, Uncommitted};
+use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::manager::TimerManager;
@@ -46,6 +47,9 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
 
     /// Scheduled execution time of this timer.
     fn time(&self) -> CompactDateTime;
+
+    /// Timer type classification.
+    fn timer_type(&self) -> TimerType;
 
     /// Returns the tracing span associated with this timer.
     ///
@@ -285,6 +289,11 @@ where
     /// Scheduled execution time of this timer.
     fn time(&self) -> CompactDateTime {
         self.trigger.time
+    }
+
+    /// Timer type classification.
+    fn timer_type(&self) -> TimerType {
+        self.trigger.timer_type
     }
 
     /// Returns the tracing span associated with this timer.

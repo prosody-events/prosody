@@ -115,6 +115,7 @@ mod tests {
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
     use crate::timers::scheduler::TimerSchedulerError;
+    use crate::timers::{TimerType, Trigger};
     use tokio::task::coop::cooperative;
     use tokio::time::{Duration, advance, pause};
     use tracing::Span;
@@ -130,7 +131,7 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(1))
             .map_err(TimerSchedulerError::DateTime)?; // 1 second in the future
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;
@@ -158,7 +159,7 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(5))
             .map_err(TimerSchedulerError::DateTime)?; // 5 seconds in the future
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;
@@ -189,14 +190,24 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(1))
             .map_err(TimerSchedulerError::DateTime)?; // 1 second in the future
-        let trigger_first = Trigger::new(key_first.clone(), time_first, Span::current());
+        let trigger_first = Trigger::new(
+            key_first.clone(),
+            time_first,
+            TimerType::Application,
+            Span::current(),
+        );
 
         let key_second = Key::from("key2");
         let time_second = CompactDateTime::now()
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(2))
             .map_err(TimerSchedulerError::DateTime)?; // 2 seconds in the future
-        let trigger_second = Trigger::new(key_second.clone(), time_second, Span::current());
+        let trigger_second = Trigger::new(
+            key_second.clone(),
+            time_second,
+            TimerType::Application,
+            Span::current(),
+        );
 
         // Insert both triggers
         triggers.insert(trigger_first.clone()).await;
@@ -230,7 +241,7 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(5))
             .map_err(TimerSchedulerError::DateTime)?; // 5 seconds in the future
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;

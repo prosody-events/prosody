@@ -240,6 +240,55 @@ pub struct CassandraConfiguration {
 }
 ```
 
+**CRITICAL: Cassandra Anti-Patterns - NEVER ALLOWED:**
+
+These patterns cause catastrophic performance issues and production outages:
+
+1. **ALLOW FILTERING** - Forces full table scans, destroys cluster performance
+2. **Secondary Indices** - Causes coordinator bottlenecks and unpredictable performance
+3. **Materialized Views** - Breaks under heavy write load, causes data inconsistency
+
+**Correct Approach:**
+- Design schema with proper partition keys for your query patterns
+- Use clustering columns for range queries within partitions
+- Handle NULL values by deserializing to `Option<T>` and filtering in application code
+
+**Example - Handling NULLs from Static Columns:**
+
+When querying tables with static columns, Cassandra returns NULL for clustering columns in rows that contain only static data. This is expected behavior and must be handled properly:
+
+```rust
+// Schema example:
+// CREATE TABLE segments (
+//     id int,
+//     name text static,          -- Static column
+//     slab_id int,                -- Clustering column
+//     PRIMARY KEY (id, slab_id)
+// );
+
+// WRONG - Never use ALLOW FILTERING
+let query = "SELECT slab_id FROM segments WHERE id = ? ALLOW FILTERING";
+
+// CORRECT - Use Option<T> and filter NULLs in application code
+// When a partition has only static columns, Cassandra returns one row with NULL clustering values
+let stream = session
+    .execute_iter(query, (segment_id,))
+    .await?
+    .rows_stream::<(Option<i32>,)>()?;
+
+while let Some((slab_id_opt,)) = stream.try_next().await? {
+    if let Some(slab_id) = slab_id_opt {
+        yield slab_id;  // Only process non-NULL clustering values
+    }
+    // Skip NULL values - these represent static-only rows
+}
+```
+
+**Key Points:**
+- Static columns cause NULL clustering columns when no regular rows exist in the partition
+- Always deserialize clustering columns as `Option<T>` when static columns are present
+- Filter NULLs in application code - never use ALLOW FILTERING
+
 **TTL Management with Overflow Protection:**
 
 ```rust

@@ -9,10 +9,11 @@ use crate::heartbeat::Heartbeat;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
+use crate::timers::migration;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::timers::store::{SEGMENT_VERSION_V2, Segment, SegmentId, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
@@ -394,18 +395,52 @@ pub async fn get_or_create_segment<T>(
 where
     T: TriggerStore,
 {
-    if let Some(segment) = store
+    if let Some(mut segment) = store
         .get_segment(&segment_id)
         .await
         .map_err(TimerManagerError::Store)?
     {
+        // Phase 1: Check if segment needs migration from v1 to v2
+        if migration::needs_migration(&segment) {
+            migration::migrate_segment(store, &segment).await?;
+
+            // Reload segment to get updated version and slab_size
+            segment = store
+                .get_segment(&segment_id)
+                .await
+                .map_err(TimerManagerError::Store)?
+                .ok_or_else(|| {
+                    TimerManagerError::MigrationFailed(format!(
+                        "Segment {segment_id} disappeared after v1→v2 migration"
+                    ))
+                })?;
+        }
+
+        // Phase 2: Check if segment needs slab_size migration
+        if migration::needs_slab_size_migration(&segment, slab_size) {
+            migration::migrate_slab_size(store, &segment, slab_size).await?;
+
+            // Reload segment to get updated slab_size
+            segment = store
+                .get_segment(&segment_id)
+                .await
+                .map_err(TimerManagerError::Store)?
+                .ok_or_else(|| {
+                    TimerManagerError::MigrationFailed(format!(
+                        "Segment {segment_id} disappeared after slab_size migration"
+                    ))
+                })?;
+        }
+
         return Ok(segment);
     }
 
+    // Create new segment as v2
     let segment = Segment {
         id: segment_id,
         name: name.to_owned(),
         slab_size,
+        version: Some(SEGMENT_VERSION_V2),
     };
 
     store
@@ -441,10 +476,10 @@ mod tests {
     use super::*;
     use crate::Key;
     use crate::heartbeat::HeartbeatRegistry;
-    use crate::timers::Trigger;
     use crate::timers::duration::CompactDuration;
     use crate::timers::store::Segment;
     use crate::timers::store::memory::InMemoryTriggerStore;
+    use crate::timers::{TimerType, Trigger};
     use color_eyre::eyre::{Result, eyre};
     use futures::future;
     use std::time::Duration;
@@ -458,11 +493,17 @@ mod tests {
             id: Uuid::new_v4(),
             name: "test-segment".to_owned(),
             slab_size: CompactDuration::new(60), // 60 seconds
+            version: None,
         }
     }
 
     fn create_test_trigger(key: u64, time: CompactDateTime) -> Trigger {
-        Trigger::new(Key::from(format!("key-{key}")), time, Span::current())
+        Trigger::new(
+            Key::from(format!("key-{key}")),
+            time,
+            TimerType::Application,
+            Span::current(),
+        )
     }
 
     #[tokio::test]

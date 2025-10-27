@@ -44,6 +44,14 @@ pub const TABLE_SLABS: &str = "timer_slabs";
 /// lookups.
 pub const TABLE_KEYS: &str = "timer_keys";
 
+/// Table name for storing v2 timer triggers with timer type support, organized
+/// by time slabs.
+pub const TABLE_TYPED_SLABS: &str = "timer_typed_slabs";
+
+/// Table name for storing v2 timer triggers with timer type support, indexed by
+/// key for efficient key-based lookups.
+pub const TABLE_TYPED_KEYS: &str = "timer_typed_keys";
+
 /// Table name for tracking applied database migrations.
 pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
 

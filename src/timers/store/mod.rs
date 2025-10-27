@@ -24,10 +24,13 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{DELETE_CONCURRENCY, Trigger};
+use educe::Educe;
 use futures::{Stream, TryStreamExt};
+use std::cmp::Ordering;
 use std::error::Error;
 use std::ops::RangeInclusive;
 use tokio::try_join;
+use tracing::Span;
 use uuid::Uuid;
 
 /// Cassandra-based persistent storage implementation.
@@ -37,6 +40,44 @@ pub mod memory;
 #[cfg(test)]
 /// Comprehensive test suite for [`TriggerStore`] implementations.
 pub mod tests;
+
+/// Schema version 1 marker value.
+pub const SEGMENT_VERSION_V1: u8 = 1;
+
+/// Schema version 2 marker value.
+pub const SEGMENT_VERSION_V2: u8 = 2;
+
+/// V1 trigger representation without timer type field.
+///
+/// Used during migration to represent triggers from v1 schema tables.
+/// V1 triggers are identified solely by (key, time) without a type field.
+/// This is a simple data bag for temporary migration use.
+#[derive(Clone, Debug, Educe)]
+#[educe(PartialEq, Eq, Hash)]
+pub struct TriggerV1 {
+    /// Entity key identifying what this timer belongs to.
+    pub key: Key,
+
+    /// When this timer should execute.
+    pub time: CompactDateTime,
+
+    /// Tracing span for distributed observability context.
+    #[educe(PartialEq(ignore), Hash(ignore))]
+    pub span: Span,
+}
+
+impl PartialOrd for TriggerV1 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TriggerV1 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Compare by (key, time) tuple, ignoring span
+        (&self.key, &self.time).cmp(&(&other.key, &other.time))
+    }
+}
 
 /// Unique identifier for a timer segment.
 ///
@@ -51,6 +92,7 @@ pub type SegmentId = Uuid;
 /// - `id`: its unique [`Uuid`]
 /// - `name`: a human-readable identifier
 /// - `slab_size`: the duration of each time-based partition (slab)
+/// - `version`: schema version (None/1 = v1, 2 = v2)
 #[derive(Clone, Debug)]
 pub struct Segment {
     /// Unique segment identifier.
@@ -61,6 +103,10 @@ pub struct Segment {
 
     /// Duration of a time-based slab in this segment.
     pub slab_size: CompactDuration,
+
+    /// Schema version: None or Some(1) indicates v1 schema, Some(2) indicates
+    /// v2 schema.
+    pub version: Option<u8>,
 }
 
 /// Persistent storage interface for timer data.
@@ -451,4 +497,137 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
             self.clear_key_triggers(&segment_id_copy, &key_clone).await
         }
     }
+
+    // === V1 Schema Migration Methods ===
+
+    /// Updates the schema version and slab size for a segment.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment to update
+    /// * `new_version` - The target schema version (`SEGMENT_VERSION_V2`)
+    /// * `new_slab_size` - The new slab size (may be same as current)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    fn update_segment_version(
+        &self,
+        segment_id: &SegmentId,
+        new_version: u8,
+        new_slab_size: CompactDuration,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Registers a slab ID in v1 tables for testing purposes.
+    ///
+    /// This method exists solely to enable testing of v1 migration logic.
+    /// Production code should never call this method.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab identifier to register
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if insertion fails.
+    fn insert_slab_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Inserts a v1 trigger for testing purposes.
+    ///
+    /// This method exists solely to enable testing of v1 migration logic.
+    /// Production code should never call this method.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab identifier
+    /// * `trigger` - The v1 trigger to insert (without `timer_type`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if insertion fails.
+    fn insert_slab_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        trigger: TriggerV1,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Lists all slab IDs in a v1 segment.
+    ///
+    /// V1 has no separate segment tracking, so implementations may return
+    /// empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    ///
+    /// # Returns
+    ///
+    /// A stream of slab identifiers from v1 tables.
+    fn get_slabs_v1(
+        &self,
+        segment_id: &SegmentId,
+    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
+
+    /// Retrieves all triggers in a v1 slab.
+    ///
+    /// Queries v1 `timer_slabs` table with PK `((segment_id, id), key, time)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab identifier
+    ///
+    /// # Returns
+    ///
+    /// A stream of v1 triggers (without `timer_type` field).
+    fn get_slab_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Stream<Item = Result<TriggerV1, Self::Error>> + Send;
+
+    /// Deletes a v1 slab and all its triggers.
+    ///
+    /// Deletes from v1 `timer_slabs` table with PK `((segment_id, id), key,
+    /// time)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab to delete
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion fails.
+    fn delete_slab_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Clears all triggers for a key from v1 tables.
+    ///
+    /// Removes from v1 `timer_keys` table using partition key (`segment_id`,
+    /// key).
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `key` - The key whose triggers should be cleared
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion fails.
+    fn clear_key_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

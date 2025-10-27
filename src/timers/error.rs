@@ -57,4 +57,29 @@ where
     /// processed.
     #[error("The context is no longer valid because the event has already been processed")]
     InvalidContext,
+
+    /// A migration operation failed.
+    #[error("Migration failed: {0}")]
+    MigrationFailed(String),
+
+    /// Segment version is incompatible or unexpected.
+    #[error("Segment version mismatch: expected {expected}, found {found:?}")]
+    VersionMismatch {
+        /// Expected version
+        expected: u8,
+        /// Found version
+        found: Option<u8>,
+    },
+
+    /// V1 data is corrupted or inconsistent.
+    #[error("V1 data corruption: {0}")]
+    V1DataCorruption(String),
+}
+
+/// Errors encountered when parsing timer-related data.
+#[derive(Debug, Error)]
+pub enum ParseError {
+    /// Unknown timer type value encountered.
+    #[error("Unknown timer type: {0}")]
+    UnknownTimerType(i8),
 }

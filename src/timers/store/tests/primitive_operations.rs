@@ -7,6 +7,7 @@ use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::tests::common::{get_key_triggers, get_slab_triggers, insert_segment};
 use crate::timers::store::tests::{TestStoreResult, TriggerTestInput};
+use futures::TryStreamExt;
 use std::fmt::Debug;
 
 /// Tests primitive (low-level) store operations directly
@@ -103,6 +104,28 @@ where
     if times.contains(&sample_trigger.time) {
         return Err("Key trigger still present after deletion".to_owned());
     }
+
+    // Test get_key_triggers trait method (returns full Trigger objects)
+    store
+        .insert_key_trigger(&input.segment.id, sample_trigger.clone())
+        .await
+        .map_err(|e| format!("Failed to insert key trigger for full test: {e:?}"))?;
+
+    let full_triggers: Vec<_> = store
+        .get_key_triggers(&input.segment.id, &sample_trigger.key)
+        .try_collect()
+        .await
+        .map_err(|e| format!("Failed to get full key triggers: {e:?}"))?;
+
+    if !full_triggers.iter().any(|t| t == sample_trigger) {
+        return Err("Full trigger not found via get_key_triggers".to_owned());
+    }
+
+    // Clean up for next test
+    store
+        .delete_key_trigger(&input.segment.id, &sample_trigger.key, sample_trigger.time)
+        .await
+        .map_err(|e| format!("Failed to clean up key trigger: {e:?}"))?;
 
     // Test key clear operation
     if input.triggers.len() >= 2 {

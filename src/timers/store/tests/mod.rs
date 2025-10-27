@@ -6,10 +6,10 @@
 //! data consistency across all storage backends.
 
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::Segment;
+use crate::timers::store::{SEGMENT_VERSION_V2, Segment};
+use crate::timers::{TimerType, Trigger};
 use quickcheck::{Arbitrary, Gen};
 use std::fmt::Debug;
 use uuid::Uuid;
@@ -22,6 +22,8 @@ pub mod common;
 pub mod contention;
 /// Tests for operations spanning multiple slabs.
 pub mod cross_slab;
+/// Tests for timer schema migration from v1 to v2.
+pub mod migration;
 /// Tests for primitive trigger store operations.
 pub mod primitive_operations;
 /// Tests for segment management in the trigger store.
@@ -71,6 +73,7 @@ impl Arbitrary for Segment {
             id,
             name,
             slab_size,
+            version: Some(SEGMENT_VERSION_V2),
         }
     }
 }
@@ -129,6 +132,7 @@ impl Arbitrary for TriggerTestInput {
                 triggers.push(Trigger::new(
                     Key::from(key.clone()),
                     time,
+                    TimerType::Application,
                     tracing::Span::current(),
                 ));
             }
@@ -270,6 +274,13 @@ macro_rules! trigger_store_tests {
         }
 
         #[test]
+        fn test_get_slab_range() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_get_slab_range as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
         fn test_trigger_operations() {
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_trigger_operations
@@ -331,6 +342,110 @@ macro_rules! trigger_store_tests {
             );
         }
 
+        #[test]
+        fn test_needs_migration_logic() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_needs_migration_logic as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_segment_version_update() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_segment_version_update as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_v2_segment_creation() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v2_segment_creation as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_mixed_timer_types() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_mixed_timer_types as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_v1_slab_enumeration() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v1_slab_enumeration as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_v1_trigger_retrieval() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v1_trigger_retrieval as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_v1_slab_roundtrip() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v1_slab_roundtrip as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_v1_trigger_roundtrip() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v1_trigger_roundtrip as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_multi_slab_v1_migration() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_multi_slab_v1_migration as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_crash_before_version_update() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_crash_before_version_update as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_crash_after_version_update() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_crash_after_version_update as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_migration_idempotency() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_migration_idempotency as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_crash_before_slab_size_update() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_crash_before_slab_size_update as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_crash_after_slab_size_update() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_crash_after_slab_size_update as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_slab_size_change_with_multiple_slabs() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_slab_size_change_with_multiple_slabs as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
 
     };
 
@@ -353,6 +468,16 @@ macro_rules! trigger_store_tests {
             let store = get_store();
 
             match runtime.block_on(tests::slabs::test_slab_operations(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_get_slab_range(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::slabs::test_get_slab_range(store, &segment)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
@@ -467,6 +592,156 @@ macro_rules! trigger_store_tests {
             match runtime.block_on(
                 tests::sequential_interleavings::test_sequential_interleavings(store, &input),
             ) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_needs_migration_logic(segment: $crate::timers::store::Segment) -> TestResult {
+            let store = get_store();
+
+            match tests::migration::test_needs_migration_logic(store, &segment) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_segment_version_update(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_segment_version_update(store, &segment))
+            {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_v2_segment_creation(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_v2_segment_creation(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_mixed_timer_types(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_mixed_timer_types(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_v1_slab_enumeration(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_v1_slab_enumeration(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_v1_trigger_retrieval(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_v1_trigger_retrieval(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_v1_slab_roundtrip(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_v1_slab_roundtrip(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_v1_trigger_roundtrip(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_v1_trigger_roundtrip(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_multi_slab_v1_migration(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_multi_slab_v1_migration(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_crash_before_version_update(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_crash_before_version_update(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_crash_after_version_update(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_crash_after_version_update(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_migration_idempotency(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_migration_idempotency(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_crash_before_slab_size_update(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_crash_before_slab_size_update(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_crash_after_slab_size_update(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_crash_after_slab_size_update(store, &segment)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(e),
+            }
+        }
+
+        fn prop_slab_size_change_with_multiple_slabs(segment: $crate::timers::store::Segment) -> TestResult {
+            let runtime = get_runtime();
+            let store = get_store();
+
+            match runtime.block_on(tests::migration::test_slab_size_change_with_multiple_slabs(store, &segment)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }

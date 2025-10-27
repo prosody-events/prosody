@@ -5,6 +5,7 @@
 
 use crate::cassandra::{
     CassandraStoreError, TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS, TABLE_SLABS,
+    TABLE_TYPED_KEYS, TABLE_TYPED_SLABS,
 };
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
@@ -78,6 +79,8 @@ pub fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, Cassan
             .replace("{{TABLE_SEGMENTS}}", TABLE_SEGMENTS)
             .replace("{{TABLE_SLABS}}", TABLE_SLABS)
             .replace("{{TABLE_KEYS}}", TABLE_KEYS)
+            .replace("{{TABLE_TYPED_SLABS}}", TABLE_TYPED_SLABS)
+            .replace("{{TABLE_TYPED_KEYS}}", TABLE_TYPED_KEYS)
             .replace("{{TABLE_SCHEMA_MIGRATIONS}}", TABLE_SCHEMA_MIGRATIONS);
 
         let checksum = calculate_checksum(&content_str);

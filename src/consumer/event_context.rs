@@ -27,7 +27,7 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
-use crate::timers::{DELETE_CONCURRENCY, TimerManager, Trigger};
+use crate::timers::{DELETE_CONCURRENCY, TimerManager, TimerType, Trigger};
 
 /// Provides shutdown notifications and timer operations to message handlers.
 ///
@@ -280,7 +280,12 @@ where
             return Err(TimerManagerError::InvalidContext);
         };
 
-        let trigger = Trigger::new(inner.key.clone(), time, Span::current());
+        let trigger = Trigger::new(
+            inner.key.clone(),
+            time,
+            TimerType::Application,
+            Span::current(),
+        );
 
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
@@ -307,7 +312,12 @@ where
             // Schedule exactly one new trigger.
             inner
                 .timers
-                .schedule(Trigger::new(inner.key.clone(), time, span.clone()))
+                .schedule(Trigger::new(
+                    inner.key.clone(),
+                    time,
+                    TimerType::Application,
+                    span.clone(),
+                ))
                 .await?;
 
             // Unschedule all existing triggers in parallel, linking spans.

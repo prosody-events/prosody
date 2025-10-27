@@ -3,7 +3,6 @@
     reason = "Trigger's ArcSwap field is excluded from hash/equality via Educe"
 )]
 
-use crate::timers::Trigger;
 use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::tests::common::{
@@ -13,6 +12,7 @@ use crate::timers::store::tests::common::{
 use crate::timers::store::tests::{
     TestStoreResult, TriggerOperation, TriggerSequence, TriggerTestInput,
 };
+use crate::timers::{TimerType, Trigger};
 use ahash::HashSet;
 use std::fmt::Debug;
 
@@ -165,7 +165,12 @@ where
 
         match op {
             TriggerOperation::Add => {
-                let trigger = Trigger::new(input.key.clone(), time, Span::current());
+                let trigger = Trigger::new(
+                    input.key.clone(),
+                    time,
+                    TimerType::Application,
+                    Span::current(),
+                );
 
                 add_trigger(store, &input.segment, &trigger).await?;
                 expected_times.insert(time);

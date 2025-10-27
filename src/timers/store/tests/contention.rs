@@ -1,11 +1,11 @@
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::tests::TestStoreResult;
 use crate::timers::store::tests::common::{
     add_trigger, get_key_triggers, insert_segment, remove_trigger,
 };
 use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::{TimerType, Trigger};
 use ahash::HashSet;
 use std::fmt::Debug;
 use tracing::Span;
@@ -37,7 +37,7 @@ where
         let time = CompactDateTime::from(1_000_i32 + i);
         all_times.push(time);
 
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         add_trigger(store, segment, &trigger).await?;
     }
@@ -78,7 +78,7 @@ where
 
     // Test the edge case of adding a trigger that was just deleted
     if let Some(&time) = all_times.first() {
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         add_trigger(store, segment, &trigger).await?;
 
