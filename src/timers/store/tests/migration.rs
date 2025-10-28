@@ -13,11 +13,9 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::migration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::tests::{TestStoreResult, common};
 use crate::timers::store::tests::common::{add_trigger, get_slab_triggers};
-use crate::timers::store::{
-    SEGMENT_VERSION_V1, SEGMENT_VERSION_V2, Segment, SegmentId, TriggerStore, TriggerV1,
-};
+use crate::timers::store::tests::{TestStoreResult, common};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore, TriggerV1};
 use crate::timers::{TimerType, Trigger};
 use ahash::{HashSet, HashSetExt};
 use futures::{StreamExt, TryStreamExt};
@@ -34,9 +32,9 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    // Test v1 segment (version = None)
+    // Test v1 segment (version = SegmentVersion::V1)
     let mut v1_none_segment = segment.clone();
-    v1_none_segment.version = None;
+    v1_none_segment.version = SegmentVersion::V1;
 
     if !migration::needs_migration(&v1_none_segment) {
         return Err("needs_migration should return true for segment with version=None".to_owned());
@@ -44,7 +42,7 @@ where
 
     // Test v1 segment (version = 1)
     let mut v1_explicit_segment = segment.clone();
-    v1_explicit_segment.version = Some(SEGMENT_VERSION_V1);
+    v1_explicit_segment.version = SegmentVersion::V1;
 
     if !migration::needs_migration(&v1_explicit_segment) {
         return Err("needs_migration should return true for segment with version=1".to_owned());
@@ -52,7 +50,7 @@ where
 
     // Test v2 segment
     let mut v2_segment = segment.clone();
-    v2_segment.version = Some(SEGMENT_VERSION_V2);
+    v2_segment.version = SegmentVersion::V2;
 
     if migration::needs_migration(&v2_segment) {
         return Err("needs_migration should return false for segment with version=2".to_owned());
@@ -75,7 +73,7 @@ where
 
     // Create a v1 segment
     let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
+    v1_segment.version = SegmentVersion::V1;
 
     store
         .insert_segment(v1_segment.clone())
@@ -118,7 +116,7 @@ where
 
     // Update to v2
     store
-        .update_segment_version(&v1_segment.id, SEGMENT_VERSION_V2, v1_segment.slab_size)
+        .update_segment_version(&v1_segment.id, SegmentVersion::V2, v1_segment.slab_size)
         .await
         .map_err(|e| format!("Failed to update segment version: {e:?}"))?;
 
@@ -129,10 +127,10 @@ where
         .map_err(|e| format!("Failed to get segment: {e:?}"))?
         .ok_or("Segment not found after version update")?;
 
-    if updated_segment.version != Some(SEGMENT_VERSION_V2) {
+    if updated_segment.version != SegmentVersion::V2 {
         return Err(format!(
             "Expected version {:?}, got {:?}",
-            Some(SEGMENT_VERSION_V2),
+            SegmentVersion::V2,
             updated_segment.version
         ));
     }
@@ -155,7 +153,7 @@ where
 {
     // Create a v2 segment
     let mut v2_segment = segment.clone();
-    v2_segment.version = Some(SEGMENT_VERSION_V2);
+    v2_segment.version = SegmentVersion::V2;
 
     store
         .insert_segment(v2_segment.clone())
@@ -184,7 +182,8 @@ where
 
     // Verify trigger is stored with correct type
     let slab = Slab::from_time(v2_segment.id, v2_segment.slab_size, trigger.time);
-    let slab_triggers = common::get_slab_triggers_by_type(store, &slab, TimerType::DeferRetry).await?;
+    let slab_triggers =
+        common::get_slab_triggers_by_type(store, &slab, TimerType::DeferRetry).await?;
 
     let found = slab_triggers.iter().any(|t| {
         t.key == trigger.key && t.time == trigger.time && t.timer_type == TimerType::DeferRetry
@@ -211,7 +210,7 @@ where
 {
     // Create a v2 segment
     let mut v2_segment = segment.clone();
-    v2_segment.version = Some(SEGMENT_VERSION_V2);
+    v2_segment.version = SegmentVersion::V2;
 
     store
         .insert_segment(v2_segment.clone())
@@ -246,7 +245,8 @@ where
 
     // Verify they have correct types via slab retrieval
     let slab1 = Slab::from_time(v2_segment.id, v2_segment.slab_size, time1);
-    let slab1_triggers = common::get_slab_triggers_by_type(store, &slab1, TimerType::Application).await?;
+    let slab1_triggers =
+        common::get_slab_triggers_by_type(store, &slab1, TimerType::Application).await?;
 
     let app_found = slab1_triggers
         .iter()
@@ -257,7 +257,8 @@ where
     }
 
     let slab2 = Slab::from_time(v2_segment.id, v2_segment.slab_size, time2);
-    let slab2_triggers = common::get_slab_triggers_by_type(store, &slab2, TimerType::DeferRetry).await?;
+    let slab2_triggers =
+        common::get_slab_triggers_by_type(store, &slab2, TimerType::DeferRetry).await?;
 
     let defer_found = slab2_triggers
         .iter()
@@ -282,7 +283,7 @@ where
 {
     // Create a v1 segment
     let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
+    v1_segment.version = SegmentVersion::V1;
 
     store
         .insert_segment(v1_segment.clone())
@@ -337,7 +338,7 @@ where
 
     // Create a v1 segment
     let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
+    v1_segment.version = SegmentVersion::V1;
 
     store
         .insert_segment(v1_segment.clone())
@@ -432,7 +433,7 @@ where
 {
     // Create a v1 segment
     let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
+    v1_segment.version = SegmentVersion::V1;
 
     store
         .insert_segment(v1_segment.clone())
@@ -481,7 +482,7 @@ where
 
     // Create a v1 segment
     let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
+    v1_segment.version = SegmentVersion::V1;
 
     store
         .insert_segment(v1_segment.clone())
@@ -660,6 +661,97 @@ fn verify_trigger_exists(
     Ok(())
 }
 
+/// Creates and inserts v1 test triggers across multiple slabs.
+async fn setup_multi_slab_v1_data<S>(
+    store: &S,
+    segment: &Segment,
+) -> Result<(Segment, Vec<TriggerV1>), String>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    use tracing::info_span;
+
+    let mut v1_segment = segment.clone();
+    v1_segment.version = SegmentVersion::V1;
+    v1_segment.slab_size = CompactDuration::new(3600); // 1 hour slabs
+
+    store
+        .insert_segment(v1_segment.clone())
+        .await
+        .map_err(|e| format!("Failed to insert v1 segment: {e:?}"))?;
+
+    let now = CompactDateTime::now().map_err(|e| format!("Failed to get time: {e:?}"))?;
+
+    let times = [
+        now.add_duration(CompactDuration::new(1000))
+            .map_err(|e| format!("Failed to add duration: {e:?}"))?, // slab 0
+        now.add_duration(CompactDuration::new(4000))
+            .map_err(|e| format!("Failed to add duration: {e:?}"))?, // slab 1
+        now.add_duration(CompactDuration::new(8000))
+            .map_err(|e| format!("Failed to add duration: {e:?}"))?, // slab 2
+    ];
+
+    let triggers: Vec<TriggerV1> = times
+        .iter()
+        .enumerate()
+        .map(|(i, &time)| TriggerV1 {
+            key: format!("multi-key-{}", i + 1).into(),
+            time,
+            span: info_span!("multi_trigger", index = i + 1),
+        })
+        .collect();
+
+    for (i, trigger) in triggers.iter().enumerate() {
+        let slab_id = Slab::from_time(v1_segment.id, v1_segment.slab_size, trigger.time).id();
+        store
+            .insert_slab_v1(&v1_segment.id, slab_id)
+            .await
+            .map_err(|e| format!("Failed to insert slab {}: {e:?}", i + 1))?;
+        store
+            .insert_slab_trigger_v1(&v1_segment.id, slab_id, trigger.clone())
+            .await
+            .map_err(|e| format!("Failed to insert trigger {}: {e:?}", i + 1))?;
+    }
+
+    Ok((v1_segment, triggers))
+}
+
+/// Verifies migrated data matches expected triggers.
+async fn verify_migrated_triggers<S>(
+    store: &S,
+    segment_id: &SegmentId,
+    slab_size: CompactDuration,
+    expected_triggers: &[TriggerV1],
+) -> TestStoreResult
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let triggers_after = get_all_v2_triggers(store, segment_id, slab_size).await?;
+
+    if triggers_after.len() != expected_triggers.len() {
+        return Err(format!(
+            "Expected {} triggers after migration, got {}",
+            expected_triggers.len(),
+            triggers_after.len()
+        ));
+    }
+
+    for trigger in expected_triggers {
+        if !triggers_after.iter().any(|t| {
+            t.key == trigger.key && t.time == trigger.time && t.timer_type == TimerType::Application
+        }) {
+            return Err(format!(
+                "Trigger lost during migration: key={}, time={}",
+                trigger.key, trigger.time
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Tests migration with multiple slabs containing real data.
 ///
 /// Creates v2 segment with data, simulates it being v1, then migrates.
@@ -672,84 +764,7 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    use tracing::info_span;
-
-    // Create a v1 segment
-    let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
-    v1_segment.slab_size = CompactDuration::new(3600); // 1 hour slabs
-
-    store
-        .insert_segment(v1_segment.clone())
-        .await
-        .map_err(|e| format!("Failed to insert v1 segment: {e:?}"))?;
-
-    // Insert v1 data spanning multiple slabs
-    let now = CompactDateTime::now().map_err(|e| format!("Failed to get time: {e:?}"))?;
-
-    let time1 = now
-        .add_duration(CompactDuration::new(1000))
-        .map_err(|e| format!("Failed to add duration: {e:?}"))?; // slab 0
-
-    let time2 = now
-        .add_duration(CompactDuration::new(4000))
-        .map_err(|e| format!("Failed to add duration: {e:?}"))?; // slab 1
-
-    let time3 = now
-        .add_duration(CompactDuration::new(8000))
-        .map_err(|e| format!("Failed to add duration: {e:?}"))?; // slab 2
-
-    // Calculate slab IDs for each time
-    let slab_id_1 = Slab::from_time(v1_segment.id, v1_segment.slab_size, time1).id();
-    let slab_id_2 = Slab::from_time(v1_segment.id, v1_segment.slab_size, time2).id();
-    let slab_id_3 = Slab::from_time(v1_segment.id, v1_segment.slab_size, time3).id();
-
-    // Insert v1 triggers
-    let trigger1 = TriggerV1 {
-        key: "multi-key-1".into(),
-        time: time1,
-        span: info_span!("multi_trigger_1"),
-    };
-
-    let trigger2 = TriggerV1 {
-        key: "multi-key-2".into(),
-        time: time2,
-        span: info_span!("multi_trigger_2"),
-    };
-
-    let trigger3 = TriggerV1 {
-        key: "multi-key-3".into(),
-        time: time3,
-        span: info_span!("multi_trigger_3"),
-    };
-
-    // Insert slabs
-    store
-        .insert_slab_v1(&v1_segment.id, slab_id_1)
-        .await
-        .map_err(|e| format!("Failed to insert slab 1: {e:?}"))?;
-    store
-        .insert_slab_v1(&v1_segment.id, slab_id_2)
-        .await
-        .map_err(|e| format!("Failed to insert slab 2: {e:?}"))?;
-    store
-        .insert_slab_v1(&v1_segment.id, slab_id_3)
-        .await
-        .map_err(|e| format!("Failed to insert slab 3: {e:?}"))?;
-
-    // Insert triggers
-    store
-        .insert_slab_trigger_v1(&v1_segment.id, slab_id_1, trigger1.clone())
-        .await
-        .map_err(|e| format!("Failed to insert trigger 1: {e:?}"))?;
-    store
-        .insert_slab_trigger_v1(&v1_segment.id, slab_id_2, trigger2.clone())
-        .await
-        .map_err(|e| format!("Failed to insert trigger 2: {e:?}"))?;
-    store
-        .insert_slab_trigger_v1(&v1_segment.id, slab_id_3, trigger3.clone())
-        .await
-        .map_err(|e| format!("Failed to insert trigger 3: {e:?}"))?;
+    let (v1_segment, triggers) = setup_multi_slab_v1_data(store, segment).await?;
 
     // Verify v1 data is present
     let v1_slabs: Vec<_> = store
@@ -777,40 +792,105 @@ where
         .map_err(|e| format!("Failed to get segment: {e:?}"))?
         .ok_or("Segment not found after migration")?;
 
-    if migrated_segment.version != Some(SEGMENT_VERSION_V2) {
+    if migrated_segment.version != SegmentVersion::V2 {
         return Err(format!(
-            "Expected version {}, got {:?}",
-            SEGMENT_VERSION_V2, migrated_segment.version
+            "Expected version {:?}, got {:?}",
+            SegmentVersion::V2,
+            migrated_segment.version
         ));
     }
 
-    // Verify all triggers migrated to v2
-    let triggers_after = get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
+    verify_migrated_triggers(
+        store,
+        &migrated_segment.id,
+        migrated_segment.slab_size,
+        &triggers,
+    )
+    .await?;
 
-    if triggers_after.len() != 3 {
-        return Err(format!(
-            "Expected 3 triggers after migration, got {}",
-            triggers_after.len()
-        ));
-    }
+    Ok(())
+}
 
-    // Verify each trigger preserved (with Application timer type)
-    let expected_triggers = vec![
-        (trigger1.key.clone(), trigger1.time),
-        (trigger2.key.clone(), trigger2.time),
-        (trigger3.key.clone(), trigger3.time),
+/// Sets up v1 crash test data with two triggers.
+async fn setup_crash_test_data<S>(
+    store: &S,
+    segment: &Segment,
+) -> Result<(Segment, TriggerV1, TriggerV1), String>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    use tracing::info_span;
+
+    let mut v1_segment = segment.clone();
+    v1_segment.version = SegmentVersion::V1;
+
+    store
+        .insert_segment(v1_segment.clone())
+        .await
+        .map_err(|e| format!("Failed to insert v1 segment: {e:?}"))?;
+
+    let now = CompactDateTime::now().map_err(|e| format!("Failed to get time: {e:?}"))?;
+
+    let times = [
+        now.add_duration(CompactDuration::new(3600))
+            .map_err(|e| format!("Failed to add duration: {e:?}"))?,
+        now.add_duration(CompactDuration::new(7200))
+            .map_err(|e| format!("Failed to add duration: {e:?}"))?,
     ];
 
-    for (key, time) in expected_triggers {
-        if !triggers_after
-            .iter()
-            .any(|t| t.key == key && t.time == time && t.timer_type == TimerType::Application)
-        {
-            return Err(format!(
-                "Trigger lost during migration: key={key}, time={time}"
-            ));
-        }
+    let triggers: Vec<TriggerV1> = times
+        .iter()
+        .enumerate()
+        .map(|(i, &time)| TriggerV1 {
+            key: format!("crash-key-{}", i + 1).into(),
+            time,
+            span: info_span!("crash_trigger", index = i + 1),
+        })
+        .collect();
+
+    for trigger in &triggers {
+        let slab_id = Slab::from_time(v1_segment.id, v1_segment.slab_size, trigger.time).id();
+        store
+            .insert_slab_v1(&v1_segment.id, slab_id)
+            .await
+            .map_err(|e| format!("Failed to insert slab: {e:?}"))?;
+        store
+            .insert_slab_trigger_v1(&v1_segment.id, slab_id, trigger.clone())
+            .await
+            .map_err(|e| format!("Failed to insert trigger: {e:?}"))?;
     }
+
+    Ok((v1_segment, triggers[0].clone(), triggers[1].clone()))
+}
+
+/// Simulates partial v2 writes for crash testing.
+async fn simulate_partial_migration<S>(
+    store: &S,
+    segment: &Segment,
+    trigger: &TriggerV1,
+) -> TestStoreResult
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let trigger_v2 = Trigger::new(
+        trigger.key.clone(),
+        trigger.time,
+        TimerType::Application,
+        Span::current(),
+    );
+
+    let slab = Slab::from_time(segment.id, segment.slab_size, trigger_v2.time);
+    store
+        .insert_slab_trigger(slab, trigger_v2.clone())
+        .await
+        .map_err(|e| format!("Failed to insert trigger to v2: {e:?}"))?;
+
+    store
+        .insert_key_trigger(&segment.id, trigger_v2)
+        .await
+        .map_err(|e| format!("Failed to insert trigger key to v2: {e:?}"))?;
 
     Ok(())
 }
@@ -837,95 +917,23 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    use tracing::info_span;
+    let (v1_segment, trigger1, trigger2) = setup_crash_test_data(store, segment).await?;
 
-    let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
+    // Simulate partial v2 writes (only trigger1 written, version not updated)
+    simulate_partial_migration(store, &v1_segment, &trigger1).await?;
 
-    store
-        .insert_segment(v1_segment.clone())
-        .await
-        .map_err(|e| format!("Failed to insert v1 segment: {e:?}"))?;
-
-    let now = CompactDateTime::now().map_err(|e| format!("Failed to get time: {e:?}"))?;
-
-    let time1 = now
-        .add_duration(CompactDuration::new(3600))
-        .map_err(|e| format!("Failed to add duration: {e:?}"))?;
-
-    let time2 = now
-        .add_duration(CompactDuration::new(7200))
-        .map_err(|e| format!("Failed to add duration: {e:?}"))?;
-
-    // Insert v1 data for both triggers
-    let slab_id_1 = Slab::from_time(v1_segment.id, v1_segment.slab_size, time1).id();
-    let slab_id_2 = Slab::from_time(v1_segment.id, v1_segment.slab_size, time2).id();
-
-    let trigger1_v1 = TriggerV1 {
-        key: "crash-key-1".into(),
-        time: time1,
-        span: info_span!("crash_trigger_1"),
-    };
-
-    let trigger2_v1 = TriggerV1 {
-        key: "crash-key-2".into(),
-        time: time2,
-        span: info_span!("crash_trigger_2"),
-    };
-
-    // Insert v1 slabs and triggers
-    store
-        .insert_slab_v1(&v1_segment.id, slab_id_1)
-        .await
-        .map_err(|e| format!("Failed to insert slab 1: {e:?}"))?;
-    store
-        .insert_slab_v1(&v1_segment.id, slab_id_2)
-        .await
-        .map_err(|e| format!("Failed to insert slab 2: {e:?}"))?;
-
-    store
-        .insert_slab_trigger_v1(&v1_segment.id, slab_id_1, trigger1_v1.clone())
-        .await
-        .map_err(|e| format!("Failed to insert trigger 1: {e:?}"))?;
-    store
-        .insert_slab_trigger_v1(&v1_segment.id, slab_id_2, trigger2_v1.clone())
-        .await
-        .map_err(|e| format!("Failed to insert trigger 2: {e:?}"))?;
-
-    // Simulate partial v2 writes (crash scenario: only trigger1 written to v2,
-    // version not updated)
-    let trigger1_v2 = Trigger::new(
-        trigger1_v1.key.clone(),
-        trigger1_v1.time,
-        TimerType::Application,
-        Span::current(),
-    );
-
-    let slab1 = Slab::from_time(v1_segment.id, v1_segment.slab_size, trigger1_v2.time);
-    store
-        .insert_slab_trigger(slab1.clone(), trigger1_v2.clone())
-        .await
-        .map_err(|e| format!("Failed to insert trigger1 to v2: {e:?}"))?;
-
-    store
-        .insert_key_trigger(&v1_segment.id, trigger1_v2.clone())
-        .await
-        .map_err(|e| format!("Failed to insert trigger1 key to v2: {e:?}"))?;
-
-    // Note: trigger2 NOT written to v2 - simulates crash during migration
-
-    // Verify segment is still v1 (version not updated - this is the crash point)
+    // Verify segment is still v1 (crash point)
     let check_segment = store
         .get_segment(&v1_segment.id)
         .await
         .map_err(|e| format!("Failed to get segment: {e:?}"))?
         .ok_or("Segment disappeared")?;
 
-    if check_segment.version != Some(SEGMENT_VERSION_V1) {
+    if check_segment.version != SegmentVersion::V1 {
         return Err("Segment version should still be v1 before migration".to_owned());
     }
 
-    // Now simulate system restart and retry migration
+    // Simulate system restart and retry migration
     migration::migrate_segment(store, &v1_segment)
         .await
         .map_err(|e| format!("Migration retry failed: {e:#}"))?;
@@ -937,14 +945,15 @@ where
         .map_err(|e| format!("Failed to get segment: {e:?}"))?
         .ok_or("Segment not found after migration")?;
 
-    if final_segment.version != Some(SEGMENT_VERSION_V2) {
+    if final_segment.version != SegmentVersion::V2 {
         return Err(format!(
-            "Expected version {}, got {:?}",
-            SEGMENT_VERSION_V2, final_segment.version
+            "Expected version {:?}, got {:?}",
+            SegmentVersion::V2,
+            final_segment.version
         ));
     }
 
-    // Verify both triggers exist in v2 (migration completed)
+    // Verify both triggers exist in v2
     let all_triggers = get_all_v2_triggers(store, &v1_segment.id, v1_segment.slab_size).await?;
 
     if all_triggers.len() != 2 {
@@ -956,17 +965,13 @@ where
 
     let has_trigger1 = all_triggers
         .iter()
-        .any(|t| t.key == trigger1_v1.key && t.time == trigger1_v1.time);
+        .any(|t| t.key == trigger1.key && t.time == trigger1.time);
     let has_trigger2 = all_triggers
         .iter()
-        .any(|t| t.key == trigger2_v1.key && t.time == trigger2_v1.time);
+        .any(|t| t.key == trigger2.key && t.time == trigger2.time);
 
-    if !has_trigger1 {
-        return Err("Trigger1 lost after migration retry - data loss!".to_owned());
-    }
-
-    if !has_trigger2 {
-        return Err("Trigger2 not migrated - data loss!".to_owned());
+    if !has_trigger1 || !has_trigger2 {
+        return Err("Triggers lost after migration retry - data loss!".to_owned());
     }
 
     Ok(())
@@ -997,7 +1002,7 @@ where
     use tracing::info_span;
 
     let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
+    v1_segment.version = SegmentVersion::V1;
 
     store
         .insert_segment(v1_segment.clone())
@@ -1060,7 +1065,7 @@ where
 
     // Update version to v2 (this is the completion marker)
     store
-        .update_segment_version(&v1_segment.id, SEGMENT_VERSION_V2, v1_segment.slab_size)
+        .update_segment_version(&v1_segment.id, SegmentVersion::V2, v1_segment.slab_size)
         .await
         .map_err(|e| format!("Failed to update version: {e:?}"))?;
 
@@ -1073,7 +1078,7 @@ where
         .map_err(|e| format!("Failed to get segment: {e:?}"))?
         .ok_or("Segment not found")?;
 
-    if check_segment.version != Some(SEGMENT_VERSION_V2) {
+    if check_segment.version != SegmentVersion::V2 {
         return Err("Segment should be v2 after version update".to_owned());
     }
 
@@ -1131,7 +1136,7 @@ where
     use tracing::info_span;
 
     let mut v1_segment = segment.clone();
-    v1_segment.version = Some(SEGMENT_VERSION_V1);
+    v1_segment.version = SegmentVersion::V1;
 
     store
         .insert_segment(v1_segment.clone())
@@ -1173,7 +1178,7 @@ where
         .map_err(|e| format!("Failed to get segment: {e:?}"))?
         .ok_or("Segment not found after first migration")?;
 
-    if segment_after_first.version != Some(SEGMENT_VERSION_V2) {
+    if segment_after_first.version != SegmentVersion::V2 {
         return Err("First migration should update version to v2".to_owned());
     }
 
@@ -1204,7 +1209,7 @@ where
         .map_err(|e| format!("Failed to get segment: {e:?}"))?
         .ok_or("Segment not found after second migration")?;
 
-    if segment_after_second.version != Some(SEGMENT_VERSION_V2) {
+    if segment_after_second.version != SegmentVersion::V2 {
         return Err("Second migration should not change version".to_owned());
     }
 
@@ -1255,7 +1260,7 @@ where
     let new_slab_size = CompactDuration::new(7200); // 2 hours
 
     let mut v2_segment = segment.clone();
-    v2_segment.version = Some(SEGMENT_VERSION_V2);
+    v2_segment.version = SegmentVersion::V2;
     v2_segment.slab_size = old_slab_size;
 
     store
@@ -1386,7 +1391,7 @@ where
     let new_slab_size = CompactDuration::new(7200); // 2 hours
 
     let mut v2_segment = segment.clone();
-    v2_segment.version = Some(SEGMENT_VERSION_V2);
+    v2_segment.version = SegmentVersion::V2;
     v2_segment.slab_size = old_slab_size;
 
     store
@@ -1436,7 +1441,7 @@ where
     // Update slab_size (atomic marker - this is the point where migration is
     // considered complete)
     store
-        .update_segment_version(&v2_segment.id, SEGMENT_VERSION_V2, new_slab_size)
+        .update_segment_version(&v2_segment.id, SegmentVersion::V2, new_slab_size)
         .await
         .map_err(|e| format!("Failed to update slab_size: {e:?}"))?;
 
@@ -1503,7 +1508,7 @@ where
     let new_slab_size = CompactDuration::new(7200); // 2 hours (will merge slabs)
 
     let mut v2_segment = segment.clone();
-    v2_segment.version = Some(SEGMENT_VERSION_V2);
+    v2_segment.version = SegmentVersion::V2;
     v2_segment.slab_size = old_slab_size;
 
     store

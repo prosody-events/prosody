@@ -13,7 +13,7 @@ use crate::timers::migration;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;
-use crate::timers::store::{SEGMENT_VERSION_V2, Segment, SegmentId, TriggerStore};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
@@ -441,7 +441,7 @@ where
         id: segment_id,
         name: name.to_owned(),
         slab_size,
-        version: Some(SEGMENT_VERSION_V2),
+        version: SegmentVersion::V2,
     };
 
     store
@@ -494,7 +494,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "test-segment".to_owned(),
             slab_size: CompactDuration::new(60), // 60 seconds
-            version: None,
+            version: SegmentVersion::V1,
         }
     }
 

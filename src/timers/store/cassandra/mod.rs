@@ -4,7 +4,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::cassandra::queries::Queries;
-use crate::timers::store::{Segment, SegmentId, TriggerStore, TriggerV1};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore, TriggerV1};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
@@ -82,7 +82,7 @@ impl TriggerStore for CassandraTriggerStore {
                     segment.id,
                     segment.name,
                     segment.slab_size,
-                    segment.version.map(|v| v as i8),
+                    i8::from(segment.version),
                 ),
             )
             .await?;
@@ -103,11 +103,16 @@ impl TriggerStore for CassandraTriggerStore {
             return Ok(None);
         };
 
+        let version = version
+            .map(SegmentVersion::try_from)
+            .transpose()?
+            .unwrap_or_default();
+
         Ok(Some(Segment {
             id: *segment_id,
             name,
             slab_size,
-            version: version.map(|v| v as u8),
+            version,
         }))
     }
 
@@ -586,6 +591,22 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
+    #[instrument(level = "debug", skip(self), err)]
+    async fn clear_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(
+                &self.queries().clear_key_triggers_all_types,
+                (segment_id, key.as_ref()),
+            )
+            .await?;
+
+        Ok(())
+    }
+
     // -- V1 migration methods --
 
     /// Updates the segment's version field after v1 to v2 migration.
@@ -593,14 +614,14 @@ impl TriggerStore for CassandraTriggerStore {
     async fn update_segment_version(
         &self,
         segment_id: &SegmentId,
-        new_version: u8,
+        new_version: SegmentVersion,
         new_slab_size: CompactDuration,
     ) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(
                 &self.queries().update_segment_version,
                 (
-                    new_version as i8,
+                    i8::from(new_version),
                     new_slab_size.seconds() as i32,
                     segment_id,
                 ),
@@ -653,7 +674,7 @@ impl TriggerStore for CassandraTriggerStore {
     /// Queries the segments table which stores one row per active slab.
     ///
     /// Note: Cassandra returns NULL for clustering columns when a partition has
-    /// only static columns. We handle this by deserializing to Option<i32>
+    /// only static columns. We handle this by deserializing to `Option<i32>`
     /// and filtering.
     #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id))]
     fn get_slabs_v1(
@@ -722,20 +743,108 @@ impl TriggerStore for CassandraTriggerStore {
         }
     }
 
-    /// Deletes a v1 slab from the `timer_slabs` table.
+    /// Deletes v1 slab metadata from the `segments` table.
     ///
-    /// Uses v1 PK `((segment_id, id), key, time)`.
+    /// Low-level method that removes a single slab entry from the segments
+    /// table. Part of the v1 migration API.
     #[instrument(level = "debug", skip(self), err)]
-    async fn delete_slab_v1(
+    async fn delete_slab_metadata_v1(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
     ) -> Result<(), Self::Error> {
         self.session()
-            .execute_unpaged(&self.queries().delete_slab_v1, (segment_id, slab_id as i32))
+            .execute_unpaged(
+                &self.queries().delete_slab_metadata_v1,
+                (segment_id, slab_id as i32),
+            )
             .await?;
 
         Ok(())
+    }
+
+    /// Deletes v1 slab triggers from the `timer_slabs` table.
+    ///
+    /// Low-level method that removes all triggers for a slab from the
+    /// `timer_slabs` table. Uses v1 PK `((segment_id, id), key, time)`.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn delete_slab_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(
+                &self.queries().delete_slab_triggers_v1,
+                (segment_id, slab_id as i32),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Inserts a v1 trigger into the `timer_keys` table.
+    ///
+    /// Low-level method that inserts into the v1 `timer_keys` table without
+    /// `timer_type`. Part of the v1 migration API.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn insert_key_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        trigger: TriggerV1,
+    ) -> Result<(), Self::Error> {
+        // Extract span context for v1 trigger
+        let mut span_map: HashMap<String, String> = HashMap::new();
+        let context = trigger.span.context();
+        self.propagator().inject_context(&context, &mut span_map);
+
+        self.session()
+            .execute_unpaged(
+                &self.queries().insert_key_trigger_v1,
+                (segment_id, trigger.key.as_ref(), trigger.time, span_map),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Retrieves v1 triggers for a key from the `timer_keys` table.
+    ///
+    /// Queries v1 `timer_keys` table using partition key (`segment_id`, key).
+    #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id, key = %key))]
+    fn get_key_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<TriggerV1, Self::Error>> + Send {
+        let segment_id = *segment_id;
+        let key = key.clone();
+
+        try_stream! {
+            let stream = self
+                .session()
+                .execute_iter(
+                    self.queries().get_key_triggers_v1.clone(),
+                    (segment_id, key.as_ref()),
+                )
+                .await?
+                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
+
+            pin_mut!(stream);
+            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
+                let context = self.propagator().extract(&span_map);
+                let span = info_span!("fetch_key_trigger_v1");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
+
+                yield TriggerV1 {
+                    key: key.into(),
+                    time,
+                    span,
+                };
+            }
+        }
     }
 
     /// Clears v1 triggers for a key from the `timer_keys` table.
@@ -780,7 +889,7 @@ mod test {
     }
     use crate::timers::duration::CompactDuration;
     use crate::timers::slab::{Slab, SlabId};
-    use crate::timers::store::{Segment, SegmentId, TriggerStore};
+    use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
     use crate::trigger_store_tests;
     use color_eyre::Result;
     use futures::pin_mut;
@@ -805,7 +914,7 @@ mod test {
             id: segment_id,
             name: "test_segment".to_owned(),
             slab_size: CompactDuration::new(60), // 1 minute slabs
-            version: None,
+            version: SegmentVersion::V1,
         };
 
         // Insert the test segment
@@ -907,7 +1016,7 @@ mod test {
             id: segment_id,
             name: "simple_test".to_owned(),
             slab_size: CompactDuration::new(60),
-            version: None,
+            version: SegmentVersion::V1,
         };
 
         store.insert_segment(segment.clone()).await?;

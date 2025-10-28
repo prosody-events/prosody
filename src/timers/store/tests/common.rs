@@ -206,7 +206,8 @@ where
         .map_err(|e| format!("Error retrieving key triggers for {timer_type:?}: {e:?}"))
 }
 
-/// Helper function to get ALL triggers for a key (both Application and `DeferRetry`)
+/// Helper function to get ALL triggers for a key (both Application and
+/// `DeferRetry`)
 ///
 /// # Errors
 ///
@@ -266,12 +267,16 @@ where
         .map_err(|e| format!("Error retrieving slab triggers for {timer_type:?}: {e:?}"))
 }
 
-/// Helper function to get ALL triggers from a slab (both Application and `DeferRetry`)
+/// Helper function to get ALL triggers from a slab (both Application and
+/// `DeferRetry`)
 ///
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn get_slab_triggers_all_types<S>(store: &S, slab: &Slab) -> Result<HashSet<Trigger>, String>
+pub async fn get_slab_triggers_all_types<S>(
+    store: &S,
+    slab: &Slab,
+) -> Result<HashSet<Trigger>, String>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,

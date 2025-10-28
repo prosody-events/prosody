@@ -51,9 +51,7 @@
 use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
 use crate::timers::slab::Slab;
-use crate::timers::store::{
-    SEGMENT_VERSION_V1, SEGMENT_VERSION_V2, Segment, TriggerStore, TriggerV1,
-};
+use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerV1};
 use crate::timers::{TimerType, Trigger};
 use futures::TryStreamExt;
 use std::error::Error;
@@ -71,14 +69,7 @@ use tracing::{debug, info, instrument, warn};
 /// `true` if the segment is v1 and needs migration, `false` otherwise.
 #[must_use]
 pub fn needs_migration(segment: &Segment) -> bool {
-    match segment.version {
-        None | Some(SEGMENT_VERSION_V1) => true,
-        Some(SEGMENT_VERSION_V2) => false,
-        Some(v) => {
-            warn!("Unknown segment version {v}, treating as v1");
-            true
-        }
-    }
+    matches!(segment.version, SegmentVersion::V1)
 }
 
 /// Migrates a segment from v1 to v2 schema.
@@ -167,7 +158,7 @@ where
     // Phase 3: Update segment version (atomic marker indicating migration complete)
     // This is the critical point - after this, the system uses v2 tables
     store
-        .update_segment_version(&segment_id, SEGMENT_VERSION_V2, segment.slab_size)
+        .update_segment_version(&segment_id, SegmentVersion::V2, segment.slab_size)
         .await
         .map_err(TimerManagerError::Store)?;
 
@@ -248,7 +239,7 @@ where
     let old_slab_size = segment.slab_size;
 
     // Verify segment is v2
-    if segment.version != Some(SEGMENT_VERSION_V2) {
+    if segment.version != SegmentVersion::V2 {
         warn!(
             "Cannot migrate slab_size for segment {segment_id}: segment is not v2 (version = \
              {:?}). Run version migration first.",
@@ -317,7 +308,7 @@ where
     // complete) This is the critical point - after this, the system uses new
     // slab_size
     store
-        .update_segment_version(&segment_id, SEGMENT_VERSION_V2, desired_slab_size)
+        .update_segment_version(&segment_id, SegmentVersion::V2, desired_slab_size)
         .await
         .map_err(TimerManagerError::Store)?;
 

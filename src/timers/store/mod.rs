@@ -28,6 +28,7 @@ use educe::Educe;
 use futures::{Stream, TryStreamExt};
 use std::cmp::Ordering;
 use std::error::Error;
+use std::fmt;
 use std::ops::RangeInclusive;
 use tokio::try_join;
 use tracing::Span;
@@ -41,11 +42,60 @@ pub mod memory;
 /// Comprehensive test suite for [`TriggerStore`] implementations.
 pub mod tests;
 
-/// Schema version 1 marker value.
-pub const SEGMENT_VERSION_V1: u8 = 1;
+/// Segment schema version.
+///
+/// Determines which Cassandra table schema is used for storing triggers.
+/// - V1: Legacy schema without `timer_type` field
+/// - V2: Current schema with `timer_type` field for Application vs `DeferRetry`
+#[repr(i8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentVersion {
+    /// V1 schema without `timer_type` field.
+    V1 = 1,
+    /// V2 schema with `timer_type` field.
+    V2 = 2,
+}
 
-/// Schema version 2 marker value.
-pub const SEGMENT_VERSION_V2: u8 = 2;
+impl Default for SegmentVersion {
+    fn default() -> Self {
+        Self::V1
+    }
+}
+
+impl From<SegmentVersion> for i8 {
+    fn from(version: SegmentVersion) -> Self {
+        version as i8
+    }
+}
+
+impl TryFrom<i8> for SegmentVersion {
+    type Error = InvalidSegmentVersionError;
+
+    fn try_from(value: i8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            _ => Err(InvalidSegmentVersionError(value)),
+        }
+    }
+}
+
+/// Error returned when trying to convert an invalid i8 value to
+/// [`SegmentVersion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSegmentVersionError(i8);
+
+impl fmt::Display for InvalidSegmentVersionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Invalid segment version: {}. Expected 1 (V1) or 2 (V2)",
+            self.0
+        )
+    }
+}
+
+impl Error for InvalidSegmentVersionError {}
 
 /// V1 trigger representation without timer type field.
 ///
@@ -92,7 +142,7 @@ pub type SegmentId = Uuid;
 /// - `id`: its unique [`Uuid`]
 /// - `name`: a human-readable identifier
 /// - `slab_size`: the duration of each time-based partition (slab)
-/// - `version`: schema version (None/1 = v1, 2 = v2)
+/// - `version`: schema version (V1 or V2)
 #[derive(Clone, Debug)]
 pub struct Segment {
     /// Unique segment identifier.
@@ -104,9 +154,8 @@ pub struct Segment {
     /// Duration of a time-based slab in this segment.
     pub slab_size: CompactDuration,
 
-    /// Schema version: None or Some(1) indicates v1 schema, Some(2) indicates
-    /// v2 schema.
-    pub version: Option<u8>,
+    /// Schema version determining the table schema.
+    pub version: SegmentVersion,
 }
 
 /// Persistent storage interface for timer data.
@@ -132,7 +181,9 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Should convey I/O and consistency failures.
     type Error: Error + Send + Sync + 'static;
 
-    // === Segment operations ===
+    // =========================================================================
+    // Foundational Operations - Segment Configuration
+    // =========================================================================
 
     /// Creates a new segment configuration.
     ///
@@ -179,7 +230,15 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         segment_id: &SegmentId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // === Slab (time partition) operations ===
+    // =========================================================================
+    // Low-Level Primitives - Single-Index Operations
+    // =========================================================================
+    //
+    // These methods operate on a single index (either slab or key) and must be
+    // implemented by each storage backend. They provide the building blocks for
+    // higher-level composite operations.
+
+    // --- Slab Metadata Operations ---
 
     /// Lists all slab IDs in a segment.
     ///
@@ -246,7 +305,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         slab_id: SlabId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // === Slab trigger (time-based index) operations ===
+    // --- Slab Trigger Operations (Time-Based Index) ---
 
     /// Streams all triggers of a specific type within a slab's time range.
     ///
@@ -336,7 +395,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         slab: &Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
-    // === Key trigger (entity-based index) operations ===
+    // --- Key Trigger Operations (Entity-Based Index) ---
 
     /// Streams all scheduled times for a given key and timer type.
     ///
@@ -449,7 +508,34 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
-    // === Composite operations ===
+    /// Clears all triggers from the key index for a given key, across ALL timer
+    /// types.
+    ///
+    /// This is a low-level primitive that only operates on the key index
+    /// partition. For coordinated operations that maintain dual indices,
+    /// use [`Self::clear_all_triggers_for_key`] instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier.
+    /// * `key` - The entity key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the clear operation fails.
+    fn clear_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    // =========================================================================
+    // High-Level Composite Operations - Dual-Index Coordination
+    // =========================================================================
+    //
+    // These methods provide default implementations that coordinate updates
+    // across both slab and key indices to maintain consistency. They use the
+    // low-level primitives defined above.
 
     /// Adds a trigger to both slab and key indices.
     ///
@@ -560,14 +646,71 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         }
     }
 
-    // === V1 Schema Migration Methods ===
+    /// Removes all triggers for a key across ALL timer types, clearing both
+    /// slab and key indices.
+    ///
+    /// This is a high-level coordinated operation that maintains the dual-index
+    /// invariant by efficiently querying all timer types at once and clearing
+    /// from both indices.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier.
+    /// * `key` - The entity key.
+    /// * `slab_size` - Slab duration used to locate each time's slab.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any deletion fails. Partial completion may occur
+    /// if an error interrupts processing.
+    fn clear_all_triggers_for_key(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        slab_size: CompactDuration,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let segment_id_copy = *segment_id;
+        let key_clone = key.clone();
+
+        // Use the efficient all-types query method
+        let stream = self.get_key_triggers_all_types(segment_id, key);
+
+        async move {
+            // Delete each trigger from slab index
+            stream
+                .try_for_each_concurrent(DELETE_CONCURRENCY, move |trigger| {
+                    let slab = Slab::from_time(segment_id_copy, slab_size, trigger.time);
+                    async move {
+                        self.delete_slab_trigger(
+                            &slab,
+                            trigger.timer_type,
+                            &trigger.key,
+                            trigger.time,
+                        )
+                        .await
+                    }
+                })
+                .await?;
+
+            // Clear key index for all timer types in one operation
+            self.clear_key_triggers_all_types(&segment_id_copy, &key_clone)
+                .await
+        }
+    }
+
+    // =========================================================================
+    // V1 Schema Migration Support
+    // =========================================================================
+    //
+    // These methods support migration from V1 schema (without timer_type) to
+    // V2 schema (with timer_type). Used by the migration module.
 
     /// Updates the schema version and slab size for a segment.
     ///
     /// # Arguments
     ///
     /// * `segment_id` - The segment to update
-    /// * `new_version` - The target schema version (`SEGMENT_VERSION_V2`)
+    /// * `new_version` - The target schema version (`SegmentVersion::V2`)
     /// * `new_slab_size` - The new slab size (may be same as current)
     ///
     /// # Errors
@@ -576,7 +719,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     fn update_segment_version(
         &self,
         segment_id: &SegmentId,
-        new_version: u8,
+        new_version: SegmentVersion,
         new_slab_size: CompactDuration,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -655,10 +798,51 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         slab_id: SlabId,
     ) -> impl Stream<Item = Result<TriggerV1, Self::Error>> + Send;
 
+    /// Deletes a v1 slab metadata entry from the segments table.
+    ///
+    /// Low-level method that removes the slab ID from the segments table
+    /// clustering columns. Does NOT delete triggers.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab ID to remove from metadata
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion fails.
+    fn delete_slab_metadata_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Deletes all v1 triggers for a slab from the `timer_slabs` table.
+    ///
+    /// Low-level method that removes all triggers with the given
+    /// `(segment_id, slab_id)` partition key. Does NOT update segments table.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab whose triggers should be deleted
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion fails.
+    fn delete_slab_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Deletes a v1 slab and all its triggers.
     ///
-    /// Deletes from v1 `timer_slabs` table with PK `((segment_id, id), key,
-    /// time)`.
+    /// High-level method that deletes both the slab metadata from the segments
+    /// table and all triggers from the `timer_slabs` table.
+    ///
+    /// Default implementation calls [`delete_slab_metadata_v1`] and
+    /// [`delete_slab_triggers_v1`].
     ///
     /// # Arguments
     ///
@@ -672,7 +856,54 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        Self: Sized,
+    {
+        async move {
+            self.delete_slab_metadata_v1(segment_id, slab_id).await?;
+            self.delete_slab_triggers_v1(segment_id, slab_id).await?;
+            Ok(())
+        }
+    }
+
+    /// Inserts a trigger into the v1 key-based index.
+    ///
+    /// Inserts into v1 `timer_keys` table using partition key (`segment_id`,
+    /// key). V1 triggers do not have [`TimerType`] field.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `trigger` - The v1 trigger to insert
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if insertion fails.
+    fn insert_key_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        trigger: TriggerV1,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Retrieves all triggers for a key from v1 key-based index.
+    ///
+    /// Queries v1 `timer_keys` table using partition key (`segment_id`, key).
+    /// Returns triggers ordered by time.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `key` - The key to query
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    fn get_key_triggers_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<TriggerV1, Self::Error>> + Send;
 
     /// Clears all triggers for a key from v1 tables.
     ///

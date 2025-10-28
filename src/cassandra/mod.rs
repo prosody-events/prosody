@@ -8,6 +8,7 @@ use crate::propagator::new_propagator;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::duration::CompactDurationError;
+use crate::timers::store::InvalidSegmentVersionError;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use scylla::_macro_internal::{
     CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
@@ -251,6 +252,10 @@ pub enum CassandraStoreError {
     /// Expected integer type but got something else.
     #[error("expected integer type")]
     IntExpected,
+
+    /// Invalid segment version value.
+    #[error("Invalid segment version: {0:#}")]
+    InvalidSegmentVersion(#[from] InvalidSegmentVersionError),
 }
 
 impl From<NewSessionError> for CassandraStoreError {

@@ -89,6 +89,9 @@ pub struct Queries {
     pub clear_key_triggers: PreparedStatement,
 
     #[educe(Debug(ignore))]
+    pub clear_key_triggers_all_types: PreparedStatement,
+
+    #[educe(Debug(ignore))]
     pub insert_slab_no_ttl: PreparedStatement,
 
     #[educe(Debug(ignore))]
@@ -108,10 +111,19 @@ pub struct Queries {
     pub get_slab_triggers_v1: PreparedStatement,
 
     #[educe(Debug(ignore))]
-    pub delete_slab_v1: PreparedStatement,
+    pub delete_slab_metadata_v1: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub delete_slab_triggers_v1: PreparedStatement,
 
     #[educe(Debug(ignore))]
     pub clear_key_triggers_v1: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub insert_key_trigger_v1: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub get_key_triggers_v1: PreparedStatement,
 
     #[educe(Debug(ignore))]
     pub insert_slab_v1: PreparedStatement,
@@ -164,6 +176,8 @@ impl Queries {
         let insert_key_trigger = prepare_insert_key_trigger(session, keyspace).await?;
         let delete_key_trigger = prepare_delete_key_trigger(session, keyspace).await?;
         let clear_key_triggers = prepare_clear_key_triggers(session, keyspace).await?;
+        let clear_key_triggers_all_types =
+            prepare_clear_key_triggers_all_types(session, keyspace).await?;
         let insert_slab_no_ttl = prepare_insert_slab_no_ttl(session, keyspace).await?;
         let insert_slab_trigger_no_ttl =
             prepare_insert_slab_trigger_no_ttl(session, keyspace).await?;
@@ -174,8 +188,11 @@ impl Queries {
         let update_segment_version = prepare_update_segment_version(session, keyspace).await?;
         let get_slabs_v1 = prepare_get_slabs_v1(session, keyspace).await?;
         let get_slab_triggers_v1 = prepare_get_slab_triggers_v1(session, keyspace).await?;
-        let delete_slab_v1 = prepare_delete_slab_v1(session, keyspace).await?;
+        let delete_slab_metadata_v1 = prepare_delete_slab_metadata_v1(session, keyspace).await?;
+        let delete_slab_triggers_v1 = prepare_delete_slab_triggers_v1(session, keyspace).await?;
         let clear_key_triggers_v1 = prepare_clear_key_triggers_v1(session, keyspace).await?;
+        let insert_key_trigger_v1 = prepare_insert_key_trigger_v1(session, keyspace).await?;
+        let get_key_triggers_v1 = prepare_get_key_triggers_v1(session, keyspace).await?;
         let insert_slab_v1 = prepare_insert_slab_v1(session, keyspace).await?;
         let insert_slab_trigger_v1 = prepare_insert_slab_trigger_v1(session, keyspace).await?;
 
@@ -198,14 +215,18 @@ impl Queries {
             insert_key_trigger,
             delete_key_trigger,
             clear_key_triggers,
+            clear_key_triggers_all_types,
             insert_slab_no_ttl,
             insert_slab_trigger_no_ttl,
             insert_key_trigger_no_ttl,
             update_segment_version,
             get_slabs_v1,
             get_slab_triggers_v1,
-            delete_slab_v1,
+            delete_slab_metadata_v1,
+            delete_slab_triggers_v1,
             clear_key_triggers_v1,
+            insert_key_trigger_v1,
+            get_key_triggers_v1,
             insert_slab_v1,
             insert_slab_trigger_v1,
         })
@@ -444,8 +465,8 @@ async fn prepare_get_key_triggers(
 /// Creates a prepared statement for: `SELECT key, time, timer_type, span FROM
 /// timer_typed_slabs WHERE segment_id = ? AND slab_size = ? AND id = ?`
 ///
-/// This queries the entire partition without filtering by `timer_type`, matching
-/// Cassandra's efficient partition query capability.
+/// This queries the entire partition without filtering by `timer_type`,
+/// matching Cassandra's efficient partition query capability.
 async fn prepare_get_slab_triggers_all_types(
     session: &Session,
     keyspace: &str,
@@ -466,8 +487,8 @@ async fn prepare_get_slab_triggers_all_types(
 /// Creates a prepared statement for: `SELECT key, time, timer_type, span FROM
 /// timer_typed_keys WHERE segment_id = ? AND key = ?`
 ///
-/// This queries the entire partition without filtering by `timer_type`, matching
-/// Cassandra's efficient partition query capability.
+/// This queries the entire partition without filtering by `timer_type`,
+/// matching Cassandra's efficient partition query capability.
 async fn prepare_get_key_triggers_all_types(
     session: &Session,
     keyspace: &str,
@@ -533,6 +554,26 @@ async fn prepare_clear_key_triggers(
             "delete from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? and key = ? and \
              timer_type = ?"
         ),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for clearing all triggers for a key across ALL
+/// timer types.
+///
+/// Creates a prepared statement for: `DELETE FROM timer_typed_keys WHERE
+/// segment_id = ? AND key = ?`
+///
+/// This deletes the entire partition `(segment_id, key)` which contains all
+/// `(timer_type, time)` clustering keys. More efficient than separately
+/// deleting each timer type.
+async fn prepare_clear_key_triggers_all_types(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!("delete from {keyspace}.{TABLE_TYPED_KEYS} where segment_id = ? and key = ?"),
     )
     .await
 }
@@ -641,11 +682,26 @@ async fn prepare_get_slab_triggers_v1(
     .await
 }
 
-/// Prepares a CQL statement for deleting a v1 slab.
+/// Prepares a CQL statement for deleting v1 slab metadata.
+///
+/// Creates a prepared statement for: `DELETE FROM segments WHERE id = ? AND
+/// slab_id = ?`
+async fn prepare_delete_slab_metadata_v1(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!("delete from {keyspace}.{TABLE_SEGMENTS} where id = ? and slab_id = ?"),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for deleting all v1 triggers for a slab.
 ///
 /// Creates a prepared statement for: `DELETE FROM timer_slabs WHERE segment_id
 /// = ? AND id = ?`
-async fn prepare_delete_slab_v1(
+async fn prepare_delete_slab_triggers_v1(
     session: &Session,
     keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
@@ -667,6 +723,40 @@ async fn prepare_clear_key_triggers_v1(
     prepare(
         session,
         &format!("delete from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ?"),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for inserting a v1 trigger into the key index.
+///
+/// Creates a prepared statement for: `INSERT INTO timer_keys (segment_id, key,
+/// time, span) VALUES (?, ?, ?, ?)`
+async fn prepare_insert_key_trigger_v1(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!(
+            "insert into {keyspace}.{TABLE_KEYS} (segment_id, key, time, span) values (?, ?, ?, ?)"
+        ),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for getting v1 triggers for a key.
+///
+/// Creates a prepared statement for: `SELECT key, time, span FROM timer_keys
+/// WHERE segment_id = ? AND key = ?`
+async fn prepare_get_key_triggers_v1(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!(
+            "select key, time, span from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ?"
+        ),
     )
     .await
 }

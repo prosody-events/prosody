@@ -8,7 +8,7 @@
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::{SEGMENT_VERSION_V2, Segment};
+use crate::timers::store::{Segment, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
 use quickcheck::{Arbitrary, Gen};
 use std::fmt::Debug;
@@ -26,6 +26,20 @@ pub mod cross_slab;
 pub mod migration;
 /// Tests for primitive trigger store operations.
 pub mod primitive_operations;
+/// Property-based tests for key trigger table operations.
+pub mod prop_key_triggers;
+/// Property-based tests for segment table operations.
+pub mod prop_segments;
+/// Property-based tests for slab metadata table operations.
+pub mod prop_slab_metadata;
+/// Property-based tests for slab trigger table operations.
+pub mod prop_slab_triggers;
+/// Property-based tests for v1 key trigger operations.
+pub mod prop_v1_key_triggers;
+/// Property-based tests for v1 slab metadata table operations.
+pub mod prop_v1_slab_metadata;
+/// Property-based tests for v1 slab trigger table operations.
+pub mod prop_v1_slab_triggers;
 /// Tests for segment management in the trigger store.
 pub mod segment;
 /// Tests for sequential interleavings of trigger operations.
@@ -73,7 +87,7 @@ impl Arbitrary for Segment {
             id,
             name,
             slab_size,
-            version: Some(SEGMENT_VERSION_V2),
+            version: SegmentVersion::V2,
         }
     }
 }
@@ -447,10 +461,115 @@ macro_rules! trigger_store_tests {
             );
         }
 
+        #[test]
+        fn test_prop_segment_model_equivalence() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_segment_model_equivalence as fn($crate::timers::store::tests::prop_segments::SegmentTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_slab_metadata_model_equivalence() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_slab_trigger_model_equivalence() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_key_trigger_model_equivalence() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_v1_slab_metadata_model_equivalence() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v1_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_v1_slab_metadata::V1SlabMetadataTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_v1_slab_trigger_model_equivalence() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v1_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_v1_slab_triggers::V1SlabTriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_v1_key_trigger_model_equivalence() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v1_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_v1_key_triggers::V1KeyTriggerTestInput) -> TestResult,
+            );
+        }
+
     };
 
     // Property functions
     (@prop_functions) => {
+        fn prop_segment_model_equivalence(
+            input: $crate::timers::store::tests::prop_segments::SegmentTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_segments::test_prop_segment_model_equivalence;
+            let store = get_store();
+            test_prop_segment_model_equivalence(store, input)
+        }
+
+        fn prop_slab_metadata_model_equivalence(
+            input: $crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_slab_metadata::test_prop_slab_metadata_model_equivalence;
+            let store = get_store();
+            test_prop_slab_metadata_model_equivalence(store, input)
+        }
+
+        fn prop_slab_trigger_model_equivalence(
+            input: $crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_slab_triggers::test_prop_slab_trigger_model_equivalence;
+            let store = get_store();
+            test_prop_slab_trigger_model_equivalence(store, input)
+        }
+
+        fn prop_key_trigger_model_equivalence(
+            input: $crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_key_triggers::test_prop_key_trigger_model_equivalence;
+            let store = get_store();
+            test_prop_key_trigger_model_equivalence(store, input)
+        }
+
+        fn prop_v1_slab_metadata_model_equivalence(
+            input: $crate::timers::store::tests::prop_v1_slab_metadata::V1SlabMetadataTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_v1_slab_metadata::test_prop_v1_slab_metadata_model_equivalence;
+            let store = get_store();
+            test_prop_v1_slab_metadata_model_equivalence(store, input)
+        }
+
+        fn prop_v1_slab_trigger_model_equivalence(
+            input: $crate::timers::store::tests::prop_v1_slab_triggers::V1SlabTriggerTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_v1_slab_triggers::test_prop_v1_slab_trigger_model_equivalence;
+            let store = get_store();
+            test_prop_v1_slab_trigger_model_equivalence(store, input)
+        }
+
+        fn prop_v1_key_trigger_model_equivalence(
+            input: $crate::timers::store::tests::prop_v1_key_triggers::V1KeyTriggerTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_v1_key_triggers::test_prop_v1_key_trigger_model_equivalence;
+            let store = get_store();
+            test_prop_v1_key_trigger_model_equivalence(store, input)
+        }
+
         fn prop_segment_operations(
             input: $crate::timers::store::tests::SegmentTestInput,
         ) -> TestResult {
