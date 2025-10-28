@@ -859,13 +859,13 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         slab_id: SlabId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Deletes a v1 slab and all its triggers.
+    /// Deletes a v1 slab and all its triggers from both slab and key indices.
     ///
-    /// High-level method that deletes both the slab metadata from the segments
-    /// table and all triggers from the `timer_slabs` table.
-    ///
-    /// Default implementation calls [`delete_slab_metadata_v1`] and
-    /// [`clear_slab_triggers_v1`].
+    /// High-level coordinated operation that maintains dual-index consistency by:
+    /// 1. Getting all triggers in the slab
+    /// 2. Deleting each trigger from the key index
+    /// 3. Clearing all triggers from the slab index
+    /// 4. Deleting the slab metadata
     ///
     /// # Arguments
     ///
@@ -874,7 +874,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns an error if deletion fails.
+    /// Returns an error if deletion fails. Partial completion may occur
+    /// if an error interrupts processing.
     fn delete_slab_v1(
         &self,
         segment_id: &SegmentId,
@@ -883,10 +884,147 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     where
         Self: Sized,
     {
+        let segment_id_copy = *segment_id;
+        let stream = self.get_slab_triggers_v1(segment_id, slab_id);
+
         async move {
-            self.delete_slab_metadata_v1(segment_id, slab_id).await?;
-            self.clear_slab_triggers_v1(segment_id, slab_id).await?;
+            // Delete each trigger from key index
+            stream
+                .try_for_each_concurrent(DELETE_CONCURRENCY, move |trigger| async move {
+                    self.delete_key_trigger_v1(&segment_id_copy, &trigger.key, trigger.time)
+                        .await
+                })
+                .await?;
+
+            // Clear slab triggers and metadata in parallel
+            try_join!(
+                self.clear_slab_triggers_v1(&segment_id_copy, slab_id),
+                self.delete_slab_metadata_v1(&segment_id_copy, slab_id)
+            )?;
+
             Ok(())
+        }
+    }
+
+    /// Adds a v1 trigger to both slab and key indices.
+    ///
+    /// High-level coordinated operation that adds a V1 trigger to both the
+    /// time-based slab index and the key-based index, maintaining dual-index
+    /// consistency.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab identifier
+    /// * `trigger` - The V1 trigger to add (without `timer_type` field)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any index insertion fails.
+    fn add_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        trigger: TriggerV1,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        Self: Sized,
+    {
+        async move {
+            try_join!(
+                self.insert_slab_v1(segment_id, slab_id),
+                self.insert_slab_trigger_v1(segment_id, slab_id, trigger.clone()),
+                self.insert_key_trigger_v1(segment_id, trigger),
+            )?;
+            Ok(())
+        }
+    }
+
+    /// Removes a v1 trigger from both slab and key indices.
+    ///
+    /// High-level coordinated operation that removes a V1 trigger from both the
+    /// time-based slab index and the key-based index, maintaining dual-index
+    /// consistency.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab identifier
+    /// * `key` - The trigger's entity key
+    /// * `time` - The trigger's scheduled time
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any index deletion fails.
+    fn remove_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        Self: Sized,
+    {
+        async move {
+            try_join!(
+                self.delete_slab_trigger_v1(segment_id, slab_id, key, time),
+                self.delete_key_trigger_v1(segment_id, key, time),
+            )?;
+            Ok(())
+        }
+    }
+
+    /// Clears all v1 triggers for a key from both slab and key indices.
+    ///
+    /// High-level coordinated operation that removes all V1 triggers for a given
+    /// key from both indices. V1 schema has no `timer_type` field, so this clears
+    /// all triggers for the key.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `key` - The entity key
+    /// * `slab_size` - Slab duration used to locate each time's slab
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any deletion fails. Partial completion may occur
+    /// if an error interrupts processing.
+    fn clear_triggers_for_key_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        slab_size: CompactDuration,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        Self: Sized,
+    {
+        let segment_id_copy = *segment_id;
+        let key_clone = key.clone();
+        let stream = self.get_key_triggers_v1(segment_id, key);
+
+        async move {
+            // Delete each trigger from slab index
+            stream
+                .try_for_each_concurrent(DELETE_CONCURRENCY, move |trigger| {
+                    let slab = Slab::from_time(segment_id_copy, slab_size, trigger.time);
+                    let slab_id = slab.id();
+                    async move {
+                        self.delete_slab_trigger_v1(
+                            &segment_id_copy,
+                            slab_id,
+                            &trigger.key,
+                            trigger.time,
+                        )
+                        .await
+                    }
+                })
+                .await?;
+
+            // Clear key index
+            self.clear_key_triggers_v1(&segment_id_copy, &key_clone)
+                .await
         }
     }
 

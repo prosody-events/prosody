@@ -26,6 +26,8 @@ pub mod cross_slab;
 pub mod migration;
 /// Tests for primitive trigger store operations.
 pub mod primitive_operations;
+/// Property-based tests for V2 high-level dual-index operations.
+pub mod prop_high_level;
 /// Property-based tests for key trigger table operations.
 pub mod prop_key_triggers;
 /// Property-based tests for segment table operations.
@@ -34,6 +36,8 @@ pub mod prop_segments;
 pub mod prop_slab_metadata;
 /// Property-based tests for slab trigger table operations.
 pub mod prop_slab_triggers;
+/// Property-based tests for V1 high-level dual-index operations.
+pub mod prop_v1_high_level;
 /// Property-based tests for v1 key trigger operations.
 pub mod prop_v1_key_triggers;
 /// Property-based tests for v1 slab metadata table operations.
@@ -510,6 +514,20 @@ macro_rules! trigger_store_tests {
             );
         }
 
+        #[test]
+        fn test_prop_high_level_dual_index_consistency() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_high_level::HighLevelTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_v1_high_level_dual_index_consistency() {
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_v1_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_v1_high_level::V1HighLevelTestInput) -> TestResult,
+            );
+        }
+
     };
 
     // Property functions
@@ -568,6 +586,22 @@ macro_rules! trigger_store_tests {
             use $crate::timers::store::tests::prop_v1_key_triggers::test_prop_v1_key_trigger_model_equivalence;
             let store = get_store();
             test_prop_v1_key_trigger_model_equivalence(store, input)
+        }
+
+        fn prop_high_level_dual_index_consistency(
+            input: $crate::timers::store::tests::prop_high_level::HighLevelTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_high_level::test_prop_high_level_dual_index_consistency;
+            let store = get_store();
+            test_prop_high_level_dual_index_consistency(store, input)
+        }
+
+        fn prop_v1_high_level_dual_index_consistency(
+            input: $crate::timers::store::tests::prop_v1_high_level::V1HighLevelTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_v1_high_level::test_prop_v1_high_level_dual_index_consistency;
+            let store = get_store();
+            test_prop_v1_high_level_dual_index_consistency(store, input)
         }
 
         fn prop_segment_operations(
