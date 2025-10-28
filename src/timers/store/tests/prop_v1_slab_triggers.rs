@@ -274,37 +274,14 @@ where
                 time,
             } => {
                 model.apply(op);
-                let remaining: Vec<TriggerV1> = store
-                    .get_slab_triggers_v1(segment_id, *slab_id)
-                    .try_collect()
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!(
-                            "Op #{op_idx} Get v1 triggers for delete failed: {e:?}"
-                        )
-                    })?;
-
                 store
-                    .delete_slab_triggers_v1(segment_id, *slab_id)
+                    .delete_slab_trigger_v1(segment_id, *slab_id, key, *time)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!(
-                            "Op #{op_idx} Delete v1 slab triggers failed: {e:?}"
+                            "Op #{op_idx} Delete v1 slab trigger failed: {e:?}"
                         )
                     })?;
-
-                for trigger in remaining {
-                    if trigger.key != *key || trigger.time != *time {
-                        store
-                            .insert_slab_trigger_v1(segment_id, *slab_id, trigger)
-                            .await
-                            .map_err(|e| {
-                                color_eyre::eyre::eyre!(
-                                    "Op #{op_idx} Re-insert v1 trigger failed: {e:?}"
-                                )
-                            })?;
-                    }
-                }
             }
             V1SlabTriggerOperation::Clear {
                 segment_id,
@@ -312,7 +289,7 @@ where
             } => {
                 model.apply(op);
                 store
-                    .delete_slab_triggers_v1(segment_id, *slab_id)
+                    .clear_slab_triggers_v1(segment_id, *slab_id)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Clear v1 slab triggers failed: {e:?}")
@@ -350,11 +327,11 @@ where
     for segment_id in &input.segment_ids {
         for slab_id in 0..5 {
             store
-                .delete_slab_triggers_v1(segment_id, slab_id)
+                .clear_slab_triggers_v1(segment_id, slab_id)
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!(
-                        "Failed to delete v1 slab triggers during cleanup: {e:?}"
+                        "Failed to clear v1 slab triggers during cleanup: {e:?}"
                     )
                 })?;
         }

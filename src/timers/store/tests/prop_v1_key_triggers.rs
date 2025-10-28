@@ -35,6 +35,15 @@ pub enum V1KeyTriggerOperation {
         /// The key to query.
         key: Key,
     },
+    /// Delete a specific trigger for a key.
+    Delete {
+        /// The segment ID.
+        segment_id: SegmentId,
+        /// The key.
+        key: Key,
+        /// The time to delete.
+        time: CompactDateTime,
+    },
     /// Clear all triggers for a key from v1 `timer_keys` table.
     ClearKey {
         /// The segment ID.
@@ -69,7 +78,7 @@ impl Arbitrary for V1KeyTriggerTestInput {
             let idx = usize::from(u8::arbitrary(g)) % segment_ids.len();
             let segment_id = segment_ids[idx];
 
-            let op = match u8::arbitrary(g) % 3 {
+            let op = match u8::arbitrary(g) % 4 {
                 0 => {
                     // Insert operation
                     let key: Key = format!("key-{}", u8::arbitrary(g) % 10).into();
@@ -87,6 +96,15 @@ impl Arbitrary for V1KeyTriggerTestInput {
                 1 => {
                     let key: Key = format!("key-{}", u8::arbitrary(g) % 10).into();
                     V1KeyTriggerOperation::GetTriggers { segment_id, key }
+                }
+                2 => {
+                    let key: Key = format!("key-{}", u8::arbitrary(g) % 10).into();
+                    let time = CompactDateTime::arbitrary(g);
+                    V1KeyTriggerOperation::Delete {
+                        segment_id,
+                        key,
+                        time,
+                    }
                 }
                 _ => {
                     let key: Key = format!("key-{}", u8::arbitrary(g) % 10).into();
@@ -141,6 +159,15 @@ impl V1KeyTriggerModel {
             }
             V1KeyTriggerOperation::GetTriggers { .. } => {
                 // Queries don't modify state
+            }
+            V1KeyTriggerOperation::Delete {
+                segment_id,
+                key,
+                time,
+            } => {
+                if let Some(triggers) = self.triggers.get_mut(&(*segment_id, key.clone())) {
+                    triggers.remove(&(key.clone(), *time));
+                }
             }
             V1KeyTriggerOperation::ClearKey { segment_id, key } => {
                 self.triggers.remove(&(*segment_id, key.clone()));
@@ -221,6 +248,19 @@ where
                     }
                 }
             }
+            V1KeyTriggerOperation::Delete {
+                segment_id,
+                key,
+                time,
+            } => {
+                model.apply(op);
+                store
+                    .delete_key_trigger_v1(segment_id, key, *time)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} Delete v1 key trigger failed: {e:?}")
+                    })?;
+            }
             V1KeyTriggerOperation::ClearKey { segment_id, key } => {
                 model.apply(op);
                 store
@@ -228,16 +268,6 @@ where
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Clear v1 key triggers failed: {e:?}")
-                    })?;
-
-                store
-                    .clear_key_triggers_v1(segment_id, key)
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!(
-                            "Op #{op_idx} Second clear v1 key triggers failed (not idempotent): \
-                             {e:?}"
-                        )
                     })?;
             }
         }

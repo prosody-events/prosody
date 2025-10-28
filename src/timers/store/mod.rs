@@ -817,6 +817,29 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         slab_id: SlabId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Deletes a specific v1 trigger from a slab's index.
+    ///
+    /// Low-level method that removes a single trigger identified by
+    /// `(segment_id, slab_id, key, time)` from the `timer_slabs` table.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab identifier
+    /// * `key` - The trigger's entity key
+    /// * `time` - The trigger's scheduled time
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion fails.
+    fn delete_slab_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Deletes all v1 triggers for a slab from the `timer_slabs` table.
     ///
     /// Low-level method that removes all triggers with the given
@@ -830,7 +853,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an error if deletion fails.
-    fn delete_slab_triggers_v1(
+    fn clear_slab_triggers_v1(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -842,7 +865,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// table and all triggers from the `timer_slabs` table.
     ///
     /// Default implementation calls [`delete_slab_metadata_v1`] and
-    /// [`delete_slab_triggers_v1`].
+    /// [`clear_slab_triggers_v1`].
     ///
     /// # Arguments
     ///
@@ -862,7 +885,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     {
         async move {
             self.delete_slab_metadata_v1(segment_id, slab_id).await?;
-            self.delete_slab_triggers_v1(segment_id, slab_id).await?;
+            self.clear_slab_triggers_v1(segment_id, slab_id).await?;
             Ok(())
         }
     }
@@ -904,6 +927,27 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         segment_id: &SegmentId,
         key: &Key,
     ) -> impl Stream<Item = Result<TriggerV1, Self::Error>> + Send;
+
+    /// Deletes a specific v1 trigger from the key-based index.
+    ///
+    /// Low-level method that removes a single trigger identified by
+    /// `(segment_id, key, time)` from the `timer_keys` table.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `key` - The entity key
+    /// * `time` - The trigger's scheduled time
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion fails.
+    fn delete_key_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Clears all triggers for a key from v1 tables.
     ///

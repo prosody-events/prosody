@@ -114,7 +114,13 @@ pub struct Queries {
     pub delete_slab_metadata_v1: PreparedStatement,
 
     #[educe(Debug(ignore))]
-    pub delete_slab_triggers_v1: PreparedStatement,
+    pub delete_slab_trigger_v1: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub clear_slab_triggers_v1: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub delete_key_trigger_v1: PreparedStatement,
 
     #[educe(Debug(ignore))]
     pub clear_key_triggers_v1: PreparedStatement,
@@ -189,7 +195,9 @@ impl Queries {
         let get_slabs_v1 = prepare_get_slabs_v1(session, keyspace).await?;
         let get_slab_triggers_v1 = prepare_get_slab_triggers_v1(session, keyspace).await?;
         let delete_slab_metadata_v1 = prepare_delete_slab_metadata_v1(session, keyspace).await?;
-        let delete_slab_triggers_v1 = prepare_delete_slab_triggers_v1(session, keyspace).await?;
+        let delete_slab_trigger_v1 = prepare_delete_slab_trigger_v1(session, keyspace).await?;
+        let clear_slab_triggers_v1 = prepare_clear_slab_triggers_v1(session, keyspace).await?;
+        let delete_key_trigger_v1 = prepare_delete_key_trigger_v1(session, keyspace).await?;
         let clear_key_triggers_v1 = prepare_clear_key_triggers_v1(session, keyspace).await?;
         let insert_key_trigger_v1 = prepare_insert_key_trigger_v1(session, keyspace).await?;
         let get_key_triggers_v1 = prepare_get_key_triggers_v1(session, keyspace).await?;
@@ -223,7 +231,9 @@ impl Queries {
             get_slabs_v1,
             get_slab_triggers_v1,
             delete_slab_metadata_v1,
-            delete_slab_triggers_v1,
+            delete_slab_trigger_v1,
+            clear_slab_triggers_v1,
+            delete_key_trigger_v1,
             clear_key_triggers_v1,
             insert_key_trigger_v1,
             get_key_triggers_v1,
@@ -697,17 +707,51 @@ async fn prepare_delete_slab_metadata_v1(
     .await
 }
 
-/// Prepares a CQL statement for deleting all v1 triggers for a slab.
+/// Prepares a CQL statement for deleting a single v1 trigger from a slab.
+///
+/// Creates a prepared statement for: `DELETE FROM timer_slabs WHERE segment_id
+/// = ? AND id = ? AND key = ? AND time = ?`
+async fn prepare_delete_slab_trigger_v1(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!(
+            "delete from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ? and key = ? and time = ?"
+        ),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for clearing all v1 triggers for a slab.
 ///
 /// Creates a prepared statement for: `DELETE FROM timer_slabs WHERE segment_id
 /// = ? AND id = ?`
-async fn prepare_delete_slab_triggers_v1(
+async fn prepare_clear_slab_triggers_v1(
     session: &Session,
     keyspace: &str,
 ) -> Result<PreparedStatement, CassandraTriggerStoreError> {
     prepare(
         session,
         &format!("delete from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ?"),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for deleting a single v1 trigger from the key index.
+///
+/// Creates a prepared statement for: `DELETE FROM timer_keys WHERE segment_id =
+/// ? AND key = ? AND time = ?`
+async fn prepare_delete_key_trigger_v1(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!(
+            "delete from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ? and time = ?"
+        ),
     )
     .await
 }

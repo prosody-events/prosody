@@ -763,19 +763,41 @@ impl TriggerStore for CassandraTriggerStore {
         Ok(())
     }
 
+    /// Deletes a single v1 trigger from the `timer_slabs` table.
+    ///
+    /// Low-level method that removes a specific trigger identified by
+    /// `(segment_id, slab_id, key, time)` from the `timer_slabs` table.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn delete_slab_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(
+                &self.queries().delete_slab_trigger_v1,
+                (segment_id, slab_id as i32, key.as_ref(), time),
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Deletes v1 slab triggers from the `timer_slabs` table.
     ///
     /// Low-level method that removes all triggers for a slab from the
     /// `timer_slabs` table. Uses v1 PK `((segment_id, id), key, time)`.
     #[instrument(level = "debug", skip(self), err)]
-    async fn delete_slab_triggers_v1(
+    async fn clear_slab_triggers_v1(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
     ) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(
-                &self.queries().delete_slab_triggers_v1,
+                &self.queries().clear_slab_triggers_v1,
                 (segment_id, slab_id as i32),
             )
             .await?;
@@ -845,6 +867,27 @@ impl TriggerStore for CassandraTriggerStore {
                 };
             }
         }
+    }
+
+    /// Deletes a single v1 trigger from the `timer_keys` table.
+    ///
+    /// Low-level method that removes a specific trigger identified by
+    /// `(segment_id, key, time)` from the `timer_keys` table.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn delete_key_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(
+                &self.queries().delete_key_trigger_v1,
+                (segment_id, key.as_ref(), time),
+            )
+            .await?;
+
+        Ok(())
     }
 
     /// Clears v1 triggers for a key from the `timer_keys` table.

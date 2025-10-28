@@ -7,6 +7,7 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
 use ahash::HashMap;
 use quickcheck::{Arbitrary, Gen, TestResult};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use uuid::Uuid;
 
@@ -19,6 +20,15 @@ pub enum SegmentOperation {
     Get(SegmentId),
     /// Delete a segment by ID.
     Delete(SegmentId),
+    /// Update segment version and slab size.
+    UpdateVersion {
+        /// The segment ID.
+        segment_id: SegmentId,
+        /// The new version.
+        version: SegmentVersion,
+        /// The new slab size.
+        slab_size: CompactDuration,
+    },
 }
 
 /// Test input containing isolated segment IDs and operations.
@@ -44,13 +54,17 @@ impl Arbitrary for SegmentTestInput {
         let op_count = (usize::arbitrary(g) % 40) + 10;
         let mut operations = Vec::with_capacity(op_count);
 
+        // Track which segments have been inserted to generate valid UpdateVersion ops
+        let mut inserted_segments = HashSet::new();
+
         for _ in 0..op_count {
             let idx = usize::from(u8::arbitrary(g)) % segment_ids.len();
             let segment_id = segment_ids[idx];
 
-            let op = match u8::arbitrary(g) % 3 {
+            let op = match u8::arbitrary(g) % 4 {
                 0 => {
                     // Insert operation
+                    inserted_segments.insert(segment_id);
                     let segment = Segment {
                         id: segment_id,
                         name: format!("segment-{}", u8::arbitrary(g) % 10),
@@ -66,7 +80,35 @@ impl Arbitrary for SegmentTestInput {
                     SegmentOperation::Insert(segment)
                 }
                 1 => SegmentOperation::Get(segment_id),
-                _ => SegmentOperation::Delete(segment_id),
+                2 => {
+                    // Delete operation - remove from tracking
+                    inserted_segments.remove(&segment_id);
+                    SegmentOperation::Delete(segment_id)
+                }
+                _ => {
+                    // UpdateVersion operation - only on currently inserted segments
+                    if inserted_segments.is_empty() {
+                        // If no segments inserted yet, generate a Get instead
+                        SegmentOperation::Get(segment_id)
+                    } else {
+                        // Pick from currently inserted segments, not random segment_id
+                        let inserted_vec: Vec<_> = inserted_segments.iter().copied().collect();
+                        let update_segment_id = inserted_vec[usize::arbitrary(g) % inserted_vec.len()];
+                        let version = if bool::arbitrary(g) {
+                            SegmentVersion::V1
+                        } else {
+                            SegmentVersion::V2
+                        };
+                        let slab_size = CompactDuration::new(
+                            (u32::arbitrary(g) % 3600) + 1, // 1-3600 seconds
+                        );
+                        SegmentOperation::UpdateVersion {
+                            segment_id: update_segment_id,
+                            version,
+                            slab_size,
+                        }
+                    }
+                }
             };
             operations.push(op);
         }
@@ -112,6 +154,16 @@ impl SegmentModel {
             }
             SegmentOperation::Delete(id) => {
                 self.segments.remove(id);
+            }
+            SegmentOperation::UpdateVersion {
+                segment_id,
+                version,
+                slab_size,
+            } => {
+                if let Some(segment) = self.segments.get_mut(segment_id) {
+                    segment.version = *version;
+                    segment.slab_size = *slab_size;
+                }
             }
         }
     }
@@ -167,6 +219,72 @@ fn verify_segment_fields(
             actual.version
         ));
     }
+    Ok(())
+}
+
+/// Performs final verification that model and store are equivalent for all
+/// segment IDs.
+///
+/// # Errors
+///
+/// Returns an error if model and store state don't match.
+async fn verify_final_state<S>(
+    store: &S,
+    model: &SegmentModel,
+) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let all_ids: Vec<SegmentId> = model.all_ids();
+
+    for id in &all_ids {
+        let model_segment = model.get(id);
+        let store_segment = store
+            .get_segment(id)
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("Get segment failed: {e:?}"))?;
+
+        match (model_segment, store_segment) {
+            (Some(expected), Some(actual)) => {
+                verify_segment_fields(id, expected, &actual)?;
+            }
+            (Some(expected), None) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "Segment {} exists in model but not in store (expected: {:?})",
+                    id,
+                    expected
+                ));
+            }
+            (None, Some(actual)) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "Segment {} exists in store but not in model (actual: {:?})",
+                    id,
+                    actual
+                ));
+            }
+            (None, None) => {
+                // Both agree it doesn't exist - correct
+            }
+        }
+    }
+
+    // Also verify that segments in store but not in model IDs are properly absent
+    // (This catches cases where store has extra segments)
+    for id in &all_ids {
+        if model.get(id).is_none() {
+            let store_result = store.get_segment(id).await.map_err(|e| {
+                color_eyre::eyre::eyre!("Get segment failed during absence check: {e:?}")
+            })?;
+            if store_result.is_some() {
+                return Err(color_eyre::eyre::eyre!(
+                    "Store has segment {} that model doesn't expect",
+                    id
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -252,61 +370,25 @@ where
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} Delete failed: {e:?}"))?;
             }
+            SegmentOperation::UpdateVersion {
+                segment_id,
+                version,
+                slab_size,
+            } => {
+                model.apply(op);
+                store
+                    .update_segment_version(segment_id, *version, *slab_size)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} UpdateVersion failed: {e:?}")
+                    })?;
+            }
         }
     }
 
     // Final sanity check: verify model-store equivalence for all segment IDs
     // (queries were already verified inline, this catches any missed state)
-    let all_ids: Vec<SegmentId> = model.all_ids();
-
-    for id in &all_ids {
-        let model_segment = model.get(id);
-        let store_segment = store
-            .get_segment(id)
-            .await
-            .map_err(|e| color_eyre::eyre::eyre!("Get segment failed: {e:?}"))?;
-
-        match (model_segment, store_segment) {
-            (Some(expected), Some(actual)) => {
-                verify_segment_fields(id, expected, &actual)?;
-            }
-            (Some(expected), None) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "Segment {} exists in model but not in store (expected: {:?})",
-                    id,
-                    expected
-                ));
-            }
-            (None, Some(actual)) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "Segment {} exists in store but not in model (actual: {:?})",
-                    id,
-                    actual
-                ));
-            }
-            (None, None) => {
-                // Both agree it doesn't exist - correct
-            }
-        }
-    }
-
-    // Also verify that segments in store but not in model IDs are properly absent
-    // (This catches cases where store has extra segments)
-    for id in &all_ids {
-        if model.get(id).is_none() {
-            let store_result = store.get_segment(id).await.map_err(|e| {
-                color_eyre::eyre::eyre!("Get segment failed during absence check: {e:?}")
-            })?;
-            if store_result.is_some() {
-                return Err(color_eyre::eyre::eyre!(
-                    "Store has segment {} that model doesn't expect",
-                    id
-                ));
-            }
-        }
-    }
-
-    Ok(())
+    verify_final_state(store, &model).await
 }
 
 /// [`QuickCheck`] wrapper for segment model equivalence property.

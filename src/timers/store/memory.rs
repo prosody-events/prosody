@@ -32,6 +32,7 @@ use std::convert::Infallible;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::join;
+use tracing::Span;
 
 /// In-memory, concurrent implementation of [`TriggerStore`] for testing and
 /// development.
@@ -783,6 +784,39 @@ impl TriggerStore for InMemoryTriggerStore {
 
     /// Delete all v1 triggers for a slab from `timer_slabs` table.
     ///
+    /// Deletes a specific v1 trigger from a slab.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment ID.
+    /// * `slab_id` - Slab ID.
+    /// * `key` - Trigger key.
+    /// * `time` - Trigger time.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error.
+    async fn delete_slab_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), Self::Error> {
+        let map_key = (*segment_id, slab_id);
+        if let hash_map::Entry::Occupied(mut entry) =
+            self.0.slab_triggers_v1.entry_async(map_key).await
+        {
+            let trigger_to_remove = TriggerV1 {
+                key: key.clone(),
+                time,
+                span: Span::current(),
+            };
+            entry.get_mut().remove(&trigger_to_remove);
+        }
+        Ok(())
+    }
+
     /// Removes all triggers with the given `(segment_id, slab_id)` key.
     ///
     /// # Arguments
@@ -793,7 +827,7 @@ impl TriggerStore for InMemoryTriggerStore {
     /// # Errors
     ///
     /// Never returns an error.
-    async fn delete_slab_triggers_v1(
+    async fn clear_slab_triggers_v1(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -854,6 +888,37 @@ impl TriggerStore for InMemoryTriggerStore {
                 }
             }
         }
+    }
+
+    /// Deletes a specific v1 trigger from the key index.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment ID.
+    /// * `key` - Trigger key.
+    /// * `time` - Trigger time.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error.
+    async fn delete_key_trigger_v1(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), Self::Error> {
+        let map_key = (*segment_id, key.clone());
+        if let hash_map::Entry::Occupied(mut entry) =
+            self.0.key_triggers_v1.entry_async(map_key).await
+        {
+            let trigger_to_remove = TriggerV1 {
+                key: key.clone(),
+                time,
+                span: Span::current(),
+            };
+            entry.get_mut().remove(&trigger_to_remove);
+        }
+        Ok(())
     }
 
     /// Clear all v1 triggers for a specific key.
