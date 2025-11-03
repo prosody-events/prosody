@@ -1,68 +1,14 @@
-use crate::timers::slab::Slab;
+use crate::Key;
 use crate::timers::store::tests::TestStoreResult;
-use crate::timers::store::tests::common::{delete_slab, get_slabs, insert_segment, insert_slab};
+use crate::timers::store::tests::common::{add_trigger, insert_segment};
 use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::{TimerType, Trigger, datetime::CompactDateTime};
 use ahash::HashSet;
 use std::fmt::Debug;
 
-/// Tests the slab operations of a `TriggerStore` implementation.
-///
-/// This test verifies that the store can correctly:
-/// - Insert slab IDs
-/// - Retrieve slab IDs
-/// - Delete slab IDs
-/// - Handle slab ID registrations independently from segment data
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn test_slab_operations<S>(store: &S, segment: &Segment) -> TestStoreResult
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    // Insert the segment first
-    insert_segment(store, segment).await?;
-
-    // Generate some slab IDs to test with
-    let slabs: Vec<u32> = (0..5).collect();
-    let mut inserted_slabs = HashSet::default();
-
-    // Insert slabs
-    for &slab_id in &slabs {
-        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
-        insert_slab(store, &segment.id, slab).await?;
-        inserted_slabs.insert(slab_id);
-    }
-
-    // Retrieve and verify slabs
-    let retrieved_slabs = get_slabs(store, &segment.id).await?;
-
-    if retrieved_slabs != inserted_slabs {
-        return Err(format!(
-            "Retrieved slabs don't match inserted slabs. Expected: {inserted_slabs:?}, Got: \
-             {retrieved_slabs:?}"
-        ));
-    }
-
-    // Delete a slab and verify it's gone
-    if let Some(&slab_to_delete) = slabs.first() {
-        delete_slab(store, &segment.id, slab_to_delete).await?;
-
-        inserted_slabs.remove(&slab_to_delete);
-
-        let retrieved_slabs = get_slabs(store, &segment.id).await?;
-
-        if retrieved_slabs != inserted_slabs {
-            return Err(format!(
-                "Retrieved slabs after deletion don't match. Expected: {inserted_slabs:?}, Got: \
-                 {retrieved_slabs:?}"
-            ));
-        }
-    }
-
-    Ok(())
-}
+// Removed test_slab_operations - uses non-public API (insert_slab, get_slabs)
+// This functionality is covered by property-based tests in
+// prop_slab_metadata.rs
 
 /// Tests the `get_slab_range` operation of a `TriggerStore` implementation.
 ///
@@ -70,6 +16,8 @@ where
 /// - Query slabs within a specific range
 /// - Return only slabs that fall within the specified inclusive range
 /// - Handle empty ranges correctly
+///
+/// Uses `add_trigger` to implicitly create slabs (public API).
 ///
 /// # Errors
 ///
@@ -84,11 +32,20 @@ where
     // Insert the segment first
     insert_segment(store, segment).await?;
 
-    // Insert slabs with IDs 0, 5, 10, 15, 20
+    // Create slabs with IDs 0, 5, 10, 15, 20 by adding triggers at appropriate
+    // times Slabs are created implicitly when triggers are added
     let all_slab_ids: Vec<u32> = vec![0, 5, 10, 15, 20];
     for &slab_id in &all_slab_ids {
-        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
-        insert_slab(store, &segment.id, slab).await?;
+        // Calculate a time that falls within this slab
+        let time_secs = slab_id * segment.slab_size.seconds();
+        let time = CompactDateTime::from(time_secs);
+        let trigger = Trigger::new(
+            Key::from(format!("test-key-{slab_id}")),
+            time,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
+        add_trigger(store, segment, &trigger).await?;
     }
 
     // Test range 5..=15 should return [5, 10, 15]

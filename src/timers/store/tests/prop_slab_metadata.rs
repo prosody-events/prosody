@@ -5,11 +5,13 @@
 
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{SegmentId, TriggerStore};
+use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::SegmentId;
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::collections::BTreeSet;
+use std::error::Error;
 use std::fmt::Debug;
 use std::ops::RangeInclusive;
 use uuid::Uuid;
@@ -192,18 +194,18 @@ impl SlabMetadataModel {
 /// - Returned IDs don't match model
 /// - Any ID is outside the requested range
 /// - Ordering is incorrect
-async fn verify_slab_range<S>(
-    store: &S,
+async fn verify_slab_range<T>(
+    operations: &T,
     model: &SlabMetadataModel,
     segment_id: &SegmentId,
     range: RangeInclusive<SlabId>,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     let model_range = model.get_slab_range(segment_id, &range);
-    let store_range: Vec<SlabId> = store
+    let store_range: Vec<SlabId> = operations
         .get_slab_range(segment_id, range.clone())
         .try_collect()
         .await
@@ -246,7 +248,7 @@ where
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every segment ID:
-///    - `store.get_slabs(seg)` matches `model.get_slabs(seg)`
+///    - `operations.get_slabs(seg)` matches `model.get_slabs(seg)`
 ///    - Ordering is correct (ascending slab IDs)
 ///    - Range queries return correct subset
 ///
@@ -256,29 +258,32 @@ where
 /// - Store operations fail (insert, delete, get)
 /// - Store state doesn't match model state
 /// - Ordering invariants are violated
-pub async fn prop_slab_metadata_model_equivalence<S>(
-    store: &S,
+pub async fn prop_slab_metadata_model_equivalence<T>(
+    operations: &T,
     input: SlabMetadataTestInput,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     // Clean up slabs from this trial to ensure isolation
     // Even with unique v4 UUIDs, cleanup prevents test pollution if trials fail and
     // rerun
     for segment_id in &input.segment_ids {
         // Get all slabs for this segment and delete them
-        let slab_ids: Vec<SlabId> = store
+        let slab_ids: Vec<SlabId> = operations
             .get_slabs(segment_id)
             .try_collect()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to get slabs during cleanup: {e:?}"))?;
 
         for slab_id in slab_ids {
-            store.delete_slab(segment_id, slab_id).await.map_err(|e| {
-                color_eyre::eyre::eyre!("Failed to delete slab during cleanup: {e:?}")
-            })?;
+            operations
+                .delete_slab(segment_id, slab_id)
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!("Failed to delete slab during cleanup: {e:?}")
+                })?;
         }
     }
 
@@ -289,7 +294,7 @@ where
         match op {
             SlabMetadataOperation::InsertSlab { segment_id, slab } => {
                 model.apply(op);
-                store
+                operations
                     .insert_slab(segment_id, slab.clone())
                     .await
                     .map_err(|e| {
@@ -299,7 +304,7 @@ where
             SlabMetadataOperation::GetSlabs(segment_id) => {
                 // Verify query immediately against model
                 let expected = model.get_slabs(segment_id);
-                let actual: Vec<SlabId> = store
+                let actual: Vec<SlabId> = operations
                     .get_slabs(segment_id)
                     .try_collect()
                     .await
@@ -324,7 +329,7 @@ where
             }
             SlabMetadataOperation::GetSlabRange { segment_id, range } => {
                 // Verify query immediately against model
-                verify_slab_range(store, &model, segment_id, range.clone())
+                verify_slab_range(operations, &model, segment_id, range.clone())
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetSlabRange: {e}"))?;
             }
@@ -333,9 +338,12 @@ where
                 slab_id,
             } => {
                 model.apply(op);
-                store.delete_slab(segment_id, *slab_id).await.map_err(|e| {
-                    color_eyre::eyre::eyre!("Op #{op_idx} Delete slab failed: {e:?}")
-                })?;
+                operations
+                    .delete_slab(segment_id, *slab_id)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} Delete slab failed: {e:?}")
+                    })?;
             }
         }
     }
@@ -347,7 +355,7 @@ where
     for segment_id in &all_segment_ids {
         // Verify get_slabs matches
         let model_slabs = model.get_slabs(segment_id);
-        let store_slabs: Vec<SlabId> = store
+        let store_slabs: Vec<SlabId> = operations
             .get_slabs(segment_id)
             .try_collect()
             .await
@@ -379,7 +387,7 @@ where
     for segment_id in &all_segment_ids {
         // Test a few different ranges
         for range in [0..=5, 3..=8, 5..=15] {
-            verify_slab_range(store, &model, segment_id, range).await?;
+            verify_slab_range(operations, &model, segment_id, range).await?;
         }
     }
 
@@ -387,13 +395,13 @@ where
 }
 
 /// [`QuickCheck`] wrapper for slab metadata model equivalence property.
-pub fn test_prop_slab_metadata_model_equivalence<S>(
-    store: &S,
+pub fn test_prop_slab_metadata_model_equivalence<T>(
+    operations: &T,
     input: SlabMetadataTestInput,
 ) -> TestResult
 where
-    S: TriggerStore + Send + Sync + 'static,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync + 'static,
+    T::Error: Error + Send + Sync + 'static,
 {
     use tokio::runtime::Runtime;
 
@@ -401,7 +409,8 @@ where
         return TestResult::error("Failed to create tokio runtime");
     };
 
-    let result = rt.block_on(async { prop_slab_metadata_model_equivalence(store, input).await });
+    let result =
+        rt.block_on(async { prop_slab_metadata_model_equivalence(operations, input).await });
 
     match result {
         Ok(()) => TestResult::passed(),

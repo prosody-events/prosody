@@ -117,13 +117,7 @@ where
 
     // Test clear_triggers_for_key
     if let Some(trigger) = input.triggers.first() {
-        clear_triggers_for_key(
-            store,
-            &input.segment.id,
-            &trigger.key,
-            input.segment.slab_size,
-        )
-        .await?;
+        clear_triggers_for_key(store, &input.segment, trigger.timer_type, &trigger.key).await?;
 
         let remaining_key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
 
@@ -180,13 +174,8 @@ where
                 expected_times.remove(&time);
             }
             TriggerOperation::Clear => {
-                clear_triggers_for_key(
-                    store,
-                    &input.segment.id,
-                    &input.key,
-                    input.segment.slab_size,
-                )
-                .await?;
+                clear_triggers_for_key(store, &input.segment, TimerType::Application, &input.key)
+                    .await?;
                 expected_times.clear();
             }
         }

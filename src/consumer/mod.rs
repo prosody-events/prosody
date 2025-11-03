@@ -176,8 +176,8 @@ use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
 use crate::timers::store::TriggerStore;
-use crate::timers::store::cassandra::{CassandraTriggerStore, CassandraTriggerStoreError};
-use crate::timers::store::memory::InMemoryTriggerStore;
+use crate::timers::store::cassandra::{CassandraTriggerStoreError, cassandra_store};
+use crate::timers::store::memory::memory_store;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
@@ -767,7 +767,7 @@ impl ProsodyConsumer {
             TriggerStoreConfiguration::InMemory => initialize_consumer(ConsumerInitParams {
                 config: consumer_config.clone(),
                 handler_provider,
-                trigger_store: InMemoryTriggerStore::new(),
+                trigger_store: memory_store(),
                 watermark_version: watermark_version.clone(),
                 managers: managers.clone(),
                 allowed_events,
@@ -778,7 +778,7 @@ impl ProsodyConsumer {
                 initialize_consumer(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
-                    trigger_store: CassandraTriggerStore::new(cassandra_config).await?,
+                    trigger_store: cassandra_store(cassandra_config).await?,
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,

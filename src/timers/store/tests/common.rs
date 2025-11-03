@@ -23,12 +23,11 @@
 use super::TestStoreResult;
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::{HashMap, HashSet};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use std::fmt::Debug;
 
 /// Helper function to insert a segment.
@@ -70,64 +69,6 @@ where
         Ok(None) => Err("Failed to retrieve segment".to_owned()),
         Err(e) => Err(format!("Error retrieving segment: {e:?}")),
     }
-}
-
-/// Helper function to delete a segment and verify it's gone
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn delete_segment<S>(store: &S, segment_id: &SegmentId) -> TestStoreResult
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    store
-        .delete_segment(segment_id)
-        .await
-        .map_err(|e| format!("Failed to delete segment: {e:?}"))?;
-
-    match store.get_segment(segment_id).await {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) => Err("Segment still exists after deletion".to_owned()),
-        Err(e) => Err(format!("Error checking segment existence: {e:?}")),
-    }
-}
-
-/// Helper function to insert a slab
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn insert_slab<S>(store: &S, segment_id: &SegmentId, slab: Slab) -> TestStoreResult
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    store
-        .insert_slab(segment_id, slab)
-        .await
-        .map_err(|e| format!("Failed to insert slab: {e:?}"))?;
-    Ok(())
-}
-
-/// Helper function to get and verify slabs
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn get_slabs<S>(store: &S, segment_id: &SegmentId) -> Result<HashSet<SlabId>, String>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    store
-        .get_slabs(segment_id)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<HashSet<_>, _>>()
-        .map_err(|e| format!("Error retrieving slabs: {e:?}"))
 }
 
 /// Helper function to delete a slab
@@ -206,69 +147,10 @@ where
         .map_err(|e| format!("Error retrieving key triggers for {timer_type:?}: {e:?}"))
 }
 
-/// Helper function to get ALL triggers for a key (both Application and
-/// `DeferRetry`)
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn get_key_triggers_all_types<S>(
-    store: &S,
-    segment_id: &SegmentId,
-    key: &Key,
-) -> Result<HashSet<CompactDateTime>, String>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    store
-        .get_key_triggers_all_types(segment_id, key)
-        .map_ok(|trigger| trigger.time)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<HashSet<_>, _>>()
-        .map_err(|e| format!("Error retrieving all key times: {e:?}"))
-}
-
-/// Helper function to get triggers by slab (Application timers only)
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn get_slab_triggers<S>(store: &S, slab: &Slab) -> Result<HashSet<Trigger>, String>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    get_slab_triggers_by_type(store, slab, TimerType::Application).await
-}
-
-/// Helper function to get triggers by slab for a specific timer type
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn get_slab_triggers_by_type<S>(
-    store: &S,
-    slab: &Slab,
-    timer_type: TimerType,
-) -> Result<HashSet<Trigger>, String>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    store
-        .get_slab_triggers(slab, timer_type)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<HashSet<_>, _>>()
-        .map_err(|e| format!("Error retrieving slab triggers for {timer_type:?}: {e:?}"))
-}
-
 /// Helper function to get ALL triggers from a slab (both Application and
 /// `DeferRetry`)
+///
+/// Uses the public API method `get_slab_triggers_all_types`.
 ///
 /// # Errors
 ///
@@ -288,6 +170,22 @@ where
         .into_iter()
         .collect::<Result<HashSet<_>, _>>()
         .map_err(|e| format!("Error retrieving all slab triggers: {e:?}"))
+}
+
+/// Helper function to get triggers from a slab (all timer types)
+///
+/// This is an alias for `get_slab_triggers_all_types` for backwards
+/// compatibility with existing tests.
+///
+/// # Errors
+///
+/// Returns an error if the store operation fails.
+pub async fn get_slab_triggers<S>(store: &S, slab: &Slab) -> Result<HashSet<Trigger>, String>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    get_slab_triggers_all_types(store, slab).await
 }
 
 /// Helper function to remove a trigger
@@ -313,42 +211,41 @@ where
     Ok(())
 }
 
-/// Helper function to clear triggers for a key
+/// Helper function to clear all triggers for a key and timer type
+///
+/// Implemented using public API: get all triggers, then remove each one
 ///
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
 pub async fn clear_triggers_for_key<S>(
     store: &S,
-    segment_id: &SegmentId,
+    segment: &Segment,
+    timer_type: TimerType,
     key: &Key,
-    slab_size: CompactDuration,
 ) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    store
-        .clear_triggers_for_key(segment_id, TimerType::Application, key, slab_size)
+    // Get all trigger times for this key
+    let times: Vec<CompactDateTime> = store
+        .get_key_times(&segment.id, timer_type, key)
+        .collect::<Vec<_>>()
         .await
-        .map_err(|e| format!("Failed to clear triggers for key: {e:?}"))?;
-    Ok(())
-}
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to get key times: {e:?}"))?;
 
-/// Helper function to clear triggers for a slab
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn clear_slab_triggers<S>(store: &S, slab: &Slab) -> TestStoreResult
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    store
-        .clear_slab_triggers(slab)
-        .await
-        .map_err(|e| format!("Failed to clear slab triggers: {e:?}"))?;
+    // Remove each trigger
+    for time in times {
+        let slab = Slab::from_time(segment.id, segment.slab_size, time);
+        store
+            .remove_trigger(segment, &slab, key, time, timer_type)
+            .await
+            .map_err(|e| format!("Failed to remove trigger: {e:?}"))?;
+    }
+
     Ok(())
 }
 
@@ -387,7 +284,7 @@ where
         // Verify slab consistency for each time
         for &time in expected_times {
             let slab = Slab::from_time(segment.id, segment.slab_size, time);
-            let slab_triggers = get_slab_triggers(store, &slab).await?;
+            let slab_triggers = get_slab_triggers_all_types(store, &slab).await?;
 
             // Check if this trigger is in the correct slab
             let found_in_slab = slab_triggers

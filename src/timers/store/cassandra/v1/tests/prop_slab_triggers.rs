@@ -7,12 +7,12 @@
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::slab::SlabId;
-use crate::timers::store::{SegmentId, TriggerStore, TriggerV1};
+use crate::timers::store::cassandra::v1::V1Operations;
+use crate::timers::store::{SegmentId, TriggerV1};
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::collections::BTreeSet;
-use std::fmt::Debug;
 use tracing::Span;
 use uuid::Uuid;
 
@@ -206,20 +206,17 @@ impl V1SlabTriggerModel {
     }
 }
 
-/// Applies v1 slab trigger operations to both store and model with inline verification.
+/// Applies v1 slab trigger operations to both store and model with inline
+/// verification.
 ///
 /// # Errors
 ///
 /// Returns an error if operations fail or query results don't match model.
-async fn apply_v1_slab_trigger_operations<S>(
-    store: &S,
+async fn apply_v1_slab_trigger_operations(
+    v1_ops: &V1Operations,
     model: &mut V1SlabTriggerModel,
     operations: &[V1SlabTriggerOperation],
-) -> color_eyre::Result<()>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
+) -> color_eyre::Result<()> {
     for (op_idx, op) in operations.iter().enumerate() {
         match op {
             V1SlabTriggerOperation::InsertTrigger {
@@ -228,7 +225,7 @@ where
                 trigger,
             } => {
                 model.apply(op);
-                store
+                v1_ops
                     .insert_slab_trigger_v1(segment_id, *slab_id, trigger.clone())
                     .await
                     .map_err(|e| {
@@ -240,7 +237,7 @@ where
                 slab_id,
             } => {
                 let expected = model.get_triggers(segment_id, *slab_id);
-                let actual: Vec<TriggerV1> = store
+                let actual: Vec<TriggerV1> = v1_ops
                     .get_slab_triggers_v1(segment_id, *slab_id)
                     .try_collect()
                     .await
@@ -274,13 +271,11 @@ where
                 time,
             } => {
                 model.apply(op);
-                store
+                v1_ops
                     .delete_slab_trigger_v1(segment_id, *slab_id, key, *time)
                     .await
                     .map_err(|e| {
-                        color_eyre::eyre::eyre!(
-                            "Op #{op_idx} Delete v1 slab trigger failed: {e:?}"
-                        )
+                        color_eyre::eyre::eyre!("Op #{op_idx} Delete v1 slab trigger failed: {e:?}")
                     })?;
             }
             V1SlabTriggerOperation::Clear {
@@ -288,7 +283,7 @@ where
                 slab_id,
             } => {
                 model.apply(op);
-                store
+                v1_ops
                     .clear_slab_triggers_v1(segment_id, *slab_id)
                     .await
                     .map_err(|e| {
@@ -307,26 +302,22 @@ where
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every slab:
-///    - `store.get_slab_triggers_v1(seg, slab)` matches model
+///    - `operations.get_slab_triggers_v1(seg, slab)` matches model
 ///    - Ordering is correct (ascending by key, time)
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - Store operations fail (insert, delete, get, clear)
+/// - V1 operations fail (insert, delete, get, clear)
 /// - Store state doesn't match model state
 /// - Ordering invariants are violated
-pub async fn prop_v1_slab_trigger_model_equivalence<S>(
-    store: &S,
+pub async fn prop_v1_slab_trigger_model_equivalence(
+    operations: &V1Operations,
     input: V1SlabTriggerTestInput,
-) -> color_eyre::Result<()>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
+) -> color_eyre::Result<()> {
     for segment_id in &input.segment_ids {
         for slab_id in 0..5 {
-            store
+            operations
                 .clear_slab_triggers_v1(segment_id, slab_id)
                 .await
                 .map_err(|e| {
@@ -338,33 +329,33 @@ where
     }
 
     let mut model = V1SlabTriggerModel::new();
-    apply_v1_slab_trigger_operations(store, &mut model, &input.operations).await?;
+    apply_v1_slab_trigger_operations(operations, &mut model, &input.operations).await?;
 
     let all_slabs = model.all_slabs();
     for (segment_id, slab_id) in &all_slabs {
         let model_triggers = model.get_triggers(segment_id, *slab_id);
-        let store_triggers: Vec<TriggerV1> = store
+        let operations_triggers: Vec<TriggerV1> = operations
             .get_slab_triggers_v1(segment_id, *slab_id)
             .try_collect()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Get v1 slab triggers failed: {e:?}"))?;
 
-        let store_tuples: Vec<TriggerV1Tuple> = store_triggers
+        let operations_tuples: Vec<TriggerV1Tuple> = operations_triggers
             .iter()
             .map(|t| (t.key.clone(), t.time))
             .collect();
 
-        if model_triggers != store_tuples {
+        if model_triggers != operations_tuples {
             return Err(color_eyre::eyre::eyre!(
                 "V1 trigger mismatch for slab ({}, {}): expected {:?}, got {:?}",
                 segment_id,
                 slab_id,
                 model_triggers,
-                store_tuples
+                operations_tuples
             ));
         }
 
-        for window in store_tuples.windows(2) {
+        for window in operations_tuples.windows(2) {
             if window[0] >= window[1] {
                 return Err(color_eyre::eyre::eyre!(
                     "V1 trigger ordering violation for slab ({}, {}): {:?} >= {:?}",
@@ -381,21 +372,18 @@ where
 }
 
 /// [`QuickCheck`] wrapper for v1 slab trigger model equivalence property.
-pub fn test_prop_v1_slab_trigger_model_equivalence<S>(
-    store: &S,
+pub fn test_prop_v1_slab_trigger_model_equivalence(
+    operations: &V1Operations,
     input: V1SlabTriggerTestInput,
-) -> TestResult
-where
-    S: TriggerStore + Send + Sync + 'static,
-    S::Error: Debug,
-{
+) -> TestResult {
     use tokio::runtime::Runtime;
 
     let Ok(rt) = Runtime::new() else {
         return TestResult::error("Failed to create tokio runtime");
     };
 
-    let result = rt.block_on(async { prop_v1_slab_trigger_model_equivalence(store, input).await });
+    let result =
+        rt.block_on(async { prop_v1_slab_trigger_model_equivalence(operations, input).await });
 
     match result {
         Ok(()) => TestResult::passed(),

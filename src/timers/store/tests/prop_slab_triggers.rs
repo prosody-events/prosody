@@ -7,12 +7,14 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{SegmentId, TriggerStore};
+use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::SegmentId;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::collections::BTreeSet;
+use std::error::Error;
 use std::fmt::Debug;
 use tracing::Span;
 use uuid::Uuid;
@@ -227,21 +229,21 @@ impl SlabTriggerModel {
 /// # Errors
 ///
 /// Returns an error if triggers don't match or ordering is wrong.
-async fn verify_slab_triggers_by_type<S>(
-    store: &S,
+async fn verify_slab_triggers_by_type<T>(
+    operations: &T,
     model: &SlabTriggerModel,
     slab: &Slab,
     timer_type: TimerType,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     let segment_id = slab.segment_id();
     let slab_id = slab.id();
 
     let model_triggers = model.get_by_type(slab, timer_type);
-    let store_triggers: Vec<Trigger> = store
+    let store_triggers: Vec<Trigger> = operations
         .get_slab_triggers(slab, timer_type)
         .try_collect()
         .await
@@ -291,18 +293,18 @@ where
 /// - Query fails
 /// - Returned triggers don't match model
 /// - Ordering is incorrect
-async fn verify_slab_triggers_all_types<S>(
-    store: &S,
+async fn verify_slab_triggers_all_types<T>(
+    operations: &T,
     model: &SlabTriggerModel,
     slab: &Slab,
     op_idx: usize,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     let expected = model.get_all_types(slab);
-    let actual: Vec<Trigger> = store
+    let actual: Vec<Trigger> = operations
         .get_slab_triggers_all_types(slab)
         .try_collect()
         .await
@@ -341,10 +343,13 @@ where
 /// # Errors
 ///
 /// Returns an error if cleanup fails.
-async fn cleanup_slab_triggers<S>(store: &S, segment_ids: &[SegmentId]) -> color_eyre::Result<()>
+async fn cleanup_slab_triggers<T>(
+    operations: &T,
+    segment_ids: &[SegmentId],
+) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     let slab_size_pool = [3600, 7200, 1800]; // Match the pool in Arbitrary
 
@@ -354,7 +359,7 @@ where
             for &slab_size_seconds in &slab_size_pool {
                 let slab_size = CompactDuration::new(slab_size_seconds);
                 let slab = Slab::new(*segment_id, slab_id, slab_size);
-                store
+                operations
                     .clear_slab_triggers(&slab)
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Failed to clear slab triggers: {e:?}"))?;
@@ -373,10 +378,13 @@ where
 /// - Any query fails
 /// - Returned triggers don't match model
 /// - Ordering is incorrect
-async fn verify_final_slab_state<S>(store: &S, model: &SlabTriggerModel) -> color_eyre::Result<()>
+async fn verify_final_slab_state<T>(
+    operations: &T,
+    model: &SlabTriggerModel,
+) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     let all_slabs = model.all_slabs();
 
@@ -387,12 +395,12 @@ where
 
         // Verify get_slab_triggers for each timer type
         for timer_type in [TimerType::Application, TimerType::DeferRetry] {
-            verify_slab_triggers_by_type(store, model, &slab, timer_type).await?;
+            verify_slab_triggers_by_type(operations, model, &slab, timer_type).await?;
         }
 
         // Verify get_slab_triggers_all_types
         let model_all = model.get_all_types(&slab);
-        let store_all: Vec<Trigger> = store
+        let store_all: Vec<Trigger> = operations
             .get_slab_triggers_all_types(&slab)
             .try_collect()
             .await
@@ -437,9 +445,9 @@ where
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every slab:
-///    - `store.get_slab_triggers(slab, type)` matches `model.get_by_type(slab,
-///      type)`
-///    - `store.get_slab_triggers_all_types(slab)` matches
+///    - `operations.get_slab_triggers(slab, type)` matches
+///      `model.get_by_type(slab, type)`
+///    - `operations.get_slab_triggers_all_types(slab)` matches
 ///      `model.get_all_types(slab)`
 ///    - Ordering is correct (ascending by `timer_type`, key, time)
 ///    - Type filtering works correctly
@@ -451,18 +459,18 @@ where
 /// - Store state doesn't match model state
 /// - Ordering invariants are violated
 /// - Type filtering is incorrect
-pub async fn prop_slab_trigger_model_equivalence<S>(
-    store: &S,
+pub async fn prop_slab_trigger_model_equivalence<T>(
+    operations: &T,
     input: SlabTriggerTestInput,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     // Clean up the slabs from this trial to ensure isolation
     // Even with unique v4 UUIDs, cleanup prevents test pollution if trials fail and
     // rerun
-    cleanup_slab_triggers(store, &input.segment_ids).await?;
+    cleanup_slab_triggers(operations, &input.segment_ids).await?;
 
     let mut model = SlabTriggerModel::new();
 
@@ -471,7 +479,7 @@ where
         match op {
             SlabTriggerOperation::Insert { slab, trigger } => {
                 model.apply(op);
-                store
+                operations
                     .insert_slab_trigger(slab.clone(), trigger.clone())
                     .await
                     .map_err(|e| {
@@ -480,13 +488,13 @@ where
             }
             SlabTriggerOperation::GetByType { slab, timer_type } => {
                 // Verify query immediately against model
-                verify_slab_triggers_by_type(store, &model, slab, *timer_type)
+                verify_slab_triggers_by_type(operations, &model, slab, *timer_type)
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetByType: {e}"))?;
             }
             SlabTriggerOperation::GetAllTypes(slab) => {
                 // Verify query immediately against model
-                verify_slab_triggers_all_types(store, &model, slab, op_idx).await?;
+                verify_slab_triggers_all_types(operations, &model, slab, op_idx).await?;
             }
             SlabTriggerOperation::Delete {
                 slab,
@@ -495,7 +503,7 @@ where
                 time,
             } => {
                 model.apply(op);
-                store
+                operations
                     .delete_slab_trigger(slab, *timer_type, key, *time)
                     .await
                     .map_err(|e| {
@@ -504,7 +512,7 @@ where
             }
             SlabTriggerOperation::Clear(slab) => {
                 model.apply(op);
-                store.clear_slab_triggers(slab).await.map_err(|e| {
+                operations.clear_slab_triggers(slab).await.map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} Clear triggers failed: {e:?}")
                 })?;
             }
@@ -513,19 +521,19 @@ where
 
     // Final sanity check: verify model-store equivalence for all slabs
     // (queries were already verified inline, this catches any missed state)
-    verify_final_slab_state(store, &model).await?;
+    verify_final_slab_state(operations, &model).await?;
 
     Ok(())
 }
 
 /// [`QuickCheck`] wrapper for slab trigger model equivalence property.
-pub fn test_prop_slab_trigger_model_equivalence<S>(
-    store: &S,
+pub fn test_prop_slab_trigger_model_equivalence<T>(
+    operations: &T,
     input: SlabTriggerTestInput,
 ) -> TestResult
 where
-    S: TriggerStore + Send + Sync + 'static,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync + 'static,
+    T::Error: Error + Send + Sync + 'static,
 {
     use tokio::runtime::Runtime;
 
@@ -533,7 +541,8 @@ where
         return TestResult::error("Failed to create tokio runtime");
     };
 
-    let result = rt.block_on(async { prop_slab_trigger_model_equivalence(store, input).await });
+    let result =
+        rt.block_on(async { prop_slab_trigger_model_equivalence(operations, input).await });
 
     match result {
         Ok(()) => TestResult::passed(),

@@ -366,7 +366,8 @@ where
 mod tests {
     use super::*;
     use crate::timers::UncommittedTimer;
-    use crate::timers::store::memory::InMemoryTriggerStore;
+    use crate::timers::store::adapter::TableAdapter;
+    use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
     use std::time::Duration;
@@ -389,10 +390,10 @@ mod tests {
 
     /// Helper function to set up a timer manager for testing
     async fn setup_timer_manager() -> Result<(
-        impl Stream<Item = PendingTimer<InMemoryTriggerStore>>,
-        TimerManager<InMemoryTriggerStore>,
+        impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+        TimerManager<TableAdapter<InMemoryTriggerStore>>,
     )> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
 
@@ -411,7 +412,7 @@ mod tests {
     async fn test_new_timer_manager_creation() -> Result<()> {
         time::pause();
 
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
 

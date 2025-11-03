@@ -5,12 +5,14 @@
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::store::{SegmentId, TriggerStore};
+use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::SegmentId;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::collections::BTreeSet;
+use std::error::Error;
 use std::fmt::Debug;
 use tracing::Span;
 use uuid::Uuid;
@@ -293,19 +295,19 @@ impl KeyTriggerModel {
 /// # Errors
 ///
 /// Returns an error if times don't match or ordering is wrong.
-async fn verify_key_times<S>(
-    store: &S,
+async fn verify_key_times<T>(
+    operations: &T,
     model: &KeyTriggerModel,
     segment_id: &SegmentId,
     timer_type: TimerType,
     key: &Key,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     let model_times = model.get_times(segment_id, timer_type, key);
-    let store_times: Vec<CompactDateTime> = store
+    let store_times: Vec<CompactDateTime> = operations
         .get_key_times(segment_id, timer_type, key)
         .try_collect()
         .await
@@ -337,19 +339,19 @@ where
 ///
 /// Returns an error if triggers don't match, ordering is wrong, or type
 /// filtering fails.
-async fn verify_key_triggers<S>(
-    store: &S,
+async fn verify_key_triggers<T>(
+    operations: &T,
     model: &KeyTriggerModel,
     segment_id: &SegmentId,
     timer_type: TimerType,
     key: &Key,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     let model_triggers = model.get_triggers(segment_id, timer_type, key);
-    let store_triggers: Vec<Trigger> = store
+    let store_triggers: Vec<Trigger> = operations
         .get_key_triggers(segment_id, timer_type, key)
         .try_collect()
         .await
@@ -385,7 +387,7 @@ where
     }
 
     // Verify times match trigger times
-    let store_times: Vec<CompactDateTime> = store
+    let store_times: Vec<CompactDateTime> = operations
         .get_key_times(segment_id, timer_type, key)
         .try_collect()
         .await
@@ -408,18 +410,18 @@ where
 ///
 /// Returns an error if triggers don't match, ordering is wrong, or keys don't
 /// match.
-async fn verify_all_types<S>(
-    store: &S,
+async fn verify_all_types<T>(
+    operations: &T,
     model: &KeyTriggerModel,
     segment_id: &SegmentId,
     key: &Key,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     let model_all = model.get_all_types(segment_id, key);
-    let store_all: Vec<Trigger> = store
+    let store_all: Vec<Trigger> = operations
         .get_key_triggers_all_types(segment_id, key)
         .try_collect()
         .await
@@ -464,11 +466,11 @@ where
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every key:
-///    - `store.get_key_times(seg, type, key)` matches `model.get_times(seg,
-///      type, key)`
-///    - `store.get_key_triggers(seg, type, key)` matches
+///    - `operations.get_key_times(seg, type, key)` matches
+///      `model.get_times(seg, type, key)`
+///    - `operations.get_key_triggers(seg, type, key)` matches
 ///      `model.get_triggers(seg, type, key)`
-///    - `store.get_key_triggers_all_types(seg, key)` matches
+///    - `operations.get_key_triggers_all_types(seg, key)` matches
 ///      `model.get_all_types(seg, key)`
 ///    - Ordering is correct (ascending by `timer_type`, time)
 ///    - Type filtering works correctly
@@ -480,13 +482,13 @@ where
 /// - Store state doesn't match model state
 /// - Ordering invariants are violated
 /// - Type filtering is incorrect
-pub async fn prop_key_trigger_model_equivalence<S>(
-    store: &S,
+pub async fn prop_key_trigger_model_equivalence<T>(
+    operations: &T,
     input: KeyTriggerTestInput,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
 {
     // Clean up the keys from this trial to ensure isolation
     // Even with unique v4 UUIDs, cleanup prevents test pollution if trials fail and
@@ -496,7 +498,7 @@ where
     for segment_id in &input.segment_ids {
         for key_str in &key_pool {
             let key = Key::from(*key_str);
-            store
+            operations
                 .clear_key_triggers_all_types(segment_id, &key)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Failed to clear key triggers: {e:?}"))?;
@@ -513,7 +515,7 @@ where
                 trigger,
             } => {
                 model.apply(op);
-                store
+                operations
                     .insert_key_trigger(segment_id, trigger.clone())
                     .await
                     .map_err(|e| {
@@ -526,7 +528,7 @@ where
                 key,
             } => {
                 // Verify query immediately against model
-                verify_key_times(store, &model, segment_id, *timer_type, key)
+                verify_key_times(operations, &model, segment_id, *timer_type, key)
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetTimes: {e}"))?;
             }
@@ -536,13 +538,13 @@ where
                 key,
             } => {
                 // Verify query immediately against model
-                verify_key_triggers(store, &model, segment_id, *timer_type, key)
+                verify_key_triggers(operations, &model, segment_id, *timer_type, key)
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetTriggers: {e}"))?;
             }
             KeyTriggerOperation::GetAllTypes { segment_id, key } => {
                 // Verify query immediately against model
-                verify_all_types(store, &model, segment_id, key)
+                verify_all_types(operations, &model, segment_id, key)
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetAllTypes: {e}"))?;
             }
@@ -553,7 +555,7 @@ where
                 time,
             } => {
                 model.apply(op);
-                store
+                operations
                     .delete_key_trigger(segment_id, *timer_type, key, *time)
                     .await
                     .map_err(|e| {
@@ -566,7 +568,7 @@ where
                 key,
             } => {
                 model.apply(op);
-                store
+                operations
                     .clear_key_triggers(segment_id, *timer_type, key)
                     .await
                     .map_err(|e| {
@@ -575,7 +577,7 @@ where
             }
             KeyTriggerOperation::ClearAllTypes { segment_id, key } => {
                 model.apply(op);
-                store
+                operations
                     .clear_key_triggers_all_types(segment_id, key)
                     .await
                     .map_err(|e| {
@@ -594,25 +596,25 @@ where
     for (segment_id, key) in &all_keys {
         // Verify get_key_times and get_key_triggers for each timer type
         for timer_type in [TimerType::Application, TimerType::DeferRetry] {
-            verify_key_times(store, &model, segment_id, timer_type, key).await?;
-            verify_key_triggers(store, &model, segment_id, timer_type, key).await?;
+            verify_key_times(operations, &model, segment_id, timer_type, key).await?;
+            verify_key_triggers(operations, &model, segment_id, timer_type, key).await?;
         }
 
         // Verify get_key_triggers_all_types
-        verify_all_types(store, &model, segment_id, key).await?;
+        verify_all_types(operations, &model, segment_id, key).await?;
     }
 
     Ok(())
 }
 
 /// [`QuickCheck`] wrapper for key trigger model equivalence property.
-pub fn test_prop_key_trigger_model_equivalence<S>(
-    store: &S,
+pub fn test_prop_key_trigger_model_equivalence<T>(
+    operations: &T,
     input: KeyTriggerTestInput,
 ) -> TestResult
 where
-    S: TriggerStore + Send + Sync + 'static,
-    S::Error: Debug,
+    T: TriggerOperations + Send + Sync + 'static,
+    T::Error: Error + Send + Sync + 'static,
 {
     use tokio::runtime::Runtime;
 
@@ -620,7 +622,7 @@ where
         return TestResult::error("Failed to create tokio runtime");
     };
 
-    let result = rt.block_on(async { prop_key_trigger_model_equivalence(store, input).await });
+    let result = rt.block_on(async { prop_key_trigger_model_equivalence(operations, input).await });
 
     match result {
         Ok(()) => TestResult::passed(),

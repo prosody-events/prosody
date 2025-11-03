@@ -718,7 +718,8 @@ async fn prepare_delete_slab_trigger_v1(
     prepare(
         session,
         &format!(
-            "delete from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ? and key = ? and time = ?"
+            "delete from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ? and key = ? and \
+             time = ?"
         ),
     )
     .await
@@ -739,7 +740,8 @@ async fn prepare_clear_slab_triggers_v1(
     .await
 }
 
-/// Prepares a CQL statement for deleting a single v1 trigger from the key index.
+/// Prepares a CQL statement for deleting a single v1 trigger from the key
+/// index.
 ///
 /// Creates a prepared statement for: `DELETE FROM timer_keys WHERE segment_id =
 /// ? AND key = ? AND time = ?`

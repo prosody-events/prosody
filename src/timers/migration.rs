@@ -51,11 +51,11 @@
 use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
 use crate::timers::slab::Slab;
-use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerV1};
+use crate::timers::store::cassandra::{CassandraTriggerStore, CassandraTriggerStoreError};
+use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::{Segment, SegmentVersion, TriggerV1};
 use crate::timers::{TimerType, Trigger};
 use futures::TryStreamExt;
-use std::error::Error;
-use std::fmt::Debug;
 use tracing::{debug, info, instrument, warn};
 
 /// Checks if a segment needs migration from v1 to v2.
@@ -77,9 +77,12 @@ pub fn needs_migration(segment: &Segment) -> bool {
 /// Reads all v1 triggers, converts them to v2 with `TimerType::Application`,
 /// writes to v2 tables, updates the segment version, and cleans up v1 data.
 ///
+/// **Note**: This function is Cassandra-specific since V1 schema only exists
+/// for Cassandra storage.
+///
 /// # Arguments
 ///
-/// * `store` - The trigger store implementation
+/// * `store` - The Cassandra trigger store implementation
 /// * `segment` - The segment to migrate
 ///
 /// # Errors
@@ -90,19 +93,18 @@ pub fn needs_migration(segment: &Segment) -> bool {
 /// - Updating segment version fails
 /// - Cleaning up v1 data fails
 #[instrument(level = "info", skip(store), err)]
-pub async fn migrate_segment<T>(
-    store: &T,
+pub async fn migrate_segment(
+    store: &CassandraTriggerStore,
     segment: &Segment,
-) -> Result<(), TimerManagerError<T::Error>>
-where
-    T: TriggerStore,
-    T::Error: Error + Debug,
-{
+) -> Result<(), TimerManagerError<CassandraTriggerStoreError>> {
     let segment_id = segment.id;
     info!("Starting v1 to v2 migration for segment {segment_id}");
 
+    // Get V1 operations for reading V1 data
+    let v1_ops = store.v1_operations();
+
     // Phase 1: Collect all v1 slabs (non-destructive)
-    let slab_ids: Vec<_> = store
+    let slab_ids: Vec<_> = v1_ops
         .get_slabs_v1(&segment_id)
         .try_collect()
         .await
@@ -118,7 +120,7 @@ where
         let slab = Slab::new(segment_id, *slab_id, segment.slab_size);
 
         // Read v1 triggers for this slab
-        let v1_triggers: Vec<TriggerV1> = store
+        let v1_triggers: Vec<TriggerV1> = v1_ops
             .get_slab_triggers_v1(&segment_id, *slab_id)
             .try_collect()
             .await
@@ -170,7 +172,7 @@ where
     // Phase 4: Clean up v1 data (can fail safely - data is orphaned but harmless)
     // If cleanup fails, we can retry it later or ignore it
     for slab_id in &slab_ids {
-        if let Err(error) = store.delete_slab_v1(&segment_id, *slab_id).await {
+        if let Err(error) = v1_ops.delete_slab_v1(&segment_id, *slab_id).await {
             warn!(
                 "Failed to delete v1 slab {slab_id} for segment {segment_id}: {error:#}; v1 data \
                  is orphaned but migration completed successfully"
@@ -211,9 +213,11 @@ pub fn needs_slab_size_migration(segment: &Segment, desired_slab_size: CompactDu
 /// **IMPORTANT:** This function requires the segment to be v2. Phase 1 version
 /// migration must be completed before calling this function.
 ///
+/// **Note**: This function is Cassandra-specific.
+///
 /// # Arguments
 ///
-/// * `store` - The trigger store implementation
+/// * `store` - The Cassandra trigger store implementation
 /// * `segment` - The v2 segment to migrate
 /// * `desired_slab_size` - The target slab size
 ///
@@ -226,15 +230,11 @@ pub fn needs_slab_size_migration(segment: &Segment, desired_slab_size: CompactDu
 /// - Updating segment `slab_size` fails
 /// - Cleaning up old slabs fails
 #[instrument(level = "info", skip(store), err)]
-pub async fn migrate_slab_size<T>(
-    store: &T,
+pub async fn migrate_slab_size(
+    store: &CassandraTriggerStore,
     segment: &Segment,
     desired_slab_size: CompactDuration,
-) -> Result<(), TimerManagerError<T::Error>>
-where
-    T: TriggerStore,
-    T::Error: Error + Debug,
-{
+) -> Result<(), TimerManagerError<CassandraTriggerStoreError>> {
     let segment_id = segment.id;
     let old_slab_size = segment.slab_size;
 

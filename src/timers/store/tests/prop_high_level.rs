@@ -10,7 +10,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::collections::BTreeSet;
 use std::fmt::Debug;
@@ -21,9 +21,10 @@ use uuid::Uuid;
 type TriggerTuple = (Key, CompactDateTime, TimerType);
 
 /// High-level operations that coordinate across dual indices.
+/// Only uses the 9 public TriggerStore methods.
 #[derive(Clone, Debug)]
 pub enum HighLevelOperation {
-    /// Add a trigger to both slab and key indices.
+    /// Add a trigger to both slab and key indices (add_trigger).
     AddTrigger {
         /// The segment.
         segment: Segment,
@@ -32,7 +33,7 @@ pub enum HighLevelOperation {
         /// The trigger to add.
         trigger: Trigger,
     },
-    /// Remove a trigger from both slab and key indices.
+    /// Remove a trigger from both slab and key indices (remove_trigger).
     RemoveTrigger {
         /// The segment.
         segment: Segment,
@@ -45,34 +46,29 @@ pub enum HighLevelOperation {
         /// The timer type.
         timer_type: TimerType,
     },
-    /// Clear all triggers for a key+type from both indices.
-    ClearTriggersForKey {
+    /// Delete a slab from storage (delete_slab).
+    DeleteSlab {
         /// The segment ID.
         segment_id: SegmentId,
-        /// The timer type.
-        timer_type: TimerType,
-        /// The key.
-        key: Key,
-        /// The slab size.
-        slab_size: CompactDuration,
+        /// The slab ID.
+        slab_id: SlabId,
     },
-    /// Clear all triggers for a key (all types) from both indices.
-    ClearAllTriggersForKey {
-        /// The segment ID.
-        segment_id: SegmentId,
-        /// The key.
-        key: Key,
-        /// The slab size.
-        slab_size: CompactDuration,
-    },
-    /// Query slab triggers to verify state.
-    GetSlabTriggers {
+    /// Query slab triggers (all types) to verify state
+    /// (get_slab_triggers_all_types).
+    GetSlabTriggersAllTypes {
         /// The slab.
         slab: Slab,
+    },
+    /// Query key times to verify state (get_key_times).
+    GetKeyTimes {
+        /// The segment ID.
+        segment_id: SegmentId,
         /// The timer type.
         timer_type: TimerType,
+        /// The key.
+        key: Key,
     },
-    /// Query key triggers to verify state.
+    /// Query key triggers to verify state (get_key_triggers).
     GetKeyTriggers {
         /// The segment ID.
         segment_id: SegmentId,
@@ -80,6 +76,13 @@ pub enum HighLevelOperation {
         timer_type: TimerType,
         /// The key.
         key: Key,
+    },
+    /// Query slab range to verify state (get_slab_range).
+    GetSlabRange {
+        /// The segment ID.
+        segment_id: SegmentId,
+        /// The range of slab IDs.
+        range: std::ops::RangeInclusive<SlabId>,
     },
 }
 
@@ -109,8 +112,10 @@ impl Arbitrary for HighLevelTestInput {
         let mut operations = Vec::with_capacity(op_count);
 
         // Track which triggers exist to generate valid removes
-        let mut existing_triggers: HashMap<(SegmentId, SlabId, Key, CompactDateTime, TimerType), ()> =
-            HashMap::default();
+        let mut existing_triggers: HashMap<
+            (SegmentId, SlabId, Key, CompactDateTime, TimerType),
+            (),
+        > = HashMap::default();
 
         for _ in 0..op_count {
             let segment_idx = usize::from(u8::arbitrary(g)) % segments.len();
@@ -128,7 +133,8 @@ impl Arbitrary for HighLevelTestInput {
                     };
                     let slab = Slab::from_time(segment.id, segment.slab_size, time);
 
-                    existing_triggers.insert((segment.id, slab.id(), key.clone(), time, timer_type), ());
+                    existing_triggers
+                        .insert((segment.id, slab.id(), key.clone(), time, timer_type), ());
 
                     HighLevelOperation::AddTrigger {
                         segment: segment.clone(),
@@ -159,11 +165,19 @@ impl Arbitrary for HighLevelTestInput {
                     } else {
                         // Remove an existing trigger
                         let keys: Vec<_> = existing_triggers.keys().cloned().collect();
-                        let (seg_id, slab_id, key, time, timer_type) = &keys[usize::arbitrary(g) % keys.len()];
+                        let (seg_id, slab_id, key, time, timer_type) =
+                            &keys[usize::arbitrary(g) % keys.len()];
 
-                        existing_triggers.remove(&(*seg_id, *slab_id, key.clone(), *time, *timer_type));
+                        existing_triggers.remove(&(
+                            *seg_id,
+                            *slab_id,
+                            key.clone(),
+                            *time,
+                            *timer_type,
+                        ));
 
-                        // Find the matching segment - use first segment as fallback (should never happen)
+                        // Find the matching segment - use first segment as fallback (should never
+                        // happen)
                         let segment = segments
                             .iter()
                             .find(|s| s.id == *seg_id)
@@ -181,54 +195,43 @@ impl Arbitrary for HighLevelTestInput {
                     }
                 }
                 2 => {
-                    // ClearTriggersForKey
-                    let key: Key = format!("key-{}", u8::arbitrary(g) % 5).into();
-                    let timer_type = if bool::arbitrary(g) {
-                        TimerType::Application
-                    } else {
-                        TimerType::DeferRetry
-                    };
+                    // DeleteSlab
+                    let time = CompactDateTime::arbitrary(g);
+                    let slab = Slab::from_time(segment.id, segment.slab_size, time);
+                    let slab_id = slab.id();
 
-                    // Remove all triggers for this key+type
-                    existing_triggers.retain(|&(seg_id, _, ref k, _, tt), _| {
-                        !(seg_id == segment.id && k == &key && tt == timer_type)
-                    });
+                    // Remove all triggers in this slab from existing_triggers
+                    existing_triggers
+                        .retain(|&(seg_id, sid, ..), _| !(seg_id == segment.id && sid == slab_id));
 
-                    HighLevelOperation::ClearTriggersForKey {
+                    HighLevelOperation::DeleteSlab {
                         segment_id: segment.id,
-                        timer_type,
-                        key,
-                        slab_size: segment.slab_size,
+                        slab_id,
                     }
                 }
                 3 => {
-                    // ClearAllTriggersForKey
-                    let key: Key = format!("key-{}", u8::arbitrary(g) % 5).into();
-
-                    // Remove all triggers for this key (all types)
-                    existing_triggers.retain(|&(seg_id, _, ref k, _, _), _| {
-                        !(seg_id == segment.id && k == &key)
-                    });
-
-                    HighLevelOperation::ClearAllTriggersForKey {
-                        segment_id: segment.id,
-                        key,
-                        slab_size: segment.slab_size,
-                    }
-                }
-                4 => {
-                    // GetSlabTriggers query
+                    // GetSlabTriggersAllTypes query
                     let time = CompactDateTime::arbitrary(g);
                     let slab = Slab::from_time(segment.id, segment.slab_size, time);
+
+                    HighLevelOperation::GetSlabTriggersAllTypes { slab }
+                }
+                4 => {
+                    // GetKeyTimes query
+                    let key: Key = format!("key-{}", u8::arbitrary(g) % 5).into();
                     let timer_type = if bool::arbitrary(g) {
                         TimerType::Application
                     } else {
                         TimerType::DeferRetry
                     };
 
-                    HighLevelOperation::GetSlabTriggers { slab, timer_type }
+                    HighLevelOperation::GetKeyTimes {
+                        segment_id: segment.id,
+                        timer_type,
+                        key,
+                    }
                 }
-                _ => {
+                5 => {
                     // GetKeyTriggers query
                     let key: Key = format!("key-{}", u8::arbitrary(g) % 5).into();
                     let timer_type = if bool::arbitrary(g) {
@@ -241,6 +244,16 @@ impl Arbitrary for HighLevelTestInput {
                         segment_id: segment.id,
                         timer_type,
                         key,
+                    }
+                }
+                _ => {
+                    // GetSlabRange query
+                    let start = u32::arbitrary(g) % 10;
+                    let end = start + (u32::arbitrary(g) % 5);
+
+                    HighLevelOperation::GetSlabRange {
+                        segment_id: segment.id,
+                        range: start..=end,
                     }
                 }
             };
@@ -312,65 +325,32 @@ impl HighLevelModel {
                 let tuple = (key.clone(), *time, *timer_type);
 
                 // Remove from slab index
-                if let Some(triggers) = self.slab_index.get_mut(&(segment.id, slab.id(), *timer_type)) {
+                if let Some(triggers) =
+                    self.slab_index
+                        .get_mut(&(segment.id, slab.id(), *timer_type))
+                {
                     triggers.remove(&tuple);
                 }
 
                 // Remove from key index
-                if let Some(triggers) = self.key_index.get_mut(&(segment.id, key.clone(), *timer_type)) {
+                if let Some(triggers) =
+                    self.key_index
+                        .get_mut(&(segment.id, key.clone(), *timer_type))
+                {
                     triggers.remove(&tuple);
                 }
             }
-            HighLevelOperation::ClearTriggersForKey {
-                segment_id,
-                timer_type,
-                key,
-                slab_size,
-            } => {
-                // Get all triggers for this key+type from key index
-                let triggers_to_remove: Vec<TriggerTuple> = self.key_index
-                    .get(&(*segment_id, key.clone(), *timer_type))
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
-
-                // Remove from slab index for each trigger
-                for (k, time, tt) in &triggers_to_remove {
-                    let slab = Slab::from_time(*segment_id, *slab_size, *time);
-                    if let Some(triggers) = self.slab_index.get_mut(&(*segment_id, slab.id(), *tt)) {
-                        triggers.remove(&(k.clone(), *time, *tt));
-                    }
-                }
-
-                // Clear from key index
-                self.key_index.remove(&(*segment_id, key.clone(), *timer_type));
+            HighLevelOperation::DeleteSlab { .. } => {
+                // delete_slab only removes slab metadata, NOT triggers
+                // Triggers remain in both slab_triggers and key_triggers tables
+                // until explicitly removed with remove_trigger
+                // The model tracks trigger data, not metadata, so this is a
+                // no-op
             }
-            HighLevelOperation::ClearAllTriggersForKey {
-                segment_id,
-                key,
-                slab_size,
-            } => {
-                // Collect all triggers for this key across all timer types
-                let mut triggers_to_remove = Vec::new();
-                for timer_type in [TimerType::Application, TimerType::DeferRetry] {
-                    if let Some(triggers) = self.key_index.get(&(*segment_id, key.clone(), timer_type)) {
-                        triggers_to_remove.extend(triggers.iter().cloned());
-                    }
-                }
-
-                // Remove from slab index for each trigger
-                for (k, time, tt) in &triggers_to_remove {
-                    let slab = Slab::from_time(*segment_id, *slab_size, *time);
-                    if let Some(triggers) = self.slab_index.get_mut(&(*segment_id, slab.id(), *tt)) {
-                        triggers.remove(&(k.clone(), *time, *tt));
-                    }
-                }
-
-                // Clear from key index for all timer types
-                for timer_type in [TimerType::Application, TimerType::DeferRetry] {
-                    self.key_index.remove(&(*segment_id, key.clone(), timer_type));
-                }
-            }
-            HighLevelOperation::GetSlabTriggers { .. } | HighLevelOperation::GetKeyTriggers { .. } => {
+            HighLevelOperation::GetSlabTriggersAllTypes { .. }
+            | HighLevelOperation::GetKeyTimes { .. }
+            | HighLevelOperation::GetKeyTriggers { .. }
+            | HighLevelOperation::GetSlabRange { .. } => {
                 // Queries don't modify state
             }
         }
@@ -426,7 +406,9 @@ where
                 store
                     .add_trigger(segment, slab.clone(), trigger.clone())
                     .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger failed: {e:?}"))?;
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger failed: {e:?}")
+                    })?;
             }
             HighLevelOperation::RemoveTrigger {
                 segment,
@@ -439,54 +421,81 @@ where
                 store
                     .remove_trigger(segment, slab, key, *time, *timer_type)
                     .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} RemoveTrigger failed: {e:?}"))?;
-            }
-            HighLevelOperation::ClearTriggersForKey {
-                segment_id,
-                timer_type,
-                key,
-                slab_size,
-            } => {
-                model.apply(op);
-                store
-                    .clear_triggers_for_key(segment_id, *timer_type, key, *slab_size)
-                    .await
                     .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} ClearTriggersForKey failed: {e:?}")
+                        color_eyre::eyre::eyre!("Op #{op_idx} RemoveTrigger failed: {e:?}")
                     })?;
             }
-            HighLevelOperation::ClearAllTriggersForKey {
+            HighLevelOperation::DeleteSlab {
                 segment_id,
-                key,
-                slab_size,
+                slab_id,
             } => {
                 model.apply(op);
-                store
-                    .clear_all_triggers_for_key(segment_id, key, *slab_size)
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} ClearAllTriggersForKey failed: {e:?}")
-                    })?;
+                store.delete_slab(segment_id, *slab_id).await.map_err(|e| {
+                    color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab failed: {e:?}")
+                })?;
             }
-            HighLevelOperation::GetSlabTriggers { slab, timer_type } => {
-                let expected = model.get_slab_triggers(&slab.segment_id(), slab.id(), *timer_type);
+            HighLevelOperation::GetSlabTriggersAllTypes { slab } => {
+                // Get expected from model - collect all triggers for this slab across ALL timer
+                // types without enumerating them
+                let mut expected = BTreeSet::new();
+                let target_seg_id = slab.segment_id();
+                let target_slab_id = slab.id();
+                for ((seg_id, slab_id, _timer_type), trigger_set) in &model.slab_index {
+                    if seg_id == target_seg_id && *slab_id == target_slab_id {
+                        expected.extend(trigger_set.iter().cloned());
+                    }
+                }
+
                 let actual: Vec<Trigger> = store
-                    .get_slab_triggers(slab, *timer_type)
+                    .get_slab_triggers_all_types(slab)
                     .try_collect()
                     .await
                     .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} GetSlabTriggers failed: {e:?}")
+                        color_eyre::eyre::eyre!(
+                            "Op #{op_idx} GetSlabTriggersAllTypes failed: {e:?}"
+                        )
                     })?;
 
-                let actual_tuples: Vec<TriggerTuple> = actual
+                let actual_tuples: BTreeSet<TriggerTuple> = actual
                     .iter()
                     .map(|t| (t.key.clone(), t.time, t.timer_type))
                     .collect();
 
                 if expected != actual_tuples {
                     return Err(color_eyre::eyre::eyre!(
-                        "Op #{op_idx} GetSlabTriggers mismatch: expected {expected:?}, got \
-                         {actual_tuples:?}"
+                        "Op #{op_idx} GetSlabTriggersAllTypes mismatch: expected {expected:?}, \
+                         got {actual_tuples:?}"
+                    ));
+                }
+            }
+            HighLevelOperation::GetKeyTimes {
+                segment_id,
+                timer_type,
+                key,
+            } => {
+                // Get expected times from model
+                let expected: BTreeSet<CompactDateTime> = model
+                    .get_key_triggers(segment_id, key, *timer_type)
+                    .iter()
+                    .map(|(_, time, _)| *time)
+                    .collect();
+
+                let actual: Vec<CompactDateTime> = store
+                    .get_key_times(segment_id, *timer_type, key)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} GetKeyTimes failed: {e:?}")
+                    })?;
+
+                let actual_set: BTreeSet<CompactDateTime> = actual.into_iter().collect();
+
+                if expected != actual_set {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Op #{op_idx} GetKeyTimes mismatch: expected {expected:?}, got \
+                         {actual_set:?}"
                     ));
                 }
             }
@@ -495,7 +504,11 @@ where
                 timer_type,
                 key,
             } => {
-                let expected = model.get_key_triggers(segment_id, key, *timer_type);
+                let expected: BTreeSet<TriggerTuple> = model
+                    .get_key_triggers(segment_id, key, *timer_type)
+                    .into_iter()
+                    .collect();
+
                 let actual: Vec<Trigger> = store
                     .get_key_triggers(segment_id, *timer_type, key)
                     .try_collect()
@@ -504,7 +517,7 @@ where
                         color_eyre::eyre::eyre!("Op #{op_idx} GetKeyTriggers failed: {e:?}")
                     })?;
 
-                let actual_tuples: Vec<TriggerTuple> = actual
+                let actual_tuples: BTreeSet<TriggerTuple> = actual
                     .iter()
                     .map(|t| (t.key.clone(), t.time, t.timer_type))
                     .collect();
@@ -516,15 +529,83 @@ where
                     ));
                 }
             }
+            HighLevelOperation::GetSlabRange { segment_id, range } => {
+                // Get expected slab IDs from model
+                let expected: BTreeSet<SlabId> = model
+                    .slab_index
+                    .keys()
+                    .filter(|(seg_id, slab_id, _)| {
+                        *seg_id == *segment_id && range.contains(slab_id)
+                    })
+                    .map(|(_, slab_id, _)| *slab_id)
+                    .collect();
+
+                let actual: Vec<SlabId> = store
+                    .get_slab_range(segment_id, range.clone())
+                    .try_collect()
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} GetSlabRange failed: {e:?}")
+                    })?;
+
+                let actual_set: BTreeSet<SlabId> = actual.into_iter().collect();
+
+                if expected != actual_set {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Op #{op_idx} GetSlabRange mismatch: expected {expected:?}, got \
+                         {actual_set:?}"
+                    ));
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Verifies dual-index consistency by comparing all triggers in slab and key indices.
+/// Cleans up all test data using only public TriggerStore API.
+async fn cleanup_test_data<S>(
+    store: &S,
+    model: &HighLevelModel,
+    segments: &[Segment],
+) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    // Remove all triggers from the model
+    for ((segment_id, _slab_id, _timer_type), trigger_set) in &model.slab_index {
+        let segment = segments
+            .iter()
+            .find(|s| s.id == *segment_id)
+            .ok_or_else(|| color_eyre::eyre::eyre!("Segment not found during cleanup"))?;
+
+        for (key, time, timer_type) in trigger_set {
+            let slab = Slab::from_time(*segment_id, segment.slab_size, *time);
+            // Ignore errors during cleanup - triggers may have been removed by test
+            // operations
+            let _ = store
+                .remove_trigger(segment, &slab, key, *time, *timer_type)
+                .await;
+        }
+    }
+
+    // Delete all slabs that were created
+    let mut deleted_slabs = std::collections::HashSet::new();
+    for ((segment_id, slab_id, _timer_type), _) in &model.slab_index {
+        if deleted_slabs.insert((*segment_id, *slab_id)) {
+            // Ignore errors - slabs may have been deleted by test operations
+            let _ = store.delete_slab(segment_id, *slab_id).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Verifies dual-index consistency by comparing all triggers in slab and key
+/// indices.
 ///
-/// This is the critical verification that high-level operations maintain consistency
-/// across both indices.
+/// This is the critical verification that high-level operations maintain
+/// consistency across both indices.
 async fn verify_dual_index_consistency<S>(
     store: &S,
     model: &HighLevelModel,
@@ -536,14 +617,25 @@ where
 {
     use std::collections::HashSet;
 
-    // Collect all triggers from slab indices
+    // Collect all triggers from slab indices using get_slab_triggers_all_types
     let mut slab_triggers = HashSet::new();
-    for ((segment_id, slab_id, timer_type), _) in &model.slab_index {
-        let segment = segments.iter().find(|s| s.id == *segment_id).unwrap_or(&segments[0]);
+    let mut processed_slabs = HashSet::new();
+
+    for ((segment_id, slab_id, _timer_type), _) in &model.slab_index {
+        // Only process each slab once (since get_slab_triggers_all_types returns all
+        // timer types)
+        if !processed_slabs.insert((*segment_id, *slab_id)) {
+            continue;
+        }
+
+        let segment = segments
+            .iter()
+            .find(|s| s.id == *segment_id)
+            .unwrap_or(&segments[0]);
         let slab = Slab::new(*segment_id, *slab_id, segment.slab_size);
 
         let triggers: Vec<Trigger> = store
-            .get_slab_triggers(&slab, *timer_type)
+            .get_slab_triggers_all_types(&slab)
             .try_collect()
             .await
             .map_err(|e| {
@@ -587,9 +679,8 @@ where
         let key_only: Vec<_> = key_triggers.difference(&slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
-            "Dual-index consistency violation!\n\
-             Triggers in slab index but not key index: {slab_only:?}\n\
-             Triggers in key index but not slab index: {key_only:?}"
+            "Dual-index consistency violation!\nTriggers in slab index but not key index: \
+             {slab_only:?}\nTriggers in key index but not slab index: {key_only:?}"
         ));
     }
 
@@ -607,9 +698,8 @@ where
         let model_only: Vec<_> = model_triggers.difference(&slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
-            "Store does not match model!\n\
-             Triggers in store but not model: {store_only:?}\n\
-             Triggers in model but not store: {model_only:?}"
+            "Store does not match model!\nTriggers in store but not model: \
+             {store_only:?}\nTriggers in model but not store: {model_only:?}"
         ));
     }
 
@@ -625,19 +715,30 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    // Clean up test data
+    // Insert all segments first
     for segment in &input.segments {
         store
-            .delete_segment(&segment.id)
+            .insert_segment(segment.clone())
             .await
-            .map_err(|e| color_eyre::eyre::eyre!("Failed to clean up segment: {e:?}"))?;
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to insert segment: {e:?}"))?;
     }
 
     let mut model = HighLevelModel::new();
-    apply_high_level_operations(store, &mut model, &input.operations).await?;
 
-    // CRITICAL: Verify dual-index consistency after all operations
-    verify_dual_index_consistency(store, &model, &input.segments).await
+    // Apply operations and verify, ensuring cleanup happens even if test fails
+    let result = async {
+        apply_high_level_operations(store, &mut model, &input.operations).await?;
+        // CRITICAL: Verify dual-index consistency BEFORE cleanup
+        verify_dual_index_consistency(store, &model, &input.segments).await?;
+        Ok(())
+    }
+    .await;
+
+    // Always cleanup, even if test failed
+    cleanup_test_data(store, &model, &input.segments).await?;
+
+    // Return the verification result
+    result
 }
 
 /// [`QuickCheck`] wrapper for high-level dual-index consistency property.

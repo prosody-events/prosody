@@ -5,12 +5,12 @@
 //! without slab size information.
 
 use crate::timers::slab::SlabId;
-use crate::timers::store::{SegmentId, TriggerStore};
+use crate::timers::store::SegmentId;
+use crate::timers::store::cassandra::v1::V1Operations;
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::collections::BTreeSet;
-use std::fmt::Debug;
 use uuid::Uuid;
 
 /// Operations that can be performed on the v1 slab metadata table.
@@ -166,21 +166,17 @@ impl V1SlabMetadataModel {
 /// - Store operations fail (insert, delete, get)
 /// - Store state doesn't match model state
 /// - Ordering invariants are violated
-pub async fn prop_v1_slab_metadata_model_equivalence<S>(
-    store: &S,
+pub async fn prop_v1_slab_metadata_model_equivalence(
+    operations: &V1Operations,
     input: V1SlabMetadataTestInput,
-) -> color_eyre::Result<()>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
+) -> color_eyre::Result<()> {
     // Clean up slabs from this trial to ensure isolation
     // Even with unique v4 UUIDs, cleanup prevents test pollution if trials fail and
     // rerun
     for segment_id in &input.segment_ids {
         // Delete all possible slab IDs from segments table (match range in Arbitrary)
         for slab_id in 0..10 {
-            store
+            operations
                 .delete_slab_metadata_v1(segment_id, slab_id)
                 .await
                 .map_err(|e| {
@@ -193,7 +189,7 @@ where
 
     let mut model = V1SlabMetadataModel::new();
 
-    // Apply all operations to both store and model, verifying queries inline
+    // Apply all operations to both operations and model, verifying queries inline
     for (op_idx, op) in input.operations.iter().enumerate() {
         match op {
             V1SlabMetadataOperation::InsertSlab {
@@ -201,7 +197,7 @@ where
                 slab_id,
             } => {
                 model.apply(op);
-                store
+                operations
                     .insert_slab_v1(segment_id, *slab_id)
                     .await
                     .map_err(|e| {
@@ -211,13 +207,13 @@ where
             V1SlabMetadataOperation::GetSlabs(segment_id) => {
                 // Verify query immediately against model
                 let expected = model.get_slabs(segment_id);
-                let actual: Vec<SlabId> = store
+                let actual: Vec<SlabId> = operations
                     .get_slabs_v1(segment_id)
                     .try_collect()
                     .await
                     .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} GetSlabs v1 failed: {e:?}")
-                    })?;
+                    color_eyre::eyre::eyre!("Op #{op_idx} GetSlabs v1 failed: {e:?}")
+                })?;
 
                 if expected != actual {
                     return Err(color_eyre::eyre::eyre!(
@@ -241,7 +237,7 @@ where
                 slab_id,
             } => {
                 model.apply(op);
-                store
+                operations
                     .delete_slab_metadata_v1(segment_id, *slab_id)
                     .await
                     .map_err(|e| {
@@ -253,30 +249,30 @@ where
         }
     }
 
-    // Final sanity check: verify model-store equivalence for all segment IDs
+    // Final sanity check: verify model-operations equivalence for all segment IDs
     // (queries were already verified inline, this catches any missed state)
     let all_segment_ids: Vec<SegmentId> = model.all_segment_ids();
 
     for segment_id in &all_segment_ids {
         // Verify get_slabs_v1 matches
         let model_slabs = model.get_slabs(segment_id);
-        let store_slabs: Vec<SlabId> = store
+        let operations_slabs: Vec<SlabId> = operations
             .get_slabs_v1(segment_id)
             .try_collect()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Get v1 slabs failed: {e:?}"))?;
 
-        if model_slabs != store_slabs {
+        if model_slabs != operations_slabs {
             return Err(color_eyre::eyre::eyre!(
                 "V1 slab list mismatch for segment {}: expected {:?}, got {:?}",
                 segment_id,
                 model_slabs,
-                store_slabs
+                operations_slabs
             ));
         }
 
         // Verify ordering (should be ascending)
-        for window in store_slabs.windows(2) {
+        for window in operations_slabs.windows(2) {
             if window[0] >= window[1] {
                 return Err(color_eyre::eyre::eyre!(
                     "V1 slab ordering violation for segment {}: {:?} >= {:?}",
@@ -292,21 +288,18 @@ where
 }
 
 /// [`QuickCheck`] wrapper for v1 slab metadata model equivalence property.
-pub fn test_prop_v1_slab_metadata_model_equivalence<S>(
-    store: &S,
+pub fn test_prop_v1_slab_metadata_model_equivalence(
+    operations: &V1Operations,
     input: V1SlabMetadataTestInput,
-) -> TestResult
-where
-    S: TriggerStore + Send + Sync + 'static,
-    S::Error: Debug,
-{
+) -> TestResult {
     use tokio::runtime::Runtime;
 
     let Ok(rt) = Runtime::new() else {
         return TestResult::error("Failed to create tokio runtime");
     };
 
-    let result = rt.block_on(async { prop_v1_slab_metadata_model_equivalence(store, input).await });
+    let result =
+        rt.block_on(async { prop_v1_slab_metadata_model_equivalence(operations, input).await });
 
     match result {
         Ok(()) => TestResult::passed(),

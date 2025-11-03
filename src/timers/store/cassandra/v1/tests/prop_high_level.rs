@@ -8,12 +8,12 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{SegmentId, TriggerStore, TriggerV1};
+use crate::timers::store::cassandra::v1::V1Operations;
+use crate::timers::store::{SegmentId, TriggerV1};
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::collections::BTreeSet;
-use std::fmt::Debug;
 use tracing::Span;
 use uuid::Uuid;
 
@@ -161,9 +161,8 @@ impl Arbitrary for V1HighLevelTestInput {
                     let key: Key = format!("key-{}", u8::arbitrary(g) % 5).into();
 
                     // Remove all triggers for this key
-                    existing_triggers.retain(|&(seg_id, _, ref k, _), _| {
-                        !(seg_id == segment_id && k == &key)
-                    });
+                    existing_triggers
+                        .retain(|&(seg_id, _, ref k, _), _| !(seg_id == segment_id && k == &key));
 
                     V1HighLevelOperation::ClearTriggersForKey {
                         segment_id,
@@ -178,9 +177,8 @@ impl Arbitrary for V1HighLevelTestInput {
                     let slab_id = slab.id();
 
                     // Remove all triggers in this slab
-                    existing_triggers.retain(|&(seg_id, sid, _, _), _| {
-                        !(seg_id == segment_id && sid == slab_id)
-                    });
+                    existing_triggers
+                        .retain(|&(seg_id, sid, ..), _| !(seg_id == segment_id && sid == slab_id));
 
                     V1HighLevelOperation::DeleteSlab {
                         segment_id,
@@ -361,11 +359,7 @@ async fn apply_v1_high_level_operations<S>(
     store: &S,
     model: &mut V1HighLevelModel,
     operations: &[V1HighLevelOperation],
-) -> color_eyre::Result<()>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
+) -> color_eyre::Result<()> {
     for (op_idx, op) in operations.iter().enumerate() {
         match op {
             V1HighLevelOperation::AddTrigger {
@@ -377,7 +371,9 @@ where
                 store
                     .add_trigger_v1(segment_id, *slab_id, trigger.clone())
                     .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger v1 failed: {e:?}"))?;
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger v1 failed: {e:?}")
+                    })?;
             }
             V1HighLevelOperation::RemoveTrigger {
                 segment_id,
@@ -466,18 +462,15 @@ where
     Ok(())
 }
 
-/// Verifies V1 dual-index consistency by comparing all triggers in slab and key indices.
+/// Verifies V1 dual-index consistency by comparing all triggers in slab and key
+/// indices.
 ///
-/// This is the critical verification that V1 high-level operations maintain consistency
-/// across both indices. V1 schema has no `timer_type` field.
+/// This is the critical verification that V1 high-level operations maintain
+/// consistency across both indices. V1 schema has no `timer_type` field.
 async fn verify_v1_dual_index_consistency<S>(
     store: &S,
     model: &V1HighLevelModel,
-) -> color_eyre::Result<()>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
+) -> color_eyre::Result<()> {
     use std::collections::HashSet;
 
     // Collect all triggers from V1 slab indices
@@ -488,7 +481,9 @@ where
             .try_collect()
             .await
             .map_err(|e| {
-                color_eyre::eyre::eyre!("Failed to get V1 slab triggers for consistency check: {e:?}")
+                color_eyre::eyre::eyre!(
+                    "Failed to get V1 slab triggers for consistency check: {e:?}"
+                )
             })?;
 
         for trigger in triggers {
@@ -504,7 +499,9 @@ where
             .try_collect()
             .await
             .map_err(|e| {
-                color_eyre::eyre::eyre!("Failed to get V1 key triggers for consistency check: {e:?}")
+                color_eyre::eyre::eyre!(
+                    "Failed to get V1 key triggers for consistency check: {e:?}"
+                )
             })?;
 
         for trigger in triggers {
@@ -518,9 +515,8 @@ where
         let key_only: Vec<_> = key_triggers.difference(&slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
-            "V1 dual-index consistency violation!\n\
-             Triggers in slab index but not key index: {slab_only:?}\n\
-             Triggers in key index but not slab index: {key_only:?}"
+            "V1 dual-index consistency violation!\nTriggers in slab index but not key index: \
+             {slab_only:?}\nTriggers in key index but not slab index: {key_only:?}"
         ));
     }
 
@@ -538,9 +534,8 @@ where
         let model_only: Vec<_> = model_triggers.difference(&slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
-            "V1 store does not match model!\n\
-             Triggers in store but not model: {store_only:?}\n\
-             Triggers in model but not store: {model_only:?}"
+            "V1 store does not match model!\nTriggers in store but not model: \
+             {store_only:?}\nTriggers in model but not store: {model_only:?}"
         ));
     }
 
@@ -548,19 +543,15 @@ where
 }
 
 /// Verifies that V1 high-level operations maintain dual-index consistency.
-pub async fn prop_v1_high_level_dual_index_consistency<S>(
-    store: &S,
+pub async fn prop_v1_high_level_dual_index_consistency(
+    operations: &V1Operations,
     input: V1HighLevelTestInput,
-) -> color_eyre::Result<()>
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
+) -> color_eyre::Result<()> {
     // Clean up test data - clear all potential V1 keys and slabs
     for segment_id in &input.segment_ids {
         for key_idx in 0_i32..5_i32 {
             let key: Key = format!("key-{key_idx}").into();
-            store
+            operations
                 .clear_key_triggers_v1(segment_id, &key)
                 .await
                 .map_err(|e| {
@@ -570,33 +561,32 @@ where
 
         // Clean up potential slabs - delete a range of slab IDs
         for slab_id in 0_u32..100_u32 {
-            let _ = store.delete_slab_v1(segment_id, slab_id).await;
+            let _ = operations
+                .delete_slab_metadata_v1(segment_id, slab_id)
+                .await;
         }
     }
 
     let mut model = V1HighLevelModel::new();
-    apply_v1_high_level_operations(store, &mut model, &input.operations).await?;
+    apply_v1_high_level_operations(operations, &mut model, &input.operations).await?;
 
     // CRITICAL: Verify V1 dual-index consistency after all operations
-    verify_v1_dual_index_consistency(store, &model).await
+    verify_v1_dual_index_consistency(operations, &model).await
 }
 
 /// [`QuickCheck`] wrapper for V1 high-level dual-index consistency property.
-pub fn test_prop_v1_high_level_dual_index_consistency<S>(
-    store: &S,
+pub fn test_prop_v1_high_level_dual_index_consistency(
+    operations: &V1Operations,
     input: V1HighLevelTestInput,
-) -> TestResult
-where
-    S: TriggerStore + Send + Sync + 'static,
-    S::Error: Debug,
-{
+) -> TestResult {
     use tokio::runtime::Runtime;
 
     let Ok(rt) = Runtime::new() else {
         return TestResult::error("Failed to create tokio runtime");
     };
 
-    let result = rt.block_on(async { prop_v1_high_level_dual_index_consistency(store, input).await });
+    let result =
+        rt.block_on(async { prop_v1_high_level_dual_index_consistency(operations, input).await });
 
     match result {
         Ok(()) => TestResult::passed(),

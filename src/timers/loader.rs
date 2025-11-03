@@ -9,7 +9,8 @@ use crate::heartbeat::Heartbeat;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
-use crate::timers::migration;
+// TODO: Re-enable migration after integrating with new trait structure
+// use crate::timers::migration;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;
@@ -396,42 +397,37 @@ pub async fn get_or_create_segment<T>(
 where
     T: TriggerStore,
 {
-    if let Some(mut segment) = store
+    if let Some(segment) = store
         .get_segment(&segment_id)
         .await
         .map_err(TimerManagerError::Store)?
     {
-        // Phase 1: Check if segment needs migration from v1 to v2
-        if migration::needs_migration(&segment) {
-            migration::migrate_segment(store, &segment).await?;
+        // TODO: Re-enable migration after integrating with new trait structure.
+        // Migration is now Cassandra-specific (uses v1_operations()) but loader
+        // is generic over TriggerStore. Options:
+        // 1. Add a SupportsMigration trait that extends TriggerStore
+        // 2. Move migration logic to CassandraTriggerStore::new()
+        // 3. Create a separate migration API that takes CassandraTriggerStore
+        // For now, segments remain at their current version. New deployments
+        // should use V2 schema from the start.
 
-            // Reload segment to get updated version and slab_size
-            segment = store
-                .get_segment(&segment_id)
-                .await
-                .map_err(TimerManagerError::Store)?
-                .ok_or_else(|| {
-                    TimerManagerError::MigrationFailed(format!(
-                        "Segment {segment_id} disappeared after v1→v2 migration"
-                    ))
-                })?;
-        }
+        // Phase 1: Check if segment needs migration from v1 to v2
+        // if migration::needs_migration(&segment) {
+        //     migration::migrate_segment(store, &segment).await?;
+        //     segment = store.get_segment(&segment_id).await?
+        //         .ok_or_else(|| TimerManagerError::MigrationFailed(
+        //             format!("Segment {segment_id} disappeared after v1→v2 migration")
+        //         ))?;
+        // }
 
         // Phase 2: Check if segment needs slab_size migration
-        if migration::needs_slab_size_migration(&segment, slab_size) {
-            migration::migrate_slab_size(store, &segment, slab_size).await?;
-
-            // Reload segment to get updated slab_size
-            segment = store
-                .get_segment(&segment_id)
-                .await
-                .map_err(TimerManagerError::Store)?
-                .ok_or_else(|| {
-                    TimerManagerError::MigrationFailed(format!(
-                        "Segment {segment_id} disappeared after slab_size migration"
-                    ))
-                })?;
-        }
+        // if migration::needs_slab_size_migration(&segment, slab_size) {
+        //     migration::migrate_slab_size(store, &segment, slab_size).await?;
+        //     segment = store.get_segment(&segment_id).await?
+        //         .ok_or_else(|| TimerManagerError::MigrationFailed(
+        //             format!("Segment {segment_id} disappeared after slab_size
+        // migration")         ))?;
+        // }
 
         return Ok(segment);
     }
@@ -479,7 +475,7 @@ mod tests {
     use crate::heartbeat::HeartbeatRegistry;
     use crate::timers::duration::CompactDuration;
     use crate::timers::store::Segment;
-    use crate::timers::store::memory::InMemoryTriggerStore;
+    use crate::timers::store::memory::memory_store;
     use crate::timers::{TimerType, Trigger};
     use color_eyre::eyre::{Result, eyre};
     use futures::future;
@@ -509,7 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_new() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
 
@@ -519,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_is_owned_when_none() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
 
@@ -530,7 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_is_owned_with_ownership() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -546,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_extend_ownership() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -616,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_new() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(60);
         let name = "test-segment";
@@ -636,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_existing() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(60);
         let name1 = "first-segment";
@@ -657,7 +653,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::reversed_empty_ranges)]
     async fn test_load_slabs_empty_range() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
         let slab_lock = SlabLock::new(state);
@@ -671,7 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_single_slab() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -680,9 +676,12 @@ mod tests {
         // Insert the segment first
         store.insert_segment(segment.clone()).await?;
 
-        // Insert a slab
-        let slab = Slab::new(segment.id, 1, segment.slab_size);
-        store.insert_slab(&segment.id, slab).await?;
+        // Create a slab by adding a trigger at an appropriate time
+        let slab_id = 1;
+        let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
+        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+        let trigger = create_test_trigger(1, time);
+        store.add_trigger(&segment, slab, trigger).await?;
 
         let loaded = load_slabs(&slab_lock, &segment, 1..=1).await?;
         assert_eq!(loaded, vec![1]);
@@ -695,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_multiple_slabs() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -704,10 +703,12 @@ mod tests {
         // Insert the segment first
         store.insert_segment(segment.clone()).await?;
 
-        // Insert multiple slabs
+        // Create multiple slabs by adding triggers at appropriate times
         for slab_id in 1..=3 {
+            let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
-            store.insert_slab(&segment.id, slab).await?;
+            let trigger = create_test_trigger(slab_id.into(), time);
+            store.add_trigger(&segment, slab, trigger).await?;
         }
 
         let mut loaded = load_slabs(&slab_lock, &segment, 1..=3).await?;
@@ -722,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_triggers_empty_slab() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
         let slab = Slab::new(segment.id, 1, segment.slab_size);
@@ -733,18 +734,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_triggers_with_triggers() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
-        let slab = Slab::new(segment.id, 1, segment.slab_size);
+        let slab_id = 1;
+        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+
+        // Insert segment first
+        store.insert_segment(segment.clone()).await?;
 
         // Add some triggers to the slab
         let now = CompactDateTime::now()?;
         let trigger1 = create_test_trigger(1, now);
         let trigger2 = create_test_trigger(2, now);
 
-        store.insert_slab_trigger(slab.clone(), trigger1).await?;
-        store.insert_slab_trigger(slab.clone(), trigger2).await?;
+        store.add_trigger(&segment, slab.clone(), trigger1).await?;
+        store.add_trigger(&segment, slab.clone(), trigger2).await?;
 
         load_triggers(&store, &scheduler, slab).await?;
         Ok(())
@@ -752,11 +757,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_completed_slabs_no_active() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
+
+        // Insert segment first
+        store.insert_segment(segment.clone()).await?;
 
         // Create a loaded_slab_ids set with some slabs
         let mut loaded_slab_ids = HashSet::new();
@@ -764,10 +772,12 @@ mod tests {
         loaded_slab_ids.insert(2);
         loaded_slab_ids.insert(3);
 
-        // Insert slabs in store
+        // Create slabs in store by adding triggers
         for slab_id in &loaded_slab_ids {
+            let time = CompactDateTime::from(*slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
-            store.insert_slab(&segment.id, slab).await?;
+            let trigger = create_test_trigger((*slab_id).into(), time);
+            store.add_trigger(&segment, slab, trigger).await?;
         }
 
         remove_completed_slabs(&slab_lock, &segment, &mut loaded_slab_ids).await?;
@@ -792,7 +802,7 @@ mod tests {
     async fn test_slab_loader_basic_operation() -> Result<()> {
         pause();
 
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -829,7 +839,7 @@ mod tests {
     async fn test_slab_loader_time_advancement() -> Result<()> {
         pause();
 
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -894,11 +904,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_completed_slabs_with_active_triggers() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler.clone());
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
+
+        // Insert segment first
+        store.insert_segment(segment.clone()).await?;
 
         // Create some loaded slabs
         let mut loaded_slab_ids = HashSet::new();
@@ -906,10 +919,12 @@ mod tests {
         loaded_slab_ids.insert(2);
         loaded_slab_ids.insert(3);
 
-        // Insert slabs and some triggers
+        // Create slabs by adding triggers
         for slab_id in &loaded_slab_ids {
+            let time = CompactDateTime::from(*slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
-            store.insert_slab(&segment.id, slab).await?;
+            let trigger = create_test_trigger((*slab_id).into(), time);
+            store.add_trigger(&segment, slab, trigger).await?;
         }
 
         // Add an active trigger to slab 2
@@ -930,7 +945,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_extends_ownership_correctly() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -945,10 +960,12 @@ mod tests {
             state_guard.extend_ownership(5);
         };
 
-        // Insert slabs beyond current ownership
+        // Create slabs beyond current ownership by adding triggers
         for slab_id in 6..=10 {
+            let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
-            store.insert_slab(&segment.id, slab).await?;
+            let trigger = create_test_trigger(slab_id.into(), time);
+            store.add_trigger(&segment, slab, trigger).await?;
         }
 
         let result = load_slabs(&slab_lock, &segment, 6..=10).await;
@@ -963,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_preserves_higher_ownership() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -978,10 +995,12 @@ mod tests {
             state_guard.extend_ownership(100);
         };
 
-        // Insert and load lower range slabs
+        // Create and load lower range slabs by adding triggers
         for slab_id in 1..=5 {
+            let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
-            store.insert_slab(&segment.id, slab).await?;
+            let trigger = create_test_trigger(slab_id.into(), time);
+            store.add_trigger(&segment, slab, trigger).await?;
         }
 
         let loaded = load_slabs(&slab_lock, &segment, 1..=5).await?;
@@ -995,7 +1014,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_ownership_edge_cases() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -1040,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_concurrent() -> Result<()> {
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(60);
         let name = "concurrent-test";
@@ -1079,7 +1098,7 @@ mod tests {
     async fn test_slab_loader_handles_time_errors() -> Result<()> {
         pause();
 
-        let store = InMemoryTriggerStore::new();
+        let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);

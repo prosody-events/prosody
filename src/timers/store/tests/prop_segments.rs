@@ -4,10 +4,12 @@
 //! reference model to verify correctness.
 
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
+use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use ahash::HashMap;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::collections::HashSet;
+use std::error::Error;
 use std::fmt::Debug;
 use uuid::Uuid;
 
@@ -93,7 +95,8 @@ impl Arbitrary for SegmentTestInput {
                     } else {
                         // Pick from currently inserted segments, not random segment_id
                         let inserted_vec: Vec<_> = inserted_segments.iter().copied().collect();
-                        let update_segment_id = inserted_vec[usize::arbitrary(g) % inserted_vec.len()];
+                        let update_segment_id =
+                            inserted_vec[usize::arbitrary(g) % inserted_vec.len()];
                         let version = if bool::arbitrary(g) {
                             SegmentVersion::V1
                         } else {
@@ -228,19 +231,16 @@ fn verify_segment_fields(
 /// # Errors
 ///
 /// Returns an error if model and store state don't match.
-async fn verify_final_state<S>(
-    store: &S,
-    model: &SegmentModel,
-) -> color_eyre::Result<()>
+async fn verify_final_state<T>(operations: &T, model: &SegmentModel) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations,
+    T::Error: Error + Send + Sync + 'static,
 {
     let all_ids: Vec<SegmentId> = model.all_ids();
 
     for id in &all_ids {
         let model_segment = model.get(id);
-        let store_segment = store
+        let store_segment = operations
             .get_segment(id)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Get segment failed: {e:?}"))?;
@@ -273,7 +273,7 @@ where
     // (This catches cases where store has extra segments)
     for id in &all_ids {
         if model.get(id).is_none() {
-            let store_result = store.get_segment(id).await.map_err(|e| {
+            let store_result = operations.get_segment(id).await.map_err(|e| {
                 color_eyre::eyre::eyre!("Get segment failed during absence check: {e:?}")
             })?;
             if store_result.is_some() {
@@ -304,17 +304,17 @@ where
 /// - Store operations fail (insert, delete, get)
 /// - Store state doesn't match model state
 /// - Field values differ between model and store
-pub async fn prop_segment_model_equivalence<S>(
-    store: &S,
+pub async fn prop_segment_model_equivalence<T>(
+    operations: &T,
     input: SegmentTestInput,
 ) -> color_eyre::Result<()>
 where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
+    T: TriggerOperations,
+    T::Error: Error + Send + Sync + 'static,
 {
     // Clean up segments from this trial to ensure isolation
     for segment_id in &input.segment_ids {
-        store
+        operations
             .delete_segment(segment_id)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to clean up segment: {e:?}"))?;
@@ -327,7 +327,7 @@ where
         match op {
             SegmentOperation::Insert(segment) => {
                 model.apply(op);
-                store
+                operations
                     .insert_segment(segment.clone())
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} Insert failed: {e:?}"))?;
@@ -335,7 +335,7 @@ where
             SegmentOperation::Get(id) => {
                 // Verify query immediately against model
                 let expected = model.get(id);
-                let actual = store
+                let actual = operations
                     .get_segment(id)
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} Get failed: {e:?}"))?;
@@ -365,7 +365,7 @@ where
             }
             SegmentOperation::Delete(id) => {
                 model.apply(op);
-                store
+                operations
                     .delete_segment(id)
                     .await
                     .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} Delete failed: {e:?}"))?;
@@ -376,7 +376,7 @@ where
                 slab_size,
             } => {
                 model.apply(op);
-                store
+                operations
                     .update_segment_version(segment_id, *version, *slab_size)
                     .await
                     .map_err(|e| {
@@ -388,14 +388,17 @@ where
 
     // Final sanity check: verify model-store equivalence for all segment IDs
     // (queries were already verified inline, this catches any missed state)
-    verify_final_state(store, &model).await
+    verify_final_state(operations, &model).await
 }
 
 /// [`QuickCheck`] wrapper for segment model equivalence property.
-pub fn test_prop_segment_model_equivalence<S>(store: &S, input: SegmentTestInput) -> TestResult
+///
+/// Tests low-level TriggerOperations implementations directly
+/// (InMemoryTriggerStore, CassandraTriggerStore).
+pub fn test_prop_segment_model_equivalence<T>(operations: &T, input: SegmentTestInput) -> TestResult
 where
-    S: TriggerStore + Send + Sync + 'static,
-    S::Error: Debug,
+    T: TriggerOperations + 'static,
+    T::Error: Error + Send + Sync + 'static,
 {
     use tokio::runtime::Runtime;
 
@@ -403,7 +406,7 @@ where
         return TestResult::error("Failed to create tokio runtime");
     };
 
-    let result = rt.block_on(async { prop_segment_model_equivalence(store, input).await });
+    let result = rt.block_on(async { prop_segment_model_equivalence(operations, input).await });
 
     match result {
         Ok(()) => TestResult::passed(),
