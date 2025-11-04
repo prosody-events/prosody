@@ -175,6 +175,7 @@ use crate::producer::ProsodyProducer;
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
+use crate::timers::duration::CompactDurationError;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, cassandra_store};
 use crate::timers::store::memory::memory_store;
@@ -775,10 +776,11 @@ impl ProsodyConsumer {
                 shutdown: shutdown.clone(),
             })?,
             TriggerStoreConfiguration::Cassandra(cassandra_config) => {
+                let slab_size = consumer_config.slab_size.try_into()?;
                 initialize_consumer(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
-                    trigger_store: cassandra_store(cassandra_config).await?,
+                    trigger_store: cassandra_store(cassandra_config, slab_size).await?,
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,
@@ -1230,4 +1232,8 @@ pub enum ConsumerError {
     /// Indicates a monopolization middleware initialization failure.
     #[error("Monopolization initialization failed: {0:#}")]
     Monopolization(#[from] MonopolizationInitError),
+
+    /// Indicates an invalid timer slab size.
+    #[error("Invalid timer slab size: {0:#}")]
+    InvalidSlabSize(#[from] CompactDurationError),
 }

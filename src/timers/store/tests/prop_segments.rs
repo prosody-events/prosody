@@ -43,6 +43,8 @@ pub struct SegmentTestInput {
     pub segment_ids: Vec<SegmentId>,
     /// Sequence of operations to apply.
     pub operations: Vec<SegmentOperation>,
+    /// Slab size used for all segments in this test.
+    pub slab_size: CompactDuration,
 }
 
 impl Arbitrary for SegmentTestInput {
@@ -51,6 +53,9 @@ impl Arbitrary for SegmentTestInput {
         // v4 UUIDs have a structure that prevents QuickCheck from shrinking them
         // into colliding values
         let segment_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+
+        // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
+        let slab_size = CompactDuration::new(u32::arbitrary(g).max(1).min(604_800));
 
         // Generate 10-50 operations using these segments
         let op_count = (usize::arbitrary(g) % 40) + 10;
@@ -70,9 +75,7 @@ impl Arbitrary for SegmentTestInput {
                     let segment = Segment {
                         id: segment_id,
                         name: format!("segment-{}", u8::arbitrary(g) % 10),
-                        slab_size: CompactDuration::new(
-                            (u32::arbitrary(g) % 3600) + 1, // 1-3600 seconds
-                        ),
+                        slab_size,
                         version: if bool::arbitrary(g) {
                             SegmentVersion::V1
                         } else {
@@ -102,9 +105,6 @@ impl Arbitrary for SegmentTestInput {
                         } else {
                             SegmentVersion::V2
                         };
-                        let slab_size = CompactDuration::new(
-                            (u32::arbitrary(g) % 3600) + 1, // 1-3600 seconds
-                        );
                         SegmentOperation::UpdateVersion {
                             segment_id: update_segment_id,
                             version,
@@ -119,6 +119,7 @@ impl Arbitrary for SegmentTestInput {
         Self {
             segment_ids,
             operations,
+            slab_size,
         }
     }
 }

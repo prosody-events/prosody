@@ -54,6 +54,8 @@ pub struct SlabMetadataTestInput {
     pub segment_ids: Vec<SegmentId>,
     /// Sequence of operations to apply.
     pub operations: Vec<SlabMetadataOperation>,
+    /// Slab size used for all slabs in this test.
+    pub slab_size: CompactDuration,
 }
 
 impl Arbitrary for SlabMetadataTestInput {
@@ -62,6 +64,9 @@ impl Arbitrary for SlabMetadataTestInput {
         // v4 UUIDs have a structure that prevents QuickCheck from shrinking them
         // into colliding values
         let segment_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+
+        // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
+        let slab_size = CompactDuration::new(u32::arbitrary(g).max(1).min(604_800));
 
         // Generate 10-50 operations using these segments
         let op_count = (usize::arbitrary(g) % 40) + 10;
@@ -77,7 +82,6 @@ impl Arbitrary for SlabMetadataTestInput {
             let op = match u8::arbitrary(g) % 4 {
                 0 => {
                     // Insert operation
-                    let slab_size = CompactDuration::new((u32::arbitrary(g) % 3600) + 1);
                     let slab = Slab::new(segment_id, slab_id, slab_size);
                     SlabMetadataOperation::InsertSlab { segment_id, slab }
                 }
@@ -102,6 +106,7 @@ impl Arbitrary for SlabMetadataTestInput {
         Self {
             segment_ids,
             operations,
+            slab_size,
         }
     }
 }

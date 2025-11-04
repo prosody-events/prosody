@@ -5,6 +5,7 @@
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::{TimerType, Trigger};
@@ -27,6 +28,8 @@ pub struct KeyTriggerTestInput {
     pub segment_ids: Vec<SegmentId>,
     /// Sequence of operations to apply.
     pub operations: Vec<KeyTriggerOperation>,
+    /// Slab size used for all triggers in this test.
+    pub slab_size: CompactDuration,
 }
 
 /// Operations that can be performed on the key trigger table.
@@ -100,6 +103,9 @@ impl Arbitrary for KeyTriggerTestInput {
         // into colliding values
         let segment_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
 
+        // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
+        let slab_size = CompactDuration::new(u32::arbitrary(g).max(1).min(604_800));
+
         // Use small key pool to increase collision probability
         let key_pool = ["key-a", "key-b", "key-c"];
 
@@ -161,6 +167,7 @@ impl Arbitrary for KeyTriggerTestInput {
         Self {
             segment_ids,
             operations,
+            slab_size,
         }
     }
 }

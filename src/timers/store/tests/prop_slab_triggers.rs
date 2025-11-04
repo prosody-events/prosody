@@ -29,6 +29,8 @@ pub struct SlabTriggerTestInput {
     pub segment_ids: Vec<SegmentId>,
     /// Sequence of operations to apply.
     pub operations: Vec<SlabTriggerOperation>,
+    /// Slab size used for all slabs in this test.
+    pub slab_size: CompactDuration,
 }
 
 /// Operations that can be performed on the slab trigger table.
@@ -72,9 +74,11 @@ impl Arbitrary for SlabTriggerTestInput {
         // into colliding values
         let segment_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
 
-        // Use small pools for keys and slab sizes to increase collision probability
+        // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
+        let slab_size = CompactDuration::new(u32::arbitrary(g).max(1).min(604_800));
+
+        // Use small pools for keys to increase collision probability
         let key_pool = ["key-a", "key-b", "key-c"];
-        let slab_size_pool = [3600, 7200, 1800];
 
         // Generate 10-50 operations using these segments
         let op_count = (usize::arbitrary(g) % 40) + 10;
@@ -85,8 +89,6 @@ impl Arbitrary for SlabTriggerTestInput {
             let segment_id = segment_ids[idx];
 
             let slab_id = SlabId::from(u8::arbitrary(g) % 5); // 0-4
-            let size_idx = usize::from(u8::arbitrary(g)) % slab_size_pool.len();
-            let slab_size = CompactDuration::new(slab_size_pool[size_idx]);
             let slab = Slab::new(segment_id, slab_id, slab_size);
 
             let key_idx = usize::from(u8::arbitrary(g)) % key_pool.len();
@@ -122,6 +124,7 @@ impl Arbitrary for SlabTriggerTestInput {
         Self {
             segment_ids,
             operations,
+            slab_size,
         }
     }
 }

@@ -681,9 +681,9 @@ mod test {
     // High-level tests use TableAdapter<InMemoryTriggerStore>
     trigger_store_tests!(
         InMemoryTriggerStore,
-        async { Result::<_, Infallible>::Ok(InMemoryTriggerStore::new()) },
+        |_slab_size| async { Result::<_, Infallible>::Ok(InMemoryTriggerStore::new()) },
         crate::timers::store::adapter::TableAdapter<InMemoryTriggerStore>,
-        async { Result::<_, Infallible>::Ok(memory_store()) },
+        |_slab_size| async { Result::<_, Infallible>::Ok(memory_store()) },
         100
     );
 }

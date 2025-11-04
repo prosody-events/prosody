@@ -2,6 +2,7 @@ use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore, CassandraStoreError};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::timers::error::TimerManagerError;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::queries::Queries;
@@ -25,6 +26,10 @@ mod queries;
 /// V1 schema operations (internal, Cassandra-only).
 pub(crate) mod v1;
 
+/// Migration utilities for V1→V2 and slab size changes (internal,
+/// Cassandra-only).
+pub(crate) mod migration;
+
 /// Cassandra-based implementation of [`TriggerStore`].
 ///
 /// Provides persistent storage for timer triggers using Apache Cassandra
@@ -34,6 +39,7 @@ pub struct CassandraTriggerStore {
     store: CassandraStore,
     queries: Arc<Queries>,
     v1_operations: v1::V1Operations,
+    slab_size: CompactDuration,
 }
 
 impl CassandraTriggerStore {
@@ -45,6 +51,7 @@ impl CassandraTriggerStore {
     /// # Arguments
     ///
     /// * `config` - Cassandra connection and TTL configuration
+    /// * `slab_size` - Target slab size for automatic migration
     ///
     /// # Errors
     ///
@@ -52,7 +59,10 @@ impl CassandraTriggerStore {
     /// - Connection to Cassandra fails
     /// - Schema migration fails
     /// - Query preparation fails
-    pub async fn new(config: &CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
+    pub async fn new(
+        config: &CassandraConfiguration,
+        slab_size: CompactDuration,
+    ) -> Result<Self, CassandraTriggerStoreError> {
         let store = CassandraStore::new(config).await?;
         let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
 
@@ -62,6 +72,7 @@ impl CassandraTriggerStore {
             store,
             queries,
             v1_operations,
+            slab_size,
         })
     }
 
@@ -85,6 +96,38 @@ impl CassandraTriggerStore {
     pub(crate) fn v1_operations(&self) -> &v1::V1Operations {
         &self.v1_operations
     }
+
+    /// Reads a segment from the database without applying any migrations.
+    ///
+    /// This is an internal helper used during migration to reload segments
+    /// after version or slab size updates, avoiding infinite recursion.
+    async fn get_segment_unchecked(
+        &self,
+        segment_id: &SegmentId,
+    ) -> Result<Option<Segment>, CassandraTriggerStoreError> {
+        let row = self
+            .session()
+            .execute_unpaged(&self.queries().get_segment, (segment_id,))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(String, CompactDuration, Option<i8>)>()?;
+
+        let Some((name, slab_size, version)) = row else {
+            return Ok(None);
+        };
+
+        let version = version
+            .map(SegmentVersion::try_from)
+            .transpose()?
+            .unwrap_or(SegmentVersion::V1);
+
+        Ok(Some(Segment {
+            id: *segment_id,
+            name,
+            slab_size,
+            version,
+        }))
+    }
 }
 
 impl TriggerOperations for CassandraTriggerStore {
@@ -92,6 +135,15 @@ impl TriggerOperations for CassandraTriggerStore {
 
     #[instrument(level = "debug", skip(self), err)]
     async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
+        // Validate that the segment's slab_size matches the configured slab_size
+        if segment.slab_size != self.slab_size {
+            return Err(CassandraTriggerStoreError::Migration(format!(
+                "Cannot insert segment {} with slab_size {} that differs from configured \
+                 slab_size {}",
+                segment.id, segment.slab_size, self.slab_size
+            )));
+        }
+
         self.session()
             .execute_unpaged(
                 &self.queries().insert_segment,
@@ -125,12 +177,63 @@ impl TriggerOperations for CassandraTriggerStore {
             .transpose()?
             .unwrap_or(SegmentVersion::V1);
 
-        Ok(Some(Segment {
+        let mut segment = Segment {
             id: *segment_id,
             name,
             slab_size,
             version,
-        }))
+        };
+
+        // Automatically migrate if needed (V1→V2 or slab size change)
+        let store = TableAdapter::new(self.clone());
+
+        // Phase 1: V1→V2 schema migration
+        if migration::needs_migration(&segment) {
+            migration::migrate_segment(&store, &segment)
+                .await
+                .map_err(|e| match e {
+                    TimerManagerError::Store(store_err) => store_err,
+                    TimerManagerError::Migration(migration_err) => {
+                        CassandraTriggerStoreError::Migration(migration_err.to_string())
+                    }
+                    other => CassandraTriggerStoreError::Migration(format!("{other:?}")),
+                })?;
+
+            // Reload segment to get updated version
+            segment = self
+                .get_segment_unchecked(segment_id)
+                .await?
+                .ok_or_else(|| {
+                    CassandraTriggerStoreError::Migration(format!(
+                        "Segment {segment_id} disappeared after V1→V2 migration"
+                    ))
+                })?;
+        }
+
+        // Phase 2: Slab size migration
+        if migration::needs_slab_size_migration(&segment, self.slab_size) {
+            migration::migrate_slab_size(&store, &segment, self.slab_size)
+                .await
+                .map_err(|e| match e {
+                    TimerManagerError::Store(store_err) => store_err,
+                    TimerManagerError::Migration(migration_err) => {
+                        CassandraTriggerStoreError::Migration(migration_err.to_string())
+                    }
+                    other => CassandraTriggerStoreError::Migration(format!("{other:?}")),
+                })?;
+
+            // Reload segment to get updated slab_size
+            segment = self
+                .get_segment_unchecked(segment_id)
+                .await?
+                .ok_or_else(|| {
+                    CassandraTriggerStoreError::Migration(format!(
+                        "Segment {segment_id} disappeared after slab size migration"
+                    ))
+                })?;
+        }
+
+        Ok(Some(segment))
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -657,6 +760,7 @@ impl TriggerOperations for CassandraTriggerStore {
 /// # Arguments
 ///
 /// * `config` - Cassandra connection and TTL configuration
+/// * `slab_size` - Target slab size for automatic migration
 ///
 /// # Errors
 ///
@@ -669,13 +773,15 @@ impl TriggerOperations for CassandraTriggerStore {
 ///
 /// ```rust,ignore
 /// let config = CassandraConfiguration { ... };
-/// let store = cassandra_store(&config).await?;
+/// let slab_size = CompactDuration::new(3600);
+/// let store = cassandra_store(&config, slab_size).await?;
 /// let manager = TimerManager::new(..., store);
 /// ```
 pub async fn cassandra_store(
     config: &CassandraConfiguration,
+    slab_size: CompactDuration,
 ) -> Result<TableAdapter<CassandraTriggerStore>, CassandraTriggerStoreError> {
-    let cassandra = CassandraTriggerStore::new(config).await?;
+    let cassandra = CassandraTriggerStore::new(config, slab_size).await?;
     Ok(TableAdapter::new(cassandra))
 }
 
@@ -716,15 +822,25 @@ mod test {
     // High-level tests use TableAdapter<CassandraTriggerStore>
     trigger_store_tests!(
         CassandraTriggerStore,
-        CassandraTriggerStore::new(&test_cassandra_config("prosody")),
+        |slab_size| async move {
+            let config = test_cassandra_config("prosody");
+            CassandraTriggerStore::new(&config, slab_size).await
+        },
         crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
-        cassandra_store(&test_cassandra_config("prosody")),
+        |slab_size| async move {
+            let config = test_cassandra_config("prosody");
+            cassandra_store(&config, slab_size).await
+        },
         25
     );
 
     #[tokio::test]
     async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
-        let store = CassandraTriggerStore::new(&test_cassandra_config("prosody_test")).await?;
+        let store = CassandraTriggerStore::new(
+            &test_cassandra_config("prosody_test"),
+            CompactDuration::new(3600),
+        )
+        .await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {
@@ -825,8 +941,11 @@ mod test {
 
     #[tokio::test]
     async fn test_simple_wrap_around() -> Result<()> {
-        let store =
-            CassandraTriggerStore::new(&test_cassandra_config("prosody_test_simple")).await?;
+        let store = CassandraTriggerStore::new(
+            &test_cassandra_config("prosody_test_simple"),
+            CompactDuration::new(3600),
+        )
+        .await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {

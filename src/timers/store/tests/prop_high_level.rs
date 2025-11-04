@@ -94,6 +94,8 @@ pub struct HighLevelTestInput {
     pub segments: Vec<Segment>,
     /// Sequence of operations to apply.
     pub operations: Vec<HighLevelOperation>,
+    /// Slab size used for all segments in this test.
+    pub slab_size: CompactDuration,
 }
 
 /// Helper type for tracking existing triggers during operation generation.
@@ -240,12 +242,15 @@ fn generate_get_slab_range(g: &mut Gen, segment: &Segment) -> HighLevelOperation
 
 impl Arbitrary for HighLevelTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate 2 segments with random UUIDs
+        // Generate a slab size for this test (60-660 seconds for faster tests)
+        let slab_size = CompactDuration::new((u32::arbitrary(g) % 600) + 60);
+
+        // Generate 2 segments with random UUIDs, all using the same slab_size
         let segments: Vec<Segment> = (0_u32..2_u32)
             .map(|i| Segment {
                 id: Uuid::new_v4(),
                 name: format!("segment-{i}"),
-                slab_size: CompactDuration::new((u32::arbitrary(g) % 600) + 60), // 60-660 seconds
+                slab_size,
                 version: SegmentVersion::V2,
             })
             .collect();
@@ -277,6 +282,7 @@ impl Arbitrary for HighLevelTestInput {
         Self {
             segments,
             operations,
+            slab_size,
         }
     }
 }
@@ -361,7 +367,8 @@ impl HighLevelModel {
                 // delete_slab only removes slab metadata, NOT triggers
                 // Triggers remain in both slab_triggers and key_triggers tables
                 // until explicitly removed with remove_trigger
-                // The model tracks trigger data, not metadata, so this is a no-op
+                // The model tracks trigger data, not metadata, so this is a
+                // no-op
                 //
                 // Query operations also don't modify state
             }
@@ -408,7 +415,8 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    // Get expected from model - collect all triggers for this slab across ALL timer types
+    // Get expected from model - collect all triggers for this slab across ALL timer
+    // types
     let mut expected = BTreeSet::new();
     let target_seg_id = slab.segment_id();
     let target_slab_id = slab.id();
@@ -490,8 +498,10 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let expected: BTreeSet<TriggerTuple> =
-        model.get_key_triggers(segment_id, key, timer_type).into_iter().collect();
+    let expected: BTreeSet<TriggerTuple> = model
+        .get_key_triggers(segment_id, key, timer_type)
+        .into_iter()
+        .collect();
 
     let actual: Vec<Trigger> = store
         .get_key_triggers(segment_id, timer_type, key)
@@ -769,7 +779,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if dual-index consistency is violated or store operations fail.
+/// Returns an error if dual-index consistency is violated or store operations
+/// fail.
 pub async fn prop_high_level_dual_index_consistency<S>(
     store: &S,
     input: HighLevelTestInput,

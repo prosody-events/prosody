@@ -336,8 +336,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create operations instance
-            let operations = match runtime.block_on(async { ($operations_constructor).await }) {
+            // Create operations instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
@@ -356,8 +357,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create operations instance
-            let operations = match runtime.block_on(async { ($operations_constructor).await }) {
+            // Create operations instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
@@ -376,8 +378,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create operations instance
-            let operations = match runtime.block_on(async { ($operations_constructor).await }) {
+            // Create operations instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
@@ -396,8 +399,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create operations instance
-            let operations = match runtime.block_on(async { ($operations_constructor).await }) {
+            // Create operations instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
@@ -416,8 +420,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create store instance
-            let store = match runtime.block_on(async { ($store_constructor).await }) {
+            // Create store instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
@@ -432,8 +437,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create store instance
-            let store = match runtime.block_on(async { ($store_constructor).await }) {
+            // Create store instance with segment's slab_size
+            let slab_size = segment.slab_size;
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
@@ -455,8 +461,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create store instance
-            let store = match runtime.block_on(async { ($store_constructor).await }) {
+            // Create store instance with segment's slab_size
+            let slab_size = input.segment.slab_size;
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
@@ -480,8 +487,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create store instance
-            let store = match runtime.block_on(async { ($store_constructor).await }) {
+            // Create store instance with segment's slab_size
+            let slab_size = input.segment.slab_size;
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
@@ -501,8 +509,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create store instance
-            let store = match runtime.block_on(async { ($store_constructor).await }) {
+            // Create store instance with segment's slab_size
+            let slab_size = input.segment.slab_size;
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
@@ -522,8 +531,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create store instance
-            let store = match runtime.block_on(async { ($store_constructor).await }) {
+            // Create store instance with segment's slab_size
+            let slab_size = segment.slab_size;
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
@@ -543,8 +553,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create store instance
-            let store = match runtime.block_on(async { ($store_constructor).await }) {
+            // Create store instance with segment's slab_size
+            let slab_size = segment.slab_size;
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
@@ -566,8 +577,9 @@ macro_rules! trigger_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
             };
 
-            // Create store instance
-            let store = match runtime.block_on(async { ($store_constructor).await }) {
+            // Create store instance with segment's slab_size
+            let slab_size = input.segment.slab_size;
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };

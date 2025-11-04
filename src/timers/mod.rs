@@ -157,7 +157,6 @@ pub mod duration;
 pub mod error;
 mod loader;
 mod manager;
-mod migration;
 mod queue;
 mod scheduler;
 mod slab;

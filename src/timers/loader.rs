@@ -402,33 +402,6 @@ where
         .await
         .map_err(TimerManagerError::Store)?
     {
-        // TODO: Re-enable migration after integrating with new trait structure.
-        // Migration is now Cassandra-specific (uses v1_operations()) but loader
-        // is generic over TriggerStore. Options:
-        // 1. Add a SupportsMigration trait that extends TriggerStore
-        // 2. Move migration logic to CassandraTriggerStore::new()
-        // 3. Create a separate migration API that takes CassandraTriggerStore
-        // For now, segments remain at their current version. New deployments
-        // should use V2 schema from the start.
-
-        // Phase 1: Check if segment needs migration from v1 to v2
-        // if migration::needs_migration(&segment) {
-        //     migration::migrate_segment(store, &segment).await?;
-        //     segment = store.get_segment(&segment_id).await?
-        //         .ok_or_else(|| TimerManagerError::MigrationFailed(
-        //             format!("Segment {segment_id} disappeared after v1→v2 migration")
-        //         ))?;
-        // }
-
-        // Phase 2: Check if segment needs slab_size migration
-        // if migration::needs_slab_size_migration(&segment, slab_size) {
-        //     migration::migrate_slab_size(store, &segment, slab_size).await?;
-        //     segment = store.get_segment(&segment_id).await?
-        //         .ok_or_else(|| TimerManagerError::MigrationFailed(
-        //             format!("Segment {segment_id} disappeared after slab_size
-        // migration")         ))?;
-        // }
-
         return Ok(segment);
     }
 

@@ -54,6 +54,16 @@ impl<T> TableAdapter<T> {
             operations: Arc::new(operations),
         }
     }
+
+    /// Returns a reference to the underlying operations.
+    ///
+    /// Provides access to low-level `TriggerOperations` methods for cases
+    /// where direct primitive access is needed (e.g., migration, internal
+    /// maintenance operations).
+    #[must_use]
+    pub fn operations(&self) -> &T {
+        self.operations.as_ref()
+    }
 }
 
 /// Implements the public `TriggerStore` interface using internal
