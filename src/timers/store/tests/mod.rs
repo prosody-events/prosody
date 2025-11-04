@@ -225,51 +225,11 @@ macro_rules! trigger_store_tests {
         mod tests {
             use super::*;
             use quickcheck::{QuickCheck, TestResult};
-            use std::sync::LazyLock;
             use tokio::runtime::Builder;
             use $crate::timers::store::tests;
 
-            // Shared runtime instance, created lazily
-            static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-                Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-            });
-
-            // Shared raw TriggerOperations instance (for low-level tests)
-            static OPERATIONS: LazyLock<$operations_type> = LazyLock::new(|| {
-                RUNTIME.block_on(async {
-                    ($operations_constructor).await
-                        .expect("Failed to create shared operations instance")
-                })
-            });
-
-            // Shared TableAdapter instance (for high-level tests)
-            static STORE: LazyLock<$store_type> = LazyLock::new(|| {
-                RUNTIME.block_on(async {
-                    ($store_constructor).await
-                        .expect("Failed to create shared store instance")
-                })
-            });
-
-            // Helper function to get the shared runtime
-            fn get_runtime() -> &'static tokio::runtime::Runtime {
-                &RUNTIME
-            }
-
-            // Helper function to get the raw TriggerOperations (for low-level property tests)
-            fn get_operations() -> &'static $operations_type {
-                &OPERATIONS
-            }
-
-            // Helper function to get the TableAdapter (for high-level tests)
-            fn get_store() -> &'static $store_type {
-                &STORE
-            }
-
             trigger_store_tests!(@test_functions, $test_count);
-            trigger_store_tests!(@prop_functions);
+            trigger_store_tests!(@prop_functions, $operations_type, $operations_constructor, $store_type, $store_constructor);
         }
     };
 
@@ -364,52 +324,121 @@ macro_rules! trigger_store_tests {
         }};
 
     // Property functions
-    (@prop_functions) => {
+    (@prop_functions, $operations_type:ty, $operations_constructor:expr, $store_type:ty, $store_constructor:expr) => {
         fn prop_segment_model_equivalence(
             input: $crate::timers::store::tests::prop_segments::SegmentTestInput,
         ) -> TestResult {
             use $crate::timers::store::tests::prop_segments::test_prop_segment_model_equivalence;
-            let operations = get_operations();
-            test_prop_segment_model_equivalence(operations, input)
+
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create operations instance
+            let operations = match runtime.block_on(async { ($operations_constructor).await }) {
+                Ok(ops) => ops,
+                Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
+            };
+
+            test_prop_segment_model_equivalence(&operations, input)
         }
 
         fn prop_slab_metadata_model_equivalence(
             input: $crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput,
         ) -> TestResult {
             use $crate::timers::store::tests::prop_slab_metadata::test_prop_slab_metadata_model_equivalence;
-            let operations = get_operations();
-            test_prop_slab_metadata_model_equivalence(operations, input)
+
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create operations instance
+            let operations = match runtime.block_on(async { ($operations_constructor).await }) {
+                Ok(ops) => ops,
+                Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
+            };
+
+            test_prop_slab_metadata_model_equivalence(&operations, input)
         }
 
         fn prop_slab_trigger_model_equivalence(
             input: $crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput,
         ) -> TestResult {
             use $crate::timers::store::tests::prop_slab_triggers::test_prop_slab_trigger_model_equivalence;
-            let operations = get_operations();
-            test_prop_slab_trigger_model_equivalence(operations, input)
+
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create operations instance
+            let operations = match runtime.block_on(async { ($operations_constructor).await }) {
+                Ok(ops) => ops,
+                Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
+            };
+
+            test_prop_slab_trigger_model_equivalence(&operations, input)
         }
 
         fn prop_key_trigger_model_equivalence(
             input: $crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput,
         ) -> TestResult {
             use $crate::timers::store::tests::prop_key_triggers::test_prop_key_trigger_model_equivalence;
-            let operations = get_operations();
-            test_prop_key_trigger_model_equivalence(operations, input)
+
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create operations instance
+            let operations = match runtime.block_on(async { ($operations_constructor).await }) {
+                Ok(ops) => ops,
+                Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
+            };
+
+            test_prop_key_trigger_model_equivalence(&operations, input)
         }
 
         fn prop_high_level_dual_index_consistency(
             input: $crate::timers::store::tests::prop_high_level::HighLevelTestInput,
         ) -> TestResult {
             use $crate::timers::store::tests::prop_high_level::test_prop_high_level_dual_index_consistency;
-            let store = get_store();
-            test_prop_high_level_dual_index_consistency(store, input)
+
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create store instance
+            let store = match runtime.block_on(async { ($store_constructor).await }) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            test_prop_high_level_dual_index_consistency(&store, input)
         }
 
         fn prop_get_slab_range(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
 
-            match runtime.block_on(tests::slabs::test_get_slab_range(store, &segment)) {
+            // Create store instance
+            let store = match runtime.block_on(async { ($store_constructor).await }) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match runtime.block_on(tests::slabs::test_get_slab_range(&store, &segment)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
@@ -420,11 +449,20 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
-            let runtime = get_runtime();
-            let store = get_store();
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create store instance
+            let store = match runtime.block_on(async { ($store_constructor).await }) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
 
             match runtime.block_on(tests::trigger_operations::test_trigger_operations(
-                store, &input,
+                &store, &input,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -436,11 +474,20 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
-            let runtime = get_runtime();
-            let store = get_store();
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create store instance
+            let store = match runtime.block_on(async { ($store_constructor).await }) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
 
             match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
-                store, &input,
+                &store, &input,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -448,11 +495,20 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_operation_sequences(input: tests::TriggerSequence) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create store instance
+            let store = match runtime.block_on(async { ($store_constructor).await }) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
 
             match runtime.block_on(tests::trigger_operations::test_operation_sequences(
-                store, &input,
+                &store, &input,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -460,11 +516,20 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_cross_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create store instance
+            let store = match runtime.block_on(async { ($store_constructor).await }) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
 
             match runtime.block_on(tests::cross_slab::test_cross_slab_operations(
-                store, &segment,
+                &store, &segment,
             )) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
@@ -472,10 +537,19 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_key_contention(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
 
-            match runtime.block_on(tests::contention::test_key_contention(store, &segment)) {
+            // Create store instance
+            let store = match runtime.block_on(async { ($store_constructor).await }) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match runtime.block_on(tests::contention::test_key_contention(&store, &segment)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
@@ -486,11 +560,20 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
-            let runtime = get_runtime();
-            let store = get_store();
+            // Create runtime for this test invocation
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            // Create store instance
+            let store = match runtime.block_on(async { ($store_constructor).await }) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
 
             match runtime.block_on(
-                tests::sequential_interleavings::test_sequential_interleavings(store, &input),
+                tests::sequential_interleavings::test_sequential_interleavings(&store, &input),
             ) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),

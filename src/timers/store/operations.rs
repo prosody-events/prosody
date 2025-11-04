@@ -28,9 +28,9 @@ use std::ops::RangeInclusive;
 ///
 /// # Used by
 ///
-/// - CassandraTriggerStore implementation
-/// - InMemoryTriggerStore implementation
-/// - TableAdapter to implement TriggerStore
+/// - `CassandraTriggerStore` implementation
+/// - `InMemoryTriggerStore` implementation
+/// - `TableAdapter` to implement `TriggerStore`
 ///
 /// # Visibility
 ///

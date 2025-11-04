@@ -226,7 +226,7 @@ async fn apply_v1_slab_trigger_operations(
             } => {
                 model.apply(op);
                 v1_ops
-                    .insert_slab_trigger_v1(segment_id, *slab_id, trigger.clone())
+                    .insert_slab_trigger(segment_id, *slab_id, trigger.clone())
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Insert v1 trigger failed: {e:?}")
@@ -238,7 +238,7 @@ async fn apply_v1_slab_trigger_operations(
             } => {
                 let expected = model.get_triggers(segment_id, *slab_id);
                 let actual: Vec<TriggerV1> = v1_ops
-                    .get_slab_triggers_v1(segment_id, *slab_id)
+                    .get_slab_triggers(segment_id, *slab_id)
                     .try_collect()
                     .await
                     .map_err(|e| {
@@ -272,7 +272,7 @@ async fn apply_v1_slab_trigger_operations(
             } => {
                 model.apply(op);
                 v1_ops
-                    .delete_slab_trigger_v1(segment_id, *slab_id, key, *time)
+                    .delete_slab_trigger(segment_id, *slab_id, key, *time)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Delete v1 slab trigger failed: {e:?}")
@@ -284,7 +284,7 @@ async fn apply_v1_slab_trigger_operations(
             } => {
                 model.apply(op);
                 v1_ops
-                    .clear_slab_triggers_v1(segment_id, *slab_id)
+                    .clear_slab_triggers(segment_id, *slab_id)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Clear v1 slab triggers failed: {e:?}")
@@ -302,7 +302,7 @@ async fn apply_v1_slab_trigger_operations(
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every slab:
-///    - `operations.get_slab_triggers_v1(seg, slab)` matches model
+///    - `operations.get_slab_triggers(seg, slab)` matches model
 ///    - Ordering is correct (ascending by key, time)
 ///
 /// # Errors
@@ -318,7 +318,7 @@ pub async fn prop_v1_slab_trigger_model_equivalence(
     for segment_id in &input.segment_ids {
         for slab_id in 0..5 {
             operations
-                .clear_slab_triggers_v1(segment_id, slab_id)
+                .clear_slab_triggers(segment_id, slab_id)
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!(
@@ -335,7 +335,7 @@ pub async fn prop_v1_slab_trigger_model_equivalence(
     for (segment_id, slab_id) in &all_slabs {
         let model_triggers = model.get_triggers(segment_id, *slab_id);
         let operations_triggers: Vec<TriggerV1> = operations
-            .get_slab_triggers_v1(segment_id, *slab_id)
+            .get_slab_triggers(segment_id, *slab_id)
             .try_collect()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Get v1 slab triggers failed: {e:?}"))?;

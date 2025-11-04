@@ -1,10 +1,7 @@
 //! Tests for V1 schema operations (Cassandra-only).
 
-// High-level tests disabled - require coordinated V1 operations (add_trigger_v1,
-// remove_trigger_v1, clear_triggers_for_key_v1) that haven't been implemented yet.
-// TODO: Implement coordinated V1 operations and re-enable these tests.
-// #[cfg(test)]
-// pub mod prop_high_level;
+#[cfg(test)]
+pub mod prop_high_level;
 #[cfg(test)]
 pub mod prop_key_triggers;
 #[cfg(test)]
@@ -17,8 +14,9 @@ mod test_runner {
     use super::super::V1Operations;
     use crate::cassandra::CassandraConfiguration;
     use crate::timers::store::cassandra::queries::Queries;
-    use quickcheck::QuickCheck;
-    use std::sync::{Arc, LazyLock};
+    use quickcheck::{QuickCheck, TestResult};
+    use std::sync::Arc;
+    use tokio::runtime::Builder;
 
     fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
         use std::time::Duration;
@@ -44,24 +42,25 @@ mod test_runner {
         Ok(V1Operations::new(store, queries))
     }
 
-    // Shared runtime instance, created lazily
-    static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-        use tokio::runtime::Builder;
-        Builder::new_multi_thread().enable_all().build().unwrap()
-    });
+    /// Generic helper to run V1 property tests with runtime and operations
+    /// setup. Runtime is kept alive for the duration of the test function.
+    fn run_v1_test<I>(
+        input: I,
+        test_fn: impl FnOnce(&V1Operations, I) -> TestResult,
+    ) -> TestResult {
+        // Create runtime for this test invocation
+        let runtime = match Builder::new_multi_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+        };
 
-    // Shared V1Operations instance (for V1 property tests)
-    static OPERATIONS: LazyLock<V1Operations> = LazyLock::new(|| {
-        RUNTIME.block_on(async {
-            create_v1_operations()
-                .await
-                .expect("Failed to create shared V1Operations instance")
-        })
-    });
+        // Create V1Operations instance
+        let operations = match runtime.block_on(async { create_v1_operations().await }) {
+            Ok(ops) => ops,
+            Err(e) => return TestResult::error(format!("Failed to create V1Operations: {e:?}")),
+        };
 
-    // Helper function to get the shared V1Operations
-    fn get_operations() -> &'static V1Operations {
-        &OPERATIONS
+        test_fn(&operations, input)
     }
 
     #[test]
@@ -70,13 +69,11 @@ mod test_runner {
             V1SlabMetadataTestInput, test_prop_v1_slab_metadata_model_equivalence,
         };
 
-        fn test_wrapper(input: V1SlabMetadataTestInput) -> quickcheck::TestResult {
-            let operations = get_operations();
-            test_prop_v1_slab_metadata_model_equivalence(operations, input)
+        fn test_wrapper(input: V1SlabMetadataTestInput) -> TestResult {
+            run_v1_test(input, test_prop_v1_slab_metadata_model_equivalence)
         }
 
-        QuickCheck::new()
-            .quickcheck(test_wrapper as fn(V1SlabMetadataTestInput) -> quickcheck::TestResult);
+        QuickCheck::new().quickcheck(test_wrapper as fn(V1SlabMetadataTestInput) -> TestResult);
     }
 
     #[test]
@@ -85,13 +82,11 @@ mod test_runner {
             V1SlabTriggerTestInput, test_prop_v1_slab_trigger_model_equivalence,
         };
 
-        fn test_wrapper(input: V1SlabTriggerTestInput) -> quickcheck::TestResult {
-            let operations = get_operations();
-            test_prop_v1_slab_trigger_model_equivalence(operations, input)
+        fn test_wrapper(input: V1SlabTriggerTestInput) -> TestResult {
+            run_v1_test(input, test_prop_v1_slab_trigger_model_equivalence)
         }
 
-        QuickCheck::new()
-            .quickcheck(test_wrapper as fn(V1SlabTriggerTestInput) -> quickcheck::TestResult);
+        QuickCheck::new().quickcheck(test_wrapper as fn(V1SlabTriggerTestInput) -> TestResult);
     }
 
     #[test]
@@ -100,23 +95,23 @@ mod test_runner {
             V1KeyTriggerTestInput, test_prop_v1_key_trigger_model_equivalence,
         };
 
-        fn test_wrapper(input: V1KeyTriggerTestInput) -> quickcheck::TestResult {
-            let operations = get_operations();
-            test_prop_v1_key_trigger_model_equivalence(operations, input)
+        fn test_wrapper(input: V1KeyTriggerTestInput) -> TestResult {
+            run_v1_test(input, test_prop_v1_key_trigger_model_equivalence)
         }
 
-        QuickCheck::new()
-            .quickcheck(test_wrapper as fn(V1KeyTriggerTestInput) -> quickcheck::TestResult);
+        QuickCheck::new().quickcheck(test_wrapper as fn(V1KeyTriggerTestInput) -> TestResult);
     }
 
-    // TODO: Implement coordinated V1 operations (add_trigger_v1,
-    // remove_trigger_v1, clear_triggers_for_key_v1, delete_slab_v1) that
-    // maintain dual-index consistency. Then re-enable prop_high_level
-    // module and add test runner here.
-    //
-    // #[test]
-    // fn prop_v1_high_level_dual_index_consistency() {
-    //     use super::prop_high_level::{...};
-    //     ...
-    // }
+    #[test]
+    fn prop_v1_high_level_dual_index_consistency() {
+        use super::prop_high_level::{
+            V1HighLevelTestInput, test_prop_v1_high_level_dual_index_consistency,
+        };
+
+        fn test_wrapper(input: V1HighLevelTestInput) -> TestResult {
+            run_v1_test(input, test_prop_v1_high_level_dual_index_consistency)
+        }
+
+        QuickCheck::new().quickcheck(test_wrapper as fn(V1HighLevelTestInput) -> TestResult);
+    }
 }

@@ -63,10 +63,11 @@ use tracing::Span;
 ///
 /// Timers can have different types that determine their purpose and routing.
 /// This is an internal classification not exposed to applications.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[repr(i8)]
 pub enum TimerType {
     /// User-scheduled application timers (default).
+    #[default]
     Application = 0,
     /// Defer middleware retry timers.
     DeferRetry = 1,
@@ -87,12 +88,6 @@ impl TryFrom<i8> for TimerType {
             1 => Ok(Self::DeferRetry),
             _ => Err(ParseError::UnknownTimerType(value)),
         }
-    }
-}
-
-impl Default for TimerType {
-    fn default() -> Self {
-        Self::Application
     }
 }
 

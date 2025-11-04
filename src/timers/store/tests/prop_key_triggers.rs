@@ -5,8 +5,8 @@
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::SegmentId;
+use crate::timers::store::operations::TriggerOperations;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::TryStreamExt;

@@ -157,7 +157,7 @@ impl V1SlabMetadataModel {
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every segment ID:
-///    - `store.get_slabs_v1(seg)` matches `model.get_slabs(seg)`
+///    - `store.get_slabs(seg)` matches `model.get_slabs(seg)`
 ///    - Ordering is correct (ascending slab IDs)
 ///
 /// # Errors
@@ -177,7 +177,7 @@ pub async fn prop_v1_slab_metadata_model_equivalence(
         // Delete all possible slab IDs from segments table (match range in Arbitrary)
         for slab_id in 0..10 {
             operations
-                .delete_slab_metadata_v1(segment_id, slab_id)
+                .delete_slab_metadata(segment_id, slab_id)
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!(
@@ -198,7 +198,7 @@ pub async fn prop_v1_slab_metadata_model_equivalence(
             } => {
                 model.apply(op);
                 operations
-                    .insert_slab_v1(segment_id, *slab_id)
+                    .insert_slab(segment_id, *slab_id)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Insert v1 slab failed: {e:?}")
@@ -208,12 +208,12 @@ pub async fn prop_v1_slab_metadata_model_equivalence(
                 // Verify query immediately against model
                 let expected = model.get_slabs(segment_id);
                 let actual: Vec<SlabId> = operations
-                    .get_slabs_v1(segment_id)
+                    .get_slabs(segment_id)
                     .try_collect()
                     .await
                     .map_err(|e| {
-                    color_eyre::eyre::eyre!("Op #{op_idx} GetSlabs v1 failed: {e:?}")
-                })?;
+                        color_eyre::eyre::eyre!("Op #{op_idx} GetSlabs v1 failed: {e:?}")
+                    })?;
 
                 if expected != actual {
                     return Err(color_eyre::eyre::eyre!(
@@ -238,7 +238,7 @@ pub async fn prop_v1_slab_metadata_model_equivalence(
             } => {
                 model.apply(op);
                 operations
-                    .delete_slab_metadata_v1(segment_id, *slab_id)
+                    .delete_slab_metadata(segment_id, *slab_id)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!(
@@ -257,7 +257,7 @@ pub async fn prop_v1_slab_metadata_model_equivalence(
         // Verify get_slabs_v1 matches
         let model_slabs = model.get_slabs(segment_id);
         let operations_slabs: Vec<SlabId> = operations
-            .get_slabs_v1(segment_id)
+            .get_slabs(segment_id)
             .try_collect()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Get v1 slabs failed: {e:?}"))?;

@@ -12,6 +12,7 @@ use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
+use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::try_join;
@@ -53,19 +54,6 @@ impl<T> TableAdapter<T> {
             operations: Arc::new(operations),
         }
     }
-
-    /// Returns a reference to the underlying operations.
-    ///
-    /// PRIVATE - DO NOT MAKE PUBLIC OR PUB(CRATE) OR PUB(SUPER).
-    /// Tests must NEVER call this method.
-    ///
-    /// Test organization:
-    /// - High-level tests: Use TriggerStore trait methods only
-    /// - Low-level tests: Construct TriggerOperations implementations directly
-    ///   (not via TableAdapter)
-    fn operations(&self) -> &T {
-        &self.operations
-    }
 }
 
 /// Implements the public `TriggerStore` interface using internal
@@ -80,14 +68,14 @@ impl<T: TriggerOperations> TriggerStore for TableAdapter<T> {
     fn get_segment(
         &self,
         segment_id: &SegmentId,
-    ) -> impl std::future::Future<Output = Result<Option<Segment>, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send {
         self.operations.get_segment(segment_id)
     }
 
     fn insert_segment(
         &self,
         segment: Segment,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.operations.insert_segment(segment)
     }
 
@@ -110,7 +98,7 @@ impl<T: TriggerOperations> TriggerStore for TableAdapter<T> {
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.operations.delete_slab(segment_id, slab_id)
     }
 
@@ -143,7 +131,7 @@ impl<T: TriggerOperations> TriggerStore for TableAdapter<T> {
         segment: &Segment,
         slab: Slab,
         trigger: Trigger,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let ops = Arc::clone(&self.operations);
         let segment_id = segment.id; // Extract segment ID
         async move {
@@ -164,7 +152,7 @@ impl<T: TriggerOperations> TriggerStore for TableAdapter<T> {
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let ops = Arc::clone(&self.operations);
         let segment_id = segment.id; // Extract segment ID
         async move {

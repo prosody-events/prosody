@@ -48,6 +48,8 @@
 //!    slabs (cleanup, can fail safely)
 //! 3. If same: No slab size migration needed
 
+#![allow(dead_code, reason = "migration in process")] // todo: remove
+
 use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
 use crate::timers::slab::Slab;
@@ -105,7 +107,7 @@ pub async fn migrate_segment(
 
     // Phase 1: Collect all v1 slabs (non-destructive)
     let slab_ids: Vec<_> = v1_ops
-        .get_slabs_v1(&segment_id)
+        .get_slabs(&segment_id)
         .try_collect()
         .await
         .map_err(TimerManagerError::Store)?;
@@ -121,7 +123,7 @@ pub async fn migrate_segment(
 
         // Read v1 triggers for this slab
         let v1_triggers: Vec<TriggerV1> = v1_ops
-            .get_slab_triggers_v1(&segment_id, *slab_id)
+            .get_slab_triggers(&segment_id, *slab_id)
             .try_collect()
             .await
             .map_err(TimerManagerError::Store)?;
@@ -172,7 +174,7 @@ pub async fn migrate_segment(
     // Phase 4: Clean up v1 data (can fail safely - data is orphaned but harmless)
     // If cleanup fails, we can retry it later or ignore it
     for slab_id in &slab_ids {
-        if let Err(error) = v1_ops.delete_slab_v1(&segment_id, *slab_id).await {
+        if let Err(error) = v1_ops.delete_slab(&segment_id, *slab_id).await {
             warn!(
                 "Failed to delete v1 slab {slab_id} for segment {segment_id}: {error:#}; v1 data \
                  is orphaned but migration completed successfully"

@@ -12,6 +12,8 @@
 //! - Load balancing and retry policy configuration
 //! - TTL and non-TTL variants of insert statements
 
+#![allow(dead_code, reason = "migration in process")] // todo: remove
+
 use crate::cassandra::{
     TABLE_KEYS, TABLE_SEGMENTS, TABLE_SLABS, TABLE_TYPED_KEYS, TABLE_TYPED_SLABS,
 };

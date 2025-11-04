@@ -665,6 +665,7 @@ impl TriggerOperations for InMemoryTriggerStore {
 /// let store = memory_store();
 /// let manager = TimerManager::new(..., store);
 /// ```
+#[must_use]
 pub fn memory_store() -> TableAdapter<InMemoryTriggerStore> {
     TableAdapter::new(InMemoryTriggerStore::new())
 }
@@ -672,7 +673,6 @@ pub fn memory_store() -> TableAdapter<InMemoryTriggerStore> {
 #[cfg(test)]
 mod test {
     use super::{InMemoryTriggerStore, memory_store};
-    use crate::timers::store::adapter::TableAdapter;
     use crate::trigger_store_tests;
     use std::convert::Infallible;
 
@@ -682,7 +682,7 @@ mod test {
     trigger_store_tests!(
         InMemoryTriggerStore,
         async { Result::<_, Infallible>::Ok(InMemoryTriggerStore::new()) },
-        TableAdapter<InMemoryTriggerStore>,
+        crate::timers::store::adapter::TableAdapter<InMemoryTriggerStore>,
         async { Result::<_, Infallible>::Ok(memory_store()) },
         100
     );

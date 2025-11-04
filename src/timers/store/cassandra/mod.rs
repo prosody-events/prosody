@@ -685,7 +685,6 @@ pub type CassandraTriggerStoreError = CassandraStoreError;
 #[cfg(test)]
 mod test {
     use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
-    use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::operations::TriggerOperations;
     use std::time::Duration;
 
@@ -718,7 +717,7 @@ mod test {
     trigger_store_tests!(
         CassandraTriggerStore,
         CassandraTriggerStore::new(&test_cassandra_config("prosody")),
-        TableAdapter<CassandraTriggerStore>,
+        crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
         cassandra_store(&test_cassandra_config("prosody")),
         25
     );

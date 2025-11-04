@@ -6,18 +6,22 @@
 //!
 //! **This is Cassandra-internal only and not part of the public API.**
 
-use crate::Key;
+#![allow(dead_code, reason = "migration in process")] // todo: remove
+
 use crate::cassandra::CassandraStore;
+use crate::timers::store::cassandra::queries::Queries;
+use std::sync::Arc;
+
+use crate::Key;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use crate::timers::slab::SlabId;
 use crate::timers::store::cassandra::CassandraTriggerStoreError;
-use crate::timers::store::cassandra::queries::Queries;
 use crate::timers::store::{SegmentId, TriggerV1};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
 use opentelemetry::propagation::TextMapPropagator;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::task::coop::cooperative;
 use tracing::{error, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -39,7 +43,7 @@ pub(crate) struct V1Operations {
 }
 
 impl V1Operations {
-    /// Creates a new V1Operations instance.
+    /// Creates a new `V1Operations` instance.
     ///
     /// # Arguments
     ///
@@ -53,7 +57,7 @@ impl V1Operations {
     ///
     /// Inserts a row into the `segments` table with partition key `segment_id`
     /// and clustering column `slab_id` (v1 schema).
-    pub(crate) async fn insert_slab_v1(
+    pub(crate) async fn insert_slab(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -68,7 +72,7 @@ impl V1Operations {
     /// Inserts a trigger into v1 slab table.
     ///
     /// Inserts into the v1 `timer_slabs` table without `timer_type`.
-    pub(crate) async fn insert_slab_trigger_v1(
+    pub(crate) async fn insert_slab_trigger(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -104,7 +108,7 @@ impl V1Operations {
     /// only static columns. We handle this by deserializing to `Option<i32>`
     /// and filtering.
     #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id))]
-    pub(crate) fn get_slabs_v1(
+    pub(crate) fn get_slabs(
         &self,
         segment_id: &SegmentId,
     ) -> impl Stream<Item = Result<SlabId, CassandraTriggerStoreError>> + Send {
@@ -136,7 +140,7 @@ impl V1Operations {
     /// Queries the v1 `timer_slabs` table with PK `((segment_id, id), key,
     /// time)`.
     #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id, slab_id = %slab_id))]
-    pub(crate) fn get_slab_triggers_v1(
+    pub(crate) fn get_slab_triggers(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -178,7 +182,7 @@ impl V1Operations {
     /// Low-level method that removes a single slab entry from the segments
     /// table. Part of the v1 migration API.
     #[instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn delete_slab_metadata_v1(
+    pub(crate) async fn delete_slab_metadata(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -199,7 +203,7 @@ impl V1Operations {
     /// Low-level method that removes a specific trigger identified by
     /// `(segment_id, slab_id, key, time)` from the `timer_slabs` table.
     #[instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn delete_slab_trigger_v1(
+    pub(crate) async fn delete_slab_trigger(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -222,7 +226,7 @@ impl V1Operations {
     /// Low-level method that removes all triggers for a slab from the
     /// `timer_slabs` table. Uses v1 PK `((segment_id, id), key, time)`.
     #[instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn clear_slab_triggers_v1(
+    pub(crate) async fn clear_slab_triggers(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -243,7 +247,7 @@ impl V1Operations {
     /// Low-level method that inserts into the v1 `timer_keys` table without
     /// `timer_type`. Part of the v1 migration API.
     #[instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn insert_key_trigger_v1(
+    pub(crate) async fn insert_key_trigger(
         &self,
         segment_id: &SegmentId,
         trigger: TriggerV1,
@@ -270,7 +274,7 @@ impl V1Operations {
     ///
     /// Queries v1 `timer_keys` table using partition key (`segment_id`, key).
     #[instrument(level = "debug", skip(self), fields(segment_id = %segment_id, key = %key))]
-    pub(crate) fn get_key_triggers_v1(
+    pub(crate) fn get_key_triggers(
         &self,
         segment_id: &SegmentId,
         key: &Key,
@@ -312,7 +316,7 @@ impl V1Operations {
     /// Low-level method that removes a specific trigger identified by
     /// `(segment_id, key, time)` from the `timer_keys` table.
     #[instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn delete_key_trigger_v1(
+    pub(crate) async fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
         key: &Key,
@@ -333,7 +337,7 @@ impl V1Operations {
     ///
     /// Uses v1 partition key (`segment_id`, key).
     #[instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn clear_key_triggers_v1(
+    pub(crate) async fn clear_key_triggers(
         &self,
         segment_id: &SegmentId,
         key: &Key,
@@ -345,6 +349,145 @@ impl V1Operations {
                 (segment_id, key.as_ref()),
             )
             .await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // High-Level Coordinated Operations (Dual-Index Consistency)
+    // ========================================================================
+
+    /// Adds a v1 trigger to both slab and key indices.
+    ///
+    /// High-level coordinated operation that maintains dual-index consistency
+    /// by inserting the trigger into both:
+    /// 1. The slab index (`timer_slabs` table) - for time-based queries
+    /// 2. The key index (`timer_keys` table) - for entity-based queries
+    ///
+    /// Both operations execute in parallel using `try_join!` for efficiency.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab ID (time partition)
+    /// * `trigger` - The trigger to add
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either insertion fails. Partial completion may
+    /// occur if one insert succeeds and the other fails.
+    #[instrument(level = "debug", skip(self, trigger), err)]
+    pub(crate) async fn add_trigger(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        trigger: TriggerV1,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        use tokio::try_join;
+
+        // Insert into both indices in parallel
+        try_join!(
+            self.insert_slab_trigger(segment_id, slab_id, trigger.clone()),
+            self.insert_key_trigger(segment_id, trigger)
+        )?;
+
+        Ok(())
+    }
+
+    /// Removes a v1 trigger from both slab and key indices.
+    ///
+    /// High-level coordinated operation that maintains dual-index consistency
+    /// by deleting the trigger from both:
+    /// 1. The slab index (`timer_slabs` table)
+    /// 2. The key index (`timer_keys` table)
+    ///
+    /// Both operations execute in parallel using `try_join!` for efficiency.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `slab_id` - The slab ID (time partition)
+    /// * `key` - The trigger key
+    /// * `time` - The trigger time
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either deletion fails. Partial completion may
+    /// occur if one delete succeeds and the other fails.
+    #[instrument(level = "debug", skip(self), err)]
+    pub(crate) async fn remove_trigger(
+        &self,
+        segment_id: &SegmentId,
+        slab_id: SlabId,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        use tokio::try_join;
+
+        // Delete from both indices in parallel
+        try_join!(
+            self.delete_slab_trigger(segment_id, slab_id, key, time),
+            self.delete_key_trigger(segment_id, key, time)
+        )?;
+
+        Ok(())
+    }
+
+    /// Clears all v1 triggers for a key from both slab and key indices.
+    ///
+    /// High-level coordinated operation that maintains dual-index consistency
+    /// by:
+    /// 1. Querying all triggers for the key from the key index
+    /// 2. Calculating the slab ID for each trigger using the provided slab size
+    /// 3. Deleting each trigger from its respective slab index (concurrently)
+    /// 4. Clearing all triggers from the key index
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment identifier
+    /// * `key` - The key whose triggers should be cleared
+    /// * `slab_size` - The slab size used to calculate slab IDs from trigger
+    ///   times
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any operation fails. Partial completion may occur
+    /// if an error interrupts processing.
+    #[instrument(level = "debug", skip(self), err)]
+    pub(crate) async fn clear_triggers_for_key(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        slab_size: CompactDuration,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        use crate::timers::DELETE_CONCURRENCY;
+        use crate::timers::slab::Slab;
+        use futures::TryStreamExt;
+
+        let segment_id_copy = *segment_id;
+        let stream = self.get_key_triggers(segment_id, key);
+
+        // Delete each trigger from its slab index
+        stream
+            .try_for_each_concurrent(DELETE_CONCURRENCY, move |trigger| {
+                let self_clone = self.clone();
+                async move {
+                    // Calculate which slab this trigger belongs to
+                    let slab = Slab::from_time(segment_id_copy, slab_size, trigger.time);
+                    self_clone
+                        .delete_slab_trigger(
+                            &segment_id_copy,
+                            slab.id(),
+                            &trigger.key,
+                            trigger.time,
+                        )
+                        .await
+                }
+            })
+            .await?;
+
+        // Clear all triggers from key index
+        self.clear_key_triggers(segment_id, key).await?;
 
         Ok(())
     }
@@ -368,7 +511,7 @@ impl V1Operations {
     /// Returns an error if deletion fails. Partial completion may occur
     /// if an error interrupts processing.
     #[instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn delete_slab_v1(
+    pub(crate) async fn delete_slab(
         &self,
         segment_id: &SegmentId,
         slab_id: SlabId,
@@ -378,7 +521,7 @@ impl V1Operations {
         use tokio::try_join;
 
         let segment_id_copy = *segment_id;
-        let stream = self.get_slab_triggers_v1(segment_id, slab_id);
+        let stream = self.get_slab_triggers(segment_id, slab_id);
 
         // Delete each trigger from key index
         stream
@@ -386,7 +529,7 @@ impl V1Operations {
                 let self_clone = self.clone();
                 async move {
                     self_clone
-                        .delete_key_trigger_v1(&segment_id_copy, &trigger.key, trigger.time)
+                        .delete_key_trigger(&segment_id_copy, &trigger.key, trigger.time)
                         .await
                 }
             })
@@ -394,8 +537,8 @@ impl V1Operations {
 
         // Clear slab triggers and metadata in parallel
         try_join!(
-            self.clear_slab_triggers_v1(&segment_id_copy, slab_id),
-            self.delete_slab_metadata_v1(&segment_id_copy, slab_id)
+            self.clear_slab_triggers(&segment_id_copy, slab_id),
+            self.delete_slab_metadata(&segment_id_copy, slab_id)
         )?;
 
         Ok(())

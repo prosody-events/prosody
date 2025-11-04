@@ -210,7 +210,7 @@ async fn apply_v1_key_trigger_operations(
             } => {
                 model.apply(op);
                 v1_ops
-                    .insert_key_trigger_v1(segment_id, trigger.clone())
+                    .insert_key_trigger(segment_id, trigger.clone())
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Insert v1 key trigger failed: {e:?}")
@@ -219,7 +219,7 @@ async fn apply_v1_key_trigger_operations(
             V1KeyTriggerOperation::GetTriggers { segment_id, key } => {
                 let expected = model.get_triggers(segment_id, key);
                 let actual: Vec<TriggerV1> = v1_ops
-                    .get_key_triggers_v1(segment_id, key)
+                    .get_key_triggers(segment_id, key)
                     .try_collect()
                     .await
                     .map_err(|e| {
@@ -252,7 +252,7 @@ async fn apply_v1_key_trigger_operations(
             } => {
                 model.apply(op);
                 v1_ops
-                    .delete_key_trigger_v1(segment_id, key, *time)
+                    .delete_key_trigger(segment_id, key, *time)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Delete v1 key trigger failed: {e:?}")
@@ -261,7 +261,7 @@ async fn apply_v1_key_trigger_operations(
             V1KeyTriggerOperation::ClearKey { segment_id, key } => {
                 model.apply(op);
                 v1_ops
-                    .clear_key_triggers_v1(segment_id, key)
+                    .clear_key_triggers(segment_id, key)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} Clear v1 key triggers failed: {e:?}")
@@ -279,7 +279,7 @@ async fn apply_v1_key_trigger_operations(
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every (`segment_id`, `key`):
-///    - `operations.get_key_triggers_v1(seg, key)` matches model
+///    - `operations.get_key_triggers(seg, key)` matches model
 ///    - Ordering is correct (ascending by key, time)
 ///
 /// # Errors
@@ -296,7 +296,7 @@ pub async fn prop_v1_key_trigger_model_equivalence(
         for key_idx in 0_i32..10_i32 {
             let key: Key = format!("key-{key_idx}").into();
             operations
-                .clear_key_triggers_v1(segment_id, &key)
+                .clear_key_triggers(segment_id, &key)
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!("Failed to clear v1 key triggers during cleanup: {e:?}")
@@ -311,7 +311,7 @@ pub async fn prop_v1_key_trigger_model_equivalence(
     for (segment_id, key) in &all_keys {
         let model_triggers = model.get_triggers(segment_id, key);
         let operations_triggers: Vec<TriggerV1> = operations
-            .get_key_triggers_v1(segment_id, key)
+            .get_key_triggers(segment_id, key)
             .try_collect()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Get v1 key triggers failed: {e:?}"))?;

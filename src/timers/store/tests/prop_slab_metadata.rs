@@ -5,8 +5,8 @@
 
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::SegmentId;
+use crate::timers::store::operations::TriggerOperations;
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -252,25 +252,16 @@ where
 ///    - Ordering is correct (ascending slab IDs)
 ///    - Range queries return correct subset
 ///
-/// # Errors
-///
-/// Returns an error if:
-/// - Store operations fail (insert, delete, get)
-/// - Store state doesn't match model state
-/// - Ordering invariants are violated
-pub async fn prop_slab_metadata_model_equivalence<T>(
+/// Cleans up all slabs for the given segment IDs.
+async fn cleanup_segment_slabs<T>(
     operations: &T,
-    input: SlabMetadataTestInput,
+    segment_ids: &[SegmentId],
 ) -> color_eyre::Result<()>
 where
     T: TriggerOperations + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
-    // Clean up slabs from this trial to ensure isolation
-    // Even with unique v4 UUIDs, cleanup prevents test pollution if trials fail and
-    // rerun
-    for segment_id in &input.segment_ids {
-        // Get all slabs for this segment and delete them
+    for segment_id in segment_ids {
         let slab_ids: Vec<SlabId> = operations
             .get_slabs(segment_id)
             .try_collect()
@@ -286,73 +277,56 @@ where
                 })?;
         }
     }
+    Ok(())
+}
 
-    let mut model = SlabMetadataModel::new();
+/// Verifies `GetSlabs` query against model, including ordering.
+async fn verify_get_slabs_query<T>(
+    operations: &T,
+    model: &SlabMetadataModel,
+    segment_id: &SegmentId,
+    op_idx: usize,
+) -> color_eyre::Result<()>
+where
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
+{
+    let expected = model.get_slabs(segment_id);
+    let actual: Vec<SlabId> = operations
+        .get_slabs(segment_id)
+        .try_collect()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetSlabs failed: {e:?}"))?;
 
-    // Apply all operations to both store and model, verifying queries inline
-    for (op_idx, op) in input.operations.iter().enumerate() {
-        match op {
-            SlabMetadataOperation::InsertSlab { segment_id, slab } => {
-                model.apply(op);
-                operations
-                    .insert_slab(segment_id, slab.clone())
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} Insert slab failed: {e:?}")
-                    })?;
-            }
-            SlabMetadataOperation::GetSlabs(segment_id) => {
-                // Verify query immediately against model
-                let expected = model.get_slabs(segment_id);
-                let actual: Vec<SlabId> = operations
-                    .get_slabs(segment_id)
-                    .try_collect()
-                    .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetSlabs failed: {e:?}"))?;
-
-                if expected != actual {
-                    return Err(color_eyre::eyre::eyre!(
-                        "Op #{op_idx} GetSlabs query mismatch for segment {segment_id}: expected \
-                         {expected:?}, got {actual:?}"
-                    ));
-                }
-
-                // Verify ordering
-                for window in actual.windows(2) {
-                    if window[0] >= window[1] {
-                        return Err(color_eyre::eyre::eyre!(
-                            "Op #{op_idx} GetSlabs ordering violation for segment {segment_id}: \
-                             {window:?}"
-                        ));
-                    }
-                }
-            }
-            SlabMetadataOperation::GetSlabRange { segment_id, range } => {
-                // Verify query immediately against model
-                verify_slab_range(operations, &model, segment_id, range.clone())
-                    .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetSlabRange: {e}"))?;
-            }
-            SlabMetadataOperation::DeleteSlab {
-                segment_id,
-                slab_id,
-            } => {
-                model.apply(op);
-                operations
-                    .delete_slab(segment_id, *slab_id)
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} Delete slab failed: {e:?}")
-                    })?;
-            }
-        }
+    if expected != actual {
+        return Err(color_eyre::eyre::eyre!(
+            "Op #{op_idx} GetSlabs query mismatch for segment {segment_id}: expected \
+             {expected:?}, got {actual:?}"
+        ));
     }
 
-    // Final sanity check: verify model-store equivalence for all segment IDs
-    // (queries were already verified inline, this catches any missed state)
-    let all_segment_ids: Vec<SegmentId> = model.all_segment_ids();
+    // Verify ordering
+    for window in actual.windows(2) {
+        if window[0] >= window[1] {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetSlabs ordering violation for segment {segment_id}: {window:?}"
+            ));
+        }
+    }
+    Ok(())
+}
 
-    for segment_id in &all_segment_ids {
+/// Verifies final state matches model for all segments.
+async fn verify_final_slab_state<T>(
+    operations: &T,
+    model: &SlabMetadataModel,
+    all_segment_ids: &[SegmentId],
+) -> color_eyre::Result<()>
+where
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
+{
+    for segment_id in all_segment_ids {
         // Verify get_slabs matches
         let model_slabs = model.get_slabs(segment_id);
         let store_slabs: Vec<SlabId> = operations
@@ -384,14 +358,72 @@ where
     }
 
     // Verify range queries for a few sample ranges
-    for segment_id in &all_segment_ids {
-        // Test a few different ranges
+    for segment_id in all_segment_ids {
         for range in [0..=5, 3..=8, 5..=15] {
-            verify_slab_range(operations, &model, segment_id, range).await?;
+            verify_slab_range(operations, model, segment_id, range).await?;
         }
     }
 
     Ok(())
+}
+
+/// # Errors
+///
+/// Returns an error if:
+/// - Store operations fail (insert, delete, get)
+/// - Store state doesn't match model state
+/// - Ordering invariants are violated
+pub async fn prop_slab_metadata_model_equivalence<T>(
+    operations: &T,
+    input: SlabMetadataTestInput,
+) -> color_eyre::Result<()>
+where
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
+{
+    // Clean up slabs from this trial to ensure isolation
+    cleanup_segment_slabs(operations, &input.segment_ids).await?;
+
+    let mut model = SlabMetadataModel::new();
+
+    // Apply all operations to both store and model, verifying queries inline
+    for (op_idx, op) in input.operations.iter().enumerate() {
+        match op {
+            SlabMetadataOperation::InsertSlab { segment_id, slab } => {
+                model.apply(op);
+                operations
+                    .insert_slab(segment_id, slab.clone())
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} Insert slab failed: {e:?}")
+                    })?;
+            }
+            SlabMetadataOperation::GetSlabs(segment_id) => {
+                verify_get_slabs_query(operations, &model, segment_id, op_idx).await?;
+            }
+            SlabMetadataOperation::GetSlabRange { segment_id, range } => {
+                verify_slab_range(operations, &model, segment_id, range.clone())
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetSlabRange: {e}"))?;
+            }
+            SlabMetadataOperation::DeleteSlab {
+                segment_id,
+                slab_id,
+            } => {
+                model.apply(op);
+                operations
+                    .delete_slab(segment_id, *slab_id)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Op #{op_idx} Delete slab failed: {e:?}")
+                    })?;
+            }
+        }
+    }
+
+    // Final sanity check: verify model-store equivalence for all segment IDs
+    let all_segment_ids: Vec<SegmentId> = model.all_segment_ids();
+    verify_final_slab_state(operations, &model, &all_segment_ids).await
 }
 
 /// [`QuickCheck`] wrapper for slab metadata model equivalence property.

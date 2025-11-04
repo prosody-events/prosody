@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use tracing::Span;
 use uuid::Uuid;
 
-/// Type alias for V1 trigger tuple (key, time) - no timer_type in V1.
+/// Type alias for V1 trigger tuple (key, time) - no `timer_type` in V1.
 type TriggerV1Tuple = (Key, CompactDateTime);
 
 /// V1 high-level operations that coordinate across dual indices.
@@ -162,7 +162,7 @@ impl Arbitrary for V1HighLevelTestInput {
 
                     // Remove all triggers for this key
                     existing_triggers
-                        .retain(|&(seg_id, _, ref k, _), _| !(seg_id == segment_id && k == &key));
+                        .retain(|&(seg_id, _, ref k, _), ()| !(seg_id == segment_id && k == &key));
 
                     V1HighLevelOperation::ClearTriggersForKey {
                         segment_id,
@@ -178,7 +178,7 @@ impl Arbitrary for V1HighLevelTestInput {
 
                     // Remove all triggers in this slab
                     existing_triggers
-                        .retain(|&(seg_id, sid, ..), _| !(seg_id == segment_id && sid == slab_id));
+                        .retain(|&(seg_id, sid, ..), ()| !(seg_id == segment_id && sid == slab_id));
 
                     V1HighLevelOperation::DeleteSlab {
                         segment_id,
@@ -218,9 +218,9 @@ impl Arbitrary for V1HighLevelTestInput {
 /// Reference model tracking V1 dual indices.
 #[derive(Clone, Debug)]
 pub struct V1HighLevelModel {
-    /// Triggers indexed by (segment_id, slab_id).
+    /// Triggers indexed by (`segment_id`, `slab_id`).
     slab_index: HashMap<(SegmentId, SlabId), BTreeSet<TriggerV1Tuple>>,
-    /// Triggers indexed by (segment_id, key).
+    /// Triggers indexed by (`segment_id`, key).
     key_index: HashMap<(SegmentId, Key), BTreeSet<TriggerV1Tuple>>,
 }
 
@@ -355,8 +355,8 @@ impl V1HighLevelModel {
 }
 
 /// Applies V1 high-level operations with inline verification.
-async fn apply_v1_high_level_operations<S>(
-    store: &S,
+async fn apply_v1_high_level_operations(
+    store: &V1Operations,
     model: &mut V1HighLevelModel,
     operations: &[V1HighLevelOperation],
 ) -> color_eyre::Result<()> {
@@ -369,7 +369,7 @@ async fn apply_v1_high_level_operations<S>(
             } => {
                 model.apply(op);
                 store
-                    .add_trigger_v1(segment_id, *slab_id, trigger.clone())
+                    .add_trigger(segment_id, *slab_id, trigger.clone())
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger v1 failed: {e:?}")
@@ -383,7 +383,7 @@ async fn apply_v1_high_level_operations<S>(
             } => {
                 model.apply(op);
                 store
-                    .remove_trigger_v1(segment_id, *slab_id, key, *time)
+                    .remove_trigger(segment_id, *slab_id, key, *time)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} RemoveTrigger v1 failed: {e:?}")
@@ -396,7 +396,7 @@ async fn apply_v1_high_level_operations<S>(
             } => {
                 model.apply(op);
                 store
-                    .clear_triggers_for_key_v1(segment_id, key, *slab_size)
+                    .clear_triggers_for_key(segment_id, key, *slab_size)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} ClearTriggersForKey v1 failed: {e:?}")
@@ -407,12 +407,9 @@ async fn apply_v1_high_level_operations<S>(
                 slab_id,
             } => {
                 model.apply(op);
-                store
-                    .delete_slab_v1(segment_id, *slab_id)
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab v1 failed: {e:?}")
-                    })?;
+                store.delete_slab(segment_id, *slab_id).await.map_err(|e| {
+                    color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab v1 failed: {e:?}")
+                })?;
             }
             V1HighLevelOperation::GetSlabTriggers {
                 segment_id,
@@ -420,7 +417,7 @@ async fn apply_v1_high_level_operations<S>(
             } => {
                 let expected = model.get_slab_triggers(segment_id, *slab_id);
                 let actual: Vec<TriggerV1> = store
-                    .get_slab_triggers_v1(segment_id, *slab_id)
+                    .get_slab_triggers(segment_id, *slab_id)
                     .try_collect()
                     .await
                     .map_err(|e| {
@@ -440,7 +437,7 @@ async fn apply_v1_high_level_operations<S>(
             V1HighLevelOperation::GetKeyTriggers { segment_id, key } => {
                 let expected = model.get_key_triggers(segment_id, key);
                 let actual: Vec<TriggerV1> = store
-                    .get_key_triggers_v1(segment_id, key)
+                    .get_key_triggers(segment_id, key)
                     .try_collect()
                     .await
                     .map_err(|e| {
@@ -467,17 +464,17 @@ async fn apply_v1_high_level_operations<S>(
 ///
 /// This is the critical verification that V1 high-level operations maintain
 /// consistency across both indices. V1 schema has no `timer_type` field.
-async fn verify_v1_dual_index_consistency<S>(
-    store: &S,
+async fn verify_v1_dual_index_consistency(
+    store: &V1Operations,
     model: &V1HighLevelModel,
 ) -> color_eyre::Result<()> {
     use std::collections::HashSet;
 
     // Collect all triggers from V1 slab indices
     let mut slab_triggers = HashSet::new();
-    for ((segment_id, slab_id), _) in &model.slab_index {
+    for (segment_id, slab_id) in model.slab_index.keys() {
         let triggers: Vec<TriggerV1> = store
-            .get_slab_triggers_v1(segment_id, *slab_id)
+            .get_slab_triggers(segment_id, *slab_id)
             .try_collect()
             .await
             .map_err(|e| {
@@ -493,9 +490,9 @@ async fn verify_v1_dual_index_consistency<S>(
 
     // Collect all triggers from V1 key indices
     let mut key_triggers = HashSet::new();
-    for ((segment_id, key), _) in &model.key_index {
+    for (segment_id, key) in model.key_index.keys() {
         let triggers: Vec<TriggerV1> = store
-            .get_key_triggers_v1(segment_id, key)
+            .get_key_triggers(segment_id, key)
             .try_collect()
             .await
             .map_err(|e| {
@@ -552,7 +549,7 @@ pub async fn prop_v1_high_level_dual_index_consistency(
         for key_idx in 0_i32..5_i32 {
             let key: Key = format!("key-{key_idx}").into();
             operations
-                .clear_key_triggers_v1(segment_id, &key)
+                .clear_key_triggers(segment_id, &key)
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!("Failed to clear v1 key triggers during cleanup: {e:?}")
@@ -561,9 +558,7 @@ pub async fn prop_v1_high_level_dual_index_consistency(
 
         // Clean up potential slabs - delete a range of slab IDs
         for slab_id in 0_u32..100_u32 {
-            let _ = operations
-                .delete_slab_metadata_v1(segment_id, slab_id)
-                .await;
+            let _ = operations.delete_slab_metadata(segment_id, slab_id).await;
         }
     }
 

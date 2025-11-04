@@ -393,8 +393,8 @@ where
 
 /// [`QuickCheck`] wrapper for segment model equivalence property.
 ///
-/// Tests low-level TriggerOperations implementations directly
-/// (InMemoryTriggerStore, CassandraTriggerStore).
+/// Tests low-level `TriggerOperations` implementations directly
+/// (`InMemoryTriggerStore`, `CassandraTriggerStore`).
 pub fn test_prop_segment_model_equivalence<T>(operations: &T, input: SegmentTestInput) -> TestResult
 where
     T: TriggerOperations + 'static,
