@@ -5,6 +5,8 @@ pub mod prop_high_level;
 #[cfg(test)]
 pub mod prop_key_triggers;
 #[cfg(test)]
+pub mod prop_migration;
+#[cfg(test)]
 pub mod prop_slab_metadata;
 #[cfg(test)]
 pub mod prop_slab_triggers;
@@ -113,5 +115,16 @@ mod test_runner {
         }
 
         QuickCheck::new().quickcheck(test_wrapper as fn(V1HighLevelTestInput) -> TestResult);
+    }
+
+    #[test]
+    fn prop_migration_invariants() {
+        use super::prop_migration::{MigrationTestInput, test_prop_migration_invariants};
+
+        fn test_wrapper(input: MigrationTestInput) -> TestResult {
+            run_v1_test(input, test_prop_migration_invariants)
+        }
+
+        QuickCheck::new().quickcheck(test_wrapper as fn(MigrationTestInput) -> TestResult);
     }
 }

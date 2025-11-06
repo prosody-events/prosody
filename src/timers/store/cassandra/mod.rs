@@ -836,17 +836,15 @@ mod test {
 
     #[tokio::test]
     async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
-        let store = CassandraTriggerStore::new(
-            &test_cassandra_config("prosody_test"),
-            CompactDuration::new(3600),
-        )
-        .await?;
+        let slab_size = CompactDuration::new(60); // 1 minute slabs
+        let store =
+            CassandraTriggerStore::new(&test_cassandra_config("prosody_test"), slab_size).await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {
             id: segment_id,
             name: "test_segment".to_owned(),
-            slab_size: CompactDuration::new(60), // 1 minute slabs
+            slab_size,
             version: SegmentVersion::V1,
         };
 
@@ -941,17 +939,16 @@ mod test {
 
     #[tokio::test]
     async fn test_simple_wrap_around() -> Result<()> {
-        let store = CassandraTriggerStore::new(
-            &test_cassandra_config("prosody_test_simple"),
-            CompactDuration::new(3600),
-        )
-        .await?;
+        let slab_size = CompactDuration::new(60);
+        let store =
+            CassandraTriggerStore::new(&test_cassandra_config("prosody_test_simple"), slab_size)
+                .await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {
             id: segment_id,
             name: "simple_test".to_owned(),
-            slab_size: CompactDuration::new(60),
+            slab_size,
             version: SegmentVersion::V1,
         };
 

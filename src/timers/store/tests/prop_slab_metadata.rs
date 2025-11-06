@@ -66,7 +66,7 @@ impl Arbitrary for SlabMetadataTestInput {
         let segment_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
 
         // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
-        let slab_size = CompactDuration::new(u32::arbitrary(g).max(1).min(604_800));
+        let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
 
         // Generate 10-50 operations using these segments
         let op_count = (usize::arbitrary(g) % 40) + 10;

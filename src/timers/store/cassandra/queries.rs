@@ -138,6 +138,9 @@ pub struct Queries {
 
     #[educe(Debug(ignore))]
     pub insert_slab_trigger_v1: PreparedStatement,
+
+    #[educe(Debug(ignore))]
+    pub insert_segment_v1: PreparedStatement,
 }
 
 impl Queries {
@@ -205,6 +208,7 @@ impl Queries {
         let get_key_triggers_v1 = prepare_get_key_triggers_v1(session, keyspace).await?;
         let insert_slab_v1 = prepare_insert_slab_v1(session, keyspace).await?;
         let insert_slab_trigger_v1 = prepare_insert_slab_trigger_v1(session, keyspace).await?;
+        let insert_segment_v1 = prepare_insert_segment_v1(session, keyspace).await?;
 
         Ok(Self {
             insert_segment,
@@ -241,6 +245,7 @@ impl Queries {
             get_key_triggers_v1,
             insert_slab_v1,
             insert_slab_trigger_v1,
+            insert_segment_v1,
         })
     }
 }
@@ -842,6 +847,26 @@ async fn prepare_insert_slab_trigger_v1(
             "insert into {keyspace}.{TABLE_SLABS} (segment_id, id, key, time, span) values (?, ?, \
              ?, ?, ?)"
         ),
+    )
+    .await
+}
+
+/// Prepares a CQL statement for inserting a V1 segment (without version).
+///
+/// Creates a prepared statement for: `INSERT INTO segments (id, name,
+/// slab_size) VALUES (?, ?, ?)`
+///
+/// This sets only the static columns without the `version` field, simulating
+/// segments created before the version column was added to the schema.
+///
+/// Note: This is for V1 migration testing purposes only.
+async fn prepare_insert_segment_v1(
+    session: &Session,
+    keyspace: &str,
+) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+    prepare(
+        session,
+        &format!("insert into {keyspace}.{TABLE_SEGMENTS} (id, name, slab_size) values (?, ?, ?)"),
     )
     .await
 }

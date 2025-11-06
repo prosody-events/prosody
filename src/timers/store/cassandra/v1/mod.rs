@@ -53,6 +53,41 @@ impl V1Operations {
         Self { store, queries }
     }
 
+    // ========================================================================
+    // Segment Metadata Operations (V1-specific)
+    // ========================================================================
+
+    /// Inserts segment metadata with V1 schema (version=NULL).
+    ///
+    /// Creates a segment with static columns `name` and `slab_size`, but leaves
+    /// `version=NULL` to simulate segments created before the version column
+    /// was added to the schema.
+    ///
+    /// This is used for testing V1→V2 migration and should not be used in
+    /// production code.
+    pub(crate) async fn insert_segment_v1(
+        &self,
+        segment_id: &SegmentId,
+        name: &str,
+        slab_size: CompactDuration,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        // Insert segment with version=NULL by only setting static columns
+        // CQL: INSERT INTO segments (id, name, slab_size) VALUES (?, ?, ?)
+        // Note: This requires a prepared statement that omits the version column
+        self.store
+            .session()
+            .execute_unpaged(
+                &self.queries.insert_segment_v1,
+                (segment_id, name, slab_size),
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Slab Metadata Operations (V1-specific)
+    // ========================================================================
+
     /// Inserts a slab entry into v1 schema.
     ///
     /// Inserts a row into the `segments` table with partition key `segment_id`

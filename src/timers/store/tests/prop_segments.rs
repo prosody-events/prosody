@@ -55,7 +55,7 @@ impl Arbitrary for SegmentTestInput {
         let segment_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
 
         // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
-        let slab_size = CompactDuration::new(u32::arbitrary(g).max(1).min(604_800));
+        let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
 
         // Generate 10-50 operations using these segments
         let op_count = (usize::arbitrary(g) % 40) + 10;
@@ -76,11 +76,7 @@ impl Arbitrary for SegmentTestInput {
                         id: segment_id,
                         name: format!("segment-{}", u8::arbitrary(g) % 10),
                         slab_size,
-                        version: if bool::arbitrary(g) {
-                            SegmentVersion::V1
-                        } else {
-                            SegmentVersion::V2
-                        },
+                        version: SegmentVersion::V2,
                     };
                     SegmentOperation::Insert(segment)
                 }
@@ -100,11 +96,7 @@ impl Arbitrary for SegmentTestInput {
                         let inserted_vec: Vec<_> = inserted_segments.iter().copied().collect();
                         let update_segment_id =
                             inserted_vec[usize::arbitrary(g) % inserted_vec.len()];
-                        let version = if bool::arbitrary(g) {
-                            SegmentVersion::V1
-                        } else {
-                            SegmentVersion::V2
-                        };
+                        let version = SegmentVersion::V2;
                         SegmentOperation::UpdateVersion {
                             segment_id: update_segment_id,
                             version,
