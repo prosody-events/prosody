@@ -4,10 +4,12 @@
 //! and migration system used by all stateful components in Prosody. It manages
 //! a single session and unified migration system.
 
+use crate::cassandra::migrator::MigrationError;
 use crate::propagator::new_propagator;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::duration::CompactDurationError;
+use crate::timers::error::TimerManagerError;
 use crate::timers::store::InvalidSegmentVersionError;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use scylla::_macro_internal::{
@@ -210,8 +212,8 @@ pub enum CassandraStoreError {
     Session(Box<NewSessionError>),
 
     /// Schema migration failed.
-    #[error("Migration failed: {0}")]
-    Migration(String),
+    #[error(transparent)]
+    Migration(#[from] MigrationError),
 
     /// Failed to set keyspace.
     #[error("Failed to set keyspace: {0:#}")]
@@ -256,6 +258,24 @@ pub enum CassandraStoreError {
     /// Invalid segment version value.
     #[error("Invalid segment version: {0:#}")]
     InvalidSegmentVersion(#[from] InvalidSegmentVersionError),
+
+    /// Slab size mismatch during segment insertion.
+    #[error(
+        "Cannot insert segment {segment_id} with slab_size {segment_slab_size} that differs from \
+         configured slab_size {configured_slab_size}"
+    )]
+    SlabSizeMismatch {
+        segment_id: crate::timers::store::SegmentId,
+        segment_slab_size: CompactDuration,
+        configured_slab_size: CompactDuration,
+    },
+
+    /// Segment disappeared during data migration.
+    #[error("Segment {segment_id} disappeared during {operation}")]
+    SegmentDisappeared {
+        segment_id: crate::timers::store::SegmentId,
+        operation: &'static str,
+    },
 }
 
 impl From<NewSessionError> for CassandraStoreError {
@@ -315,6 +335,18 @@ impl From<RowsError> for CassandraStoreError {
 impl From<TypeCheckError> for CassandraStoreError {
     fn from(error: TypeCheckError) -> Self {
         Self::TypeCheck(Box::new(error))
+    }
+}
+
+impl From<TimerManagerError<CassandraStoreError>> for CassandraStoreError {
+    fn from(error: TimerManagerError<CassandraStoreError>) -> Self {
+        match error {
+            TimerManagerError::Store(e) => e,
+            _ => Self::SegmentDisappeared {
+                segment_id: crate::timers::store::SegmentId::default(),
+                operation: "timer manager operation",
+            },
+        }
     }
 }
 

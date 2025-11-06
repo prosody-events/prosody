@@ -102,6 +102,7 @@
 //!         retry: RetryConfiguration::builder(),
 //!         failure_topic: FailureTopicConfigurationBuilder::default(),
 //!         scheduler: SchedulerConfigurationBuilder::default(),
+//!         monopolization: Default::default(),
 //!         timeout: TimeoutConfigurationBuilder::default(),
 //!     };
 //!     let cassandra_config = CassandraConfigurationBuilder::default();

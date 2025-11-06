@@ -4,7 +4,6 @@
 //! pending migrations that need to be applied.
 
 use super::loader::Migration;
-use crate::cassandra::CassandraStoreError;
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -36,7 +35,7 @@ pub struct AppliedMigration {
 pub fn validate_applied_migrations(
     migrations: &[Migration],
     applied_migrations: &HashMap<String, AppliedMigration>,
-) -> Result<(), CassandraStoreError> {
+) -> Result<(), super::MigrationError> {
     let migration_map: HashMap<String, &Migration> =
         migrations.iter().map(|m| (m.filename.clone(), m)).collect();
 
@@ -44,11 +43,11 @@ pub fn validate_applied_migrations(
         match migration_map.get(filename) {
             Some(migration) => {
                 if migration.checksum != applied.checksum {
-                    return Err(CassandraStoreError::Migration(format!(
-                        "Migration {} has been modified after being applied. Expected checksum: \
-                         {}, found: {}",
-                        filename, applied.checksum, migration.checksum
-                    )));
+                    return Err(super::MigrationError::ChecksumMismatch {
+                        file: filename.clone(),
+                        expected: applied.checksum.clone(),
+                        actual: migration.checksum.clone(),
+                    });
                 }
             }
             None => {

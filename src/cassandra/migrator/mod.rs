@@ -67,6 +67,10 @@ use humantime::format_duration;
 use loader::{Migration, load_embedded_migrations};
 use lock::LockManager;
 use scylla::client::session::Session;
+use scylla::deserialize::TypeCheckError;
+use scylla::errors::{
+    ExecutionError, IntoRowsResultError, MaybeFirstRowError, MetadataError, PrepareError,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::task::coop::cooperative;
@@ -153,10 +157,7 @@ impl<'a> CassandraMigrator<'a> {
             }
         }
 
-        Err(CassandraStoreError::Migration(format!(
-            "Failed to prepare lock statements after {MAX_TABLE_PREPARATION_RETRIES} attempts. \
-             Tables may not be available."
-        )))
+        Err(MigrationError::LockPreparationFailed(MAX_TABLE_PREPARATION_RETRIES).into())
     }
 
     /// Executes the complete migration process with distributed locking and
@@ -220,9 +221,7 @@ impl<'a> CassandraMigrator<'a> {
                         tracing::error!(
                             "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
                         );
-                        return Err(CassandraStoreError::Migration(format!(
-                            "Migration failed after {MAX_MIGRATION_RETRIES} retries: {e:#}"
-                        )));
+                        return Err(e);
                     }
 
                     let sleep_duration = calculate_backoff(attempt);
@@ -343,7 +342,11 @@ impl<'a> CassandraMigrator<'a> {
 
         let select_sql =
             format!("select filename, checksum from {keyspace}.{TABLE_SCHEMA_MIGRATIONS}");
-        let select_stmt = self.session.prepare(select_sql).await?;
+        let select_stmt = self
+            .session
+            .prepare(select_sql)
+            .await
+            .map_err(|e| MigrationError::AppliedMigrationsPreparationFailed(Box::new(e)))?;
 
         let stream = self
             .session
@@ -360,5 +363,117 @@ impl<'a> CassandraMigrator<'a> {
 
         debug!("Found {} applied migrations", applied.len());
         Ok(applied)
+    }
+}
+
+/// Errors that can occur during Cassandra schema migration.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationError {
+    /// Keyspace metadata not found after refresh.
+    #[error("Keyspace not found in cluster metadata")]
+    KeyspaceNotFound,
+
+    /// Failed to refresh cluster metadata.
+    #[error("Failed to refresh metadata: {0:#}")]
+    MetadataRefreshFailed(#[from] MetadataError),
+
+    /// Failed to load embedded migration file.
+    #[error("Failed to load migration file: {0}")]
+    MigrationFileLoadFailed(String),
+
+    /// Migration file contains invalid UTF-8.
+    #[error("Invalid UTF-8 in migration file {file}: {source}")]
+    InvalidUtf8 {
+        file: String,
+        source: std::str::Utf8Error,
+    },
+
+    /// Migration filename does not follow the required format.
+    #[error("Invalid migration filename format: {0}")]
+    InvalidFilenameFormat(String),
+
+    /// Migration filename timestamp is not valid.
+    #[error("Invalid timestamp in filename: {0}")]
+    InvalidTimestamp(String),
+
+    /// Failed to acquire distributed migration lock.
+    #[error("Failed to acquire migration lock - another process may be running migrations")]
+    LockAcquisitionFailed,
+
+    /// Failed to execute a statement in a migration.
+    #[error("Failed to execute statement {statement_index} in migration {migration}")]
+    StatementExecutionFailed {
+        migration: String,
+        statement_index: usize,
+        #[source]
+        source: Box<ExecutionError>,
+    },
+
+    /// Migration checksum mismatch - file has been modified after being
+    /// applied.
+    #[error(
+        "Migration {file} has been modified after being applied. Expected checksum: {expected}, \
+         found: {actual}"
+    )]
+    ChecksumMismatch {
+        file: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// Failed to prepare lock-related statements after multiple retries.
+    #[error("Failed to prepare lock statements after {0} attempts. Tables may not be available.")]
+    LockPreparationFailed(u32),
+
+    /// Database query execution failed.
+    #[error(transparent)]
+    ExecutionError(Box<ExecutionError>),
+
+    /// Failed to prepare lock-related database statements.
+    #[error("Failed to prepare lock statements")]
+    LockStatementPreparationFailed(#[source] Box<PrepareError>),
+
+    /// Failed to prepare migration tracking statement.
+    #[error("Failed to prepare migration tracking statement")]
+    MigrationTrackingPreparationFailed(#[source] Box<PrepareError>),
+
+    /// Failed to prepare query for applied migrations.
+    #[error("Failed to prepare applied migrations query")]
+    AppliedMigrationsPreparationFailed(#[source] Box<PrepareError>),
+
+    /// Failed to parse lock acquisition result into rows.
+    #[error("Failed to parse lock acquisition result into rows")]
+    LockResultIntoRowsFailed(Box<IntoRowsResultError>),
+
+    /// Failed to extract first row from lock acquisition result.
+    #[error("Failed to extract first row from lock acquisition result")]
+    LockResultFirstRowFailed(Box<MaybeFirstRowError>),
+
+    /// Failed to parse applied migrations from query result.
+    #[error("Failed to parse applied migrations query result")]
+    AppliedMigrationsParsingFailed(Box<TypeCheckError>),
+}
+
+impl From<ExecutionError> for MigrationError {
+    fn from(error: ExecutionError) -> Self {
+        Self::ExecutionError(Box::new(error))
+    }
+}
+
+impl From<IntoRowsResultError> for MigrationError {
+    fn from(error: IntoRowsResultError) -> Self {
+        Self::LockResultIntoRowsFailed(Box::new(error))
+    }
+}
+
+impl From<MaybeFirstRowError> for MigrationError {
+    fn from(error: MaybeFirstRowError) -> Self {
+        Self::LockResultFirstRowFailed(Box::new(error))
+    }
+}
+
+impl From<TypeCheckError> for MigrationError {
+    fn from(error: TypeCheckError) -> Self {
+        Self::AppliedMigrationsParsingFailed(Box::new(error))
     }
 }

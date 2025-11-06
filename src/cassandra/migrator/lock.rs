@@ -4,7 +4,7 @@
 //! to ensure only one process applies migrations at a time across a
 //! distributed system.
 
-use crate::cassandra::{CassandraStoreError, TABLE_LOCKS};
+use crate::cassandra::TABLE_LOCKS;
 use chrono::Utc;
 use humantime::format_duration;
 use scylla::client::session::Session;
@@ -43,8 +43,8 @@ impl<'a> LockManager<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraStoreError`] if statement preparation fails.
-    pub async fn new(session: &'a Session, keyspace: &str) -> Result<Self, CassandraStoreError> {
+    /// Returns [`super::MigrationError`] if statement preparation fails.
+    pub async fn new(session: &'a Session, keyspace: &str) -> Result<Self, super::MigrationError> {
         let (acquire_lock, release_lock) = prepare_lock_statements(session, keyspace).await?;
 
         Ok(Self {
@@ -87,7 +87,7 @@ impl<'a> LockManager<'a> {
         &'a self,
         lock_name: &'a str,
         timeout: Duration,
-    ) -> Result<LockGuard<'a>, CassandraStoreError> {
+    ) -> Result<LockGuard<'a>, super::MigrationError> {
         let owner_id = Uuid::new_v4();
         let acquired_at = Utc::now();
         let expires_at = acquired_at
@@ -138,10 +138,7 @@ impl<'a> LockManager<'a> {
             })
         } else {
             debug!("Failed to acquire migration lock - another process holds it");
-            Err(CassandraStoreError::Migration(
-                "Failed to acquire migration lock - another process may be running migrations"
-                    .to_owned(),
-            ))
+            Err(super::MigrationError::LockAcquisitionFailed)
         }
     }
 }
@@ -155,8 +152,8 @@ impl LockGuard<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraStoreError`] if the database query fails.
-    pub async fn release(mut self) -> Result<(), CassandraStoreError> {
+    /// Returns [`super::MigrationError`] if the database query fails.
+    pub async fn release(mut self) -> Result<(), super::MigrationError> {
         if !self.released {
             debug!(
                 "Explicitly releasing lock '{}' with owner_id: {}",
@@ -195,19 +192,21 @@ impl Drop for LockGuard<'_> {
 async fn prepare_lock_statements(
     session: &Session,
     keyspace: &str,
-) -> Result<(PreparedStatement, PreparedStatement), CassandraStoreError> {
+) -> Result<(PreparedStatement, PreparedStatement), super::MigrationError> {
     let acquire_lock = session
         .prepare(format!(
             "insert into {keyspace}.{TABLE_LOCKS} (lock_name, owner_id, acquired_at, expires_at, \
              process_info) values (?, ?, ?, ?, ?) if not exists using ttl ?"
         ))
-        .await?;
+        .await
+        .map_err(|e| super::MigrationError::LockStatementPreparationFailed(Box::new(e)))?;
 
     let release_lock = session
         .prepare(format!(
             "delete from {keyspace}.{TABLE_LOCKS} where lock_name = ? if owner_id = ?"
         ))
-        .await?;
+        .await
+        .map_err(|e| super::MigrationError::LockStatementPreparationFailed(Box::new(e)))?;
 
     Ok((acquire_lock, release_lock))
 }

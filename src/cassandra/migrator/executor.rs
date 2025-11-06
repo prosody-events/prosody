@@ -4,7 +4,7 @@
 //! in the database.
 
 use super::loader::{Migration, parse_cql_statements};
-use crate::cassandra::{CassandraStoreError, TABLE_SCHEMA_MIGRATIONS};
+use crate::cassandra::TABLE_SCHEMA_MIGRATIONS;
 use humantime::format_duration;
 use scylla::client::session::Session;
 use std::time::Instant;
@@ -40,7 +40,7 @@ impl<'a> MigrationExecutor<'a> {
         &self,
         migration: &Migration,
         keyspace: &str,
-    ) -> Result<(), CassandraStoreError> {
+    ) -> Result<(), super::MigrationError> {
         let start_time = Instant::now();
 
         debug!("Starting execution of migration: {}", migration.filename);
@@ -55,12 +55,10 @@ impl<'a> MigrationExecutor<'a> {
                 self.session
                     .query_unpaged(statement_text.as_str(), &[])
                     .await
-                    .map_err(|e| {
-                        CassandraStoreError::Migration(format!(
-                            "Failed to execute statement {} in migration {}: {e:#}",
-                            index + 1,
-                            migration.filename
-                        ))
+                    .map_err(|source| super::MigrationError::StatementExecutionFailed {
+                        migration: migration.filename.clone(),
+                        statement_index: index + 1,
+                        source: Box::new(source),
                     })?;
             }
         }
@@ -74,7 +72,10 @@ impl<'a> MigrationExecutor<'a> {
             "insert into {keyspace}.{TABLE_SCHEMA_MIGRATIONS} (filename, checksum, applied_at, \
              execution_time_ms) values (?, ?, ?, ?)"
         );
-        let insert_stmt = self.session.prepare(insert_sql).await?;
+        let insert_stmt =
+            self.session.prepare(insert_sql).await.map_err(|e| {
+                super::MigrationError::MigrationTrackingPreparationFailed(Box::new(e))
+            })?;
 
         self.session
             .execute_unpaged(

@@ -4,8 +4,8 @@
 //! substitution, and parse CQL statements for execution.
 
 use crate::cassandra::{
-    CassandraStoreError, TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS, TABLE_SLABS,
-    TABLE_TYPED_KEYS, TABLE_TYPED_SLABS,
+    TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS, TABLE_SLABS, TABLE_TYPED_KEYS,
+    TABLE_TYPED_SLABS,
 };
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
@@ -57,19 +57,17 @@ struct MigrationAssets;
 /// - Migration files cannot be loaded from embedded assets
 /// - File content contains invalid UTF-8
 /// - Timestamp extraction from filename fails
-pub fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, CassandraStoreError> {
+pub fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, super::MigrationError> {
     let mut migrations = Vec::new();
 
     for filename in MigrationAssets::iter() {
-        let content = MigrationAssets::get(filename.as_ref()).ok_or_else(|| {
-            CassandraStoreError::Migration(format!("Failed to load migration file: {filename}",))
-        })?;
+        let content = MigrationAssets::get(filename.as_ref())
+            .ok_or_else(|| super::MigrationError::MigrationFileLoadFailed(filename.to_string()))?;
 
         let mut content_str = str::from_utf8(content.data.as_ref())
-            .map_err(|e| {
-                CassandraStoreError::Migration(format!(
-                    "Invalid UTF-8 in migration file {filename}: {e}",
-                ))
+            .map_err(|e| super::MigrationError::InvalidUtf8 {
+                file: filename.to_string(),
+                source: e,
             })?
             .to_owned();
 
@@ -180,18 +178,16 @@ fn calculate_checksum(content: &str) -> String {
 /// Returns [`CassandraStoreError`] if:
 /// - Filename is shorter than 8 characters
 /// - First 8 characters are not all digits
-fn extract_timestamp(filename: &str) -> Result<String, CassandraStoreError> {
+fn extract_timestamp(filename: &str) -> Result<String, super::MigrationError> {
     if filename.len() < 8 {
-        return Err(CassandraStoreError::Migration(format!(
-            "Invalid migration filename format: {filename}",
-        )));
+        return Err(super::MigrationError::InvalidFilenameFormat(
+            filename.to_owned(),
+        ));
     }
 
     let timestamp = &filename[..8];
     if !timestamp.chars().all(|c| c.is_ascii_digit()) {
-        return Err(CassandraStoreError::Migration(format!(
-            "Invalid timestamp in filename: {filename}",
-        )));
+        return Err(super::MigrationError::InvalidTimestamp(filename.to_owned()));
     }
 
     Ok(timestamp.to_owned())

@@ -2,7 +2,6 @@ use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore, CassandraStoreError};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::error::TimerManagerError;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::queries::Queries;
@@ -38,7 +37,6 @@ pub(crate) mod migration;
 pub struct CassandraTriggerStore {
     store: CassandraStore,
     queries: Arc<Queries>,
-    v1_operations: v1::V1Operations,
     slab_size: CompactDuration,
 }
 
@@ -66,12 +64,9 @@ impl CassandraTriggerStore {
         let store = CassandraStore::new(config).await?;
         let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
 
-        let v1_operations = v1::V1Operations::new(store.clone(), Arc::clone(&queries));
-
         Ok(Self {
             store,
             queries,
-            v1_operations,
             slab_size,
         })
     }
@@ -92,9 +87,13 @@ impl CassandraTriggerStore {
         self.store.calculate_ttl(time)
     }
 
-    /// Returns a reference to the V1 operations for migration support.
-    pub(crate) fn v1_operations(&self) -> &v1::V1Operations {
-        &self.v1_operations
+    /// Creates V1 operations on-demand for migration support.
+    ///
+    /// This method constructs a `V1Operations` instance that provides access
+    /// to V1 schema operations (reading/writing data without `timer_type`).
+    /// Only used during V1→V2 migration.
+    pub(crate) fn v1(&self) -> v1::V1Operations {
+        v1::V1Operations::new(self.store.clone(), Arc::clone(&self.queries))
     }
 
     /// Reads a segment from the database without applying any migrations.
@@ -137,11 +136,11 @@ impl TriggerOperations for CassandraTriggerStore {
     async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
         // Validate that the segment's slab_size matches the configured slab_size
         if segment.slab_size != self.slab_size {
-            return Err(CassandraTriggerStoreError::Migration(format!(
-                "Cannot insert segment {} with slab_size {} that differs from configured \
-                 slab_size {}",
-                segment.id, segment.slab_size, self.slab_size
-            )));
+            return Err(CassandraTriggerStoreError::SlabSizeMismatch {
+                segment_id: segment.id,
+                segment_slab_size: segment.slab_size,
+                configured_slab_size: self.slab_size,
+            });
         }
 
         self.session()
@@ -161,76 +160,34 @@ impl TriggerOperations for CassandraTriggerStore {
 
     #[instrument(level = "debug", skip(self), err)]
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
-        let row = self
-            .session()
-            .execute_unpaged(&self.queries().get_segment, (segment_id,))
-            .await?
-            .into_rows_result()?
-            .maybe_first_row::<(String, CompactDuration, Option<i8>)>()?;
-
-        let Some((name, slab_size, version)) = row else {
+        let Some(mut segment) = self.get_segment_unchecked(segment_id).await? else {
             return Ok(None);
         };
 
-        let version = version
-            .map(SegmentVersion::try_from)
-            .transpose()?
-            .unwrap_or(SegmentVersion::V1);
-
-        let mut segment = Segment {
-            id: *segment_id,
-            name,
-            slab_size,
-            version,
-        };
-
-        // Automatically migrate if needed (V1→V2 or slab size change)
-        let store = TableAdapter::new(self.clone());
-
         // Phase 1: V1→V2 schema migration
         if migration::needs_migration(&segment) {
-            migration::migrate_segment(&store, &segment)
-                .await
-                .map_err(|e| match e {
-                    TimerManagerError::Store(store_err) => store_err,
-                    TimerManagerError::Migration(migration_err) => {
-                        CassandraTriggerStoreError::Migration(migration_err.to_string())
-                    }
-                    other => CassandraTriggerStoreError::Migration(format!("{other:?}")),
-                })?;
+            migration::migrate_segment(self, &segment).await?;
 
             // Reload segment to get updated version
-            segment = self
-                .get_segment_unchecked(segment_id)
-                .await?
-                .ok_or_else(|| {
-                    CassandraTriggerStoreError::Migration(format!(
-                        "Segment {segment_id} disappeared after V1→V2 migration"
-                    ))
-                })?;
+            segment = self.get_segment_unchecked(segment_id).await?.ok_or(
+                CassandraTriggerStoreError::SegmentDisappeared {
+                    segment_id: *segment_id,
+                    operation: "V1→V2 migration",
+                },
+            )?;
         }
 
         // Phase 2: Slab size migration
         if migration::needs_slab_size_migration(&segment, self.slab_size) {
-            migration::migrate_slab_size(&store, &segment, self.slab_size)
-                .await
-                .map_err(|e| match e {
-                    TimerManagerError::Store(store_err) => store_err,
-                    TimerManagerError::Migration(migration_err) => {
-                        CassandraTriggerStoreError::Migration(migration_err.to_string())
-                    }
-                    other => CassandraTriggerStoreError::Migration(format!("{other:?}")),
-                })?;
+            migration::migrate_slab_size(self, &segment, self.slab_size).await?;
 
             // Reload segment to get updated slab_size
-            segment = self
-                .get_segment_unchecked(segment_id)
-                .await?
-                .ok_or_else(|| {
-                    CassandraTriggerStoreError::Migration(format!(
-                        "Segment {segment_id} disappeared after slab size migration"
-                    ))
-                })?;
+            segment = self.get_segment_unchecked(segment_id).await?.ok_or(
+                CassandraTriggerStoreError::SegmentDisappeared {
+                    segment_id: *segment_id,
+                    operation: "slab size migration",
+                },
+            )?;
         }
 
         Ok(Some(segment))
@@ -442,6 +399,39 @@ impl TriggerOperations for CassandraTriggerStore {
         }
     }
 
+    #[instrument(level = "debug", skip(self))]
+    fn get_slab_triggers_all_types(
+        &self,
+        slab: &Slab,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        let segment_id = slab.segment_id();
+        let slab_size = slab.size().seconds() as i32;
+        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
+
+        try_stream! {
+            let stream = self
+                .session()
+                .execute_iter(
+                    self.queries().get_slab_triggers_all_types.clone(),
+                    (segment_id, slab_size, slab_id),
+                )
+                .await?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
+
+            pin_mut!(stream);
+            while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
+                let context = self.propagator().extract(&span_map);
+                let span = info_span!("fetch_slab_trigger_all_types");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
+
+                let timer_type = TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                yield Trigger::new(key.into(), time, timer_type, span);
+            }
+        }
+    }
+
     #[instrument(level = "debug", skip(self), err)]
     async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
         let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
@@ -567,39 +557,6 @@ impl TriggerOperations for CassandraTriggerStore {
             while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
                 let context = self.propagator().extract(&span_map);
                 let span = debug_span!("fetch_key_trigger");
-                if let Err(error) = span.set_parent(context) {
-                    error!("failed to set parent span: {error:#}");
-                }
-
-                let timer_type = TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
-                yield Trigger::new(key.into(), time, timer_type, span);
-            }
-        }
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    fn get_slab_triggers_all_types(
-        &self,
-        slab: &Slab,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        let segment_id = slab.segment_id();
-        let slab_size = slab.size().seconds() as i32;
-        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
-
-        try_stream! {
-            let stream = self
-                .session()
-                .execute_iter(
-                    self.queries().get_slab_triggers_all_types.clone(),
-                    (segment_id, slab_size, slab_id),
-                )
-                .await?
-                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
-
-            pin_mut!(stream);
-            while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
-                let context = self.propagator().extract(&span_map);
-                let span = info_span!("fetch_slab_trigger_all_types");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
