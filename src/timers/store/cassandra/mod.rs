@@ -166,7 +166,7 @@ impl TriggerOperations for CassandraTriggerStore {
 
         // Phase 1: V1→V2 schema migration
         if migration::needs_migration(&segment) {
-            migration::migrate_segment(self, &segment).await?;
+            migration::migrate_segment_version(self, &segment).await?;
 
             // Reload segment to get updated version
             segment = self.get_segment_unchecked(segment_id).await?.ok_or(

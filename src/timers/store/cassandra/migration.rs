@@ -53,9 +53,10 @@ use crate::timers::error::TimerManagerError;
 use crate::timers::slab::Slab;
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, SlabId, TriggerV1};
-use crate::timers::{TimerType, Trigger};
+use crate::timers::{DELETE_CONCURRENCY, TimerType, Trigger};
 use ahash::HashSet;
 use futures::TryStreamExt;
+use futures::stream;
 use thiserror::Error;
 use tokio::try_join;
 use tracing::{debug, info, instrument, warn};
@@ -98,7 +99,7 @@ pub fn needs_migration(segment: &Segment) -> bool {
 /// - Updating segment version fails
 /// - Cleaning up v1 data fails
 #[instrument(level = "info", skip(store), err)]
-pub async fn migrate_segment(
+pub async fn migrate_segment_version(
     store: &CassandraTriggerStore,
     segment: &Segment,
 ) -> Result<(), TimerManagerError<CassandraTriggerStoreError>> {
@@ -177,111 +178,76 @@ pub async fn migrate_segment(
 
     // Phase 4: Clean up V1 trigger data (can fail safely - data is orphaned but
     // harmless)
-    cleanup_v1_data(&v1_ops, &segment_id, &slab_ids, segment.slab_size).await;
+    if let Err(error) = cleanup_v1_data(&v1_ops, &segment_id, &slab_ids).await {
+        warn!(
+            "Failed to clean up V1 data for segment {segment_id}: {error:#}; v1 data is orphaned \
+             but migration completed successfully"
+        );
+    }
 
     Ok(())
 }
 
-/// Cleans up V1 trigger data and obsolete slab metadata after migration.
+/// Cleans up V1 trigger data after migration.
 ///
-/// This function removes V1 data from `timer_slabs` and `timer_keys` tables,
-/// and deletes slab metadata for slabs that are not reused by V2.
+/// This function removes V1 trigger data from `timer_slabs` and `timer_keys`
+/// tables. Slab metadata in `timer_segments` is left intact as it is shared
+/// between V1 and V2 and does not need to be cleaned up.
 ///
 /// # Arguments
 ///
 /// * `v1_ops` - V1 operations interface
 /// * `segment_id` - The segment being migrated
 /// * `slab_ids` - List of V1 slab IDs to clean up
-/// * `target_slab_size` - The V2 slab size (used to calculate which slabs are
-///   reused)
+///
+/// # Errors
+///
+/// Returns an error if any cleanup operations fail. Processing continues for
+/// all slabs even if some fail, but the first error encountered is returned.
 async fn cleanup_v1_data(
     v1_ops: &super::v1::V1Operations,
     segment_id: &SegmentId,
     slab_ids: &[SlabId],
-    target_slab_size: CompactDuration,
-) {
-    // Calculate which V1 slabs are obsolete (not used by V2)
-    // If slab size didn't change, V2 uses the same slab IDs - don't delete those!
-    let mut v2_slab_ids = HashSet::default();
-    for slab_id in slab_ids {
-        // Get triggers from this old V1 slab and calculate their new V2 slab IDs
-        let v1_triggers: Vec<TriggerV1> = match v1_ops
-            .get_slab_triggers(segment_id, *slab_id)
-            .try_collect()
-            .await
-        {
-            Ok(triggers) => triggers,
-            Err(error) => {
-                warn!("Failed to get v1 triggers for cleanup calculation: {error:#}");
-                continue;
-            }
-        };
+) -> Result<(), CassandraTriggerStoreError> {
+    // Process all slabs concurrently for maximum throughput
+    stream::iter(
+        slab_ids
+            .iter()
+            .copied()
+            .map(Ok::<_, CassandraTriggerStoreError>),
+    )
+    .try_for_each_concurrent(DELETE_CONCURRENCY, |slab_id| {
+        let v1_ops = v1_ops.clone();
+        let segment_id = *segment_id;
 
-        for trigger in &v1_triggers {
-            let v2_slab_id = Slab::from_time(*segment_id, target_slab_size, trigger.time).id();
-            v2_slab_ids.insert(v2_slab_id);
+        async move {
+            // Stream triggers from slab and delete from key index concurrently
+            let triggers = v1_ops.get_slab_triggers(&segment_id, slab_id);
+            triggers
+                .try_for_each_concurrent(DELETE_CONCURRENCY, |trigger| {
+                    let v1_ops = v1_ops.clone();
+                    async move {
+                        v1_ops
+                            .delete_key_trigger(&segment_id, &trigger.key, trigger.time)
+                            .await
+                    }
+                })
+                .await?;
+
+            // Clear slab triggers (separate table, can't combine with above)
+            v1_ops.clear_slab_triggers(&segment_id, slab_id).await?;
+
+            Ok(())
         }
-    }
-
-    // Now clean up V1 data
-    for slab_id in slab_ids {
-        // Get all V1 triggers to delete from key index
-        let v1_triggers: Vec<_> = match v1_ops
-            .get_slab_triggers(segment_id, *slab_id)
-            .try_collect()
-            .await
-        {
-            Ok(triggers) => triggers,
-            Err(error) => {
-                warn!(
-                    "Failed to get v1 triggers for cleanup of slab {slab_id} in segment \
-                     {segment_id}: {error:#}; v1 data is orphaned but migration completed \
-                     successfully"
-                );
-                continue;
-            }
-        };
-
-        // Delete each trigger from V1 key index
-        for trigger in v1_triggers {
-            if let Err(error) = v1_ops
-                .delete_key_trigger(segment_id, &trigger.key, trigger.time)
-                .await
-            {
-                warn!(
-                    "Failed to delete v1 key trigger during cleanup: {error:#}; orphaned data \
-                     remains"
-                );
-            }
-        }
-
-        // Clear all V1 slab triggers (timer_slabs table)
-        if let Err(error) = v1_ops.clear_slab_triggers(segment_id, *slab_id).await {
-            warn!(
-                "Failed to clear v1 slab triggers for {slab_id} in segment {segment_id}: \
-                 {error:#}; v1 data is orphaned but migration completed successfully"
-            );
-        }
-
-        // Delete slab metadata ONLY for obsolete slabs (not reused by V2)
-        // During version migration, slab_size is unchanged, so V2 reuses all V1
-        // slab_ids and we won't delete any slab metadata rows here (all are in
-        // v2_slab_ids). Note: If a slab_id is needed in the future,
-        // add_trigger() will recreate it.
-        if !v2_slab_ids.contains(slab_id)
-            && let Err(error) = v1_ops.delete_slab_metadata(segment_id, *slab_id).await
-        {
-            warn!(
-                "Failed to delete obsolete v1 slab metadata for {slab_id} in segment \
-                 {segment_id}: {error:#}; orphaned metadata remains"
-            );
-        }
-    }
+    })
+    .await?;
 
     debug!(
-        "Cleaned up V1 data for {} slabs in segment {segment_id}",
+        "Cleaned up V1 trigger data for {} slabs in segment {segment_id}",
         slab_ids.len()
     );
+
+    Ok(())
 }
 
 /// Checks if a segment needs slab size migration.
