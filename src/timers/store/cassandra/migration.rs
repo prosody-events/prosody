@@ -52,8 +52,20 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
 use crate::timers::slab::Slab;
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion, SlabId, TriggerV1};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion, SlabId};
 use crate::timers::{DELETE_CONCURRENCY, TimerType, Trigger};
+
+/// Maximum concurrent slab migrations.
+///
+/// Conservative limit to avoid overwhelming Cassandra during migration.
+/// With 4 slabs × 4 triggers = 16 total concurrent operations.
+const MIGRATION_SLAB_CONCURRENCY: usize = 4;
+
+/// Maximum concurrent trigger writes per slab during migration.
+///
+/// Conservative limit for write operations during migration.
+/// Combined with [`MIGRATION_SLAB_CONCURRENCY`]: 4 × 4 = 16 total operations.
+const MIGRATION_WRITE_CONCURRENCY: usize = 4;
 use ahash::HashSet;
 use futures::TryStreamExt;
 use futures::stream;
@@ -118,51 +130,56 @@ pub async fn migrate_segment_version(
 
     debug!("Found {} v1 slabs to migrate", slab_ids.len());
 
-    let mut total_triggers = 0_usize;
-
     // Phase 2: Read all v1 data and write to v2 (idempotent, no deletes)
-    // This phase can be retried completely if it fails at any point
-    for slab_id in &slab_ids {
-        // Read v1 triggers for this slab
-        let v1_triggers: Vec<TriggerV1> = v1_ops
-            .get_slab_triggers(&segment_id, *slab_id)
-            .try_collect()
-            .await
-            .map_err(TimerManagerError::Store)?;
+    // Process all slabs and triggers concurrently for maximum throughput
+    stream::iter(slab_ids.iter().copied().map(Ok::<_, TimerManagerError<_>>))
+        .try_for_each_concurrent(MIGRATION_SLAB_CONCURRENCY, |slab_id| {
+            let v1_ops = v1_ops.clone();
+            let store = store.clone();
+            let segment_id = segment.id;
+            let slab_size = segment.slab_size;
 
-        debug!(
-            "Migrating {} triggers from slab {slab_id}",
-            v1_triggers.len()
-        );
+            async move {
+                // Stream v1 triggers and write to v2 concurrently
+                let triggers = v1_ops.get_slab_triggers(&segment_id, slab_id);
 
-        // Convert each v1 trigger to v2 and write using coordinated high-level
-        // operation
-        for v1_trigger in v1_triggers {
-            let v2_trigger = Trigger::new(
-                v1_trigger.key.clone(),
-                v1_trigger.time,
-                TimerType::Application,
-                v1_trigger.span,
-            );
+                triggers
+                    .map_err(TimerManagerError::Store)
+                    .try_for_each_concurrent(MIGRATION_WRITE_CONCURRENCY, |v1_trigger| {
+                        let store = store.clone();
 
-            // Recalculate slab based on trigger time and segment slab_size.
-            // Since slab_size is unchanged during version migration, this will produce
-            // the same slab_id as V1, so the slab metadata row already exists.
-            let target_slab = Slab::from_time(segment_id, segment.slab_size, v2_trigger.time);
+                        async move {
+                            // Convert v1 trigger to v2 with Application timer type
+                            let v2_trigger = Trigger::new(
+                                v1_trigger.key.clone(),
+                                v1_trigger.time,
+                                TimerType::Application,
+                                v1_trigger.span,
+                            );
 
-            // Write to V2 tables (slab and key indices).
-            // Note: We don't call insert_slab here because the slab metadata row
-            // already exists in the segments table from V1 operations (with TTL).
-            // Since slab_size is unchanged, V1 and V2 use the same slab_ids.
-            try_join!(
-                store.insert_slab_trigger(target_slab, v2_trigger.clone()),
-                store.insert_key_trigger(&segment_id, v2_trigger),
-            )
-            .map_err(TimerManagerError::Store)?;
+                            // Recalculate slab based on trigger time and segment slab_size.
+                            // Since slab_size is unchanged during version migration, this produces
+                            // the same slab_id as V1, so slab metadata row already exists.
+                            let target_slab =
+                                Slab::from_time(segment_id, slab_size, v2_trigger.time);
 
-            total_triggers += 1;
-        }
-    }
+                            // Write to V2 tables (slab and key indices)
+                            try_join!(
+                                store.insert_slab_trigger(target_slab, v2_trigger.clone()),
+                                store.insert_key_trigger(&segment_id, v2_trigger),
+                            )
+                            .map_err(TimerManagerError::Store)?;
+
+                            Ok(())
+                        }
+                    })
+                    .await?;
+
+                debug!("Migrated slab {slab_id}");
+                Ok(())
+            }
+        })
+        .await?;
 
     // Phase 3: Update segment version (atomic marker indicating migration complete)
     // This is the critical point - after this, the system uses v2 tables
@@ -171,10 +188,7 @@ pub async fn migrate_segment_version(
         .await
         .map_err(TimerManagerError::Store)?;
 
-    info!(
-        "Successfully migrated {total_triggers} triggers from segment {segment_id}, version \
-         updated to v2"
-    );
+    info!("Successfully migrated segment {segment_id} from V1 to V2");
 
     // Phase 4: Clean up V1 trigger data (can fail safely - data is orphaned but
     // harmless)
