@@ -576,6 +576,12 @@ pub fn test_prop_v1_high_level_dual_index_consistency(
 ) -> TestResult {
     use tokio::runtime::Runtime;
 
+    // Initialize tracing subscriber to create valid spans in tests
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::ERROR)
+        .try_init();
+
     let Ok(rt) = Runtime::new() else {
         return TestResult::error("Failed to create tokio runtime");
     };
