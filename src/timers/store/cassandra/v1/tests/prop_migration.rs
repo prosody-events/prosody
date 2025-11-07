@@ -169,7 +169,7 @@ impl MigrationModel {
 /// Sets up V1 initial state using `V1Operations`.
 ///
 /// V1 setup requires:
-/// 1. Initialize segment with metadata (name, slab_size) using
+/// 1. Initialize segment with metadata (name, `slab_size`) using
 ///    `insert_segment_v1()`
 /// 2. Register slabs with `insert_slab()`
 /// 3. Add triggers with `add_trigger()` (no `timer_type`)

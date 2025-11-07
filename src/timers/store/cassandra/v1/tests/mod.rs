@@ -50,6 +50,13 @@ mod test_runner {
         input: I,
         test_fn: impl FnOnce(&V1Operations, I) -> TestResult,
     ) -> TestResult {
+        // Initialize tracing subscriber to create valid spans in tests
+        // try_init() returns Err if already initialized, which is fine
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .try_init();
+
         // Create runtime for this test invocation
         let runtime = match Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,

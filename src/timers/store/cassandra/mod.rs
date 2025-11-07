@@ -12,6 +12,8 @@ use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use scylla::client::session::Session;
+use scylla::serialize::row::SerializeRow;
+use scylla::statement::prepared::PreparedStatement;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -87,6 +89,37 @@ impl CassandraTriggerStore {
         self.store.calculate_ttl(time)
     }
 
+    /// Helper to execute a query conditionally based on TTL.
+    ///
+    /// Executes `query_with_ttl` if TTL is available, otherwise executes
+    /// `query_no_ttl`. The `params_with_ttl` builder receives the TTL value.
+    async fn execute_with_optional_ttl<P1, P2>(
+        &self,
+        time: CompactDateTime,
+        query_with_ttl: &PreparedStatement,
+        query_no_ttl: &PreparedStatement,
+        params_with_ttl: impl FnOnce(i32) -> P1,
+        params_no_ttl: impl FnOnce() -> P2,
+    ) -> Result<(), CassandraTriggerStoreError>
+    where
+        P1: SerializeRow,
+        P2: SerializeRow,
+    {
+        match self.calculate_ttl(time) {
+            Some(ttl) => {
+                self.session()
+                    .execute_unpaged(query_with_ttl, params_with_ttl(ttl))
+                    .await?;
+            }
+            None => {
+                self.session()
+                    .execute_unpaged(query_no_ttl, params_no_ttl())
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Creates V1 operations on-demand for migration support.
     ///
     /// This method constructs a `V1Operations` instance that provides access
@@ -160,36 +193,11 @@ impl TriggerOperations for CassandraTriggerStore {
 
     #[instrument(level = "debug", skip(self), err)]
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
-        let Some(mut segment) = self.get_segment_unchecked(segment_id).await? else {
+        let Some(segment) = self.get_segment_unchecked(segment_id).await? else {
             return Ok(None);
         };
 
-        // Phase 1: V1→V2 schema migration
-        if migration::needs_migration(&segment) {
-            migration::migrate_segment_version(self, &segment).await?;
-
-            // Reload segment to get updated version
-            segment = self.get_segment_unchecked(segment_id).await?.ok_or(
-                CassandraTriggerStoreError::SegmentDisappeared {
-                    segment_id: *segment_id,
-                    operation: "V1→V2 migration",
-                },
-            )?;
-        }
-
-        // Phase 2: Slab size migration
-        if migration::needs_slab_size_migration(&segment, self.slab_size) {
-            migration::migrate_slab_size(self, &segment, self.slab_size).await?;
-
-            // Reload segment to get updated slab_size
-            segment = self.get_segment_unchecked(segment_id).await?.ok_or(
-                CassandraTriggerStoreError::SegmentDisappeared {
-                    segment_id: *segment_id,
-                    operation: "slab size migration",
-                },
-            )?;
-        }
-
+        let segment = migration::migrate_segment_if_needed(self, segment, self.slab_size).await?;
         Ok(Some(segment))
     }
 
@@ -332,20 +340,14 @@ impl TriggerOperations for CassandraTriggerStore {
     async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
-        match self.calculate_ttl(slab.range().end) {
-            Some(ttl) => {
-                self.session()
-                    .execute_unpaged(&self.queries().insert_slab, (segment_id, slab_id, ttl))
-                    .await?;
-            }
-            None => {
-                self.session()
-                    .execute_unpaged(&self.queries().insert_slab_no_ttl, (segment_id, slab_id))
-                    .await?;
-            }
-        }
-
-        Ok(())
+        self.execute_with_optional_ttl(
+            slab.range().end,
+            &self.queries().insert_slab,
+            &self.queries().insert_slab_no_ttl,
+            |ttl| (segment_id, slab_id, ttl),
+            || (segment_id, slab_id),
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -386,14 +388,17 @@ impl TriggerOperations for CassandraTriggerStore {
                 .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
 
             pin_mut!(stream);
-            while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, timer_type_returned, span_map)) =
+                cooperative(stream.try_next()).await?
+            {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type = TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                let timer_type =
+                    TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -419,14 +424,17 @@ impl TriggerOperations for CassandraTriggerStore {
                 .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
 
             pin_mut!(stream);
-            while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, timer_type_returned, span_map)) =
+                cooperative(stream.try_next()).await?
+            {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger_all_types");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type = TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                let timer_type =
+                    TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -445,30 +453,22 @@ impl TriggerOperations for CassandraTriggerStore {
         let time = trigger.time;
         let timer_type = i8::from(trigger.timer_type);
 
-        match self.calculate_ttl(slab.range().end) {
-            Some(ttl) => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().insert_slab_trigger,
-                        (
-                            segment_id, slab_size, slab_id, timer_type, key, time, span_map, ttl,
-                        ),
-                    )
-                    .await?;
-            }
-            None => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().insert_slab_trigger_no_ttl,
-                        (
-                            segment_id, slab_size, slab_id, timer_type, key, time, span_map,
-                        ),
-                    )
-                    .await?;
-            }
-        }
-
-        Ok(())
+        self.execute_with_optional_ttl(
+            slab.range().end,
+            &self.queries().insert_slab_trigger,
+            &self.queries().insert_slab_trigger_no_ttl,
+            |ttl| {
+                (
+                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, ttl,
+                )
+            },
+            || {
+                (
+                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map,
+                )
+            },
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -554,14 +554,17 @@ impl TriggerOperations for CassandraTriggerStore {
                 .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
 
             pin_mut!(stream);
-            while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, timer_type_returned, span_map)) =
+                cooperative(stream.try_next()).await?
+            {
                 let context = self.propagator().extract(&span_map);
                 let span = debug_span!("fetch_key_trigger");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type = TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                let timer_type =
+                    TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -584,14 +587,17 @@ impl TriggerOperations for CassandraTriggerStore {
                 .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
 
             pin_mut!(stream);
-            while let Some((key, time, timer_type_returned, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, timer_type_returned, span_map)) =
+                cooperative(stream.try_next()).await?
+            {
                 let context = self.propagator().extract(&span_map);
                 let span = debug_span!("fetch_key_trigger_all_types");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type = TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                let timer_type =
+                    TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -611,26 +617,14 @@ impl TriggerOperations for CassandraTriggerStore {
         let time = trigger.time;
         let timer_type = i8::from(trigger.timer_type);
 
-        match self.calculate_ttl(trigger.time) {
-            Some(ttl) => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().insert_key_trigger,
-                        (segment_id, key, timer_type, time, span_map, ttl),
-                    )
-                    .await?;
-            }
-            None => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().insert_key_trigger_no_ttl,
-                        (segment_id, key, timer_type, time, span_map),
-                    )
-                    .await?;
-            }
-        }
-
-        Ok(())
+        self.execute_with_optional_ttl(
+            trigger.time,
+            &self.queries().insert_key_trigger,
+            &self.queries().insert_key_trigger_no_ttl,
+            |ttl| (segment_id, key, timer_type, time, &span_map, ttl),
+            || (segment_id, key, timer_type, time, &span_map),
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -748,8 +742,19 @@ pub type CassandraTriggerStoreError = CassandraStoreError;
 #[cfg(test)]
 mod test {
     use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
+    use crate::timers::duration::CompactDuration;
+    use crate::timers::slab::{Slab, SlabId};
     use crate::timers::store::operations::TriggerOperations;
+    use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+    use crate::trigger_store_tests;
+    use color_eyre::Result;
+    use futures::TryStreamExt;
+    use futures::pin_mut;
+    use futures::stream::StreamExt;
+    use std::collections::HashSet;
+    use std::ops::RangeInclusive;
     use std::time::Duration;
+    use uuid::Uuid;
 
     /// Creates a test configuration for Cassandra integration tests.
     fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
@@ -763,16 +768,6 @@ mod test {
             retention: Duration::from_secs(10 * 60),
         }
     }
-    use crate::timers::duration::CompactDuration;
-    use crate::timers::slab::{Slab, SlabId};
-    use crate::timers::store::{Segment, SegmentId, SegmentVersion};
-    use crate::trigger_store_tests;
-    use color_eyre::Result;
-    use futures::pin_mut;
-    use futures::stream::StreamExt;
-    use std::collections::HashSet;
-    use std::ops::RangeInclusive;
-    use uuid::Uuid;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
     // Low-level tests use CassandraTriggerStore directly
@@ -829,10 +824,8 @@ mod test {
         let cross_boundary_range = RangeInclusive::new(boundary - 1, boundary + 1);
         let result: HashSet<SlabId> = store
             .get_slab_range(&segment_id, cross_boundary_range)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<HashSet<_>, _>>()?;
+            .try_collect()
+            .await?;
 
         let expected: HashSet<SlabId> = vec![boundary - 1, boundary, boundary + 1]
             .into_iter()
@@ -843,10 +836,8 @@ mod test {
         let high_range = RangeInclusive::new(boundary, SlabId::MAX);
         let result: HashSet<SlabId> = store
             .get_slab_range(&segment_id, high_range)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<HashSet<_>, _>>()?;
+            .try_collect()
+            .await?;
 
         let expected: HashSet<SlabId> = vec![boundary, boundary + 1, SlabId::MAX - 1, SlabId::MAX]
             .into_iter()
@@ -857,10 +848,8 @@ mod test {
         let low_range = RangeInclusive::new(boundary - 2, boundary - 1);
         let result: HashSet<SlabId> = store
             .get_slab_range(&segment_id, low_range)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<HashSet<_>, _>>()?;
+            .try_collect()
+            .await?;
 
         let expected: HashSet<SlabId> = vec![boundary - 2, boundary - 1].into_iter().collect();
         assert_eq!(result, expected, "Low range (positive i32) failed");
@@ -880,10 +869,8 @@ mod test {
         let invalid_range = RangeInclusive::new(SlabId::MAX - 1, boundary - 2);
         let result: HashSet<SlabId> = store
             .get_slab_range(&segment_id, invalid_range)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<HashSet<_>, _>>()?;
+            .try_collect()
+            .await?;
 
         let expected: HashSet<SlabId> = HashSet::new();
         assert_eq!(result, expected, "Invalid range should return empty set");

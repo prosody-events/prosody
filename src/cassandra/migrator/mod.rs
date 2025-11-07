@@ -72,6 +72,7 @@ use scylla::errors::{
     ExecutionError, IntoRowsResultError, MaybeFirstRowError, MetadataError, PrepareError,
 };
 use std::collections::HashMap;
+use std::str::Utf8Error;
 use std::time::Duration;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
@@ -384,8 +385,10 @@ pub enum MigrationError {
     /// Migration file contains invalid UTF-8.
     #[error("Invalid UTF-8 in migration file {file}: {source}")]
     InvalidUtf8 {
+        /// The filename that contains invalid UTF-8.
         file: String,
-        source: std::str::Utf8Error,
+        /// The underlying UTF-8 decoding error.
+        source: Utf8Error,
     },
 
     /// Migration filename does not follow the required format.
@@ -403,8 +406,11 @@ pub enum MigrationError {
     /// Failed to execute a statement in a migration.
     #[error("Failed to execute statement {statement_index} in migration {migration}")]
     StatementExecutionFailed {
+        /// The name of the migration file that failed.
         migration: String,
+        /// The index of the statement within the migration that failed.
         statement_index: usize,
+        /// The underlying database execution error.
         #[source]
         source: Box<ExecutionError>,
     },
@@ -416,8 +422,11 @@ pub enum MigrationError {
          found: {actual}"
     )]
     ChecksumMismatch {
+        /// The name of the migration file with a checksum mismatch.
         file: String,
+        /// The expected checksum from the database.
         expected: String,
+        /// The actual checksum computed from the current file.
         actual: String,
     },
 

@@ -330,6 +330,12 @@ macro_rules! trigger_store_tests {
         ) -> TestResult {
             use $crate::timers::store::tests::prop_segments::test_prop_segment_model_equivalence;
 
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
+
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -350,6 +356,12 @@ macro_rules! trigger_store_tests {
             input: $crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput,
         ) -> TestResult {
             use $crate::timers::store::tests::prop_slab_metadata::test_prop_slab_metadata_model_equivalence;
+
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -372,6 +384,12 @@ macro_rules! trigger_store_tests {
         ) -> TestResult {
             use $crate::timers::store::tests::prop_slab_triggers::test_prop_slab_trigger_model_equivalence;
 
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
+
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -392,6 +410,12 @@ macro_rules! trigger_store_tests {
             input: $crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput,
         ) -> TestResult {
             use $crate::timers::store::tests::prop_key_triggers::test_prop_key_trigger_model_equivalence;
+
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -414,6 +438,12 @@ macro_rules! trigger_store_tests {
         ) -> TestResult {
             use $crate::timers::store::tests::prop_high_level::test_prop_high_level_dual_index_consistency;
 
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
+
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -431,6 +461,12 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_get_slab_range(segment: $crate::timers::store::Segment) -> TestResult {
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
+
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -454,6 +490,12 @@ macro_rules! trigger_store_tests {
             if input.triggers.is_empty() {
                 return TestResult::discard();
             }
+
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -481,6 +523,12 @@ macro_rules! trigger_store_tests {
                 return TestResult::discard();
             }
 
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
+
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -503,6 +551,12 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_operation_sequences(input: tests::TriggerSequence) -> TestResult {
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
+
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -525,6 +579,12 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_cross_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
+
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -547,6 +607,12 @@ macro_rules! trigger_store_tests {
         }
 
         fn prop_key_contention(segment: $crate::timers::store::Segment) -> TestResult {
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
+
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -570,6 +636,12 @@ macro_rules! trigger_store_tests {
             if input.triggers.is_empty() {
                 return TestResult::discard();
             }
+
+            // Initialize tracing subscriber to create valid spans in tests
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::ERROR)
+                .try_init();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {

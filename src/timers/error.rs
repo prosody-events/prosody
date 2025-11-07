@@ -6,7 +6,6 @@
 
 use crate::timers::datetime::CompactDateTimeError;
 use crate::timers::scheduler::TimerSchedulerError;
-use crate::timers::store::cassandra::migration::MigrationError;
 use chrono::OutOfRangeError;
 use std::error::Error;
 use std::fmt::Debug;
@@ -49,10 +48,6 @@ where
     /// The partition has been shut down and cannot process operations.
     #[error("Partition has been shutdown")]
     Shutdown,
-
-    /// Migration operation failed.
-    #[error(transparent)]
-    Migration(#[from] MigrationError),
 
     /// Message processing has been cancelled.
     #[error("Message processing has been cancelled")]

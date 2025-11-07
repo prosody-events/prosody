@@ -10,7 +10,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::duration::CompactDurationError;
 use crate::timers::error::TimerManagerError;
-use crate::timers::store::InvalidSegmentVersionError;
+use crate::timers::store::{InvalidSegmentVersionError, SegmentId};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use scylla::_macro_internal::{
     CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
@@ -265,15 +265,20 @@ pub enum CassandraStoreError {
          configured slab_size {configured_slab_size}"
     )]
     SlabSizeMismatch {
-        segment_id: crate::timers::store::SegmentId,
+        /// The ID of the segment being inserted.
+        segment_id: SegmentId,
+        /// The slab size of the segment being inserted.
         segment_slab_size: CompactDuration,
+        /// The configured slab size for this store.
         configured_slab_size: CompactDuration,
     },
 
     /// Segment disappeared during data migration.
     #[error("Segment {segment_id} disappeared during {operation}")]
     SegmentDisappeared {
-        segment_id: crate::timers::store::SegmentId,
+        /// The ID of the segment that disappeared.
+        segment_id: SegmentId,
+        /// The operation that was being performed when the segment disappeared.
         operation: &'static str,
     },
 }
@@ -343,7 +348,7 @@ impl From<TimerManagerError<CassandraStoreError>> for CassandraStoreError {
         match error {
             TimerManagerError::Store(e) => e,
             _ => Self::SegmentDisappeared {
-                segment_id: crate::timers::store::SegmentId::default(),
+                segment_id: SegmentId::default(),
                 operation: "timer manager operation",
             },
         }

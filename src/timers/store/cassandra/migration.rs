@@ -67,13 +67,56 @@ const MIGRATION_SLAB_CONCURRENCY: usize = 4;
 /// Combined with [`MIGRATION_SLAB_CONCURRENCY`]: 4 × 4 = 16 total operations.
 const MIGRATION_WRITE_CONCURRENCY: usize = 4;
 use ahash::HashSet;
-use futures::TryStreamExt;
 use futures::stream;
-use thiserror::Error;
+use futures::{StreamExt, TryStreamExt};
+use tokio::task::coop::cooperative;
 use tokio::try_join;
 use tracing::{debug, info, instrument, warn};
 
 use super::{CassandraTriggerStore, CassandraTriggerStoreError};
+
+/// Migrates a segment if necessary, performing both version and slab size
+/// migrations.
+///
+/// This function orchestrates the two-phase migration process:
+/// 1. **Phase 1**: V1→V2 schema migration (if needed)
+/// 2. **Phase 2**: Slab size migration (if needed)
+///
+/// Each phase is performed atomically and independently. If no migrations are
+/// needed, the segment is returned unchanged.
+///
+/// # Arguments
+///
+/// * `store` - The Cassandra trigger store
+/// * `segment` - The segment to potentially migrate
+/// * `desired_slab_size` - The target slab size for Phase 2 migration
+///
+/// # Returns
+///
+/// The segment with updated version and/or `slab_size` if migrations were
+/// performed.
+///
+/// # Errors
+///
+/// Returns [`TimerManagerError`] if any migration phase fails.
+#[instrument(level = "debug", skip(store), err)]
+pub async fn migrate_segment_if_needed(
+    store: &CassandraTriggerStore,
+    mut segment: Segment,
+    desired_slab_size: CompactDuration,
+) -> Result<Segment, TimerManagerError<CassandraTriggerStoreError>> {
+    // Phase 1: V1→V2 schema migration
+    if needs_migration(&segment) {
+        segment = migrate_segment_version(store, segment).await?;
+    }
+
+    // Phase 2: Slab size migration
+    if needs_slab_size_migration(&segment, desired_slab_size) {
+        segment = migrate_slab_size(store, segment, desired_slab_size).await?;
+    }
+
+    Ok(segment)
+}
 
 /// Checks if a segment needs migration from v1 to v2.
 ///
@@ -113,8 +156,8 @@ pub fn needs_migration(segment: &Segment) -> bool {
 #[instrument(level = "info", skip(store), err)]
 pub async fn migrate_segment_version(
     store: &CassandraTriggerStore,
-    segment: &Segment,
-) -> Result<(), TimerManagerError<CassandraTriggerStoreError>> {
+    mut segment: Segment,
+) -> Result<Segment, TimerManagerError<CassandraTriggerStoreError>> {
     let segment_id = segment.id;
     info!("Starting v1 to v2 migration for segment {segment_id}");
 
@@ -199,7 +242,9 @@ pub async fn migrate_segment_version(
         );
     }
 
-    Ok(())
+    // Update segment version and return
+    segment.version = SegmentVersion::V2;
+    Ok(segment)
 }
 
 /// Cleans up V1 trigger data after migration.
@@ -280,6 +325,178 @@ pub fn needs_slab_size_migration(segment: &Segment, desired_slab_size: CompactDu
     segment.slab_size != desired_slab_size
 }
 
+/// Migrates triggers from old slabs to new slabs with recalculated slab IDs.
+///
+/// Processes slabs concurrently (bounded by [`MIGRATION_SLAB_CONCURRENCY`]),
+/// streaming triggers within each slab sequentially. Returns the set of new
+/// slab IDs created during migration.
+///
+/// # Arguments
+///
+/// * `store` - The Cassandra trigger store
+/// * `segment` - The segment being migrated
+/// * `old_slab_ids` - Slab IDs with the old `slab_size`
+/// * `desired_slab_size` - Target slab size for recalculation
+///
+/// # Returns
+///
+/// Set of all new slab IDs created during migration
+///
+/// # Errors
+///
+/// Returns [`TimerManagerError`] if reading or writing triggers fails
+async fn migrate_triggers_to_new_slabs(
+    store: &CassandraTriggerStore,
+    segment: &Segment,
+    old_slab_ids: &[SlabId],
+    desired_slab_size: CompactDuration,
+) -> Result<HashSet<SlabId>, TimerManagerError<CassandraTriggerStoreError>> {
+    // Process slabs concurrently, streaming triggers within each slab
+    let new_slab_id_sets: Vec<HashSet<SlabId>> = stream::iter(old_slab_ids.iter().copied())
+        .map(|old_slab_id| {
+            let store = store.clone();
+
+            async move {
+                let segment_id = segment.id;
+                let old_slab_size = segment.slab_size;
+                let old_slab = Slab::new(segment_id, old_slab_id, old_slab_size);
+                let mut new_slab_ids = HashSet::default();
+                let trigger_stream = store.get_slab_triggers_all_types(&old_slab);
+                tokio::pin!(trigger_stream);
+
+                while let Some(trigger) = cooperative(trigger_stream.try_next())
+                    .await
+                    .map_err(TimerManagerError::Store)?
+                {
+                    let new_slab = Slab::from_time(segment_id, desired_slab_size, trigger.time);
+
+                    // Register new slab metadata if first time seeing this ID
+                    if new_slab_ids.insert(new_slab.id()) {
+                        store
+                            .insert_slab(&segment_id, new_slab.clone())
+                            .await
+                            .map_err(TimerManagerError::Store)?;
+                    }
+
+                    // Write trigger to new slab (key table unchanged)
+                    store
+                        .insert_slab_trigger(new_slab, trigger)
+                        .await
+                        .map_err(TimerManagerError::Store)?;
+                }
+
+                debug!(
+                    "Migrated old slab {old_slab_id} to {} new unique slabs",
+                    new_slab_ids.len()
+                );
+
+                Ok::<_, TimerManagerError<CassandraTriggerStoreError>>(new_slab_ids)
+            }
+        })
+        .buffer_unordered(MIGRATION_SLAB_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    // Merge all new slab IDs from all old slabs
+    let new_slab_ids: HashSet<SlabId> = new_slab_id_sets.into_iter().flatten().collect();
+
+    debug!(
+        "Migrated {} old slabs → {} new unique slab IDs",
+        old_slab_ids.len(),
+        new_slab_ids.len()
+    );
+
+    Ok(new_slab_ids)
+}
+
+/// Cleans up old slabs with schema-aware overlap protection.
+///
+/// **Critical schema insight:** `timer_typed_slabs` has partition key
+/// `(segment_id, slab_size, id)`, meaning old and new triggers with the SAME
+/// `slab_id` but DIFFERENT `slab_size` are in SEPARATE partitions.
+///
+/// **Cleanup strategy:**
+/// - Metadata (`timer_segments`): Skip deletion for reused slab IDs (shared
+///   row)
+/// - Triggers (`timer_typed_slabs`): ALWAYS delete old partition (separate from
+///   new)
+///
+/// **Example with reused `slab_id=2`:**
+/// - Old partition: `(segment_id, slab_size=100, id=2)` ← DELETE
+/// - New partition: `(segment_id, slab_size=30, id=2)` ← Keep
+/// - Metadata row: `(segment_id, slab_id=2)` ← Shared, don't delete
+///
+/// # Arguments
+///
+/// * `store` - The Cassandra trigger store
+/// * `segment` - The segment being migrated
+/// * `old_slab_ids` - Original slab IDs before migration
+/// * `new_slab_ids` - New slab IDs created during migration
+async fn cleanup_old_slabs_with_overlap_protection(
+    store: &CassandraTriggerStore,
+    segment: &Segment,
+    old_slab_ids: Vec<SlabId>,
+    new_slab_ids: &HashSet<SlabId>,
+) {
+    let old_slab_size = segment.slab_size;
+    let old_slab_count = old_slab_ids.len();
+    let reused_count = old_slab_ids
+        .iter()
+        .filter(|id| new_slab_ids.contains(id))
+        .count();
+
+    if reused_count > 0 {
+        debug!(
+            "{} slab IDs reused by new slab_size (will skip metadata deletion, but clear triggers)",
+            reused_count
+        );
+    }
+
+    debug!(
+        "Cleaning up {} old slabs for segment {}",
+        old_slab_count, segment.id
+    );
+
+    // Process ALL old slab IDs: conditionally delete metadata, always clear
+    // triggers
+    stream::iter(old_slab_ids)
+        .for_each_concurrent(DELETE_CONCURRENCY, |slab_id| {
+            let store = store.clone();
+            let is_reused = new_slab_ids.contains(&slab_id);
+
+            async move {
+                let segment_id = segment.id;
+
+                // Delete metadata ONLY if slab_id is not reused (shared row in timer_segments)
+                if !is_reused && let Err(error) = store.delete_slab(&segment_id, slab_id).await {
+                    warn!(
+                        "Failed to delete metadata for old slab {slab_id} (segment {segment_id}): \
+                         {error:#}"
+                    );
+                    // Continue to clear triggers even if metadata deletion
+                    // fails
+                }
+
+                // ALWAYS clear old triggers - they're in a separate partition due to slab_size
+                // in partition key: (segment_id, OLD_slab_size, id) != (segment_id,
+                // NEW_slab_size, id)
+                let old_slab = Slab::new(segment_id, slab_id, old_slab_size);
+                if let Err(error) = store.clear_slab_triggers(&old_slab).await {
+                    warn!(
+                        "Failed to clear triggers for old slab {slab_id} (segment {segment_id}): \
+                         {error:#}"
+                    );
+                }
+            }
+        })
+        .await;
+
+    debug!(
+        "Cleaned up {} old slabs for segment {} ({} metadata deletions skipped for reused IDs)",
+        old_slab_count, segment.id, reused_count
+    );
+}
+
 /// Migrates a v2 segment to a new slab size.
 ///
 /// Reads all triggers from slabs with the old slab size, recalculates their
@@ -309,9 +526,9 @@ pub fn needs_slab_size_migration(segment: &Segment, desired_slab_size: CompactDu
 #[instrument(level = "info", skip(store), err)]
 pub async fn migrate_slab_size(
     store: &CassandraTriggerStore,
-    segment: &Segment,
+    mut segment: Segment,
     desired_slab_size: CompactDuration,
-) -> Result<(), TimerManagerError<CassandraTriggerStoreError>> {
+) -> Result<Segment, TimerManagerError<CassandraTriggerStoreError>> {
     let segment_id = segment.id;
     let old_slab_size = segment.slab_size;
 
@@ -322,7 +539,7 @@ pub async fn migrate_slab_size(
              {:?}). Run version migration first.",
             segment.version
         );
-        return Ok(());
+        return Ok(segment);
     }
 
     info!(
@@ -342,105 +559,26 @@ pub async fn migrate_slab_size(
         old_slab_ids.len()
     );
 
-    let mut total_triggers = 0_usize;
-    let mut registered_slabs = HashSet::default();
-
-    // Phase 2: Read all triggers from old slabs and write to new slabs
-    // (idempotent, no deletes) This phase can be retried completely if it fails at
-    // any point
-    for old_slab_id in &old_slab_ids {
-        let old_slab = Slab::new(segment_id, *old_slab_id, old_slab_size);
-
-        // Read all triggers from old slab across all timer types
-        let triggers = store
-            .get_slab_triggers_all_types(&old_slab)
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(TimerManagerError::Store)?;
-
-        debug!(
-            "Migrating {} triggers from old slab {old_slab_id}",
-            triggers.len()
-        );
-
-        // Write each trigger to its new slab
-        // NOTE: We only write to slab tables, NOT key tables
-        // Key tables are indexed by (segment_id, key, time, type) which doesn't
-        // include slab_id, so they don't need to change when slab_size changes
-        for trigger in triggers {
-            // Recalculate slab ID based on new slab size
-            let new_slab = Slab::from_time(segment_id, desired_slab_size, trigger.time);
-
-            // Register the new slab metadata if not already registered
-            // Note: Cassandra INSERT is an upsert, so this is idempotent
-            if registered_slabs.insert(new_slab.id()) {
-                store
-                    .insert_slab(&segment_id, new_slab.clone())
-                    .await
-                    .map_err(TimerManagerError::Store)?;
-            }
-
-            // Write to new v2 slab index
-            store
-                .insert_slab_trigger(new_slab.clone(), trigger.clone())
-                .await
-                .map_err(TimerManagerError::Store)?;
-
-            total_triggers += 1;
-        }
-    }
+    // Phase 2: Migrate triggers to new slabs with recalculated slab IDs
+    let new_slab_ids =
+        migrate_triggers_to_new_slabs(store, &segment, &old_slab_ids, desired_slab_size).await?;
 
     // Phase 3: Update segment slab_size (atomic marker indicating migration
-    // complete) This is the critical point - after this, the system uses new
-    // slab_size
+    // complete)
     store
         .update_segment_version(&segment_id, SegmentVersion::V2, desired_slab_size)
         .await
         .map_err(TimerManagerError::Store)?;
 
     info!(
-        "Successfully migrated {total_triggers} triggers for segment {segment_id}, slab_size \
-         updated to {desired_slab_size}"
+        "Successfully migrated segment {segment_id}, slab_size updated from {old_slab_size} to \
+         {desired_slab_size}"
     );
 
-    // Phase 4: Clean up old slabs (can fail safely - data is orphaned but harmless)
-    // If cleanup fails, we can retry it later or ignore it
-    for old_slab_id in &old_slab_ids {
-        // Delete the old slab registration
-        if let Err(error) = store.delete_slab(&segment_id, *old_slab_id).await {
-            warn!(
-                "Failed to delete old slab {old_slab_id} for segment {segment_id}: {error:#}; old \
-                 slab data is orphaned but migration completed successfully"
-            );
-            continue;
-        }
+    // Phase 4: Clean up old slabs with overlap protection (best-effort)
+    cleanup_old_slabs_with_overlap_protection(store, &segment, old_slab_ids, &new_slab_ids).await;
 
-        // Clear the old slab triggers
-        let old_slab = Slab::new(segment_id, *old_slab_id, old_slab_size);
-        if let Err(error) = store.clear_slab_triggers(&old_slab).await {
-            warn!(
-                "Failed to clear triggers for old slab {old_slab_id} in segment {segment_id}: \
-                 {error:#}; old slab data is orphaned but migration completed successfully"
-            );
-        }
-    }
-
-    debug!(
-        "Cleaned up {} old slabs for segment {segment_id}",
-        old_slab_ids.len()
-    );
-
-    Ok(())
-}
-
-/// Errors that can occur during migration operations.
-#[derive(Debug, Error)]
-pub enum MigrationError {
-    /// Segment disappeared after V1→V2 schema migration completed.
-    #[error("Segment {0} disappeared after V1→V2 migration")]
-    SegmentDisappearedAfterV1Migration(SegmentId),
-
-    /// Segment disappeared after slab size migration completed.
-    #[error("Segment {0} disappeared after slab size migration")]
-    SegmentDisappearedAfterSlabSizeMigration(SegmentId),
+    // Update segment slab_size and return
+    segment.slab_size = desired_slab_size;
+    Ok(segment)
 }
