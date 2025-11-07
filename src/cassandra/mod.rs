@@ -32,6 +32,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub mod config;
+pub mod macros;
 pub mod migrator;
 
 pub use config::CassandraConfiguration;
