@@ -310,6 +310,36 @@ impl TriggerOperations for InMemoryTriggerStore {
         }
     }
 
+    /// Stream ALL triggers within a slab across all timer types.
+    ///
+    /// # Arguments
+    ///
+    /// * `slab` - The slab specification to query.
+    ///
+    /// # Returns
+    ///
+    /// A stream of all `Trigger`s in the slab, regardless of timer type.
+    fn get_slab_triggers_all_types(
+        &self,
+        slab: &Slab,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> {
+        let segment_id = *slab.segment_id();
+        let slab_size = slab.size();
+        let slab_id = slab.id();
+
+        try_stream! {
+            let partition_key = (segment_id, slab_size, slab_id);
+            let Some(triggers_map) = self.0.slab_triggers.get_async(&partition_key).await else {
+                return;
+            };
+
+            // Stream all triggers from the partition
+            for (_clustering_key, trigger) in triggers_map.iter() {
+                yield trigger.clone();
+            }
+        }
+    }
+
     /// Insert a trigger into a slab's time index.
     ///
     /// # Arguments
@@ -388,36 +418,6 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(())
     }
 
-    /// Stream ALL triggers within a slab across all timer types.
-    ///
-    /// # Arguments
-    ///
-    /// * `slab` - The slab specification to query.
-    ///
-    /// # Returns
-    ///
-    /// A stream of all `Trigger`s in the slab, regardless of timer type.
-    fn get_slab_triggers_all_types(
-        &self,
-        slab: &Slab,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> {
-        let segment_id = *slab.segment_id();
-        let slab_size = slab.size();
-        let slab_id = slab.id();
-
-        try_stream! {
-            let partition_key = (segment_id, slab_size, slab_id);
-            let Some(triggers_map) = self.0.slab_triggers.get_async(&partition_key).await else {
-                return;
-            };
-
-            // Stream all triggers from the partition
-            for (_clustering_key, trigger) in triggers_map.iter() {
-                yield trigger.clone();
-            }
-        }
-    }
-
     // -- Key trigger operations (entity index) --
 
     /// Stream all scheduled times for a given key and timer type.
@@ -469,6 +469,34 @@ impl TriggerOperations for InMemoryTriggerStore {
                 if *t_type == timer_type {
                     yield trigger.clone();
                 }
+            }
+        }
+    }
+
+    /// Stream ALL triggers for a given key across all timer types.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment to query.
+    /// * `key` - Entity key.
+    ///
+    /// # Returns
+    ///
+    /// A stream of all `Trigger`s for the key, regardless of timer type.
+    fn get_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        try_stream! {
+            let partition_key = (*segment_id, key.clone());
+            let Some(triggers_map) = self.0.key_triggers.get_async(&partition_key).await else {
+                return;
+            };
+
+            // Stream all triggers from the partition
+            for (_clustering_key, trigger) in triggers_map.iter() {
+                yield trigger.clone();
             }
         }
     }
@@ -592,34 +620,6 @@ impl TriggerOperations for InMemoryTriggerStore {
         let partition_key = (*segment_id, key.clone());
         self.0.key_triggers.remove_async(&partition_key).await;
         Ok(())
-    }
-
-    /// Stream ALL triggers for a given key across all timer types.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment to query.
-    /// * `key` - Entity key.
-    ///
-    /// # Returns
-    ///
-    /// A stream of all `Trigger`s for the key, regardless of timer type.
-    fn get_key_triggers_all_types(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        try_stream! {
-            let partition_key = (*segment_id, key.clone());
-            let Some(triggers_map) = self.0.key_triggers.get_async(&partition_key).await else {
-                return;
-            };
-
-            // Stream all triggers from the partition
-            for (_clustering_key, trigger) in triggers_map.iter() {
-                yield trigger.clone();
-            }
-        }
     }
 
     // -- V1 migration methods --
