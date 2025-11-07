@@ -752,6 +752,7 @@ mod test {
     use futures::pin_mut;
     use futures::stream::StreamExt;
     use std::collections::HashSet;
+    use std::env;
     use std::ops::RangeInclusive;
     use std::time::Duration;
     use uuid::Uuid;
@@ -769,6 +770,16 @@ mod test {
         }
     }
 
+    // Determine the number of tests to run from an environment variable,
+    // defaulting to 25 if the variable is not set or invalid.
+    // Uses INTEGRATION_TESTS since these tests hit a real Cassandra database.
+    fn get_test_count() -> u64 {
+        env::var("INTEGRATION_TESTS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(25)
+    }
+
     // Run the full suite of TriggerStore compliance tests on this implementation.
     // Low-level tests use CassandraTriggerStore directly
     // High-level tests use TableAdapter<CassandraTriggerStore>
@@ -783,7 +794,7 @@ mod test {
             let config = test_cassandra_config("prosody");
             cassandra_store(&config, slab_size).await
         },
-        25
+        get_test_count()
     );
 
     #[tokio::test]

@@ -679,11 +679,11 @@ mod test {
     // Run the full suite of TriggerStore compliance tests on this implementation.
     // Low-level tests use InMemoryTriggerStore directly
     // High-level tests use TableAdapter<InMemoryTriggerStore>
+    // Uses QuickCheck's default test count (no external systems involved)
     trigger_store_tests!(
         InMemoryTriggerStore,
         |_slab_size| async { Result::<_, Infallible>::Ok(InMemoryTriggerStore::new()) },
         crate::timers::store::adapter::TableAdapter<InMemoryTriggerStore>,
-        |_slab_size| async { Result::<_, Infallible>::Ok(memory_store()) },
-        100
+        |_slab_size| async { Result::<_, Infallible>::Ok(memory_store()) }
     );
 }

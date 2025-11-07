@@ -17,6 +17,7 @@ mod test_runner {
     use crate::cassandra::CassandraConfiguration;
     use crate::timers::store::cassandra::queries::Queries;
     use quickcheck::{QuickCheck, TestResult};
+    use std::env;
     use std::sync::Arc;
     use tokio::runtime::Builder;
 
@@ -42,6 +43,16 @@ mod test_runner {
         let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
 
         Ok(V1Operations::new(store, queries))
+    }
+
+    /// Determine the number of tests to run from an environment variable.
+    /// Returns the appropriate default based on test complexity if not set.
+    /// Uses INTEGRATION_TESTS since these tests hit a real Cassandra database.
+    fn get_test_count(default: u64) -> u64 {
+        env::var("INTEGRATION_TESTS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(default)
     }
 
     /// Generic helper to run V1 property tests with runtime and operations
@@ -82,7 +93,9 @@ mod test_runner {
             run_v1_test(input, test_prop_v1_slab_metadata_model_equivalence)
         }
 
-        QuickCheck::new().quickcheck(test_wrapper as fn(V1SlabMetadataTestInput) -> TestResult);
+        QuickCheck::new()
+            .tests(get_test_count(50))
+            .quickcheck(test_wrapper as fn(V1SlabMetadataTestInput) -> TestResult);
     }
 
     #[test]
@@ -95,7 +108,9 @@ mod test_runner {
             run_v1_test(input, test_prop_v1_slab_trigger_model_equivalence)
         }
 
-        QuickCheck::new().quickcheck(test_wrapper as fn(V1SlabTriggerTestInput) -> TestResult);
+        QuickCheck::new()
+            .tests(get_test_count(50))
+            .quickcheck(test_wrapper as fn(V1SlabTriggerTestInput) -> TestResult);
     }
 
     #[test]
@@ -108,7 +123,9 @@ mod test_runner {
             run_v1_test(input, test_prop_v1_key_trigger_model_equivalence)
         }
 
-        QuickCheck::new().quickcheck(test_wrapper as fn(V1KeyTriggerTestInput) -> TestResult);
+        QuickCheck::new()
+            .tests(get_test_count(50))
+            .quickcheck(test_wrapper as fn(V1KeyTriggerTestInput) -> TestResult);
     }
 
     #[test]
@@ -121,7 +138,9 @@ mod test_runner {
             run_v1_test(input, test_prop_v1_high_level_dual_index_consistency)
         }
 
-        QuickCheck::new().quickcheck(test_wrapper as fn(V1HighLevelTestInput) -> TestResult);
+        QuickCheck::new()
+            .tests(get_test_count(25))
+            .quickcheck(test_wrapper as fn(V1HighLevelTestInput) -> TestResult);
     }
 
     #[test]
@@ -132,6 +151,8 @@ mod test_runner {
             run_v1_test(input, test_prop_migration_invariants)
         }
 
-        QuickCheck::new().quickcheck(test_wrapper as fn(MigrationTestInput) -> TestResult);
+        QuickCheck::new()
+            .tests(get_test_count(10))
+            .quickcheck(test_wrapper as fn(MigrationTestInput) -> TestResult);
     }
 }

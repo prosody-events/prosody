@@ -220,6 +220,21 @@ impl Arbitrary for TriggerSequence {
 /// * `$test_count` - Number of property tests to run for each test function
 #[macro_export]
 macro_rules! trigger_store_tests {
+    // Variant without test_count - uses QuickCheck's default
+    ($operations_type:ty, $operations_constructor:expr, $store_type:ty, $store_constructor:expr) => {
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use quickcheck::{QuickCheck, TestResult};
+            use tokio::runtime::Builder;
+            use $crate::timers::store::tests;
+
+            trigger_store_tests!(@test_functions_default);
+            trigger_store_tests!(@prop_functions, $operations_type, $operations_constructor, $store_type, $store_constructor);
+        }
+    };
+
+    // Variant with explicit test_count
     ($operations_type:ty, $operations_constructor:expr, $store_type:ty, $store_constructor:expr, $test_count:expr) => {
         #[cfg(test)]
         mod tests {
@@ -233,7 +248,98 @@ macro_rules! trigger_store_tests {
         }
     };
 
-    // Common test function definitions
+    // Test functions using QuickCheck's default
+    (@test_functions_default) => {
+        #[test]
+        fn test_get_slab_range() {
+            QuickCheck::new().quickcheck(
+                prop_get_slab_range as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_trigger_operations() {
+            QuickCheck::new().quickcheck(
+                prop_trigger_operations
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_trigger_consistency() {
+            QuickCheck::new().quickcheck(
+                prop_trigger_consistency
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_operation_sequences() {
+            QuickCheck::new().quickcheck(
+                prop_operation_sequences
+                    as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_cross_slab_operations() {
+            QuickCheck::new().quickcheck(
+                prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_key_contention() {
+            QuickCheck::new().quickcheck(
+                prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_sequential_interleavings() {
+            QuickCheck::new().quickcheck(
+                prop_sequential_interleavings
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_segment_model_equivalence() {
+            QuickCheck::new().quickcheck(
+                prop_segment_model_equivalence as fn($crate::timers::store::tests::prop_segments::SegmentTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_slab_metadata_model_equivalence() {
+            QuickCheck::new().quickcheck(
+                prop_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_slab_trigger_model_equivalence() {
+            QuickCheck::new().quickcheck(
+                prop_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_key_trigger_model_equivalence() {
+            QuickCheck::new().quickcheck(
+                prop_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_high_level_dual_index_consistency() {
+            QuickCheck::new().quickcheck(
+                prop_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_high_level::HighLevelTestInput) -> TestResult,
+            );
+        }
+    };
+
+    // Test functions with explicit test count
     (@test_functions, $test_count:expr) => {
         // Removed test_segment_operations - redundant with prop_segment_model_equivalence
 
