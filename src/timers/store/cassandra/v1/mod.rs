@@ -6,22 +6,21 @@
 //!
 //! **This is Cassandra-internal only and not part of the public API.**
 
-#![allow(dead_code, reason = "migration in process")] // todo: remove
-
-use crate::cassandra::CassandraStore;
-use crate::timers::store::cassandra::queries::Queries;
-use std::sync::Arc;
+#![allow(dead_code, reason = "methods used in tests")]
 
 use crate::Key;
+use crate::cassandra::CassandraStore;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::SlabId;
 use crate::timers::store::cassandra::CassandraTriggerStoreError;
+use crate::timers::store::cassandra::queries::Queries;
 use crate::timers::store::{SegmentId, TriggerV1};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
 use opentelemetry::propagation::TextMapPropagator;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::task::coop::cooperative;
 use tracing::{error, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -114,8 +113,11 @@ impl V1Operations {
         trigger: TriggerV1,
     ) -> Result<(), CassandraTriggerStoreError> {
         // Extract span context from tracing::Span
-        // For v1 test data, we use an empty span map since this is test-only
-        let span_map: HashMap<String, String> = HashMap::new();
+        let mut span_map: HashMap<String, String> = HashMap::new();
+        let context = trigger.span.context();
+        self.store
+            .propagator()
+            .inject_context(&context, &mut span_map);
 
         self.store
             .session()

@@ -9,8 +9,6 @@ use crate::heartbeat::Heartbeat;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::error::TimerManagerError;
-// TODO: Re-enable migration after integrating with new trait structure
-// use crate::timers::migration;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;

@@ -9,7 +9,7 @@ use crate::propagator::new_propagator;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::duration::CompactDurationError;
-use crate::timers::error::TimerManagerError;
+use crate::timers::error::{ParseError, TimerManagerError};
 use crate::timers::store::{InvalidSegmentVersionError, SegmentId};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use scylla::_macro_internal::{
@@ -282,6 +282,10 @@ pub enum CassandraStoreError {
         /// The operation that was being performed when the segment disappeared.
         operation: &'static str,
     },
+
+    /// Invalid timer type value in database.
+    #[error("Invalid timer type: {0:#}")]
+    Parse(#[from] ParseError),
 }
 
 impl From<NewSessionError> for CassandraStoreError {

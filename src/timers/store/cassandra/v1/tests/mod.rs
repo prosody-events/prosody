@@ -47,7 +47,8 @@ mod test_runner {
 
     /// Determine the number of tests to run from an environment variable.
     /// Returns the appropriate default based on test complexity if not set.
-    /// Uses INTEGRATION_TESTS since these tests hit a real Cassandra database.
+    /// Uses `INTEGRATION_TESTS` since these tests hit a real Cassandra
+    /// database.
     fn get_test_count(default: u64) -> u64 {
         env::var("INTEGRATION_TESTS")
             .ok()

@@ -397,8 +397,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type =
-                    TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                let timer_type = TimerType::try_from(timer_type_returned)?;
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -433,8 +432,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type =
-                    TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                let timer_type = TimerType::try_from(timer_type_returned)?;
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -563,8 +561,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type =
-                    TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                let timer_type = TimerType::try_from(timer_type_returned)?;
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -596,8 +593,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     error!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type =
-                    TimerType::try_from(timer_type_returned).unwrap_or(TimerType::Application);
+                let timer_type = TimerType::try_from(timer_type_returned)?;
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
