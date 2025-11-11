@@ -16,6 +16,7 @@ mod test_runner {
     use super::super::V1Operations;
     use crate::cassandra::CassandraConfiguration;
     use crate::timers::store::cassandra::queries::Queries;
+    use crate::tracing::init_test_logging;
     use quickcheck::{QuickCheck, TestResult};
     use std::env;
     use std::sync::Arc;
@@ -63,7 +64,7 @@ mod test_runner {
     fn init_test_tracing() -> EnteredSpan {
         use tracing::info_span;
 
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         // Return an active span guard to ensure Span::current() works during test
         info_span!("test").entered()

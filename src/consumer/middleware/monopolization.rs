@@ -412,6 +412,7 @@ mod tests {
     };
     use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
     use crate::timers::Trigger;
+    use crate::tracing::init_test_logging;
     use color_eyre::Result;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -565,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_monopolizing_key_passes_through() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -618,9 +619,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_monopolizing_key_triggers_error() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -680,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_keys_independent_tracking() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -761,7 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_window_sliding_removes_old_intervals() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -852,7 +853,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_interval_closed_on_completion() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -913,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_execution_before_window() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -968,7 +969,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_execution_crosses_window_end() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -1021,7 +1022,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_exact_threshold() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -1075,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_just_above_threshold() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 
@@ -1128,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_multiple_executions_in_window() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let telemetry = Telemetry::new();
 

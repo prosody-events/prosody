@@ -7,6 +7,7 @@ use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
@@ -44,7 +45,7 @@ fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>
 
 #[tokio::test]
 async fn test_partition_manager_capacity() {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let handler = TestHandler::new();
     let mut config = default_config();
@@ -72,7 +73,7 @@ async fn test_partition_manager_capacity() {
 
 #[tokio::test]
 async fn test_partition_manager_ordering() {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let handler = TestHandler::new();
     let mut config = default_config();
@@ -106,7 +107,7 @@ async fn test_partition_manager_ordering() {
 
 #[tokio::test]
 async fn test_partition_manager_concurrent_processing() {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let handler = TestHandler::new();
     let config = default_config();
@@ -139,7 +140,7 @@ async fn test_partition_manager_concurrent_processing() {
 
 #[tokio::test]
 async fn test_partition_manager_watermark() {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let handler = TestHandler::new();
     let config = default_config();
@@ -168,7 +169,7 @@ async fn test_partition_manager_watermark() {
 
 #[tokio::test]
 async fn test_partition_manager_max_uncommitted() {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let handler = TestHandler::new();
     let max_uncommitted = 5;
@@ -256,7 +257,7 @@ async fn test_partition_manager_is_stalled() {
         }
     }
 
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let handler = StallTestHandler::new();
     let mut config = default_config();
@@ -293,7 +294,7 @@ async fn test_partition_manager_is_stalled() {
 
 #[tokio::test]
 async fn test_partition_manager_event_type_filtering() {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let handler = TestHandler::new();
     let mut config = default_config();
@@ -360,7 +361,7 @@ async fn test_partition_manager_event_type_filtering() {
 
 #[tokio::test]
 async fn test_partition_manager_deduplication() {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let handler = TestHandler::new();
     let mut config = default_config();
@@ -569,7 +570,7 @@ fn create_test_message_with_event_id(
 
 #[tokio::test]
 async fn test_partition_manager_timer_heartbeat_integration() {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     // Test verifies that timer heartbeats are properly integrated into partition
     // stall detection

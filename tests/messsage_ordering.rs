@@ -3,7 +3,6 @@
 //! received in the order they were produced per key, utilizing integration
 //! tests with Kafka, via the Prosody library.
 
-use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use std::env;
@@ -18,7 +17,7 @@ use prosody::tracing::init_test_logging;
 /// which generates various input scenarios to ensure correct order. It supports
 /// integration testing with Kafka through the Prosody library.
 #[test]
-fn receives_all_in_key_order() -> Result<()> {
+fn receives_all_in_key_order() {
     // Determine the number of tests to run from an environment variable,
     // defaulting to 3 if the variable is not set or invalid.
     let test_count = env::var("INTEGRATION_TESTS")
@@ -33,8 +32,6 @@ fn receives_all_in_key_order() -> Result<()> {
     QuickCheck::new()
         .tests(test_count)
         .quickcheck(prop as fn(TestInput) -> TestResult);
-
-    Ok(())
 }
 
 /// Property function for `QuickCheck` to verify message ordering.

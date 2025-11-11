@@ -1,5 +1,6 @@
 use super::*;
 use crate::Topic;
+use crate::tracing::init_test_logging;
 use futures::future::join_all;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -98,7 +99,7 @@ async fn delete_records_up_to(topic: &str, offset: i64) -> color_eyre::Result<()
 #[tokio::test]
 async fn test_load_valid_offset() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("valid");
     create_topic(&topic_name).await?;
@@ -131,7 +132,7 @@ async fn test_load_valid_offset() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_load_sequential_offsets() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("sequential");
     create_topic(&topic_name).await?;
@@ -165,7 +166,7 @@ async fn test_load_sequential_offsets() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_multiple_concurrent_requests() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("concurrent");
     create_topic(&topic_name).await?;
@@ -210,7 +211,7 @@ async fn test_multiple_concurrent_requests() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_load_deleted_offset() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("deleted");
     create_topic(&topic_name).await?;
@@ -253,7 +254,7 @@ async fn test_load_deleted_offset() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("multi_deleted");
     create_topic(&topic_name).await?;
@@ -333,7 +334,7 @@ async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("at_lso");
     create_topic(&topic_name).await?;
@@ -369,7 +370,7 @@ async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("truncated");
     create_topic(&topic_name).await?;
@@ -411,7 +412,7 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("seek_recovery");
     create_topic(&topic_name).await?;
@@ -447,7 +448,7 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_sparse_offset_requests() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("sparse");
     create_topic(&topic_name).await?;
@@ -481,7 +482,7 @@ async fn test_sparse_offset_requests() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_backwards_seek() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("backwards");
     create_topic(&topic_name).await?;
@@ -529,7 +530,7 @@ async fn test_backwards_seek() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("threshold");
     create_topic(&topic_name).await?;
@@ -586,7 +587,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_concurrent_same_offset_requests() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("same_offset");
     create_topic(&topic_name).await?;
@@ -633,7 +634,7 @@ async fn test_concurrent_same_offset_requests() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     // This test verifies that seek failure recovery works
     // In a real multi-partition scenario, the recovery poll might return
@@ -686,7 +687,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_decode_error() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("decode_error");
     create_topic(&topic_name).await?;
@@ -740,7 +741,7 @@ async fn test_decode_error() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("concurrent_decode_error");
     create_topic(&topic_name).await?;
@@ -806,7 +807,7 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("older_deleted");
     create_topic(&topic_name).await?;
@@ -879,7 +880,7 @@ async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<(
 #[tokio::test]
 async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let topic_name = test_topic("cache_permits");
     create_topic(&topic_name).await?;

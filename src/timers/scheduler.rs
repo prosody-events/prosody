@@ -298,12 +298,13 @@ mod tests {
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
     use crate::timers::{TimerType, Trigger};
+    use crate::tracing::init_test_logging;
     use tokio::time::{Duration, advance, pause, sleep};
     use tracing::Span;
 
     #[tokio::test]
     async fn test_schedule_and_unschedule() -> Result<(), String> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -347,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_emission() -> Result<(), String> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -390,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_triggers() -> Result<(), String> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -464,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deactivate_trigger() -> Result<(), String> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -505,7 +506,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_times_for_single_key() -> Result<(), String> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -619,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backpressure_handling() -> Result<(), String> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());

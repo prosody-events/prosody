@@ -142,7 +142,9 @@ fn build_exporter() -> Result<SpanExporter, TracingError> {
 #[derive(Debug, Error)]
 pub enum TracingError {
     /// OTLP exporter could not be configured because no endpoint was configured
-    #[error("missing OTEL_EXPORTER_OTLP_ENDPOINT environment variable; can't initialize tracing")]
+    #[error(
+        "missing OTEL_EXPORTER_OTLP_ENDPOINT environment variable; can't initialize OTLP exporter"
+    )]
     MissingOtlpEndpoint,
 
     /// Unknown OTLP protocol specified in environment variable

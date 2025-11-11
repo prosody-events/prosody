@@ -7,6 +7,7 @@
 
 use super::CassandraMigrator;
 use crate::cassandra::{CassandraStoreError, TABLE_LOCKS};
+use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -55,7 +56,7 @@ const CONCURRENT_MIGRATORS: usize = 2;
 /// and then succeed when they see migrations are already complete.
 #[tokio::test]
 async fn test_concurrent_migration_lock_safety() -> Result<()> {
-    crate::tracing::init_test_logging();
+    init_test_logging();
 
     let session = Arc::new(Box::pin(create_test_session()).await?);
     let keyspace = random_keyspace();

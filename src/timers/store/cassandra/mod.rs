@@ -19,7 +19,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use tokio::task::coop::cooperative;
-use tracing::{debug_span, error, info_span, instrument};
+use tracing::{error, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod queries;
@@ -556,7 +556,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 cooperative(stream.try_next()).await?
             {
                 let context = self.propagator().extract(&span_map);
-                let span = debug_span!("fetch_key_trigger");
+                let span = info_span!("fetch_key_trigger");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
@@ -588,7 +588,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 cooperative(stream.try_next()).await?
             {
                 let context = self.propagator().extract(&span_map);
-                let span = debug_span!("fetch_key_trigger_all_types");
+                let span = info_span!("fetch_key_trigger_all_types");
                 if let Err(error) = span.set_parent(context) {
                     error!("failed to set parent span: {error:#}");
                 }
@@ -742,6 +742,7 @@ mod test {
     use crate::timers::slab::{Slab, SlabId};
     use crate::timers::store::operations::TriggerOperations;
     use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+    use crate::tracing::init_test_logging;
     use crate::trigger_store_tests;
     use color_eyre::Result;
     use futures::TryStreamExt;
@@ -795,7 +796,7 @@ mod test {
 
     #[tokio::test]
     async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let slab_size = CompactDuration::new(60); // 1 minute slabs
         let store =
@@ -892,7 +893,7 @@ mod test {
 
     #[tokio::test]
     async fn test_simple_wrap_around() -> Result<()> {
-        crate::tracing::init_test_logging();
+        init_test_logging();
 
         let slab_size = CompactDuration::new(60);
         let store =
