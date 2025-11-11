@@ -301,29 +301,9 @@ mod tests {
     use tokio::time::{Duration, advance, pause, sleep};
     use tracing::Span;
 
-    fn init_test_tracing() {
-        use opentelemetry::trace::TracerProvider;
-        use opentelemetry_sdk::trace::SdkTracerProvider;
-        use tracing::subscriber::set_global_default;
-        use tracing_subscriber::Registry;
-        use tracing_subscriber::filter::LevelFilter;
-        use tracing_subscriber::fmt;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
-        let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-        let subscriber = Registry::default()
-            .with(telemetry_layer)
-            .with(fmt::layer().with_test_writer())
-            .with(LevelFilter::ERROR);
-
-        let _ = set_global_default(subscriber);
-    }
-
     #[tokio::test]
     async fn test_schedule_and_unschedule() -> Result<(), String> {
-        init_test_tracing();
+        crate::tracing::init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -367,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_emission() -> Result<(), String> {
-        init_test_tracing();
+        crate::tracing::init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -410,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_triggers() -> Result<(), String> {
-        init_test_tracing();
+        crate::tracing::init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -484,7 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deactivate_trigger() -> Result<(), String> {
-        init_test_tracing();
+        crate::tracing::init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -525,7 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_times_for_single_key() -> Result<(), String> {
-        init_test_tracing();
+        crate::tracing::init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -639,7 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backpressure_handling() -> Result<(), String> {
-        init_test_tracing();
+        crate::tracing::init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());

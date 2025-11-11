@@ -13,39 +13,7 @@ use scylla::client::session_builder::SessionBuilder;
 use std::iter::Iterator;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
-
-/// Initializes test logging with appropriate levels for migration testing.
-fn init_test_logging() -> Result<()> {
-    use opentelemetry::trace::TracerProvider;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
-    use tracing::subscriber::set_global_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    // Create a no-op OpenTelemetry tracer for testing
-    // This allows span.set_parent() to work without actually exporting spans
-    let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
-    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-    let env_filter = EnvFilter::builder()
-        .with_env_var("PROSODY_LOG")
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy()
-        .add_directive("scylla=warn".parse()?);
-
-    let subscriber = Registry::default()
-        .with(telemetry_layer)
-        .with(fmt::layer().compact())
-        .with(env_filter);
-
-    if set_global_default(subscriber).is_err() {
-        tracing::info!("logging already initialized");
-    }
-    Ok(())
-}
 
 /// Creates a Cassandra session for testing.
 async fn create_test_session() -> Result<Session> {
@@ -87,7 +55,7 @@ const CONCURRENT_MIGRATORS: usize = 2;
 /// and then succeed when they see migrations are already complete.
 #[tokio::test]
 async fn test_concurrent_migration_lock_safety() -> Result<()> {
-    init_test_logging()?;
+    crate::tracing::init_test_logging();
 
     let session = Arc::new(Box::pin(create_test_session()).await?);
     let keyspace = random_keyspace();

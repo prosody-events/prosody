@@ -212,7 +212,7 @@ async fn setup_v1_state(
         let v1_trigger = TriggerV1 {
             key: trigger_data.key.clone(),
             time: trigger_data.time,
-            span: Span::none(),
+            span: Span::current(),
         };
 
         operations
@@ -260,7 +260,7 @@ async fn setup_v2_state(
             trigger_data.key.clone(),
             trigger_data.time,
             trigger_data.timer_type,
-            Span::none(),
+            Span::current(),
         );
 
         let slab = Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time);

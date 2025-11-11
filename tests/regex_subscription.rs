@@ -6,6 +6,7 @@
 
 use crate::common::{FallibleTestHandler, collect_messages_with_timeout};
 use color_eyre::eyre::{Result, ensure};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
@@ -231,7 +232,7 @@ async fn cleanup_topics(admin_client: &ProsodyAdminClient, topics: &[TestTopic])
 /// sending/receiving, or cleanup fails.
 #[tokio::test]
 async fn test_regex_topic_subscription() -> Result<()> {
-    common::init_test_logging()?;
+    init_test_logging();
 
     let uuid = Uuid::new_v4().to_string();
     let topic_prefix = format!("regex_test_{}", &uuid[0..8]);

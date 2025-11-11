@@ -105,7 +105,7 @@ impl Arbitrary for SlabTriggerTestInput {
             let op = match u8::arbitrary(g) % 5 {
                 0 => {
                     // Insert operation
-                    let trigger = Trigger::new(key, time, timer_type, Span::none());
+                    let trigger = Trigger::new(key, time, timer_type, Span::current());
                     SlabTriggerOperation::Insert { slab, trigger }
                 }
                 1 => SlabTriggerOperation::GetByType { slab, timer_type },

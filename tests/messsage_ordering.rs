@@ -11,6 +11,7 @@ use tokio::runtime::Builder;
 
 mod common;
 use common::{TestInput, run_test};
+use prosody::tracing::init_test_logging;
 
 /// Tests that messages are received in the order they were produced for each
 /// key. This function leverages property-based testing using `QuickCheck`,
@@ -26,7 +27,7 @@ fn receives_all_in_key_order() -> Result<()> {
         .unwrap_or(3);
 
     // Start tracing for logging and debugging.
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Use QuickCheck to run property-based tests that validate message ordering.
     QuickCheck::new()

@@ -19,26 +19,6 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::Span;
 
-fn init_test_tracing() {
-    use opentelemetry::trace::TracerProvider;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
-    use tracing::subscriber::set_global_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::filter::LevelFilter;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
-    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-    let subscriber = Registry::default()
-        .with(telemetry_layer)
-        .with(fmt::layer().with_test_writer())
-        .with(LevelFilter::ERROR);
-
-    let _ = set_global_default(subscriber);
-}
-
 /// Helper trait for waiting on processed offsets.
 trait HasProcessedOffsets {
     fn processed_offsets(&self) -> &Arc<Mutex<Vec<Offset>>>;
@@ -64,7 +44,7 @@ fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>
 
 #[tokio::test]
 async fn test_partition_manager_capacity() {
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     let handler = TestHandler::new();
     let mut config = default_config();
@@ -92,7 +72,7 @@ async fn test_partition_manager_capacity() {
 
 #[tokio::test]
 async fn test_partition_manager_ordering() {
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     let handler = TestHandler::new();
     let mut config = default_config();
@@ -126,7 +106,7 @@ async fn test_partition_manager_ordering() {
 
 #[tokio::test]
 async fn test_partition_manager_concurrent_processing() {
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     let handler = TestHandler::new();
     let config = default_config();
@@ -159,7 +139,7 @@ async fn test_partition_manager_concurrent_processing() {
 
 #[tokio::test]
 async fn test_partition_manager_watermark() {
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     let handler = TestHandler::new();
     let config = default_config();
@@ -188,7 +168,7 @@ async fn test_partition_manager_watermark() {
 
 #[tokio::test]
 async fn test_partition_manager_max_uncommitted() {
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     let handler = TestHandler::new();
     let max_uncommitted = 5;
@@ -276,7 +256,7 @@ async fn test_partition_manager_is_stalled() {
         }
     }
 
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     let handler = StallTestHandler::new();
     let mut config = default_config();
@@ -313,7 +293,7 @@ async fn test_partition_manager_is_stalled() {
 
 #[tokio::test]
 async fn test_partition_manager_event_type_filtering() {
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     let handler = TestHandler::new();
     let mut config = default_config();
@@ -338,7 +318,7 @@ async fn test_partition_manager_event_type_filtering() {
         "key".into(),
         Utc::now(),
         json!({ "type": "disallowed" }),
-        Span::none(),
+        Span::current(),
         test_semaphore
             .clone()
             .try_acquire_owned()
@@ -355,7 +335,7 @@ async fn test_partition_manager_event_type_filtering() {
         "key".into(),
         Utc::now(),
         json!({ "type": "allowed" }),
-        Span::none(),
+        Span::current(),
         test_semaphore
             .clone()
             .try_acquire_owned()
@@ -380,7 +360,7 @@ async fn test_partition_manager_event_type_filtering() {
 
 #[tokio::test]
 async fn test_partition_manager_deduplication() {
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     let handler = TestHandler::new();
     let mut config = default_config();
@@ -554,7 +534,7 @@ fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
         key.into(),
         Utc::now(),
         serde_json::json!({}),
-        Span::none(),
+        Span::current(),
         semaphore
             .try_acquire_owned()
             .expect("Failed to acquire permit"),
@@ -580,7 +560,7 @@ fn create_test_message_with_event_id(
         key.into(),
         Utc::now(),
         payload,
-        Span::none(),
+        Span::current(),
         semaphore
             .try_acquire_owned()
             .expect("Failed to acquire permit"),
@@ -589,7 +569,7 @@ fn create_test_message_with_event_id(
 
 #[tokio::test]
 async fn test_partition_manager_timer_heartbeat_integration() {
-    init_test_tracing();
+    crate::tracing::init_test_logging();
 
     // Test verifies that timer heartbeats are properly integrated into partition
     // stall detection

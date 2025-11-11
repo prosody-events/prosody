@@ -61,24 +61,9 @@ mod test_runner {
     /// Initialize test tracing with OpenTelemetry layer and return an active
     /// span guard
     fn init_test_tracing() -> EnteredSpan {
-        use opentelemetry::trace::TracerProvider;
-        use opentelemetry_sdk::trace::SdkTracerProvider;
         use tracing::info_span;
-        use tracing::subscriber::set_global_default;
-        use tracing_subscriber::Registry;
-        use tracing_subscriber::filter::LevelFilter;
-        use tracing_subscriber::fmt;
-        use tracing_subscriber::layer::SubscriberExt;
 
-        let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
-        let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-        let subscriber = Registry::default()
-            .with(telemetry_layer)
-            .with(fmt::layer().with_test_writer())
-            .with(LevelFilter::ERROR);
-
-        let _ = set_global_default(subscriber);
+        crate::tracing::init_test_logging();
 
         // Return an active span guard to ensure Span::current() works during test
         info_span!("test").entered()

@@ -35,9 +35,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tracing::level_filters::LevelFilter;
 use tracing::{error, info, instrument};
-use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
 
 /// A small, non-zero count used in tests.
@@ -560,45 +558,6 @@ impl FallibleHandler for FallibleTestHandler {
     async fn shutdown(self) {
         // No cleanup needed for test handler
     }
-}
-
-/// Initializes logging for integration tests with scylla noise filtering.
-///
-/// Sets up a compact tracing subscriber with the scylla crate set to WARN level
-/// to reduce noise from database driver logs during testing. Also includes a
-/// minimal OpenTelemetry layer to support span parent context operations.
-///
-/// # Errors
-///
-/// Returns an error if the tracing subscriber cannot be initialized.
-pub fn init_test_logging() -> Result<()> {
-    use opentelemetry::trace::TracerProvider;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
-    use tracing::subscriber::set_global_default;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    // Create a no-op OpenTelemetry tracer for testing
-    // This allows span.set_parent() to work without actually exporting spans
-    let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
-    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-    let env_filter = EnvFilter::builder()
-        .with_env_var("PROSODY_LOG")
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy()
-        .add_directive("scylla=warn".parse()?);
-
-    let subscriber = Registry::default()
-        .with(telemetry_layer)
-        .with(fmt::layer().compact())
-        .with(env_filter);
-
-    if set_global_default(subscriber).is_err() {
-        info!("logging already initialized");
-    }
-
-    Ok(())
 }
 
 /// Collects exactly the expected number of messages within a timeout period.

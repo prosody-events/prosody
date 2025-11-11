@@ -8,6 +8,7 @@
 
 use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
@@ -26,7 +27,7 @@ mod common;
 /// Tests the filtering functionality of the source system.
 #[tokio::test]
 async fn test_source_system_filtering() -> Result<()> {
-    common::init_test_logging()?;
+    init_test_logging();
     let timeout_duration = Duration::from_secs(30);
 
     // Scenario 1: Both source system and group ID are the same, so no messages

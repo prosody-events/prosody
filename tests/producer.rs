@@ -13,6 +13,7 @@ use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, 
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::timers::UncommittedTimer;
+use prosody::tracing::init_test_logging;
 use prosody::{Payload, Topic};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -259,7 +260,7 @@ async fn case_return_to_original_id(
 #[tokio::test]
 async fn test_producer_deduplication() -> Result<()> {
     // Initialize tracing for easier debugging
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Setup test environment with Kafka broker
     let brokers = vec!["localhost:9094".to_owned()];

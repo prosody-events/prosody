@@ -4,6 +4,7 @@
 
 use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
@@ -36,8 +37,7 @@ mod common;
 /// Panics if initializing the tracing subscriber fails.
 #[tokio::test]
 async fn test_deduplication_of_same_event_id() -> Result<()> {
-    // Initialize compact tracing format
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique Kafka topic for isolated testing
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();

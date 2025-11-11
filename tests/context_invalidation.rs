@@ -5,6 +5,7 @@
 //! partition ownership changes.
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
@@ -86,7 +87,7 @@ impl EventHandler for ContextInvalidationHandler {
 #[tokio::test]
 async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
     // Initialize logging
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique topic for the test
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();

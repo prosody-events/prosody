@@ -795,6 +795,8 @@ mod test {
 
     #[tokio::test]
     async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
+        crate::tracing::init_test_logging();
+
         let slab_size = CompactDuration::new(60); // 1 minute slabs
         let store =
             CassandraTriggerStore::new(&test_cassandra_config("prosody_test"), slab_size).await?;
@@ -890,6 +892,8 @@ mod test {
 
     #[tokio::test]
     async fn test_simple_wrap_around() -> Result<()> {
+        crate::tracing::init_test_logging();
+
         let slab_size = CompactDuration::new(60);
         let store =
             CassandraTriggerStore::new(&test_cassandra_config("prosody_test_simple"), slab_size)

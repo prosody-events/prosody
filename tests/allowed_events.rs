@@ -4,6 +4,7 @@
 
 use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
@@ -31,7 +32,7 @@ mod common;
 #[tokio::test]
 async fn test_allowed_events_filtering() -> Result<()> {
     // Initialize logging
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique topic to isolate the test environment
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();

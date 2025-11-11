@@ -8,6 +8,7 @@
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::consumer::event_context::EventContext;
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
@@ -437,7 +438,7 @@ where
     F: FnOnce(TestEnvironment) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    common::init_test_logging()?;
+    init_test_logging();
 
     let result = timeout(Duration::from_secs(timeout_secs), async {
         let env = TestEnvironment::new(test_name).await?;

@@ -5,6 +5,7 @@
 //! backpressure handling capabilities of the timer system.
 
 use color_eyre::eyre::Result;
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
@@ -98,7 +99,7 @@ impl EventHandler for SlowTimerHandler {
 #[tokio::test]
 async fn test_timer_backpressure() -> Result<()> {
     // Initialize the logger.
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique topic for the test
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();

@@ -41,6 +41,7 @@ use color_eyre::eyre::{Result, eyre};
 use prosody::consumer::Uncommitted;
 use prosody::consumer::event_context::EventContext;
 use prosody::timers::UncommittedTimer;
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
@@ -168,7 +169,7 @@ async fn produce_messages(
 #[tokio::test]
 async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     // Initialize logging
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a topic with 3 partitions
     let partitions = 3_u16;

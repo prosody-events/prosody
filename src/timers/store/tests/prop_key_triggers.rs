@@ -131,7 +131,7 @@ impl Arbitrary for KeyTriggerTestInput {
             let op = match u8::arbitrary(g) % 7 {
                 0 => {
                     // Insert operation
-                    let trigger = Trigger::new(key, time, timer_type, Span::none());
+                    let trigger = Trigger::new(key, time, timer_type, Span::current());
                     KeyTriggerOperation::Insert {
                         segment_id,
                         trigger,
