@@ -116,6 +116,9 @@ where
     /// Scheduled execution time.
     time: CompactDateTime,
 
+    /// Timer type classification.
+    timer_type: TimerType,
+
     /// Manager coordinating persistent and in-memory state.
     manager: TimerManager<T>,
 
@@ -141,11 +144,13 @@ where
     pub fn new(trigger: Trigger, manager: TimerManager<T>) -> Self {
         let key = trigger.key.clone();
         let time = trigger.time;
+        let timer_type = trigger.timer_type;
         Self {
             trigger,
             uncommitted: UncommittedTrigger {
                 key,
                 time,
+                timer_type,
                 manager,
                 completed: false,
             },
@@ -238,7 +243,9 @@ where
     ///
     /// `true` if still loaded, `false` if completed or no longer scheduled.
     pub async fn is_active(&self) -> bool {
-        self.manager.is_active(&self.key, self.time).await
+        self.manager
+            .is_active(&self.key, self.time, self.timer_type)
+            .await
     }
 
     /// Permanently remove the timer from storage and deactivate it.
@@ -253,7 +260,11 @@ where
 
         // Retry loop: ensure TimerManager::complete eventually succeeds.
         loop {
-            match self.manager.complete(&self.key, self.time).await {
+            match self
+                .manager
+                .complete(&self.key, self.time, self.timer_type)
+                .await
+            {
                 Ok(()) => break,
                 Err(error) => {
                     tracing::error!("failed to commit timer: {error:#}; retrying");
@@ -275,7 +286,9 @@ where
             return;
         }
 
-        self.manager.abort(&self.key, self.time).await;
+        self.manager
+            .abort(&self.key, self.time, self.timer_type)
+            .await;
         self.completed = true;
     }
 }

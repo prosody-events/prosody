@@ -136,6 +136,7 @@ where
     pub fn scheduled_times(
         &self,
         key: &Key,
+        timer_type: TimerType,
     ) -> impl Stream<Item = Result<CompactDateTime, TimerManagerError<T::Error>>> + Send + 'static
     {
         let slab_lock = self.0.state.clone();
@@ -147,7 +148,7 @@ where
 
             let stream = state
                 .store
-                .get_key_times(&segment_id, TimerType::Application, &key)
+                .get_key_times(&segment_id, timer_type, &key)
                 .map_err(TimerManagerError::Store);
 
             pin_mut!(stream);
@@ -170,13 +171,14 @@ where
     pub async fn scheduled_triggers(
         &self,
         key: &Key,
+        timer_type: TimerType,
     ) -> Result<Vec<Trigger>, TimerManagerError<T::Error>> {
         self.0
             .state
             .trigger_lock()
             .await
             .store
-            .get_key_triggers(&self.0.segment.id, TimerType::Application, key)
+            .get_key_triggers(&self.0.segment.id, timer_type, key)
             .map_err(TimerManagerError::Store)
             .try_collect()
             .await
@@ -237,6 +239,7 @@ where
         &self,
         key: &Key,
         time: CompactDateTime,
+        timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         // Identify the slab containing this time.
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
@@ -245,14 +248,14 @@ where
 
         // Remove from in-memory scheduler if owned.
         if state.is_owned(slab_id) {
-            let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
+            let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
             state.scheduler.unschedule(trigger).await?;
         }
 
         // Remove from persistent storage.
         state
             .store
-            .remove_trigger(&self.0.segment, &slab, key, time, TimerType::Application)
+            .remove_trigger(&self.0.segment, &slab, key, time, timer_type)
             .await
             .map_err(TimerManagerError::Store)
     }
@@ -271,11 +274,18 @@ where
     ///
     /// Returns [`TimerManagerError::Store`] or scheduler errors if any cancel
     /// operation fails.
-    pub async fn unschedule_all(&self, key: &Key) -> Result<(), TimerManagerError<T::Error>> {
+    pub async fn unschedule_all(
+        &self,
+        key: &Key,
+        timer_type: TimerType,
+    ) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
 
-        self.scheduled_times(key)
-            .map_ok(|time| self.unschedule(key, time).instrument(span.clone()))
+        self.scheduled_times(key, timer_type)
+            .map_ok(|time| {
+                self.unschedule(key, time, timer_type)
+                    .instrument(span.clone())
+            })
             .try_buffer_unordered(DELETE_CONCURRENCY)
             .try_collect::<()>()
             .await
@@ -294,13 +304,13 @@ where
     /// # Returns
     ///
     /// `true` if the timer is active in the scheduler.
-    pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
+    pub async fn is_active(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) -> bool {
         self.0
             .state
             .trigger_lock()
             .await
             .scheduler
-            .is_active(key, time)
+            .is_active(key, time, timer_type)
             .await
     }
 
@@ -321,6 +331,7 @@ where
         &self,
         key: &Key,
         time: CompactDateTime,
+        timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         // Derive the slab and lock state.
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
@@ -329,13 +340,13 @@ where
 
         // Deactivate in-memory if owned.
         if state.is_owned(slab_id) {
-            state.scheduler.deactivate(key, time).await;
+            state.scheduler.deactivate(key, time, timer_type).await;
         }
 
         // Remove from storage.
         state
             .store
-            .remove_trigger(&self.0.segment, &slab, key, time, TimerType::Application)
+            .remove_trigger(&self.0.segment, &slab, key, time, timer_type)
             .await
             .map_err(TimerManagerError::Store)?;
 
@@ -351,13 +362,13 @@ where
     ///
     /// * `key` - The entity key of the timer.
     /// * `time` - The scheduled execution time to abort.
-    pub async fn abort(&self, key: &Key, time: CompactDateTime) {
+    pub async fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
         let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
         if state.is_owned(slab_id) {
-            state.scheduler.deactivate(key, time).await;
+            state.scheduler.deactivate(key, time, timer_type).await;
         }
     }
 }
@@ -365,6 +376,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::Uncommitted;
     use crate::timers::UncommittedTimer;
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
@@ -372,18 +384,22 @@ mod tests {
     use futures::StreamExt;
     use std::time::Duration;
     use tokio::task;
-    use tokio::time;
+    use tokio::time::{self, advance, timeout};
     use tracing::Span;
     use uuid::Uuid;
 
     /// Helper function to create a test trigger
-    fn create_test_trigger(key: &str, seconds_offset: u32) -> Result<Trigger> {
+    fn create_test_trigger(
+        key: &str,
+        seconds_offset: u32,
+        timer_type: TimerType,
+    ) -> Result<Trigger> {
         let time = CompactDateTime::now()?.add_duration(CompactDuration::new(seconds_offset))?;
 
         Ok(Trigger::new(
             Key::from(key),
             time,
-            TimerType::Application,
+            timer_type,
             Span::current(),
         ))
     }
@@ -439,14 +455,14 @@ mod tests {
         time::pause();
 
         let (_stream, manager) = setup_timer_manager().await?;
-        let trigger = create_test_trigger("test-key", 60)?;
+        let trigger = create_test_trigger("test-key", 60, TimerType::Application)?;
 
         let result = manager.schedule(trigger.clone()).await;
         assert!(result.is_ok(), "Scheduling should succeed");
 
         // Verify the timer is stored
         let scheduled_times = manager
-            .scheduled_times(&trigger.key)
+            .scheduled_times(&trigger.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(scheduled_times.len(), 1);
@@ -463,9 +479,9 @@ mod tests {
 
         // Schedule multiple timers for the same key
         let triggers = vec![
-            create_test_trigger("multi-timer-key", 60)?,
-            create_test_trigger("multi-timer-key", 120)?,
-            create_test_trigger("multi-timer-key", 180)?,
+            create_test_trigger("multi-timer-key", 60, TimerType::Application)?,
+            create_test_trigger("multi-timer-key", 120, TimerType::Application)?,
+            create_test_trigger("multi-timer-key", 180, TimerType::Application)?,
         ];
 
         for trigger in &triggers {
@@ -473,7 +489,7 @@ mod tests {
         }
 
         let scheduled_times = manager
-            .scheduled_times(&key)
+            .scheduled_times(&key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(scheduled_times.len(), 3);
@@ -490,19 +506,19 @@ mod tests {
 
         let (_stream, manager) = setup_timer_manager().await?;
 
-        let trigger1 = create_test_trigger("key-1", 60)?;
-        let trigger2 = create_test_trigger("key-2", 120)?;
+        let trigger1 = create_test_trigger("key-1", 60, TimerType::Application)?;
+        let trigger2 = create_test_trigger("key-2", 120, TimerType::Application)?;
 
         manager.schedule(trigger1.clone()).await?;
         manager.schedule(trigger2.clone()).await?;
 
         // Verify each key has its timer
         let times1 = manager
-            .scheduled_times(&trigger1.key)
+            .scheduled_times(&trigger1.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         let times2 = manager
-            .scheduled_times(&trigger2.key)
+            .scheduled_times(&trigger2.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -521,7 +537,7 @@ mod tests {
         let nonexistent_key = Key::from("nonexistent");
 
         let scheduled_times = manager
-            .scheduled_times(&nonexistent_key)
+            .scheduled_times(&nonexistent_key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert!(scheduled_times.is_empty());
@@ -533,16 +549,18 @@ mod tests {
         time::pause();
 
         let (_stream, manager) = setup_timer_manager().await?;
-        let trigger = create_test_trigger("unschedule-key", 60)?;
+        let trigger = create_test_trigger("unschedule-key", 60, TimerType::Application)?;
 
         // Schedule then unschedule
         manager.schedule(trigger.clone()).await?;
-        let result = manager.unschedule(&trigger.key, trigger.time).await;
+        let result = manager
+            .unschedule(&trigger.key, trigger.time, TimerType::Application)
+            .await;
         assert!(result.is_ok(), "Unscheduling should succeed");
 
         // Verify timer is removed
         let scheduled_times = manager
-            .scheduled_times(&trigger.key)
+            .scheduled_times(&trigger.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert!(scheduled_times.is_empty());
@@ -558,7 +576,7 @@ mod tests {
         let time = CompactDateTime::now()?;
 
         // Unscheduling non-existent timer should succeed (idempotent)
-        let result = manager.unschedule(&key, time).await;
+        let result = manager.unschedule(&key, time, TimerType::Application).await;
         assert!(
             result.is_ok(),
             "Unscheduling nonexistent timer should succeed"
@@ -575,9 +593,9 @@ mod tests {
 
         // Schedule multiple timers
         let triggers = vec![
-            create_test_trigger("unschedule-all-key", 60)?,
-            create_test_trigger("unschedule-all-key", 120)?,
-            create_test_trigger("unschedule-all-key", 180)?,
+            create_test_trigger("unschedule-all-key", 60, TimerType::Application)?,
+            create_test_trigger("unschedule-all-key", 120, TimerType::Application)?,
+            create_test_trigger("unschedule-all-key", 180, TimerType::Application)?,
         ];
 
         for trigger in &triggers {
@@ -586,18 +604,18 @@ mod tests {
 
         // Verify all are scheduled
         let scheduled_times = manager
-            .scheduled_times(&key)
+            .scheduled_times(&key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(scheduled_times.len(), 3);
 
         // Unschedule all
-        let result = manager.unschedule_all(&key).await;
+        let result = manager.unschedule_all(&key, TimerType::Application).await;
         assert!(result.is_ok(), "Unschedule all should succeed");
 
         // Verify all are removed
         let scheduled_times = manager
-            .scheduled_times(&key)
+            .scheduled_times(&key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert!(scheduled_times.is_empty());
@@ -612,7 +630,9 @@ mod tests {
         let empty_key = Key::from("empty-key");
 
         // Unschedule all on empty key should succeed
-        let result = manager.unschedule_all(&empty_key).await;
+        let result = manager
+            .unschedule_all(&empty_key, TimerType::Application)
+            .await;
         assert!(result.is_ok(), "Unschedule all on empty key should succeed");
         Ok(())
     }
@@ -640,7 +660,9 @@ mod tests {
         task::yield_now().await;
 
         // Check if timer is active
-        let is_active = manager.is_active(&trigger.key, trigger.time).await;
+        let is_active = manager
+            .is_active(&trigger.key, trigger.time, TimerType::Application)
+            .await;
         assert!(is_active);
 
         Ok(())
@@ -654,7 +676,7 @@ mod tests {
         let key = Key::from("nonexistent");
         let time = CompactDateTime::now()?;
 
-        let is_active = manager.is_active(&key, time).await;
+        let is_active = manager.is_active(&key, time, TimerType::Application).await;
         assert!(!is_active, "Nonexistent timer should not be active");
         Ok(())
     }
@@ -664,18 +686,20 @@ mod tests {
         time::pause();
 
         let (_stream, manager) = setup_timer_manager().await?;
-        let trigger = create_test_trigger("complete-key", 60)?;
+        let trigger = create_test_trigger("complete-key", 60, TimerType::Application)?;
 
         // Schedule timer
         manager.schedule(trigger.clone()).await?;
 
         // Complete timer
-        let result = manager.complete(&trigger.key, trigger.time).await;
+        let result = manager
+            .complete(&trigger.key, trigger.time, TimerType::Application)
+            .await;
         assert!(result.is_ok(), "Complete should succeed");
 
         // Verify timer is removed from storage
         let scheduled_times = manager
-            .scheduled_times(&trigger.key)
+            .scheduled_times(&trigger.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert!(scheduled_times.is_empty());
@@ -691,7 +715,7 @@ mod tests {
         let time = CompactDateTime::now()?;
 
         // Completing nonexistent timer should succeed (idempotent)
-        let result = manager.complete(&key, time).await;
+        let result = manager.complete(&key, time, TimerType::Application).await;
         assert!(result.is_ok(), "Complete nonexistent timer should succeed");
         Ok(())
     }
@@ -701,17 +725,19 @@ mod tests {
         time::pause();
 
         let (_stream, manager) = setup_timer_manager().await?;
-        let trigger = create_test_trigger("abort-key", 60)?;
+        let trigger = create_test_trigger("abort-key", 60, TimerType::Application)?;
 
         // Schedule timer
         manager.schedule(trigger.clone()).await?;
 
         // Abort timer (should deactivate but leave in storage)
-        manager.abort(&trigger.key, trigger.time).await;
+        manager
+            .abort(&trigger.key, trigger.time, TimerType::Application)
+            .await;
 
         // Timer should still be in storage after abort
         let scheduled_times = manager
-            .scheduled_times(&trigger.key)
+            .scheduled_times(&trigger.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(scheduled_times.len(), 1);
@@ -728,7 +754,7 @@ mod tests {
         let time = CompactDateTime::now()?;
 
         // Aborting nonexistent timer should succeed without error
-        manager.abort(&key, time).await;
+        manager.abort(&key, time, TimerType::Application).await;
         Ok(())
     }
 
@@ -778,7 +804,9 @@ mod tests {
         for i in 0..10 {
             let manager_clone = manager.clone();
             let handle = spawn(async move {
-                let trigger = create_test_trigger(&format!("concurrent-{i}"), 60 + i).unwrap();
+                let trigger =
+                    create_test_trigger(&format!("concurrent-{i}"), 60 + i, TimerType::Application)
+                        .unwrap();
                 manager_clone.schedule(trigger).await
             });
             handles.push(handle);
@@ -795,7 +823,7 @@ mod tests {
         for i in 0..10_u8 {
             let key = Key::from(format!("concurrent-{i}"));
             let times = manager
-                .scheduled_times(&key)
+                .scheduled_times(&key, TimerType::Application)
                 .try_collect::<Vec<_>>()
                 .await?;
             assert_eq!(times.len(), 1, "Timer {i} should be scheduled");
@@ -808,12 +836,12 @@ mod tests {
         time::pause();
 
         let (_stream, manager) = setup_timer_manager().await?;
-        let trigger = create_test_trigger("lifecycle-key", 60)?;
+        let trigger = create_test_trigger("lifecycle-key", 60, TimerType::Application)?;
 
         // 1. Schedule timer
         manager.schedule(trigger.clone()).await?;
         let times = manager
-            .scheduled_times(&trigger.key)
+            .scheduled_times(&trigger.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(times.len(), 1);
@@ -822,9 +850,11 @@ mod tests {
         assert!(times.contains(&trigger.time));
 
         // 3. Complete timer
-        manager.complete(&trigger.key, trigger.time).await?;
+        manager
+            .complete(&trigger.key, trigger.time, TimerType::Application)
+            .await?;
         let times = manager
-            .scheduled_times(&trigger.key)
+            .scheduled_times(&trigger.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
         assert!(times.is_empty());
@@ -867,7 +897,7 @@ mod tests {
         // Verify each key has exactly one timer at the same time
         for trigger in &triggers {
             let times = manager
-                .scheduled_times(&trigger.key)
+                .scheduled_times(&trigger.key, TimerType::Application)
                 .try_collect::<Vec<_>>()
                 .await?;
             assert_eq!(times.len(), 1);
@@ -908,17 +938,259 @@ mod tests {
 
         // Verify both timers are stored
         let times_now = manager
-            .scheduled_times(&trigger_now.key)
+            .scheduled_times(&trigger_now.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
 
         let times_future = manager
-            .scheduled_times(&trigger_future.key)
+            .scheduled_times(&trigger_future.key, TimerType::Application)
             .try_collect::<Vec<_>>()
             .await?;
 
         assert_eq!(times_now.len(), 1);
         assert_eq!(times_future.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_timer_type_isolation_end_to_end() -> Result<()> {
+        time::pause();
+
+        let (mut stream, manager) = setup_timer_manager().await?;
+        let key = Key::from("isolation-key");
+        let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?;
+
+        // Schedule BOTH types at same (key, time)
+        let app_trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
+        let retry_trigger = Trigger::new(key.clone(), time, TimerType::DeferRetry, Span::current());
+
+        manager.schedule(app_trigger.clone()).await?;
+        manager.schedule(retry_trigger.clone()).await?;
+
+        // Allow time for the scheduler to process
+        time::advance(Duration::from_millis(100)).await;
+        task::yield_now().await;
+
+        // Verify both are scheduled independently via scheduled_times
+        let app_times = manager
+            .scheduled_times(&key, TimerType::Application)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let retry_times = manager
+            .scheduled_times(&key, TimerType::DeferRetry)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert_eq!(
+            app_times.len(),
+            1,
+            "Should have exactly 1 Application timer"
+        );
+        assert_eq!(
+            retry_times.len(),
+            1,
+            "Should have exactly 1 DeferRetry timer"
+        );
+        assert_eq!(app_times[0], time, "Application timer at correct time");
+        assert_eq!(retry_times[0], time, "DeferRetry timer at correct time");
+
+        // Verify both are active via is_active
+        assert!(
+            manager.is_active(&key, time, TimerType::Application).await,
+            "Application timer should be active"
+        );
+        assert!(
+            manager.is_active(&key, time, TimerType::DeferRetry).await,
+            "DeferRetry timer should be active"
+        );
+
+        // Advance time to trigger BOTH timers
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        // First timer fires - could be either type
+        let first_timer = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("First timer should fire"))?;
+        let (first_trigger, first_guard) = first_timer.into_inner();
+
+        // Second timer fires - should be the other type
+        let second_timer = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("Second timer should fire"))?;
+        let (second_trigger, second_guard) = second_timer.into_inner();
+
+        // Verify we got both types (order may vary)
+        let fired_types = [first_trigger.timer_type, second_trigger.timer_type];
+        assert!(
+            fired_types.contains(&TimerType::Application),
+            "Application timer should fire"
+        );
+        assert!(
+            fired_types.contains(&TimerType::DeferRetry),
+            "DeferRetry timer should fire"
+        );
+
+        // Both should have same key and time
+        assert_eq!(first_trigger.key, key, "First timer has correct key");
+        assert_eq!(first_trigger.time, time, "First timer has correct time");
+        assert_eq!(second_trigger.key, key, "Second timer has correct key");
+        assert_eq!(second_trigger.time, time, "Second timer has correct time");
+
+        // Separate the guards by type
+        let (app_guard, retry_guard) = if first_trigger.timer_type == TimerType::Application {
+            (first_guard, second_guard)
+        } else {
+            (second_guard, first_guard)
+        };
+
+        // Commit only the Application timer
+        app_guard.commit().await;
+
+        // Verify only Application is gone from storage (isolation test!)
+        let app_times = manager
+            .scheduled_times(&key, TimerType::Application)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let retry_times = manager
+            .scheduled_times(&key, TimerType::DeferRetry)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert!(
+            app_times.is_empty(),
+            "Application timer should be removed after commit"
+        );
+        assert_eq!(
+            retry_times.len(),
+            1,
+            "DeferRetry timer should still exist (isolation!)"
+        );
+
+        // Commit the DeferRetry timer
+        retry_guard.commit().await;
+
+        // Verify both types are now gone
+        let app_times = manager
+            .scheduled_times(&key, TimerType::Application)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let retry_times = manager
+            .scheduled_times(&key, TimerType::DeferRetry)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert!(app_times.is_empty(), "No Application timers remain");
+        assert!(retry_times.is_empty(), "No DeferRetry timers remain");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_timer_type_unschedule_isolation() -> Result<()> {
+        time::pause();
+
+        let (mut stream, manager) = setup_timer_manager().await?;
+        let key = Key::from("unschedule-isolation-key");
+        let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?;
+
+        // Schedule BOTH types at same (key, time)
+        let app_trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
+        let retry_trigger = Trigger::new(key.clone(), time, TimerType::DeferRetry, Span::current());
+
+        manager.schedule(app_trigger.clone()).await?;
+        manager.schedule(retry_trigger.clone()).await?;
+
+        // Allow time for the scheduler to process
+        time::advance(Duration::from_millis(100)).await;
+        task::yield_now().await;
+
+        // Verify both are scheduled
+        let app_times = manager
+            .scheduled_times(&key, TimerType::Application)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let retry_times = manager
+            .scheduled_times(&key, TimerType::DeferRetry)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert_eq!(app_times.len(), 1, "Should have 1 Application timer");
+        assert_eq!(retry_times.len(), 1, "Should have 1 DeferRetry timer");
+
+        // Unschedule ONLY the Application timer
+        manager
+            .unschedule(&key, time, TimerType::Application)
+            .await?;
+
+        // Allow scheduler to process the unschedule
+        task::yield_now().await;
+
+        // Verify Application is gone but DeferRetry remains (isolation!)
+        let app_times = manager
+            .scheduled_times(&key, TimerType::Application)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let retry_times = manager
+            .scheduled_times(&key, TimerType::DeferRetry)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert!(
+            app_times.is_empty(),
+            "Application timer should be unscheduled"
+        );
+        assert_eq!(
+            retry_times.len(),
+            1,
+            "DeferRetry timer should still exist (isolation!)"
+        );
+
+        // Verify Application is not active but DeferRetry is
+        assert!(
+            !manager.is_active(&key, time, TimerType::Application).await,
+            "Application timer should not be active after unschedule"
+        );
+        assert!(
+            manager.is_active(&key, time, TimerType::DeferRetry).await,
+            "DeferRetry timer should still be active"
+        );
+
+        // Advance time to trigger timers
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        // Only DeferRetry should fire
+        let fired_timer = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("DeferRetry timer should fire"))?;
+        let (fired_trigger, guard) = fired_timer.into_inner();
+
+        assert_eq!(fired_trigger.key, key, "Fired timer has correct key");
+        assert_eq!(fired_trigger.time, time, "Fired timer has correct time");
+        assert_eq!(
+            fired_trigger.timer_type,
+            TimerType::DeferRetry,
+            "Only DeferRetry should fire"
+        );
+
+        // Commit the DeferRetry timer
+        guard.commit().await;
+
+        // Verify no more timers fire (Application was unscheduled)
+        advance(Duration::from_secs(1)).await;
+        task::yield_now().await;
+
+        let no_more_timers = timeout(Duration::from_millis(100), stream.next()).await;
+
+        assert!(
+            no_more_timers.is_err(),
+            "No more timers should fire (Application was unscheduled)"
+        );
+
         Ok(())
     }
 }

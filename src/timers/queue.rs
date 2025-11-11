@@ -102,7 +102,11 @@ impl TriggerQueue {
         // Remove from the delay queue and deactivate in the registry.
         self.queue.remove(&queue_key);
         self.active
-            .remove(&owned_trigger.key, owned_trigger.time)
+            .remove(
+                &owned_trigger.key,
+                owned_trigger.time,
+                owned_trigger.timer_type,
+            )
             .await;
     }
 }
@@ -168,7 +172,12 @@ mod tests {
         triggers.remove(&trigger).await;
 
         // Verify the trigger is no longer active
-        assert!(!triggers.active_triggers().contains(&key, time).await);
+        assert!(
+            !triggers
+                .active_triggers()
+                .contains(&key, time, TimerType::Application)
+                .await
+        );
 
         // Advance time by 5 seconds to simulate the trigger's original expiration time
         advance(Duration::from_secs(5)).await;
@@ -247,13 +256,23 @@ mod tests {
         triggers.insert(trigger.clone()).await;
 
         // Verify the trigger is active
-        assert!(triggers.active_triggers().contains(&key, time).await);
+        assert!(
+            triggers
+                .active_triggers()
+                .contains(&key, time, TimerType::Application)
+                .await
+        );
 
         // Remove the trigger
         triggers.remove(&trigger).await;
 
         // Verify the trigger is no longer active
-        assert!(!triggers.active_triggers().contains(&key, time).await);
+        assert!(
+            !triggers
+                .active_triggers()
+                .contains(&key, time, TimerType::Application)
+                .await
+        );
 
         Ok(())
     }

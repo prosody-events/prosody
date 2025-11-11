@@ -15,7 +15,7 @@ use prosody::{
     consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
-    timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
+    timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
 use serde_json::json;
 use std::time::Duration;
@@ -53,7 +53,10 @@ impl EventHandler for SlowTimerHandler {
             let delay = CompactDuration::new(delay_secs);
             match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
                 Ok(schedule_time) => {
-                    if let Err(e) = context.schedule(schedule_time).await {
+                    if let Err(e) = context
+                        .schedule(schedule_time, TimerType::Application)
+                        .await
+                    {
                         error!("Failed to schedule timer for key {}: {e}", key);
                     }
                 }

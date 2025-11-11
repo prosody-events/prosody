@@ -6,6 +6,11 @@ This document proposes a persistent, per-key retry mechanism (Defer Middleware) 
 provides long-term retry capabilities with Cassandra-backed persistence. The middleware wraps the inner handler stack,
 enabling graceful degradation from immediate retries to persistent deferred retries.
 
+The middleware leverages Prosody's built-in timer system with typed timers (defer vs. business timers) to schedule
+retries, eliminating the need for a separate timer manager. Defer timers trigger on_timer() calls that reload deferred
+messages from Kafka and retry them through the handler pipeline. The `clear_and_schedule()` context method provides
+atomic timer replacement to maintain continuous coverage during retries.
+
 Pipeline mode prioritizes high throughput, durability, and eventual success over latency.
 
 ## Context
@@ -59,7 +64,6 @@ For pipeline mode, we need:
 - Provide exactly-once semantics (maintain existing at-least-once)
 - Support cross-partition deferred batching
 - Guarantee infinite retries (after extended retries, messages may be lost)
-- **Defer timers**: Timer failures propagate to `RetryMiddleware` for immediate retry (not deferred)
 
 ## Critical Invariants
 
@@ -67,16 +71,29 @@ The defer system must maintain two essential invariants to prevent message loss:
 
 ### Invariant 1: Timer Coverage
 
-**For every key with deferred messages in Cassandra, exactly one retry timer must be scheduled.**
+**For every key with deferred messages in Cassandra, exactly one defer timer must be scheduled.**
 
-- **Adding first message**: Schedule timer BEFORE writing to Cassandra
-- **Processing success with more messages**: Schedule new timer BEFORE committing old timer
-- **Processing failure**: Schedule new timer BEFORE committing old timer
-- **Processing success with no messages**: Commit timer only after confirming no messages remain
+**On first failure (on_message handler):**
+
+- Schedule defer timer using `ctx.schedule_timer()` BEFORE writing to Cassandra
+- This creates the initial timer for the key
+
+**On defer timer fires (on_timer handler):**
+
+- Check if more deferred messages exist after processing current one
+- **If more messages**: Use `ctx.clear_and_schedule()` to atomically clear current timer and schedule next
+- **If no more messages**: Return successfully (timer clears automatically, no new timer scheduled)
+- **On processing failure**: Use `ctx.clear_and_schedule()` to atomically clear current timer and schedule retry with
+  increased backoff
 
 **Why**: If messages exist without a timer, they will never be retried (abandoned).
 
-**Ordering**: Always `schedule_new_timer() → cassandra_write() → commit_old_timer()` to ensure continuous coverage.
+**Critical ordering**:
+
+1. First failure: `schedule_timer() → write_to_cassandra()`
+2. Subsequent retries: `clear_and_schedule() → update_cassandra()`
+
+The `clear_and_schedule()` method ensures atomic timer transition with no gap in coverage.
 
 ### Invariant 2: Cache Consistency
 
@@ -103,22 +120,19 @@ store remain synchronized.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                   DeferMiddleware                            │
-│                 (Messages Only)                              │
+│         (Messages + Defer Timer Handling)                    │
 │                                                               │
 │  ┌──────────────┐  ┌─────────────┐  ┌────────────────────┐  │
-│  │  Cassandra   │  │   Kafka     │  │  Retry Timer       │  │
-│  │   Store      │  │  Loader     │  │   Manager          │  │
-│  │ (deferred    │  │ (load by    │  │ (schedule retry)   │  │
+│  │  Cassandra   │  │   Kafka     │  │  EventContext      │  │
+│  │   Store      │  │  Loader     │  │  (schedule_timer,  │  │
+│  │ (deferred    │  │ (load by    │  │ clear_and_schedule)│  │
 │  │  offsets)    │  │  offset)    │  │                    │  │
 │  └──────────────┘  └─────────────┘  └────────────────────┘  │
 │         │                 │                    │              │
 │         └─────────────────┴────────────────────┘              │
 │                           │                                   │
-│                  ┌────────▼────────┐                          │
-│                  │ Per-Partition   │                          │
-│                  │  Event Loop     │                          │
-│                  │ (order + retry) │                          │
-│                  └────────┬────────┘                          │
+│              on_message(): defer on failure                   │
+│              on_timer(): retry deferred messages              │
 │                           │                                   │
 └───────────────────────────┼───────────────────────────────────┘
                             │
@@ -129,8 +143,10 @@ store remain synchronized.
                             ▼
                     Business Handler
 
-Note: Timers are NOT deferred by this middleware. Timer failures propagate
-      to RetryMiddleware for immediate retry with exponential backoff.
+Note: Uses built-in timer system with typed defer timers.
+      - on_message(): Catches failures and schedules defer timers
+      - on_timer(): Checks timer type; if defer timer, loads & retries message
+      - No separate event loop needed - timer system delivers via on_timer()
 ```
 
 ### Middleware Stack
@@ -188,36 +204,44 @@ let provider = common_middleware
         - If disabled (>90% failure rate): re-raise error to RetryMiddleware
         - If enabled: **schedule retry timer, defer to Cassandra**, update cache, return Ok (maintains Invariant 1)
 4. If defer operation fails (Cassandra unavailable): error propagates to RetryMiddleware
-5. RetryMiddleware retries the defer operation with exponential backoff
-6. If all retries exhausted: error is logged and offset is committed (message lost)
+5. RetryMiddleware retries the entire on_message call (including defer attempt) with exponential backoff
+6. On retry, message may be deferred (if Cassandra recovered) or error may propagate again
 
-**Execution flow for timer failures:**
+**Execution flow for timer events:**
 
-1. Handler fails processing a timer
-2. Error propagates through all middleware layers including DeferMiddleware (pass-through)
-3. RetryMiddleware receives error and retries immediately with exponential backoff
-4. No deferral occurs - timers use only immediate retry
+1. Timer fires
+2. DeferMiddleware::on_timer() receives timer
+3. Check timer type:
+    - **If defer timer**: Load deferred message from Cassandra, load from Kafka, call inner handler's on_message()
+        - On success: Remove offset from Cassandra, reset retry_count to 0, use `ctx.clear_and_schedule()` if more
+          messages exist
+        - On failure: Use `ctx.clear_and_schedule()` with increased backoff, increment retry_count in Cassandra, keep
+          offset in Cassandra
+    - **If regular timer**: Pass through to inner handler's on_timer()
+        - On failure: Error propagates to RetryMiddleware for immediate retry
 
 **Deferred message flow:**
 
 1. Message arrives for deferred key
 2. DeferMiddleware checks cache/Cassandra: key is deferred
 3. Append offset to Cassandra wide row
-4. Return Ok (message queued for later retry)
-5. Kafka offset committed
+4. Return Ok (message queued for later retry, offset auto-commits on return)
 
-Note: Retry timer already exists (scheduled during first failure), maintaining Timer Coverage Invariant.
+Note: Defer timer already exists (scheduled during first failure), maintaining Timer Coverage Invariant.
 
-**Retry timer flow:**
+**Defer timer fires (on_timer flow):**
 
-1. Background retry loop receives timer event
-2. Load next offset from Cassandra
-3. Load message from Kafka via KafkaLoader
-4. Re-inject into handler pipeline
-5. On success: **schedule new timer before removing old** (if more messages exist), then remove from queue
-6. On failure: **schedule new timer before removing old**, increment retry_count
+1. DeferMiddleware::on_timer() receives timer event
+2. Check timer type - if defer timer:
+3. Load next offset from Cassandra for the timer's key
+4. Load message from Kafka via KafkaLoader
+5. Call inner handler's on_message() (re-process the deferred message)
+6. On success with more messages: Use **ctx.clear_and_schedule()** to atomically replace timer, then remove offset from
+   Cassandra
+7. On success with no more messages: Remove offset from Cassandra, return Ok (timer auto-clears)
+8. On failure: Use **ctx.clear_and_schedule()** with increased delay, increment retry_count in Cassandra
 
-Critical: New timer scheduled BEFORE committing old timer to maintain continuous coverage (Invariant 1).
+Critical: `clear_and_schedule()` atomically replaces the timer with no coverage gap (Invariant 1).
 
 ## Detailed Design
 
@@ -265,9 +289,6 @@ pub struct DeferHandler<S, T> {
     /// Kafka message loader (shared across partitions)
     kafka_loader: Arc<KafkaLoader>,
 
-    /// Timer manager for scheduling retry timers (per-partition)
-    retry_timer_manager: TimerManager<CassandraTriggerStore>,
-
     /// Failure rate tracker (per-partition)
     failure_tracker: FailureTracker,
 
@@ -281,9 +302,6 @@ pub struct DeferHandler<S, T> {
     topic: Topic,
     partition: Partition,
     consumer_group: String,
-
-    /// Retry event loop state
-    retry_loop_shutdown: Arc<Notify>,
 }
 ```
 
@@ -336,6 +354,7 @@ The `DeferStore` trait provides storage operations for deferred messages:
 - `append_deferred_message(key_id, offset)` - Add offset to queue
 - `remove_deferred_message(key_id, offset)` - Remove after successful retry
 - `increment_retry_count(key_id)` - Bump shared retry counter (static column)
+- `reset_retry_count(key_id)` - Reset retry counter to 0 (after successful retry)
 
 All operations are async and return `Result<T, Self::Error>`.
 
@@ -387,7 +406,7 @@ All operations are async and return `Result<T, Self::Error>`.
          ├─→ Generate key_id from (group, topic, partition, key)
          ├─→ Check cache for current state
          │   ├─→ NotDeferred (first failure):
-         │   │   ├─→ STEP 1: Schedule retry timer (delay = backoff(1), key = key_id)
+         │   │   ├─→ STEP 1: Schedule defer timer using ctx.schedule_timer(key, type=Defer, delay=backoff(1))
          │   │   ├─→ STEP 2: INSERT offset to Cassandra with retry_count = 1
          │   │   ├─→ STEP 3: Update cache: Deferred { retry_count: 1 }
          │   │   └─→ Invariants maintained: Timer exists BEFORE Cassandra write
@@ -402,7 +421,7 @@ All operations are async and return `Result<T, Self::Error>`.
          │         Timer with no messages will cleanup on next fire.
          │
          ▼
-6. Kafka offset committed
+6. Return Ok - offset auto-commits
 ```
 
 #### Subsequent Messages for Deferred Key
@@ -423,55 +442,62 @@ All operations are async and return `Result<T, Self::Error>`.
          │   (timer already exists - no scheduling needed)
          │
          ▼
-4. Return Ok (message queued)
-         │
-         ▼
-5. Kafka offset committed
+4. Return Ok (message queued, offset auto-commits)
 
 Note: Invariant 1 maintained - timer already exists from first failure,
       no new timer scheduling required.
 ```
 
-#### Retry Timer Fires
+#### Defer Timer Fires (on_timer handler)
 
 ```
-1. Retry timer fires
+1. Timer fires in consumer system
          │
          ▼
-2. Background retry loop receives timer
+2. DeferMiddleware::on_timer(ctx, timer) called
+         │
+         ├─→ Check timer type
+         │   ├─→ If NOT defer timer: return handler.on_timer(ctx, timer) [pass through]
+         │   └─→ If defer timer: continue
          │
          ▼
-3. Load next offset from Cassandra
+3. Extract key from timer, generate key_id
+         │
+         ▼
+4. Load next offset from Cassandra: store.get_next_deferred_message(key_id)
          │   (first offset in clustering order)
          │
          ▼
-4. Load message from Kafka (via KafkaLoader)
+5. Load message from Kafka (via KafkaLoader)
          │
          ▼
-5. Call inner handler (monopolization → shutdown → scheduler → ... → business handler)
+6. Call inner handler.on_message(ctx, message, DemandType::Failure)
+         │   (monopolization → shutdown → scheduler → ... → business handler)
          │
          ├─→ Success:
-         │   ├─→ Check if more offsets exist (peek next)
+         │   ├─→ Check if more offsets exist: store.peek_next_deferred_message(key_id)
          │   ├─→ If more offsets:
-         │   │   ├─→ STEP 1: Schedule next retry timer (same key, new time)
-         │   │   ├─→ STEP 2: Remove current offset from Cassandra
-         │   │   ├─→ STEP 3: Commit current timer (removes it)
-         │   │   └─→ Invariant maintained: New timer scheduled BEFORE old removed
+         │   │   ├─→ STEP 1: Reset retry_count to 0 in Cassandra
+         │   │   ├─→ STEP 2: ctx.clear_and_schedule(key, type=Defer, delay=backoff(0))
+         │   │   ├─→ STEP 3: Remove current offset from Cassandra
+         │   │   ├─→ STEP 4: Update cache: Deferred { retry_count: 0 }
+         │   │   ├─→ STEP 5: Return Ok
+         │   │   └─→ Invariant maintained: Timer atomically replaced, next message starts fresh
          │   ├─→ If no more offsets:
          │   │   ├─→ STEP 1: Remove current offset from Cassandra
          │   │   ├─→ STEP 2: Update cache: NotDeferred
-         │   │   ├─→ STEP 3: Commit current timer (removes it)
+         │   │   ├─→ STEP 3: Return Ok (timer auto-clears, no new timer)
          │   │   └─→ Invariant maintained: No messages left, no timer needed
          │   └─→ Record success in tracker
          │
          └─→ Failure:
-             ├─→ STEP 1: Schedule new retry timer (same key, increased delay)
+             ├─→ STEP 1: ctx.clear_and_schedule(key, type=Defer, delay=backoff(retry_count + 1))
              ├─→ STEP 2: Increment retry_count in Cassandra (static column)
              ├─→ STEP 3: Update cache: Deferred { retry_count: retry_count + 1 }
-             ├─→ STEP 4: Commit current timer (removes it)
-             ├─→ Invariant maintained: New timer scheduled BEFORE old removed
+             ├─→ STEP 4: Return Ok
+             ├─→ Invariant maintained: Timer atomically replaced with increased delay
              ├─→ Record failure in tracker
-             └─→ Return (message will retry later)
+             └─→ Message will retry later with new timer
 ```
 
 ### Failure Rate Tracking
@@ -571,7 +597,7 @@ cache.insert(key, state);
 
 ```rust
 // INVARIANT MAINTENANCE: Schedule timer BEFORE writing to Cassandra
-retry_timer_manager.schedule(key, backoff(1)).await?;  // STEP 1
+ctx.schedule_timer(key, timer_type = Defer, delay = backoff(1)).await?;  // STEP 1
 store.insert_deferred_message(key_id, offset, retry_count = 1).await?;  // STEP 2
 cache.insert(key, DeferState::Deferred { retry_count: 1 });  // STEP 3
 // Ensures timer exists before messages exist (Invariant 1)
@@ -588,22 +614,24 @@ cache.insert(key, DeferState::Deferred { retry_count: retry_count + 1 });
 // Invariant 2 maintained: cache updated after Cassandra write
 ```
 
-**On successful retry:**
+**On successful retry (in on_timer handler):**
 
 ```rust
-// INVARIANT MAINTENANCE: Check for more messages BEFORE committing timer
+// INVARIANT MAINTENANCE: Check for more messages and use clear_and_schedule
 let has_more = store.peek_next_deferred_message(key_id).await?;
 if has_more {
-// Schedule new timer BEFORE removing old
-retry_timer_manager.schedule(key, backoff(retry_count)).await?;
+// Reset retry count for next message (starts fresh)
+store.reset_retry_count(key_id).await?;
+cache.insert(key, DeferState::Deferred { retry_count: 0 });
+// Atomically clear old timer and schedule new one with backoff(0)
+ctx.clear_and_schedule(key, timer_type = Defer, delay = backoff(0)).await?;
 store.remove_deferred_message(key_id, offset).await?;
-current_timer.commit().await?;  // Remove old timer
-// Invariant 1 maintained: new timer scheduled before old removed
+// Invariant 1 maintained: atomic timer replacement with no gap
 } else {
-// No more messages, safe to remove timer
+// No more messages, safe to let timer clear automatically
 store.remove_deferred_message(key_id, offset).await?;
 cache.insert(key, DeferState::NotDeferred);
-current_timer.commit().await?;
+// Return Ok - timer auto-clears without replacement
 // Invariant 1 maintained: timer removed only after messages removed
 }
 ```
@@ -645,8 +673,6 @@ pub struct DeferConfiguration {
     pub failure_threshold: f64,                   // Default: 0.9 (90%)
     pub cache_size: usize,                        // Default: 10,000
     pub loader_config: LoaderConfiguration,       // Kafka loader settings
-    pub retry_timer_segment_id: Uuid,             // Retry timer storage
-    pub retry_timer_slab_size: CompactDuration,
     pub ttl: CompactDuration,                     // TTL for Cassandra entries (uses Prosody's existing TTL config)
 }
 
@@ -681,85 +707,100 @@ The defer middleware follows Prosody's standard middleware pattern:
 **DeferHandler** - Per-partition handler instance:
 
 - Wraps inner handler
-- Creates per-partition `TimerManager` for retry timers
-- Spawns background retry event loop
-- Maintains per-partition `FailureTracker`
+- Maintains global cross-partition `FailureTracker`
 
 **Key methods:**
 
-- `on_message()` - Check if key deferred, defer message on failure
-- `on_timer()` - Pass-through to inner handler (no deferral logic for timers)
-- Background retry loop processes fired retry timers
+- `on_message(ctx, message)` - Check if key deferred, defer message on failure. Uses `ctx.schedule_timer()` to create
+  initial defer timer.
+- `on_timer(ctx, timer)` - Check timer type:
+    - If defer timer: Load deferred message from Cassandra, load from Kafka, call `handler.on_message()` with the
+      deferred message
+    - If regular timer: Pass through to `handler.on_timer()`
+    - Uses `ctx.clear_and_schedule()` to atomically replace defer timers. Timer auto-clears on successful return if no
+      replacement scheduled.
 
-**Note on timers:** The `on_timer()` implementation is a simple pass-through that calls the inner handler and returns
-the result. Timer failures propagate to `RetryMiddleware` for immediate retry with exponential backoff.
+### Timer Type Handling
 
-### Retry Event Loop
+The defer middleware uses Prosody's timer system with typed timers to distinguish defer timers from business timers:
 
-Each partition runs a background task that processes retry timers:
+**Timer types:**
 
-**Main loop:**
+- **Defer timer**: Special timer type created by DeferMiddleware to trigger deferred message retry
+- **Business timer**: Regular timers created by the business logic handler
 
-```
-loop {
-    select! {
-        retry_timer fires => {
-            key = retry_timer.key()
-            deferred_offset = store.get_next_deferred_message(key_id)
+**on_timer() flow:**
 
-            message = kafka_loader.load_message(offset)
-            result = handler.on_message(message, DemandType::Failure)
+```rust
+async fn on_timer(&self, ctx: &EventContext, timer: Timer) -> Result<()> {
+    // Check if this is a defer timer
+    if timer.timer_type() == TimerType::Defer {
+        // Extract key from timer metadata
+        let key = timer.key();
+        let key_id = generate_key_id(&self.consumer_group, &self.topic, &self.partition, &key);
 
-            match result {
-                Ok => {
-                    // Success path
-                    let has_more = store.peek_next_deferred_message(key_typesid)
-                    if has_more {
-                        // MAINTAIN INVARIANT: Schedule new before removing old
-                        schedule_new_timer(key, backoff(retry_count))
-                        store.remove_deferred_message(key_id, offset)
-                        retry_timer.commit()
-                    } else {
-                        // No more messages
-                        store.remove_deferred_message(key_id, offset)
-                        cache.insert(key, NotDeferred)
-                        retry_timer.commit()
-                    }
+        // Get current retry count from cache
+        let retry_count = self.get_retry_count(&key_id).await?;
+
+        // Load next deferred message
+        let offset = self.store.get_next_deferred_message(&key_id).await?;
+        let message = self.kafka_loader.load_message(&self.topic, &self.partition, offset).await?;
+
+        // Re-process through handler with DemandType::Failure
+        match self.handler.on_message(ctx, message, DemandType::Failure).await {
+            Ok(()) => {
+                // Success! Check if more messages exist
+                let has_more = self.store.peek_next_deferred_message(&key_id).await?;
+                if has_more {
+                    // Reset retry count for next message
+                    self.store.reset_retry_count(&key_id).await?;
+                    self.cache.insert(key.clone(), DeferState::Deferred { retry_count: 0 });
+                    // Atomically replace timer for next message (starts fresh with backoff(0))
+                    ctx.clear_and_schedule(&key, TimerType::Defer, self.backoff(0)).await?;
+                } else {
+                    // No more messages, clear from cache
+                    self.cache.insert(key.clone(), DeferState::NotDeferred);
                 }
-                Err => {
-                    // Failure path - MAINTAIN INVARIANT: Schedule new before removing old
-                    schedule_new_timer(key, backoff(retry_count + 1))
-                    store.increment_retry_count(key_id)
-                    cache.insert(key, Deferred { retry_count: retry_count + 1 })
-                    retry_timer.commit()
-                }
+                // Remove processed message
+                self.store.remove_deferred_message(&key_id, offset).await?;
+                Ok(()) // Timer auto-clears (or already replaced)
+            }
+            Err(_) => {
+                // Failure - keep retrying with increased backoff
+                ctx.clear_and_schedule(&key, TimerType::Defer, self.backoff(retry_count + 1)).await?;
+                self.store.increment_retry_count(&key_id).await?;
+                self.cache.insert(key.clone(), DeferState::Deferred { retry_count: retry_count + 1 });
+                Ok(()) // Timer replaced, will retry later
             }
         }
-        shutdown => break
+    } else {
+        // Pass through to inner handler for business timers
+        self.handler.on_timer(ctx, timer).await
     }
 }
 ```
 
-**Flow:**
-
-1. Retry timer fires (scheduled by defer operation)
-2. Load next offset from Cassandra
-3. Load message from Kafka via `KafkaLoader`
-4. Re-process through handler **with `DemandType::Failure`** (all deferred traffic is failure demand)
-5. On success: remove from queue, schedule next if more offsets exist
-6. On failure: increment retry count, reschedule with Full Jitter exponential backoff
-
 **Important:** All deferred retries use `DemandType::Failure` since they represent reprocessing of previously failed
 events, consistent with how `RetryMiddleware` marks retry attempts.
 
+**Shutdown:** When a partition is revoked, the timer system automatically handles cleanup. No separate event loop
+to shut down.
+
 ### Error Handling and Invariant Recovery
 
-**When timer scheduling fails:**
+**When clear_and_schedule fails (in on_timer handler):**
 
-- Error propagates to outer scope
-- Current timer is NOT committed (will retry)
-- No state changes occur
+- Error propagates from on_timer() method
+- Current timer is NOT cleared (on_timer failed, so timer remains active)
+- Timer system will retry the on_timer call later
+- No state changes occur in Cassandra
 - Invariant maintained: Messages still covered by existing timer
+
+**When Cassandra operations fail after clear_and_schedule:**
+
+- New timer already scheduled
+- Current timer will be cleared on successful return
+- On next timer fire: query will return updated state, system self-corrects
 
 **When Cassandra write fails:**
 
@@ -778,11 +819,12 @@ events, consistent with how `RetryMiddleware` marks retry attempts.
 **Recovery scenarios:**
 
 1. **Timer exists, no messages (orphaned timer)**:
-    - Timer fires → query returns None → clear cache → commit timer
-    - Self-healing: Timer cleans itself up
+    - Timer fires → on_timer() called → query returns None → clear cache → return Ok
+    - Timer auto-commits on successful return
+    - Self-healing: Timer cleans itself up automatically
 
 2. **Messages exist, no timer (abandoned messages)**:
-    - CANNOT HAPPEN if ordering is followed
+    - CANNOT HAPPEN if ordering is followed (timer scheduled before Cassandra write)
     - If somehow occurs: Messages never retried (lost)
     - **This is why invariant order is critical**
 
@@ -841,43 +883,47 @@ WHERE key_id = ? AND offset = ?;
 **Per partition:**
 
 - `FailureTracker`: Bounded by 5-minute sliding window × event rate (typically < 100 KB)
-- `RetryTimerManager`: Minimal (active slabs only)
 
 **Shared:**
 
 - `DeferredCache`: 10,000 × 64 bytes = 640 KB
 - `KafkaLoader cache`: 10,000 × ~1 KB = 10 MB
 
-**Total estimate for 100 partitions:** ~26 MB
+**Defer timers:** Stored in Cassandra via existing timer system (no per-partition memory overhead)
+
+**Total estimate for 100 partitions:** ~20 MB
 
 ## Edge Cases and Error Handling
 
 ### Kafka Message Deleted (Retention/Compaction)
 
-When loading a deferred message, if Kafka returns `OffsetDeleted`:
+When loading a deferred message in on_timer(), if Kafka returns `OffsetDeleted`:
 
 1. Log warning
 2. Remove offset from deferred queue (can't retry)
 3. Check if more messages exist (`peek_next_deferred_message()`)
-4. If more messages exist: schedule new timer before committing old timer (maintain Invariant 1)
-5. If no more messages: remove from Cassandra, clear from cache, commit timer (safe - no coverage gap)
+4. If more messages exist: Use `ctx.clear_and_schedule()` to replace timer, remove offset, return Ok (maintains
+   Invariant 1)
+5. If no more messages: Remove offset from Cassandra, clear from cache, return Ok (timer auto-clears, no replacement)
 
 This handles messages that aged out due to Kafka retention or were removed by compaction while maintaining timer
-coverage invariant.
+coverage invariant. The `clear_and_schedule()` ensures atomic timer replacement with no coverage gap.
 
 ### Partition Rebalancing
 
 **On partition revoke:**
 
-1. Signal retry loop to stop
-2. Wait for current retry to complete
-3. Shutdown inner handler
+1. Shutdown inner handler
+2. Timer system automatically stops processing timers for this partition
 
 **State preservation:**
 
 - All deferred items remain in Cassandra
-- New consumer instance picks up retry timers automatically (timer manager loads active slabs)
+- All defer timers remain in Cassandra timer storage
+- New consumer instance picks up defer timers automatically when partition is reassigned
 - Cache is cold on new instance (minor performance impact until warmed)
+
+**No explicit cleanup needed:** The timer system handles all timer lifecycle management automatically.
 
 ### Cassandra Unavailability
 
@@ -885,11 +931,12 @@ When Cassandra store operations fail:
 
 1. Log error
 2. Re-raise error to outer RetryMiddleware
-3. RetryMiddleware will retry the defer operation with exponential backoff
-4. If retries exhausted: error logged, offset committed (message lost)
+3. RetryMiddleware retries the entire on_message operation (including defer attempt)
+4. On retry: message may be deferred (if Cassandra recovered) or error propagates again to RetryMiddleware
 
 **Future enhancement:** Circuit breaker to temporarily disable deferring during extended Cassandra outages, falling back
-to immediate error propagation.
+to immediate error propagation. This would allow RetryMiddleware to handle the failure directly instead of repeatedly
+attempting (and failing) to defer.
 
 ### Failure Rate Above Threshold
 
@@ -1088,7 +1135,14 @@ messages lost)
 
 ---
 
-**Document Version:** 1.0
+**Document Version:** 2.0
 **Last Updated:** 2025-01-21
 **Author:** Design Team
-**Status:** Draft for Review
+**Status:** Updated for Timer Types
+**Changes:**
+
+- Removed separate TimerManager - uses built-in timer system with defer timer type
+- Uses `ctx.schedule_timer()` for initial defer timer creation
+- Uses `ctx.clear_and_schedule()` for atomic timer replacement in on_timer handler
+- Timer auto-clears on successful on_timer() return if no replacement scheduled
+- Simplified architecture by leveraging existing timer infrastructure

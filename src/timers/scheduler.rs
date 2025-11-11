@@ -10,10 +10,10 @@
 
 use crate::Key;
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
-use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::queue::TriggerQueue;
+use crate::timers::{TimerType, Trigger};
 use futures::TryFutureExt;
 use std::fmt::Debug;
 use thiserror::Error;
@@ -169,12 +169,13 @@ impl TriggerScheduler {
     ///
     /// * `key` - The [`Key`] of the trigger.
     /// * `time` - The scheduled time of the trigger.
+    /// * `timer_type` - The [`TimerType`] of the trigger.
     ///
     /// # Returns
     ///
     /// `true` if the trigger is in the active set.
-    pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
-        self.active_triggers.contains(key, time).await
+    pub async fn is_active(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) -> bool {
+        self.active_triggers.contains(key, time, timer_type).await
     }
 
     /// Deactivate a trigger without removing it from the persistent queue.
@@ -187,8 +188,9 @@ impl TriggerScheduler {
     ///
     /// * `key` - The [`Key`] of the trigger.
     /// * `time` - The scheduled time of the trigger.
-    pub async fn deactivate(&self, key: &Key, time: CompactDateTime) {
-        self.active_triggers.remove(key, time).await;
+    /// * `timer_type` - The [`TimerType`] of the trigger.
+    pub async fn deactivate(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
+        self.active_triggers.remove(key, time, timer_type).await;
     }
 }
 
@@ -322,7 +324,10 @@ mod tests {
             .map_err(|e| format!("Failed to schedule trigger: {e:?}"))?;
 
         // Verify the trigger is active
-        if !scheduler.is_active(&key, time).await {
+        if !scheduler
+            .is_active(&key, time, TimerType::Application)
+            .await
+        {
             return Err("Trigger is not active after scheduling".to_owned());
         }
 
@@ -333,7 +338,10 @@ mod tests {
             .map_err(|e| format!("Failed to unschedule trigger: {e:?}"))?;
 
         // Verify the trigger is no longer active
-        if scheduler.is_active(&key, time).await {
+        if scheduler
+            .is_active(&key, time, TimerType::Application)
+            .await
+        {
             return Err("Trigger is still active after unscheduling".to_owned());
         }
 
@@ -380,7 +388,10 @@ mod tests {
         }
 
         // Verify the trigger is still active
-        if !scheduler.is_active(&key, time).await {
+        if !scheduler
+            .is_active(&key, time, TimerType::Application)
+            .await
+        {
             return Err(format!(
                 "Trigger is not active after emission. Key: {key:?}, Time: {time:?}"
             ));
@@ -433,7 +444,10 @@ mod tests {
         }
 
         // Verify the first trigger is still active
-        if !scheduler.is_active(&key1, time1).await {
+        if !scheduler
+            .is_active(&key1, time1, TimerType::Application)
+            .await
+        {
             return Err(format!(
                 "First trigger is not active after emission. Key: {key1:?}, Time: {time1:?}"
             ));
@@ -454,7 +468,10 @@ mod tests {
         }
 
         // Verify the second trigger is still active
-        if !scheduler.is_active(&key2, time2).await {
+        if !scheduler
+            .is_active(&key2, time2, TimerType::Application)
+            .await
+        {
             return Err(format!(
                 "Second trigger is not active after emission. Key: {key2:?}, Time: {time2:?}"
             ));
@@ -494,10 +511,15 @@ mod tests {
             .map_err(|_| "Expected trigger to be emitted".to_owned())?;
 
         // Deactivate a trigger
-        scheduler.deactivate(&key, time).await;
+        scheduler
+            .deactivate(&key, time, TimerType::Application)
+            .await;
 
         // Verify the trigger is no longer active
-        if scheduler.is_active(&key, time).await {
+        if scheduler
+            .is_active(&key, time, TimerType::Application)
+            .await
+        {
             return Err("Trigger is still active after deactivation".to_owned());
         }
 
@@ -556,7 +578,9 @@ mod tests {
 
         // Verify the first trigger is still active
         assert!(
-            scheduler.is_active(&key, time1).await,
+            scheduler
+                .is_active(&key, time1, TimerType::Application)
+                .await,
             "First trigger is not active after emission"
         );
 
@@ -574,7 +598,9 @@ mod tests {
 
         // Verify the second trigger is still active
         assert!(
-            scheduler.is_active(&key, time2).await,
+            scheduler
+                .is_active(&key, time2, TimerType::Application)
+                .await,
             "Second trigger is not active after emission"
         );
 
@@ -592,26 +618,40 @@ mod tests {
 
         // Verify the third trigger is still active
         assert!(
-            scheduler.is_active(&key, time3).await,
+            scheduler
+                .is_active(&key, time3, TimerType::Application)
+                .await,
             "Third trigger is not active after emission"
         );
 
         // Deactivate all triggers
-        scheduler.deactivate(&key, time1).await;
-        scheduler.deactivate(&key, time2).await;
-        scheduler.deactivate(&key, time3).await;
+        scheduler
+            .deactivate(&key, time1, TimerType::Application)
+            .await;
+        scheduler
+            .deactivate(&key, time2, TimerType::Application)
+            .await;
+        scheduler
+            .deactivate(&key, time3, TimerType::Application)
+            .await;
 
         // Verify all triggers are no longer active
         assert!(
-            !scheduler.is_active(&key, time1).await,
+            !scheduler
+                .is_active(&key, time1, TimerType::Application)
+                .await,
             "First trigger is still active after deactivation"
         );
         assert!(
-            !scheduler.is_active(&key, time2).await,
+            !scheduler
+                .is_active(&key, time2, TimerType::Application)
+                .await,
             "Second trigger is still active after deactivation"
         );
         assert!(
-            !scheduler.is_active(&key, time3).await,
+            !scheduler
+                .is_active(&key, time3, TimerType::Application)
+                .await,
             "Third trigger is still active after deactivation"
         );
 
@@ -676,7 +716,11 @@ mod tests {
 
         // Verify the command was processed by checking if trigger is active
         if !scheduler
-            .is_active(&command_test_trigger.key, command_test_trigger.time)
+            .is_active(
+                &command_test_trigger.key,
+                command_test_trigger.time,
+                TimerType::Application,
+            )
             .await
         {
             return Err(
@@ -704,7 +748,11 @@ mod tests {
             .map_err(|_| "Unschedule failed during backpressure")?;
 
         if scheduler
-            .is_active(&command_test_trigger.key, command_test_trigger.time)
+            .is_active(
+                &command_test_trigger.key,
+                command_test_trigger.time,
+                TimerType::Application,
+            )
             .await
         {
             return Err("Trigger still active after unscheduling during backpressure".to_owned());

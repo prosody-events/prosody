@@ -359,7 +359,7 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
 
     scheduler
         .active_triggers()
-        .scan_active_times(|time| {
+        .scan_active_times(|time, _timer_type| {
             active_slab_ids.insert(Slab::from_time(segment.id, segment.slab_size, time).id());
         })
         .await;

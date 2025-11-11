@@ -15,7 +15,7 @@ use prosody::{
     consumer::{ConsumerConfiguration, DemandType, EventHandler, ProsodyConsumer, Uncommitted},
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
-    timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
+    timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
 use serde_json::json;
 use tokio::sync::mpsc::{Sender, channel};
@@ -158,7 +158,10 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
     // Now try to use the cloned context - this should fail with InvalidContext
     let future_time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
 
-    match cloned_context.schedule(future_time).await {
+    match cloned_context
+        .schedule(future_time, TimerType::Application)
+        .await
+    {
         Ok(()) => {
             return Err(eyre!(
                 "UNEXPECTED: Cloned context usage succeeded when it should have failed"

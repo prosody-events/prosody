@@ -17,6 +17,7 @@ use prosody::{
     consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
+    timers::TimerType,
     timers::UncommittedTimer,
     timers::datetime::CompactDateTime,
     timers::duration::CompactDuration,
@@ -88,7 +89,10 @@ impl EventHandler for TimerTestHandler {
                     {
                         // Absolute time scheduling
                         let schedule_time = CompactDateTime::from(target_time_secs as u32);
-                        if let Err(e) = context.schedule(schedule_time).await {
+                        if let Err(e) = context
+                            .schedule(schedule_time, TimerType::Application)
+                            .await
+                        {
                             error!("Failed to schedule timer for key {key}: {e}");
                         } else {
                             info!("Scheduled timer for key {key} at time {schedule_time}");
@@ -101,7 +105,10 @@ impl EventHandler for TimerTestHandler {
                         let delay = CompactDuration::new(delay_secs as u32);
                         match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
                             Ok(schedule_time) => {
-                                if let Err(e) = context.schedule(schedule_time).await {
+                                if let Err(e) = context
+                                    .schedule(schedule_time, TimerType::Application)
+                                    .await
+                                {
                                     error!("Failed to schedule timer for key {key}: {e}");
                                 } else {
                                     info!("Scheduled timer for key {key} at time {schedule_time}");
@@ -115,7 +122,7 @@ impl EventHandler for TimerTestHandler {
                 }
                 "cancel_timer" => {
                     // Clear all scheduled timers for this key
-                    if let Err(e) = context.clear_scheduled().await {
+                    if let Err(e) = context.clear_scheduled(TimerType::Application).await {
                         error!("Failed to cancel timers for key {key}: {e}");
                     } else {
                         info!("Canceled all timers for key {key}");

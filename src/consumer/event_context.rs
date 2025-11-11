@@ -68,6 +68,7 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `time` – The `CompactDateTime` at which the timer should fire.
+    /// * `timer_type` – The `TimerType` of the timer to schedule.
     ///
     /// # Errors
     ///
@@ -76,6 +77,7 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     fn schedule(
         &self,
         time: CompactDateTime,
+        timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Unschedule all existing timers for this key, then schedule exactly one.
@@ -86,6 +88,7 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `time` – The time for the new, sole scheduled timer.
+    /// * `timer_type` – The `TimerType` of the timer to schedule.
     ///
     /// # Errors
     ///
@@ -94,6 +97,7 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     fn clear_and_schedule(
         &self,
         time: CompactDateTime,
+        timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Unschedule a single timer for this key at the specified time.
@@ -101,6 +105,7 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `time` – The execution time of the timer to remove.
+    /// * `timer_type` – The `TimerType` of the timer to remove.
     ///
     /// # Errors
     ///
@@ -108,14 +113,22 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     fn unschedule(
         &self,
         time: CompactDateTime,
+        timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Unschedule *all* timers for this key.
+    /// Unschedule *all* timers for this key of the specified type.
+    ///
+    /// # Arguments
+    ///
+    /// * `timer_type` – The `TimerType` of timers to clear.
     ///
     /// # Errors
     ///
     /// Returns `Err(Self::Error)` if any unschedule operation fails.
-    fn clear_scheduled(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn clear_scheduled(
+        &self,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Invalidate this context to prevent further usage after message
     /// processing.
@@ -128,7 +141,12 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     /// compiler cannot enforce lifecycle constraints.
     fn invalidate(self);
 
-    /// List all scheduled execution times for timers on this key.
+    /// List all scheduled execution times for timers on this key of the
+    /// specified type.
+    ///
+    /// # Arguments
+    ///
+    /// * `timer_type` – The `TimerType` to filter by.
     ///
     /// # Returns
     ///
@@ -140,6 +158,7 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     /// store fails.
     fn scheduled(
         &self,
+        timer_type: TimerType,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static;
 
     /// Return a boxed, type-erased event context
@@ -274,18 +293,17 @@ where
         .right_future()
     }
 
-    async fn schedule(&self, time: CompactDateTime) -> Result<(), Self::Error> {
+    async fn schedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), Self::Error> {
         let inner = self.inner.load();
         let Some(inner) = inner.as_ref() else {
             return Err(TimerManagerError::InvalidContext);
         };
 
-        let trigger = Trigger::new(
-            inner.key.clone(),
-            time,
-            TimerType::Application,
-            Span::current(),
-        );
+        let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
 
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
@@ -297,6 +315,7 @@ where
     async fn clear_and_schedule(
         &self,
         time: CompactDateTime,
+        timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
         let inner = self.inner.load();
@@ -305,8 +324,11 @@ where
         };
 
         let operation = async {
-            // Get scheduled triggers
-            let mut triggers_to_delete = inner.timers.scheduled_triggers(&inner.key).await?;
+            // Get scheduled triggers of this type
+            let mut triggers_to_delete = inner
+                .timers
+                .scheduled_triggers(&inner.key, timer_type)
+                .await?;
             triggers_to_delete.retain(|trigger| trigger.time != time);
 
             // Schedule exactly one new trigger.
@@ -315,7 +337,7 @@ where
                 .schedule(Trigger::new(
                     inner.key.clone(),
                     time,
-                    TimerType::Application,
+                    timer_type,
                     span.clone(),
                 ))
                 .await?;
@@ -327,7 +349,10 @@ where
                     async move {
                         // Link new span with the original trigger's span.
                         span_clone.follows_from(trigger.span());
-                        inner.timers.unschedule(&trigger.key, trigger.time).await
+                        inner
+                            .timers
+                            .unschedule(&trigger.key, trigger.time, trigger.timer_type)
+                            .await
                     }
                 })
                 .buffer_unordered(DELETE_CONCURRENCY)
@@ -342,7 +367,11 @@ where
         }
     }
 
-    async fn unschedule(&self, time: CompactDateTime) -> Result<(), TimerManagerError<T::Error>> {
+    async fn unschedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), TimerManagerError<T::Error>> {
         let inner = self.inner.load();
         let Some(inner) = inner.as_ref() else {
             return Err(TimerManagerError::InvalidContext);
@@ -351,11 +380,14 @@ where
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
             () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
-            result = inner.timers.unschedule(&inner.key, time) => result,
+            result = inner.timers.unschedule(&inner.key, time, timer_type) => result,
         }
     }
 
-    async fn clear_scheduled(&self) -> Result<(), TimerManagerError<T::Error>> {
+    async fn clear_scheduled(
+        &self,
+        timer_type: TimerType,
+    ) -> Result<(), TimerManagerError<T::Error>> {
         let inner = self.inner.load();
         let Some(inner) = inner.as_ref() else {
             return Err(TimerManagerError::InvalidContext);
@@ -364,7 +396,7 @@ where
         select! {
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
             () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
-            result = inner.timers.unschedule_all(&inner.key) => result,
+            result = inner.timers.unschedule_all(&inner.key, timer_type) => result,
         }
     }
 
@@ -384,6 +416,7 @@ where
 
     fn scheduled(
         &self,
+        timer_type: TimerType,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
         let on_shutdown = EventContext::on_shutdown(self);
         let on_cancel = EventContext::on_cancel(self);
@@ -396,7 +429,7 @@ where
         let inner = Arc::clone(inner);
 
         try_stream! {
-            let scheduled_timers = inner.timers.scheduled_times(&inner.key);
+            let scheduled_timers = inner.timers.scheduled_times(&inner.key, timer_type);
 
             pin_mut!(on_shutdown);
             pin_mut!(on_cancel);
@@ -445,28 +478,47 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an error if scheduling fails.
-    async fn schedule(&self, time: CompactDateTime) -> Result<(), BoxError>;
+    async fn schedule(&self, time: CompactDateTime, timer_type: TimerType) -> Result<(), BoxError>;
 
     /// Unschedule all existing timers and schedule a new one.
     ///
     /// # Arguments
     ///
     /// * `time` – The new execution time.
-    async fn clear_and_schedule(&self, time: CompactDateTime) -> Result<(), BoxError>;
+    /// * `timer_type` – The timer type.
+    async fn clear_and_schedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), BoxError>;
 
     /// Unschedule a specific timer.
     ///
     /// # Arguments
     ///
     /// * `time` – The time to unschedule.
-    async fn unschedule(&self, time: CompactDateTime) -> Result<(), BoxError>;
+    /// * `timer_type` – The timer type.
+    async fn unschedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), BoxError>;
 
-    /// Unschedule all timers.
-    async fn clear_scheduled(&self) -> Result<(), BoxError>;
+    /// Unschedule all timers of the specified type.
+    ///
+    /// # Arguments
+    ///
+    /// * `timer_type` – The timer type.
+    async fn clear_scheduled(&self, timer_type: TimerType) -> Result<(), BoxError>;
 
-    /// List scheduled execution times.
+    /// List scheduled execution times for the specified type.
+    ///
+    /// # Arguments
+    ///
+    /// * `timer_type` – The timer type.
     fn scheduled(
         &self,
+        timer_type: TimerType,
     ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxError>> + Send + 'static>>;
 
     /// Synchronously check if partition shutdown has been requested.
@@ -492,34 +544,43 @@ where
         EventContext::on_cancel(self).await;
     }
 
-    async fn schedule(&self, time: CompactDateTime) -> Result<(), BoxError> {
-        EventContext::schedule(self, time)
+    async fn schedule(&self, time: CompactDateTime, timer_type: TimerType) -> Result<(), BoxError> {
+        EventContext::schedule(self, time, timer_type)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn clear_and_schedule(&self, time: CompactDateTime) -> Result<(), BoxError> {
-        EventContext::clear_and_schedule(self, time)
+    async fn clear_and_schedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), BoxError> {
+        EventContext::clear_and_schedule(self, time, timer_type)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn unschedule(&self, time: CompactDateTime) -> Result<(), BoxError> {
-        EventContext::unschedule(self, time)
+    async fn unschedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), BoxError> {
+        EventContext::unschedule(self, time, timer_type)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn clear_scheduled(&self) -> Result<(), BoxError> {
-        EventContext::clear_scheduled(self)
+    async fn clear_scheduled(&self, timer_type: TimerType) -> Result<(), BoxError> {
+        EventContext::clear_scheduled(self, timer_type)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
 
     fn scheduled(
         &self,
+        timer_type: TimerType,
     ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxError>> + Send + 'static>> {
-        Box::pin(EventContext::scheduled(self).map_err(|e| Box::new(e) as BoxError))
+        Box::pin(EventContext::scheduled(self, timer_type).map_err(|e| Box::new(e) as BoxError))
     }
 
     fn should_shutdown(&self) -> bool {
