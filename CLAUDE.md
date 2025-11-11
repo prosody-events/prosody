@@ -156,3 +156,7 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 - Implement `Arbitrary` for QuickCheck property tests
 - Efficient strings: `Flexstr` (stack), `Intern` (interning)
 - Dependencies: `ahash`, `parking_lot`, `simd-json` (non-ARM)
+
+## Research
+
+- Automatically use context7 for code generation and library documentation.
