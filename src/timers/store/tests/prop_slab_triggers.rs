@@ -349,24 +349,20 @@ where
 async fn cleanup_slab_triggers<T>(
     operations: &T,
     segment_ids: &[SegmentId],
+    slab_size: CompactDuration,
 ) -> color_eyre::Result<()>
 where
     T: TriggerOperations + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
-    let slab_size_pool = [3600, 7200, 1800]; // Match the pool in Arbitrary
-
     for segment_id in segment_ids {
         for slab_id in 0..5 {
             // Match the slab_id range in Arbitrary
-            for &slab_size_seconds in &slab_size_pool {
-                let slab_size = CompactDuration::new(slab_size_seconds);
-                let slab = Slab::new(*segment_id, slab_id, slab_size);
-                operations
-                    .clear_slab_triggers(&slab)
-                    .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Failed to clear slab triggers: {e:?}"))?;
-            }
+            let slab = Slab::new(*segment_id, slab_id, slab_size);
+            operations
+                .clear_slab_triggers(&slab)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("Failed to clear slab triggers: {e:?}"))?;
         }
     }
 
@@ -473,7 +469,7 @@ where
     // Clean up the slabs from this trial to ensure isolation
     // Even with unique v4 UUIDs, cleanup prevents test pollution if trials fail and
     // rerun
-    cleanup_slab_triggers(operations, &input.segment_ids).await?;
+    cleanup_slab_triggers(operations, &input.segment_ids, input.slab_size).await?;
 
     let mut model = SlabTriggerModel::new();
 
