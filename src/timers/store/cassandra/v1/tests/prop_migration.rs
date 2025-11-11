@@ -16,7 +16,7 @@ use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore, Tri
 use crate::timers::{TimerType, Trigger};
 use ahash::{HashMap, HashSet};
 use futures::TryStreamExt;
-use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck::{Arbitrary, Gen};
 use tracing::Span;
 use uuid::Uuid;
 
@@ -694,29 +694,4 @@ pub async fn prop_migration_invariants(
         .map_err(|e| color_eyre::eyre::eyre!("Failed to cleanup segment: {e:?}"))?;
 
     Ok(())
-}
-
-/// `QuickCheck` wrapper for migration property test.
-pub fn test_prop_migration_invariants(
-    v1_operations: &V1Operations,
-    input: MigrationTestInput,
-) -> TestResult {
-    use tokio::runtime::Runtime;
-
-    // Initialize tracing subscriber to create valid spans in tests
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::Level::ERROR)
-        .try_init();
-
-    let Ok(rt) = Runtime::new() else {
-        return TestResult::error("Failed to create tokio runtime");
-    };
-
-    let result = rt.block_on(async { prop_migration_invariants(v1_operations, input).await });
-
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(format!("{e:?}")),
-    }
 }

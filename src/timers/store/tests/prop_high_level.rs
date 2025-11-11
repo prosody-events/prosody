@@ -11,7 +11,7 @@ use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::{StreamExt, TryStreamExt};
-use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::ops::RangeInclusive;
@@ -813,27 +813,4 @@ where
 
     // Return the verification result
     result
-}
-
-/// [`QuickCheck`] wrapper for high-level dual-index consistency property.
-pub fn test_prop_high_level_dual_index_consistency<S>(
-    store: &S,
-    input: HighLevelTestInput,
-) -> TestResult
-where
-    S: TriggerStore + Send + Sync + 'static,
-    S::Error: Debug,
-{
-    use tokio::runtime::Runtime;
-
-    let Ok(rt) = Runtime::new() else {
-        return TestResult::error("Failed to create tokio runtime");
-    };
-
-    let result = rt.block_on(async { prop_high_level_dual_index_consistency(store, input).await });
-
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(format!("{e:?}")),
-    }
 }

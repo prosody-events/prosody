@@ -248,10 +248,35 @@ macro_rules! trigger_store_tests {
         }
     };
 
+    // Helper to initialize test tracing with OpenTelemetry layer and active span
+    (@init_test_tracing) => {{
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing::subscriber::set_global_default;
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Registry;
+
+        let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
+        let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+        let subscriber = Registry::default()
+            .with(telemetry_layer)
+            .with(fmt::layer().with_test_writer())
+            .with(LevelFilter::ERROR);
+
+        let _ = set_global_default(subscriber);
+
+        // Return an active span guard to ensure Span::current() works during test
+        tracing::info_span!("test").entered()
+    }};
+
     // Test functions using QuickCheck's default
     (@test_functions_default) => {
         #[test]
         fn test_get_slab_range() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_get_slab_range as fn($crate::timers::store::Segment) -> TestResult,
             );
@@ -259,6 +284,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_trigger_operations() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_trigger_operations
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
@@ -267,6 +293,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_trigger_consistency() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_trigger_consistency
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
@@ -275,6 +302,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_operation_sequences() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_operation_sequences
                     as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
@@ -283,6 +311,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_cross_slab_operations() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
             );
@@ -290,6 +319,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_key_contention() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
             );
@@ -297,6 +327,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_sequential_interleavings() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_sequential_interleavings
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
@@ -305,6 +336,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_prop_segment_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_segment_model_equivalence as fn($crate::timers::store::tests::prop_segments::SegmentTestInput) -> TestResult,
             );
@@ -312,6 +344,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_prop_slab_metadata_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput) -> TestResult,
             );
@@ -319,6 +352,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_prop_slab_trigger_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput) -> TestResult,
             );
@@ -326,6 +360,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_prop_key_trigger_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput) -> TestResult,
             );
@@ -333,6 +368,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_prop_high_level_dual_index_consistency() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().quickcheck(
                 prop_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_high_level::HighLevelTestInput) -> TestResult,
             );
@@ -347,6 +383,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_get_slab_range() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_get_slab_range as fn($crate::timers::store::Segment) -> TestResult,
             );
@@ -354,6 +391,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_trigger_operations() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_trigger_operations
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
@@ -362,6 +400,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_trigger_consistency() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_trigger_consistency
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
@@ -370,6 +409,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_operation_sequences() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_operation_sequences
                     as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
@@ -378,6 +418,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_cross_slab_operations() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
             );
@@ -385,6 +426,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_key_contention() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count / 2).quickcheck(
                 prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
             );
@@ -392,12 +434,14 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_sequential_interleavings() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_sequential_interleavings
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
         }#[test]
         fn test_prop_segment_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_segment_model_equivalence as fn($crate::timers::store::tests::prop_segments::SegmentTestInput) -> TestResult,
             );
@@ -405,6 +449,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_prop_slab_metadata_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput) -> TestResult,
             );
@@ -412,6 +457,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_prop_slab_trigger_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput) -> TestResult,
             );
@@ -419,11 +465,13 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_prop_key_trigger_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput) -> TestResult,
             );
         }#[test]
         fn test_prop_high_level_dual_index_consistency() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_high_level::HighLevelTestInput) -> TestResult,
             );
@@ -434,13 +482,11 @@ macro_rules! trigger_store_tests {
         fn prop_segment_model_equivalence(
             input: $crate::timers::store::tests::prop_segments::SegmentTestInput,
         ) -> TestResult {
-            use $crate::timers::store::tests::prop_segments::test_prop_segment_model_equivalence;
+            use $crate::timers::store::tests::prop_segments::prop_segment_model_equivalence;
+            use tracing::Instrument;
 
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -450,24 +496,26 @@ macro_rules! trigger_store_tests {
 
             // Create operations instance with the test's slab_size
             let slab_size = input.slab_size;
-            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }) {
+            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
 
-            test_prop_segment_model_equivalence(&operations, input)
+            // Call the async test function within the same runtime
+            match runtime.block_on(async { prop_segment_model_equivalence(&operations, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
         fn prop_slab_metadata_model_equivalence(
             input: $crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput,
         ) -> TestResult {
-            use $crate::timers::store::tests::prop_slab_metadata::test_prop_slab_metadata_model_equivalence;
+            use $crate::timers::store::tests::prop_slab_metadata::prop_slab_metadata_model_equivalence;
+            use tracing::Instrument;
 
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -477,24 +525,26 @@ macro_rules! trigger_store_tests {
 
             // Create operations instance with the test's slab_size
             let slab_size = input.slab_size;
-            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }) {
+            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
 
-            test_prop_slab_metadata_model_equivalence(&operations, input)
+            // Call the async test function within the same runtime
+            match runtime.block_on(async { prop_slab_metadata_model_equivalence(&operations, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
         fn prop_slab_trigger_model_equivalence(
             input: $crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput,
         ) -> TestResult {
-            use $crate::timers::store::tests::prop_slab_triggers::test_prop_slab_trigger_model_equivalence;
+            use $crate::timers::store::tests::prop_slab_triggers::prop_slab_trigger_model_equivalence;
+            use tracing::Instrument;
 
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -504,24 +554,26 @@ macro_rules! trigger_store_tests {
 
             // Create operations instance with the test's slab_size
             let slab_size = input.slab_size;
-            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }) {
+            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
 
-            test_prop_slab_trigger_model_equivalence(&operations, input)
+            // Call the async test function within the same runtime
+            match runtime.block_on(async { prop_slab_trigger_model_equivalence(&operations, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
         fn prop_key_trigger_model_equivalence(
             input: $crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput,
         ) -> TestResult {
-            use $crate::timers::store::tests::prop_key_triggers::test_prop_key_trigger_model_equivalence;
+            use $crate::timers::store::tests::prop_key_triggers::prop_key_trigger_model_equivalence;
+            use tracing::Instrument;
 
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -531,24 +583,26 @@ macro_rules! trigger_store_tests {
 
             // Create operations instance with the test's slab_size
             let slab_size = input.slab_size;
-            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }) {
+            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
 
-            test_prop_key_trigger_model_equivalence(&operations, input)
+            // Call the async test function within the same runtime
+            match runtime.block_on(async { prop_key_trigger_model_equivalence(&operations, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
         fn prop_high_level_dual_index_consistency(
             input: $crate::timers::store::tests::prop_high_level::HighLevelTestInput,
         ) -> TestResult {
-            use $crate::timers::store::tests::prop_high_level::test_prop_high_level_dual_index_consistency;
+            use $crate::timers::store::tests::prop_high_level::prop_high_level_dual_index_consistency;
+            use tracing::Instrument;
 
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -558,20 +612,23 @@ macro_rules! trigger_store_tests {
 
             // Create store instance with the test's slab_size
             let slab_size = input.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            test_prop_high_level_dual_index_consistency(&store, input)
+            // Call the async test function within the same runtime
+            match runtime.block_on(async { prop_high_level_dual_index_consistency(&store, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
         fn prop_get_slab_range(segment: $crate::timers::store::Segment) -> TestResult {
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            use tracing::Instrument;
+
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -581,27 +638,26 @@ macro_rules! trigger_store_tests {
 
             // Create store instance with segment's slab_size
             let slab_size = segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(tests::slabs::test_get_slab_range(&store, &segment)) {
+            match runtime.block_on(tests::slabs::test_get_slab_range(&store, &segment).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_trigger_operations(input: tests::TriggerTestInput) -> TestResult {
+            use tracing::Instrument;
+
             if input.triggers.is_empty() {
                 return TestResult::discard();
             }
 
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -611,29 +667,28 @@ macro_rules! trigger_store_tests {
 
             // Create store instance with segment's slab_size
             let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
             match runtime.block_on(tests::trigger_operations::test_trigger_operations(
                 &store, &input,
-            )) {
+            ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_trigger_consistency(input: tests::TriggerTestInput) -> TestResult {
+            use tracing::Instrument;
+
             if input.triggers.is_empty() {
                 return TestResult::discard();
             }
 
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -643,25 +698,24 @@ macro_rules! trigger_store_tests {
 
             // Create store instance with segment's slab_size
             let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
             match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
                 &store, &input,
-            )) {
+            ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_operation_sequences(input: tests::TriggerSequence) -> TestResult {
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            use tracing::Instrument;
+
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -671,25 +725,24 @@ macro_rules! trigger_store_tests {
 
             // Create store instance with segment's slab_size
             let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
             match runtime.block_on(tests::trigger_operations::test_operation_sequences(
                 &store, &input,
-            )) {
+            ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_cross_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            use tracing::Instrument;
+
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -699,25 +752,24 @@ macro_rules! trigger_store_tests {
 
             // Create store instance with segment's slab_size
             let slab_size = segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
             match runtime.block_on(tests::cross_slab::test_cross_slab_operations(
                 &store, &segment,
-            )) {
+            ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_key_contention(segment: $crate::timers::store::Segment) -> TestResult {
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            use tracing::Instrument;
+
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -727,27 +779,26 @@ macro_rules! trigger_store_tests {
 
             // Create store instance with segment's slab_size
             let slab_size = segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(tests::contention::test_key_contention(&store, &segment)) {
+            match runtime.block_on(tests::contention::test_key_contention(&store, &segment).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_sequential_interleavings(input: tests::TriggerTestInput) -> TestResult {
+            use tracing::Instrument;
+
             if input.triggers.is_empty() {
                 return TestResult::discard();
             }
 
-            // Initialize tracing subscriber to create valid spans in tests
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_max_level(tracing::Level::ERROR)
-                .try_init();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
             // Create runtime for this test invocation
             let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -757,13 +808,13 @@ macro_rules! trigger_store_tests {
 
             // Create store instance with segment's slab_size
             let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }) {
+            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
             match runtime.block_on(
-                tests::sequential_interleavings::test_sequential_interleavings(&store, &input),
+                tests::sequential_interleavings::test_sequential_interleavings(&store, &input).instrument(span),
             ) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),

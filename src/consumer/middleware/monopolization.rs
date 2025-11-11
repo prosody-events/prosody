@@ -417,6 +417,26 @@ mod tests {
     use std::time::Duration;
     use tokio::time::sleep;
 
+    fn init_test_tracing() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing::subscriber::set_global_default;
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
+        let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+        let subscriber = Registry::default()
+            .with(telemetry_layer)
+            .with(fmt::layer().with_test_writer())
+            .with(LevelFilter::ERROR);
+
+        let _ = set_global_default(subscriber);
+    }
+
     #[derive(Clone, Debug, Error)]
     #[error("Mock error")]
     struct MockError;
@@ -565,6 +585,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_monopolizing_key_passes_through() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -616,6 +638,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_monopolizing_key_triggers_error() -> Result<()> {
+        init_test_tracing();
+
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -674,6 +700,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_keys_independent_tracking() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -753,6 +781,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_window_sliding_removes_old_intervals() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -842,6 +872,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_interval_closed_on_completion() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -901,6 +933,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_execution_before_window() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -954,6 +988,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_execution_crosses_window_end() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -1005,6 +1041,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_exact_threshold() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -1057,6 +1095,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_just_above_threshold() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
@@ -1108,6 +1148,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_boundary_multiple_executions_in_window() -> Result<()> {
+        init_test_tracing();
+
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()

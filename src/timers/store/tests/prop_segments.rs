@@ -7,7 +7,7 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use ahash::HashMap;
-use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck::{Arbitrary, Gen};
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::Debug;
@@ -382,27 +382,4 @@ where
     // Final sanity check: verify model-store equivalence for all segment IDs
     // (queries were already verified inline, this catches any missed state)
     verify_final_state(operations, &model).await
-}
-
-/// [`QuickCheck`] wrapper for segment model equivalence property.
-///
-/// Tests low-level `TriggerOperations` implementations directly
-/// (`InMemoryTriggerStore`, `CassandraTriggerStore`).
-pub fn test_prop_segment_model_equivalence<T>(operations: &T, input: SegmentTestInput) -> TestResult
-where
-    T: TriggerOperations + 'static,
-    T::Error: Error + Send + Sync + 'static,
-{
-    use tokio::runtime::Runtime;
-
-    let Ok(rt) = Runtime::new() else {
-        return TestResult::error("Failed to create tokio runtime");
-    };
-
-    let result = rt.block_on(async { prop_segment_model_equivalence(operations, input).await });
-
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(format!("{e:?}")),
-    }
 }

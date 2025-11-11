@@ -17,15 +17,28 @@ fn test_topic(name: &str) -> String {
 }
 
 fn init_test_logging() {
-    let _ = fmt()
-        .compact()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_env_var("PROSODY_LOG")
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .try_init();
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing::subscriber::set_global_default;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // Create a no-op OpenTelemetry tracer for testing
+    // This allows span.set_parent() to work without actually exporting spans
+    let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
+    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    let env_filter = EnvFilter::builder()
+        .with_env_var("PROSODY_LOG")
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+
+    let subscriber = Registry::default()
+        .with(telemetry_layer)
+        .with(fmt::layer().compact())
+        .with(env_filter);
+
+    let _ = set_global_default(subscriber);
 }
 
 fn loader_config() -> LoaderConfiguration {
@@ -112,6 +125,7 @@ async fn delete_records_up_to(topic: &str, offset: i64) -> color_eyre::Result<()
 #[tokio::test]
 async fn test_load_valid_offset() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("valid");
     create_topic(&topic_name).await?;
@@ -144,6 +158,7 @@ async fn test_load_valid_offset() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_load_sequential_offsets() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("sequential");
     create_topic(&topic_name).await?;
@@ -177,6 +192,7 @@ async fn test_load_sequential_offsets() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_multiple_concurrent_requests() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("concurrent");
     create_topic(&topic_name).await?;
@@ -221,6 +237,7 @@ async fn test_multiple_concurrent_requests() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_load_deleted_offset() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("deleted");
     create_topic(&topic_name).await?;
@@ -263,6 +280,7 @@ async fn test_load_deleted_offset() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("multi_deleted");
     create_topic(&topic_name).await?;
@@ -342,6 +360,7 @@ async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("at_lso");
     create_topic(&topic_name).await?;
@@ -377,6 +396,7 @@ async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("truncated");
     create_topic(&topic_name).await?;
@@ -418,6 +438,7 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("seek_recovery");
     create_topic(&topic_name).await?;
@@ -453,6 +474,7 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_sparse_offset_requests() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("sparse");
     create_topic(&topic_name).await?;
@@ -486,6 +508,7 @@ async fn test_sparse_offset_requests() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_backwards_seek() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("backwards");
     create_topic(&topic_name).await?;
@@ -533,6 +556,7 @@ async fn test_backwards_seek() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("threshold");
     create_topic(&topic_name).await?;
@@ -589,6 +613,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_concurrent_same_offset_requests() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("same_offset");
     create_topic(&topic_name).await?;
@@ -635,6 +660,7 @@ async fn test_concurrent_same_offset_requests() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     // This test verifies that seek failure recovery works
     // In a real multi-partition scenario, the recovery poll might return
@@ -687,6 +713,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_decode_error() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("decode_error");
     create_topic(&topic_name).await?;
@@ -740,6 +767,7 @@ async fn test_decode_error() -> color_eyre::Result<()> {
 #[tokio::test]
 async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("concurrent_decode_error");
     create_topic(&topic_name).await?;
@@ -878,6 +906,7 @@ async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<(
 #[tokio::test]
 async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
+    init_test_logging();
 
     let topic_name = test_topic("cache_permits");
     create_topic(&topic_name).await?;

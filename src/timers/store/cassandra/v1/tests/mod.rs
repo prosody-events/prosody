@@ -56,44 +56,69 @@ mod test_runner {
             .unwrap_or(default)
     }
 
-    /// Generic helper to run V1 property tests with runtime and operations
-    /// setup. Runtime is kept alive for the duration of the test function.
-    fn run_v1_test<I>(
-        input: I,
-        test_fn: impl FnOnce(&V1Operations, I) -> TestResult,
-    ) -> TestResult {
-        // Initialize tracing subscriber to create valid spans in tests
-        // try_init() returns Err if already initialized, which is fine
-        let _ = tracing_subscriber::fmt()
-            .with_test_writer()
-            .with_max_level(tracing::Level::ERROR)
-            .try_init();
+    use tracing::span::EnteredSpan;
 
-        // Create runtime for this test invocation
-        let runtime = match Builder::new_multi_thread().enable_all().build() {
-            Ok(rt) => rt,
-            Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-        };
+    /// Initialize test tracing with OpenTelemetry layer and return an active
+    /// span guard
+    fn init_test_tracing() -> EnteredSpan {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing::info_span;
+        use tracing::subscriber::set_global_default;
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::SubscriberExt;
 
-        // Create V1Operations instance
-        let operations = match runtime.block_on(async { create_v1_operations().await }) {
-            Ok(ops) => ops,
-            Err(e) => return TestResult::error(format!("Failed to create V1Operations: {e:?}")),
-        };
+        let tracer = SdkTracerProvider::builder().build().tracer("prosody-test");
+        let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-        test_fn(&operations, input)
+        let subscriber = Registry::default()
+            .with(telemetry_layer)
+            .with(fmt::layer().with_test_writer())
+            .with(LevelFilter::ERROR);
+
+        let _ = set_global_default(subscriber);
+
+        // Return an active span guard to ensure Span::current() works during test
+        info_span!("test").entered()
     }
 
     #[test]
     fn prop_v1_slab_metadata_model_equivalence() {
         use super::prop_slab_metadata::{
-            V1SlabMetadataTestInput, test_prop_v1_slab_metadata_model_equivalence,
+            V1SlabMetadataTestInput, prop_v1_slab_metadata_model_equivalence,
         };
 
         fn test_wrapper(input: V1SlabMetadataTestInput) -> TestResult {
-            run_v1_test(input, test_prop_v1_slab_metadata_model_equivalence)
+            use tracing::Instrument;
+
+            let span = tracing::Span::current();
+
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            let operations = match runtime
+                .block_on(async { create_v1_operations().await }.instrument(span.clone()))
+            {
+                Ok(ops) => ops,
+                Err(e) => {
+                    return TestResult::error(format!("Failed to create V1Operations: {e:?}"));
+                }
+            };
+
+            match runtime.block_on(
+                async { prop_v1_slab_metadata_model_equivalence(&operations, input).await }
+                    .instrument(span),
+            ) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
+        let _span = init_test_tracing();
         QuickCheck::new()
             .tests(get_test_count(50))
             .quickcheck(test_wrapper as fn(V1SlabMetadataTestInput) -> TestResult);
@@ -102,13 +127,38 @@ mod test_runner {
     #[test]
     fn prop_v1_slab_trigger_model_equivalence() {
         use super::prop_slab_triggers::{
-            V1SlabTriggerTestInput, test_prop_v1_slab_trigger_model_equivalence,
+            V1SlabTriggerTestInput, prop_v1_slab_trigger_model_equivalence,
         };
 
         fn test_wrapper(input: V1SlabTriggerTestInput) -> TestResult {
-            run_v1_test(input, test_prop_v1_slab_trigger_model_equivalence)
+            use tracing::Instrument;
+
+            let span = tracing::Span::current();
+
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            let operations = match runtime
+                .block_on(async { create_v1_operations().await }.instrument(span.clone()))
+            {
+                Ok(ops) => ops,
+                Err(e) => {
+                    return TestResult::error(format!("Failed to create V1Operations: {e:?}"));
+                }
+            };
+
+            match runtime.block_on(
+                async { prop_v1_slab_trigger_model_equivalence(&operations, input).await }
+                    .instrument(span),
+            ) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
+        let _span = init_test_tracing();
         QuickCheck::new()
             .tests(get_test_count(50))
             .quickcheck(test_wrapper as fn(V1SlabTriggerTestInput) -> TestResult);
@@ -117,13 +167,38 @@ mod test_runner {
     #[test]
     fn prop_v1_key_trigger_model_equivalence() {
         use super::prop_key_triggers::{
-            V1KeyTriggerTestInput, test_prop_v1_key_trigger_model_equivalence,
+            V1KeyTriggerTestInput, prop_v1_key_trigger_model_equivalence,
         };
 
         fn test_wrapper(input: V1KeyTriggerTestInput) -> TestResult {
-            run_v1_test(input, test_prop_v1_key_trigger_model_equivalence)
+            use tracing::Instrument;
+
+            let span = tracing::Span::current();
+
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            let operations = match runtime
+                .block_on(async { create_v1_operations().await }.instrument(span.clone()))
+            {
+                Ok(ops) => ops,
+                Err(e) => {
+                    return TestResult::error(format!("Failed to create V1Operations: {e:?}"));
+                }
+            };
+
+            match runtime.block_on(
+                async { prop_v1_key_trigger_model_equivalence(&operations, input).await }
+                    .instrument(span),
+            ) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
+        let _span = init_test_tracing();
         QuickCheck::new()
             .tests(get_test_count(50))
             .quickcheck(test_wrapper as fn(V1KeyTriggerTestInput) -> TestResult);
@@ -132,13 +207,38 @@ mod test_runner {
     #[test]
     fn prop_v1_high_level_dual_index_consistency() {
         use super::prop_high_level::{
-            V1HighLevelTestInput, test_prop_v1_high_level_dual_index_consistency,
+            V1HighLevelTestInput, prop_v1_high_level_dual_index_consistency,
         };
 
         fn test_wrapper(input: V1HighLevelTestInput) -> TestResult {
-            run_v1_test(input, test_prop_v1_high_level_dual_index_consistency)
+            use tracing::Instrument;
+
+            let span = tracing::Span::current();
+
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            let operations = match runtime
+                .block_on(async { create_v1_operations().await }.instrument(span.clone()))
+            {
+                Ok(ops) => ops,
+                Err(e) => {
+                    return TestResult::error(format!("Failed to create V1Operations: {e:?}"));
+                }
+            };
+
+            match runtime.block_on(
+                async { prop_v1_high_level_dual_index_consistency(&operations, input).await }
+                    .instrument(span),
+            ) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
+        let _span = init_test_tracing();
         QuickCheck::new()
             .tests(get_test_count(25))
             .quickcheck(test_wrapper as fn(V1HighLevelTestInput) -> TestResult);
@@ -146,12 +246,36 @@ mod test_runner {
 
     #[test]
     fn prop_migration_invariants() {
-        use super::prop_migration::{MigrationTestInput, test_prop_migration_invariants};
+        use super::prop_migration::{MigrationTestInput, prop_migration_invariants};
 
         fn test_wrapper(input: MigrationTestInput) -> TestResult {
-            run_v1_test(input, test_prop_migration_invariants)
+            use tracing::Instrument;
+
+            let span = tracing::Span::current();
+
+            let runtime = match Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
+
+            let operations = match runtime
+                .block_on(async { create_v1_operations().await }.instrument(span.clone()))
+            {
+                Ok(ops) => ops,
+                Err(e) => {
+                    return TestResult::error(format!("Failed to create V1Operations: {e:?}"));
+                }
+            };
+
+            match runtime.block_on(
+                async { prop_migration_invariants(&operations, input).await }.instrument(span),
+            ) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
         }
 
+        let _span = init_test_tracing();
         QuickCheck::new()
             .tests(get_test_count(10))
             .quickcheck(test_wrapper as fn(MigrationTestInput) -> TestResult);

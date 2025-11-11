@@ -12,7 +12,7 @@ use crate::timers::store::operations::TriggerOperations;
 use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::TryStreamExt;
-use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
@@ -527,28 +527,4 @@ where
     verify_final_slab_state(operations, &model).await?;
 
     Ok(())
-}
-
-/// [`QuickCheck`] wrapper for slab trigger model equivalence property.
-pub fn test_prop_slab_trigger_model_equivalence<T>(
-    operations: &T,
-    input: SlabTriggerTestInput,
-) -> TestResult
-where
-    T: TriggerOperations + Send + Sync + 'static,
-    T::Error: Error + Send + Sync + 'static,
-{
-    use tokio::runtime::Runtime;
-
-    let Ok(rt) = Runtime::new() else {
-        return TestResult::error("Failed to create tokio runtime");
-    };
-
-    let result =
-        rt.block_on(async { prop_slab_trigger_model_equivalence(operations, input).await });
-
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(format!("{e:?}")),
-    }
 }

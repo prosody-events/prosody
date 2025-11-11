@@ -9,7 +9,7 @@ use crate::timers::store::SegmentId;
 use crate::timers::store::cassandra::v1::V1Operations;
 use ahash::HashMap;
 use futures::TryStreamExt;
-use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
@@ -285,30 +285,4 @@ pub async fn prop_v1_slab_metadata_model_equivalence(
     }
 
     Ok(())
-}
-
-/// [`QuickCheck`] wrapper for v1 slab metadata model equivalence property.
-pub fn test_prop_v1_slab_metadata_model_equivalence(
-    operations: &V1Operations,
-    input: V1SlabMetadataTestInput,
-) -> TestResult {
-    use tokio::runtime::Runtime;
-
-    // Initialize tracing subscriber to create valid spans in tests
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::Level::ERROR)
-        .try_init();
-
-    let Ok(rt) = Runtime::new() else {
-        return TestResult::error("Failed to create tokio runtime");
-    };
-
-    let result =
-        rt.block_on(async { prop_v1_slab_metadata_model_equivalence(operations, input).await });
-
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(format!("{e:?}")),
-    }
 }

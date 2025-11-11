@@ -12,7 +12,7 @@ use crate::timers::store::cassandra::v1::V1Operations;
 use crate::timers::store::{SegmentId, TriggerV1};
 use ahash::HashMap;
 use futures::TryStreamExt;
-use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
 use tracing::Span;
 use uuid::Uuid;
@@ -567,30 +567,4 @@ pub async fn prop_v1_high_level_dual_index_consistency(
 
     // CRITICAL: Verify V1 dual-index consistency after all operations
     verify_v1_dual_index_consistency(operations, &model).await
-}
-
-/// [`QuickCheck`] wrapper for V1 high-level dual-index consistency property.
-pub fn test_prop_v1_high_level_dual_index_consistency(
-    operations: &V1Operations,
-    input: V1HighLevelTestInput,
-) -> TestResult {
-    use tokio::runtime::Runtime;
-
-    // Initialize tracing subscriber to create valid spans in tests
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::Level::ERROR)
-        .try_init();
-
-    let Ok(rt) = Runtime::new() else {
-        return TestResult::error("Failed to create tokio runtime");
-    };
-
-    let result =
-        rt.block_on(async { prop_v1_high_level_dual_index_consistency(operations, input).await });
-
-    match result {
-        Ok(()) => TestResult::passed(),
-        Err(e) => TestResult::error(format!("{e:?}")),
-    }
 }
