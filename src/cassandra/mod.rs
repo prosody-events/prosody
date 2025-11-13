@@ -4,13 +4,9 @@
 //! and migration system used by all stateful components in Prosody. It manages
 //! a single session and unified migration system.
 
-use crate::cassandra::migrator::MigrationError;
 use crate::propagator::new_propagator;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::duration::CompactDurationError;
-use crate::timers::error::{ParseError, TimerManagerError};
-use crate::timers::store::{InvalidSegmentVersionError, SegmentId};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use scylla::_macro_internal::{
     CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
@@ -21,21 +17,18 @@ use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::cluster::metadata::NativeType;
-use scylla::errors::{
-    ExecutionError, IntoRowsResultError, MaybeFirstRowError, NewSessionError, NextRowError,
-    PagerExecutionError, PrepareError, RowsError, UseKeyspaceError,
-};
 use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
 use scylla::statement::Consistency;
 use std::sync::Arc;
-use thiserror::Error;
 
 pub mod config;
+pub mod errors;
 pub mod macros;
 pub mod migrator;
 
 pub use config::CassandraConfiguration;
+use errors::CassandraStoreError;
 pub use migrator::CassandraMigrator;
 
 /// Table name for storing segment metadata and slab IDs.
@@ -199,165 +192,6 @@ async fn create_session(config: &CassandraConfiguration) -> Result<Session, Cass
     }
 
     Ok(session.build().await?)
-}
-
-/// Error type for Cassandra store operations.
-#[derive(Debug, Error)]
-pub enum CassandraStoreError {
-    /// Invalid duration
-    #[error("Invalid duration: {0:#}")]
-    Duration(#[from] CompactDurationError),
-
-    /// Failed to create Cassandra session.
-    #[error("Failed to create session: {0:#}")]
-    Session(Box<NewSessionError>),
-
-    /// Schema migration failed.
-    #[error(transparent)]
-    Migration(#[from] MigrationError),
-
-    /// Failed to set keyspace.
-    #[error("Failed to set keyspace: {0:#}")]
-    UseKeyspace(Box<UseKeyspaceError>),
-
-    /// Failed to prepare statement.
-    #[error("Failed to prepare statement: {0:#}")]
-    Prepare(Box<PrepareError>),
-
-    /// Failed to execute statement.
-    #[error("Failed to execute statement: {0:#}")]
-    Execution(Box<ExecutionError>),
-
-    /// Failed to retrieve the next page.
-    #[error("Failed to retrieve the next page: {0:#}")]
-    PageExecution(Box<PagerExecutionError>),
-
-    /// Failed to retrieve the next row.
-    #[error("Failed to retrieve the next row: {0:#}")]
-    NextRow(Box<NextRowError>),
-
-    /// Failed to retrieve the first row.
-    #[error("Failed to retrieve the first row: {0:#}")]
-    MaybeFirstRow(Box<MaybeFirstRowError>),
-
-    /// Failed to get rows.
-    #[error("Failed to get rows: {0:#}")]
-    IntoRows(Box<IntoRowsResultError>),
-
-    /// Rows error.
-    #[error("Rows error: {0:#}")]
-    Rows(Box<RowsError>),
-
-    /// Invalid column type.
-    #[error("Invalid type: {0:#}")]
-    TypeCheck(Box<TypeCheckError>),
-
-    /// Expected integer type but got something else.
-    #[error("expected integer type")]
-    IntExpected,
-
-    /// Invalid segment version value.
-    #[error("Invalid segment version: {0:#}")]
-    InvalidSegmentVersion(#[from] InvalidSegmentVersionError),
-
-    /// Slab size mismatch during segment insertion.
-    #[error(
-        "Cannot insert segment {segment_id} with slab_size {segment_slab_size} that differs from \
-         configured slab_size {configured_slab_size}"
-    )]
-    SlabSizeMismatch {
-        /// The ID of the segment being inserted.
-        segment_id: SegmentId,
-        /// The slab size of the segment being inserted.
-        segment_slab_size: CompactDuration,
-        /// The configured slab size for this store.
-        configured_slab_size: CompactDuration,
-    },
-
-    /// Segment disappeared during data migration.
-    #[error("Segment {segment_id} disappeared during {operation}")]
-    SegmentDisappeared {
-        /// The ID of the segment that disappeared.
-        segment_id: SegmentId,
-        /// The operation that was being performed when the segment disappeared.
-        operation: &'static str,
-    },
-
-    /// Invalid timer type value in database.
-    #[error("Invalid timer type: {0:#}")]
-    Parse(#[from] ParseError),
-}
-
-impl From<NewSessionError> for CassandraStoreError {
-    fn from(error: NewSessionError) -> Self {
-        Self::Session(Box::new(error))
-    }
-}
-
-impl From<UseKeyspaceError> for CassandraStoreError {
-    fn from(error: UseKeyspaceError) -> Self {
-        Self::UseKeyspace(Box::new(error))
-    }
-}
-
-impl From<PrepareError> for CassandraStoreError {
-    fn from(error: PrepareError) -> Self {
-        Self::Prepare(Box::new(error))
-    }
-}
-
-impl From<ExecutionError> for CassandraStoreError {
-    fn from(error: ExecutionError) -> Self {
-        Self::Execution(Box::new(error))
-    }
-}
-
-impl From<PagerExecutionError> for CassandraStoreError {
-    fn from(error: PagerExecutionError) -> Self {
-        Self::PageExecution(Box::new(error))
-    }
-}
-
-impl From<NextRowError> for CassandraStoreError {
-    fn from(error: NextRowError) -> Self {
-        Self::NextRow(Box::new(error))
-    }
-}
-
-impl From<MaybeFirstRowError> for CassandraStoreError {
-    fn from(error: MaybeFirstRowError) -> Self {
-        Self::MaybeFirstRow(Box::new(error))
-    }
-}
-
-impl From<IntoRowsResultError> for CassandraStoreError {
-    fn from(error: IntoRowsResultError) -> Self {
-        Self::IntoRows(Box::new(error))
-    }
-}
-
-impl From<RowsError> for CassandraStoreError {
-    fn from(error: RowsError) -> Self {
-        Self::Rows(Box::new(error))
-    }
-}
-
-impl From<TypeCheckError> for CassandraStoreError {
-    fn from(error: TypeCheckError) -> Self {
-        Self::TypeCheck(Box::new(error))
-    }
-}
-
-impl From<TimerManagerError<CassandraStoreError>> for CassandraStoreError {
-    fn from(error: TimerManagerError<CassandraStoreError>) -> Self {
-        match error {
-            TimerManagerError::Store(e) => e,
-            _ => Self::SegmentDisappeared {
-                segment_id: SegmentId::default(),
-                operation: "timer manager operation",
-            },
-        }
-    }
 }
 
 // Scylla trait implementations for Prosody types

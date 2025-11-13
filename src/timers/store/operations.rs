@@ -7,6 +7,7 @@
 //! **Not part of the public API.** Use `TriggerStore` instead.
 
 use crate::Key;
+use crate::consumer::middleware::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -39,7 +40,7 @@ use std::ops::RangeInclusive;
 /// effectively internal.
 pub trait TriggerOperations: Clone + Send + Sync + 'static {
     /// Error type for storage operations.
-    type Error: Error + Send + Sync + 'static;
+    type Error: ClassifyError + Error + Send + Sync + 'static;
 
     // =========================================================================
     // Segment Operations (3 methods)

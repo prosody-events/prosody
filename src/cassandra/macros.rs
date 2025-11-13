@@ -3,7 +3,7 @@
 //! This module provides declarative macros that eliminate repetitive code
 //! patterns in Cassandra prepared statement management.
 
-use crate::timers::store::cassandra::CassandraTriggerStoreError;
+use crate::cassandra::errors::CassandraStoreError;
 use scylla::client::session::Session;
 use scylla::statement::prepared::PreparedStatement;
 
@@ -30,7 +30,7 @@ use scylla::statement::prepared::PreparedStatement;
 pub async fn prepare_statement(
     session: &Session,
     statement: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
+) -> Result<PreparedStatement, CassandraStoreError> {
     let mut statement = session.prepare(statement).await?;
     statement.set_use_cached_result_metadata(true);
     statement.set_is_idempotent(true);
@@ -165,7 +165,7 @@ macro_rules! cassandra_queries {
             pub async fn new(
                 session: &::scylla::client::session::Session,
                 keyspace: &str,
-            ) -> ::std::result::Result<Self, $crate::timers::store::cassandra::CassandraTriggerStoreError> {
+            ) -> ::std::result::Result<Self, $crate::cassandra::errors::CassandraStoreError> {
                 $(
                     let $field = ::paste::paste! {
                         [<prepare_ $field>](session, keyspace).await?
@@ -191,7 +191,7 @@ macro_rules! cassandra_queries {
                     keyspace: &str,
                 ) -> ::std::result::Result<
                     ::scylla::statement::prepared::PreparedStatement,
-                    $crate::timers::store::cassandra::CassandraTriggerStoreError
+                    $crate::cassandra::errors::CassandraStoreError
                 > {
                     let sql_query = $crate::cassandra::macros::format_sql(
                         $sql,

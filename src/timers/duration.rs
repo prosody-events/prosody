@@ -264,6 +264,17 @@ pub enum CompactDurationError {
     OutOfRange,
 }
 
+impl crate::consumer::middleware::ClassifyError for CompactDurationError {
+    fn classify_error(&self) -> crate::consumer::middleware::ErrorCategory {
+        match self {
+            // OutOfRange: Arithmetic overflow (add/sub exceeding u32 bounds) or
+            // conversion failure (Duration > u32::MAX seconds). Invalid data or
+            // calculation - not recoverable by retry.
+            Self::OutOfRange => crate::consumer::middleware::ErrorCategory::Permanent,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

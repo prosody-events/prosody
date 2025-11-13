@@ -10,6 +10,7 @@
 
 use crate::Key;
 use crate::cassandra::CassandraStore;
+use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::SlabId;
@@ -79,7 +80,8 @@ impl V1Operations {
                 &self.queries.insert_segment_v1,
                 (segment_id, name, slab_size),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
         Ok(())
     }
 
@@ -99,7 +101,8 @@ impl V1Operations {
         self.store
             .session()
             .execute_unpaged(&self.queries.insert_slab_v1, (segment_id, slab_id as i32))
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
         Ok(())
     }
 
@@ -131,7 +134,8 @@ impl V1Operations {
                     span_map,
                 ),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
         Ok(())
     }
 
@@ -154,16 +158,19 @@ impl V1Operations {
         let queries = Arc::clone(&self.queries);
 
         try_stream! {
-            let stream = store.session()
-                .execute_iter(
-                    queries.get_slabs_v1.clone(),
-                    (segment_id,),
-                )
-                .await?
-                .rows_stream::<(Option<i32>,)>()?;
+            let stream = store
+                .session()
+                .execute_iter(queries.get_slabs_v1.clone(), (segment_id,))
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(Option<i32>,)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((slab_id_opt,)) = cooperative(stream.try_next()).await? {
+            while let Some((slab_id_opt,)) = cooperative(stream.try_next())
+                .await
+                .map_err(CassandraStoreError::from)?
+            {
                 // Filter out NULL slab_ids (partitions with only static columns)
                 if let Some(slab_id) = slab_id_opt {
                     yield SlabId::from_le_bytes(slab_id.to_le_bytes());
@@ -186,19 +193,21 @@ impl V1Operations {
         let slab_id = i32::from_le_bytes(slab_id.to_le_bytes());
         let store = self.store.clone();
         let queries = Arc::clone(&self.queries);
-        // store already cloned above
 
         try_stream! {
-            let stream = store.session()
-                .execute_iter(
-                    queries.get_slab_triggers_v1.clone(),
-                    (segment_id, slab_id),
-                )
-                .await?
-                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
+            let stream = store
+                .session()
+                .execute_iter(queries.get_slab_triggers_v1.clone(), (segment_id, slab_id))
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, span_map)) = cooperative(stream.try_next())
+                .await
+                .map_err(CassandraStoreError::from)?
+            {
                 let context = store.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger_v1");
                 if let Err(error) = span.set_parent(context) {
@@ -230,7 +239,8 @@ impl V1Operations {
                 &self.queries.delete_slab_metadata_v1,
                 (segment_id, slab_id as i32),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -253,7 +263,8 @@ impl V1Operations {
                 &self.queries.delete_slab_trigger_v1,
                 (segment_id, slab_id as i32, key.as_ref(), time),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -274,7 +285,8 @@ impl V1Operations {
                 &self.queries.clear_slab_triggers_v1,
                 (segment_id, slab_id as i32),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -302,7 +314,8 @@ impl V1Operations {
                 &self.queries.insert_key_trigger_v1,
                 (segment_id, trigger.key.as_ref(), trigger.time, span_map),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -323,16 +336,22 @@ impl V1Operations {
         // store already cloned above
 
         try_stream! {
-            let stream = store.session()
+            let stream = store
+                .session()
                 .execute_iter(
                     queries.get_key_triggers_v1.clone(),
                     (segment_id, key.as_ref()),
                 )
-                .await?
-                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, span_map)) = cooperative(stream.try_next())
+                .await
+                .map_err(CassandraStoreError::from)?
+            {
                 let context = store.propagator().extract(&span_map);
                 let span = info_span!("fetch_key_trigger_v1");
                 if let Err(error) = span.set_parent(context) {
@@ -365,7 +384,8 @@ impl V1Operations {
                 &self.queries.delete_key_trigger_v1,
                 (segment_id, key.as_ref(), time),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -385,7 +405,8 @@ impl V1Operations {
                 &self.queries.clear_key_triggers_v1,
                 (segment_id, key.as_ref()),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }

@@ -8,6 +8,12 @@
 //!   `TimerManager<T>` using a `TriggerStore` backend.
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
+use crate::Key;
+use crate::consumer::middleware::ClassifyError;
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::error::TimerManagerError;
+use crate::timers::store::TriggerStore;
+use crate::timers::{DELETE_CONCURRENCY, TimerManager, TimerType, Trigger};
 use arc_swap::ArcSwapOption;
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -15,6 +21,7 @@ use dyn_clone::DynClone;
 use educe::Educe;
 use futures::stream::{iter, once};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, pin_mut};
+use serde::de::StdError;
 use std::error::Error;
 use std::future::{Future, ready};
 use std::pin::Pin;
@@ -23,11 +30,9 @@ use tokio::select;
 use tokio::sync::watch;
 use tracing::{Span, error};
 
-use crate::Key;
-use crate::timers::datetime::CompactDateTime;
-use crate::timers::error::TimerManagerError;
-use crate::timers::store::TriggerStore;
-use crate::timers::{DELETE_CONCURRENCY, TimerManager, TimerType, Trigger};
+pub trait EventContextError: StdError + ClassifyError + Send + Sync + 'static {}
+
+impl<T> EventContextError for T where T: StdError + ClassifyError + Send + Sync + 'static {}
 
 /// Provides shutdown notifications and timer operations to message handlers.
 ///
@@ -40,7 +45,7 @@ use crate::timers::{DELETE_CONCURRENCY, TimerManager, TimerType, Trigger};
 /// - Check synchronously if shutdown has been requested.
 pub trait EventContext: Clone + Send + Sync + 'static {
     /// Error type returned by timer-related operations.
-    type Error: Error + Send + Sync + 'static;
+    type Error: EventContextError;
 
     /// Returns `true` if a partition shutdown signal has been issued.
     fn should_shutdown(&self) -> bool;
@@ -451,7 +456,7 @@ where
 pub type BoxEventContext = Box<dyn DynEventContext>;
 
 /// Boxed error type for object-safe contexts.
-pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+pub type BoxEventContextError = Box<dyn EventContextError>;
 
 /// Object-safe version of `EventContext` with boxed futures and errors.
 ///
@@ -478,7 +483,11 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an error if scheduling fails.
-    async fn schedule(&self, time: CompactDateTime, timer_type: TimerType) -> Result<(), BoxError>;
+    async fn schedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), BoxEventContextError>;
 
     /// Unschedule all existing timers and schedule a new one.
     ///
@@ -490,7 +499,7 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<(), BoxError>;
+    ) -> Result<(), BoxEventContextError>;
 
     /// Unschedule a specific timer.
     ///
@@ -502,14 +511,14 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<(), BoxError>;
+    ) -> Result<(), BoxEventContextError>;
 
     /// Unschedule all timers of the specified type.
     ///
     /// # Arguments
     ///
     /// * `timer_type` – The timer type.
-    async fn clear_scheduled(&self, timer_type: TimerType) -> Result<(), BoxError>;
+    async fn clear_scheduled(&self, timer_type: TimerType) -> Result<(), BoxEventContextError>;
 
     /// List scheduled execution times for the specified type.
     ///
@@ -519,7 +528,7 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     fn scheduled(
         &self,
         timer_type: TimerType,
-    ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxError>> + Send + 'static>>;
+    ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxEventContextError>> + Send + 'static>>;
 
     /// Synchronously check if partition shutdown has been requested.
     fn should_shutdown(&self) -> bool;
@@ -544,43 +553,51 @@ where
         EventContext::on_cancel(self).await;
     }
 
-    async fn schedule(&self, time: CompactDateTime, timer_type: TimerType) -> Result<(), BoxError> {
+    async fn schedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<(), BoxEventContextError> {
         EventContext::schedule(self, time, timer_type)
             .await
-            .map_err(|e| Box::new(e) as BoxError)
+            .map_err(|e| Box::new(e) as BoxEventContextError)
     }
 
     async fn clear_and_schedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), BoxEventContextError> {
         EventContext::clear_and_schedule(self, time, timer_type)
             .await
-            .map_err(|e| Box::new(e) as BoxError)
+            .map_err(|e| Box::new(e) as BoxEventContextError)
     }
 
     async fn unschedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), BoxEventContextError> {
         EventContext::unschedule(self, time, timer_type)
             .await
-            .map_err(|e| Box::new(e) as BoxError)
+            .map_err(|e| Box::new(e) as BoxEventContextError)
     }
 
-    async fn clear_scheduled(&self, timer_type: TimerType) -> Result<(), BoxError> {
+    async fn clear_scheduled(&self, timer_type: TimerType) -> Result<(), BoxEventContextError> {
         EventContext::clear_scheduled(self, timer_type)
             .await
-            .map_err(|e| Box::new(e) as BoxError)
+            .map_err(|e| Box::new(e) as BoxEventContextError)
     }
 
     fn scheduled(
         &self,
         timer_type: TimerType,
-    ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxError>> + Send + 'static>> {
-        Box::pin(EventContext::scheduled(self, timer_type).map_err(|e| Box::new(e) as BoxError))
+    ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxEventContextError>> + Send + 'static>>
+    {
+        Box::pin(
+            EventContext::scheduled(self, timer_type)
+                .map_err(|e| Box::new(e) as BoxEventContextError),
+        )
     }
 
     fn should_shutdown(&self) -> bool {

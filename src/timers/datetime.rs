@@ -341,6 +341,22 @@ pub enum CompactDateTimeError {
     PastDateTime,
 }
 
+impl crate::consumer::middleware::ClassifyError for CompactDateTimeError {
+    fn classify_error(&self) -> crate::consumer::middleware::ErrorCategory {
+        match self {
+            // Time is outside representable range (before 1970 or after 2106). Data-dependent -
+            // specific message has invalid time value. Permanent to drop this bad message rather
+            // than retry endlessly.
+            Self::OutOfRange => crate::consumer::middleware::ErrorCategory::Permanent,
+
+            // Time subtraction resulted in negative interval (past datetime). Data-dependent -
+            // specific message has invalid time ordering. Permanent to drop this bad message
+            // rather than retry endlessly.
+            Self::PastDateTime => crate::consumer::middleware::ErrorCategory::Permanent,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

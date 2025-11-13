@@ -68,7 +68,10 @@ impl<T> TableAdapter<T> {
 
 /// Implements the public `TriggerStore` interface using internal
 /// `TriggerOperations`.
-impl<T: TriggerOperations> TriggerStore for TableAdapter<T> {
+impl<T> TriggerStore for TableAdapter<T>
+where
+    T: TriggerOperations,
+{
     type Error = T::Error;
 
     // ===================================================================

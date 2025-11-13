@@ -20,6 +20,7 @@
 //! implement the same trait to provide durability.
 
 use crate::Key;
+use crate::consumer::middleware::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -102,6 +103,14 @@ impl fmt::Display for InvalidSegmentVersionError {
 }
 
 impl Error for InvalidSegmentVersionError {}
+
+impl crate::consumer::middleware::ClassifyError for InvalidSegmentVersionError {
+    fn classify_error(&self) -> crate::consumer::middleware::ErrorCategory {
+        // Invalid segment version value (not 1 or 2). Indicates data corruption or
+        // incompatible schema version in database. Not recoverable by retry.
+        crate::consumer::middleware::ErrorCategory::Permanent
+    }
+}
 
 /// V1 trigger representation without timer type field.
 ///
@@ -189,7 +198,7 @@ pub struct Segment {
 /// - Slab Loader (segment management + slab queries)
 pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Error type for storage operations.
-    type Error: Error + Send + Sync + 'static;
+    type Error: ClassifyError + Error + Send + Sync + 'static;
 
     // ===================================================================
     // Segment Operations (2 methods) - Used by Loader

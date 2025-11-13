@@ -1,12 +1,15 @@
 use crate::Key;
-use crate::cassandra::{CassandraConfiguration, CassandraStore, CassandraStoreError};
+use crate::cassandra::errors::CassandraStoreError;
+use crate::cassandra::{CassandraConfiguration, CassandraStore};
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::timers::error::ParseError;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::queries::Queries;
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::store::{InvalidSegmentVersionError, Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
@@ -17,7 +20,7 @@ use scylla::statement::prepared::PreparedStatement;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-
+use thiserror::Error;
 use tokio::task::coop::cooperative;
 use tracing::{error, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -109,12 +112,14 @@ impl CassandraTriggerStore {
             Some(ttl) => {
                 self.session()
                     .execute_unpaged(query_with_ttl, params_with_ttl(ttl))
-                    .await?;
+                    .await
+                    .map_err(CassandraStoreError::from)?;
             }
             None => {
                 self.session()
                     .execute_unpaged(query_no_ttl, params_no_ttl())
-                    .await?;
+                    .await
+                    .map_err(CassandraStoreError::from)?;
             }
         }
         Ok(())
@@ -140,9 +145,12 @@ impl CassandraTriggerStore {
         let row = self
             .session()
             .execute_unpaged(&self.queries().get_segment, (segment_id,))
-            .await?
-            .into_rows_result()?
-            .maybe_first_row::<(String, CompactDuration, Option<i8>)>()?;
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<(String, CompactDuration, Option<i8>)>()
+            .map_err(CassandraStoreError::from)?;
 
         let Some((name, slab_size, version)) = row else {
             return Ok(None);
@@ -186,7 +194,8 @@ impl TriggerOperations for CassandraTriggerStore {
                     i8::from(segment.version),
                 ),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -198,6 +207,7 @@ impl TriggerOperations for CassandraTriggerStore {
         };
 
         let segment = migration::migrate_segment_if_needed(self, segment, self.slab_size).await?;
+
         Ok(Some(segment))
     }
 
@@ -205,7 +215,8 @@ impl TriggerOperations for CassandraTriggerStore {
     async fn delete_segment(&self, segment_id: &SegmentId) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(&self.queries().delete_segment, (segment_id,))
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -219,11 +230,16 @@ impl TriggerOperations for CassandraTriggerStore {
             let stream = self
                 .session()
                 .execute_iter(self.queries().get_slabs.clone(), (segment_id,))
-                .await?
-                .rows_stream::<(Option<i32>,)>()?;
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(Option<i32>,)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((value,)) = cooperative(stream.try_next()).await? {
+            while let Some((value,)) = cooperative(stream.try_next())
+                .await
+                .map_err(CassandraStoreError::from)?
+            {
                 let Some(value) = value else {
                     continue;
                 };
@@ -281,11 +297,16 @@ impl TriggerOperations for CassandraTriggerStore {
                         self.queries().get_slab_range.clone(),
                         (segment_id, start, i32::MAX),
                     )
-                    .await?
-                    .rows_stream::<(Option<i32>,)>()?;
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .rows_stream::<(Option<i32>,)>()
+                    .map_err(CassandraStoreError::from)?;
 
                 pin_mut!(stream1);
-                while let Some((value,)) = cooperative(stream1.try_next()).await? {
+                while let Some((value,)) = cooperative(stream1.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                {
                     let Some(value) = value else {
                         continue;
                     };
@@ -301,11 +322,16 @@ impl TriggerOperations for CassandraTriggerStore {
                         self.queries().get_slab_range.clone(),
                         (segment_id, i32::MIN, end),
                     )
-                    .await?
-                    .rows_stream::<(Option<i32>,)>()?;
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .rows_stream::<(Option<i32>,)>()
+                    .map_err(CassandraStoreError::from)?;
 
                 pin_mut!(stream2);
-                while let Some((value,)) = cooperative(stream2.try_next()).await? {
+                while let Some((value,)) = cooperative(stream2.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                {
                     let Some(value) = value else {
                         continue;
                     };
@@ -321,11 +347,16 @@ impl TriggerOperations for CassandraTriggerStore {
                         self.queries().get_slab_range.clone(),
                         (segment_id, start, end),
                     )
-                    .await?
-                    .rows_stream::<(Option<i32>,)>()?;
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .rows_stream::<(Option<i32>,)>()
+                    .map_err(CassandraStoreError::from)?;
 
                 pin_mut!(stream);
-                while let Some((value,)) = cooperative(stream.try_next()).await? {
+                while let Some((value,)) = cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                {
                     let Some(value) = value else {
                         continue;
                     };
@@ -361,7 +392,8 @@ impl TriggerOperations for CassandraTriggerStore {
                 &self.queries().delete_slab,
                 (segment_id, i32::from_le_bytes(slab_id.to_le_bytes())),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -384,12 +416,12 @@ impl TriggerOperations for CassandraTriggerStore {
                     self.queries().get_slab_triggers.clone(),
                     (segment_id, slab_size, slab_id, timer_type_i8),
                 )
-                .await?
-                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
+                .await.map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>().map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
             while let Some((key, time, timer_type_returned, span_map)) =
-                cooperative(stream.try_next()).await?
+                cooperative(stream.try_next()).await.map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger");
@@ -398,6 +430,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 }
 
                 let timer_type = TimerType::try_from(timer_type_returned)?;
+
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -419,12 +452,16 @@ impl TriggerOperations for CassandraTriggerStore {
                     self.queries().get_slab_triggers_all_types.clone(),
                     (segment_id, slab_size, slab_id),
                 )
-                .await?
-                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
             while let Some((key, time, timer_type_returned, span_map)) =
-                cooperative(stream.try_next()).await?
+                cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger_all_types");
@@ -489,7 +526,8 @@ impl TriggerOperations for CassandraTriggerStore {
                     time,
                 ),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -505,7 +543,8 @@ impl TriggerOperations for CassandraTriggerStore {
                     i32::from_le_bytes(slab.id().to_le_bytes()),
                 ),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -524,11 +563,16 @@ impl TriggerOperations for CassandraTriggerStore {
                     self.queries().get_key_times.clone(),
                     (segment_id, key.as_ref(), i8::from(timer_type)),
                 )
-                .await?
-                .rows_stream::<(CompactDateTime,)>()?;
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(CompactDateTime,)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((time,)) = cooperative(stream.try_next()).await? {
+            while let Some((time,)) = cooperative(stream.try_next())
+                .await
+                .map_err(CassandraStoreError::from)?
+            {
                 yield time
             }
         }
@@ -548,12 +592,16 @@ impl TriggerOperations for CassandraTriggerStore {
                     self.queries().get_key_triggers.clone(),
                     (segment_id, key.as_ref(), i8::from(timer_type)),
                 )
-                .await?
-                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
             while let Some((key, time, timer_type_returned, span_map)) =
-                cooperative(stream.try_next()).await?
+                cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_key_trigger");
@@ -580,12 +628,16 @@ impl TriggerOperations for CassandraTriggerStore {
                     self.queries().get_key_triggers_all_types.clone(),
                     (segment_id, key.as_ref()),
                 )
-                .await?
-                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()?;
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
             while let Some((key, time, timer_type_returned, span_map)) =
-                cooperative(stream.try_next()).await?
+                cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_key_trigger_all_types");
@@ -636,7 +688,8 @@ impl TriggerOperations for CassandraTriggerStore {
                 &self.queries().delete_key_trigger,
                 (segment_id, key.as_ref(), i8::from(timer_type), time),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -653,7 +706,8 @@ impl TriggerOperations for CassandraTriggerStore {
                 &self.queries().clear_key_triggers,
                 (segment_id, key.as_ref(), i8::from(timer_type)),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -669,7 +723,8 @@ impl TriggerOperations for CassandraTriggerStore {
                 &self.queries().clear_key_triggers_all_types,
                 (segment_id, key.as_ref()),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -693,7 +748,8 @@ impl TriggerOperations for CassandraTriggerStore {
                     segment_id,
                 ),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -732,8 +788,63 @@ pub async fn cassandra_store(
     Ok(TableAdapter::new(cassandra))
 }
 
-/// Error type for Cassandra trigger store operations.
-pub type CassandraTriggerStoreError = CassandraStoreError;
+#[derive(Debug, Error)]
+pub enum CassandraTriggerStoreError {
+    /// Database error
+    #[error("database error: {0:#}")]
+    Database(#[from] CassandraStoreError),
+
+    /// Invalid segment version value.
+    #[error("Invalid segment version: {0:#}")]
+    InvalidSegmentVersion(#[from] InvalidSegmentVersionError),
+
+    /// Slab size mismatch during segment insertion.
+    #[error(
+        "Cannot insert segment {segment_id} with slab_size {segment_slab_size} that differs from \
+         configured slab_size {configured_slab_size}"
+    )]
+    SlabSizeMismatch {
+        /// The ID of the segment being inserted.
+        segment_id: SegmentId,
+        /// The slab size of the segment being inserted.
+        segment_slab_size: CompactDuration,
+        /// The configured slab size for this store.
+        configured_slab_size: CompactDuration,
+    },
+
+    /// Segment disappeared during data migration.
+    #[error("Segment {segment_id} disappeared during {operation}")]
+    SegmentDisappeared {
+        /// The ID of the segment that disappeared.
+        segment_id: SegmentId,
+        /// The operation that was being performed when the segment disappeared.
+        operation: &'static str,
+    },
+
+    /// Invalid timer type value in database.
+    #[error("Invalid timer type: {0:#}")]
+    Parse(#[from] ParseError),
+}
+
+impl ClassifyError for CassandraTriggerStoreError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Database(e) => e.classify_error(),
+            Self::InvalidSegmentVersion(e) => e.classify_error(),
+
+            // Attempting to insert segment with slab_size different from store's configured
+            // slab_size. Configuration mismatch that prevents ALL insertions of mismatched
+            // segments. Requires configuration or data fix.
+            Self::SlabSizeMismatch { .. } => ErrorCategory::Terminal,
+
+            // Segment disappeared during data migration, likely due to concurrent deletion or
+            // race condition. Retrying might succeed if segment reappears or operation completes.
+            Self::SegmentDisappeared { .. } => ErrorCategory::Transient,
+
+            Self::Parse(e) => e.classify_error(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {

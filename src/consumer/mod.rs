@@ -177,7 +177,8 @@ use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDurationError;
 use crate::timers::store::TriggerStore;
-use crate::timers::store::cassandra::{CassandraTriggerStoreError, cassandra_store};
+use crate::timers::store::cassandra::CassandraTriggerStoreError;
+use crate::timers::store::cassandra::cassandra_store;
 use crate::timers::store::memory::memory_store;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
@@ -1217,9 +1218,8 @@ pub enum ConsumerError {
     #[error("Kafka operation failed: {0:#}")]
     Kafka(#[from] KafkaError),
 
-    /// Indicates a Cassandra trigger store operation failure.
-    #[error("Cassandra operation failed: {0:#}")]
-    Cassandra(#[from] CassandraTriggerStoreError),
+    #[error("Cassandra trigger store operation failed: {0:#}")]
+    CassandraTriggerStore(#[from] CassandraTriggerStoreError),
 
     /// Indicates a scheduler initialization failure.
     #[error("Scheduler initialization failed: {0:#}")]

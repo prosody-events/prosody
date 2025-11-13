@@ -59,6 +59,19 @@ use educe::Educe;
 use std::sync::Arc;
 use tracing::Span;
 
+mod active;
+pub mod datetime;
+pub mod duration;
+pub mod error;
+mod loader;
+mod manager;
+mod queue;
+mod scheduler;
+mod slab;
+mod slab_lock;
+pub mod store;
+pub mod uncommitted;
+
 /// Timer type identifier for distinguishing concurrent timer types.
 ///
 /// Timers can have different types that determine their purpose and routing.
@@ -150,19 +163,6 @@ impl Trigger {
         span.as_ref().clone()
     }
 }
-
-mod active;
-pub mod datetime;
-pub mod duration;
-pub mod error;
-mod loader;
-mod manager;
-mod queue;
-mod scheduler;
-mod slab;
-mod slab_lock;
-pub mod store;
-pub mod uncommitted;
 
 /// Maximum concurrent slab loading operations.
 const LOAD_CONCURRENCY: usize = 16;

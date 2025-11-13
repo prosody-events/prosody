@@ -146,7 +146,8 @@
 //! - [`ErrorCategory::Terminal`] - System failure, abort processing
 
 use std::convert::Infallible;
-use std::fmt::Display;
+use std::error::Error;
+use std::fmt::{Debug, Display};
 use std::future::Future;
 
 use crate::consumer::event_context::EventContext;
@@ -565,5 +566,11 @@ where
 impl ClassifyError for Infallible {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Terminal
+    }
+}
+
+impl ClassifyError for std::io::Error {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Transient
     }
 }

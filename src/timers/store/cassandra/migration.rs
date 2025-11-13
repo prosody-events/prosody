@@ -49,7 +49,6 @@
 //! 3. If same: No slab size migration needed
 
 use crate::timers::duration::CompactDuration;
-use crate::timers::error::TimerManagerError;
 use crate::timers::slab::Slab;
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, SlabId};
@@ -66,14 +65,13 @@ const MIGRATION_SLAB_CONCURRENCY: usize = 4;
 /// Conservative limit for write operations during migration.
 /// Combined with [`MIGRATION_SLAB_CONCURRENCY`]: 4 × 4 = 16 total operations.
 const MIGRATION_WRITE_CONCURRENCY: usize = 4;
+use super::{CassandraTriggerStore, CassandraTriggerStoreError};
 use ahash::HashSet;
 use futures::stream;
 use futures::{StreamExt, TryStreamExt};
 use tokio::task::coop::cooperative;
 use tokio::try_join;
 use tracing::{debug, info, instrument, warn};
-
-use super::{CassandraTriggerStore, CassandraTriggerStoreError};
 
 /// Migrates a segment if necessary, performing both version and slab size
 /// migrations.
@@ -104,7 +102,7 @@ pub async fn migrate_segment_if_needed(
     store: &CassandraTriggerStore,
     mut segment: Segment,
     desired_slab_size: CompactDuration,
-) -> Result<Segment, TimerManagerError<CassandraTriggerStoreError>> {
+) -> Result<Segment, CassandraTriggerStoreError> {
     // Phase 1: V1→V2 schema migration
     if needs_migration(&segment) {
         segment = migrate_segment_version(store, segment).await?;
@@ -157,7 +155,7 @@ pub fn needs_migration(segment: &Segment) -> bool {
 pub async fn migrate_segment_version(
     store: &CassandraTriggerStore,
     mut segment: Segment,
-) -> Result<Segment, TimerManagerError<CassandraTriggerStoreError>> {
+) -> Result<Segment, CassandraTriggerStoreError> {
     let segment_id = segment.id;
     info!("Starting v1 to v2 migration for segment {segment_id}");
 
@@ -165,71 +163,68 @@ pub async fn migrate_segment_version(
     let v1_ops = store.v1();
 
     // Phase 1: Collect all v1 slabs (non-destructive)
-    let slab_ids: Vec<_> = v1_ops
-        .get_slabs(&segment_id)
-        .try_collect()
-        .await
-        .map_err(TimerManagerError::Store)?;
+    let slab_ids: Vec<_> = v1_ops.get_slabs(&segment_id).try_collect().await?;
 
     debug!("Found {} v1 slabs to migrate", slab_ids.len());
 
     // Phase 2: Read all v1 data and write to v2 (idempotent, no deletes)
     // Process all slabs and triggers concurrently for maximum throughput
-    stream::iter(slab_ids.iter().copied().map(Ok::<_, TimerManagerError<_>>))
-        .try_for_each_concurrent(MIGRATION_SLAB_CONCURRENCY, |slab_id| {
-            let v1_ops = v1_ops.clone();
-            let store = store.clone();
-            let segment_id = segment.id;
-            let slab_size = segment.slab_size;
+    stream::iter(
+        slab_ids
+            .iter()
+            .copied()
+            .map(Ok::<_, CassandraTriggerStoreError>),
+    )
+    .try_for_each_concurrent(MIGRATION_SLAB_CONCURRENCY, |slab_id| {
+        let v1_ops = v1_ops.clone();
+        let store = store.clone();
+        let segment_id = segment.id;
+        let slab_size = segment.slab_size;
 
-            async move {
-                // Stream v1 triggers and write to v2 concurrently
-                let triggers = v1_ops.get_slab_triggers(&segment_id, slab_id);
+        async move {
+            // Stream v1 triggers and write to v2 concurrently
+            let triggers = v1_ops.get_slab_triggers(&segment_id, slab_id);
 
-                triggers
-                    .map_err(TimerManagerError::Store)
-                    .try_for_each_concurrent(MIGRATION_WRITE_CONCURRENCY, |v1_trigger| {
-                        let store = store.clone();
+            triggers
+                .try_for_each_concurrent(MIGRATION_WRITE_CONCURRENCY, |v1_trigger| {
+                    let store = store.clone();
 
-                        async move {
-                            // Convert v1 trigger to v2 with Application timer type
-                            let v2_trigger = Trigger::new(
-                                v1_trigger.key.clone(),
-                                v1_trigger.time,
-                                TimerType::Application,
-                                v1_trigger.span,
-                            );
+                    async move {
+                        // Convert v1 trigger to v2 with Application timer type
+                        let v2_trigger = Trigger::new(
+                            v1_trigger.key.clone(),
+                            v1_trigger.time,
+                            TimerType::Application,
+                            v1_trigger.span,
+                        );
 
-                            // Recalculate slab based on trigger time and segment slab_size.
-                            // Since slab_size is unchanged during version migration, this produces
-                            // the same slab_id as V1, so slab metadata row already exists.
-                            let target_slab =
-                                Slab::from_time(segment_id, slab_size, v2_trigger.time);
+                        // Recalculate slab based on trigger time and segment slab_size.
+                        // Since slab_size is unchanged during version migration, this produces
+                        // the same slab_id as V1, so slab metadata row already exists.
+                        let target_slab = Slab::from_time(segment_id, slab_size, v2_trigger.time);
 
-                            // Write to V2 tables (slab and key indices)
-                            try_join!(
-                                store.insert_slab_trigger(target_slab, v2_trigger.clone()),
-                                store.insert_key_trigger(&segment_id, v2_trigger),
-                            )
-                            .map_err(TimerManagerError::Store)?;
+                        // Write to V2 tables (slab and key indices)
+                        try_join!(
+                            store.insert_slab_trigger(target_slab, v2_trigger.clone()),
+                            store.insert_key_trigger(&segment_id, v2_trigger),
+                        )?;
 
-                            Ok(())
-                        }
-                    })
-                    .await?;
+                        Ok(())
+                    }
+                })
+                .await?;
 
-                debug!("Migrated slab {slab_id}");
-                Ok(())
-            }
-        })
-        .await?;
+            debug!("Migrated slab {slab_id}");
+            Ok(())
+        }
+    })
+    .await?;
 
     // Phase 3: Update segment version (atomic marker indicating migration complete)
     // This is the critical point - after this, the system uses v2 tables
     store
         .update_segment_version(&segment_id, SegmentVersion::V2, segment.slab_size)
-        .await
-        .map_err(TimerManagerError::Store)?;
+        .await?;
 
     info!("Successfully migrated segment {segment_id} from V1 to V2");
 
@@ -344,13 +339,13 @@ pub fn needs_slab_size_migration(segment: &Segment, desired_slab_size: CompactDu
 ///
 /// # Errors
 ///
-/// Returns [`TimerManagerError`] if reading or writing triggers fails
+/// Returns [`CassandraTriggerStoreError`] if reading or writing triggers fails
 async fn migrate_triggers_to_new_slabs(
     store: &CassandraTriggerStore,
     segment: &Segment,
     old_slab_ids: &[SlabId],
     desired_slab_size: CompactDuration,
-) -> Result<HashSet<SlabId>, TimerManagerError<CassandraTriggerStoreError>> {
+) -> Result<HashSet<SlabId>, CassandraTriggerStoreError> {
     // Process slabs concurrently, streaming triggers within each slab
     let new_slab_id_sets: Vec<HashSet<SlabId>> = stream::iter(old_slab_ids.iter().copied())
         .map(|old_slab_id| {
@@ -364,25 +359,16 @@ async fn migrate_triggers_to_new_slabs(
                 let trigger_stream = store.get_slab_triggers_all_types(&old_slab);
                 tokio::pin!(trigger_stream);
 
-                while let Some(trigger) = cooperative(trigger_stream.try_next())
-                    .await
-                    .map_err(TimerManagerError::Store)?
-                {
+                while let Some(trigger) = cooperative(trigger_stream.try_next()).await? {
                     let new_slab = Slab::from_time(segment_id, desired_slab_size, trigger.time);
 
                     // Register new slab metadata if first time seeing this ID
                     if new_slab_ids.insert(new_slab.id()) {
-                        store
-                            .insert_slab(&segment_id, new_slab.clone())
-                            .await
-                            .map_err(TimerManagerError::Store)?;
+                        store.insert_slab(&segment_id, new_slab.clone()).await?;
                     }
 
                     // Write trigger to new slab (key table unchanged)
-                    store
-                        .insert_slab_trigger(new_slab, trigger)
-                        .await
-                        .map_err(TimerManagerError::Store)?;
+                    store.insert_slab_trigger(new_slab, trigger).await?;
                 }
 
                 debug!(
@@ -390,7 +376,7 @@ async fn migrate_triggers_to_new_slabs(
                     new_slab_ids.len()
                 );
 
-                Ok::<_, TimerManagerError<CassandraTriggerStoreError>>(new_slab_ids)
+                Ok::<_, CassandraTriggerStoreError>(new_slab_ids)
             }
         })
         .buffer_unordered(MIGRATION_SLAB_CONCURRENCY)
@@ -528,7 +514,7 @@ pub async fn migrate_slab_size(
     store: &CassandraTriggerStore,
     mut segment: Segment,
     desired_slab_size: CompactDuration,
-) -> Result<Segment, TimerManagerError<CassandraTriggerStoreError>> {
+) -> Result<Segment, CassandraTriggerStoreError> {
     let segment_id = segment.id;
     let old_slab_size = segment.slab_size;
 
@@ -548,11 +534,7 @@ pub async fn migrate_slab_size(
     );
 
     // Phase 1: Collect all slabs with old slab_size (non-destructive)
-    let old_slab_ids: Vec<_> = store
-        .get_slabs(&segment_id)
-        .try_collect()
-        .await
-        .map_err(TimerManagerError::Store)?;
+    let old_slab_ids: Vec<_> = store.get_slabs(&segment_id).try_collect().await?;
 
     debug!(
         "Found {} slabs to migrate for segment {segment_id}",
@@ -567,8 +549,7 @@ pub async fn migrate_slab_size(
     // complete)
     store
         .update_segment_version(&segment_id, SegmentVersion::V2, desired_slab_size)
-        .await
-        .map_err(TimerManagerError::Store)?;
+        .await?;
 
     info!(
         "Successfully migrated segment {segment_id}, slab_size updated from {old_slab_size} to \

@@ -1,0 +1,316 @@
+//! In-memory implementation of `DeferStore` for testing.
+//!
+//! Provides [`MemoryDeferStore`], a lock-free, concurrent implementation
+//! of the [`DeferStore`] trait using [`scc::HashMap`].
+//!
+//! # Usage
+//!
+//! ```rust,no_run
+//! use prosody::consumer::middleware::defer::store::memory::MemoryDeferStore;
+//!
+//! let store = MemoryDeferStore::new();
+//! // Use store with DeferStore methods
+//! ```
+//!
+//! All data is held in memory and lost on process exit. Not suitable for
+//! production use where persistence across restarts is required.
+
+use super::DeferStore;
+use crate::Offset;
+use crate::timers::datetime::CompactDateTime;
+use scc::HashMap;
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+/// In-memory implementation of [`DeferStore`] for testing and development.
+///
+/// Uses [`scc::HashMap`] for lock-free concurrent access. Stores multiple
+/// offsets per key (queue) with a shared retry counter. All data is
+/// volatile - deferred state is lost when the process exits.
+///
+/// # Thread Safety
+///
+/// Safe to clone and use from multiple threads. All operations are atomic
+/// per `key_id`.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryDeferStore(Arc<Inner>);
+
+/// Internal state for [`MemoryDeferStore`].
+///
+/// Maps each UUID to:
+/// - `BTreeMap<Offset, Instant>`: Sorted offsets (oldest first) with TTL
+///   simulation
+/// - `u32`: Shared retry counter for this key
+#[derive(Debug, Default)]
+struct Inner {
+    /// Storage: `key_id` -> (`offsets_with_expiry`, `retry_count`)
+    deferred: HashMap<Uuid, (BTreeMap<Offset, Instant>, u32)>,
+}
+
+impl MemoryDeferStore {
+    /// Creates a new, empty in-memory defer store.
+    ///
+    /// # Returns
+    ///
+    /// A ready-to-use [`MemoryDeferStore`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl DeferStore for MemoryDeferStore {
+    type Error = Infallible;
+
+    async fn get_next_deferred_message(
+        &self,
+        key_id: &Uuid,
+    ) -> Result<Option<(Offset, u32)>, Self::Error> {
+        let now = Instant::now();
+
+        // Get the entry for this key
+        let result = self.0.deferred.get_async(key_id).await.and_then(|entry| {
+            let (offsets, retry_count) = entry.get();
+
+            // Find the oldest (first) non-expired offset
+            offsets
+                .iter()
+                .find(|&(_, expiry)| *expiry > now)
+                .map(|(&offset, _)| (offset, *retry_count))
+        });
+
+        Ok(result)
+    }
+
+    async fn append_deferred_message(
+        &self,
+        key_id: &Uuid,
+        offset: Offset,
+        _expected_retry_time: CompactDateTime,
+        retry_count: Option<u32>,
+    ) -> Result<(), Self::Error> {
+        // Calculate expiry time (TTL simulation)
+        // In real Cassandra implementation, this would use
+        // CassandraStore::calculate_ttl() For in-memory, we add 1 hour to
+        // simulate TTL
+        let expiry = Instant::now() + Duration::from_secs(3600);
+
+        self.0
+            .deferred
+            .entry_async(*key_id)
+            .await
+            .and_modify(|(offsets, current_retry_count)| {
+                // Insert the offset with expiry
+                offsets.insert(offset, expiry);
+
+                // Update retry_count if provided (first failure case)
+                if let Some(new_retry_count) = retry_count {
+                    *current_retry_count = new_retry_count;
+                }
+            })
+            .or_insert_with(|| {
+                let mut offsets = BTreeMap::new();
+                offsets.insert(offset, expiry);
+                (offsets, retry_count.unwrap_or(0))
+            });
+
+        Ok(())
+    }
+
+    async fn remove_deferred_message(
+        &self,
+        key_id: &Uuid,
+        offset: Offset,
+    ) -> Result<(), Self::Error> {
+        // Remove offset and determine if entry should be cleaned up
+        // Must drop entry guard before calling remove_async to avoid deadlock
+        let is_empty = {
+            self.0
+                .deferred
+                .entry_async(*key_id)
+                .await
+                .and_modify(|(offsets, _retry_count)| {
+                    offsets.remove(&offset);
+                })
+                .or_default()
+                .get()
+                .0
+                .is_empty()
+        }; // Entry guard is dropped here
+
+        // Clean up empty entries
+        if is_empty {
+            self.0.deferred.remove_async(key_id).await;
+        }
+
+        Ok(())
+    }
+
+    async fn set_retry_count(&self, key_id: &Uuid, retry_count: u32) -> Result<(), Self::Error> {
+        let _ = self.0.deferred.entry_async(*key_id).await.and_modify(
+            |(_offsets, current_retry_count)| {
+                *current_retry_count = retry_count;
+            },
+        );
+
+        Ok(())
+    }
+}
+
+/// Creates a new in-memory defer store.
+///
+/// Convenience function that returns the store wrapped for use as a
+/// trait object. Equivalent to [`MemoryDeferStore::new()`].
+///
+/// # Returns
+///
+/// A new [`MemoryDeferStore`] instance.
+#[must_use]
+pub fn memory_defer_store() -> MemoryDeferStore {
+    MemoryDeferStore::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timers::datetime::CompactDateTime;
+
+    fn test_key_id() -> Uuid {
+        Uuid::new_v4()
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_key() -> color_eyre::Result<()> {
+        let store = MemoryDeferStore::new();
+        let key_id = test_key_id();
+
+        let result = store.get_next_deferred_message(&key_id).await?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_and_get() -> color_eyre::Result<()> {
+        let store = MemoryDeferStore::new();
+        let key_id = test_key_id();
+        let offset = Offset::from(42_i64);
+        let retry_time = CompactDateTime::now()?;
+
+        // Append with retry_count = Some(0) for first failure
+        store
+            .append_deferred_message(&key_id, offset, retry_time, Some(0))
+            .await?;
+
+        let result = store.get_next_deferred_message(&key_id).await?;
+        assert_eq!(result, Some((offset, 0)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multiple_offsets_returns_oldest() -> color_eyre::Result<()> {
+        let store = MemoryDeferStore::new();
+        let key_id = test_key_id();
+        let retry_time = CompactDateTime::now()?;
+
+        // Append multiple offsets
+        store
+            .append_deferred_message(&key_id, Offset::from(100_i64), retry_time, Some(0))
+            .await?;
+        store
+            .append_deferred_message(&key_id, Offset::from(50_i64), retry_time, None)
+            .await?;
+        store
+            .append_deferred_message(&key_id, Offset::from(150_i64), retry_time, None)
+            .await?;
+
+        // Should return the oldest (smallest) offset
+        let result = store.get_next_deferred_message(&key_id).await?;
+        assert_eq!(result, Some((Offset::from(50_i64), 0)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_offset() -> color_eyre::Result<()> {
+        let store = MemoryDeferStore::new();
+        let key_id = test_key_id();
+        let offset = Offset::from(42_i64);
+        let retry_time = CompactDateTime::now()?;
+
+        store
+            .append_deferred_message(&key_id, offset, retry_time, Some(0))
+            .await?;
+        store.remove_deferred_message(&key_id, offset).await?;
+
+        let result = store.get_next_deferred_message(&key_id).await?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent() -> color_eyre::Result<()> {
+        let store = MemoryDeferStore::new();
+        let key_id = test_key_id();
+
+        // Should not error
+        store
+            .remove_deferred_message(&key_id, Offset::from(42_i64))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_retry_count() -> color_eyre::Result<()> {
+        let store = MemoryDeferStore::new();
+        let key_id = test_key_id();
+        let offset = Offset::from(42_i64);
+        let retry_time = CompactDateTime::now()?;
+
+        // Append with retry_count = 0
+        store
+            .append_deferred_message(&key_id, offset, retry_time, Some(0))
+            .await?;
+
+        // Update retry_count to 5
+        store.set_retry_count(&key_id, 5).await?;
+
+        let result = store.get_next_deferred_message(&key_id).await?;
+        assert_eq!(result, Some((offset, 5)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_access() -> color_eyre::Result<()> {
+        let store = MemoryDeferStore::new();
+        let key1 = Uuid::new_v4();
+        let key2 = Uuid::new_v4();
+        let retry_time = CompactDateTime::now()?;
+
+        let store_clone = store.clone();
+        let handle1 = tokio::spawn(async move {
+            store_clone
+                .append_deferred_message(&key1, Offset::from(1_i64), retry_time, Some(1))
+                .await
+        });
+
+        let store_clone = store.clone();
+        let handle2 = tokio::spawn(async move {
+            store_clone
+                .append_deferred_message(&key2, Offset::from(2_i64), retry_time, Some(2))
+                .await
+        });
+
+        assert!(handle1.await.is_ok());
+        assert!(handle2.await.is_ok());
+
+        let result1 = store.get_next_deferred_message(&key1).await?;
+        assert_eq!(result1, Some((Offset::from(1_i64), 1)));
+
+        let result2 = store.get_next_deferred_message(&key2).await?;
+        assert_eq!(result2, Some((Offset::from(2_i64), 2)));
+
+        Ok(())
+    }
+}
