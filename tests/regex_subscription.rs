@@ -72,7 +72,7 @@ async fn create_test_topics(topic_prefix: &str) -> Result<(Vec<TestTopic>, Proso
     ];
 
     let bootstrap = vec![BOOTSTRAP_SERVER.to_owned()];
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap)?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap)?)?;
 
     // Create all test topics with 1 partition and 1 replica
     for topic in &topics {

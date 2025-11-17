@@ -42,7 +42,7 @@ async fn test_backpressure() -> Result<()> {
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Setup an admin client to manage the topic creation
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()

@@ -1,9 +1,11 @@
 //! Provides functionality for administrative operations on Kafka topics.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use derive_builder::Builder;
 use rdkafka::ClientConfig;
+use rdkafka::TopicPartitionList;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::error::KafkaError;
@@ -11,6 +13,7 @@ use thiserror::Error;
 use validator::{Validate, ValidationErrors};
 
 use crate::util::{from_env, from_option_duration_env, from_option_env, from_vec_env};
+use crate::{Offset, Partition, Topic};
 
 /// Configuration for the Kafka admin client.
 ///
@@ -170,10 +173,42 @@ impl ProsodyAdminClient {
         let mut client_config = ClientConfig::new();
         client_config.set("bootstrap.servers", config.bootstrap_servers.join(","));
 
+        // Use 30s timeout for admin operations to handle concurrent test execution
+        let options = AdminOptions::new().operation_timeout(Some(Duration::from_secs(30)));
+
         Ok(Self {
             client: client_config.create()?,
-            options: AdminOptions::default(),
+            options,
         })
+    }
+
+    /// Returns a cached `ProsodyAdminClient` instance, creating it on first
+    /// call.
+    ///
+    /// This method uses a static cache to avoid creating multiple admin clients
+    /// with the same configuration. The first call initializes the client with
+    /// the provided configuration; subsequent calls return the same instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The admin configuration containing bootstrap servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProsodyAdminClientError` if the client creation fails.
+    ///
+    /// # Note
+    ///
+    /// Only the configuration from the first call is used. Subsequent calls
+    /// with different configurations will receive the same cached result.
+    /// Both successful and failed initialization results are cached.
+    pub fn cached(
+        config: &AdminConfiguration,
+    ) -> Result<&'static Self, &'static ProsodyAdminClientError> {
+        static ADMIN: OnceLock<Result<ProsodyAdminClient, ProsodyAdminClientError>> =
+            OnceLock::new();
+
+        ADMIN.get_or_init(|| Self::new(config)).as_ref()
     }
 
     /// Creates a new Kafka topic with the specified configuration.
@@ -235,6 +270,38 @@ impl ProsodyAdminClient {
     /// Returns a `ProsodyAdminClientError` if the topic deletion fails.
     pub async fn delete_topic(&self, name: &str) -> Result<(), ProsodyAdminClientError> {
         self.client.delete_topics(&[name], &self.options).await?;
+        Ok(())
+    }
+
+    /// Deletes records from Kafka topics up to the specified offsets.
+    ///
+    /// # Arguments
+    ///
+    /// * `records` - An iterator of `(Topic, Partition, Offset)` tuples
+    ///   specifying which records to delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProsodyAdminClientError` if the record deletion fails or if
+    /// partition offset addition fails.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// admin.delete_records([
+    ///     (topic.clone(), 0, 100),
+    ///     (topic2.clone(), 1, 200),
+    /// ]).await?;
+    /// ```
+    pub async fn delete_records<I>(&self, records: I) -> Result<(), ProsodyAdminClientError>
+    where
+        I: IntoIterator<Item = (Topic, Partition, Offset)>,
+    {
+        let mut tpl = TopicPartitionList::new();
+        for (topic, partition, offset) in records {
+            tpl.add_partition_offset(topic.as_ref(), partition, rdkafka::Offset::Offset(offset))?;
+        }
+        self.client.delete_records(&tpl, &self.options).await?;
         Ok(())
     }
 }

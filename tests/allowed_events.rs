@@ -39,7 +39,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     let bootstrap = vec!["localhost:9094".to_owned()];
 
     // Create a Kafka topic using the admin client for testing
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()

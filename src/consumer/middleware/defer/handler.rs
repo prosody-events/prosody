@@ -108,20 +108,13 @@ where
     S: DeferStore,
 {
     handler: T,
-    #[allow(dead_code)] // Will be used in Phase 6 (timer handling)
     loader: Arc<KafkaLoader>,
-    #[allow(dead_code)] // Will be used in Phase 5 (deferral logic)
     store: S,
     failure_tracker: FailureTracker,
-    #[allow(dead_code)] // Will be used in Phase 5 (deferral logic)
     cache: Arc<Cache<Key, DeferState>>,
-    #[allow(dead_code)] // Will be used in Phase 5 (backoff calculation)
     config: DeferConfiguration,
-    #[allow(dead_code)] // Will be used in Phase 5 (UUID generation)
     topic: Topic,
-    #[allow(dead_code)] // Will be used in Phase 5 (UUID generation)
     partition: Partition,
-    #[allow(dead_code)] // Will be used in Phase 5 (UUID generation)
     consumer_group: Arc<str>,
 }
 
@@ -230,7 +223,7 @@ where
         context
             .clear_and_schedule(fire_time, TimerType::DeferRetry)
             .await
-            .map_err(|e| DeferError::EventContext(Box::new(e)))?;
+            .map_err(|e| DeferError::Timer(Box::new(e)))?;
 
         Ok(())
     }
@@ -410,9 +403,12 @@ where
             }
         };
 
+        // Determine retry_count for this deferred message
+        // For first failure: retry_count = 0
+        // For subsequent messages on already-deferred key: keep existing retry_count
         let retry_count = match current_state {
             DeferState::NotDeferred => 0,
-            DeferState::Deferred { retry_count } => retry_count + 1,
+            DeferState::Deferred { retry_count } => retry_count, // Don't increment here!
         };
 
         // Calculate backoff delay
@@ -422,10 +418,30 @@ where
         let now = CompactDateTime::now()?;
         let expected_retry_time = now.add_duration(delay)?;
 
-        // Store offset in deferred queue
+        // CRITICAL ORDERING (Invariant 1: Timer Coverage):
+        // 1. Schedule timer FIRST
+        // 2. Write to Cassandra
+        // 3. Update cache
+        //
+        // If timer scheduling fails, error propagates and nothing is stored.
+        // If Cassandra write fails after timer scheduled, error propagates to
+        // RetryMiddleware which retries the entire operation (including timer
+        // scheduling).
+        //
+        // This ensures every deferred message has timer coverage.
+
+        // 1. Schedule timer FIRST (for first failure only)
+        if retry_count == 0 {
+            context
+                .schedule(expected_retry_time, TimerType::DeferRetry)
+                .await
+                .map_err(|e| DeferError::Timer(Box::new(e)))?;
+        }
+
+        // 2. Write to Cassandra
         // For first failure (retry_count == 0), pass Some(0) to set the static
-        // retry_count For subsequent failures, pass None to keep existing
-        // retry_count
+        // retry_count column
+        // For subsequent messages, pass None (just append offset, keep retry_count)
         let retry_count_update = (retry_count == 0).then_some(0);
 
         self.store
@@ -438,15 +454,9 @@ where
             .await
             .map_err(DeferError::Store)?;
 
-        // Update cache
+        // 3. Update cache
         self.cache
             .insert(key.clone(), DeferState::Deferred { retry_count });
-
-        // Schedule timer (TODO Phase 5.2: use clear_and_schedule for retries)
-        context
-            .schedule(expected_retry_time, TimerType::DeferRetry)
-            .await
-            .map_err(|e| DeferError::EventContext(Box::new(e)))?;
 
         debug!(
             "Deferred message for key {:?} (retry_count={}, delay={} seconds)",

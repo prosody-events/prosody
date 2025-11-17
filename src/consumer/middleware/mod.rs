@@ -146,7 +146,6 @@
 //! - [`ErrorCategory::Terminal`] - System failure, abort processing
 
 use std::convert::Infallible;
-use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 

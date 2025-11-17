@@ -94,7 +94,7 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Setup admin client and create topic
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()

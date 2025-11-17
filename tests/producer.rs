@@ -265,7 +265,7 @@ async fn test_producer_deduplication() -> Result<()> {
     // Setup test environment with Kafka broker
     let brokers = vec!["localhost:9094".to_owned()];
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
-    let admin = ProsodyAdminClient::new(&AdminConfiguration::new(brokers.clone())?)?;
+    let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(brokers.clone())?)?;
     admin
         .create_topic(
             &TopicConfiguration::builder()

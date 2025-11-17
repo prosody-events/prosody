@@ -1,12 +1,11 @@
 use super::*;
 use crate::Topic;
+use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use crate::tracing::init_test_logging;
 use futures::future::join_all;
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::client::DefaultClientContext;
+use rdkafka::ClientConfig;
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::{ClientConfig, TopicPartitionList};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -28,33 +27,28 @@ fn loader_config() -> LoaderConfiguration {
 }
 
 fn producer() -> color_eyre::Result<FutureProducer> {
-    Ok(ClientConfig::new()
+    let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9094")
-        .set("message.timeout.ms", "5000")
-        .create()?)
+        .create()?;
+    Ok(producer)
 }
 
-fn admin() -> color_eyre::Result<AdminClient<DefaultClientContext>> {
-    Ok(ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9094")
-        .create()?)
+fn admin() -> color_eyre::Result<&'static ProsodyAdminClient> {
+    let config = AdminConfiguration::new(vec!["localhost:9094".to_owned()])?;
+    Ok(ProsodyAdminClient::cached(&config)?)
 }
 
 async fn create_topic(name: &str) -> color_eyre::Result<()> {
     let admin = admin()?;
-    admin
-        .create_topics(
-            &[NewTopic::new(name, 1, TopicReplication::Fixed(1))],
-            &AdminOptions::new(),
-        )
-        .await?;
+    let topic_config = TopicConfiguration::new(name)?;
+    admin.create_topic(&topic_config).await?;
     sleep(Duration::from_secs(2)).await;
     Ok(())
 }
 
 async fn delete_topic(name: &str) -> color_eyre::Result<()> {
     let admin = admin()?;
-    admin.delete_topics(&[name], &AdminOptions::new()).await?;
+    admin.delete_topic(name).await?;
     Ok(())
 }
 
@@ -82,13 +76,9 @@ async fn produce_messages(topic: &str, count: usize) -> color_eyre::Result<Vec<i
     Ok(offsets)
 }
 
-async fn delete_records_up_to(topic: &str, offset: i64) -> color_eyre::Result<()> {
+async fn delete_records_up_to(topic: &Topic, offset: crate::Offset) -> color_eyre::Result<()> {
     let admin = admin()?;
-    let mut delete_list = TopicPartitionList::new();
-    delete_list.add_partition_offset(topic, 0, rdkafka::Offset::Offset(offset))?;
-    admin
-        .delete_records(&delete_list, &AdminOptions::new())
-        .await?;
+    admin.delete_records([(*topic, 0_i32, offset)]).await?;
     // Wait for Kafka to propagate the deletion across all brokers
     // Experiments show this can take time - increase to 5 seconds
     sleep(Duration::from_secs(5)).await;
@@ -220,7 +210,7 @@ async fn test_load_deleted_offset() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 100).await?;
 
         // Delete offsets 0-49 (LSO becomes 50)
-        delete_records_up_to(&topic_name, 50).await?;
+        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
         let loader = KafkaLoader::new(loader_config())?;
@@ -263,7 +253,7 @@ async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 100).await?;
 
         // Delete offsets 0-49 (LSO becomes 50)
-        delete_records_up_to(&topic_name, 50).await?;
+        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
         let loader = Arc::new(KafkaLoader::new(loader_config())?);
@@ -343,7 +333,7 @@ async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 100).await?;
 
         // Delete offsets 0-49 (LSO becomes 50)
-        delete_records_up_to(&topic_name, 50).await?;
+        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
         let loader = KafkaLoader::new(loader_config())?;
@@ -379,7 +369,7 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 100).await?;
 
         // Delete partition FIRST
-        delete_records_up_to(&topic_name, 50).await?;
+        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
         let loader = KafkaLoader::new(loader_config())?;
@@ -421,7 +411,7 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 100).await?;
 
         // Delete some offsets to set up potential seek failure
-        delete_records_up_to(&topic_name, 30).await?;
+        delete_records_up_to(&Topic::from(topic_name.as_str()), 30).await?;
 
         let topic = Topic::from(topic_name.as_str());
         let loader = KafkaLoader::new(loader_config())?;
@@ -648,7 +638,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 100).await?;
 
         // Delete offsets to trigger seek failure
-        delete_records_up_to(&topic_name, 50).await?;
+        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
         let loader = KafkaLoader::new(loader_config())?;
@@ -816,7 +806,7 @@ async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<(
         let offsets = produce_messages(&topic_name, 100).await?;
 
         // Delete offsets 0-49 (LSO becomes 50)
-        delete_records_up_to(&topic_name, 50).await?;
+        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
         let loader = Arc::new(KafkaLoader::new(loader_config())?);

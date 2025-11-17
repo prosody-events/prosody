@@ -179,7 +179,7 @@ impl TestEnvironment {
     async fn new(test_name: &str) -> Result<Self> {
         let topic: Topic = format!("{}-{}", test_name, Uuid::new_v4()).as_str().into();
         let bootstrap = vec!["localhost:9094".to_owned()];
-        let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+        let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
         admin_client
             .create_topic(
                 &TopicConfiguration::builder()

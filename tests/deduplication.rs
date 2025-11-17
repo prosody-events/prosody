@@ -42,7 +42,7 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
     // Create a unique Kafka topic for isolated testing
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
 
     // Create the Kafka topic with a single partition and replica
     admin_client

@@ -25,8 +25,8 @@ where
     Store(S),
 
     /// Error from the timer system.
-    #[error("event context operation failed: {0:#}")]
-    EventContext(BoxEventContextError),
+    #[error("timer error: {0:#}")]
+    Timer(BoxEventContextError),
 
     /// Error loading message from Kafka.
     #[error("kafka loader error: {0:#}")]
@@ -64,9 +64,56 @@ where
 
             // Delegate to inner error classifications
             Self::Store(error) => error.classify_error(),
-            Self::EventContext(error) => error.classify_error(),
+            Self::Timer(error) => error.classify_error(),
             Self::KafkaLoader(error) => error.classify_error(),
             Self::CompactTime(error) => error.classify_error(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test error type for transient store errors.
+    #[derive(Debug, thiserror::Error, Clone)]
+    #[error("test transient error")]
+    struct TestTransientError;
+
+    impl ClassifyError for TestTransientError {
+        fn classify_error(&self) -> ErrorCategory {
+            ErrorCategory::Transient
+        }
+    }
+
+    /// Test error type for permanent store errors.
+    #[derive(Debug, thiserror::Error, Clone)]
+    #[error("test permanent error")]
+    struct TestPermanentError;
+
+    impl ClassifyError for TestPermanentError {
+        fn classify_error(&self) -> ErrorCategory {
+            ErrorCategory::Permanent
+        }
+    }
+
+    #[test]
+    fn test_configuration_error_is_terminal() {
+        let error = DeferError::<TestTransientError>::Configuration(ConfigurationError::Invalid(
+            "test".to_string(),
+        ));
+        assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
+    }
+
+    #[test]
+    fn test_store_error_delegates_transient() {
+        let error = DeferError::Store(TestTransientError);
+        assert!(matches!(error.classify_error(), ErrorCategory::Transient));
+    }
+
+    #[test]
+    fn test_store_error_delegates_permanent() {
+        let error = DeferError::Store(TestPermanentError);
+        assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
     }
 }

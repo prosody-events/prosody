@@ -175,7 +175,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     let partitions = 3_u16;
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()
