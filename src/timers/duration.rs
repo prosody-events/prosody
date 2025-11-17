@@ -4,6 +4,7 @@
 //! seconds. Reduces memory usage and enables fast arithmetic for timer systems
 //! requiring only second-level precision.
 
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::ops::{Add, Sub};
 use std::time::Duration;
@@ -264,13 +265,13 @@ pub enum CompactDurationError {
     OutOfRange,
 }
 
-impl crate::consumer::middleware::ClassifyError for CompactDurationError {
-    fn classify_error(&self) -> crate::consumer::middleware::ErrorCategory {
+impl ClassifyError for CompactDurationError {
+    fn classify_error(&self) -> ErrorCategory {
         match self {
             // OutOfRange: Arithmetic overflow (add/sub exceeding u32 bounds) or
             // conversion failure (Duration > u32::MAX seconds). Invalid data or
             // calculation - not recoverable by retry.
-            Self::OutOfRange => crate::consumer::middleware::ErrorCategory::Permanent,
+            Self::OutOfRange => ErrorCategory::Permanent,
         }
     }
 }

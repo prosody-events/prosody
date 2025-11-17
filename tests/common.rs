@@ -110,7 +110,9 @@ pub struct TestInput {
 /// # Errors
 ///
 /// Returns an error if the topic creation fails.
-pub async fn create_test_topic(partition_count: SmallCount) -> Result<(Topic, &'static ProsodyAdminClient)> {
+pub async fn create_test_topic(
+    partition_count: SmallCount,
+) -> Result<(Topic, &'static ProsodyAdminClient)> {
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
     let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap)?)?;

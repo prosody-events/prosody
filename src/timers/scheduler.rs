@@ -9,6 +9,7 @@
 //! on a spawned Tokio task.
 
 use crate::Key;
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
@@ -293,8 +294,8 @@ pub enum TimerSchedulerError {
     Shutdown,
 }
 
-impl crate::consumer::middleware::ClassifyError for TimerSchedulerError {
-    fn classify_error(&self) -> crate::consumer::middleware::ErrorCategory {
+impl ClassifyError for TimerSchedulerError {
+    fn classify_error(&self) -> ErrorCategory {
         match self {
             // DateTime conversion error. Delegate to nested error's classification.
             Self::DateTime(e) => e.classify_error(),
@@ -302,7 +303,7 @@ impl crate::consumer::middleware::ClassifyError for TimerSchedulerError {
             // Scheduler has been shut down. System is shutting down or partition is being
             // rebalanced. Transient allows retry after rebalance completes or on different
             // partition.
-            Self::Shutdown => crate::consumer::middleware::ErrorCategory::Transient,
+            Self::Shutdown => ErrorCategory::Transient,
         }
     }
 }

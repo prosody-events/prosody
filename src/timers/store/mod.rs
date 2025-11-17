@@ -20,7 +20,7 @@
 //! implement the same trait to provide durability.
 
 use crate::Key;
-use crate::consumer::middleware::ClassifyError;
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -104,11 +104,11 @@ impl fmt::Display for InvalidSegmentVersionError {
 
 impl Error for InvalidSegmentVersionError {}
 
-impl crate::consumer::middleware::ClassifyError for InvalidSegmentVersionError {
-    fn classify_error(&self) -> crate::consumer::middleware::ErrorCategory {
+impl ClassifyError for InvalidSegmentVersionError {
+    fn classify_error(&self) -> ErrorCategory {
         // Invalid segment version value (not 1 or 2). Indicates data corruption or
         // incompatible schema version in database. Not recoverable by retry.
-        crate::consumer::middleware::ErrorCategory::Permanent
+        ErrorCategory::Permanent
     }
 }
 

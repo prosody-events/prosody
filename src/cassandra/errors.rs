@@ -1,3 +1,16 @@
+//! Error types and classification for Cassandra operations.
+//!
+//! This module defines error types for Cassandra store operations and
+//! implements error classification for retry logic. Errors are classified as:
+//!
+//! - **Terminal**: Programming bugs or configuration errors that won't resolve
+//!   without code/config changes. Requires process restart or deployment.
+//! - **Permanent**: Data-dependent failures specific to this message. Other
+//!   messages will succeed. Message should be dropped or moved to dead letter
+//!   queue.
+//! - **Transient**: Network, timeout, or cluster state issues that may resolve
+//!   on retry. Retry with backoff recommended.
+
 use crate::cassandra::migrator::MigrationError;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDurationError;
@@ -140,9 +153,7 @@ impl From<TypeCheckError> for CassandraStoreError {
 impl ClassifyError for CassandraStoreError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Database returned non-integer type when code expects integer. Schema mismatch where
-            // code type expectations don't match database schema. ALL similar operations will fail
-            // until schema or code is fixed. Terminal because schema issues require intervention.
+            // Schema mismatch: code expects integer but database has different type
             Self::IntExpected => ErrorCategory::Terminal,
 
             Self::Duration(e) => e.classify_error(),
@@ -166,22 +177,14 @@ impl ClassifyError for CassandraStoreError {
 impl ClassifyError for ConnectionPoolError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Connection pool broken, last connection attempt failed. Network or cluster issue
-            // that could be temporary (node down, network partition). Retry may succeed.
-            Self::Broken { .. } => ErrorCategory::Transient,
-
-            // Connection pool still initializing. Temporary state that will resolve once
-            // initialization completes. Retry may succeed.
-            Self::Initializing => ErrorCategory::Transient,
-
-            // Host filter explicitly excludes this node. While this is a configuration setting,
-            // the filter might be updated dynamically or temporarily. Routing to this node may
-            // succeed later if filter is updated, or operation may succeed on other nodes.
-            Self::NodeDisabledByHostFilter => ErrorCategory::Transient,
-
-            // Non-exhaustive enum: safe default for unknown variants. New error types should be
-            // explicitly classified after reviewing scylla driver updates.
-            _ => ErrorCategory::Transient,
+            // All variants are transient cluster/network states:
+            // - Broken: connection failed, may recover when network/node restores
+            // - Initializing: pool starting up, will complete shortly
+            // - NodeDisabledByHostFilter: host filter may change, or other nodes may succeed
+            // - _: unknown variants conservatively treated as transient
+            Self::Broken { .. } | Self::Initializing | Self::NodeDisabledByHostFilter | _ => {
+                ErrorCategory::Transient
+            }
         }
     }
 }
@@ -191,37 +194,25 @@ impl ClassifyError for RequestAttemptError {
         match self {
             Self::SerializationError(e) => e.classify_error(),
             Self::CqlRequestSerialization(e) => e.classify_error(),
-
-            // Failed to allocate stream ID for request. Driver resource pool exhausted,
-            // typically due to too many concurrent requests. Temporary resource constraint that
-            // should resolve as requests complete. Retry may succeed after backoff.
-            Self::UnableToAllocStreamId => ErrorCategory::Transient,
-
             Self::BrokenConnectionError(e) => e.classify_error(),
             Self::BodyExtensionsParseError(e) => e.classify_error(),
             Self::CqlResultParseError(e) => e.classify_error(),
             Self::CqlErrorParseError(e) => e.classify_error(),
             Self::DbError(e, _) => e.classify_error(),
 
-            // Server sent unexpected response type. Likely protocol violation or driver bug, but
-            // could be transient server state. May resolve when server restarts or reconnects.
-            Self::UnexpectedResponse(_) => ErrorCategory::Transient,
-
-            // Prepared statement ID changed after re-preparation. Protocol anomaly that may be
-            // transient server state. May resolve on retry or reconnection.
-            Self::RepreparedIdChanged { .. } => ErrorCategory::Transient,
-
-            // Re-prepared statement missing from batch. Driver state issue that may resolve on
-            // retry or reconnection.
-            Self::RepreparedIdMissingInBatch => ErrorCategory::Transient,
-
-            // Unpaged query returned paging state. Protocol anomaly that may be transient server
-            // state. May resolve on retry.
-            Self::NonfinishedPagingState => ErrorCategory::Transient,
-
-            // Non-exhaustive enum: safe default for unknown variants. New error types should be
-            // explicitly classified after reviewing scylla driver updates.
-            _ => ErrorCategory::Transient,
+            // All remaining variants are transient driver/protocol states:
+            // - UnableToAllocStreamId: resource pool exhausted, resolves as requests complete
+            // - UnexpectedResponse: protocol anomaly, may resolve on reconnection
+            // - RepreparedIdChanged: statement re-preparation issue, retry may succeed
+            // - RepreparedIdMissingInBatch: driver state inconsistency, retry may succeed
+            // - NonfinishedPagingState: protocol violation, retry may succeed
+            // - _: unknown variants conservatively treated as transient
+            Self::UnableToAllocStreamId
+            | Self::UnexpectedResponse(_)
+            | Self::RepreparedIdChanged { .. }
+            | Self::RepreparedIdMissingInBatch
+            | Self::NonfinishedPagingState
+            | _ => ErrorCategory::Transient,
         }
     }
 }
@@ -233,8 +224,7 @@ impl ClassifyError for NextPageError {
             Self::RequestFailure(e) => e.classify_error(),
             Self::ResultMetadataParseError(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants. Future variants may include
-            // type check errors or other validation failures that should be explicitly classified.
+            // Unknown variants conservatively treated as transient
             _ => ErrorCategory::Transient,
         }
     }
@@ -248,34 +238,20 @@ impl ClassifyError for SchemaAgreementError {
             Self::TracesEventsIntoRowsResultError(e) => e.classify_error(),
             Self::SingleRowError(e) => e.classify_error(),
 
-            // Schema agreement check timed out waiting for all nodes to converge on same schema
-            // version. Transient cluster state during schema propagation. Retry may succeed once
-            // schema converges across nodes.
-            Self::Timeout(_) => ErrorCategory::Transient,
-
-            // Required host not present in connection pool. Transient topology state during node
-            // joins/leaves or pool initialization. Retry may succeed once topology stabilizes.
-            Self::RequiredHostAbsent { .. } => ErrorCategory::Transient,
-
-            // Non-exhaustive enum: safe default for unknown variants.
-            _ => ErrorCategory::Transient,
+            // Transient cluster states during schema propagation:
+            // - Timeout: schema agreement check took too long
+            // - RequiredHostAbsent: host unavailable during topology check
+            Self::Timeout(_) | Self::RequiredHostAbsent { .. } | _ => ErrorCategory::Transient,
         }
     }
 }
 
 impl ClassifyError for PeersMetadataError {
     fn classify_error(&self) -> ErrorCategory {
+        // All variants are transient topology states (cluster initialization, metadata
+        // refresh)
         match self {
-            // Cluster peers metadata query returned no peers. Transient state during cluster
-            // initialization or metadata refresh. Retry may succeed once topology stabilizes.
-            Self::EmptyPeers => ErrorCategory::Transient,
-
-            // Cluster peers have empty token ownership lists. Transient state during cluster
-            // topology changes or token assignment. Retry may succeed once tokens are assigned.
-            Self::EmptyTokenLists => ErrorCategory::Transient,
-
-            // Non-exhaustive enum: safe default for unknown variants.
-            _ => ErrorCategory::Transient,
+            Self::EmptyPeers | Self::EmptyTokenLists | _ => ErrorCategory::Transient,
         }
     }
 }
@@ -285,7 +261,6 @@ impl ClassifyError for KeyspacesMetadataError {
         match self {
             Self::Strategy { error, .. } => error.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
             _ => ErrorCategory::Transient,
         }
     }
@@ -294,15 +269,8 @@ impl ClassifyError for KeyspacesMetadataError {
 impl ClassifyError for UdtMetadataError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Database schema has invalid CQL type in UDT definition. Schema error affecting ALL
-            // operations using this UDT. Requires schema fix to resolve. Terminal because schema
-            // issues won't resolve without intervention.
-            Self::InvalidCqlType { .. } => ErrorCategory::Terminal,
-
-            // Database schema has circular UDT dependency. Schema design error affecting ALL
-            // operations with this UDT. Requires schema fix. Terminal because schema issues need
-            // manual intervention.
-            Self::CircularTypeDependency => ErrorCategory::Terminal,
+            // Schema errors require manual fix: invalid type or circular UDT dependency
+            Self::InvalidCqlType { .. } | Self::CircularTypeDependency => ErrorCategory::Terminal,
 
             _ => ErrorCategory::Transient,
         }
@@ -312,15 +280,8 @@ impl ClassifyError for UdtMetadataError {
 impl ClassifyError for TablesMetadataError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Database schema has invalid CQL type in table definition. Schema error affecting
-            // ALL operations on this table. Requires schema fix. Terminal because schema issues
-            // need manual intervention.
-            Self::InvalidCqlType { .. } => ErrorCategory::Terminal,
-
-            // Database schema has unknown column kind. Schema error affecting ALL operations on
-            // this table. Requires schema fix. Terminal because schema issues need manual
-            // intervention.
-            Self::UnknownColumnKind { .. } => ErrorCategory::Terminal,
+            // Schema errors require manual fix: invalid type or unknown column kind
+            Self::InvalidCqlType { .. } | Self::UnknownColumnKind { .. } => ErrorCategory::Terminal,
 
             _ => ErrorCategory::Transient,
         }
@@ -330,20 +291,14 @@ impl ClassifyError for TablesMetadataError {
 impl ClassifyError for NewSessionError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // ALL configured hostnames failed DNS resolution. Could be temporary DNS server
-            // failure, network partition, or invalid hostnames. DNS infrastructure failures are
-            // transient and may resolve. Retry may succeed when DNS recovers.
-            Self::FailedToResolveAnyHostname(_) => ErrorCategory::Transient,
-
-            // No Cassandra nodes configured for connection. Structural configuration error - cannot
-            // connect to cluster without any node addresses. Terminal because requires adding node
-            // addresses to configuration.
+            // Configuration error: no nodes configured, requires adding node addresses
             Self::EmptyKnownNodesList => ErrorCategory::Terminal,
 
             Self::MetadataError(e) => e.classify_error(),
             Self::UseKeyspaceError(e) => e.classify_error(),
 
-            _ => ErrorCategory::Transient,
+            // DNS failures are transient infrastructure issues
+            Self::FailedToResolveAnyHostname(_) | _ => ErrorCategory::Transient,
         }
     }
 }
@@ -351,24 +306,13 @@ impl ClassifyError for NewSessionError {
 impl ClassifyError for UseKeyspaceError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // BadKeyspaceName: Invalid keyspace name format. Delegate to nested error.
             Self::BadKeyspaceName(e) => e.classify_error(),
-
-            // RequestError: Network, timeout, or permissions. Delegate to nested error.
             Self::RequestError(e) => e.classify_error(),
 
-            // Protocol violation during connection setup: server successfully processed USE command
-            // but returned different keyspace name than requested. Indicates server bug, driver
-            // bug, or protocol corruption. Transient because may resolve on reconnection to
-            // different node or server restart.
-            Self::KeyspaceNameMismatch { .. } => ErrorCategory::Transient,
-
-            // Keyspace operation timed out. Cluster overload or slow query response. Transient
-            // performance issue. Retry may succeed.
-            Self::RequestTimeout(_) => ErrorCategory::Transient,
-
-            // Non-exhaustive enum: safe default for unknown variants.
-            _ => ErrorCategory::Transient,
+            // Protocol violations and timeouts are transient
+            Self::KeyspaceNameMismatch { .. } | Self::RequestTimeout(_) | _ => {
+                ErrorCategory::Transient
+            }
         }
     }
 }
@@ -376,19 +320,13 @@ impl ClassifyError for UseKeyspaceError {
 impl ClassifyError for PrepareError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // ConnectionPoolError: Network/cluster issue. Delegate to nested error.
             Self::ConnectionPoolError(e) => e.classify_error(),
 
-            // Failed to prepare statement on all contacted nodes. Could be network issues, all
-            // nodes down, or invalid CQL. Network issues are transient. Invalid CQL should be
-            // caught in testing. Conservative classification allows retry.
-            Self::AllAttemptsFailed { .. } => ErrorCategory::Transient,
-
-            // Prepared statement IDs don't match across nodes. Could be transient state during
-            // cluster topology changes or statement propagation. May resolve on retry.
-            Self::PreparedStatementIdsMismatch => ErrorCategory::Transient,
-
-            _ => ErrorCategory::Transient,
+            // Statement preparation failures (network, topology changes, or invalid CQL)
+            // Invalid CQL should be caught in testing; conservatively treat as transient
+            Self::AllAttemptsFailed { .. } | Self::PreparedStatementIdsMismatch | _ => {
+                ErrorCategory::Transient
+            }
         }
     }
 }
@@ -397,25 +335,15 @@ impl ClassifyError for ExecutionError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             Self::BadQuery(e) => e.classify_error(),
-
-            // Load balancing policy returned empty execution plan. All nodes unavailable, down,
-            // or filtered out. Transient cluster state. Retry may succeed when nodes recover.
-            Self::EmptyPlan => ErrorCategory::Transient,
-
             Self::PrepareError(e) => e.classify_error(),
             Self::ConnectionPoolError(e) => e.classify_error(),
             Self::LastAttemptError(e) => e.classify_error(),
-
-            // Query execution timed out. Cluster overload or slow query. Transient performance
-            // issue. Retry may succeed.
-            Self::RequestTimeout(_) => ErrorCategory::Transient,
-
             Self::UseKeyspaceError(e) => e.classify_error(),
             Self::SchemaAgreementError(e) => e.classify_error(),
             Self::MetadataError(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
-            _ => ErrorCategory::Transient,
+            // Transient cluster states: no nodes available, timeouts, overload
+            Self::EmptyPlan | Self::RequestTimeout(_) | _ => ErrorCategory::Transient,
         }
     }
 }
@@ -427,7 +355,6 @@ impl ClassifyError for PagerExecutionError {
             Self::SerializationError(e) => e.classify_error(),
             Self::NextPageError(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
             _ => ErrorCategory::Transient,
         }
     }
@@ -439,7 +366,6 @@ impl ClassifyError for NextRowError {
             Self::NextPageError(e) => e.classify_error(),
             Self::RowDeserializationError(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
             _ => ErrorCategory::Transient,
         }
     }
@@ -457,10 +383,8 @@ impl ClassifyError for MaybeFirstRowError {
 impl ClassifyError for IntoRowsResultError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Code called into_rows() on a non-rows result (e.g., void result). Most likely a
-            // code bug calling the wrong method for this query type, but could potentially vary
-            // by data or query path. Conservative classification allows retry in case of edge
-            // cases.
+            // Wrong result type (e.g., void instead of rows). Likely code bug but could
+            // vary by query path. Conservatively treat as transient for edge cases.
             Self::ResultNotRows(_) => ErrorCategory::Transient,
 
             Self::ResultMetadataLazyDeserializationError(e) => e.classify_error(),
@@ -478,10 +402,8 @@ impl ClassifyError for RowsError {
 
 impl ClassifyError for TypeCheckError {
     fn classify_error(&self) -> ErrorCategory {
-        // Type validation failed - code expects different type than database schema
-        // provides. Schema mismatch affecting ALL similar operations. Requires
-        // schema migration or code fix. Terminal because schema issues won't
-        // resolve without intervention.
+        // Schema mismatch: code type expectations don't match database schema
+        // Requires schema migration or code fix
         ErrorCategory::Terminal
     }
 }
@@ -496,7 +418,6 @@ impl ClassifyError for MetadataError {
             Self::Udts(e) => e.classify_error(),
             Self::Tables(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
             _ => ErrorCategory::Transient,
         }
     }
@@ -505,23 +426,17 @@ impl ClassifyError for MetadataError {
 impl ClassifyError for BadQuery {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Code provides wrong number of bound values to prepared statement. Prepared statement
-            // expects N values (based on table schema), but code provides M values. This is a
-            // programming error - code is calling function with wrong number of arguments. Will
-            // fail for ALL messages on this code path, not data-dependent. Terminal to crash and
-            // force fix rather than silently losing data.
+            // Programming error: wrong number of bound values for prepared statement
+            // Will fail for ALL messages on this code path (not data-dependent)
             Self::PartitionKeyExtraction => ErrorCategory::Terminal,
 
             Self::SerializationError(e) => e.classify_error(),
 
-            // Serialized partition key values exceed maximum size. Query will always fail.
+            // Data-dependent: this message's partition key exceeds max size
             Self::ValuesTooLongForKey { .. } => ErrorCategory::Permanent,
 
-            // Batch statement contains too many queries. Could be code bug or could vary with
-            // batch size. Conservative classification allows retry.
-            Self::TooManyQueriesInBatchStatement(_) => ErrorCategory::Transient,
-
-            _ => ErrorCategory::Transient,
+            // Could be code bug or could vary with batch size; conservatively transient
+            Self::TooManyQueriesInBatchStatement(_) | _ => ErrorCategory::Transient,
         }
     }
 }
@@ -541,40 +456,26 @@ impl ClassifyError for MetadataFetchError {
 impl ClassifyError for RequestError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Load balancing policy returned empty execution plan. All nodes unavailable, down,
-            // or filtered out. Transient cluster state. Retry may succeed when nodes recover.
-            Self::EmptyPlan => ErrorCategory::Transient,
-
             Self::ConnectionPoolError(e) => e.classify_error(),
-
-            // Client-side request timeout exceeded. Cluster overload or slow response. Transient
-            // performance issue. Retry may succeed.
-            Self::RequestTimeout(_) => ErrorCategory::Transient,
-
             Self::LastAttemptError(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
-            _ => ErrorCategory::Transient,
+            // Transient cluster states: no nodes available, timeouts, overload
+            Self::EmptyPlan | Self::RequestTimeout(_) | _ => ErrorCategory::Transient,
         }
     }
 }
 
 impl ClassifyError for SerializationError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to serialize query parameters. Data-dependent failure - specific
-        // values in this message fail serialization (e.g., value too large, out
-        // of range for CQL type, too many values). Other messages with valid
-        // values will succeed. Permanent to drop this bad message rather than
-        // retry endlessly.
+        // Data-dependent: this message has invalid values (too large, out of range,
+        // etc.) Other messages with valid values will succeed
         ErrorCategory::Permanent
     }
 }
 
 impl ClassifyError for DeserializationError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to deserialize database response. Schema mismatch where code type
-        // expectations don't match database schema. Terminal because schema
-        // issues require intervention.
+        // Schema mismatch: code type expectations don't match database schema
         ErrorCategory::Terminal
     }
 }
@@ -586,7 +487,6 @@ impl ClassifyError for PartitionKeyError {
             PartitionKeyError::TokenCalculation(e) => e.classify_error(),
             PartitionKeyError::Serialization(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
             _ => ErrorCategory::Transient,
         }
     }
@@ -598,7 +498,6 @@ impl ClassifyError for ResultMetadataAndRowsCountParseError {
             ResultMetadataAndRowsCountParseError::ResultMetadataParseError(e) => e.classify_error(),
             ResultMetadataAndRowsCountParseError::RowsCountParseError(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
             _ => ErrorCategory::Transient,
         }
     }
@@ -607,8 +506,7 @@ impl ClassifyError for ResultMetadataAndRowsCountParseError {
 impl ClassifyError for SingleRowError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Query returned unexpected number of rows. Could be code bug, but also could vary
-            // with data or transient state. Conservative classification allows retry.
+            // Could be code bug or could vary with data; conservatively transient
             SingleRowError::UnexpectedRowCount(_) => ErrorCategory::Transient,
             SingleRowError::TypeCheckFailed(e) => e.classify_error(),
             SingleRowError::DeserializationFailed(e) => e.classify_error(),
@@ -618,9 +516,7 @@ impl ClassifyError for SingleRowError {
 
 impl ClassifyError for BadKeyspaceName {
     fn classify_error(&self) -> ErrorCategory {
-        // Invalid keyspace name format in configuration or code. Structural
-        // configuration error that won't resolve without fixing the keyspace
-        // name. Terminal because requires code or configuration change.
+        // Configuration error: invalid keyspace name format
         ErrorCategory::Terminal
     }
 }
@@ -628,13 +524,12 @@ impl ClassifyError for BadKeyspaceName {
 impl ClassifyError for ResultMetadataParseError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::FlagsParseError(e) => e.classify_error(),
-            Self::ColumnCountParseError(e) => e.classify_error(),
-            Self::PagingStateParseError(e) => e.classify_error(),
+            Self::FlagsParseError(e)
+            | Self::ColumnCountParseError(e)
+            | Self::PagingStateParseError(e) => e.classify_error(),
             Self::GlobalTableSpecParseError(e) => e.classify_error(),
             Self::ColumnSpecParseError(e) => e.classify_error(),
 
-            // Non-exhaustive enum: safe default for unknown variants.
             _ => ErrorCategory::Transient,
         }
     }
@@ -642,69 +537,56 @@ impl ClassifyError for ResultMetadataParseError {
 
 impl ClassifyError for LowLevelDeserializationError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to deserialize protocol frame at low level. Network corruption,
-        // protocol version mismatch, or malformed response. Transient
-        // network/protocol issue. Retry may succeed.
+        // Protocol frame parsing failure (network corruption, protocol mismatch)
         ErrorCategory::Transient
     }
 }
 
 impl ClassifyError for TableSpecParseError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to parse table specification from protocol frame. Malformed response
-        // or protocol issue. Transient network/protocol error. Retry may
-        // succeed.
+        // Protocol frame parsing failure (malformed table spec)
         ErrorCategory::Transient
     }
 }
 
 impl ClassifyError for ColumnSpecParseError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to parse column specification from protocol frame. Malformed response
-        // or protocol issue. Transient network/protocol error. Retry may
-        // succeed.
+        // Protocol frame parsing failure (malformed column spec)
         ErrorCategory::Transient
     }
 }
 
 impl ClassifyError for CqlRequestSerializationError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to serialize CQL request to protocol format. Driver or protocol issue.
-        // Transient error. Retry may succeed.
+        // Protocol serialization failure (driver or protocol issue)
         ErrorCategory::Transient
     }
 }
 
 impl ClassifyError for BrokenConnectionError {
     fn classify_error(&self) -> ErrorCategory {
-        // Connection broken during operation. Network failure, node crash, or timeout.
-        // Transient network issue. Retry may succeed with new connection.
+        // Network failure: connection broken during operation
         ErrorCategory::Transient
     }
 }
 
 impl ClassifyError for FrameBodyExtensionsParseError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to parse frame body extensions from protocol frame. Protocol version
-        // mismatch or malformed response. Transient protocol error. Retry may
-        // succeed.
+        // Protocol frame parsing failure (malformed body extensions)
         ErrorCategory::Transient
     }
 }
 
 impl ClassifyError for CqlResultParseError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to parse RESULT frame from protocol response. Malformed response or
-        // protocol issue. Transient network/protocol error. Retry may succeed.
+        // Protocol frame parsing failure (malformed RESULT frame)
         ErrorCategory::Transient
     }
 }
 
 impl ClassifyError for CqlErrorParseError {
     fn classify_error(&self) -> ErrorCategory {
-        // Failed to parse ERROR frame from protocol response. Malformed error response
-        // or protocol issue. Transient network/protocol error. Retry may
-        // succeed.
+        // Protocol frame parsing failure (malformed ERROR frame)
         ErrorCategory::Transient
     }
 }
@@ -712,114 +594,60 @@ impl ClassifyError for CqlErrorParseError {
 impl ClassifyError for DbError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // CQL syntax error in query. Since queries are in program code, this is a code bug
-            // that will fail for ALL executions. Terminal to crash and force fix.
-            DbError::SyntaxError => ErrorCategory::Terminal,
+            // Terminal: code bugs or server config requiring manual fix
+            DbError::SyntaxError | DbError::Invalid | DbError::ConfigError => {
+                ErrorCategory::Terminal
+            }
 
-            // Syntactically valid but semantically invalid query. Since queries are in program
-            // code, this is a code bug that will fail for ALL executions. Terminal to crash and
-            // force fix.
-            DbError::Invalid => ErrorCategory::Terminal,
-
-            // Keyspace or table already exists. Could be race condition with concurrent creation
-            // or intentional idempotent operation. Permanent allows dropping message for
-            // idempotent creates without crashing program.
+            // Permanent: idempotent operations (e.g., CREATE IF NOT EXISTS race)
             DbError::AlreadyExists { .. } => ErrorCategory::Permanent,
 
-            // User-defined function execution failed. Could be UDF bug or could vary with input
-            // data. Conservative classification allows retry.
-            DbError::FunctionFailure { .. } => ErrorCategory::Transient,
-
-            // Authentication failed. Could be wrong credentials or could be transient auth service
-            // issue. Conservative classification allows retry in case auth service recovers.
-            DbError::AuthenticationError => ErrorCategory::Transient,
-
-            // Insufficient permissions. Could be config issue or could be transient permissions
-            // state. Conservative classification allows retry.
-            DbError::Unauthorized => ErrorCategory::Transient,
-
-            // Invalid Cassandra configuration. Server-side configuration error. Terminal because
-            // requires server configuration fix.
-            DbError::ConfigError => ErrorCategory::Terminal,
-
-            // Insufficient replicas available for consistency level. Transient cluster state that
-            // may resolve as nodes recover.
-            DbError::Unavailable { .. } => ErrorCategory::Transient,
-
-            // Coordinator node overloaded. Transient load condition that may resolve.
-            DbError::Overloaded => ErrorCategory::Transient,
-
-            // Node still initializing. Transient state that resolves when bootstrap completes.
-            DbError::IsBootstrapping => ErrorCategory::Transient,
-
-            // Truncate operation failed. Could be transient cluster state. Retry may succeed.
-            DbError::TruncateError => ErrorCategory::Transient,
-
-            // Read operation timed out. Transient performance issue. Retry may succeed.
-            DbError::ReadTimeout { .. } => ErrorCategory::Transient,
-
-            // Write operation timed out. Transient performance issue. Retry may succeed.
-            DbError::WriteTimeout { .. } => ErrorCategory::Transient,
-
-            // Read failed on replica nodes. Transient cluster state. Retry may succeed.
-            DbError::ReadFailure { .. } => ErrorCategory::Transient,
-
-            // Write failed on replica nodes. Transient cluster state. Retry may succeed.
-            DbError::WriteFailure { .. } => ErrorCategory::Transient,
-
-            // Prepared statement not found on server (likely after node restart). Transient state
-            // that driver handles by re-preparing. Retry may succeed.
-            DbError::Unprepared { .. } => ErrorCategory::Transient,
-
-            // Internal server error. Server bug or transient state. May resolve after server
-            // restart or retry.
-            DbError::ServerError => ErrorCategory::Transient,
-
-            // Protocol violation between driver and server. Could be version mismatch or could be
-            // transient server state. May resolve after server restart.
-            DbError::ProtocolError => ErrorCategory::Transient,
-
-            // Rate limit exceeded for partition. Transient throttling. Retry with backoff may
-            // succeed.
-            DbError::RateLimitReached { .. } => ErrorCategory::Transient,
-
-            // Unknown/unrecognized error code. Conservative classification allows retry.
-            DbError::Other(_) => ErrorCategory::Transient,
-
-            // Non-exhaustive enum catch-all. Conservative default for future error variants.
-            _ => ErrorCategory::Transient,
+            // Transient: cluster/server states that may resolve on retry
+            // - Auth/permissions: AuthenticationError, Unauthorized
+            // - Availability: Unavailable, Overloaded, IsBootstrapping
+            // - Timeouts/failures: ReadTimeout, WriteTimeout, ReadFailure, WriteFailure
+            // - Operations: FunctionFailure, TruncateError, Unprepared
+            // - Protocol: ServerError, ProtocolError, RateLimitReached
+            DbError::FunctionFailure { .. }
+            | DbError::AuthenticationError
+            | DbError::Unauthorized
+            | DbError::Unavailable { .. }
+            | DbError::Overloaded
+            | DbError::IsBootstrapping
+            | DbError::TruncateError
+            | DbError::ReadTimeout { .. }
+            | DbError::WriteTimeout { .. }
+            | DbError::ReadFailure { .. }
+            | DbError::WriteFailure { .. }
+            | DbError::Unprepared { .. }
+            | DbError::ServerError
+            | DbError::ProtocolError
+            | DbError::RateLimitReached { .. }
+            | DbError::Other(_)
+            | _ => ErrorCategory::Transient,
         }
     }
 }
 
 impl ClassifyError for KeyspaceStrategyError {
     fn classify_error(&self) -> ErrorCategory {
-        // Invalid keyspace replication strategy in configuration. Configuration error
-        // requiring manual intervention to fix keyspace definition. Terminal
-        // because won't resolve without configuration change.
+        // Configuration error: invalid keyspace replication strategy
         ErrorCategory::Terminal
     }
 }
 
 impl ClassifyError for PartitionKeyExtractionError {
     fn classify_error(&self) -> ErrorCategory {
-        // Code provides wrong number of bound values to prepared statement. Prepared
-        // statement expects N values (based on table schema), but code provides
-        // M values. This is a programming error - code is calling function with
-        // wrong number of arguments. Will fail for ALL messages on this code
-        // path, not data-dependent. Terminal to crash and force fix rather than
-        // silently losing data.
+        // Programming error: wrong number of bound values for prepared statement
+        // Will fail for ALL messages on this code path (not data-dependent)
         ErrorCategory::Terminal
     }
 }
 
 impl ClassifyError for TokenCalculationError {
     fn classify_error(&self) -> ErrorCategory {
-        // Partition key value exceeds maximum size (65,535 bytes). Data-dependent -
-        // this specific message has oversized partition key value. Other
-        // messages with valid-sized keys will succeed. Permanent to drop this
-        // bad message. Note: Gets mapped to BadQuery::ValuesTooLongForKey which
-        // is also Permanent.
+        // Data-dependent: this message's partition key exceeds max size (65,535 bytes)
+        // Maps to BadQuery::ValuesTooLongForKey
         ErrorCategory::Permanent
     }
 }

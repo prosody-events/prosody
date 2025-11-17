@@ -1218,6 +1218,7 @@ pub enum ConsumerError {
     #[error("Kafka operation failed: {0:#}")]
     Kafka(#[from] KafkaError),
 
+    /// Indicates a Cassandra trigger store operation failure.
     #[error("Cassandra trigger store operation failed: {0:#}")]
     CassandraTriggerStore(#[from] CassandraTriggerStoreError),
 

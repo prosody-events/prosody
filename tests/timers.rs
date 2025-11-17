@@ -167,7 +167,7 @@ impl EventHandler for TimerTestHandler {
 /// Test environment that encapsulates common setup and provides helper methods
 struct TestEnvironment {
     topic: Topic,
-    admin_client: ProsodyAdminClient,
+    admin_client: &'static ProsodyAdminClient,
     consumer: ProsodyConsumer,
     producer: ProsodyProducer,
     timer_rx: Receiver<TimerEvent>,
@@ -179,7 +179,8 @@ impl TestEnvironment {
     async fn new(test_name: &str) -> Result<Self> {
         let topic: Topic = format!("{}-{}", test_name, Uuid::new_v4()).as_str().into();
         let bootstrap = vec!["localhost:9094".to_owned()];
-        let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
+        let admin_client =
+            ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
         admin_client
             .create_topic(
                 &TopicConfiguration::builder()

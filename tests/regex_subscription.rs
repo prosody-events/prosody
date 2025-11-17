@@ -52,7 +52,9 @@ impl TestTopic {
 }
 
 /// Creates test topics for regex subscription testing.
-async fn create_test_topics(topic_prefix: &str) -> Result<(Vec<TestTopic>, ProsodyAdminClient)> {
+async fn create_test_topics(
+    topic_prefix: &str,
+) -> Result<(Vec<TestTopic>, &'static ProsodyAdminClient)> {
     let topics = vec![
         TestTopic::new(
             format!("{topic_prefix}_events").as_str().into(),
@@ -269,7 +271,7 @@ async fn test_regex_topic_subscription() -> Result<()> {
     verify_messages(&received_messages, &topics)?;
 
     // Cleanup test topics
-    cleanup_topics(&admin_client, &topics).await?;
+    cleanup_topics(admin_client, &topics).await?;
 
     Ok(())
 }

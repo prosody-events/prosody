@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn test_configuration_error_is_terminal() {
         let error = DeferError::<TestTransientError>::Configuration(ConfigurationError::Invalid(
-            "test".to_string(),
+            "test".to_owned(),
         ));
         assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
     }

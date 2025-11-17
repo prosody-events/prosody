@@ -148,6 +148,7 @@
 use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::future::Future;
+use std::io::Error as IoError;
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
@@ -568,7 +569,7 @@ impl ClassifyError for Infallible {
     }
 }
 
-impl ClassifyError for std::io::Error {
+impl ClassifyError for IoError {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Transient
     }

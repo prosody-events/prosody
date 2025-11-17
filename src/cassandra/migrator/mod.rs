@@ -61,6 +61,7 @@ mod validator;
 mod tests;
 
 use crate::cassandra::{CassandraStoreError, TABLE_SCHEMA_MIGRATIONS};
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use executor::MigrationExecutor;
 use futures::{TryStreamExt, pin_mut};
 use humantime::format_duration;
@@ -487,85 +488,36 @@ impl From<TypeCheckError> for MigrationError {
     }
 }
 
-impl crate::consumer::middleware::ClassifyError for MigrationError {
-    fn classify_error(&self) -> crate::consumer::middleware::ErrorCategory {
-        use crate::consumer::middleware::ErrorCategory;
-
+impl ClassifyError for MigrationError {
+    fn classify_error(&self) -> ErrorCategory {
         match self {
-            // KeyspaceNotFound: Keyspace doesn't exist in cluster metadata after
-            // refresh. Configuration error - application misconfigured or keyspace
-            // was deleted. Terminal.
-            Self::KeyspaceNotFound => ErrorCategory::Terminal,
+            // Metadata refresh failed, lock acquisition failed, statement execution failed,
+            // database query execution failed, or lock result row extraction failed. All
+            // represent transient network/cluster state that may resolve on retry.
+            Self::MetadataRefreshFailed(_)
+            | Self::LockAcquisitionFailed
+            | Self::StatementExecutionFailed { .. }
+            | Self::ExecutionError(_)
+            | Self::LockResultFirstRowFailed(_) => ErrorCategory::Transient,
 
-            // MetadataRefreshFailed: Failed to refresh cluster metadata from
-            // Cassandra. Could be transient network issue or cluster problem.
-            Self::MetadataRefreshFailed(_) => ErrorCategory::Transient,
-
-            // MigrationFileLoadFailed: Embedded migration file failed to load.
-            // This is a build/packaging issue, not recoverable at runtime.
-            Self::MigrationFileLoadFailed(_) => ErrorCategory::Terminal,
-
-            // InvalidUtf8: Migration file contains invalid UTF-8 encoding. Build/
-            // packaging issue, not recoverable at runtime.
-            Self::InvalidUtf8 { .. } => ErrorCategory::Terminal,
-
-            // InvalidFilenameFormat: Migration filename doesn't follow required
-            // format. Build/packaging issue, not recoverable at runtime.
-            Self::InvalidFilenameFormat(_) => ErrorCategory::Terminal,
-
-            // InvalidTimestamp: Migration filename has invalid timestamp. Build/
-            // packaging issue, not recoverable at runtime.
-            Self::InvalidTimestamp(_) => ErrorCategory::Terminal,
-
-            // LockAcquisitionFailed: Failed to acquire distributed migration lock
-            // after retries. Another process may be running migrations or lock
-            // is stale. Could succeed on retry after lock expires.
-            Self::LockAcquisitionFailed => ErrorCategory::Transient,
-
-            // StatementExecutionFailed: Failed to execute a migration statement.
-            // Could be transient (timeout, coordinator overload) or permanent
-            // (syntax error, constraint violation). Classify as transient to
-            // allow retry - permanent failures will fail fast on retry.
-            Self::StatementExecutionFailed { .. } => ErrorCategory::Transient,
-
-            // ChecksumMismatch: Applied migration file has been modified. This
-            // indicates severe configuration error or tampering. Cannot proceed.
-            Self::ChecksumMismatch { .. } => ErrorCategory::Terminal,
-
-            // LockPreparationFailed: Failed to prepare lock statements after
-            // retries. Migration tables may not be available or schema issue.
-            // Setup/configuration problem.
-            Self::LockPreparationFailed(_) => ErrorCategory::Terminal,
-
-            // ExecutionError: Database query execution failed. Could be transient
-            // (network, timeout) or permanent (constraint violation). Retry is
-            // appropriate for distributed systems.
-            Self::ExecutionError(_) => ErrorCategory::Transient,
-
-            // LockStatementPreparationFailed: Failed to prepare lock-related
-            // statements. Schema mismatch or table doesn't exist. Setup issue.
-            Self::LockStatementPreparationFailed(_) => ErrorCategory::Terminal,
-
-            // MigrationTrackingPreparationFailed: Failed to prepare migration
-            // tracking statement. Schema issue or table doesn't exist. Setup.
-            Self::MigrationTrackingPreparationFailed(_) => ErrorCategory::Terminal,
-
-            // AppliedMigrationsPreparationFailed: Failed to prepare query for
-            // applied migrations. Schema issue or table doesn't exist. Setup.
-            Self::AppliedMigrationsPreparationFailed(_) => ErrorCategory::Terminal,
-
-            // LockResultIntoRowsFailed: Failed to parse lock acquisition result.
-            // Type mismatch between code and schema. Setup issue.
-            Self::LockResultIntoRowsFailed(_) => ErrorCategory::Terminal,
-
-            // LockResultFirstRowFailed: Failed to extract first row from lock
-            // result. Could be network issue during result retrieval or
-            // deserialization error. Classify as transient.
-            Self::LockResultFirstRowFailed(_) => ErrorCategory::Transient,
-
-            // AppliedMigrationsParsingFailed: Failed to parse applied migrations
-            // query result. Type mismatch between code and schema. Setup issue.
-            Self::AppliedMigrationsParsingFailed(_) => ErrorCategory::Terminal,
+            // Keyspace not found, migration file load failed, invalid UTF-8, invalid filename
+            // format, invalid timestamp, checksum mismatch, lock preparation failed, lock
+            // statement preparation failed, migration tracking preparation failed, applied
+            // migrations preparation failed, lock result parsing failed, or applied migrations
+            // parsing failed. All represent configuration, build/packaging, or setup issues
+            // that are not recoverable at runtime.
+            Self::KeyspaceNotFound
+            | Self::MigrationFileLoadFailed(_)
+            | Self::InvalidUtf8 { .. }
+            | Self::InvalidFilenameFormat(_)
+            | Self::InvalidTimestamp(_)
+            | Self::ChecksumMismatch { .. }
+            | Self::LockPreparationFailed(_)
+            | Self::LockStatementPreparationFailed(_)
+            | Self::MigrationTrackingPreparationFailed(_)
+            | Self::AppliedMigrationsPreparationFailed(_)
+            | Self::LockResultIntoRowsFailed(_)
+            | Self::AppliedMigrationsParsingFailed(_) => ErrorCategory::Terminal,
         }
     }
 }

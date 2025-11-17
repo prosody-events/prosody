@@ -101,7 +101,7 @@ where
 /// # Type Parameters
 ///
 /// * `T` - Inner handler type
-/// * `S` - Store implementation (DeferStore)
+/// * `S` - Store implementation (`DeferStore`)
 #[derive(Clone)]
 pub struct DeferHandler<T, S>
 where

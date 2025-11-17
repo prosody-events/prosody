@@ -30,6 +30,10 @@ use tokio::select;
 use tokio::sync::watch;
 use tracing::{Span, error};
 
+/// Marker trait for errors that can be returned from event context operations.
+///
+/// This trait is automatically implemented for any type that satisfies the
+/// bounds.
 pub trait EventContextError: StdError + ClassifyError + Send + Sync + 'static {}
 
 impl<T> EventContextError for T where T: StdError + ClassifyError + Send + Sync + 'static {}

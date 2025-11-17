@@ -39,6 +39,27 @@ pub enum TestError {
     Transient,
 }
 
+/// Operations for property-based store testing.
+#[derive(Debug, Clone, Copy)]
+enum StoreOp {
+    /// Append a deferred message to the store.
+    Append,
+    /// Get the next deferred message from the store.
+    Get,
+    /// Remove a deferred message from the store.
+    Remove,
+}
+
+impl Arbitrary for StoreOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 3 {
+            0 => Self::Append,
+            1 => Self::Get,
+            _ => Self::Remove,
+        }
+    }
+}
+
 impl ClassifyError for TestError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
@@ -67,6 +88,7 @@ pub enum HandlerBehavior {
 
 impl TestHandler {
     /// Create a new test handler with the specified behavior.
+    #[must_use]
     pub fn new(behavior: HandlerBehavior) -> Self {
         Self {
             behavior: Arc::new(parking_lot::Mutex::new(behavior)),
@@ -117,7 +139,7 @@ impl FallibleHandler for TestHandler {
     async fn shutdown(self) {}
 }
 
-/// Timer operation recorded by MockContext.
+/// Timer operation recorded by `MockContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerOperation {
     /// Timer was scheduled.
@@ -145,6 +167,7 @@ pub struct MockContext {
 
 impl MockContext {
     /// Create a new mock context for the given topic and partition.
+    #[must_use]
     pub fn new(topic: Topic, partition: Partition) -> Self {
         Self {
             operations: Arc::new(Mutex::new(Vec::new())),
@@ -154,11 +177,13 @@ impl MockContext {
     }
 
     /// Get all recorded timer operations.
+    #[must_use]
     pub fn operations(&self) -> Vec<TimerOperation> {
         self.operations.lock().clone()
     }
 
     /// Check if any timer was scheduled.
+    #[must_use]
     pub fn has_scheduled_timer(&self) -> bool {
         self.operations.lock().iter().any(|op| {
             matches!(
@@ -169,6 +194,7 @@ impl MockContext {
     }
 
     /// Count scheduled timers of a specific type.
+    #[must_use]
     pub fn count_scheduled(&self, timer_type: TimerType) -> usize {
         self.operations
             .lock()
@@ -341,7 +367,7 @@ impl Arbitrary for DeferTestInput {
     }
 }
 
-/// Basic tests for DeferState enum and UUID generation.
+/// Basic tests for `DeferState` enum and UUID generation.
 #[cfg(test)]
 mod defer_state_tests {
     use super::*;
@@ -468,6 +494,85 @@ mod property_tests {
         }
     }
 
+    /// Handle append operation in property test.
+    async fn handle_append(
+        store: &MemoryDeferStore,
+        cache: &Cache<Key, DeferState>,
+        key: &Key,
+        key_id: &uuid::Uuid,
+        op_byte: u8,
+        retry_counts: &mut HashMap<Key, u32>,
+    ) {
+        use crate::timers::datetime::CompactDateTime;
+        use crate::timers::duration::CompactDuration;
+
+        let offset = Offset::from(i64::from(op_byte));
+        let retry_count = retry_counts.get(key).copied().unwrap_or_default();
+
+        if let Ok(now) = CompactDateTime::now()
+            && let Ok(retry_time) = now.add_duration(CompactDuration::new(60))
+        {
+            let retry_count_update = (retry_count == 0).then_some(0);
+            let _ = store
+                .append_deferred_message(key_id, offset, retry_time, retry_count_update)
+                .await;
+            cache.insert(key.clone(), DeferState::Deferred { retry_count });
+            retry_counts.insert(key.clone(), retry_count);
+        }
+    }
+
+    /// Handle increment operation in property test.
+    async fn handle_increment(
+        store: &MemoryDeferStore,
+        cache: &Cache<Key, DeferState>,
+        key: &Key,
+        key_id: &uuid::Uuid,
+        retry_counts: &mut HashMap<Key, u32>,
+    ) {
+        if let Some(&current_retry_count) = retry_counts.get(key) {
+            let new_retry_count = current_retry_count + 1;
+            if store
+                .get_next_deferred_message(key_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = store.set_retry_count(key_id, new_retry_count).await;
+                cache.insert(
+                    key.clone(),
+                    DeferState::Deferred {
+                        retry_count: new_retry_count,
+                    },
+                );
+                retry_counts.insert(key.clone(), new_retry_count);
+            }
+        }
+    }
+
+    /// Handle delete operation in property test.
+    async fn handle_delete(
+        store: &MemoryDeferStore,
+        cache: &Cache<Key, DeferState>,
+        key: &Key,
+        key_id: &uuid::Uuid,
+        retry_counts: &mut HashMap<Key, u32>,
+    ) {
+        if let Ok(Some((offset, _))) = store.get_next_deferred_message(key_id).await {
+            let _ = store.remove_deferred_message(key_id, offset).await;
+            if store
+                .get_next_deferred_message(key_id)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                cache.remove(key);
+                retry_counts.remove(key);
+            }
+        }
+    }
+
     /// Verify defer middleware maintains cache-store consistency.
     ///
     /// Key invariants tested:
@@ -475,40 +580,35 @@ mod property_tests {
     /// 2. Retry count monotonicity: Retry count never decreases for a key
     /// 3. Idempotency: Repeated operations produce consistent state
     ///
-    /// This test simulates the cache/store operations that DeferHandler
-    /// performs without requiring full ConsumerMessage construction.
+    /// This test simulates the cache/store operations that `DeferHandler`
+    /// performs without requiring full `ConsumerMessage` construction.
     #[test]
     fn prop_defer_cache_store_consistency() {
+        use crate::consumer::middleware::defer::generate_key_id;
+        use tokio::runtime::Runtime;
+
+        #[allow(clippy::needless_pass_by_value)]
         fn test(keys: Vec<u8>, operations: Vec<u8>) -> bool {
             let keys = &keys;
             let operations = &operations;
-
-            use crate::consumer::middleware::defer::generate_key_id;
-            use crate::timers::datetime::CompactDateTime;
-            use crate::timers::duration::CompactDuration;
-            use tokio::runtime::Runtime;
 
             let Ok(rt) = Runtime::new() else {
                 return false;
             };
             rt.block_on(async {
-                // Create real components
                 let store = MemoryDeferStore::new();
                 let cache: Cache<Key, DeferState> = Cache::new(100);
                 let consumer_group = "test-group";
                 let topic = Topic::from("test-topic");
                 let partition = Partition::from(0_i32);
 
-                // Generate 2-5 unique keys
                 let key_count = (keys.len() % 4) + 2;
                 let test_keys: Vec<Key> = (0..key_count)
                     .map(|i| Arc::from(format!("key-{i}")))
                     .collect();
 
-                // Track retry counts to verify monotonicity
                 let mut retry_counts: HashMap<Key, u32> = HashMap::default();
 
-                // Execute operation sequence
                 for &op_byte in operations {
                     let key_idx = usize::from(op_byte) % test_keys.len();
                     let key = &test_keys[key_idx];
@@ -516,87 +616,16 @@ mod property_tests {
 
                     match op_byte % 3 {
                         0 => {
-                            // Append deferred offset (simulate message failure)
-                            let offset = Offset::from(i64::from(op_byte));
-                            let retry_count = retry_counts.get(key).copied().unwrap_or_default();
-
-                            // Calculate expected retry time
-                            if let Ok(now) = CompactDateTime::now()
-                                && let Ok(retry_time) = now.add_duration(CompactDuration::new(60))
-                            {
-                                // For first failure, set retry_count to Some(0)
-                                let retry_count_update = (retry_count == 0).then_some(0);
-
-                                // Update store
-                                let _ = store
-                                    .append_deferred_message(
-                                        &key_id,
-                                        offset,
-                                        retry_time,
-                                        retry_count_update,
-                                    )
-                                    .await;
-
-                                // Update cache (simulating DeferHandler behavior)
-                                cache.insert(key.clone(), DeferState::Deferred { retry_count });
-
-                                // Track retry count
-                                retry_counts.insert(key.clone(), retry_count);
-                            }
+                            handle_append(&store, &cache, key, &key_id, op_byte, &mut retry_counts)
+                                .await
                         }
                         1 => {
-                            // Increment retry count (simulate timer retry failure)
-                            if let Some(&current_retry_count) = retry_counts.get(key) {
-                                let new_retry_count = current_retry_count + 1;
-
-                                // Check if there's a deferred message
-                                if store
-                                    .get_next_deferred_message(&key_id)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .is_some()
-                                {
-                                    // Update retry count
-                                    let _ = store.set_retry_count(&key_id, new_retry_count).await;
-
-                                    // Update cache
-                                    cache.insert(
-                                        key.clone(),
-                                        DeferState::Deferred {
-                                            retry_count: new_retry_count,
-                                        },
-                                    );
-
-                                    // Update tracking
-                                    retry_counts.insert(key.clone(), new_retry_count);
-                                }
-                            }
+                            handle_increment(&store, &cache, key, &key_id, &mut retry_counts).await
                         }
-                        2 => {
-                            // Delete deferred offset (simulate successful retry)
-                            if let Ok(Some((offset, _))) =
-                                store.get_next_deferred_message(&key_id).await
-                            {
-                                let _ = store.remove_deferred_message(&key_id, offset).await;
-
-                                // Only remove from cache if store is now empty
-                                if store
-                                    .get_next_deferred_message(&key_id)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .is_none()
-                                {
-                                    cache.remove(key);
-                                    retry_counts.remove(key);
-                                }
-                            }
-                        }
+                        2 => handle_delete(&store, &cache, key, &key_id, &mut retry_counts).await,
                         _ => {}
                     }
 
-                    // Verify cache-store consistency for this key
                     let cache_state = cache.get(key);
                     let store_state = store
                         .get_next_deferred_message(&key_id)
@@ -608,7 +637,6 @@ mod property_tests {
                     }
                 }
 
-                // Final verification: Check all keys for consistency
                 for key in &test_keys {
                     let key_id = generate_key_id(consumer_group, &topic, partition, key);
                     let cache_state = cache.get(key);
@@ -646,8 +674,8 @@ mod property_tests {
                 cmp::min(delay, max_delay_seconds)
             };
 
-            let current = calc_backoff(retry_count as u32);
-            let next = calc_backoff((retry_count as u32) + 1);
+            let current = calc_backoff(u32::from(retry_count));
+            let next = calc_backoff(u32::from(retry_count) + 1);
 
             // Backoff should be monotonic (next >= current) until we hit max
             next >= current || current == max_delay_seconds
@@ -690,14 +718,13 @@ mod property_tests {
     /// Verify store operations maintain consistency.
     #[test]
     fn prop_store_consistency() {
-        fn test(operations: Vec<u8>) -> bool {
-            let operations = &operations;
+        use crate::consumer::middleware::defer::generate_key_id;
+        use crate::timers::datetime::CompactDateTime;
+        use crate::timers::duration::CompactDuration;
+        use tokio::runtime::Runtime;
 
-            use crate::consumer::middleware::defer::generate_key_id;
-            use crate::timers::datetime::CompactDateTime;
-            use crate::timers::duration::CompactDuration;
-            use tokio::runtime::Runtime;
-
+        #[allow(clippy::needless_pass_by_value)]
+        fn test(operations: Vec<StoreOp>) -> bool {
             let Ok(rt) = Runtime::new() else {
                 return false;
             };
@@ -709,12 +736,11 @@ mod property_tests {
                 let partition = Partition::from(0_i32);
                 let key_id = generate_key_id(consumer_group, &topic, partition, &key);
 
-                for (i, &op) in operations.iter().enumerate() {
+                for (i, op) in operations.iter().enumerate() {
                     let offset = Offset::from(i as i64);
 
-                    match op % 3 {
-                        0 => {
-                            // Append offset
+                    match op {
+                        StoreOp::Append => {
                             if let Ok(now) = CompactDateTime::now()
                                 && let Ok(retry_time) = now.add_duration(CompactDuration::new(60))
                             {
@@ -723,19 +749,16 @@ mod property_tests {
                                     .await;
                             }
                         }
-                        1 => {
-                            // Get offset
+                        StoreOp::Get => {
                             let _ = store.get_next_deferred_message(&key_id).await;
                         }
-                        2 => {
-                            // Delete offset
+                        StoreOp::Remove => {
                             if let Ok(Some((offset, _))) =
                                 store.get_next_deferred_message(&key_id).await
                             {
                                 let _ = store.remove_deferred_message(&key_id, offset).await;
                             }
                         }
-                        _ => {}
                     }
                 }
 
@@ -744,7 +767,7 @@ mod property_tests {
             })
         }
 
-        quickcheck(test as fn(Vec<u8>) -> bool);
+        quickcheck(test as fn(Vec<StoreOp>) -> bool);
     }
 }
 

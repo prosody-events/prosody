@@ -788,6 +788,7 @@ pub async fn cassandra_store(
     Ok(TableAdapter::new(cassandra))
 }
 
+/// Errors that can occur during Cassandra trigger store operations.
 #[derive(Debug, Error)]
 pub enum CassandraTriggerStoreError {
     /// Database error
