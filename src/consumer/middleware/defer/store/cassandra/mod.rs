@@ -98,53 +98,55 @@ impl DeferStore for CassandraDeferStore {
         }))
     }
 
-    #[instrument(skip(self), fields(key_id = %key_id, offset = %offset), err)]
-    async fn append_deferred_message(
+    #[instrument(skip(self), err)]
+    async fn defer_first_message(
         &self,
         key_id: &Uuid,
         offset: Offset,
         expected_retry_time: CompactDateTime,
-        retry_count: Option<u32>,
     ) -> Result<(), Self::Error> {
         let ttl = self
             .store
             .calculate_ttl(expected_retry_time)
             .ok_or(CassandraDeferStoreError::TtlCalculationFailed)?;
 
-        // Use different prepared statements based on whether we're updating retry_count
-        match retry_count {
-            Some(rc) => {
-                let retry_count_i32: i32 =
-                    rc.try_into()
-                        .map_err(|_| CassandraDeferStoreError::InvalidRetryCount {
-                            retry_count: rc,
-                            reason: "retry count exceeds i32::MAX",
-                        })?;
-
-                self.session()
-                    .execute_unpaged(
-                        &self.queries.insert_deferred_message_with_retry_count,
-                        (key_id, offset, retry_count_i32, ttl),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-            }
-            None => {
-                // Don't include retry_count in INSERT - leaves static column unchanged
-                self.session()
-                    .execute_unpaged(
-                        &self.queries.insert_deferred_message_without_retry_count,
-                        (key_id, offset, ttl),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-            }
-        }
+        // INSERT with retry_count=0 for first failure
+        self.session()
+            .execute_unpaged(
+                &self.queries.insert_deferred_message_with_retry_count,
+                (key_id, offset, 0_i32, ttl),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
 
-    #[instrument(skip(self), fields(key_id = %key_id, offset = %offset), err)]
+    #[instrument(skip(self), err)]
+    async fn append_deferred_message(
+        &self,
+        key_id: &Uuid,
+        offset: Offset,
+        expected_retry_time: CompactDateTime,
+    ) -> Result<(), Self::Error> {
+        let ttl = self
+            .store
+            .calculate_ttl(expected_retry_time)
+            .ok_or(CassandraDeferStoreError::TtlCalculationFailed)?;
+
+        // Don't include retry_count in INSERT - leaves static column unchanged
+        self.session()
+            .execute_unpaged(
+                &self.queries.insert_deferred_message_without_retry_count,
+                (key_id, offset, ttl),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self), err)]
     async fn remove_deferred_message(
         &self,
         key_id: &Uuid,
@@ -158,7 +160,7 @@ impl DeferStore for CassandraDeferStore {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(key_id = %key_id, retry_count = retry_count), err)]
+    #[instrument(skip(self), err)]
     async fn set_retry_count(&self, key_id: &Uuid, retry_count: u32) -> Result<(), Self::Error> {
         let retry_count_i32: i32 =
             retry_count
@@ -176,7 +178,7 @@ impl DeferStore for CassandraDeferStore {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(key_id = %key_id), err)]
+    #[instrument(skip(self), err)]
     async fn delete_key(&self, key_id: &Uuid) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(&self.queries.delete_key, (key_id,))
@@ -232,7 +234,7 @@ mod tests {
     // Property-based tests using model equivalence
     defer_store_tests!(async {
         let config = CassandraConfiguration::builder()
-            .nodes(vec!["localhost:9042".to_string()])
+            .nodes(vec!["localhost:9042".to_owned()])
             .build()
             .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
 

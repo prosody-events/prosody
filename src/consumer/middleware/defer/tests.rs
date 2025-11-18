@@ -512,10 +512,13 @@ mod property_tests {
         if let Ok(now) = CompactDateTime::now()
             && let Ok(retry_time) = now.add_duration(CompactDuration::new(60))
         {
-            let retry_count_update = (retry_count == 0).then_some(0);
-            let _ = store
-                .append_deferred_message(key_id, offset, retry_time, retry_count_update)
-                .await;
+            let _ = if retry_count == 0 {
+                store.defer_first_message(key_id, offset, retry_time).await
+            } else {
+                store
+                    .defer_additional_message(key_id, offset, retry_time)
+                    .await
+            };
             cache.insert(key.clone(), DeferState::Deferred { retry_count });
             retry_counts.insert(key.clone(), retry_count);
         }
@@ -744,9 +747,8 @@ mod property_tests {
                             if let Ok(now) = CompactDateTime::now()
                                 && let Ok(retry_time) = now.add_duration(CompactDuration::new(60))
                             {
-                                let _ = store
-                                    .append_deferred_message(&key_id, offset, retry_time, Some(0))
-                                    .await;
+                                let _ =
+                                    store.defer_first_message(&key_id, offset, retry_time).await;
                             }
                         }
                         StoreOp::Get => {

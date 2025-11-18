@@ -10,7 +10,7 @@ use super::config::DeferConfiguration;
 use super::error::{DeferError, DeferInitError};
 use super::failure_tracker::FailureTracker;
 use super::loader::KafkaLoader;
-use super::store::DeferStore;
+use super::store::{DeferStore, RetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::scheduler::SchedulerConfiguration;
@@ -190,6 +190,77 @@ where
     T: FallibleHandler,
     S: DeferStore,
 {
+    /// Checks the defer state for a key (cache + store query on miss).
+    ///
+    /// Returns `Some(DeferState)` if key has deferred messages, `None`
+    /// otherwise.
+    async fn check_defer_state(
+        &self,
+        key: &Key,
+        key_id: &uuid::Uuid,
+    ) -> Result<Option<DeferState>, DeferError<S::Error, T::Error>> {
+        // Check cache first
+        if let Some(state) = self.cache.get(key) {
+            return Ok(Some(state));
+        }
+
+        // Cache miss - query store
+        let store_state = self
+            .store
+            .get_next_deferred_message(key_id)
+            .await
+            .map_err(DeferError::Store)?;
+
+        match store_state {
+            Some((_offset, retry_count)) => {
+                let state = DeferState::Deferred { retry_count };
+                self.cache.insert(key.clone(), state.clone());
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Handles a new message arriving for an already-deferred key.
+    ///
+    /// Appends the message to the deferred queue without processing it.
+    async fn handle_deferred_key_message(
+        &self,
+        key: &Key,
+        key_id: &uuid::Uuid,
+        offset: crate::Offset,
+        retry_count: u32,
+    ) -> Result<(), DeferError<S::Error, T::Error>> {
+        use crate::timers::datetime::CompactDateTime;
+
+        // Calculate expected retry time using current backoff
+        let delay = self.calculate_backoff(retry_count);
+        let now = CompactDateTime::now()?;
+        let expected_retry_time = now.add_duration(delay)?;
+
+        // Append to deferred queue (doesn't modify retry_count)
+        self.store
+            .defer_additional_message(key_id, offset, expected_retry_time)
+            .await
+            .map_err(DeferError::Store)?;
+
+        debug!(
+            "Appended offset {} to deferred queue for key {:?} (retry_count={})",
+            offset, key, retry_count
+        );
+
+        Ok(())
+    }
+
+    /// Cleans up any stale cache entries after successful message processing.
+    ///
+    /// This is defensive - normally the cache should already be clean if the
+    /// key wasn't deferred.
+    fn cleanup_deferred_state_on_success(&self, key: &Key, _key_id: &uuid::Uuid) {
+        // Remove any stale cache entry (defensive programming)
+        self.cache.remove(key);
+    }
+
     /// Calculates the backoff delay for a given retry count.
     ///
     /// Uses exponential backoff: base * `2^retry_count`, capped at `max_delay`.
@@ -260,43 +331,31 @@ where
     {
         self.failure_tracker.record_success();
 
-        // Success! Remove this offset from deferred queue
-        self.store
-            .remove_deferred_message(key_id, offset)
+        // Complete successful retry and prepare for next message or cleanup
+        let result = self
+            .store
+            .complete_retry_success(key_id, offset)
             .await
             .map_err(DeferError::Store)?;
 
-        // Check if there are more deferred messages
-        let has_more = self
-            .store
-            .get_next_deferred_message(key_id)
-            .await
-            .map_err(DeferError::Store)?
-            .is_some();
+        match result {
+            RetryCompletionResult::MoreMessages { next_offset } => {
+                // More messages in queue - retry_count has been reset to 0
+                self.cache
+                    .insert(key.clone(), DeferState::Deferred { retry_count: 0 });
 
-        if has_more {
-            // Reset retry_count to 0 for the next message
-            self.store
-                .set_retry_count(key_id, 0)
-                .await
-                .map_err(DeferError::Store)?;
-            self.cache
-                .insert(key.clone(), DeferState::Deferred { retry_count: 0 });
+                // Schedule timer for the next deferred message
+                self.schedule_retry_timer(context, 0).await?;
 
-            // Schedule timer for the next deferred message
-            self.schedule_retry_timer(context, 0).await?;
-
-            debug!(
-                "Scheduled next retry for key {:?} (more messages in queue)",
-                key
-            );
-        } else {
-            // No more messages, clean up entirely
-            self.store
-                .delete_key(key_id)
-                .await
-                .map_err(DeferError::Store)?;
-            self.cache.remove(key);
+                debug!(
+                    "Scheduled next retry for key {:?} at offset {} (more messages in queue)",
+                    key, next_offset
+                );
+            }
+            RetryCompletionResult::Completed => {
+                // No more messages - key has been deleted from storage
+                self.cache.remove(key);
+            }
         }
 
         debug!(
@@ -342,9 +401,9 @@ where
             }
 
             // Increment retry count
-            let new_retry_count = retry_count + 1;
-            self.store
-                .set_retry_count(key_id, new_retry_count)
+            let new_retry_count = self
+                .store
+                .increment_retry_count(key_id, retry_count)
                 .await
                 .map_err(DeferError::Store)?;
 
@@ -458,21 +517,20 @@ where
                 .map_err(|e| DeferError::Timer(Box::new(e)))?;
         }
 
-        // 2. Write to Cassandra
-        // For first failure (retry_count == 0), pass Some(0) to set the static
-        // retry_count column
-        // For subsequent messages, pass None (just append offset, keep retry_count)
-        let retry_count_update = (retry_count == 0).then_some(0);
-
-        self.store
-            .append_deferred_message(
-                &key_id,
-                message.offset(),
-                expected_retry_time,
-                retry_count_update,
-            )
-            .await
-            .map_err(DeferError::Store)?;
+        // 2. Write to storage
+        if retry_count == 0 {
+            // First failure - initialize with retry_count=0
+            self.store
+                .defer_first_message(&key_id, message.offset(), expected_retry_time)
+                .await
+                .map_err(DeferError::Store)?;
+        } else {
+            // Additional message for already-deferred key
+            self.store
+                .defer_additional_message(&key_id, message.offset(), expected_retry_time)
+                .await
+                .map_err(DeferError::Store)?;
+        }
 
         // 3. Update cache
         self.cache
@@ -508,11 +566,8 @@ where
         use super::error::ConfigurationError;
         use crate::consumer::Keyed;
         use crate::consumer::middleware::defer::generate_key_id;
-        use crate::timers::datetime::CompactDateTime;
 
         let key = message.key().clone();
-
-        // Check if this key is already deferred
         let key_id = generate_key_id(
             self.consumer_group.as_ref(),
             &self.topic,
@@ -520,44 +575,14 @@ where
             &key,
         );
 
-        // Check cache first, query store on miss
-        let defer_state = match self.cache.get(&key) {
-            Some(state) => Some(state),
-            None => {
-                // Cache miss - query store
-                self.store
-                    .get_next_deferred_message(&key_id)
-                    .await
-                    .map_err(DeferError::Store)?
-                    .map(|(_offset, retry_count)| {
-                        let state = DeferState::Deferred { retry_count };
-                        self.cache.insert(key.clone(), state.clone());
-                        state
-                    })
-            }
-        };
+        // Check if this key is already deferred
+        let defer_state = self.check_defer_state(&key, &key_id).await?;
 
-        // If key is already deferred, append this message to the queue and return
+        // If key is already deferred, append this message to the queue
         if let Some(DeferState::Deferred { retry_count }) = defer_state {
-            // Calculate expected retry time for TTL
-            let delay = self.calculate_backoff(retry_count);
-            let now = CompactDateTime::now()?;
-            let expected_retry_time = now.add_duration(delay)?;
-
-            // Append to deferred queue (don't update retry_count - it's managed by timer
-            // retries)
-            self.store
-                .append_deferred_message(&key_id, message.offset(), expected_retry_time, None)
-                .await
-                .map_err(DeferError::Store)?;
-
-            debug!(
-                "Queued message for already-deferred key {:?} (offset={})",
-                key,
-                message.offset()
-            );
-
-            return Ok(());
+            return self
+                .handle_deferred_key_message(&key, &key_id, message.offset(), retry_count)
+                .await;
         }
 
         // Key is not deferred - try to process the message with the inner handler
@@ -568,40 +593,7 @@ where
         {
             Ok(()) => {
                 self.failure_tracker.record_success();
-
-                // If this key was previously deferred, clean up
-                let cached_state = self.cache.get(&key);
-                if let Some(DeferState::Deferred { .. }) = cached_state {
-                    // Generate UUID for this key
-                    let key_id = generate_key_id(
-                        self.consumer_group.as_ref(),
-                        &self.topic,
-                        self.partition,
-                        &key,
-                    );
-
-                    // Remove the oldest deferred offset for this key
-                    // TODO Phase 5.3: After success, if there are more deferred messages,
-                    // remove the oldest one and check if queue is empty
-                    let deferred_result = self
-                        .store
-                        .get_next_deferred_message(&key_id)
-                        .await
-                        .map_err(DeferError::Store)?;
-
-                    if let Some((offset, _retry_count)) = deferred_result {
-                        self.store
-                            .remove_deferred_message(&key_id, offset)
-                            .await
-                            .map_err(DeferError::Store)?;
-                    }
-
-                    // Remove from cache (will be updated if there are more messages)
-                    self.cache.remove(&key);
-
-                    debug!("Cleared defer state for key {:?} after success", key);
-                }
-
+                self.cleanup_deferred_state_on_success(&key, &key_id);
                 Ok(())
             }
             Err(error) => {

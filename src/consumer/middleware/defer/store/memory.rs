@@ -88,36 +88,57 @@ impl DeferStore for MemoryDeferStore {
         Ok(result)
     }
 
+    async fn defer_first_message(
+        &self,
+        key_id: &Uuid,
+        offset: Offset,
+        _expected_retry_time: CompactDateTime,
+    ) -> Result<(), Self::Error> {
+        // Calculate expiry time (TTL simulation)
+        let expiry = Instant::now() + Duration::from_secs(3600);
+
+        // Set retry_count=0 and append offset
+        // Match Cassandra: INSERT doesn't delete existing offsets
+        self.0
+            .deferred
+            .entry_async(*key_id)
+            .await
+            .and_modify(|(offsets, retry_count)| {
+                offsets.insert(offset, expiry);
+                *retry_count = 0;
+            })
+            .or_insert_with(|| {
+                let mut offsets = BTreeMap::new();
+                offsets.insert(offset, expiry);
+                (offsets, 0)
+            });
+
+        Ok(())
+    }
+
     async fn append_deferred_message(
         &self,
         key_id: &Uuid,
         offset: Offset,
         _expected_retry_time: CompactDateTime,
-        retry_count: Option<u32>,
     ) -> Result<(), Self::Error> {
         // Calculate expiry time (TTL simulation)
-        // In real Cassandra implementation, this would use
-        // CassandraStore::calculate_ttl() For in-memory, we add 1 hour to
-        // simulate TTL
         let expiry = Instant::now() + Duration::from_secs(3600);
 
+        // Insert offset without modifying retry_count
         self.0
             .deferred
             .entry_async(*key_id)
             .await
-            .and_modify(|(offsets, current_retry_count)| {
-                // Insert the offset with expiry
+            .and_modify(|(offsets, _retry_count)| {
                 offsets.insert(offset, expiry);
-
-                // Update retry_count if provided (first failure case)
-                if let Some(new_retry_count) = retry_count {
-                    *current_retry_count = new_retry_count;
-                }
             })
             .or_insert_with(|| {
+                // Shouldn't happen (should use defer_first_message first)
+                // but handle gracefully with retry_count=0
                 let mut offsets = BTreeMap::new();
                 offsets.insert(offset, expiry);
-                (offsets, retry_count.unwrap_or(0))
+                (offsets, 0)
             });
 
         Ok(())
@@ -208,9 +229,9 @@ mod tests {
         let offset = Offset::from(42_i64);
         let retry_time = CompactDateTime::now()?;
 
-        // Append with retry_count = Some(0) for first failure
+        // Use defer_first_message for first failure
         store
-            .append_deferred_message(&key_id, offset, retry_time, Some(0))
+            .defer_first_message(&key_id, offset, retry_time)
             .await?;
 
         let result = store.get_next_deferred_message(&key_id).await?;
@@ -224,15 +245,16 @@ mod tests {
         let key_id = test_key_id();
         let retry_time = CompactDateTime::now()?;
 
-        // Append multiple offsets
+        // Defer first message
         store
-            .append_deferred_message(&key_id, Offset::from(100_i64), retry_time, Some(0))
+            .defer_first_message(&key_id, Offset::from(100_i64), retry_time)
+            .await?;
+        // Append additional messages
+        store
+            .append_deferred_message(&key_id, Offset::from(50_i64), retry_time)
             .await?;
         store
-            .append_deferred_message(&key_id, Offset::from(50_i64), retry_time, None)
-            .await?;
-        store
-            .append_deferred_message(&key_id, Offset::from(150_i64), retry_time, None)
+            .append_deferred_message(&key_id, Offset::from(150_i64), retry_time)
             .await?;
 
         // Should return the oldest (smallest) offset
@@ -249,7 +271,7 @@ mod tests {
         let retry_time = CompactDateTime::now()?;
 
         store
-            .append_deferred_message(&key_id, offset, retry_time, Some(0))
+            .defer_first_message(&key_id, offset, retry_time)
             .await?;
         store.remove_deferred_message(&key_id, offset).await?;
 
@@ -277,9 +299,9 @@ mod tests {
         let offset = Offset::from(42_i64);
         let retry_time = CompactDateTime::now()?;
 
-        // Append with retry_count = 0
+        // Defer first message
         store
-            .append_deferred_message(&key_id, offset, retry_time, Some(0))
+            .defer_first_message(&key_id, offset, retry_time)
             .await?;
 
         // Update retry_count to 5
@@ -300,14 +322,14 @@ mod tests {
         let store_clone = store.clone();
         let handle1 = tokio::spawn(async move {
             store_clone
-                .append_deferred_message(&key1, Offset::from(1_i64), retry_time, Some(1))
+                .defer_first_message(&key1, Offset::from(1_i64), retry_time)
                 .await
         });
 
         let store_clone = store.clone();
         let handle2 = tokio::spawn(async move {
             store_clone
-                .append_deferred_message(&key2, Offset::from(2_i64), retry_time, Some(2))
+                .defer_first_message(&key2, Offset::from(2_i64), retry_time)
                 .await
         });
 
@@ -315,10 +337,10 @@ mod tests {
         assert!(handle2.await.is_ok());
 
         let result1 = store.get_next_deferred_message(&key1).await?;
-        assert_eq!(result1, Some((Offset::from(1_i64), 1)));
+        assert_eq!(result1, Some((Offset::from(1_i64), 0)));
 
         let result2 = store.get_next_deferred_message(&key2).await?;
-        assert_eq!(result2, Some((Offset::from(2_i64), 2)));
+        assert_eq!(result2, Some((Offset::from(2_i64), 0)));
 
         Ok(())
     }
