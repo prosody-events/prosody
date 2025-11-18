@@ -4,8 +4,8 @@
 //! with automatic schema migration and optimized TTL management.
 
 use crate::Offset;
+use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::consumer::middleware::defer::store::DeferStore;
 use crate::consumer::middleware::defer::store::cassandra::queries::Queries;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
@@ -38,24 +38,25 @@ pub struct CassandraDeferStore {
 }
 
 impl CassandraDeferStore {
-    /// Creates a new Cassandra defer store with the given configuration.
+    /// Creates a new Cassandra defer store using an existing `CassandraStore`.
     ///
-    /// Initializes the connection to Cassandra, runs schema migrations,
-    /// and prepares all required queries.
+    /// This allows sharing a single Cassandra session across multiple stores
+    /// (e.g., trigger store and defer store), avoiding the creation of multiple
+    /// sessions which is not allowed.
     ///
     /// # Arguments
     ///
-    /// * `config` - Cassandra connection and TTL configuration
+    /// * `store` - Existing `CassandraStore` to share
+    /// * `keyspace` - Cassandra keyspace name for query preparation
     ///
     /// # Errors
     ///
-    /// Returns error if:
-    /// - Connection to Cassandra fails
-    /// - Schema migration fails
-    /// - Query preparation fails
-    pub async fn new(config: &CassandraConfiguration) -> Result<Self, CassandraStoreError> {
-        let store = CassandraStore::new(config).await?;
-        let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
+    /// Returns error if query preparation fails.
+    pub async fn with_store(
+        store: CassandraStore,
+        keyspace: &str,
+    ) -> Result<Self, CassandraStoreError> {
+        let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
         Ok(Self { store, queries })
     }
@@ -83,13 +84,17 @@ impl DeferStore for CassandraDeferStore {
         let row_opt = result
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(i64, Option<i32>)>()
+            .maybe_first_row::<(Option<i64>, Option<i32>)>()
             .map_err(CassandraStoreError::from)?;
 
-        Ok(row_opt.map(|(offset_raw, retry_count_opt)| {
-            let offset = Offset::from(offset_raw);
-            let retry_count = retry_count_opt.and_then(|c| c.try_into().ok()).unwrap_or(0);
-            (offset, retry_count)
+        // Filter out rows where offset is NULL (only static column set, no clustering
+        // rows)
+        Ok(row_opt.and_then(|(offset_opt, retry_count_opt)| {
+            offset_opt.map(|offset_raw| {
+                let offset = Offset::from(offset_raw);
+                let retry_count = retry_count_opt.and_then(|c| c.try_into().ok()).unwrap_or(0);
+                (offset, retry_count)
+            })
         }))
     }
 
@@ -106,15 +111,35 @@ impl DeferStore for CassandraDeferStore {
             .calculate_ttl(expected_retry_time)
             .ok_or(CassandraDeferStoreError::TtlCalculationFailed)?;
 
-        let retry_count_i32: Option<i32> = retry_count.and_then(|c| c.try_into().ok());
+        // Use different prepared statements based on whether we're updating retry_count
+        match retry_count {
+            Some(rc) => {
+                let retry_count_i32: i32 =
+                    rc.try_into()
+                        .map_err(|_| CassandraDeferStoreError::InvalidRetryCount {
+                            retry_count: rc,
+                            reason: "retry count exceeds i32::MAX",
+                        })?;
 
-        self.session()
-            .execute_unpaged(
-                &self.queries.insert_deferred_message,
-                (key_id, offset, retry_count_i32, ttl),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
+                self.session()
+                    .execute_unpaged(
+                        &self.queries.insert_deferred_message_with_retry_count,
+                        (key_id, offset, retry_count_i32, ttl),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)?;
+            }
+            None => {
+                // Don't include retry_count in INSERT - leaves static column unchanged
+                self.session()
+                    .execute_unpaged(
+                        &self.queries.insert_deferred_message_without_retry_count,
+                        (key_id, offset, ttl),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)?;
+            }
+        }
 
         Ok(())
     }
@@ -196,4 +221,23 @@ impl ClassifyError for CassandraDeferStoreError {
             Self::InvalidRetryCount { .. } => ErrorCategory::Terminal,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cassandra::{CassandraConfiguration, CassandraStore};
+    use crate::defer_store_tests;
+
+    // Property-based tests using model equivalence
+    defer_store_tests!(async {
+        let config = CassandraConfiguration::builder()
+            .nodes(vec!["localhost:9042".to_string()])
+            .build()
+            .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
+
+        let store = CassandraStore::new(&config).await?;
+        let defer_store = CassandraDeferStore::with_store(store, "prosody").await?;
+        Ok::<_, color_eyre::Report>(defer_store)
+    });
 }

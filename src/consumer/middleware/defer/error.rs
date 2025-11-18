@@ -1,5 +1,6 @@
 //! Error types for defer middleware.
 
+use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::event_context::BoxEventContextError;
 use crate::consumer::middleware::defer::loader::KafkaLoaderError;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
@@ -7,6 +8,7 @@ use crate::timers::datetime::CompactDateTimeError;
 use std::error::Error as StdError;
 use std::fmt::Debug;
 use thiserror::Error;
+use validator::ValidationErrors;
 
 /// Errors that can occur in defer middleware operations.
 ///
@@ -57,6 +59,22 @@ pub enum ConfigurationError {
     /// Configuration builder error.
     #[error("failed to build configuration: {0:#}")]
     BuildError(String),
+}
+
+/// Errors that can occur during defer middleware initialization.
+#[derive(Debug, Error)]
+pub enum DeferInitError {
+    /// Configuration validation failed.
+    #[error("invalid configuration: {0:#}")]
+    Validation(#[from] ValidationErrors),
+
+    /// `KafkaLoader` construction failed.
+    #[error("failed to create kafka loader: {0:#}")]
+    KafkaLoader(#[from] KafkaLoaderError),
+
+    /// Cassandra store initialization failed.
+    #[error("failed to initialize cassandra store: {0:#}")]
+    CassandraStore(#[from] CassandraStoreError),
 }
 
 impl<S, H> ClassifyError for DeferError<S, H>

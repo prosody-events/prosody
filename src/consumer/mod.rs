@@ -153,6 +153,7 @@ use whoami::fallible::hostname;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
+use crate::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::monopolization::{
     MonopolizationConfiguration, MonopolizationInitError, MonopolizationMiddleware,
@@ -170,6 +171,7 @@ use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopic
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
+use crate::consumer::storage::StorePair;
 use crate::heartbeat::Heartbeat;
 use crate::producer::ProsodyProducer;
 use crate::telemetry::Telemetry;
@@ -195,6 +197,7 @@ pub mod middleware;
 mod partition;
 mod poll;
 mod probes;
+pub mod storage;
 
 /// Atomic counter for tracking changes in partition watermarks.
 ///
@@ -711,12 +714,64 @@ fn build_common_middleware(
         .layer(ShutdownMiddleware))
 }
 
+/// Helper function to initialize a consumer with a pre-built trigger store.
+///
+/// Used when sharing a `CassandraStore` between trigger and defer stores.
+fn initialize_consumer_with_store<T, S>(
+    consumer_config: &ConsumerConfiguration,
+    handler_provider: T,
+    trigger_store: S,
+    telemetry: &Telemetry,
+) -> Result<ProsodyConsumer, ConsumerError>
+where
+    T: HandlerProvider,
+    S: TriggerStore,
+{
+    // Validate the configuration
+    consumer_config.validate()?;
+
+    // Initialize shared state
+    let watermark_version: Arc<WatermarkVersion> = Arc::default();
+    let managers: Arc<Managers> = Arc::default();
+    let shutdown: Arc<AtomicBool> = Arc::default();
+    let telemetry_sender = telemetry.sender();
+
+    // Build event type search automaton for filtering messages
+    let allowed_events = consumer_config
+        .allowed_events
+        .as_ref()
+        .map(|prefixes| {
+            AhoCorasick::builder()
+                .start_kind(StartKind::Anchored)
+                .build(prefixes)
+        })
+        .transpose()?;
+
+    let (managers, runtime_state) = initialize_consumer(ConsumerInitParams {
+        config: consumer_config.clone(),
+        handler_provider,
+        trigger_store,
+        watermark_version: watermark_version.clone(),
+        managers: managers.clone(),
+        allowed_events,
+        telemetry: telemetry_sender,
+        shutdown: shutdown.clone(),
+    })?;
+
+    Ok(ProsodyConsumer {
+        shutdown,
+        managers,
+        runtime_state,
+    })
+}
+
 impl ProsodyConsumer {
-    /// Creates a new `ProsodyConsumer` instance.
+    /// Creates a new `ProsodyConsumer` with the given configuration and handler
+    /// provider.
     ///
-    /// This is the low-level constructor that takes a custom handler provider.
-    /// For common use cases, consider using the specialized constructors like
-    /// `pipeline_consumer` or `low_latency_consumer`.
+    /// This is the standard constructor which is usually wrapped by
+    /// higher-level functions like `pipeline_consumer` or
+    /// `low_latency_consumer`.
     ///
     /// # Arguments
     ///
@@ -778,10 +833,11 @@ impl ProsodyConsumer {
             })?,
             TriggerStoreConfiguration::Cassandra(cassandra_config) => {
                 let slab_size = consumer_config.slab_size.try_into()?;
+                let trigger_store = cassandra_store(cassandra_config, slab_size).await?;
                 initialize_consumer(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
-                    trigger_store: cassandra_store(cassandra_config, slab_size).await?,
+                    trigger_store,
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,
@@ -828,27 +884,76 @@ impl ProsodyConsumer {
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
         monopolization_config: MonopolizationConfiguration,
+        defer_config: DeferConfiguration,
         common_config: &CommonMiddlewareConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
+        // Create both stores atomically - ensures trigger and defer stores match
+        let slab_size = consumer_config.slab_size.try_into()?;
+        let stores = StorePair::new(trigger_store_config, slab_size, consumer_config.mock).await?;
+
         let telemetry = Telemetry::new();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let monopolization_middleware =
             MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
-        let common_middleware =
-            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
 
-        // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then
-        // monopolization then retry
-        let provider = common_middleware
-            .layer(monopolization_middleware)
-            .layer(retry_middleware)
-            .into_provider(handler);
+        // Build the complete middleware stack and consumer
+        // StorePair enum guarantees stores match - no unreachable!() needed
+        match stores {
+            StorePair::Memory {
+                trigger: trigger_store,
+                defer: defer_store,
+            } => {
+                let defer_middleware = DeferMiddleware::new(
+                    defer_config,
+                    consumer_config,
+                    &common_config.scheduler,
+                    defer_store,
+                )?;
 
-        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
+                let common_middleware = build_common_middleware(
+                    common_config,
+                    consumer_config.stall_threshold,
+                    &telemetry,
+                )?;
+
+                let provider = common_middleware
+                    .layer(monopolization_middleware)
+                    .layer(defer_middleware)
+                    .layer(retry_middleware)
+                    .into_provider(handler);
+
+                initialize_consumer_with_store(consumer_config, provider, trigger_store, &telemetry)
+            }
+            StorePair::Cassandra {
+                trigger: trigger_store,
+                defer: defer_store,
+            } => {
+                let defer_middleware = DeferMiddleware::new(
+                    defer_config,
+                    consumer_config,
+                    &common_config.scheduler,
+                    defer_store,
+                )?;
+
+                let common_middleware = build_common_middleware(
+                    common_config,
+                    consumer_config.stall_threshold,
+                    &telemetry,
+                )?;
+
+                let provider = common_middleware
+                    .layer(monopolization_middleware)
+                    .layer(defer_middleware)
+                    .layer(retry_middleware)
+                    .into_provider(handler);
+
+                initialize_consumer_with_store(consumer_config, provider, trigger_store, &telemetry)
+            }
+        }
     }
 
     /// Creates a new `ProsodyConsumer` with a low-latency strategy.
@@ -1220,7 +1325,7 @@ pub enum ConsumerError {
 
     /// Indicates a Cassandra trigger store operation failure.
     #[error("Cassandra trigger store operation failed: {0:#}")]
-    CassandraTriggerStore(#[from] CassandraTriggerStoreError),
+    CassandraTriggerStore(Box<CassandraTriggerStoreError>),
 
     /// Indicates a scheduler initialization failure.
     #[error("Scheduler initialization failed: {0:#}")]
@@ -1234,7 +1339,27 @@ pub enum ConsumerError {
     #[error("Monopolization initialization failed: {0:#}")]
     Monopolization(#[from] MonopolizationInitError),
 
+    /// Indicates a defer middleware initialization failure.
+    #[error("Defer initialization failed: {0:#}")]
+    Defer(#[from] middleware::defer::DeferInitError),
+
+    /// Indicates storage backend creation failure.
+    #[error("Failed to create storage backend: {0:#}")]
+    StorageBackend(Box<storage::StoreCreationError>),
+
     /// Indicates an invalid timer slab size.
     #[error("Invalid timer slab size: {0:#}")]
     InvalidSlabSize(#[from] CompactDurationError),
+}
+
+impl From<CassandraTriggerStoreError> for ConsumerError {
+    fn from(e: CassandraTriggerStoreError) -> Self {
+        Self::CassandraTriggerStore(Box::new(e))
+    }
+}
+
+impl From<storage::StoreCreationError> for ConsumerError {
+    fn from(e: storage::StoreCreationError) -> Self {
+        Self::StorageBackend(Box::new(e))
+    }
 }

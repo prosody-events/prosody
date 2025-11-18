@@ -1,9 +1,9 @@
 //! Configuration for defer middleware.
 
-use crate::cassandra::CassandraConfiguration;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use derive_builder::Builder;
 use std::time::Duration;
+use thiserror::Error;
 use validator::Validate;
 
 /// Configuration for defer middleware.
@@ -85,12 +85,31 @@ pub struct DeferConfiguration {
     #[validate(range(min = 1_usize))]
     pub cache_size: usize,
 
-    /// Storage backend for deferred messages.
+    /// Timeout for Kafka seek operations in the message loader.
     ///
-    /// Determines where deferred offsets are persisted. Uses the same
-    /// `CassandraConfiguration` as the trigger store for consistency.
-    #[builder(default)]
-    pub store: DeferStoreConfiguration,
+    /// Environment variable: `PROSODY_DEFER_SEEK_TIMEOUT`
+    /// Default: 30 seconds
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_DEFER_SEEK_TIMEOUT\", \
+                   Duration::from_secs(30))?",
+        setter(into)
+    )]
+    pub seek_timeout: Duration,
+
+    /// Number of messages to read sequentially before seeking.
+    ///
+    /// If the next requested offset is within this threshold, the loader
+    /// continues reading and discards intermediate messages rather than
+    /// performing an expensive seek operation.
+    ///
+    /// Environment variable: `PROSODY_DEFER_DISCARD_THRESHOLD`
+    /// Default: 100
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_DEFER_DISCARD_THRESHOLD\", 100)?",
+        setter(into)
+    )]
+    #[validate(range(min = 0_i64))]
+    pub discard_threshold: i64,
 }
 
 impl DeferConfiguration {
@@ -101,21 +120,16 @@ impl DeferConfiguration {
     }
 }
 
-/// Storage backend configuration for defer middleware.
-#[derive(Debug, Clone, Default)]
-pub enum DeferStoreConfiguration {
-    /// In-memory storage for testing and development.
-    ///
-    /// Uses HashMap-based storage that is lost on process restart.
-    /// Not suitable for production use.
-    #[default]
-    InMemory,
+/// Error type for defer configuration building and validation.
+#[derive(Debug, Error)]
+pub enum DeferConfigError {
+    /// Error during configuration building (missing fields, etc).
+    #[error("configuration build error: {0:#}")]
+    Build(#[from] DeferConfigurationBuilderError),
 
-    /// Cassandra-based persistent storage.
-    ///
-    /// Uses the same `CassandraConfiguration` as the trigger store,
-    /// ensuring consistent connection pooling and TTL configuration.
-    Cassandra(CassandraConfiguration),
+    /// Error during configuration validation.
+    #[error("configuration validation error: {0:#}")]
+    Validation(#[from] validator::ValidationErrors),
 }
 
 impl DeferConfigurationBuilder {
@@ -126,9 +140,9 @@ impl DeferConfigurationBuilder {
     /// Returns an error if:
     /// - Any required field is missing
     /// - Any validation constraint is violated
-    pub fn build(&mut self) -> Result<DeferConfiguration, String> {
-        let config = self.build_internal().map_err(|e| e.to_string())?;
-        config.validate().map_err(|e| e.to_string())?;
+    pub fn build(&mut self) -> Result<DeferConfiguration, DeferConfigError> {
+        let config = self.build_internal()?;
+        config.validate()?;
         Ok(config)
     }
 }

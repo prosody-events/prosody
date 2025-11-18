@@ -8,6 +8,10 @@ pub mod store;
 #[cfg(test)]
 pub mod tests;
 
+pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
+pub use error::DeferInitError;
+pub use handler::DeferMiddleware;
+
 use crate::{Key, Partition, Topic};
 use uuid::Uuid;
 

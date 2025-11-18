@@ -29,9 +29,15 @@ cassandra_queries! {
             TABLE_DEFERRED_MESSAGES
         ),
 
-        /// Inserts a new deferred message with optional retry count initialization and TTL
-        insert_deferred_message: (
+        /// Inserts a new deferred message with retry count initialization and TTL
+        insert_deferred_message_with_retry_count: (
             "INSERT INTO $keyspace.{} (key_id, offset, retry_count) VALUES (?, ?, ?) USING TTL ?",
+            TABLE_DEFERRED_MESSAGES
+        ),
+
+        /// Inserts a new deferred message WITHOUT updating retry count (leaves static column unchanged)
+        insert_deferred_message_without_retry_count: (
+            "INSERT INTO $keyspace.{} (key_id, offset) VALUES (?, ?) USING TTL ?",
             TABLE_DEFERRED_MESSAGES
         ),
 

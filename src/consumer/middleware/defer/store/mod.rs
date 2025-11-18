@@ -3,6 +3,9 @@
 pub mod cassandra;
 pub mod memory;
 
+#[cfg(test)]
+pub mod tests;
+
 use crate::Offset;
 use crate::consumer::middleware::ClassifyError;
 use crate::timers::datetime::CompactDateTime;

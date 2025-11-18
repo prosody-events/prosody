@@ -7,16 +7,17 @@
 
 use super::DeferState;
 use super::config::DeferConfiguration;
-use super::error::DeferError;
+use super::error::{DeferError, DeferInitError};
 use super::failure_tracker::FailureTracker;
 use super::loader::KafkaLoader;
 use super::store::DeferStore;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::middleware::scheduler::SchedulerConfiguration;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
-use crate::consumer::{DemandType, EventHandler, Uncommitted};
+use crate::consumer::{ConsumerConfiguration, DemandType, EventHandler, Uncommitted};
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};
 use crate::{Key, Partition, Topic};
@@ -50,9 +51,9 @@ where
     /// # Arguments
     ///
     /// * `config` - Configuration for defer behavior
-    /// * `loader` - Kafka loader for reloading messages
+    /// * `consumer_config` - Consumer configuration for shared Kafka settings
+    /// * `scheduler_config` - Scheduler configuration for max concurrency
     /// * `store` - Storage backend for deferred state
-    /// * `consumer_group` - Consumer group name for UUID generation
     ///
     /// # Returns
     ///
@@ -60,15 +61,33 @@ where
     ///
     /// # Errors
     ///
-    /// Returns `ValidationErrors` if the configuration is invalid.
+    /// Returns an error if configuration validation fails or `KafkaLoader`
+    /// construction fails.
     pub fn new(
         config: DeferConfiguration,
-        loader: KafkaLoader,
+        consumer_config: &ConsumerConfiguration,
+        scheduler_config: &SchedulerConfiguration,
         store: S,
-        consumer_group: &str,
-    ) -> Result<Self, validator::ValidationErrors> {
+    ) -> Result<Self, DeferInitError> {
+        use super::loader::LoaderConfiguration;
         use validator::Validate;
+
         config.validate()?;
+
+        // Create a derived group ID for the loader with .defer-loader suffix
+        let loader_group_id = format!("{}.defer-loader", consumer_config.group_id);
+
+        // Build KafkaLoader with shared consumer configuration
+        let loader_config = LoaderConfiguration {
+            bootstrap_servers: consumer_config.bootstrap_servers.clone(),
+            group_id: loader_group_id,
+            max_permits: scheduler_config.max_concurrency,
+            cache_size: config.cache_size,
+            poll_interval: consumer_config.poll_interval,
+            seek_timeout: config.seek_timeout,
+            discard_threshold: config.discard_threshold,
+        };
+        let loader = KafkaLoader::new(loader_config)?;
 
         let failure_tracker = FailureTracker::new(config.failure_window, config.failure_threshold);
 
@@ -77,7 +96,7 @@ where
             loader: Arc::new(loader),
             store,
             failure_tracker,
-            consumer_group: Arc::from(consumer_group),
+            consumer_group: Arc::from(consumer_config.group_id.as_str()),
         })
     }
 }

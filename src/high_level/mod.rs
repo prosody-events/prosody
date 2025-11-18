@@ -6,6 +6,7 @@
 
 use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::defer::DeferConfigurationBuilder;
 use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
 use crate::consumer::middleware::retry::RetryConfigurationBuilder;
 use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, SchedulerInitError};
@@ -51,6 +52,8 @@ pub struct ConsumerBuilders {
     pub scheduler: SchedulerConfigurationBuilder,
     /// Monopolization middleware configuration builder.
     pub monopolization: MonopolizationConfigurationBuilder,
+    /// Defer middleware configuration builder.
+    pub defer: DeferConfigurationBuilder,
     /// Timeout middleware configuration builder.
     pub timeout: TimeoutConfigurationBuilder,
 }
@@ -144,6 +147,7 @@ impl<T> HighLevelClient<T> {
             failure_topic_builder: &consumer_builders.failure_topic,
             scheduler_builder: &consumer_builders.scheduler,
             monopolization_builder: &consumer_builders.monopolization,
+            defer_builder: &consumer_builders.defer,
             timeout_builder: &consumer_builders.timeout,
             cassandra_builder,
         });
@@ -218,6 +222,7 @@ impl<T> HighLevelClient<T> {
                 consumer,
                 retry,
                 monopolization,
+                defer,
                 common,
                 trigger_store,
             } => {
@@ -226,6 +231,7 @@ impl<T> HighLevelClient<T> {
                     trigger_store,
                     retry.clone(),
                     monopolization.clone(),
+                    defer.clone(),
                     common,
                     handler.clone(),
                 )

@@ -10,6 +10,9 @@ use crate::cassandra::{
     CassandraConfiguration,
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
+use crate::consumer::middleware::defer::{
+    DeferConfigError, DeferConfiguration, DeferConfigurationBuilder,
+};
 use crate::consumer::middleware::monopolization::{
     MonopolizationConfiguration, MonopolizationConfigurationBuilder,
     MonopolizationConfigurationBuilderError,
@@ -48,6 +51,8 @@ pub(crate) struct ModeConfigurationBuildParams<'a> {
     pub scheduler_builder: &'a SchedulerConfigurationBuilder,
     /// Builder for the monopolization configuration.
     pub monopolization_builder: &'a MonopolizationConfigurationBuilder,
+    /// Builder for the defer configuration.
+    pub defer_builder: &'a DeferConfigurationBuilder,
     /// Builder for the timeout configuration.
     pub timeout_builder: &'a TimeoutConfigurationBuilder,
     /// Builder for the Cassandra configuration.
@@ -74,6 +79,8 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// Monopolization detection configuration.
         monopolization: MonopolizationConfiguration,
+        /// Defer middleware configuration.
+        defer: DeferConfiguration,
         /// Common middleware configuration (scheduler, timeout).
         common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
@@ -141,10 +148,12 @@ impl ModeConfiguration {
         Ok(match params.mode {
             Mode::Pipeline => {
                 let monopolization = params.monopolization_builder.build()?;
+                let defer = params.defer_builder.clone().build()?;
                 Self::Pipeline {
                     consumer,
                     retry,
                     monopolization,
+                    defer,
                     common,
                     trigger_store,
                 }
@@ -246,6 +255,10 @@ pub enum ModeConfigurationError {
     /// Error when the monopolization configuration builder fails.
     #[error("invalid monopolization configuration: {0:#}")]
     MonopolizationConfigurationBuilder(#[from] MonopolizationConfigurationBuilderError),
+
+    /// Error when the defer configuration builder fails.
+    #[error("invalid defer configuration: {0:#}")]
+    DeferConfiguration(#[from] DeferConfigError),
 
     /// Error when the timeout configuration builder fails.
     #[error("invalid timeout configuration: {0:#}")]

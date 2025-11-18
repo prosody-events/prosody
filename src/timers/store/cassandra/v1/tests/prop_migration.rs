@@ -4,7 +4,7 @@
 //! random scenarios to verify all migration invariants.
 
 use crate::Key;
-use crate::cassandra::CassandraConfiguration;
+use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -649,8 +649,13 @@ pub async fn prop_migration_invariants(
         }
         SegmentVersion::V2 => {
             let config = test_cassandra_config("prosody_test_v1");
-            let cassandra_store =
-                CassandraTriggerStore::new(&config, input.initial_slab_size).await?;
+            let cassandra_base = CassandraStore::new(&config).await?;
+            let cassandra_store = CassandraTriggerStore::with_store(
+                cassandra_base,
+                &config.keyspace,
+                input.initial_slab_size,
+            )
+            .await?;
             let store = TableAdapter::new(cassandra_store);
             setup_v2_state(&store, &input).await?;
         }
@@ -658,7 +663,10 @@ pub async fn prop_migration_invariants(
 
     // Migration phase: Create store with target_slab_size
     let config = test_cassandra_config("prosody_test_v1");
-    let cassandra_store = CassandraTriggerStore::new(&config, input.target_slab_size).await?;
+    let cassandra_base = CassandraStore::new(&config).await?;
+    let cassandra_store =
+        CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, input.target_slab_size)
+            .await?;
     let store = TableAdapter::new(cassandra_store);
 
     // Trigger migration by calling get_segment()

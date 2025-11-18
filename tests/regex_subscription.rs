@@ -13,9 +13,9 @@ use prosody::{
     cassandra::config::CassandraConfigurationBuilder,
     consumer::ConsumerConfigurationBuilder,
     consumer::middleware::{
-        monopolization::MonopolizationConfigurationBuilder, retry::RetryConfigurationBuilder,
-        scheduler::SchedulerConfigurationBuilder, timeout::TimeoutConfigurationBuilder,
-        topic::FailureTopicConfigurationBuilder,
+        defer::DeferConfigurationBuilder, monopolization::MonopolizationConfigurationBuilder,
+        retry::RetryConfigurationBuilder, scheduler::SchedulerConfigurationBuilder,
+        timeout::TimeoutConfigurationBuilder, topic::FailureTopicConfigurationBuilder,
     },
     high_level::{ConsumerBuilders, HighLevelClient, HighLevelClientError, mode::Mode},
     producer::ProducerConfigurationBuilder,
@@ -117,6 +117,7 @@ fn create_high_level_client(
         failure_topic: FailureTopicConfigurationBuilder::default(),
         scheduler: SchedulerConfigurationBuilder::default(),
         monopolization: MonopolizationConfigurationBuilder::default(),
+        defer: DeferConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
     };
     let mut cassandra_builder = CassandraConfigurationBuilder::default();

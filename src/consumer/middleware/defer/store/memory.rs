@@ -18,6 +18,9 @@
 use super::DeferStore;
 use crate::Offset;
 use crate::timers::datetime::CompactDateTime;
+
+#[cfg(test)]
+use crate::defer_store_tests;
 use scc::HashMap;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -125,36 +128,37 @@ impl DeferStore for MemoryDeferStore {
         key_id: &Uuid,
         offset: Offset,
     ) -> Result<(), Self::Error> {
-        // Remove offset and determine if entry should be cleaned up
-        // Must drop entry guard before calling remove_async to avoid deadlock
-        let is_empty = {
-            self.0
-                .deferred
-                .entry_async(*key_id)
-                .await
-                .and_modify(|(offsets, _retry_count)| {
-                    offsets.remove(&offset);
-                })
-                .or_default()
-                .get()
-                .0
-                .is_empty()
-        }; // Entry guard is dropped here
-
-        // Clean up empty entries
-        if is_empty {
-            self.0.deferred.remove_async(key_id).await;
-        }
+        // Remove the specific offset
+        // Note: Unlike Cassandra's DELETE on clustering column, we don't remove the
+        // entry entirely when offsets become empty. This preserves retry_count
+        // (static column equivalent), matching Cassandra behavior where static
+        // columns persist after deleting all clustering rows.
+        let _ = self
+            .0
+            .deferred
+            .entry_async(*key_id)
+            .await
+            .and_modify(|(offsets, _retry_count)| {
+                offsets.remove(&offset);
+            });
 
         Ok(())
     }
 
     async fn set_retry_count(&self, key_id: &Uuid, retry_count: u32) -> Result<(), Self::Error> {
-        let _ = self.0.deferred.entry_async(*key_id).await.and_modify(
-            |(_offsets, current_retry_count)| {
+        // Match Cassandra: UPDATE creates partition with static column even if no
+        // offsets exist
+        self.0
+            .deferred
+            .entry_async(*key_id)
+            .await
+            .and_modify(|(_offsets, current_retry_count)| {
                 *current_retry_count = retry_count;
-            },
-        );
+            })
+            .or_insert_with(|| {
+                // Create entry with empty offsets and the specified retry_count
+                (BTreeMap::new(), retry_count)
+            });
 
         Ok(())
     }
@@ -318,4 +322,7 @@ mod tests {
 
         Ok(())
     }
+
+    // Property-based tests using model equivalence
+    defer_store_tests!(async { Ok::<_, color_eyre::Report>(MemoryDeferStore::new()) });
 }

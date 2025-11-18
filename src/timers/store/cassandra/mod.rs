@@ -46,28 +46,28 @@ pub struct CassandraTriggerStore {
 }
 
 impl CassandraTriggerStore {
-    /// Creates a new Cassandra trigger store with the given configuration.
+    /// Creates a new Cassandra trigger store using an existing
+    /// `CassandraStore`.
     ///
-    /// Initializes the connection to Cassandra, runs schema migrations,
-    /// and prepares all required queries.
+    /// This allows sharing a single Cassandra session across multiple stores
+    /// (e.g., trigger store and defer store), avoiding the creation of multiple
+    /// sessions which is not allowed.
     ///
     /// # Arguments
     ///
-    /// * `config` - Cassandra connection and TTL configuration
+    /// * `store` - Existing `CassandraStore` to share
+    /// * `keyspace` - Cassandra keyspace name for query preparation
     /// * `slab_size` - Target slab size for automatic migration
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraTriggerStoreError`] if:
-    /// - Connection to Cassandra fails
-    /// - Schema migration fails
-    /// - Query preparation fails
-    pub async fn new(
-        config: &CassandraConfiguration,
+    /// Returns error if query preparation fails.
+    pub async fn with_store(
+        store: CassandraStore,
+        keyspace: &str,
         slab_size: CompactDuration,
     ) -> Result<Self, CassandraTriggerStoreError> {
-        let store = CassandraStore::new(config).await?;
-        let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
+        let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
         Ok(Self {
             store,
@@ -784,7 +784,8 @@ pub async fn cassandra_store(
     config: &CassandraConfiguration,
     slab_size: CompactDuration,
 ) -> Result<TableAdapter<CassandraTriggerStore>, CassandraTriggerStoreError> {
-    let cassandra = CassandraTriggerStore::new(config, slab_size).await?;
+    let store = CassandraStore::new(config).await?;
+    let cassandra = CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await?;
     Ok(TableAdapter::new(cassandra))
 }
 
@@ -850,6 +851,7 @@ impl ClassifyError for CassandraTriggerStoreError {
 #[cfg(test)]
 mod test {
     use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
+    use crate::cassandra::CassandraStore;
     use crate::timers::duration::CompactDuration;
     use crate::timers::slab::{Slab, SlabId};
     use crate::timers::store::operations::TriggerOperations;
@@ -896,7 +898,8 @@ mod test {
         CassandraTriggerStore,
         |slab_size| async move {
             let config = test_cassandra_config("prosody");
-            CassandraTriggerStore::new(&config, slab_size).await
+            let store = CassandraStore::new(&config).await?;
+            CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await
         },
         crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
         |slab_size| async move {
@@ -911,8 +914,10 @@ mod test {
         init_test_logging();
 
         let slab_size = CompactDuration::new(60); // 1 minute slabs
+        let config = test_cassandra_config("prosody_test");
+        let cassandra_store = CassandraStore::new(&config).await?;
         let store =
-            CassandraTriggerStore::new(&test_cassandra_config("prosody_test"), slab_size).await?;
+            CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {
@@ -1008,9 +1013,10 @@ mod test {
         init_test_logging();
 
         let slab_size = CompactDuration::new(60);
+        let config = test_cassandra_config("prosody_test_simple");
+        let cassandra_store = CassandraStore::new(&config).await?;
         let store =
-            CassandraTriggerStore::new(&test_cassandra_config("prosody_test_simple"), slab_size)
-                .await?;
+            CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {
