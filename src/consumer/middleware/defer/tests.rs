@@ -161,8 +161,8 @@ pub enum TimerOperation {
 pub struct MockContext {
     /// Records all timer operations in order.
     operations: Arc<Mutex<Vec<TimerOperation>>>,
-    partition: Partition,
-    topic: Topic,
+    _partition: Partition,
+    _topic: Topic,
 }
 
 impl MockContext {
@@ -171,8 +171,8 @@ impl MockContext {
     pub fn new(topic: Topic, partition: Partition) -> Self {
         Self {
             operations: Arc::new(Mutex::new(Vec::new())),
-            partition,
-            topic,
+            _partition: partition,
+            _topic: topic,
         }
     }
 
@@ -617,10 +617,10 @@ mod property_tests {
                     match op_byte % 3 {
                         0 => {
                             handle_append(&store, &cache, key, &key_id, op_byte, &mut retry_counts)
-                                .await
+                                .await;
                         }
                         1 => {
-                            handle_increment(&store, &cache, key, &key_id, &mut retry_counts).await
+                            handle_increment(&store, &cache, key, &key_id, &mut retry_counts).await;
                         }
                         2 => handle_delete(&store, &cache, key, &key_id, &mut retry_counts).await,
                         _ => {}

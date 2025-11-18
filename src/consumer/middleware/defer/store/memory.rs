@@ -158,6 +158,11 @@ impl DeferStore for MemoryDeferStore {
 
         Ok(())
     }
+
+    async fn delete_key(&self, key_id: &Uuid) -> Result<(), Self::Error> {
+        self.0.deferred.remove_async(key_id).await;
+        Ok(())
+    }
 }
 
 /// Creates a new in-memory defer store.

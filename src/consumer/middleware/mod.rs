@@ -146,7 +146,8 @@
 //! - [`ErrorCategory::Terminal`] - System failure, abort processing
 
 use std::convert::Infallible;
-use std::fmt::{Debug, Display};
+use std::error::Error as StdError;
+use std::fmt::Debug;
 use std::future::Future;
 use std::io::Error as IoError;
 
@@ -356,7 +357,7 @@ pub trait HandlerMiddleware {
 /// Defines a handler that can fail during message processing.
 pub trait FallibleHandler: Send + Sync + 'static {
     /// The error type returned by this handler.
-    type Error: ClassifyError + Display + Send;
+    type Error: ClassifyError + StdError + Send;
 
     /// Handles a message, potentially returning an error.
     ///

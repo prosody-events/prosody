@@ -1,5 +1,6 @@
 //! Storage trait and implementations for defer middleware.
 
+pub mod cassandra;
 pub mod memory;
 
 use crate::Offset;
@@ -8,6 +9,9 @@ use crate::timers::datetime::CompactDateTime;
 use std::error::Error;
 use std::future::Future;
 use uuid::Uuid;
+
+pub use cassandra::CassandraDeferStore;
+pub use memory::MemoryDeferStore;
 
 /// Storage backend for deferred message offsets.
 ///
@@ -144,4 +148,28 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
         key_id: &Uuid,
         retry_count: u32,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Delete all data for a key, including the static `retry_count` column.
+    ///
+    /// Called when processing the last deferred message successfully and
+    /// `get_next_deferred_message` returns `None`, indicating no more messages.
+    /// This cleans up the entire partition and prevents orphaned static
+    /// columns.
+    ///
+    /// # Rationale
+    ///
+    /// After removing the last offset row via [`remove_deferred_message`], the
+    /// static `retry_count` column remains in Cassandra until TTL expiration.
+    /// This wastes storage and creates tombstones. By explicitly deleting the
+    /// entire partition when we know we're done with a key, we maintain clean
+    /// state and efficient storage usage.
+    ///
+    /// # Arguments
+    ///
+    /// * `key_id` - The UUID identifying the key to delete
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage backend fails.
+    fn delete_key(&self, key_id: &Uuid) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

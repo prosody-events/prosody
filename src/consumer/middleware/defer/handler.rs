@@ -143,7 +143,6 @@ impl<T, S> FallibleHandlerProvider for DeferProvider<T, S>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
-    <T::Handler as FallibleHandler>::Error: ClassifyError,
     S: DeferStore,
 {
     type Handler = DeferHandler<T::Handler, S>;
@@ -210,7 +209,7 @@ where
         &self,
         context: &C,
         retry_count: u32,
-    ) -> Result<(), DeferError<S::Error>>
+    ) -> Result<(), DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -236,7 +235,7 @@ where
         key_id: &uuid::Uuid,
         offset: crate::Offset,
         retry_count: u32,
-    ) -> Result<(), DeferError<S::Error>>
+    ) -> Result<(), DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -273,7 +272,11 @@ where
                 key
             );
         } else {
-            // No more messages, clear cache
+            // No more messages, clean up entirely
+            self.store
+                .delete_key(key_id)
+                .await
+                .map_err(DeferError::Store)?;
             self.cache.remove(key);
         }
 
@@ -294,7 +297,7 @@ where
         offset: crate::Offset,
         retry_count: u32,
         error: T::Error,
-    ) -> Result<(), DeferError<S::Error>>
+    ) -> Result<(), DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -350,9 +353,7 @@ where
                 .await
                 .map_err(DeferError::Store)?;
             self.cache.remove(key);
-            Err(DeferError::Configuration(ConfigurationError::Invalid(
-                format!("Handler error: {error}"),
-            )))
+            Err(DeferError::Handler(error))
         }
     }
 
@@ -367,7 +368,7 @@ where
         context: C,
         key: &Key,
         message: &ConsumerMessage,
-    ) -> Result<(), DeferError<S::Error>>
+    ) -> Result<(), DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -474,7 +475,7 @@ where
     T: FallibleHandler,
     S: DeferStore,
 {
-    type Error = DeferError<S::Error>;
+    type Error = DeferError<S::Error, T::Error>;
 
     async fn on_message<C>(
         &self,
@@ -602,9 +603,7 @@ where
                     Ok(())
                 } else {
                     // Transient or terminal errors - don't defer, propagate immediately
-                    Err(DeferError::Configuration(ConfigurationError::Invalid(
-                        format!("Handler error: {error}"),
-                    )))
+                    Err(DeferError::Handler(error))
                 }
             }
         }
@@ -619,7 +618,6 @@ where
     where
         C: EventContext,
     {
-        use super::error::ConfigurationError;
         use crate::consumer::Keyed;
         use crate::consumer::middleware::defer::generate_key_id;
 
@@ -630,11 +628,7 @@ where
                 .handler
                 .on_timer(context, trigger, demand_type)
                 .await
-                .map_err(|e| {
-                    DeferError::Configuration(ConfigurationError::Invalid(format!(
-                        "Handler timer error: {e}"
-                    )))
-                });
+                .map_err(DeferError::Handler);
         }
 
         // This is a defer retry timer - load and retry the deferred message
@@ -705,7 +699,6 @@ where
 impl<T, S> EventHandler for DeferHandler<T, S>
 where
     T: FallibleHandler,
-    T::Error: ClassifyError,
     S: DeferStore,
 {
     async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)

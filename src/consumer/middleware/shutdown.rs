@@ -122,7 +122,7 @@ impl<T> FallibleHandler for ShutdownHandler<T>
 where
     T: FallibleHandler,
 {
-    type Error = ShutdownError<T>;
+    type Error = ShutdownError<T::Error>;
 
     /// Processes a message, checking for shutdown conditions.
     ///
@@ -187,22 +187,19 @@ where
 
 /// Represents errors that can occur during shutdown handling.
 #[derive(Debug, Error)]
-pub enum ShutdownError<T>
-where
-    T: FallibleHandler,
-{
+pub enum ShutdownError<T> {
     /// Indicates that the partition is being revoked.
     #[error("partition is being revoked")]
     Shutdown,
 
     /// Wraps an error from the underlying handler.
     #[error("handler error: {0:#}")]
-    Handler(T::Error),
+    Handler(T),
 }
 
 impl<T> ClassifyError for ShutdownError<T>
 where
-    T: FallibleHandler,
+    T: ClassifyError,
 {
     /// Classifies the shutdown error.
     ///

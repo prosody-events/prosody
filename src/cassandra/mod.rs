@@ -55,6 +55,9 @@ pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
 /// Table name for distributed migration locking.
 pub const TABLE_LOCKS: &str = "locks";
 
+/// Table name for storing deferred messages awaiting retry.
+pub const TABLE_DEFERRED_MESSAGES: &str = "deferred_messages";
+
 /// Unified Cassandra store providing session and infrastructure for all
 /// components.
 ///
