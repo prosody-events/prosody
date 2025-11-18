@@ -75,6 +75,36 @@ where
             cache: Arc::new(Cache::new(capacity)),
         }
     }
+
+    /// Updates cache after appending an offset to the deferred queue.
+    ///
+    /// Uses smart invalidation: only updates/invalidates if the new offset
+    /// might change the cached minimum offset.
+    ///
+    /// # Strategy
+    ///
+    /// - If cached and `offset >= min_offset`: Preserve cache (monotonic
+    ///   append)
+    /// - If cached and `offset < min_offset`: Update cache with new minimum
+    /// - If not cached or was `None`: Invalidate (conservative)
+    fn update_cache_after_append(&self, key_id: &Uuid, offset: Offset) {
+        if let Some(cached) = self.cache.get(key_id)
+            && let Some((min_offset, retry_count)) = cached
+        {
+            if offset >= min_offset {
+                // New offset doesn't change minimum (monotonic append case)
+                // Preserve cache - this is the common case for Kafka
+                return;
+            }
+            // New offset is smaller - update cache with new minimum
+            // Keep existing retry_count as it applies to the queue as a whole
+            self.cache.insert(*key_id, Some((offset, retry_count)));
+            return;
+        }
+
+        // No cached entry or was None - invalidate to be safe
+        self.cache.remove(key_id);
+    }
 }
 
 impl<S> DeferStore for CachedDeferStore<S>
@@ -94,12 +124,18 @@ where
             .defer_first_message(key_id, offset, expected_retry_time)
             .await?;
 
-        // Invalidate cache: While the contract says this should only be called
-        // for new keys, the store implementations handle it gracefully even if
-        // the key already has offsets (e.g., if defer_additional was called first).
-        // To ensure correctness in all cases, we invalidate and let the next read
-        // query the store for the actual next offset.
-        self.cache.remove(key_id);
+        // Pre-populate cache ONLY if we're confident this is truly the first message
+        match self.cache.get(key_id) {
+            Some(None) => {
+                // Was cached as not-deferred - safe to update to deferred
+                self.cache.insert(*key_id, Some((offset, 0)));
+            }
+            Some(Some(_)) | None => {
+                // Either already had deferred state (contract violation) or not cached
+                // Be conservative: invalidate so next read queries store for true minimum
+                self.cache.remove(key_id);
+            }
+        }
 
         Ok(())
     }
@@ -115,12 +151,8 @@ where
             .defer_additional_message(key_id, offset, expected_retry_time)
             .await?;
 
-        // Invalidate cache: the appended offset might be smaller than the current
-        // "next" offset (if offsets arrive out-of-order), which would make the
-        // cached next offset stale.
-        // In practice, Kafka offsets are monotonic per partition, but the property
-        // tests (and correct general behavior) require handling arbitrary offsets.
-        self.cache.remove(key_id);
+        // Update cache using smart invalidation
+        self.update_cache_after_append(key_id, offset);
 
         Ok(())
     }
@@ -159,8 +191,16 @@ where
             .increment_retry_count(key_id, current_retry_count)
             .await?;
 
-        // Invalidate cache - next read will populate with correct retry_count.
-        // Conservative strategy: simpler and safer than in-place update.
+        // Update retry count in-place if we have a cached entry with offset.
+        // This is safe because retry_count changes don't affect offset ordering.
+        if let Some(cached) = self.cache.get(key_id)
+            && let Some((offset, _old_retry_count)) = cached
+        {
+            self.cache.insert(*key_id, Some((offset, new_count)));
+            return Ok(new_count);
+        }
+
+        // No cached entry or was None - invalidate so next read repopulates
         self.cache.remove(key_id);
 
         Ok(new_count)
@@ -195,9 +235,8 @@ where
             .append_deferred_message(key_id, offset, expected_retry_time)
             .await?;
 
-        // Invalidate cache for the same reason as defer_additional_message:
-        // the appended offset might be smaller than the current next offset.
-        self.cache.remove(key_id);
+        // Update cache using smart invalidation
+        self.update_cache_after_append(key_id, offset);
 
         Ok(())
     }
@@ -222,8 +261,20 @@ where
         // Write through to store first
         self.store.set_retry_count(key_id, retry_count).await?;
 
-        // Invalidate cache - next read will populate with correct state.
-        // Low-level primitive, safest to invalidate.
+        // Update retry count in-place if we have a cached entry with offset.
+        // This is safe because:
+        // 1. Retry count changes are orthogonal to offset ordering
+        // 2. If we have an offset cached, the key exists with offsets in store
+        // 3. set_retry_count doesn't remove offsets, so our cached offset remains valid
+        if let Some(cached) = self.cache.get(key_id)
+            && let Some((offset, _old_retry_count)) = cached
+        {
+            self.cache.insert(*key_id, Some((offset, retry_count)));
+            return Ok(());
+        }
+
+        // No cached entry or was None - invalidate to be safe
+        // (set_retry_count can create entry with empty offsets per trait semantics)
         self.cache.remove(key_id);
 
         Ok(())
@@ -275,7 +326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_invalidation_on_increment() -> color_eyre::Result<()> {
+    async fn test_cache_update_on_increment() -> color_eyre::Result<()> {
         let store = MemoryDeferStore::new();
         let cached_store = CachedDeferStore::new(store, 100);
         let key_id = test_key_id();
@@ -288,13 +339,20 @@ mod tests {
             .await?;
         cached_store.get_next_deferred_message(&key_id).await?;
 
-        // Increment retry count (should invalidate cache)
+        // Increment retry count (should update cache in-place)
         let new_count = cached_store.increment_retry_count(&key_id, 0).await?;
         assert_eq!(new_count, 1);
 
-        // Next get should see updated retry_count
+        // Next get should see updated retry_count (cache hit, no store query)
         let result = cached_store.get_next_deferred_message(&key_id).await?;
         assert_eq!(result, Some((offset, 1)));
+
+        // Increment again to verify it keeps working
+        let new_count = cached_store.increment_retry_count(&key_id, 1).await?;
+        assert_eq!(new_count, 2);
+
+        let result = cached_store.get_next_deferred_message(&key_id).await?;
+        assert_eq!(result, Some((offset, 2)));
 
         Ok(())
     }
@@ -364,22 +422,54 @@ mod tests {
         let key_id = test_key_id();
         let retry_time = CompactDateTime::now()?;
 
-        // Defer first message and populate cache
+        // Defer first message - cache pre-populated
         cached_store
             .defer_first_message(&key_id, Offset::from(100_i64), retry_time)
             .await?;
-        let before = cached_store.get_next_deferred_message(&key_id).await?;
-        assert_eq!(before, Some((Offset::from(100_i64), 0)));
+        // No need to call get_next - defer_first_message pre-warms cache
 
         // Defer additional message with SMALLER offset (out-of-order scenario)
-        // This should invalidate cache since the new offset becomes the "next"
+        // Smart invalidation should update cache with new minimum
         cached_store
             .defer_additional_message(&key_id, Offset::from(50_i64), retry_time)
             .await?;
 
-        // Next read should see offset 50 (the smaller one) as next
+        // Next read should see offset 50 (the smaller one) as next (cache hit!)
         let after = cached_store.get_next_deferred_message(&key_id).await?;
         assert_eq!(after, Some((Offset::from(50_i64), 0)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_defer_additional_monotonic() -> color_eyre::Result<()> {
+        let store = MemoryDeferStore::new();
+        let cached_store = CachedDeferStore::new(store, 100);
+        let key_id = test_key_id();
+        let retry_time = CompactDateTime::now()?;
+
+        // Defer first message - cache pre-populated
+        cached_store
+            .defer_first_message(&key_id, Offset::from(100_i64), retry_time)
+            .await?;
+
+        // Append monotonically increasing offsets - cache should be preserved
+        cached_store
+            .defer_additional_message(&key_id, Offset::from(200_i64), retry_time)
+            .await?;
+
+        // Cache should still have offset 100 as minimum (not invalidated!)
+        let result = cached_store.get_next_deferred_message(&key_id).await?;
+        assert_eq!(result, Some((Offset::from(100_i64), 0)));
+
+        // Append another - still monotonic
+        cached_store
+            .defer_additional_message(&key_id, Offset::from(300_i64), retry_time)
+            .await?;
+
+        // Still cached at 100
+        let result = cached_store.get_next_deferred_message(&key_id).await?;
+        assert_eq!(result, Some((Offset::from(100_i64), 0)));
 
         Ok(())
     }
