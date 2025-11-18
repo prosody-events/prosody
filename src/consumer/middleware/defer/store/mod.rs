@@ -1,5 +1,6 @@
 //! Storage trait and implementations for defer middleware.
 
+pub mod cached;
 pub mod cassandra;
 pub mod memory;
 
@@ -13,6 +14,7 @@ use std::error::Error;
 use std::future::Future;
 use uuid::Uuid;
 
+pub use cached::CachedDeferStore;
 pub use cassandra::CassandraDeferStore;
 pub use memory::MemoryDeferStore;
 

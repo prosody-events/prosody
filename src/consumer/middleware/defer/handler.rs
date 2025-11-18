@@ -10,7 +10,7 @@ use super::config::DeferConfiguration;
 use super::error::{DeferError, DeferInitError};
 use super::failure_tracker::FailureTracker;
 use super::loader::KafkaLoader;
-use super::store::{DeferStore, RetryCompletionResult};
+use super::store::{CachedDeferStore, DeferStore, RetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::scheduler::SchedulerConfiguration;
@@ -21,7 +21,6 @@ use crate::consumer::{ConsumerConfiguration, DemandType, EventHandler, Uncommitt
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};
 use crate::{Key, Partition, Topic};
-use quick_cache::sync::Cache;
 use std::sync::Arc;
 use tracing::{debug, error};
 
@@ -120,7 +119,8 @@ where
 /// # Type Parameters
 ///
 /// * `T` - Inner handler type
-/// * `S` - Store implementation (`DeferStore`)
+/// * `S` - Store implementation (`DeferStore`, typically wrapped in
+///   `CachedDeferStore`)
 #[derive(Clone)]
 pub struct DeferHandler<T, S>
 where
@@ -130,7 +130,6 @@ where
     loader: Arc<KafkaLoader>,
     store: S,
     failure_tracker: FailureTracker,
-    cache: Arc<Cache<Key, DeferState>>,
     config: DeferConfiguration,
     topic: Topic,
     partition: Partition,
@@ -164,15 +163,18 @@ where
     T::Handler: FallibleHandler,
     S: DeferStore,
 {
-    type Handler = DeferHandler<T::Handler, S>;
+    type Handler = DeferHandler<T::Handler, CachedDeferStore<S>>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        // Wrap store in cache for this partition handler.
+        // Each partition gets its own cache with the same lifecycle as the handler.
+        let cached_store = CachedDeferStore::new(self.store.clone(), self.config.cache_size);
+
         DeferHandler {
             handler: self.provider.handler_for_partition(topic, partition),
             loader: self.loader.clone(),
-            store: self.store.clone(),
+            store: cached_store,
             failure_tracker: self.failure_tracker.clone(),
-            cache: Arc::new(Cache::new(self.config.cache_size)),
             config: self.config.clone(),
             topic,
             partition,
@@ -190,35 +192,23 @@ where
     T: FallibleHandler,
     S: DeferStore,
 {
-    /// Checks the defer state for a key (cache + store query on miss).
+    /// Checks the defer state for a key.
     ///
     /// Returns `Some(DeferState)` if key has deferred messages, `None`
     /// otherwise.
     async fn check_defer_state(
         &self,
-        key: &Key,
+        _key: &Key,
         key_id: &uuid::Uuid,
     ) -> Result<Option<DeferState>, DeferError<S::Error, T::Error>> {
-        // Check cache first
-        if let Some(state) = self.cache.get(key) {
-            return Ok(Some(state));
-        }
-
-        // Cache miss - query store
-        let store_state = self
+        // Query store (cached internally by CachedDeferStore)
+        let retry_count = self
             .store
-            .get_next_deferred_message(key_id)
+            .is_deferred(key_id)
             .await
             .map_err(DeferError::Store)?;
 
-        match store_state {
-            Some((_offset, retry_count)) => {
-                let state = DeferState::Deferred { retry_count };
-                self.cache.insert(key.clone(), state.clone());
-                Ok(Some(state))
-            }
-            None => Ok(None),
-        }
+        Ok(retry_count.map(|retry_count| DeferState::Deferred { retry_count }))
     }
 
     /// Handles a new message arriving for an already-deferred key.
@@ -250,15 +240,6 @@ where
         );
 
         Ok(())
-    }
-
-    /// Cleans up any stale cache entries after successful message processing.
-    ///
-    /// This is defensive - normally the cache should already be clean if the
-    /// key wasn't deferred.
-    fn cleanup_deferred_state_on_success(&self, key: &Key, _key_id: &uuid::Uuid) {
-        // Remove any stale cache entry (defensive programming)
-        self.cache.remove(key);
     }
 
     /// Calculates the backoff delay for a given retry count.
@@ -341,8 +322,7 @@ where
         match result {
             RetryCompletionResult::MoreMessages { next_offset } => {
                 // More messages in queue - retry_count has been reset to 0
-                self.cache
-                    .insert(key.clone(), DeferState::Deferred { retry_count: 0 });
+                // (cache updated by CachedDeferStore)
 
                 // Schedule timer for the next deferred message
                 self.schedule_retry_timer(context, 0).await?;
@@ -354,7 +334,7 @@ where
             }
             RetryCompletionResult::Completed => {
                 // No more messages - key has been deleted from storage
-                self.cache.remove(key);
+                // (cache updated by CachedDeferStore)
             }
         }
 
@@ -394,26 +374,17 @@ where
                     .remove_deferred_message(key_id, offset)
                     .await
                     .map_err(DeferError::Store)?;
-                self.cache.remove(key);
                 return Err(DeferError::Configuration(ConfigurationError::Invalid(
                     format!("Deferral disabled: {error}"),
                 )));
             }
 
-            // Increment retry count
+            // Increment retry count (cache updated by CachedDeferStore)
             let new_retry_count = self
                 .store
                 .increment_retry_count(key_id, retry_count)
                 .await
                 .map_err(DeferError::Store)?;
-
-            // Update cache
-            self.cache.insert(
-                key.clone(),
-                DeferState::Deferred {
-                    retry_count: new_retry_count,
-                },
-            );
 
             // Schedule next retry with new backoff
             self.schedule_retry_timer(context, new_retry_count).await?;
@@ -426,11 +397,11 @@ where
             Ok(())
         } else {
             // Transient or terminal error - clean up and propagate
+            // (cache invalidated by CachedDeferStore)
             self.store
                 .remove_deferred_message(key_id, offset)
                 .await
                 .map_err(DeferError::Store)?;
-            self.cache.remove(key);
             Err(DeferError::Handler(error))
         }
     }
@@ -461,34 +432,14 @@ where
             key,
         );
 
-        // Check cache for existing defer state
-        let current_state = if let Some(state) = self.cache.get(key) {
-            state
-        } else {
-            // Cache miss - query store to see if key has deferred messages
-            let store_state = self
-                .store
-                .get_next_deferred_message(&key_id)
-                .await
-                .map_err(DeferError::Store)?;
-
-            match store_state {
-                Some((_offset, retry_count)) => {
-                    let state = DeferState::Deferred { retry_count };
-                    self.cache.insert(key.clone(), state.clone());
-                    state
-                }
-                None => DeferState::NotDeferred,
-            }
-        };
-
-        // Determine retry_count for this deferred message
-        // For first failure: retry_count = 0
-        // For subsequent messages on already-deferred key: keep existing retry_count
-        let retry_count = match current_state {
-            DeferState::NotDeferred => 0,
-            DeferState::Deferred { retry_count } => retry_count, // Don't increment here!
-        };
+        // Query store to check if key already has deferred messages
+        // (cached internally by CachedDeferStore)
+        let retry_count = self
+            .store
+            .is_deferred(&key_id)
+            .await
+            .map_err(DeferError::Store)?
+            .unwrap_or(0); // If not deferred, this is the first failure (retry_count = 0)
 
         // Calculate backoff delay
         let delay = self.calculate_backoff(retry_count);
@@ -499,11 +450,10 @@ where
 
         // CRITICAL ORDERING (Invariant 1: Timer Coverage):
         // 1. Schedule timer FIRST
-        // 2. Write to Cassandra
-        // 3. Update cache
+        // 2. Write to store (cache updated automatically by CachedDeferStore)
         //
         // If timer scheduling fails, error propagates and nothing is stored.
-        // If Cassandra write fails after timer scheduled, error propagates to
+        // If store write fails after timer scheduled, error propagates to
         // RetryMiddleware which retries the entire operation (including timer
         // scheduling).
         //
@@ -517,7 +467,7 @@ where
                 .map_err(|e| DeferError::Timer(Box::new(e)))?;
         }
 
-        // 2. Write to storage
+        // 2. Write to storage (cache updated by CachedDeferStore)
         if retry_count == 0 {
             // First failure - initialize with retry_count=0
             self.store
@@ -531,10 +481,6 @@ where
                 .await
                 .map_err(DeferError::Store)?;
         }
-
-        // 3. Update cache
-        self.cache
-            .insert(key.clone(), DeferState::Deferred { retry_count });
 
         debug!(
             "Deferred message for key {:?} (retry_count={}, delay={} seconds)",
@@ -593,7 +539,6 @@ where
         {
             Ok(()) => {
                 self.failure_tracker.record_success();
-                self.cleanup_deferred_state_on_success(&key, &key_id);
                 Ok(())
             }
             Err(error) => {
@@ -659,7 +604,6 @@ where
             Ok(None) => {
                 // No deferred message found - possibly already succeeded or expired
                 debug!("No deferred message found for key {:?}", key);
-                self.cache.remove(key);
                 return Ok(());
             }
             Err(e) => {
@@ -677,11 +621,11 @@ where
         if message.key() != key {
             debug!("Key mismatch: expected {:?}, got {:?}", key, message.key());
             // Clean up this offset from the deferred queue
+            // (cache invalidated by CachedDeferStore)
             self.store
                 .remove_deferred_message(&key_id, offset)
                 .await
                 .map_err(DeferError::Store)?;
-            self.cache.remove(key);
             return Ok(());
         }
 
