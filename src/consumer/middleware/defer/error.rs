@@ -12,17 +12,20 @@ use validator::ValidationErrors;
 
 /// Errors that can occur in defer middleware operations.
 ///
-/// Generic over store and handler error types. Timer errors use type erasure.
+/// Generic over store, handler, and loader error types. Timer errors use type
+/// erasure.
 ///
 /// # Type Parameters
 ///
 /// * `S` - Store error type (from `DeferStore::Error`)
 /// * `H` - Handler error type (from inner `FallibleHandler::Error`)
+/// * `L` - Loader error type (from `MessageLoader::Error`)
 #[derive(Debug, Error)]
-pub enum DeferError<S, H>
+pub enum DeferError<S, H, L = KafkaLoaderError>
 where
     S: StdError + ClassifyError + Send + Sync + 'static,
     H: StdError + ClassifyError + Send,
+    L: StdError + ClassifyError + Send + Sync + 'static,
 {
     /// Error from the underlying store implementation.
     #[error("store error: {0:#}")]
@@ -36,17 +39,17 @@ where
     #[error("timer error: {0:#}")]
     Timer(BoxEventContextError),
 
-    /// Error loading message from Kafka.
-    #[error("kafka loader error: {0:#}")]
-    KafkaLoader(#[from] KafkaLoaderError),
+    /// Error loading message.
+    #[error("loader error: {0:#}")]
+    Loader(L),
 
     /// Configuration validation error.
     #[error("configuration error: {0:#}")]
-    Configuration(#[from] ConfigurationError),
+    Configuration(ConfigurationError),
 
     /// Error encoding/decoding compact time values.
     #[error("compact time error: {0:#}")]
-    CompactTime(#[from] CompactDateTimeError),
+    CompactTime(CompactDateTimeError),
 }
 
 /// Configuration validation errors.
@@ -77,10 +80,11 @@ pub enum DeferInitError {
     CassandraStore(#[from] CassandraStoreError),
 }
 
-impl<S, H> ClassifyError for DeferError<S, H>
+impl<S, H, L> ClassifyError for DeferError<S, H, L>
 where
     S: StdError + ClassifyError + Send + Sync + 'static,
     H: StdError + ClassifyError + Send,
+    L: StdError + ClassifyError + Send + Sync + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
@@ -91,9 +95,31 @@ where
             Self::Store(error) => error.classify_error(),
             Self::Handler(error) => error.classify_error(),
             Self::Timer(error) => error.classify_error(),
-            Self::KafkaLoader(error) => error.classify_error(),
+            Self::Loader(error) => error.classify_error(),
             Self::CompactTime(error) => error.classify_error(),
         }
+    }
+}
+
+impl<S, H, L> From<CompactDateTimeError> for DeferError<S, H, L>
+where
+    S: StdError + ClassifyError + Send + Sync + 'static,
+    H: StdError + ClassifyError + Send,
+    L: StdError + ClassifyError + Send + Sync + 'static,
+{
+    fn from(error: CompactDateTimeError) -> Self {
+        Self::CompactTime(error)
+    }
+}
+
+impl<S, H, L> From<ConfigurationError> for DeferError<S, H, L>
+where
+    S: StdError + ClassifyError + Send + Sync + 'static,
+    H: StdError + ClassifyError + Send,
+    L: StdError + ClassifyError + Send + Sync + 'static,
+{
+    fn from(error: ConfigurationError) -> Self {
+        Self::Configuration(error)
     }
 }
 
@@ -125,35 +151,44 @@ mod tests {
 
     #[test]
     fn test_configuration_error_is_terminal() {
-        let error = DeferError::<TestTransientError, TestTransientError>::Configuration(
-            ConfigurationError::Invalid("test".to_owned()),
-        );
+        let error =
+            DeferError::<TestTransientError, TestTransientError, TestTransientError>::Configuration(
+                ConfigurationError::Invalid("test".to_owned()),
+            );
         assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
     }
 
     #[test]
     fn test_store_error_delegates_transient() {
-        let error = DeferError::<TestTransientError, TestTransientError>::Store(TestTransientError);
+        let error = DeferError::<TestTransientError, TestTransientError, TestTransientError>::Store(
+            TestTransientError,
+        );
         assert!(matches!(error.classify_error(), ErrorCategory::Transient));
     }
 
     #[test]
     fn test_store_error_delegates_permanent() {
-        let error = DeferError::<TestPermanentError, TestTransientError>::Store(TestPermanentError);
+        let error = DeferError::<TestPermanentError, TestTransientError, TestTransientError>::Store(
+            TestPermanentError,
+        );
         assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
     }
 
     #[test]
     fn test_handler_error_delegates_transient() {
         let error =
-            DeferError::<TestTransientError, TestTransientError>::Handler(TestTransientError);
+            DeferError::<TestTransientError, TestTransientError, TestTransientError>::Handler(
+                TestTransientError,
+            );
         assert!(matches!(error.classify_error(), ErrorCategory::Transient));
     }
 
     #[test]
     fn test_handler_error_delegates_permanent() {
         let error =
-            DeferError::<TestTransientError, TestPermanentError>::Handler(TestPermanentError);
+            DeferError::<TestTransientError, TestPermanentError, TestTransientError>::Handler(
+                TestPermanentError,
+            );
         assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
     }
 }

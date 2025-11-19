@@ -1,15 +1,15 @@
 //! Defer middleware handler implementation.
 //!
-//! Implements the defer middleware that intercepts permanent failures and
+//! Implements the defer middleware that intercepts transient failures and
 //! defers them for later retry using the timer system. This allows the system
-//! to handle persistent failures (e.g., downstream service outages) without
+//! to handle temporary failures (e.g., downstream service outages) without
 //! blocking partition processing.
 
 use super::DeferState;
 use super::config::DeferConfiguration;
 use super::error::{DeferError, DeferInitError};
 use super::failure_tracker::FailureTracker;
-use super::loader::KafkaLoader;
+use super::loader::{KafkaLoader, MessageLoader};
 use super::store::{CachedDeferStore, DeferStore, RetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
@@ -24,28 +24,36 @@ use crate::{Key, Partition, Topic};
 use std::sync::Arc;
 use tracing::{debug, error};
 
-/// Middleware that defers permanently failed messages for later retry.
+/// Middleware that defers transiently failed messages for later retry.
 ///
-/// Intercepts permanent failures from the inner handler and schedules them
+/// Intercepts transient failures from the inner handler and schedules them
 /// for retry using the timer system, allowing partition processing to
 /// continue without blocking.
+///
+/// # Type Parameters
+///
+/// * `S` - Store implementation for deferred state
+/// * `L` - Loader implementation for retrieving messages by offset
 #[derive(Clone)]
-pub struct DeferMiddleware<S>
+pub struct DeferMiddleware<S, L = KafkaLoader>
 where
     S: DeferStore,
+    L: MessageLoader,
 {
     config: DeferConfiguration,
-    loader: Arc<KafkaLoader>,
+    loader: L,
     store: S,
     failure_tracker: FailureTracker,
     consumer_group: Arc<str>,
 }
 
-impl<S> DeferMiddleware<S>
+impl<S> DeferMiddleware<S, KafkaLoader>
 where
     S: DeferStore,
 {
     /// Creates a new defer middleware with the given configuration and store.
+    ///
+    /// Uses [`KafkaLoader`] to load messages from Kafka for retry.
     ///
     /// # Arguments
     ///
@@ -92,7 +100,7 @@ where
 
         Ok(Self {
             config,
-            loader: Arc::new(loader),
+            loader,
             store,
             failure_tracker,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
@@ -100,15 +108,65 @@ where
     }
 }
 
-/// Provider that creates defer handlers for each partition.
-#[derive(Clone)]
-pub struct DeferProvider<T, S>
+impl<S, L> DeferMiddleware<S, L>
 where
     S: DeferStore,
+    L: MessageLoader,
+{
+    /// Creates a new defer middleware with a custom loader.
+    ///
+    /// Use this constructor for testing with [`MemoryLoader`] or other
+    /// custom loader implementations.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration for defer behavior
+    /// * `consumer_group` - Consumer group ID for state isolation
+    /// * `loader` - Message loader implementation
+    /// * `store` - Storage backend for deferred state
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the new middleware if configuration is valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if configuration validation fails.
+    pub fn with_loader<G>(
+        config: DeferConfiguration,
+        consumer_group: G,
+        loader: L,
+        store: S,
+    ) -> Result<Self, DeferInitError>
+    where
+        G: Into<Arc<str>>,
+    {
+        use validator::Validate;
+
+        config.validate()?;
+
+        let failure_tracker = FailureTracker::new(config.failure_window, config.failure_threshold);
+
+        Ok(Self {
+            config,
+            loader,
+            store,
+            failure_tracker,
+            consumer_group: consumer_group.into(),
+        })
+    }
+}
+
+/// Provider that creates defer handlers for each partition.
+#[derive(Clone)]
+pub struct DeferProvider<T, S, L = KafkaLoader>
+where
+    S: DeferStore,
+    L: MessageLoader,
 {
     provider: T,
     config: DeferConfiguration,
-    loader: Arc<KafkaLoader>,
+    loader: L,
     store: S,
     failure_tracker: FailureTracker,
     consumer_group: Arc<str>,
@@ -121,13 +179,15 @@ where
 /// * `T` - Inner handler type
 /// * `S` - Store implementation (`DeferStore`, typically wrapped in
 ///   `CachedDeferStore`)
+/// * `L` - Loader implementation for retrieving messages by offset
 #[derive(Clone)]
-pub struct DeferHandler<T, S>
+pub struct DeferHandler<T, S, L = KafkaLoader>
 where
     S: DeferStore,
+    L: MessageLoader,
 {
     handler: T,
-    loader: Arc<KafkaLoader>,
+    loader: L,
     store: S,
     failure_tracker: FailureTracker,
     config: DeferConfiguration,
@@ -136,11 +196,12 @@ where
     consumer_group: Arc<str>,
 }
 
-impl<S> HandlerMiddleware for DeferMiddleware<S>
+impl<S, L> HandlerMiddleware for DeferMiddleware<S, L>
 where
     S: DeferStore,
+    L: MessageLoader + 'static,
 {
-    type Provider<T: FallibleHandlerProvider> = DeferProvider<T, S>;
+    type Provider<T: FallibleHandlerProvider> = DeferProvider<T, S, L>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
@@ -157,13 +218,14 @@ where
     }
 }
 
-impl<T, S> FallibleHandlerProvider for DeferProvider<T, S>
+impl<T, S, L> FallibleHandlerProvider for DeferProvider<T, S, L>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
     S: DeferStore,
+    L: MessageLoader + 'static,
 {
-    type Handler = DeferHandler<T::Handler, CachedDeferStore<S>>;
+    type Handler = DeferHandler<T::Handler, CachedDeferStore<S>, L>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         // Wrap store in cache for this partition handler.
@@ -187,10 +249,11 @@ where
 // HandlerProvider implementation removed as it requires non-fallible handlers
 // which don't support error classification needed for defer logic.
 
-impl<T, S> DeferHandler<T, S>
+impl<T, S, L> DeferHandler<T, S, L>
 where
     T: FallibleHandler,
     S: DeferStore,
+    L: MessageLoader + 'static,
 {
     /// Checks the defer state for a key.
     ///
@@ -200,7 +263,7 @@ where
         &self,
         _key: &Key,
         key_id: &uuid::Uuid,
-    ) -> Result<Option<DeferState>, DeferError<S::Error, T::Error>> {
+    ) -> Result<Option<DeferState>, DeferError<S::Error, T::Error, L::Error>> {
         // Query store (cached internally by CachedDeferStore)
         let retry_count = self
             .store
@@ -220,7 +283,7 @@ where
         key_id: &uuid::Uuid,
         offset: crate::Offset,
         retry_count: u32,
-    ) -> Result<(), DeferError<S::Error, T::Error>> {
+    ) -> Result<(), DeferError<S::Error, T::Error, L::Error>> {
         use crate::timers::datetime::CompactDateTime;
 
         // Calculate expected retry time using current backoff
@@ -280,7 +343,7 @@ where
         &self,
         context: &C,
         retry_count: u32,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
+    ) -> Result<(), DeferError<S::Error, T::Error, L::Error>>
     where
         C: EventContext,
     {
@@ -306,7 +369,7 @@ where
         key_id: &uuid::Uuid,
         offset: crate::Offset,
         retry_count: u32,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
+    ) -> Result<(), DeferError<S::Error, T::Error, L::Error>>
     where
         C: EventContext,
     {
@@ -355,7 +418,7 @@ where
         offset: crate::Offset,
         retry_count: u32,
         error: T::Error,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
+    ) -> Result<(), DeferError<S::Error, T::Error, L::Error>>
     where
         C: EventContext,
     {
@@ -364,8 +427,8 @@ where
 
         self.failure_tracker.record_failure();
 
-        // Check error classification
-        if let ErrorCategory::Permanent = error.classify_error() {
+        // Check error classification - only defer transient (recoverable) errors
+        if let ErrorCategory::Transient = error.classify_error() {
             // Check if we should defer again
             if !self.failure_tracker.should_defer() {
                 debug!("Deferral disabled due to high failure rate");
@@ -417,7 +480,7 @@ where
         context: C,
         key: &Key,
         message: &ConsumerMessage,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
+    ) -> Result<(), DeferError<S::Error, T::Error, L::Error>>
     where
         C: EventContext,
     {
@@ -493,12 +556,13 @@ where
     }
 }
 
-impl<T, S> FallibleHandler for DeferHandler<T, S>
+impl<T, S, L> FallibleHandler for DeferHandler<T, S, L>
 where
     T: FallibleHandler,
     S: DeferStore,
+    L: MessageLoader + 'static,
 {
-    type Error = DeferError<S::Error, T::Error>;
+    type Error = DeferError<S::Error, T::Error, L::Error>;
 
     async fn on_message<C>(
         &self,
@@ -544,8 +608,8 @@ where
             Err(error) => {
                 self.failure_tracker.record_failure();
 
-                // Check error classification - only defer permanent failures
-                if let ErrorCategory::Permanent = error.classify_error() {
+                // Check error classification - only defer transient (recoverable) errors
+                if let ErrorCategory::Transient = error.classify_error() {
                     // Check if deferral is enabled based on failure rate
                     if !self.failure_tracker.should_defer() {
                         debug!("Deferral disabled due to high failure rate");
@@ -611,11 +675,12 @@ where
             }
         };
 
-        // Load the actual message from Kafka
+        // Load the actual message
         let message = self
             .loader
             .load_message(self.topic, self.partition, offset)
-            .await?;
+            .await
+            .map_err(DeferError::Loader)?;
 
         // Verify the key matches (sanity check)
         if message.key() != key {
@@ -651,10 +716,11 @@ where
     }
 }
 
-impl<T, S> EventHandler for DeferHandler<T, S>
+impl<T, S, L> EventHandler for DeferHandler<T, S, L>
 where
     T: FallibleHandler,
     S: DeferStore,
+    L: MessageLoader + 'static,
 {
     async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
     where

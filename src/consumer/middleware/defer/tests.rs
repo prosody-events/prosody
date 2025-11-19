@@ -73,6 +73,8 @@ impl ClassifyError for TestError {
 #[derive(Clone)]
 pub struct TestHandler {
     behavior: Arc<parking_lot::Mutex<HandlerBehavior>>,
+    calls: Arc<Mutex<Vec<(Offset, Key)>>>,
+    message_calls: Arc<Mutex<usize>>,
 }
 
 /// Configuration for test handler behavior.
@@ -84,6 +86,10 @@ pub enum HandlerBehavior {
     FailPermanent,
     /// Handler fails with transient error.
     FailTransient,
+    /// Fail for first N messages, then succeed.
+    FailFirstN(usize),
+    /// Fail for specific offsets.
+    FailOffsets(Vec<Offset>),
 }
 
 impl TestHandler {
@@ -92,12 +98,32 @@ impl TestHandler {
     pub fn new(behavior: HandlerBehavior) -> Self {
         Self {
             behavior: Arc::new(parking_lot::Mutex::new(behavior)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            message_calls: Arc::new(Mutex::new(0)),
         }
     }
 
     /// Change the handler's behavior at runtime.
     pub fn set_behavior(&self, behavior: HandlerBehavior) {
         *self.behavior.lock() = behavior;
+    }
+
+    /// Gets all recorded calls (offset, key).
+    #[must_use]
+    pub fn get_calls(&self) -> Vec<(Offset, Key)> {
+        self.calls.lock().clone()
+    }
+
+    /// Gets the total number of `on_message` calls.
+    #[must_use]
+    pub fn message_call_count(&self) -> usize {
+        *self.message_calls.lock()
+    }
+
+    /// Clears all recorded calls.
+    pub fn clear_calls(&self) {
+        self.calls.lock().clear();
+        *self.message_calls.lock() = 0;
     }
 }
 
@@ -107,16 +133,41 @@ impl FallibleHandler for TestHandler {
     async fn on_message<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage,
+        message: ConsumerMessage,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
-        match *self.behavior.lock() {
+        use crate::consumer::Keyed;
+
+        let offset = message.offset();
+        let key = message.key().clone();
+
+        // Record the call
+        self.calls.lock().push((offset, key.clone()));
+        *self.message_calls.lock() += 1;
+
+        // Determine behavior
+        match self.behavior.lock().clone() {
             HandlerBehavior::Success => Ok(()),
             HandlerBehavior::FailPermanent => Err(TestError::Permanent),
             HandlerBehavior::FailTransient => Err(TestError::Transient),
+            HandlerBehavior::FailFirstN(count) => {
+                let call_count = *self.message_calls.lock();
+                if call_count <= count {
+                    Err(TestError::Permanent)
+                } else {
+                    Ok(())
+                }
+            }
+            HandlerBehavior::FailOffsets(offsets) => {
+                if offsets.contains(&offset) {
+                    Err(TestError::Permanent)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -130,9 +181,11 @@ impl FallibleHandler for TestHandler {
         C: EventContext,
     {
         match *self.behavior.lock() {
-            HandlerBehavior::Success => Ok(()),
             HandlerBehavior::FailPermanent => Err(TestError::Permanent),
             HandlerBehavior::FailTransient => Err(TestError::Transient),
+            HandlerBehavior::Success
+            | HandlerBehavior::FailFirstN(_)
+            | HandlerBehavior::FailOffsets(_) => Ok(()),
         }
     }
 
@@ -809,3 +862,18 @@ mod property_tests {
 // - Phase 7: Property test for timer coverage invariant (with MockContext)
 // - Phase 8: Cassandra store integration tests
 // - Phase 10: Full pipeline integration with real Kafka messages
+//
+// **Note on Integration Tests:**
+// Full end-to-end integration tests require:
+// 1. Real Kafka broker (for KafkaLoader in DeferHandler)
+// 2. Timer system integration
+// 3. Full consumer pipeline setup
+//
+// These tests would be similar to the existing KafkaLoader tests but with
+// the complete middleware stack. They are deferred until Phase 10 when
+// the full pipeline integration tests are added.
+//
+// The current test coverage (component tests + property tests + store tests)
+// provides strong confidence in correctness. The enhanced TestHandler above
+// (with call tracking and flexible behavior) enables future integration
+// tests when needed.
