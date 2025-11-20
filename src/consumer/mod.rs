@@ -172,7 +172,7 @@ use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
 use crate::consumer::storage::StorePair;
-use crate::heartbeat::Heartbeat;
+use crate::heartbeat::HeartbeatRegistry;
 use crate::producer::ProsodyProducer;
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
@@ -670,6 +670,10 @@ pub struct ProsodyConsumer {
     /// Runtime state of the consumer.
     #[educe(Debug(ignore))]
     runtime_state: Arc<Mutex<Option<RuntimeState>>>,
+
+    /// Heartbeat registry for consumer-level actors.
+    #[educe(Debug(ignore))]
+    heartbeats: HeartbeatRegistry,
 }
 
 /// Builds the common middleware stack applied to all consumer types.
@@ -722,6 +726,7 @@ fn initialize_consumer_with_store<T, S>(
     handler_provider: T,
     trigger_store: S,
     telemetry: &Telemetry,
+    heartbeats: HeartbeatRegistry,
 ) -> Result<ProsodyConsumer, ConsumerError>
 where
     T: HandlerProvider,
@@ -756,12 +761,14 @@ where
         allowed_events,
         telemetry: telemetry_sender,
         shutdown: shutdown.clone(),
+        heartbeats: heartbeats.clone(),
     })?;
 
     Ok(ProsodyConsumer {
         shutdown,
         managers,
         runtime_state,
+        heartbeats,
     })
 }
 
@@ -808,6 +815,10 @@ impl ProsodyConsumer {
         let managers: Arc<Managers> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
         let telemetry_sender = telemetry.sender();
+        let heartbeats = HeartbeatRegistry::new(
+            consumer_config.group_id.clone(),
+            consumer_config.stall_threshold,
+        );
 
         // Build event type search automaton for filtering messages
         let allowed_events = consumer_config
@@ -830,6 +841,7 @@ impl ProsodyConsumer {
                 allowed_events,
                 telemetry: telemetry_sender,
                 shutdown: shutdown.clone(),
+                heartbeats: heartbeats.clone(),
             })?,
             TriggerStoreConfiguration::Cassandra(cassandra_config) => {
                 let slab_size = consumer_config.slab_size.try_into()?;
@@ -843,6 +855,7 @@ impl ProsodyConsumer {
                     allowed_events,
                     telemetry: telemetry_sender,
                     shutdown: shutdown.clone(),
+                    heartbeats: heartbeats.clone(),
                 })?
             }
         };
@@ -851,6 +864,7 @@ impl ProsodyConsumer {
             shutdown,
             managers,
             runtime_state,
+            heartbeats,
         })
     }
 
@@ -899,6 +913,10 @@ impl ProsodyConsumer {
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let monopolization_middleware =
             MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
+        let heartbeats = HeartbeatRegistry::new(
+            consumer_config.group_id.clone(),
+            consumer_config.stall_threshold,
+        );
 
         // Build the complete middleware stack and consumer
         // StorePair enum guarantees stores match - no unreachable!() needed
@@ -912,6 +930,7 @@ impl ProsodyConsumer {
                     consumer_config,
                     &common_config.scheduler,
                     defer_store,
+                    &heartbeats,
                 )?;
 
                 let common_middleware = build_common_middleware(
@@ -926,7 +945,13 @@ impl ProsodyConsumer {
                     .layer(retry_middleware)
                     .into_provider(handler);
 
-                initialize_consumer_with_store(consumer_config, provider, trigger_store, &telemetry)
+                initialize_consumer_with_store(
+                    consumer_config,
+                    provider,
+                    trigger_store,
+                    &telemetry,
+                    heartbeats,
+                )
             }
             StorePair::Cassandra {
                 trigger: trigger_store,
@@ -937,6 +962,7 @@ impl ProsodyConsumer {
                     consumer_config,
                     &common_config.scheduler,
                     defer_store,
+                    &heartbeats,
                 )?;
 
                 let common_middleware = build_common_middleware(
@@ -951,7 +977,13 @@ impl ProsodyConsumer {
                     .layer(retry_middleware)
                     .into_provider(handler);
 
-                initialize_consumer_with_store(consumer_config, provider, trigger_store, &telemetry)
+                initialize_consumer_with_store(
+                    consumer_config,
+                    provider,
+                    trigger_store,
+                    &telemetry,
+                    heartbeats,
+                )
             }
         }
     }
@@ -1069,17 +1101,19 @@ impl ProsodyConsumer {
         get_assigned_partition_count(&self.managers)
     }
 
-    /// Checks if any assigned partition is stalled.
+    /// Checks if any assigned partition or consumer-level actor is stalled.
     ///
     /// A partition is considered stalled if it hasn't processed messages
-    /// within the configured stall threshold duration.
+    /// within the configured stall threshold duration. Consumer-level actors
+    /// (main poll loop, defer middleware) are also monitored for stalls.
     ///
     /// # Returns
     ///
-    /// `true` if any partition is stalled, `false` otherwise.
+    /// `true` if any partition or consumer-level actor is stalled, `false`
+    /// otherwise.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
-        get_is_stalled(&self.managers)
+        get_is_stalled(&self.managers) || self.heartbeats.any_stalled()
     }
 
     /// Initiates a graceful shutdown of the Kafka consumer.
@@ -1176,6 +1210,7 @@ where
     allowed_events: Option<AhoCorasick>,
     telemetry: TelemetrySender,
     shutdown: Arc<AtomicBool>,
+    heartbeats: HeartbeatRegistry,
 }
 
 /// Initializes a Prosody consumer with the provided parameters.
@@ -1251,7 +1286,7 @@ where
 
     // Spawn the background polling task with monitoring
     let poll_interval = params.config.poll_interval;
-    let heartbeat = Heartbeat::new("Kafka poll loop", params.config.stall_threshold);
+    let heartbeat = params.heartbeats.register("Kafka poll loop");
     let cloned_managers = params.managers.clone();
     let cloned_heartbeat = heartbeat.clone();
     let max_message_count = params.config.max_uncommitted;
@@ -1272,7 +1307,7 @@ where
         .config
         .probe_port
         .filter(|_| !params.config.mock)
-        .map(|port| ProbeServer::new(port, params.managers.clone(), heartbeat))
+        .map(|port| ProbeServer::new(port, params.managers.clone(), params.heartbeats.clone()))
         .transpose()?;
 
     let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {

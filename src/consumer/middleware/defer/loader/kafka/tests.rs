@@ -1,6 +1,7 @@
 use super::*;
 use crate::Topic;
 use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use crate::heartbeat::HeartbeatRegistry;
 use crate::tracing::init_test_logging;
 use futures::future::join_all;
 use rdkafka::ClientConfig;
@@ -98,7 +99,7 @@ async fn test_load_valid_offset() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 10).await?;
         let topic = Topic::from(topic_name.as_str());
 
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Load offset 5
         let result = timeout(
@@ -131,7 +132,7 @@ async fn test_load_sequential_offsets() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 20).await?;
         let topic = Topic::from(topic_name.as_str());
 
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Load offsets 5, 6, 7 in sequence
         for &offset in &offsets[5..8] {
@@ -165,7 +166,10 @@ async fn test_multiple_concurrent_requests() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 30).await?;
         let topic = Topic::from(topic_name.as_str());
 
-        let loader = Arc::new(KafkaLoader::new(loader_config())?);
+        let loader = Arc::new(KafkaLoader::new(
+            loader_config(),
+            &HeartbeatRegistry::test(),
+        )?);
 
         // Request multiple offsets concurrently
         let mut handles = Vec::new();
@@ -213,7 +217,7 @@ async fn test_load_deleted_offset() -> color_eyre::Result<()> {
         delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Try to load deleted offset 25
         let result = timeout(
@@ -256,7 +260,10 @@ async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
         delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
-        let loader = Arc::new(KafkaLoader::new(loader_config())?);
+        let loader = Arc::new(KafkaLoader::new(
+            loader_config(),
+            &HeartbeatRegistry::test(),
+        )?);
 
         // Request deleted offsets 10, 20, and valid offset 60 concurrently
         let loader1 = Arc::clone(&loader);
@@ -336,7 +343,7 @@ async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
         delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Try to load offset at LSO (50)
         let result = timeout(
@@ -372,7 +379,7 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
         delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // NOW request the deleted offset 40
         let offset_40 = offsets[40];
@@ -414,7 +421,7 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
         delete_records_up_to(&Topic::from(topic_name.as_str()), 30).await?;
 
         let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Load valid offset after LSO
         let result = timeout(
@@ -447,7 +454,7 @@ async fn test_sparse_offset_requests() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 100).await?;
 
         let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Request sparse offsets
         for &idx in &[10, 50, 90] {
@@ -481,7 +488,7 @@ async fn test_backwards_seek() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 100).await?;
         let topic = Topic::from(topic_name.as_str());
 
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Load offset 80 (position will be at 81)
         let msg1 = timeout(
@@ -538,7 +545,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 5, // Small threshold for testing
         };
-        let loader = KafkaLoader::new(config)?;
+        let loader = KafkaLoader::new(config, &HeartbeatRegistry::test())?;
 
         // Load offset 50 (position will be at 51)
         let msg1 = timeout(
@@ -586,7 +593,10 @@ async fn test_concurrent_same_offset_requests() -> color_eyre::Result<()> {
         let offsets = produce_messages(&topic_name, 10).await?;
         let topic = Topic::from(topic_name.as_str());
 
-        let loader = Arc::new(KafkaLoader::new(loader_config())?);
+        let loader = Arc::new(KafkaLoader::new(
+            loader_config(),
+            &HeartbeatRegistry::test(),
+        )?);
 
         let target_offset = offsets[5];
 
@@ -641,7 +651,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
         delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Try to load deleted offset (should trigger seek failure and recovery)
         let result = timeout(
@@ -700,7 +710,7 @@ async fn test_decode_error() -> color_eyre::Result<()> {
         let bad_offset = delivery.offset;
         let topic = Topic::from(topic_name.as_str());
 
-        let loader = KafkaLoader::new(loader_config())?;
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Try to load the malformed message
         let result = timeout(
@@ -754,7 +764,10 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
         let bad_offset = delivery.offset;
         let topic = Topic::from(topic_name.as_str());
 
-        let loader = Arc::new(KafkaLoader::new(loader_config())?);
+        let loader = Arc::new(KafkaLoader::new(
+            loader_config(),
+            &HeartbeatRegistry::test(),
+        )?);
 
         // Launch 3 concurrent requests for same bad offset
         let mut handles = Vec::new();
@@ -809,7 +822,10 @@ async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<(
         delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
 
         let topic = Topic::from(topic_name.as_str());
-        let loader = Arc::new(KafkaLoader::new(loader_config())?);
+        let loader = Arc::new(KafkaLoader::new(
+            loader_config(),
+            &HeartbeatRegistry::test(),
+        )?);
 
         // Launch BOTH requests simultaneously
         // This ensures both are in active before any seeking happens
@@ -889,7 +905,7 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 10,
         };
-        let loader = Arc::new(KafkaLoader::new(config)?);
+        let loader = Arc::new(KafkaLoader::new(config, &HeartbeatRegistry::test())?);
 
         // Launch 10 concurrent loads for DIFFERENT offsets
         // This will cause 8+ cache evictions since cache_size=2

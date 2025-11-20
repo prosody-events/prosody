@@ -27,6 +27,8 @@ use std::future::{self, Future};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::runtime::Builder;
+use tokio::task::yield_now;
 
 /// Test error that can be classified.
 #[derive(Debug, Error, Clone)]
@@ -743,32 +745,56 @@ mod property_tests {
     /// Verify failure tracker threshold behavior.
     #[test]
     fn prop_failure_tracker_threshold() {
-        fn test(success_count: u8, failure_count: u8, threshold_pct: u8) -> bool {
-            let threshold = f64::from(threshold_pct % 100) / 100.0_f64;
-            let tracker = FailureTracker::new(Duration::from_secs(60), threshold);
+        use quickcheck::TestResult;
 
-            // Record events
-            for _ in 0..success_count {
-                tracker.record_success();
-            }
-            for _ in 0..failure_count {
-                tracker.record_failure();
-            }
+        fn test(success_count: u8, failure_count: u8, threshold_pct: u8) -> TestResult {
+            let runtime = match Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+            };
 
-            let should_defer = tracker.should_defer();
-            let failure_rate = tracker.failure_rate();
+            runtime.block_on(async {
+                use crate::heartbeat::HeartbeatRegistry;
 
-            // Verify threshold logic
-            if success_count == 0 && failure_count == 0 {
-                // No events: should allow deferring
-                should_defer && failure_rate == 0.0_f64
-            } else {
-                // should_defer is true when failure_rate < threshold
-                should_defer == (failure_rate < threshold)
-            }
+                let threshold = f64::from(threshold_pct % 100) / 100.0_f64;
+                let tracker = FailureTracker::new(
+                    Duration::from_secs(60),
+                    threshold,
+                    &HeartbeatRegistry::test(),
+                );
+
+                // Record events
+                for _ in 0..success_count {
+                    tracker.record_success();
+                }
+                for _ in 0..failure_count {
+                    tracker.record_failure();
+                }
+
+                // Give actor time to process events
+                yield_now().await;
+
+                let should_defer = tracker.should_defer();
+                let failure_rate = tracker.failure_rate();
+
+                // Verify threshold logic
+                let result = if success_count == 0 && failure_count == 0 {
+                    // No events: should allow deferring
+                    should_defer && failure_rate == 0.0_f64
+                } else {
+                    // should_defer is true when failure_rate < threshold
+                    should_defer == (failure_rate < threshold)
+                };
+
+                if result {
+                    TestResult::passed()
+                } else {
+                    TestResult::failed()
+                }
+            })
         }
 
-        quickcheck(test as fn(u8, u8, u8) -> bool);
+        quickcheck(test as fn(u8, u8, u8) -> TestResult);
     }
 
     /// Verify store operations maintain consistency.

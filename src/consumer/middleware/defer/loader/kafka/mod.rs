@@ -37,6 +37,7 @@ use super::MessageLoader;
 use crate::consumer::decode::{DecodedMessage, decode_message};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::propagator::new_propagator;
 use crate::{Offset, Partition, Topic};
 use ahash::HashMap;
@@ -179,13 +180,17 @@ impl KafkaLoader {
     ///
     /// * `config` - Loader configuration (bootstrap servers, group ID, permits,
     ///   thresholds, etc.)
+    /// * `heartbeats` - Registry for monitoring background polling loop
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Configuration validation fails
     /// - Consumer creation fails
-    pub fn new(config: LoaderConfiguration) -> Result<Self, KafkaLoaderError> {
+    pub fn new(
+        config: LoaderConfiguration,
+        heartbeats: &HeartbeatRegistry,
+    ) -> Result<Self, KafkaLoaderError> {
         let group_id = format!("{}-deferred", config.group_id);
         let client_id = hostname().map_err(|error| KafkaLoaderError::Hostname(Arc::new(error)))?;
 
@@ -204,7 +209,8 @@ impl KafkaLoader {
         let semaphore = Arc::new(Semaphore::new(config.max_permits));
         let cache = Arc::new(Cache::new(config.cache_size));
 
-        spawn_blocking(move || poll_loop(rx, &consumer, &config));
+        let heartbeat = heartbeats.register("kafka loader");
+        spawn_blocking(move || poll_loop(rx, &consumer, &config, &heartbeat));
 
         Ok(Self {
             tx,
@@ -336,6 +342,7 @@ fn poll_loop(
     mut rx: mpsc::Receiver<Request>,
     consumer: &BaseConsumer,
     config: &LoaderConfiguration,
+    heartbeat: &Heartbeat,
 ) {
     let mut active: ActiveRequests = HashMap::default();
     let propagator = new_propagator();
@@ -344,6 +351,8 @@ fn poll_loop(
     let mut buffers = Buffers::default();
 
     loop {
+        heartbeat.beat();
+
         // Drain all pending requests (non-blocking)
         loop {
             match rx.try_recv() {

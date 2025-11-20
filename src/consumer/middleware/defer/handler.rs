@@ -18,6 +18,7 @@ use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::consumer::{ConsumerConfiguration, DemandType, EventHandler, Uncommitted};
+use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};
 use crate::{Key, Partition, Topic};
@@ -61,6 +62,7 @@ where
     /// * `consumer_config` - Consumer configuration for shared Kafka settings
     /// * `scheduler_config` - Scheduler configuration for max concurrency
     /// * `store` - Storage backend for deferred state
+    /// * `heartbeats` - Registry for monitoring background actors
     ///
     /// # Returns
     ///
@@ -75,6 +77,7 @@ where
         consumer_config: &ConsumerConfiguration,
         scheduler_config: &SchedulerConfiguration,
         store: S,
+        heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, DeferInitError> {
         use super::loader::LoaderConfiguration;
         use validator::Validate;
@@ -94,9 +97,10 @@ where
             seek_timeout: config.seek_timeout,
             discard_threshold: config.discard_threshold,
         };
-        let loader = KafkaLoader::new(loader_config)?;
+        let loader = KafkaLoader::new(loader_config, heartbeats)?;
 
-        let failure_tracker = FailureTracker::new(config.failure_window, config.failure_threshold);
+        let failure_tracker =
+            FailureTracker::new(config.failure_window, config.failure_threshold, heartbeats);
 
         Ok(Self {
             config,
@@ -124,6 +128,7 @@ where
     /// * `consumer_group` - Consumer group ID for state isolation
     /// * `loader` - Message loader implementation
     /// * `store` - Storage backend for deferred state
+    /// * `heartbeats` - Registry for monitoring background actors
     ///
     /// # Returns
     ///
@@ -137,6 +142,7 @@ where
         consumer_group: G,
         loader: L,
         store: S,
+        heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, DeferInitError>
     where
         G: Into<Arc<str>>,
@@ -145,7 +151,8 @@ where
 
         config.validate()?;
 
-        let failure_tracker = FailureTracker::new(config.failure_window, config.failure_threshold);
+        let failure_tracker =
+            FailureTracker::new(config.failure_window, config.failure_threshold, heartbeats);
 
         Ok(Self {
             config,
