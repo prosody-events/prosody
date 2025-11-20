@@ -930,6 +930,7 @@ impl ProsodyConsumer {
                     consumer_config,
                     &common_config.scheduler,
                     defer_store,
+                    &telemetry,
                     &heartbeats,
                 )?;
 
@@ -962,6 +963,7 @@ impl ProsodyConsumer {
                     consumer_config,
                     &common_config.scheduler,
                     defer_store,
+                    &telemetry,
                     &heartbeats,
                 )?;
 

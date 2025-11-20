@@ -754,21 +754,27 @@ mod property_tests {
             };
 
             runtime.block_on(async {
+                use crate::consumer::DemandType;
                 use crate::heartbeat::HeartbeatRegistry;
+                use crate::telemetry::Telemetry;
 
+                let telemetry = Telemetry::new();
                 let threshold = f64::from(threshold_pct % 100) / 100.0_f64;
                 let tracker = FailureTracker::new(
                     Duration::from_secs(60),
                     threshold,
+                    &telemetry,
                     &HeartbeatRegistry::test(),
                 );
 
-                // Record events
+                // Emit telemetry events
+                let sender =
+                    telemetry.partition_sender(Topic::from("test"), Partition::from(0_i32));
                 for _ in 0..success_count {
-                    tracker.record_success();
+                    sender.handler_succeeded(Arc::from("test-key"), DemandType::Normal);
                 }
                 for _ in 0..failure_count {
-                    tracker.record_failure();
+                    sender.handler_failed(Arc::from("test-key"), DemandType::Normal);
                 }
 
                 // Give actor time to process events

@@ -19,6 +19,7 @@ use crate::consumer::middleware::{
 };
 use crate::consumer::{ConsumerConfiguration, DemandType, EventHandler, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::telemetry::Telemetry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};
 use crate::{Key, Partition, Topic};
@@ -62,6 +63,7 @@ where
     /// * `consumer_config` - Consumer configuration for shared Kafka settings
     /// * `scheduler_config` - Scheduler configuration for max concurrency
     /// * `store` - Storage backend for deferred state
+    /// * `telemetry` - Telemetry system for failure tracking
     /// * `heartbeats` - Registry for monitoring background actors
     ///
     /// # Returns
@@ -77,6 +79,7 @@ where
         consumer_config: &ConsumerConfiguration,
         scheduler_config: &SchedulerConfiguration,
         store: S,
+        telemetry: &Telemetry,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, DeferInitError> {
         use super::loader::LoaderConfiguration;
@@ -99,8 +102,12 @@ where
         };
         let loader = KafkaLoader::new(loader_config, heartbeats)?;
 
-        let failure_tracker =
-            FailureTracker::new(config.failure_window, config.failure_threshold, heartbeats);
+        let failure_tracker = FailureTracker::new(
+            config.failure_window,
+            config.failure_threshold,
+            telemetry,
+            heartbeats,
+        );
 
         Ok(Self {
             config,
@@ -128,6 +135,7 @@ where
     /// * `consumer_group` - Consumer group ID for state isolation
     /// * `loader` - Message loader implementation
     /// * `store` - Storage backend for deferred state
+    /// * `telemetry` - Telemetry system for failure tracking
     /// * `heartbeats` - Registry for monitoring background actors
     ///
     /// # Returns
@@ -142,6 +150,7 @@ where
         consumer_group: G,
         loader: L,
         store: S,
+        telemetry: &Telemetry,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, DeferInitError>
     where
@@ -151,8 +160,12 @@ where
 
         config.validate()?;
 
-        let failure_tracker =
-            FailureTracker::new(config.failure_window, config.failure_threshold, heartbeats);
+        let failure_tracker = FailureTracker::new(
+            config.failure_window,
+            config.failure_threshold,
+            telemetry,
+            heartbeats,
+        );
 
         Ok(Self {
             config,
@@ -380,8 +393,6 @@ where
     where
         C: EventContext,
     {
-        self.failure_tracker.record_success();
-
         // Complete successful retry and prepare for next message or cleanup
         let result = self
             .store
@@ -431,8 +442,6 @@ where
     {
         use super::error::ConfigurationError;
         use crate::consumer::middleware::ClassifyError;
-
-        self.failure_tracker.record_failure();
 
         // Check error classification - only defer transient (recoverable) errors
         if let ErrorCategory::Transient = error.classify_error() {
@@ -608,13 +617,8 @@ where
             .on_message(context.clone(), message.clone(), demand_type)
             .await
         {
-            Ok(()) => {
-                self.failure_tracker.record_success();
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
-                self.failure_tracker.record_failure();
-
                 // Check error classification - only defer transient (recoverable) errors
                 if let ErrorCategory::Transient = error.classify_error() {
                     // Check if deferral is enabled based on failure rate

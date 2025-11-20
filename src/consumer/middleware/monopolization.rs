@@ -22,6 +22,7 @@
 
 use ahash::RandomState;
 use derive_builder::Builder;
+use humantime::format_duration;
 use interval::IntervalSet;
 use interval::interval_set::ToIntervalSet;
 use interval::prelude::{Bounded, Intersection, Union};
@@ -294,7 +295,7 @@ where
                 key: key.clone(),
                 percentage,
                 threshold: self.monopolization_threshold * 100.0_f64,
-                window_secs: self.window_duration.as_secs(),
+                window: self.window_duration,
             }
         })
     }
@@ -362,10 +363,9 @@ pub enum MonopolizationError<E> {
 
     /// A key has monopolized execution time.
     #[error(
-        "Key '{key}' monopolized {percentage:.1}% of execution time over {window_secs}s window \
-         (threshold: {threshold:.1}%). This key is consuming an excessive amount of processing \
-         time, preventing other keys from being processed efficiently. Consider investigating why \
-         this key requires significantly more processing time than others."
+        "Key '{key}' monopolized {percentage:.1}% of execution time over {} window \
+         (threshold: {threshold:.1}%).",
+        format_duration(*.window)
     )]
     Monopolization {
         /// The key that monopolized execution.
@@ -374,9 +374,8 @@ pub enum MonopolizationError<E> {
         percentage: f64,
         /// The configured threshold percentage that was exceeded.
         threshold: f64,
-        /// The window duration in seconds over which monopolization was
-        /// detected.
-        window_secs: u64,
+        /// The window duration over which monopolization was detected.
+        window: Duration,
     },
 }
 
@@ -525,7 +524,7 @@ mod tests {
             key: "test-key".into(),
             percentage: 95.0,
             threshold: 90.0,
-            window_secs: 300,
+            window: Duration::from_secs(300),
         };
 
         assert!(
@@ -541,7 +540,7 @@ mod tests {
             key: "user-12345".into(),
             percentage: 95.5,
             threshold: 90.0,
-            window_secs: 300,
+            window: Duration::from_secs(300),
         };
 
         let message = error.to_string();
@@ -555,8 +554,8 @@ mod tests {
         );
         assert!(message.contains("90.0%"), "Error should include threshold");
         assert!(
-            message.contains("300s"),
-            "Error should include window duration in seconds"
+            message.contains("5m"),
+            "Error should include window duration in human-readable format"
         );
         assert!(
             message.contains("preventing other keys from being processed efficiently"),
