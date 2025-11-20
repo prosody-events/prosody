@@ -21,10 +21,11 @@ use crossbeam_utils::CachePadded;
 use educe::Educe;
 use humantime::format_duration;
 use parking_lot::Mutex;
+use quanta::Instant;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
 
