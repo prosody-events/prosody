@@ -25,37 +25,37 @@ cassandra_queries! {
     pub struct Queries {
         /// Gets the next deferred message (oldest offset) and retry count for a key
         get_next_deferred_message: (
-            "SELECT offset, retry_count FROM $keyspace.{} WHERE key_id = ? LIMIT 1",
+            "SELECT offset, retry_count FROM $keyspace.{} WHERE defer_key = ? LIMIT 1",
             TABLE_DEFERRED_MESSAGES
         ),
 
         /// Inserts a new deferred message with retry count initialization and TTL
         insert_deferred_message_with_retry_count: (
-            "INSERT INTO $keyspace.{} (key_id, offset, retry_count) VALUES (?, ?, ?) USING TTL ?",
+            "INSERT INTO $keyspace.{} (defer_key, offset, retry_count) VALUES (?, ?, ?) USING TTL ?",
             TABLE_DEFERRED_MESSAGES
         ),
 
         /// Inserts a new deferred message WITHOUT updating retry count (leaves static column unchanged)
         insert_deferred_message_without_retry_count: (
-            "INSERT INTO $keyspace.{} (key_id, offset) VALUES (?, ?) USING TTL ?",
+            "INSERT INTO $keyspace.{} (defer_key, offset) VALUES (?, ?) USING TTL ?",
             TABLE_DEFERRED_MESSAGES
         ),
 
         /// Updates the retry count for all messages of a key (static column)
         update_retry_count: (
-            "UPDATE $keyspace.{} SET retry_count = ? WHERE key_id = ?",
+            "UPDATE $keyspace.{} SET retry_count = ? WHERE defer_key = ?",
             TABLE_DEFERRED_MESSAGES
         ),
 
         /// Removes a specific deferred message
         remove_deferred_message: (
-            "DELETE FROM $keyspace.{} WHERE key_id = ? AND offset = ?",
+            "DELETE FROM $keyspace.{} WHERE defer_key = ? AND offset = ?",
             TABLE_DEFERRED_MESSAGES
         ),
 
         /// Deletes all data for a key (entire partition including static columns)
         delete_key: (
-            "DELETE FROM $keyspace.{} WHERE key_id = ?",
+            "DELETE FROM $keyspace.{} WHERE defer_key = ?",
             TABLE_DEFERRED_MESSAGES
         ),
     }

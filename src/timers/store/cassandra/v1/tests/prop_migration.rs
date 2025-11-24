@@ -648,7 +648,7 @@ pub async fn prop_migration_invariants(
             setup_v1_state(v1_operations, &input).await?;
         }
         SegmentVersion::V2 => {
-            let config = test_cassandra_config("prosody_test_v1");
+            let config = test_cassandra_config("prosody_test");
             let cassandra_base = CassandraStore::new(&config).await?;
             let cassandra_store = CassandraTriggerStore::with_store(
                 cassandra_base,
@@ -662,7 +662,7 @@ pub async fn prop_migration_invariants(
     }
 
     // Migration phase: Create store with target_slab_size
-    let config = test_cassandra_config("prosody_test_v1");
+    let config = test_cassandra_config("prosody_test");
     let cassandra_base = CassandraStore::new(&config).await?;
     let cassandra_store =
         CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, input.target_slab_size)

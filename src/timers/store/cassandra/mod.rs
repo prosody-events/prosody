@@ -897,13 +897,13 @@ mod test {
     trigger_store_tests!(
         CassandraTriggerStore,
         |slab_size| async move {
-            let config = test_cassandra_config("prosody");
+            let config = test_cassandra_config("prosody_test");
             let store = CassandraStore::new(&config).await?;
             CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await
         },
         crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
         |slab_size| async move {
-            let config = test_cassandra_config("prosody");
+            let config = test_cassandra_config("prosody_test");
             cassandra_store(&config, slab_size).await
         },
         get_test_count()
@@ -1013,7 +1013,7 @@ mod test {
         init_test_logging();
 
         let slab_size = CompactDuration::new(60);
-        let config = test_cassandra_config("prosody_test_simple");
+        let config = test_cassandra_config("prosody_test");
         let cassandra_store = CassandraStore::new(&config).await?;
         let store =
             CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;

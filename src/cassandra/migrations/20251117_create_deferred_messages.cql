@@ -4,10 +4,10 @@
 -- Deferred messages table for consumer middleware retry tracking
 create table {{KEYSPACE}}.{{TABLE_DEFERRED_MESSAGES}}
 (
-    key_id      uuid,
+    defer_key    uuid,
     offset      bigint,
     retry_count int static,
-    primary key (key_id, offset)
+    primary key (defer_key, offset)
 )
     with clustering order by (offset asc)
      and compression = { 'class': 'ZstdCompressor' }

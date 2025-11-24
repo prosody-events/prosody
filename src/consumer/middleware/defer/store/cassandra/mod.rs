@@ -25,7 +25,8 @@ mod queries;
 ///
 /// # Design
 ///
-/// - **Single table**: `deferred_messages` with `(key_id, offset)` primary key
+/// - **Single table**: `deferred_messages` with `(defer_key, offset)` primary
+///   key
 /// - **Retry count**: Stored as static column (shared across all offsets for a
 ///   key)
 /// - **TTL management**: Uses `CassandraStore::calculate_ttl()` for safe TTL
@@ -73,11 +74,11 @@ impl DeferStore for CassandraDeferStore {
     #[instrument(skip(self), err)]
     async fn get_next_deferred_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
     ) -> Result<Option<(Offset, u32)>, Self::Error> {
         let result = self
             .session()
-            .execute_unpaged(&self.queries.get_next_deferred_message, (key_id,))
+            .execute_unpaged(&self.queries.get_next_deferred_message, (defer_key,))
             .await
             .map_err(CassandraStoreError::from)?;
 
@@ -101,7 +102,7 @@ impl DeferStore for CassandraDeferStore {
     #[instrument(skip(self), err)]
     async fn defer_first_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         offset: Offset,
         expected_retry_time: CompactDateTime,
     ) -> Result<(), Self::Error> {
@@ -114,7 +115,7 @@ impl DeferStore for CassandraDeferStore {
         self.session()
             .execute_unpaged(
                 &self.queries.insert_deferred_message_with_retry_count,
-                (key_id, offset, 0_i32, ttl),
+                (defer_key, offset, 0_i32, ttl),
             )
             .await
             .map_err(CassandraStoreError::from)?;
@@ -125,7 +126,7 @@ impl DeferStore for CassandraDeferStore {
     #[instrument(skip(self), err)]
     async fn append_deferred_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         offset: Offset,
         expected_retry_time: CompactDateTime,
     ) -> Result<(), Self::Error> {
@@ -138,7 +139,7 @@ impl DeferStore for CassandraDeferStore {
         self.session()
             .execute_unpaged(
                 &self.queries.insert_deferred_message_without_retry_count,
-                (key_id, offset, ttl),
+                (defer_key, offset, ttl),
             )
             .await
             .map_err(CassandraStoreError::from)?;
@@ -149,11 +150,11 @@ impl DeferStore for CassandraDeferStore {
     #[instrument(skip(self), err)]
     async fn remove_deferred_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         offset: Offset,
     ) -> Result<(), Self::Error> {
         self.session()
-            .execute_unpaged(&self.queries.remove_deferred_message, (key_id, offset))
+            .execute_unpaged(&self.queries.remove_deferred_message, (defer_key, offset))
             .await
             .map_err(CassandraStoreError::from)?;
 
@@ -161,7 +162,7 @@ impl DeferStore for CassandraDeferStore {
     }
 
     #[instrument(skip(self), err)]
-    async fn set_retry_count(&self, key_id: &Uuid, retry_count: u32) -> Result<(), Self::Error> {
+    async fn set_retry_count(&self, defer_key: &Uuid, retry_count: u32) -> Result<(), Self::Error> {
         let retry_count_i32: i32 =
             retry_count
                 .try_into()
@@ -171,7 +172,10 @@ impl DeferStore for CassandraDeferStore {
                 })?;
 
         self.session()
-            .execute_unpaged(&self.queries.update_retry_count, (retry_count_i32, key_id))
+            .execute_unpaged(
+                &self.queries.update_retry_count,
+                (retry_count_i32, defer_key),
+            )
             .await
             .map_err(CassandraStoreError::from)?;
 
@@ -179,9 +183,9 @@ impl DeferStore for CassandraDeferStore {
     }
 
     #[instrument(skip(self), err)]
-    async fn delete_key(&self, key_id: &Uuid) -> Result<(), Self::Error> {
+    async fn delete_key(&self, defer_key: &Uuid) -> Result<(), Self::Error> {
         self.session()
-            .execute_unpaged(&self.queries.delete_key, (key_id,))
+            .execute_unpaged(&self.queries.delete_key, (defer_key,))
             .await
             .map_err(CassandraStoreError::from)?;
 
@@ -235,11 +239,12 @@ mod tests {
     defer_store_tests!(async {
         let config = CassandraConfiguration::builder()
             .nodes(vec!["localhost:9042".to_owned()])
+            .keyspace("prosody_test".to_owned())
             .build()
             .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
 
         let store = CassandraStore::new(&config).await?;
-        let defer_store = CassandraDeferStore::with_store(store, "prosody").await?;
+        let defer_store = CassandraDeferStore::with_store(store, "prosody_test").await?;
         Ok::<_, color_eyre::Report>(defer_store)
     });
 }

@@ -105,7 +105,7 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if storage operation fails.
     fn defer_first_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         offset: Offset,
         expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -130,12 +130,12 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if storage operation fails.
     fn defer_additional_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         offset: Offset,
         expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            self.append_deferred_message(key_id, offset, expected_retry_time)
+            self.append_deferred_message(defer_key, offset, expected_retry_time)
                 .await
         }
     }
@@ -162,23 +162,23 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if any operation fails. State may be partially updated.
     fn complete_retry_success(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         offset: Offset,
     ) -> impl Future<Output = Result<RetryCompletionResult, Self::Error>> + Send {
         async move {
             // Step 1: Remove the successfully processed offset
-            self.remove_deferred_message(key_id, offset).await?;
+            self.remove_deferred_message(defer_key, offset).await?;
 
             // Step 2: Check if more messages exist for this key
-            let next_message = self.get_next_deferred_message(key_id).await?;
+            let next_message = self.get_next_deferred_message(defer_key).await?;
 
             if let Some((next_offset, _retry_count)) = next_message {
                 // Step 3a: More messages exist - reset retry_count to 0 for next message
-                self.set_retry_count(key_id, 0).await?;
+                self.set_retry_count(defer_key, 0).await?;
                 Ok(RetryCompletionResult::MoreMessages { next_offset })
             } else {
                 // Step 3b: No more messages - delete entire key
-                self.delete_key(key_id).await?;
+                self.delete_key(defer_key).await?;
                 Ok(RetryCompletionResult::Completed)
             }
         }
@@ -199,12 +199,12 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if storage operation fails.
     fn increment_retry_count(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         current_retry_count: u32,
     ) -> impl Future<Output = Result<u32, Self::Error>> + Send {
         async move {
             let new_count = current_retry_count.saturating_add(1);
-            self.set_retry_count(key_id, new_count).await?;
+            self.set_retry_count(defer_key, new_count).await?;
             Ok(new_count)
         }
     }
@@ -225,7 +225,7 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if query fails.
     fn get_next_deferred_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
     ) -> impl Future<Output = Result<Option<(Offset, u32)>, Self::Error>> + Send;
 
     /// Checks if this key has any deferred messages.
@@ -245,11 +245,11 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if query fails.
     fn is_deferred(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
     ) -> impl Future<Output = Result<Option<u32>, Self::Error>> + Send {
         async move {
             Ok(self
-                .get_next_deferred_message(key_id)
+                .get_next_deferred_message(defer_key)
                 .await?
                 .map(|(_, count)| count))
         }
@@ -272,7 +272,7 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if storage operation fails.
     fn append_deferred_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         offset: Offset,
         expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -289,7 +289,7 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if storage operation fails.
     fn remove_deferred_message(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         offset: Offset,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -308,7 +308,7 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     #[doc(hidden)]
     fn set_retry_count(
         &self,
-        key_id: &Uuid,
+        defer_key: &Uuid,
         retry_count: u32,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -321,5 +321,5 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     ///
     /// Returns error if storage operation fails.
     #[doc(hidden)]
-    fn delete_key(&self, key_id: &Uuid) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn delete_key(&self, defer_key: &Uuid) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

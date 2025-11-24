@@ -39,7 +39,7 @@ mod test_runner {
     async fn create_v1_operations() -> color_eyre::Result<V1Operations> {
         use crate::cassandra::CassandraStore;
 
-        let config = test_cassandra_config("prosody_test_v1");
+        let config = test_cassandra_config("prosody_test");
         let store = CassandraStore::new(&config).await?;
         let queries = Arc::new(Queries::new(store.session(), &config.keyspace).await?);
 

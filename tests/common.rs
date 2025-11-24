@@ -403,7 +403,7 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
         datacenter: None,
         rack: None,
         nodes: vec!["localhost:9042".to_owned()],
-        keyspace: "prosody_integration_test".to_owned(),
+        keyspace: "prosody_test".to_owned(),
         user: None,
         password: None,
         retention: StdDuration::from_secs(10 * 60),

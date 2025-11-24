@@ -554,7 +554,7 @@ mod property_tests {
         store: &MemoryDeferStore,
         cache: &Cache<Key, DeferState>,
         key: &Key,
-        key_id: &uuid::Uuid,
+        defer_key: &uuid::Uuid,
         op_byte: u8,
         retry_counts: &mut HashMap<Key, u32>,
     ) {
@@ -568,10 +568,12 @@ mod property_tests {
             && let Ok(retry_time) = now.add_duration(CompactDuration::new(60))
         {
             let _ = if retry_count == 0 {
-                store.defer_first_message(key_id, offset, retry_time).await
+                store
+                    .defer_first_message(defer_key, offset, retry_time)
+                    .await
             } else {
                 store
-                    .defer_additional_message(key_id, offset, retry_time)
+                    .defer_additional_message(defer_key, offset, retry_time)
                     .await
             };
             cache.insert(key.clone(), DeferState::Deferred { retry_count });
@@ -584,19 +586,19 @@ mod property_tests {
         store: &MemoryDeferStore,
         cache: &Cache<Key, DeferState>,
         key: &Key,
-        key_id: &uuid::Uuid,
+        defer_key: &uuid::Uuid,
         retry_counts: &mut HashMap<Key, u32>,
     ) {
         if let Some(&current_retry_count) = retry_counts.get(key) {
             let new_retry_count = current_retry_count + 1;
             if store
-                .get_next_deferred_message(key_id)
+                .get_next_deferred_message(defer_key)
                 .await
                 .ok()
                 .flatten()
                 .is_some()
             {
-                let _ = store.set_retry_count(key_id, new_retry_count).await;
+                let _ = store.set_retry_count(defer_key, new_retry_count).await;
                 cache.insert(
                     key.clone(),
                     DeferState::Deferred {
@@ -613,13 +615,13 @@ mod property_tests {
         store: &MemoryDeferStore,
         cache: &Cache<Key, DeferState>,
         key: &Key,
-        key_id: &uuid::Uuid,
+        defer_key: &uuid::Uuid,
         retry_counts: &mut HashMap<Key, u32>,
     ) {
-        if let Ok(Some((offset, _))) = store.get_next_deferred_message(key_id).await {
-            let _ = store.remove_deferred_message(key_id, offset).await;
+        if let Ok(Some((offset, _))) = store.get_next_deferred_message(defer_key).await {
+            let _ = store.remove_deferred_message(defer_key, offset).await;
             if store
-                .get_next_deferred_message(key_id)
+                .get_next_deferred_message(defer_key)
                 .await
                 .ok()
                 .flatten()
