@@ -842,6 +842,7 @@ mod property_tests {
 // Trace-based property test infrastructure
 mod context;
 mod generator;
+mod handler;
 mod harness;
 mod properties;
 mod types;

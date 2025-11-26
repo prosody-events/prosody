@@ -160,3 +160,11 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 ## Research
 
 - Automatically use context7 for code generation and library documentation.
+
+## Active Technologies
+- Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer middleware (001-simplified-prop-tests)
+- N/A (tests use `MemoryDeferStore`) (001-simplified-prop-tests)
+- Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6, tokio, parking_lo (001-simplified-prop-tests)
+
+## Recent Changes
+- 001-simplified-prop-tests: Added Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer middleware

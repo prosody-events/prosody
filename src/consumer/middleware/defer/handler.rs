@@ -7,6 +7,7 @@
 
 use super::DeferState;
 use super::config::DeferConfiguration;
+use super::decider::DeferralDecider;
 use super::error::{DeferError, DeferInitError};
 use super::failure_tracker::FailureTracker;
 use super::loader::{KafkaLoader, MessageLoader};
@@ -36,40 +37,44 @@ use tracing::{debug, error};
 ///
 /// * `S` - Store implementation for deferred state
 /// * `L` - Loader implementation for retrieving messages by offset
+/// * `D` - Deferral decision implementation
 #[derive(Clone)]
-pub struct DeferMiddleware<S, L = KafkaLoader>
+pub struct DeferMiddleware<S, L = KafkaLoader, D = FailureTracker>
 where
     S: DeferStore,
     L: MessageLoader,
+    D: DeferralDecider,
 {
     config: DeferConfiguration,
     loader: L,
     store: S,
-    failure_tracker: FailureTracker,
+    decider: D,
     consumer_group: Arc<str>,
 }
 
-impl<S, L> DeferMiddleware<S, L>
+impl<S, L, D> DeferMiddleware<S, L, D>
 where
     S: DeferStore,
     L: MessageLoader,
+    D: DeferralDecider,
 {
-    /// Returns a reference to the failure tracker.
+    /// Returns a reference to the deferral decider.
     ///
     /// Useful for testing and monitoring.
     #[must_use]
-    pub fn failure_tracker(&self) -> &FailureTracker {
-        &self.failure_tracker
+    pub fn decider(&self) -> &D {
+        &self.decider
     }
 }
 
-impl<S> DeferMiddleware<S, KafkaLoader>
+impl<S> DeferMiddleware<S, KafkaLoader, FailureTracker>
 where
     S: DeferStore,
 {
     /// Creates a new defer middleware with the given configuration and store.
     ///
-    /// Uses [`KafkaLoader`] to load messages from Kafka for retry.
+    /// Uses [`KafkaLoader`] to load messages from Kafka for retry and
+    /// [`FailureTracker`] for deferral decisions.
     ///
     /// # Arguments
     ///
@@ -116,7 +121,7 @@ where
         };
         let loader = KafkaLoader::new(loader_config, heartbeats)?;
 
-        let failure_tracker = FailureTracker::new(
+        let decider = FailureTracker::new(
             config.failure_window,
             config.failure_threshold,
             telemetry,
@@ -127,13 +132,13 @@ where
             config,
             loader,
             store,
-            failure_tracker,
+            decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
         })
     }
 }
 
-impl<S, L> DeferMiddleware<S, L>
+impl<S, L> DeferMiddleware<S, L, FailureTracker>
 where
     S: DeferStore,
     L: MessageLoader,
@@ -141,7 +146,8 @@ where
     /// Creates a new defer middleware with a custom loader.
     ///
     /// Use this constructor for testing with [`MemoryLoader`] or other
-    /// custom loader implementations.
+    /// custom loader implementations. Uses [`FailureTracker`] for deferral
+    /// decisions.
     ///
     /// # Arguments
     ///
@@ -174,7 +180,7 @@ where
 
         config.validate()?;
 
-        let failure_tracker = FailureTracker::new(
+        let decider = FailureTracker::new(
             config.failure_window,
             config.failure_threshold,
             telemetry,
@@ -185,7 +191,57 @@ where
             config,
             loader,
             store,
-            failure_tracker,
+            decider,
+            consumer_group: consumer_group.into(),
+        })
+    }
+}
+
+impl<S, L, D> DeferMiddleware<S, L, D>
+where
+    S: DeferStore,
+    L: MessageLoader,
+    D: DeferralDecider,
+{
+    /// Creates a new defer middleware with a custom loader and decider.
+    ///
+    /// Use this constructor for property testing with [`MemoryLoader`] and
+    /// [`TraceBasedDecider`] or similar test doubles.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration for defer behavior
+    /// * `consumer_group` - Consumer group ID for state isolation
+    /// * `loader` - Message loader implementation
+    /// * `store` - Storage backend for deferred state
+    /// * `decider` - Deferral decision implementation
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the new middleware if configuration is valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if configuration validation fails.
+    pub fn with_loader_and_decider<G>(
+        config: DeferConfiguration,
+        consumer_group: G,
+        loader: L,
+        store: S,
+        decider: D,
+    ) -> Result<Self, DeferInitError>
+    where
+        G: Into<Arc<str>>,
+    {
+        use validator::Validate;
+
+        config.validate()?;
+
+        Ok(Self {
+            config,
+            loader,
+            store,
+            decider,
             consumer_group: consumer_group.into(),
         })
     }
@@ -193,16 +249,17 @@ where
 
 /// Provider that creates defer handlers for each partition.
 #[derive(Clone)]
-pub struct DeferProvider<T, S, L = KafkaLoader>
+pub struct DeferProvider<T, S, L = KafkaLoader, D = FailureTracker>
 where
     S: DeferStore,
     L: MessageLoader,
+    D: DeferralDecider,
 {
     provider: T,
     config: DeferConfiguration,
     loader: L,
     store: S,
-    failure_tracker: FailureTracker,
+    decider: D,
     consumer_group: Arc<str>,
 }
 
@@ -214,28 +271,31 @@ where
 /// * `S` - Store implementation (`DeferStore`, typically wrapped in
 ///   `CachedDeferStore`)
 /// * `L` - Loader implementation for retrieving messages by offset
+/// * `D` - Deferral decision implementation
 #[derive(Clone)]
-pub struct DeferHandler<T, S, L = KafkaLoader>
+pub struct DeferHandler<T, S, L = KafkaLoader, D = FailureTracker>
 where
     S: DeferStore,
     L: MessageLoader,
+    D: DeferralDecider,
 {
-    handler: T,
-    loader: L,
-    store: S,
-    failure_tracker: FailureTracker,
-    config: DeferConfiguration,
-    topic: Topic,
-    partition: Partition,
-    consumer_group: Arc<str>,
+    pub(crate) handler: T,
+    pub(crate) loader: L,
+    pub(crate) store: S,
+    pub(crate) decider: D,
+    pub(crate) config: DeferConfiguration,
+    pub(crate) topic: Topic,
+    pub(crate) partition: Partition,
+    pub(crate) consumer_group: Arc<str>,
 }
 
-impl<S, L> HandlerMiddleware for DeferMiddleware<S, L>
+impl<S, L, D> HandlerMiddleware for DeferMiddleware<S, L, D>
 where
     S: DeferStore,
     L: MessageLoader + 'static,
+    D: DeferralDecider,
 {
-    type Provider<T: FallibleHandlerProvider> = DeferProvider<T, S, L>;
+    type Provider<T: FallibleHandlerProvider> = DeferProvider<T, S, L, D>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
@@ -246,20 +306,21 @@ where
             config: self.config.clone(),
             loader: self.loader.clone(),
             store: self.store.clone(),
-            failure_tracker: self.failure_tracker.clone(),
+            decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
         }
     }
 }
 
-impl<T, S, L> FallibleHandlerProvider for DeferProvider<T, S, L>
+impl<T, S, L, D> FallibleHandlerProvider for DeferProvider<T, S, L, D>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
     S: DeferStore,
     L: MessageLoader + 'static,
+    D: DeferralDecider,
 {
-    type Handler = DeferHandler<T::Handler, CachedDeferStore<S>, L>;
+    type Handler = DeferHandler<T::Handler, CachedDeferStore<S>, L, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         // Wrap store in cache for this partition handler.
@@ -270,7 +331,7 @@ where
             handler: self.provider.handler_for_partition(topic, partition),
             loader: self.loader.clone(),
             store: cached_store,
-            failure_tracker: self.failure_tracker.clone(),
+            decider: self.decider.clone(),
             config: self.config.clone(),
             topic,
             partition,
@@ -283,11 +344,12 @@ where
 // HandlerProvider implementation removed as it requires non-fallible handlers
 // which don't support error classification needed for defer logic.
 
-impl<T, S, L> DeferHandler<T, S, L>
+impl<T, S, L, D> DeferHandler<T, S, L, D>
 where
     T: FallibleHandler,
     S: DeferStore,
     L: MessageLoader + 'static,
+    D: DeferralDecider,
 {
     /// Checks the defer state for a key.
     ///
@@ -429,6 +491,11 @@ where
             RetryCompletionResult::Completed => {
                 // No more messages - key has been deleted from storage
                 // (cache updated by CachedDeferStore)
+                // Clear the timer since we won't be retrying
+                context
+                    .clear_scheduled(TimerType::DeferRetry)
+                    .await
+                    .map_err(|e| DeferError::Timer(Box::new(e)))?;
             }
         }
 
@@ -459,7 +526,7 @@ where
         // Check error classification - only defer transient (recoverable) errors
         if let ErrorCategory::Transient = error.classify_error() {
             // Check if we should defer again
-            if !self.failure_tracker.should_defer() {
+            if !self.decider.should_defer() {
                 debug!("Deferral disabled due to high failure rate");
                 // Clean up this offset and propagate error
                 self.store
@@ -488,12 +555,34 @@ where
 
             Ok(())
         } else {
-            // Transient or terminal error - clean up and propagate
-            // (cache invalidated by CachedDeferStore)
-            self.store
-                .remove_deferred_message(key_ref, offset)
+            // Permanent or terminal error - clean up current offset but check for more messages
+            // (cache updated by CachedDeferStore)
+            let result = self
+                .store
+                .complete_retry_success(key_ref, offset)
                 .await
                 .map_err(DeferError::Store)?;
+
+            // Handle timer management before propagating the error
+            match result {
+                RetryCompletionResult::MoreMessages { next_offset } => {
+                    // Schedule timer for the next deferred message (retry_count reset to 0)
+                    self.schedule_retry_timer(context, 0).await?;
+
+                    debug!(
+                        "Permanent error for key {:?} offset {}, scheduled timer for next offset {}",
+                        message_key, offset, next_offset
+                    );
+                }
+                RetryCompletionResult::Completed => {
+                    // No more messages - clear the timer
+                    context
+                        .clear_scheduled(TimerType::DeferRetry)
+                        .await
+                        .map_err(|e| DeferError::Timer(Box::new(e)))?;
+                }
+            }
+
             Err(DeferError::Handler(error))
         }
     }
@@ -584,11 +673,12 @@ where
     }
 }
 
-impl<T, S, L> FallibleHandler for DeferHandler<T, S, L>
+impl<T, S, L, D> FallibleHandler for DeferHandler<T, S, L, D>
 where
     T: FallibleHandler,
     S: DeferStore,
     L: MessageLoader + 'static,
+    D: DeferralDecider,
 {
     type Error = DeferError<S::Error, T::Error, L::Error>;
 
@@ -633,7 +723,7 @@ where
                 // Check error classification - only defer transient (recoverable) errors
                 if let ErrorCategory::Transient = error.classify_error() {
                     // Check if deferral is enabled based on failure rate
-                    if !self.failure_tracker.should_defer() {
+                    if !self.decider.should_defer() {
                         debug!("Deferral disabled due to high failure rate");
                         return Err(DeferError::Configuration(ConfigurationError::Invalid(
                             format!("Deferral disabled: {error}"),
@@ -685,10 +775,16 @@ where
 
         // Get the next deferred message for this key
         let (offset, retry_count) = match self.store.get_next_deferred_message(&key_ref).await {
-            Ok(Some(result)) => result,
+            Ok(Some(result)) => {
+                tracing::info!(
+                    "on_timer: got deferred message for key {:?}: offset={}, retry_count={}",
+                    message_key, result.0, result.1
+                );
+                result
+            }
             Ok(None) => {
                 // No deferred message found - possibly already succeeded or expired
-                debug!("No deferred message found for key {:?}", message_key);
+                tracing::info!("on_timer: No deferred message found for key {:?}", message_key);
                 return Ok(());
             }
             Err(e) => {
@@ -703,12 +799,19 @@ where
             .await
             .map_err(DeferError::Loader)?;
 
+        tracing::info!(
+            "on_timer: loaded message for offset {}: key={:?}",
+            offset,
+            message.key()
+        );
+
         // Verify the key matches (sanity check)
         if message.key() != message_key {
-            debug!(
-                "Key mismatch: expected {:?}, got {:?}",
+            tracing::info!(
+                "on_timer: Key mismatch! expected {:?}, got {:?} - removing offset {}",
                 message_key,
-                message.key()
+                message.key(),
+                offset
             );
             // Clean up this offset from the deferred queue
             // (cache invalidated by CachedDeferStore)
@@ -748,11 +851,12 @@ where
     }
 }
 
-impl<T, S, L> EventHandler for DeferHandler<T, S, L>
+impl<T, S, L, D> EventHandler for DeferHandler<T, S, L, D>
 where
     T: FallibleHandler,
     S: DeferStore,
     L: MessageLoader + 'static,
+    D: DeferralDecider,
 {
     async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
     where

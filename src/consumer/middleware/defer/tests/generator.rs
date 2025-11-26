@@ -35,8 +35,8 @@ pub struct TraceBuilder {
     deferred: HashMap<usize, VecDeque<Offset>>,
     /// Retry count per (`key_idx`, offset).
     retry_counts: HashMap<(usize, Offset), u32>,
-    /// Next offset per key for monotonic generation.
-    next_offset: HashMap<usize, i64>,
+    /// Global offset counter for monotonic generation (Kafka offsets are partition-global).
+    next_offset: i64,
 }
 
 impl TraceBuilder {
@@ -47,7 +47,7 @@ impl TraceBuilder {
             events: Vec::new(),
             deferred: HashMap::default(),
             retry_counts: HashMap::default(),
-            next_offset: HashMap::default(),
+            next_offset: 0,
         }
     }
 
@@ -61,16 +61,15 @@ impl TraceBuilder {
         self.deferred.get(&key_idx).and_then(|q| q.front().copied())
     }
 
-    /// Gets the next monotonic offset for a key.
-    fn get_next_offset(&mut self, key_idx: usize) -> Offset {
-        let offset = self.next_offset.entry(key_idx).or_insert(0);
-        *offset += 1;
-        Offset::from(*offset)
+    /// Gets the next monotonic offset (global across all keys, like Kafka partitions).
+    fn get_next_offset(&mut self) -> Offset {
+        self.next_offset += 1;
+        Offset::from(self.next_offset)
     }
 
     /// Adds a message event with the given outcome (if valid).
     fn add_message_event(&mut self, g: &mut Gen, key_idx: usize, outcome: MessageOutcome) {
-        let offset = self.get_next_offset(key_idx);
+        let offset = self.get_next_offset();
 
         // Apply state transitions
         match &outcome {

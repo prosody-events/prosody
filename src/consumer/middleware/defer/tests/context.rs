@@ -9,12 +9,10 @@ use crate::Key;
 use crate::consumer::event_context::EventContext;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
-use ahash::HashMap;
 use futures::stream::{self, Stream};
-use parking_lot::Mutex;
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::{self, Future};
-use std::mem;
 use std::sync::Arc;
 
 // ============================================================================
@@ -25,12 +23,15 @@ use std::sync::Arc;
 ///
 /// This is shared by all [`KeyedCapturingContext`] instances, allowing
 /// the test harness to query timer state for any key.
+///
+/// Timers are tracked per key with a set of scheduled times, allowing
+/// multiple timers per key and precise removal of specific timers.
 #[derive(Clone, Default)]
 pub struct TimerCapture {
     /// Recorded operations in order (for debugging/verification).
-    events: Arc<Mutex<Vec<OutputEvent>>>,
-    /// Currently active timers per key.
-    active_timers: Arc<Mutex<HashMap<Key, CompactDateTime>>>,
+    events: Arc<scc::Queue<OutputEvent>>,
+    /// Currently active timers: key -> set of scheduled times.
+    active_timers: Arc<scc::HashMap<Key, BTreeSet<CompactDateTime>>>,
 }
 
 impl TimerCapture {
@@ -40,67 +41,98 @@ impl TimerCapture {
         Self::default()
     }
 
-    /// Records a timer schedule operation.
+    /// Records a timer schedule operation for a specific (key, time).
     pub fn record_schedule(&self, key: Key, time: CompactDateTime) {
-        let mut events = self.events.lock();
-        events.push(OutputEvent::Scheduled {
+        self.events.push(OutputEvent::Scheduled {
             key: key.clone(),
             time,
         });
 
-        let mut timers = self.active_timers.lock();
-        timers.insert(key, time);
+        let _ = self
+            .active_timers
+            .entry_sync(key)
+            .and_modify(|times| {
+                times.insert(time);
+            })
+            .or_insert_with(|| {
+                let mut set = BTreeSet::new();
+                set.insert(time);
+                set
+            });
     }
 
-    /// Records a timer clear operation.
-    pub fn record_clear(&self, key: &Key) {
-        let mut events = self.events.lock();
-        events.push(OutputEvent::Cleared { key: key.clone() });
+    /// Records clearing a specific timer by (key, time).
+    ///
+    /// Used when `commit()` is called after a timer fires - removes only the
+    /// specific timer that was fired, not any newly scheduled timers.
+    pub fn record_clear(&self, key: &Key, time: CompactDateTime) {
+        self.events
+            .push(OutputEvent::Cleared { key: key.clone() });
 
-        let mut timers = self.active_timers.lock();
-        timers.remove(key);
+        // Check if this is the only timer for the key
+        let should_remove = self
+            .active_timers
+            .read_sync(key, |_, times| times.len() == 1 && times.contains(&time))
+            .unwrap_or(false);
+
+        if should_remove {
+            let _ = self.active_timers.remove_sync(key);
+        } else if let Some(mut entry) = self.active_timers.get_sync(key) {
+            entry.get_mut().remove(&time);
+        }
+    }
+
+    /// Records clearing all timers for a key (any time).
+    ///
+    /// Used by `clear_scheduled` and the clear part of `clear_and_schedule`.
+    pub fn record_clear_all(&self, key: &Key) {
+        self.events
+            .push(OutputEvent::Cleared { key: key.clone() });
+
+        let _ = self.active_timers.remove_sync(key);
     }
 
     /// Pops and returns the oldest recorded event, if any.
     #[must_use]
     pub fn pop_event(&self) -> Option<OutputEvent> {
-        let mut events = self.events.lock();
-        if events.is_empty() {
-            None
-        } else {
-            Some(events.remove(0))
-        }
+        self.events.pop().map(|entry| (**entry).clone())
     }
 
     /// Returns all recorded events (draining the queue).
     #[must_use]
     pub fn drain_events(&self) -> Vec<OutputEvent> {
-        let mut events = self.events.lock();
-        mem::take(&mut *events)
+        std::iter::from_fn(|| self.events.pop().map(|e| (**e).clone())).collect()
     }
 
     /// Returns the number of pending events.
     #[must_use]
     pub fn event_count(&self) -> usize {
-        self.events.lock().len()
+        self.events.len()
     }
 
-    /// Returns true if there is an active timer for the given key.
+    /// Returns true if there is an active timer for the given key (any time).
     #[must_use]
     pub fn has_active_timer(&self, key: &Key) -> bool {
-        self.active_timers.lock().contains_key(key)
+        self.active_timers
+            .read_sync(key, |_, times| !times.is_empty())
+            .unwrap_or(false)
     }
 
-    /// Returns the scheduled time for the key's active timer, if any.
+    /// Returns the earliest scheduled time for the key's active timers, if any.
     #[must_use]
     pub fn get_timer_time(&self, key: &Key) -> Option<CompactDateTime> {
-        self.active_timers.lock().get(key).copied()
+        self.active_timers
+            .read_sync(key, |_, times| times.first().copied())
+            .flatten()
     }
 
-    /// Returns the number of active timers.
+    /// Returns the number of keys with active timers.
+    ///
+    /// Note: This returns the number of keys, not the total count of timer instances.
+    /// Each key may have multiple scheduled times in its BTreeSet.
     #[must_use]
     pub fn active_timer_count(&self) -> usize {
-        self.active_timers.lock().len()
+        self.active_timers.len()
     }
 }
 
@@ -177,8 +209,8 @@ impl EventContext for KeyedCapturingContext {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         if timer_type == TimerType::DeferRetry {
-            // Clear first, then schedule
-            self.capture.record_clear(&self.key);
+            // Clear all timers for this key first, then schedule new one
+            self.capture.record_clear_all(&self.key);
             self.capture.record_schedule(self.key.clone(), time);
         }
         future::ready(Ok(()))
@@ -186,11 +218,12 @@ impl EventContext for KeyedCapturingContext {
 
     fn unschedule(
         &self,
-        _time: CompactDateTime,
+        time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         if timer_type == TimerType::DeferRetry {
-            self.capture.record_clear(&self.key);
+            // Remove specific timer by (key, time)
+            self.capture.record_clear(&self.key, time);
         }
         future::ready(Ok(()))
     }
@@ -200,7 +233,8 @@ impl EventContext for KeyedCapturingContext {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         if timer_type == TimerType::DeferRetry {
-            self.capture.record_clear(&self.key);
+            // Remove all timers for this key
+            self.capture.record_clear_all(&self.key);
         }
         future::ready(Ok(()))
     }
@@ -259,7 +293,7 @@ mod tests {
 
         if let Some(time) = time {
             capture.record_schedule(test_key("k1"), time);
-            capture.record_clear(&test_key("k1"));
+            capture.record_clear(&test_key("k1"), time);
 
             assert!(!capture.has_active_timer(&test_key("k1")));
             assert_eq!(capture.active_timer_count(), 0);

@@ -29,12 +29,14 @@ fn prop_timer_coverage(trace: Trace) -> TestResult {
     let Trace { events, key_count } = trace;
 
     TEST_RUNTIME.block_on(async {
-        let mut harness = TestHarness::new(key_count);
+        let mut harness = match TestHarness::new(key_count) {
+            Ok(h) => h,
+            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
+        };
 
         for event in &events {
-            if harness.execute_event(event).await.is_err() {
-                // Invalid trace - discard
-                return TestResult::discard();
+            if let Err(e) = harness.execute_event(event).await {
+                return TestResult::error(format!("Execution failed: {e}"));
             }
 
             // Verify timer coverage after each event
@@ -57,7 +59,10 @@ fn prop_fifo_order(trace: Trace) -> TestResult {
     let Trace { events, key_count } = trace;
 
     TEST_RUNTIME.block_on(async {
-        let mut harness = TestHarness::new(key_count);
+        let mut harness = match TestHarness::new(key_count) {
+            Ok(h) => h,
+            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
+        };
 
         for event in &events {
             // For timer events, verify FIFO before execution
@@ -74,15 +79,20 @@ fn prop_fifo_order(trace: Trace) -> TestResult {
                             ));
                         }
                     }
-                    Ok(None) | Err(_) => {
-                        // Key not deferred or store error - invalid trace
-                        return TestResult::discard();
+                    Ok(None) => {
+                        return TestResult::error(format!(
+                            "Timer for key {} but key not deferred",
+                            timer.key_idx
+                        ));
+                    }
+                    Err(e) => {
+                        return TestResult::error(format!("Store error: {e}"));
                     }
                 }
             }
 
-            if harness.execute_event(event).await.is_err() {
-                return TestResult::discard();
+            if let Err(e) = harness.execute_event(event).await {
+                return TestResult::error(format!("Execution failed: {e}"));
             }
         }
 
@@ -100,7 +110,10 @@ fn prop_retry_increment(trace: Trace) -> TestResult {
     let Trace { events, key_count } = trace;
 
     TEST_RUNTIME.block_on(async {
-        let mut harness = TestHarness::new(key_count);
+        let mut harness = match TestHarness::new(key_count) {
+            Ok(h) => h,
+            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
+        };
 
         for event in &events {
             if let TraceEvent::Timer(timer) = event
@@ -109,8 +122,8 @@ fn prop_retry_increment(trace: Trace) -> TestResult {
                 // Get retry count before
                 let before = harness.get_retry_count(timer.key_idx).await.ok().flatten();
 
-                if harness.execute_event(event).await.is_err() {
-                    return TestResult::discard();
+                if let Err(e) = harness.execute_event(event).await {
+                    return TestResult::error(format!("Execution failed: {e}"));
                 }
 
                 // Get retry count after
@@ -129,8 +142,8 @@ fn prop_retry_increment(trace: Trace) -> TestResult {
                 continue;
             }
 
-            if harness.execute_event(event).await.is_err() {
-                return TestResult::discard();
+            if let Err(e) = harness.execute_event(event).await {
+                return TestResult::error(format!("Execution failed: {e}"));
             }
         }
 
@@ -148,14 +161,16 @@ fn prop_backoff_bounds(trace: Trace) -> TestResult {
     let Trace { events, key_count } = trace;
 
     TEST_RUNTIME.block_on(async {
-        let mut harness = TestHarness::new(key_count);
+        let mut harness = match TestHarness::new(key_count) {
+            Ok(h) => h,
+            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
+        };
 
         for event in &events {
-            if harness.execute_event(event).await.is_err() {
-                return TestResult::discard();
+            if let Err(e) = harness.execute_event(event).await {
+                return TestResult::error(format!("Execution failed: {e}"));
             }
-            // Backoff bounds verified during execution via harness
-            // implementation
+            // TODO: Verify scheduled timer times against max_backoff bounds
         }
 
         TestResult::passed()
@@ -172,11 +187,14 @@ fn prop_cleanup(trace: Trace) -> TestResult {
     let Trace { events, key_count } = trace;
 
     TEST_RUNTIME.block_on(async {
-        let mut harness = TestHarness::new(key_count);
+        let mut harness = match TestHarness::new(key_count) {
+            Ok(h) => h,
+            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
+        };
 
         for event in &events {
-            if harness.execute_event(event).await.is_err() {
-                return TestResult::discard();
+            if let Err(e) = harness.execute_event(event).await {
+                return TestResult::error(format!("Execution failed: {e}"));
             }
 
             // After each event, verify cleanup invariant
@@ -212,161 +230,4 @@ fn prop_cleanup(trace: Trace) -> TestResult {
 
         TestResult::passed()
     })
-}
-
-// ============================================================================
-// Unit Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Offset;
-    use crate::consumer::middleware::defer::tests::types::{
-        MessageEvent, MessageOutcome, TimerEvent, TimerOutcome, Trace, TraceEvent,
-    };
-    use std::time::Duration;
-
-    /// Simple test case: defer and complete.
-    #[tokio::test]
-    async fn test_simple_defer_complete() {
-        init_test_logging();
-
-        let trace = Trace::new(
-            vec![
-                TraceEvent::Message(MessageEvent {
-                    key_idx: 0,
-                    offset: Offset::from(1_i64),
-                    outcome: MessageOutcome::Transient {
-                        max_backoff: Duration::from_secs(60),
-                        defer: true,
-                    },
-                }),
-                TraceEvent::Timer(TimerEvent {
-                    key_idx: 0,
-                    offset: Offset::from(1_i64),
-                    outcome: TimerOutcome::Success,
-                }),
-            ],
-            1,
-        );
-
-        let mut harness = TestHarness::new(1);
-
-        for event in &trace.events {
-            harness.execute_event(event).await.ok();
-            harness.verify_invariants().await.ok();
-        }
-
-        // Final state: no deferred messages, no timers
-        {
-            let key_ref = harness.key_ref(0);
-            let deferred = harness.store().get_next_deferred_message(&key_ref).await;
-            assert!(deferred.is_ok_and(|d| d.is_none()));
-        };
-        let key = harness.key(0).clone();
-        assert!(!harness.capture().has_active_timer(&key));
-    }
-
-    /// Test case: retry then succeed.
-    #[tokio::test]
-    async fn test_retry_then_succeed() {
-        init_test_logging();
-
-        let trace = Trace::new(
-            vec![
-                // Message defers
-                TraceEvent::Message(MessageEvent {
-                    key_idx: 0,
-                    offset: Offset::from(1_i64),
-                    outcome: MessageOutcome::Transient {
-                        max_backoff: Duration::from_secs(60),
-                        defer: true,
-                    },
-                }),
-                // Timer fires, transient failure
-                TraceEvent::Timer(TimerEvent {
-                    key_idx: 0,
-                    offset: Offset::from(1_i64),
-                    outcome: TimerOutcome::Transient {
-                        max_backoff: Duration::from_secs(120),
-                    },
-                }),
-                // Timer fires again, success
-                TraceEvent::Timer(TimerEvent {
-                    key_idx: 0,
-                    offset: Offset::from(1_i64),
-                    outcome: TimerOutcome::Success,
-                }),
-            ],
-            1,
-        );
-
-        let mut harness = TestHarness::new(1);
-
-        // Execute first event (defer)
-        harness.execute_event(&trace.events[0]).await.ok();
-        let retry_count = harness.get_retry_count(0).await.ok().flatten();
-        assert_eq!(retry_count, Some(0));
-
-        // Execute second event (transient failure)
-        harness.execute_event(&trace.events[1]).await.ok();
-        let retry_count = harness.get_retry_count(0).await.ok().flatten();
-        assert_eq!(retry_count, Some(1));
-
-        // Execute third event (success)
-        harness.execute_event(&trace.events[2]).await.ok();
-        // Key should no longer be deferred
-        {
-            let key_ref = harness.key_ref(0);
-            let deferred = harness.store().get_next_deferred_message(&key_ref).await;
-            assert!(deferred.is_ok_and(|d| d.is_none()));
-        }
-    }
-
-    /// Test case: multiple keys independent.
-    #[tokio::test]
-    async fn test_multiple_keys() {
-        init_test_logging();
-
-        let trace = Trace::new(
-            vec![
-                // Key 0 defers
-                TraceEvent::Message(MessageEvent {
-                    key_idx: 0,
-                    offset: Offset::from(1_i64),
-                    outcome: MessageOutcome::Transient {
-                        max_backoff: Duration::from_secs(60),
-                        defer: true,
-                    },
-                }),
-                // Key 1 succeeds
-                TraceEvent::Message(MessageEvent {
-                    key_idx: 1,
-                    offset: Offset::from(2_i64),
-                    outcome: MessageOutcome::Success,
-                }),
-                // Key 0 timer fires
-                TraceEvent::Timer(TimerEvent {
-                    key_idx: 0,
-                    offset: Offset::from(1_i64),
-                    outcome: TimerOutcome::Success,
-                }),
-            ],
-            2,
-        );
-
-        let mut harness = TestHarness::new(2);
-
-        for event in &trace.events {
-            harness.execute_event(event).await.ok();
-            harness.verify_invariants().await.ok();
-        }
-
-        // Both keys should have no timers
-        let key0 = harness.key(0).clone();
-        let key1 = harness.key(1).clone();
-        assert!(!harness.capture().has_active_timer(&key0));
-        assert!(!harness.capture().has_active_timer(&key1));
-    }
 }
