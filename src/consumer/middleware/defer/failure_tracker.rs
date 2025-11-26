@@ -8,6 +8,7 @@
 //! Uses telemetry subscription with lock-free atomic reads for high
 //! performance.
 
+use super::decider::DeferralDecider;
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
@@ -95,7 +96,14 @@ impl FailureTracker {
     ///
     /// - `true`: Failure rate is acceptable, deferral enabled
     /// - `false`: Failure rate exceeds threshold, deferral disabled
+    ///
+    /// # Note
+    ///
+    /// This method also exists on [`DeferralDecider`] trait. Both are kept
+    /// for backward compatibility - existing code calls this inherent method,
+    /// while generic code uses the trait method.
     #[must_use]
+    #[allow(clippy::same_name_method)]
     pub fn should_defer(&self) -> bool {
         self.failure_rate() < self.threshold
     }
@@ -218,6 +226,14 @@ impl Debug for FailureTracker {
             .field("failure_rate", &self.failure_rate())
             .field("threshold", &self.threshold)
             .finish_non_exhaustive()
+    }
+}
+
+impl DeferralDecider for FailureTracker {
+    #[allow(clippy::same_name_method)]
+    fn should_defer(&self) -> bool {
+        // Delegate to the existing inherent method for backward compatibility
+        self.failure_rate() < self.threshold
     }
 }
 

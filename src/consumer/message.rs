@@ -420,6 +420,52 @@ impl ConsumerMessage {
             uncommitted_offset,
         }
     }
+
+    /// Create a test message with minimal dependencies.
+    ///
+    /// Creates a `ConsumerMessage` suitable for unit testing without requiring
+    /// complex setup. Each message gets its own semaphore permit.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - Kafka topic
+    /// * `partition` - Partition index
+    /// * `offset` - Message offset
+    /// * `key` - Message key
+    /// * `payload` - JSON payload
+    ///
+    /// # Panics
+    ///
+    /// Panics if semaphore permit acquisition fails (should never happen).
+    #[cfg(test)]
+    #[must_use]
+    #[allow(clippy::panic)]
+    pub fn for_testing(
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+        key: Key,
+        payload: Payload,
+    ) -> Self {
+        use tokio::sync::Semaphore;
+        let semaphore = Arc::new(Semaphore::new(10));
+        let Ok(permit) = semaphore.try_acquire_owned() else {
+            // Semaphore with 10 permits, acquiring 1 - cannot fail
+            panic!("Semaphore should always have capacity")
+        };
+
+        Self::new(
+            None,
+            topic,
+            partition,
+            offset,
+            key,
+            chrono::Utc::now(),
+            payload,
+            tracing::Span::current(),
+            permit,
+        )
+    }
 }
 
 impl Keyed for ConsumerMessage {

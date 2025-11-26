@@ -42,14 +42,24 @@ use prosody::{
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::{Value, json};
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
 use tracing::{error, info};
 use uuid::Uuid;
+
+/// Shared runtime for integration tests.
+#[allow(clippy::expect_used)]
+static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+        .expect("Failed to create tokio runtime")
+});
 
 mod common;
 
@@ -449,16 +459,7 @@ fn test_first_failure_defers_and_retries() {
 }
 
 fn prop_first_failure_defers_and_retries(_: ()) -> TestResult {
-    let runtime = match Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => return TestResult::error(format!("failed to initialize runtime: {e}")),
-    };
-
-    match runtime.block_on(run_first_failure_defers_and_retries()) {
+    match TEST_RUNTIME.block_on(run_first_failure_defers_and_retries()) {
         Ok(()) => TestResult::passed(),
         Err(e) => TestResult::error(e.to_string()),
     }
@@ -509,16 +510,7 @@ fn test_multiple_messages_queued_in_order() {
 }
 
 fn prop_multiple_messages_queued_in_order(_: ()) -> TestResult {
-    let runtime = match Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => return TestResult::error(format!("failed to initialize runtime: {e}")),
-    };
-
-    match runtime.block_on(run_multiple_messages_queued_in_order()) {
+    match TEST_RUNTIME.block_on(run_multiple_messages_queued_in_order()) {
         Ok(()) => TestResult::passed(),
         Err(e) => TestResult::error(e.to_string()),
     }
@@ -578,16 +570,7 @@ fn test_permanent_errors_not_deferred() {
 }
 
 fn prop_permanent_errors_not_deferred(_: ()) -> TestResult {
-    let runtime = match Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => return TestResult::error(format!("failed to initialize runtime: {e}")),
-    };
-
-    match runtime.block_on(run_permanent_errors_not_deferred()) {
+    match TEST_RUNTIME.block_on(run_permanent_errors_not_deferred()) {
         Ok(()) => TestResult::passed(),
         Err(e) => TestResult::error(e.to_string()),
     }

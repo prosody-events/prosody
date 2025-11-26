@@ -11,12 +11,31 @@ use crossbeam_utils::CachePadded;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 use tokio::task;
 use tokio::time::{Instant, advance};
+
+/// Shared runtime for property tests that use real time.
+#[allow(clippy::expect_used)]
+static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .expect("Failed to create tokio runtime")
+});
+
+/// Shared runtime for property tests that use paused/mock time.
+#[allow(clippy::expect_used)]
+static PAUSED_TIME_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .expect("Failed to create paused tokio runtime")
+});
 
 /// A wrapper for a vector of Actions used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
@@ -28,11 +47,7 @@ struct Actions(Vec<Action>);
 /// * `actions` - An `Actions` instance containing the test actions.
 #[quickcheck]
 fn tracks_commit_watermark(actions: Actions) -> TestResult {
-    let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
-        return TestResult::error("failed to initialize runtime");
-    };
-
-    runtime.block_on(tracks_commit_watermark_impl(actions))
+    TEST_RUNTIME.block_on(tracks_commit_watermark_impl(actions))
 }
 
 /// Implements the test for verifying watermark tracking and committing.
@@ -144,15 +159,7 @@ struct StallTestCase {
 
 #[quickcheck]
 fn detects_stalls(test_case: StallTestCase) -> TestResult {
-    let Ok(runtime) = Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-    else {
-        return TestResult::error("failed to initialize runtime");
-    };
-
-    runtime.block_on(async {
+    PAUSED_TIME_RUNTIME.block_on(async {
         let StallTestCase {
             actions,
             stall_threshold,

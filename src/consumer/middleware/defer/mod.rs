@@ -1,4 +1,5 @@
 pub mod config;
+pub mod decider;
 pub mod error;
 pub mod failure_tracker;
 pub mod handler;
@@ -9,12 +10,10 @@ pub mod store;
 pub mod tests;
 
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
+pub use decider::{AlwaysDefer, DeferralDecider, NeverDefer, TraceBasedDecider};
 pub use error::DeferInitError;
 pub use handler::DeferMiddleware;
 pub use loader::MessageLoader;
-
-use crate::{Key, Partition, Topic};
-use uuid::Uuid;
 
 /// State of a key in the defer system.
 ///
@@ -29,35 +28,4 @@ pub enum DeferState {
         /// Current retry count for backoff calculation.
         retry_count: u32,
     },
-}
-
-/// Generates a deterministic `UUIDv5` for a deferred message key.
-///
-/// The UUID is generated from the consumer group, topic, partition, and message
-/// key, ensuring:
-/// - Same logical key always maps to the same Cassandra partition
-/// - Different consumer groups have isolated defer state
-/// - Different partitions have isolated defer state
-///
-/// # Arguments
-///
-/// * `consumer_group` - The Kafka consumer group name
-/// * `topic` - The Kafka topic
-/// * `partition` - The partition number
-/// * `key` - The message key
-///
-/// # Returns
-///
-/// A deterministic `UUIDv5` computed as:
-/// `UUIDv5(NAMESPACE_OID, "{consumer_group}:{topic}/{partition}:{key}")`
-#[must_use]
-pub fn generate_key_id(
-    consumer_group: &str,
-    topic: &Topic,
-    partition: Partition,
-    key: &Key,
-) -> Uuid {
-    let namespace = Uuid::NAMESPACE_OID;
-    let input = format!("{consumer_group}:{topic}/{partition}:{key}");
-    Uuid::new_v5(&namespace, input.as_bytes())
 }

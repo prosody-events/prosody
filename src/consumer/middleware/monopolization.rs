@@ -364,7 +364,7 @@ pub enum MonopolizationError<E> {
     /// A key has monopolized execution time.
     #[error(
         "Key '{key}' monopolized {percentage:.1}% of execution time over {} window \
-         (threshold: {threshold:.1}%).",
+         (threshold: {threshold:.1}%), preventing other keys from being processed efficiently.",
         format_duration(*.window)
     )]
     Monopolization {

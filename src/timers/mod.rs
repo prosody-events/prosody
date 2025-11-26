@@ -154,6 +154,22 @@ impl Trigger {
         }
     }
 
+    /// Create a test trigger with minimal dependencies.
+    ///
+    /// Creates a `Trigger` suitable for unit testing without requiring
+    /// complex span setup. Uses the current span context.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Entity key
+    /// * `time` - Execution time
+    /// * `timer_type` - Timer classification
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_testing(key: Key, time: CompactDateTime, timer_type: TimerType) -> Self {
+        Self::new(key, time, timer_type, Span::current())
+    }
+
     /// Returns the tracing span associated with this trigger.
     ///
     /// Returns the current span for tracing operations or span linking.

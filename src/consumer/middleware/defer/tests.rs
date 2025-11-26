@@ -8,6 +8,7 @@ use super::DeferState;
 use super::config::DeferConfiguration;
 use super::failure_tracker::FailureTracker;
 use super::store::DeferStore;
+use super::store::key_ref::DeferKeyRef;
 use super::store::memory::MemoryDeferStore;
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
@@ -446,84 +447,6 @@ mod defer_state_tests {
         let cloned = state.clone();
         assert_eq!(state, cloned);
     }
-
-    #[test]
-    fn test_generate_key_id_deterministic() {
-        use crate::consumer::middleware::defer::generate_key_id;
-
-        let consumer_group = "test-group";
-        let topic = Topic::from("test-topic");
-        let partition = Partition::from(0_i32);
-        let key: Key = Arc::from("test-key");
-
-        // Generate UUID twice - should be identical
-        let uuid1 = generate_key_id(consumer_group, &topic, partition, &key);
-        let uuid2 = generate_key_id(consumer_group, &topic, partition, &key);
-
-        assert_eq!(uuid1, uuid2, "UUIDs must be deterministic");
-    }
-
-    #[test]
-    fn test_generate_key_id_consumer_group_isolation() {
-        use crate::consumer::middleware::defer::generate_key_id;
-
-        let topic = Topic::from("test-topic");
-        let partition = Partition::from(0_i32);
-        let key: Key = Arc::from("test-key");
-
-        let uuid1 = generate_key_id("group-1", &topic, partition, &key);
-        let uuid2 = generate_key_id("group-2", &topic, partition, &key);
-
-        assert_ne!(
-            uuid1, uuid2,
-            "Different consumer groups must have different UUIDs"
-        );
-    }
-
-    #[test]
-    fn test_generate_key_id_partition_isolation() {
-        use crate::consumer::middleware::defer::generate_key_id;
-
-        let consumer_group = "test-group";
-        let topic = Topic::from("test-topic");
-        let key: Key = Arc::from("test-key");
-
-        let uuid1 = generate_key_id(consumer_group, &topic, Partition::from(0_i32), &key);
-        let uuid2 = generate_key_id(consumer_group, &topic, Partition::from(1_i32), &key);
-
-        assert_ne!(
-            uuid1, uuid2,
-            "Different partitions must have different UUIDs"
-        );
-    }
-
-    #[test]
-    fn test_generate_key_id_topic_isolation() {
-        use crate::consumer::middleware::defer::generate_key_id;
-
-        let consumer_group = "test-group";
-        let partition = Partition::from(0_i32);
-        let key: Key = Arc::from("test-key");
-
-        let uuid1 = generate_key_id(consumer_group, &Topic::from("topic-1"), partition, &key);
-        let uuid2 = generate_key_id(consumer_group, &Topic::from("topic-2"), partition, &key);
-
-        assert_ne!(uuid1, uuid2, "Different topics must have different UUIDs");
-    }
-
-    #[test]
-    fn test_generate_key_id_key_isolation() {
-        use crate::consumer::middleware::defer::generate_key_id;
-
-        let consumer_group = "test-group";
-        let topic = Topic::from("test-topic");
-        let partition = Partition::from(0_i32);
-
-        let uuid1 = generate_key_id(consumer_group, &topic, partition, &Arc::from("key-1"));
-        let uuid2 = generate_key_id(consumer_group, &topic, partition, &Arc::from("key-2"));
-
-        assert_ne!(uuid1, uuid2, "Different keys must have different UUIDs");
-    }
 }
 
 /// Property-based tests for defer middleware.
@@ -531,6 +454,17 @@ mod defer_state_tests {
 mod property_tests {
     use super::*;
     use quickcheck::quickcheck;
+    use std::sync::LazyLock;
+    use tokio::runtime::Runtime;
+
+    /// Shared runtime for property tests.
+    #[allow(clippy::expect_used)]
+    static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+    });
 
     /// Check if cache and store states are consistent for a key.
     fn verify_cache_store_consistency(
@@ -554,7 +488,7 @@ mod property_tests {
         store: &MemoryDeferStore,
         cache: &Cache<Key, DeferState>,
         key: &Key,
-        defer_key: &uuid::Uuid,
+        key_ref: &DeferKeyRef<'_>,
         op_byte: u8,
         retry_counts: &mut HashMap<Key, u32>,
     ) {
@@ -568,12 +502,10 @@ mod property_tests {
             && let Ok(retry_time) = now.add_duration(CompactDuration::new(60))
         {
             let _ = if retry_count == 0 {
-                store
-                    .defer_first_message(defer_key, offset, retry_time)
-                    .await
+                store.defer_first_message(key_ref, offset, retry_time).await
             } else {
                 store
-                    .defer_additional_message(defer_key, offset, retry_time)
+                    .defer_additional_message(key_ref, offset, retry_time)
                     .await
             };
             cache.insert(key.clone(), DeferState::Deferred { retry_count });
@@ -586,19 +518,19 @@ mod property_tests {
         store: &MemoryDeferStore,
         cache: &Cache<Key, DeferState>,
         key: &Key,
-        defer_key: &uuid::Uuid,
+        key_ref: &DeferKeyRef<'_>,
         retry_counts: &mut HashMap<Key, u32>,
     ) {
         if let Some(&current_retry_count) = retry_counts.get(key) {
             let new_retry_count = current_retry_count + 1;
             if store
-                .get_next_deferred_message(defer_key)
+                .get_next_deferred_message(key_ref)
                 .await
                 .ok()
                 .flatten()
                 .is_some()
             {
-                let _ = store.set_retry_count(defer_key, new_retry_count).await;
+                let _ = store.set_retry_count(key_ref, new_retry_count).await;
                 cache.insert(
                     key.clone(),
                     DeferState::Deferred {
@@ -615,13 +547,13 @@ mod property_tests {
         store: &MemoryDeferStore,
         cache: &Cache<Key, DeferState>,
         key: &Key,
-        defer_key: &uuid::Uuid,
+        key_ref: &DeferKeyRef<'_>,
         retry_counts: &mut HashMap<Key, u32>,
     ) {
-        if let Ok(Some((offset, _))) = store.get_next_deferred_message(defer_key).await {
-            let _ = store.remove_deferred_message(defer_key, offset).await;
+        if let Ok(Some((offset, _))) = store.get_next_deferred_message(key_ref).await {
+            let _ = store.remove_deferred_message(key_ref, offset).await;
             if store
-                .get_next_deferred_message(defer_key)
+                .get_next_deferred_message(key_ref)
                 .await
                 .ok()
                 .flatten()
@@ -644,18 +576,12 @@ mod property_tests {
     /// performs without requiring full `ConsumerMessage` construction.
     #[test]
     fn prop_defer_cache_store_consistency() {
-        use crate::consumer::middleware::defer::generate_key_id;
-        use tokio::runtime::Runtime;
-
         #[allow(clippy::needless_pass_by_value)]
         fn test(keys: Vec<u8>, operations: Vec<u8>) -> bool {
             let keys = &keys;
             let operations = &operations;
 
-            let Ok(rt) = Runtime::new() else {
-                return false;
-            };
-            rt.block_on(async {
+            TEST_RUNTIME.block_on(async {
                 let store = MemoryDeferStore::new();
                 let cache: Cache<Key, DeferState> = Cache::new(100);
                 let consumer_group = "test-group";
@@ -672,23 +598,33 @@ mod property_tests {
                 for &op_byte in operations {
                     let key_idx = usize::from(op_byte) % test_keys.len();
                     let key = &test_keys[key_idx];
-                    let key_id = generate_key_id(consumer_group, &topic, partition, key);
+                    let key_ref = DeferKeyRef::new(consumer_group, topic, partition, key);
 
                     match op_byte % 3 {
                         0 => {
-                            handle_append(&store, &cache, key, &key_id, op_byte, &mut retry_counts)
-                                .await;
+                            handle_append(
+                                &store,
+                                &cache,
+                                key,
+                                &key_ref,
+                                op_byte,
+                                &mut retry_counts,
+                            )
+                            .await;
                         }
                         1 => {
-                            handle_increment(&store, &cache, key, &key_id, &mut retry_counts).await;
+                            handle_increment(&store, &cache, key, &key_ref, &mut retry_counts)
+                                .await;
                         }
-                        2 => handle_delete(&store, &cache, key, &key_id, &mut retry_counts).await,
+                        2 => {
+                            handle_delete(&store, &cache, key, &key_ref, &mut retry_counts).await;
+                        }
                         _ => {}
                     }
 
                     let cache_state = cache.get(key);
                     let store_state = store
-                        .get_next_deferred_message(&key_id)
+                        .get_next_deferred_message(&key_ref)
                         .await
                         .ok()
                         .flatten();
@@ -698,10 +634,10 @@ mod property_tests {
                 }
 
                 for key in &test_keys {
-                    let key_id = generate_key_id(consumer_group, &topic, partition, key);
+                    let key_ref = DeferKeyRef::new(consumer_group, topic, partition, key);
                     let cache_state = cache.get(key);
                     let store_state = store
-                        .get_next_deferred_message(&key_id)
+                        .get_next_deferred_message(&key_ref)
                         .await
                         .ok()
                         .flatten();
@@ -750,12 +686,7 @@ mod property_tests {
         use quickcheck::TestResult;
 
         fn test(success_count: u8, failure_count: u8, threshold_pct: u8) -> TestResult {
-            let runtime = match Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
-            runtime.block_on(async {
+            TEST_RUNTIME.block_on(async {
                 use crate::consumer::DemandType;
                 use crate::heartbeat::HeartbeatRegistry;
                 use crate::telemetry::Telemetry;
@@ -808,23 +739,18 @@ mod property_tests {
     /// Verify store operations maintain consistency.
     #[test]
     fn prop_store_consistency() {
-        use crate::consumer::middleware::defer::generate_key_id;
         use crate::timers::datetime::CompactDateTime;
         use crate::timers::duration::CompactDuration;
-        use tokio::runtime::Runtime;
 
         #[allow(clippy::needless_pass_by_value)]
         fn test(operations: Vec<StoreOp>) -> bool {
-            let Ok(rt) = Runtime::new() else {
-                return false;
-            };
-            rt.block_on(async {
+            TEST_RUNTIME.block_on(async {
                 let store = MemoryDeferStore::new();
                 let consumer_group = "test-group";
                 let key: Key = Arc::from("test-key");
                 let topic = Topic::from("test-topic");
                 let partition = Partition::from(0_i32);
-                let key_id = generate_key_id(consumer_group, &topic, partition, &key);
+                let key_ref = DeferKeyRef::new(consumer_group, topic, partition, &key);
 
                 for (i, op) in operations.iter().enumerate() {
                     let offset = Offset::from(i as i64);
@@ -834,18 +760,19 @@ mod property_tests {
                             if let Ok(now) = CompactDateTime::now()
                                 && let Ok(retry_time) = now.add_duration(CompactDuration::new(60))
                             {
-                                let _ =
-                                    store.defer_first_message(&key_id, offset, retry_time).await;
+                                let _ = store
+                                    .defer_first_message(&key_ref, offset, retry_time)
+                                    .await;
                             }
                         }
                         StoreOp::Get => {
-                            let _ = store.get_next_deferred_message(&key_id).await;
+                            let _ = store.get_next_deferred_message(&key_ref).await;
                         }
                         StoreOp::Remove => {
                             if let Ok(Some((offset, _))) =
-                                store.get_next_deferred_message(&key_id).await
+                                store.get_next_deferred_message(&key_ref).await
                             {
-                                let _ = store.remove_deferred_message(&key_id, offset).await;
+                                let _ = store.remove_deferred_message(&key_ref, offset).await;
                             }
                         }
                     }
@@ -911,3 +838,26 @@ mod property_tests {
 // provides strong confidence in correctness. The enhanced TestHandler above
 // (with call tracking and flexible behavior) enables future integration
 // tests when needed.
+
+// Trace-based property test infrastructure
+mod context;
+mod generator;
+mod harness;
+mod properties;
+mod types;
+
+use std::sync::LazyLock;
+use tokio::runtime::Runtime;
+
+/// Shared multi-threaded runtime for all defer property tests.
+///
+/// Using a static runtime avoids the overhead of creating a new runtime for
+/// each `QuickCheck` iteration. Multi-threaded to support concurrent test
+/// execution.
+#[allow(clippy::expect_used)]
+pub(crate) static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .expect("Failed to create tokio runtime")
+});

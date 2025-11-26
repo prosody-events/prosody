@@ -10,7 +10,7 @@ use super::config::DeferConfiguration;
 use super::error::{DeferError, DeferInitError};
 use super::failure_tracker::FailureTracker;
 use super::loader::{KafkaLoader, MessageLoader};
-use super::store::{CachedDeferStore, DeferStore, RetryCompletionResult};
+use super::store::{CachedDeferStore, DeferKeyRef, DeferStore, RetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::middleware::scheduler::SchedulerConfiguration;
@@ -47,6 +47,20 @@ where
     store: S,
     failure_tracker: FailureTracker,
     consumer_group: Arc<str>,
+}
+
+impl<S, L> DeferMiddleware<S, L>
+where
+    S: DeferStore,
+    L: MessageLoader,
+{
+    /// Returns a reference to the failure tracker.
+    ///
+    /// Useful for testing and monitoring.
+    #[must_use]
+    pub fn failure_tracker(&self) -> &FailureTracker {
+        &self.failure_tracker
+    }
 }
 
 impl<S> DeferMiddleware<S, KafkaLoader>
@@ -281,12 +295,12 @@ where
     /// otherwise.
     async fn check_defer_state(
         &self,
-        defer_key: &uuid::Uuid,
+        key_ref: &DeferKeyRef<'_>,
     ) -> Result<Option<DeferState>, DeferError<S::Error, T::Error, L::Error>> {
         // Query store (cached internally by CachedDeferStore)
         let retry_count = self
             .store
-            .is_deferred(defer_key)
+            .is_deferred(key_ref)
             .await
             .map_err(DeferError::Store)?;
 
@@ -299,7 +313,7 @@ where
     async fn handle_deferred_key_message(
         &self,
         message_key: &Key,
-        defer_key: &uuid::Uuid,
+        key_ref: &DeferKeyRef<'_>,
         offset: crate::Offset,
         retry_count: u32,
     ) -> Result<(), DeferError<S::Error, T::Error, L::Error>> {
@@ -312,7 +326,7 @@ where
 
         // Append to deferred queue (doesn't modify retry_count)
         self.store
-            .defer_additional_message(defer_key, offset, expected_retry_time)
+            .defer_additional_message(key_ref, offset, expected_retry_time)
             .await
             .map_err(DeferError::Store)?;
 
@@ -385,7 +399,7 @@ where
         &self,
         context: &C,
         message_key: &Key,
-        defer_key: &uuid::Uuid,
+        key_ref: &DeferKeyRef<'_>,
         offset: crate::Offset,
         retry_count: u32,
     ) -> Result<(), DeferError<S::Error, T::Error, L::Error>>
@@ -395,7 +409,7 @@ where
         // Complete successful retry and prepare for next message or cleanup
         let result = self
             .store
-            .complete_retry_success(defer_key, offset)
+            .complete_retry_success(key_ref, offset)
             .await
             .map_err(DeferError::Store)?;
 
@@ -431,7 +445,7 @@ where
         &self,
         context: &C,
         message_key: &Key,
-        defer_key: &uuid::Uuid,
+        key_ref: &DeferKeyRef<'_>,
         offset: crate::Offset,
         retry_count: u32,
         error: T::Error,
@@ -449,7 +463,7 @@ where
                 debug!("Deferral disabled due to high failure rate");
                 // Clean up this offset and propagate error
                 self.store
-                    .remove_deferred_message(defer_key, offset)
+                    .remove_deferred_message(key_ref, offset)
                     .await
                     .map_err(DeferError::Store)?;
                 return Err(DeferError::Configuration(ConfigurationError::Invalid(
@@ -460,7 +474,7 @@ where
             // Increment retry count (cache updated by CachedDeferStore)
             let new_retry_count = self
                 .store
-                .increment_retry_count(defer_key, retry_count)
+                .increment_retry_count(key_ref, retry_count)
                 .await
                 .map_err(DeferError::Store)?;
 
@@ -477,7 +491,7 @@ where
             // Transient or terminal error - clean up and propagate
             // (cache invalidated by CachedDeferStore)
             self.store
-                .remove_deferred_message(defer_key, offset)
+                .remove_deferred_message(key_ref, offset)
                 .await
                 .map_err(DeferError::Store)?;
             Err(DeferError::Handler(error))
@@ -499,13 +513,12 @@ where
     where
         C: EventContext,
     {
-        use crate::consumer::middleware::defer::generate_key_id;
         use crate::timers::datetime::CompactDateTime;
 
-        // Generate UUID for this key
-        let defer_key = generate_key_id(
+        // Create key reference for store operations
+        let key_ref = DeferKeyRef::new(
             self.consumer_group.as_ref(),
-            &self.topic,
+            self.topic,
             self.partition,
             message_key,
         );
@@ -514,7 +527,7 @@ where
         // (cached internally by CachedDeferStore)
         let retry_count = self
             .store
-            .is_deferred(&defer_key)
+            .is_deferred(&key_ref)
             .await
             .map_err(DeferError::Store)?
             .unwrap_or(0); // If not deferred, this is the first failure (retry_count = 0)
@@ -549,13 +562,13 @@ where
         if retry_count == 0 {
             // First failure - initialize with retry_count=0
             self.store
-                .defer_first_message(&defer_key, message.offset(), expected_retry_time)
+                .defer_first_message(&key_ref, message.offset(), expected_retry_time)
                 .await
                 .map_err(DeferError::Store)?;
         } else {
             // Additional message for already-deferred key
             self.store
-                .defer_additional_message(&defer_key, message.offset(), expected_retry_time)
+                .defer_additional_message(&key_ref, message.offset(), expected_retry_time)
                 .await
                 .map_err(DeferError::Store)?;
         }
@@ -590,28 +603,22 @@ where
     {
         use super::error::ConfigurationError;
         use crate::consumer::Keyed;
-        use crate::consumer::middleware::defer::generate_key_id;
 
         let message_key = message.key().clone();
-        let defer_key = generate_key_id(
+        let key_ref = DeferKeyRef::new(
             self.consumer_group.as_ref(),
-            &self.topic,
+            self.topic,
             self.partition,
             &message_key,
         );
 
         // Check if this key is already deferred
-        let defer_state = self.check_defer_state(&defer_key).await?;
+        let defer_state = self.check_defer_state(&key_ref).await?;
 
         // If key is already deferred, append this message to the queue
         if let Some(DeferState::Deferred { retry_count }) = defer_state {
             return self
-                .handle_deferred_key_message(
-                    &message_key,
-                    &defer_key,
-                    message.offset(),
-                    retry_count,
-                )
+                .handle_deferred_key_message(&message_key, &key_ref, message.offset(), retry_count)
                 .await;
         }
 
@@ -654,7 +661,6 @@ where
         C: EventContext,
     {
         use crate::consumer::Keyed;
-        use crate::consumer::middleware::defer::generate_key_id;
 
         // Check if this is a defer retry timer
         if trigger.timer_type != TimerType::DeferRetry {
@@ -669,16 +675,16 @@ where
         // This is a defer retry timer - load and retry the deferred message
         let message_key = &trigger.key;
 
-        // Generate UUID for this key
-        let defer_key = generate_key_id(
+        // Create key reference for store operations
+        let key_ref = DeferKeyRef::new(
             self.consumer_group.as_ref(),
-            &self.topic,
+            self.topic,
             self.partition,
             message_key,
         );
 
         // Get the next deferred message for this key
-        let (offset, retry_count) = match self.store.get_next_deferred_message(&defer_key).await {
+        let (offset, retry_count) = match self.store.get_next_deferred_message(&key_ref).await {
             Ok(Some(result)) => result,
             Ok(None) => {
                 // No deferred message found - possibly already succeeded or expired
@@ -707,7 +713,7 @@ where
             // Clean up this offset from the deferred queue
             // (cache invalidated by CachedDeferStore)
             self.store
-                .remove_deferred_message(&defer_key, offset)
+                .remove_deferred_message(&key_ref, offset)
                 .await
                 .map_err(DeferError::Store)?;
             return Ok(());
@@ -720,14 +726,14 @@ where
             .await
         {
             Ok(()) => {
-                self.handle_retry_success(&context, message_key, &defer_key, offset, retry_count)
+                self.handle_retry_success(&context, message_key, &key_ref, offset, retry_count)
                     .await
             }
             Err(error) => {
                 self.handle_retry_failure(
                     &context,
                     message_key,
-                    &defer_key,
+                    &key_ref,
                     offset,
                     retry_count,
                     error,

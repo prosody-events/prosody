@@ -226,8 +226,18 @@ macro_rules! trigger_store_tests {
         mod tests {
             use super::*;
             use quickcheck::{QuickCheck, TestResult};
-            use tokio::runtime::Builder;
+            use std::sync::LazyLock;
+            use tokio::runtime::{Builder, Runtime};
             use $crate::timers::store::tests;
+
+            /// Shared runtime for property tests.
+            #[allow(clippy::expect_used)]
+            static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+                Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime")
+            });
 
             trigger_store_tests!(@test_functions_default);
             trigger_store_tests!(@prop_functions, $operations_type, $operations_constructor, $store_type, $store_constructor);
@@ -240,8 +250,18 @@ macro_rules! trigger_store_tests {
         mod tests {
             use super::*;
             use quickcheck::{QuickCheck, TestResult};
-            use tokio::runtime::Builder;
+            use std::sync::LazyLock;
+            use tokio::runtime::{Builder, Runtime};
             use $crate::timers::store::tests;
+
+            /// Shared runtime for property tests.
+            #[allow(clippy::expect_used)]
+            static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+                Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime")
+            });
 
             trigger_store_tests!(@test_functions, $test_count);
             trigger_store_tests!(@prop_functions, $operations_type, $operations_constructor, $store_type, $store_constructor);
@@ -472,21 +492,15 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create operations instance with the test's slab_size
             let slab_size = input.slab_size;
-            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
+            let operations = match TEST_RUNTIME.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
 
-            // Call the async test function within the same runtime
-            match runtime.block_on(async { prop_segment_model_equivalence(&operations, input).await }.instrument(span)) {
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_segment_model_equivalence(&operations, input).await }.instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(format!("{e:?}")),
             }
@@ -501,21 +515,15 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create operations instance with the test's slab_size
             let slab_size = input.slab_size;
-            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
+            let operations = match TEST_RUNTIME.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
 
-            // Call the async test function within the same runtime
-            match runtime.block_on(async { prop_slab_metadata_model_equivalence(&operations, input).await }.instrument(span)) {
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_slab_metadata_model_equivalence(&operations, input).await }.instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(format!("{e:?}")),
             }
@@ -530,21 +538,15 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create operations instance with the test's slab_size
             let slab_size = input.slab_size;
-            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
+            let operations = match TEST_RUNTIME.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
 
-            // Call the async test function within the same runtime
-            match runtime.block_on(async { prop_slab_trigger_model_equivalence(&operations, input).await }.instrument(span)) {
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_slab_trigger_model_equivalence(&operations, input).await }.instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(format!("{e:?}")),
             }
@@ -559,21 +561,15 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create operations instance with the test's slab_size
             let slab_size = input.slab_size;
-            let operations = match runtime.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
+            let operations = match TEST_RUNTIME.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(ops) => ops,
                 Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
             };
 
-            // Call the async test function within the same runtime
-            match runtime.block_on(async { prop_key_trigger_model_equivalence(&operations, input).await }.instrument(span)) {
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_key_trigger_model_equivalence(&operations, input).await }.instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(format!("{e:?}")),
             }
@@ -588,21 +584,15 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create store instance with the test's slab_size
             let slab_size = input.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            // Call the async test function within the same runtime
-            match runtime.block_on(async { prop_high_level_dual_index_consistency(&store, input).await }.instrument(span)) {
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_high_level_dual_index_consistency(&store, input).await }.instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(format!("{e:?}")),
             }
@@ -614,20 +604,14 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create store instance with segment's slab_size
             let slab_size = segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(tests::slabs::test_get_slab_range(&store, &segment).instrument(span)) {
+            match TEST_RUNTIME.block_on(tests::slabs::test_get_slab_range(&store, &segment).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
@@ -643,20 +627,14 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create store instance with segment's slab_size
             let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(tests::trigger_operations::test_trigger_operations(
+            match TEST_RUNTIME.block_on(tests::trigger_operations::test_trigger_operations(
                 &store, &input,
             ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
@@ -674,20 +652,14 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create store instance with segment's slab_size
             let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
+            match TEST_RUNTIME.block_on(tests::trigger_consistency::test_trigger_consistency(
                 &store, &input,
             ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
@@ -701,20 +673,14 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create store instance with segment's slab_size
             let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(tests::trigger_operations::test_operation_sequences(
+            match TEST_RUNTIME.block_on(tests::trigger_operations::test_operation_sequences(
                 &store, &input,
             ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
@@ -728,20 +694,14 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create store instance with segment's slab_size
             let slab_size = segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(tests::cross_slab::test_cross_slab_operations(
+            match TEST_RUNTIME.block_on(tests::cross_slab::test_cross_slab_operations(
                 &store, &segment,
             ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
@@ -755,20 +715,14 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create store instance with segment's slab_size
             let slab_size = segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(tests::contention::test_key_contention(&store, &segment).instrument(span)) {
+            match TEST_RUNTIME.block_on(tests::contention::test_key_contention(&store, &segment).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
@@ -784,20 +738,14 @@ macro_rules! trigger_store_tests {
             // Capture the current span to propagate into async runtime
             let span = tracing::Span::current();
 
-            // Create runtime for this test invocation
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
-            };
-
             // Create store instance with segment's slab_size
             let slab_size = input.segment.slab_size;
-            let store = match runtime.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
                 Ok(s) => s,
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
-            match runtime.block_on(
+            match TEST_RUNTIME.block_on(
                 tests::sequential_interleavings::test_sequential_interleavings(&store, &input).instrument(span),
             ) {
                 Ok(()) => TestResult::passed(),

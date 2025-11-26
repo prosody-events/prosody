@@ -6,8 +6,8 @@
 //! and complete message processing.
 
 use std::cmp::max;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::consumer::Keyed;
@@ -18,9 +18,18 @@ use futures::stream::iter;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use scc::{HashMap, HashSet};
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 use tokio::time::sleep;
+
+/// Shared runtime for property tests.
+#[allow(clippy::expect_used)]
+static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .expect("Failed to create tokio runtime")
+});
 
 /// A sequence of messages with keys and values for testing.
 #[derive(Clone, Debug)]
@@ -43,11 +52,7 @@ struct SimpleMessages(Vec<u8>);
 /// A `TestResult` indicating whether the test passed or failed.
 #[quickcheck]
 fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8) -> TestResult {
-    let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
-        return TestResult::error("failed to initialize runtime");
-    };
-
-    runtime.block_on(prevents_concurrent_key_execution_impl(
+    TEST_RUNTIME.block_on(prevents_concurrent_key_execution_impl(
         messages,
         max_enqueued,
     ))
@@ -65,11 +70,7 @@ fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8)
 /// A `TestResult` indicating whether the test passed or failed.
 #[quickcheck]
 fn processes_messages_in_order(messages: Messages, max_enqueued: u8) -> TestResult {
-    let Ok(runtime) = Builder::new_multi_thread().enable_time().build() else {
-        return TestResult::error("failed to initialize runtime");
-    };
-
-    runtime.block_on(processes_messages_in_order_impl(messages, max_enqueued))
+    TEST_RUNTIME.block_on(processes_messages_in_order_impl(messages, max_enqueued))
 }
 
 /// Implements the test for preventing concurrent execution of messages with the

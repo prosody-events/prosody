@@ -3,26 +3,70 @@
 //! Tests the `DeferStore` trait using a simple reference model to verify
 //! correctness across both memory and Cassandra implementations.
 
-use crate::Offset;
+use crate::consumer::middleware::defer::store::key_ref::DeferKeyRef;
 use crate::consumer::middleware::defer::store::{DeferStore, RetryCompletionResult};
 use crate::timers::datetime::CompactDateTime;
+use crate::{Key, Offset, Partition, Topic};
 use ahash::HashMap;
+use color_eyre::eyre::Report;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
+use std::sync::Arc;
 use uuid::Uuid;
 
+/// Test helper holding owned key component data.
+///
+/// Allows creating `DeferKeyRef` instances that borrow from this struct.
+/// Each unique combination of components produces a unique UUID via
+/// `Uuid::from(&DeferKeyRef)`.
+#[derive(Clone, Debug)]
+pub struct TestKeyComponents {
+    /// Consumer group for state isolation.
+    pub consumer_group: String,
+    /// Kafka topic.
+    pub topic: Topic,
+    /// Kafka partition.
+    pub partition: Partition,
+    /// Message key (business key for ordering).
+    pub key: Key,
+}
+
+impl TestKeyComponents {
+    /// Creates test key components with the given index for uniqueness.
+    fn new(index: usize) -> Self {
+        Self {
+            consumer_group: "test-group".to_owned(),
+            topic: Topic::from("test-topic"),
+            partition: Partition::from(0_i32),
+            key: Arc::from(format!("test-key-{index}")),
+        }
+    }
+
+    /// Returns a `DeferKeyRef` borrowing from this struct.
+    fn key_ref(&self) -> DeferKeyRef<'_> {
+        DeferKeyRef::new(&self.consumer_group, self.topic, self.partition, &self.key)
+    }
+
+    /// Returns the UUID for this key (computed via `DeferKeyRef`).
+    fn uuid(&self) -> Uuid {
+        Uuid::from(&self.key_ref())
+    }
+}
+
 /// Operations that can be performed on the defer store.
+///
+/// Operations reference keys by index into `DeferTestInput.key_components`.
 #[derive(Clone, Debug)]
 pub enum DeferOperation {
     /// Get the next deferred message for a key.
-    GetNext(Uuid),
+    GetNext(usize),
     /// Check if a key is deferred.
-    IsDeferred(Uuid),
+    IsDeferred(usize),
     /// Defer first message for a key (compound operation).
     DeferFirst {
-        /// Key ID.
-        defer_key: Uuid,
+        /// Index into `key_components`.
+        key_index: usize,
         /// Offset to defer.
         offset: Offset,
         /// Expected retry time (for TTL).
@@ -31,8 +75,8 @@ pub enum DeferOperation {
     /// Defer additional message for an already-deferred key (compound
     /// operation).
     DeferAdditional {
-        /// Key ID.
-        defer_key: Uuid,
+        /// Index into `key_components`.
+        key_index: usize,
         /// Offset to defer.
         offset: Offset,
         /// Expected retry time (for TTL).
@@ -40,22 +84,22 @@ pub enum DeferOperation {
     },
     /// Complete successful retry (compound operation).
     CompleteRetrySuccess {
-        /// Key ID.
-        defer_key: Uuid,
+        /// Index into `key_components`.
+        key_index: usize,
         /// Offset that was successfully retried.
         offset: Offset,
     },
     /// Increment retry count (compound operation).
     IncrementRetryCount {
-        /// Key ID.
-        defer_key: Uuid,
+        /// Index into `key_components`.
+        key_index: usize,
         /// Current retry count.
         current_retry_count: u32,
     },
     /// Append a new offset for a key (primitive operation).
     Append {
-        /// Key ID.
-        defer_key: Uuid,
+        /// Index into `key_components`.
+        key_index: usize,
         /// Offset to append.
         offset: Offset,
         /// Expected retry time (for TTL).
@@ -63,48 +107,49 @@ pub enum DeferOperation {
     },
     /// Remove an offset for a key (primitive operation).
     Remove {
-        /// Key ID.
-        defer_key: Uuid,
+        /// Index into `key_components`.
+        key_index: usize,
         /// Offset to remove.
         offset: Offset,
     },
     /// Set retry count for a key (hidden primitive operation).
     SetRetryCount {
-        /// Key ID.
-        defer_key: Uuid,
+        /// Index into `key_components`.
+        key_index: usize,
         /// New retry count.
         retry_count: u32,
     },
     /// Delete all data for a key (hidden primitive operation).
-    DeleteKey(Uuid),
+    DeleteKey(usize),
 }
 
-/// Test input containing isolated key IDs and operations.
+/// Test input containing isolated key components and operations.
 #[derive(Clone, Debug)]
 pub struct DeferTestInput {
-    /// Pool of key IDs used by operations in this trial.
-    pub defer_keys: Vec<Uuid>,
+    /// Pool of key components used by operations in this trial.
+    /// Operations reference these by index.
+    pub key_components: Vec<TestKeyComponents>,
     /// Sequence of operations to apply.
     pub operations: Vec<DeferOperation>,
 }
 
 impl Arbitrary for DeferTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate 3-5 random UUIDs unique to this trial
+        // Generate 3-5 unique key components for this trial
         let key_count = (usize::arbitrary(g) % 3) + 3;
-        let defer_keys: Vec<Uuid> = (0..key_count).map(|_| Uuid::new_v4()).collect();
+        let key_components: Vec<TestKeyComponents> =
+            (0..key_count).map(TestKeyComponents::new).collect();
 
         // Generate 20-50 operations using these keys
         let op_count = (usize::arbitrary(g) % 30) + 20;
         let mut operations = Vec::with_capacity(op_count);
 
-        // Track which keys have had DeferFirst called to avoid calling it multiple
-        // times
-        let mut deferred_keys = HashSet::new();
+        // Track which key indices have had DeferFirst called to avoid calling it
+        // multiple times
+        let mut deferred_indices = HashSet::new();
 
         for _ in 0..op_count {
-            let idx = usize::arbitrary(g) % defer_keys.len();
-            let defer_key = defer_keys[idx];
+            let key_index = usize::arbitrary(g) % key_components.len();
 
             // Helper to generate offset and retry time
             let offset = Offset::from(i64::from(u32::arbitrary(g)));
@@ -116,17 +161,17 @@ impl Arbitrary for DeferTestInput {
                 // Compound operations (60%)
                 0..=14 => {
                     // DeferFirst (15%) - only if not already deferred
-                    if deferred_keys.contains(&defer_key) {
+                    if deferred_indices.contains(&key_index) {
                         // Use DeferAdditional instead
                         DeferOperation::DeferAdditional {
-                            defer_key,
+                            key_index,
                             offset,
                             expected_retry_time,
                         }
                     } else {
-                        deferred_keys.insert(defer_key);
+                        deferred_indices.insert(key_index);
                         DeferOperation::DeferFirst {
-                            defer_key,
+                            key_index,
                             offset,
                             expected_retry_time,
                         }
@@ -135,20 +180,20 @@ impl Arbitrary for DeferTestInput {
                 15..=29 => {
                     // DeferAdditional (15%)
                     DeferOperation::DeferAdditional {
-                        defer_key,
+                        key_index,
                         offset,
                         expected_retry_time,
                     }
                 }
                 30..=44 => {
                     // CompleteRetrySuccess (15%)
-                    DeferOperation::CompleteRetrySuccess { defer_key, offset }
+                    DeferOperation::CompleteRetrySuccess { key_index, offset }
                 }
                 45..=59 => {
                     // IncrementRetryCount (15%)
                     let current_retry_count = u32::arbitrary(g) % 10;
                     DeferOperation::IncrementRetryCount {
-                        defer_key,
+                        key_index,
                         current_retry_count,
                     }
                 }
@@ -156,45 +201,45 @@ impl Arbitrary for DeferTestInput {
                 // Queries (20%)
                 60..=69 => {
                     // GetNext (10%)
-                    DeferOperation::GetNext(defer_key)
+                    DeferOperation::GetNext(key_index)
                 }
                 70..=79 => {
                     // IsDeferred (10%)
-                    DeferOperation::IsDeferred(defer_key)
+                    DeferOperation::IsDeferred(key_index)
                 }
 
                 // Primitive operations (20%)
                 80..=84 => {
                     // Append (5%)
                     DeferOperation::Append {
-                        defer_key,
+                        key_index,
                         offset,
                         expected_retry_time,
                     }
                 }
                 85..=89 => {
                     // Remove (5%)
-                    DeferOperation::Remove { defer_key, offset }
+                    DeferOperation::Remove { key_index, offset }
                 }
                 90..=94 => {
                     // SetRetryCount (5%)
                     let retry_count = u32::arbitrary(g) % 20;
                     DeferOperation::SetRetryCount {
-                        defer_key,
+                        key_index,
                         retry_count,
                     }
                 }
                 _ => {
-                    // DeleteKey (5%) - clear from deferred_keys
-                    deferred_keys.remove(&defer_key);
-                    DeferOperation::DeleteKey(defer_key)
+                    // DeleteKey (5%) - clear from deferred_indices
+                    deferred_indices.remove(&key_index);
+                    DeferOperation::DeleteKey(key_index)
                 }
             };
             operations.push(op);
         }
 
         Self {
-            defer_keys,
+            key_components,
             operations,
         }
     }
@@ -238,43 +283,48 @@ impl DeferModel {
     }
 
     /// Applies an operation to the model.
-    pub fn apply(&mut self, op: &DeferOperation) {
+    ///
+    /// Requires `key_components` to resolve key indices to UUIDs.
+    pub fn apply(&mut self, op: &DeferOperation, key_components: &[TestKeyComponents]) {
         match op {
             // Queries don't modify state
             DeferOperation::GetNext(_) | DeferOperation::IsDeferred(_) => {}
 
             // Compound operations
             DeferOperation::DeferFirst {
-                defer_key, offset, ..
+                key_index, offset, ..
             } => {
+                let defer_key = key_components[*key_index].uuid();
                 // Set retry_count=0 and append offset
                 // Note: Does NOT delete existing offsets (Cassandra INSERT behavior)
                 let entry = self
                     .keys
-                    .entry(*defer_key)
+                    .entry(defer_key)
                     .or_insert_with(|| (BTreeSet::new(), None));
                 entry.0.insert(*offset);
                 entry.1 = Some(0);
             }
             DeferOperation::DeferAdditional {
-                defer_key, offset, ..
+                key_index, offset, ..
             } => {
+                let defer_key = key_components[*key_index].uuid();
                 // Append offset without modifying retry_count
-                let entry = self.keys.entry(*defer_key).or_insert_with(|| {
+                let entry = self.keys.entry(defer_key).or_insert_with(|| {
                     // Shouldn't happen (should use DeferFirst first), but handle gracefully
                     (BTreeSet::new(), Some(0))
                 });
                 entry.0.insert(*offset);
             }
-            DeferOperation::CompleteRetrySuccess { defer_key, offset } => {
-                if let Some(entry) = self.keys.get_mut(defer_key) {
+            DeferOperation::CompleteRetrySuccess { key_index, offset } => {
+                let defer_key = key_components[*key_index].uuid();
+                if let Some(entry) = self.keys.get_mut(&defer_key) {
                     // Remove the offset
                     entry.0.remove(offset);
 
                     // Check if more messages exist
                     if entry.0.is_empty() {
                         // No more messages - delete entire key
-                        self.keys.remove(defer_key);
+                        self.keys.remove(&defer_key);
                     } else {
                         // More messages exist - reset retry_count to 0
                         entry.1 = Some(0);
@@ -282,48 +332,53 @@ impl DeferModel {
                 }
             }
             DeferOperation::IncrementRetryCount {
-                defer_key,
+                key_index,
                 current_retry_count,
             } => {
+                let defer_key = key_components[*key_index].uuid();
                 // Increment retry count (saturating_add)
                 // Note: Creates partition if doesn't exist (via set_retry_count)
                 let new_count = current_retry_count.saturating_add(1);
                 let entry = self
                     .keys
-                    .entry(*defer_key)
+                    .entry(defer_key)
                     .or_insert_with(|| (BTreeSet::new(), None));
                 entry.1 = Some(new_count);
             }
 
             // Primitive operations
             DeferOperation::Append {
-                defer_key, offset, ..
+                key_index, offset, ..
             } => {
-                let entry = self.keys.entry(*defer_key).or_insert_with(|| {
+                let defer_key = key_components[*key_index].uuid();
+                let entry = self.keys.entry(defer_key).or_insert_with(|| {
                     // When creating a new key, retry_count defaults to None (NULL in Cassandra)
                     (BTreeSet::new(), None)
                 });
                 entry.0.insert(*offset);
             }
-            DeferOperation::Remove { defer_key, offset } => {
-                if let Some(entry) = self.keys.get_mut(defer_key) {
+            DeferOperation::Remove { key_index, offset } => {
+                let defer_key = key_components[*key_index].uuid();
+                if let Some(entry) = self.keys.get_mut(&defer_key) {
                     entry.0.remove(offset);
                 }
             }
             DeferOperation::SetRetryCount {
-                defer_key,
+                key_index,
                 retry_count,
             } => {
+                let defer_key = key_components[*key_index].uuid();
                 // Match Cassandra: UPDATE creates partition with static column even if no
                 // offsets exist
                 let entry = self
                     .keys
-                    .entry(*defer_key)
+                    .entry(defer_key)
                     .or_insert_with(|| (BTreeSet::new(), None));
                 entry.1 = Some(*retry_count);
             }
-            DeferOperation::DeleteKey(defer_key) => {
-                self.keys.remove(defer_key);
+            DeferOperation::DeleteKey(key_index) => {
+                let defer_key = key_components[*key_index].uuid();
+                self.keys.remove(&defer_key);
             }
         }
     }
@@ -364,7 +419,7 @@ impl DeferModel {
     }
 }
 
-/// Verifies that model and store are equivalent for all key IDs.
+/// Verifies that model and store are equivalent for all key components.
 async fn verify_final_state<S>(
     store: &S,
     model: &DeferModel,
@@ -377,10 +432,13 @@ where
     // Check ALL keys used in operations, not just those in model
     // This catches Cassandra partitions with only static columns set (from
     // SetRetryCount)
-    for defer_key in &input.defer_keys {
-        let model_result = model.get_next(defer_key);
+    for key_comp in &input.key_components {
+        let defer_key = key_comp.uuid();
+        let key_ref = key_comp.key_ref();
+
+        let model_result = model.get_next(&defer_key);
         let store_result = store
-            .get_next_deferred_message(defer_key)
+            .get_next_deferred_message(&key_ref)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Get next failed: {e:?}"))?;
 
@@ -461,16 +519,21 @@ async fn apply_query_operation<S>(
     model: &DeferModel,
     op: &DeferOperation,
     op_idx: usize,
+    key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
     S: DeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     match op {
-        DeferOperation::GetNext(defer_key) => {
-            let expected = model.get_next(defer_key);
+        DeferOperation::GetNext(key_index) => {
+            let key_comp = &key_components[*key_index];
+            let defer_key = key_comp.uuid();
+            let key_ref = key_comp.key_ref();
+
+            let expected = model.get_next(&defer_key);
             let actual = store
-                .get_next_deferred_message(defer_key)
+                .get_next_deferred_message(&key_ref)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetNext failed: {e:?}"))?;
 
@@ -482,10 +545,14 @@ where
             }
             Ok(())
         }
-        DeferOperation::IsDeferred(defer_key) => {
-            let expected = model.is_deferred(defer_key);
+        DeferOperation::IsDeferred(key_index) => {
+            let key_comp = &key_components[*key_index];
+            let defer_key = key_comp.uuid();
+            let key_ref = key_comp.key_ref();
+
+            let expected = model.is_deferred(&defer_key);
             let actual = store
-                .is_deferred(defer_key)
+                .is_deferred(&key_ref)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} IsDeferred failed: {e:?}"))?;
 
@@ -507,42 +574,51 @@ where
 async fn apply_complete_retry<S>(
     store: &S,
     model: &mut DeferModel,
-    defer_key: &Uuid,
+    key_index: usize,
     offset: Offset,
     op_idx: usize,
     op: &DeferOperation,
+    key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
     S: DeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
-    model.apply(op);
+    let key_comp = &key_components[key_index];
+    let defer_key = key_comp.uuid();
+    let key_ref = key_comp.key_ref();
+
+    model.apply(op, key_components);
 
     let result = store
-        .complete_retry_success(defer_key, offset)
+        .complete_retry_success(&key_ref, offset)
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} CompleteRetrySuccess failed: {e:?}"))?;
 
-    let expected_next = model.get_next(defer_key);
-    verify_completion_result(expected_next, result, defer_key, op_idx)
+    let expected_next = model.get_next(&defer_key);
+    verify_completion_result(expected_next, result, &defer_key, op_idx)
 }
 
 /// Applies `increment_retry_count` with return value verification.
 async fn apply_increment_retry<S>(
     store: &S,
     model: &mut DeferModel,
-    defer_key: &Uuid,
+    key_index: usize,
     current_retry_count: u32,
     op_idx: usize,
     op: &DeferOperation,
+    key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
     S: DeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
-    model.apply(op);
+    let key_comp = &key_components[key_index];
+    let key_ref = key_comp.key_ref();
+
+    model.apply(op, key_components);
     let new_count = store
-        .increment_retry_count(defer_key, current_retry_count)
+        .increment_retry_count(&key_ref, current_retry_count)
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} IncrementRetryCount failed: {e:?}"))?;
 
@@ -555,90 +631,200 @@ where
     Ok(())
 }
 
+/// Context for mutation operation execution.
+struct MutationContext<'a, S> {
+    store: &'a S,
+    op_idx: usize,
+    key_components: &'a [TestKeyComponents],
+}
+
+impl<S> MutationContext<'_, S>
+where
+    S: DeferStore,
+    S::Error: Error + Send + Sync + 'static,
+{
+    fn key_ref(&self, key_index: usize) -> DeferKeyRef<'_> {
+        self.key_components[key_index].key_ref()
+    }
+
+    fn err(&self, op_name: &str, e: S::Error) -> Report {
+        color_eyre::eyre::eyre!("Op #{} {} failed: {e:?}", self.op_idx, op_name)
+    }
+
+    async fn defer_first(
+        &self,
+        model: &mut DeferModel,
+        op: &DeferOperation,
+        key_index: usize,
+        offset: Offset,
+        time: CompactDateTime,
+    ) -> color_eyre::Result<()> {
+        let key_ref = self.key_ref(key_index);
+        model.apply(op, self.key_components);
+        self.store
+            .defer_first_message(&key_ref, offset, time)
+            .await
+            .map_err(|e| self.err("DeferFirst", e))
+    }
+
+    async fn defer_additional(
+        &self,
+        model: &mut DeferModel,
+        op: &DeferOperation,
+        key_index: usize,
+        offset: Offset,
+        time: CompactDateTime,
+    ) -> color_eyre::Result<()> {
+        let key_ref = self.key_ref(key_index);
+        model.apply(op, self.key_components);
+        self.store
+            .defer_additional_message(&key_ref, offset, time)
+            .await
+            .map_err(|e| self.err("DeferAdditional", e))
+    }
+
+    async fn append(
+        &self,
+        model: &mut DeferModel,
+        op: &DeferOperation,
+        key_index: usize,
+        offset: Offset,
+        time: CompactDateTime,
+    ) -> color_eyre::Result<()> {
+        let key_ref = self.key_ref(key_index);
+        model.apply(op, self.key_components);
+        self.store
+            .append_deferred_message(&key_ref, offset, time)
+            .await
+            .map_err(|e| self.err("Append", e))
+    }
+
+    async fn remove(
+        &self,
+        model: &mut DeferModel,
+        op: &DeferOperation,
+        key_index: usize,
+        offset: Offset,
+    ) -> color_eyre::Result<()> {
+        let key_ref = self.key_ref(key_index);
+        model.apply(op, self.key_components);
+        self.store
+            .remove_deferred_message(&key_ref, offset)
+            .await
+            .map_err(|e| self.err("Remove", e))
+    }
+
+    async fn set_retry_count(
+        &self,
+        model: &mut DeferModel,
+        op: &DeferOperation,
+        key_index: usize,
+        retry_count: u32,
+    ) -> color_eyre::Result<()> {
+        let key_ref = self.key_ref(key_index);
+        model.apply(op, self.key_components);
+        self.store
+            .set_retry_count(&key_ref, retry_count)
+            .await
+            .map_err(|e| self.err("SetRetryCount", e))
+    }
+
+    async fn delete_key(
+        &self,
+        model: &mut DeferModel,
+        op: &DeferOperation,
+        key_index: usize,
+    ) -> color_eyre::Result<()> {
+        let key_ref = self.key_ref(key_index);
+        model.apply(op, self.key_components);
+        self.store
+            .delete_key(&key_ref)
+            .await
+            .map_err(|e| self.err("DeleteKey", e))
+    }
+}
+
 /// Handles mutation operations by applying to model and executing on store.
 async fn apply_mutation_operation<S>(
     store: &S,
     model: &mut DeferModel,
     op: &DeferOperation,
     op_idx: usize,
+    key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
     S: DeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
+    let ctx = MutationContext {
+        store,
+        op_idx,
+        key_components,
+    };
+
     match op {
         DeferOperation::DeferFirst {
-            defer_key,
+            key_index,
             offset,
             expected_retry_time,
         } => {
-            model.apply(op);
-            store
-                .defer_first_message(defer_key, *offset, *expected_retry_time)
+            ctx.defer_first(model, op, *key_index, *offset, *expected_retry_time)
                 .await
-                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} DeferFirst failed: {e:?}"))?;
-            Ok(())
         }
         DeferOperation::DeferAdditional {
-            defer_key,
+            key_index,
             offset,
             expected_retry_time,
         } => {
-            model.apply(op);
-            store
-                .defer_additional_message(defer_key, *offset, *expected_retry_time)
+            ctx.defer_additional(model, op, *key_index, *offset, *expected_retry_time)
                 .await
-                .map_err(|e| {
-                    color_eyre::eyre::eyre!("Op #{op_idx} DeferAdditional failed: {e:?}")
-                })?;
-            Ok(())
         }
-        DeferOperation::CompleteRetrySuccess { defer_key, offset } => {
-            apply_complete_retry(store, model, defer_key, *offset, op_idx, op).await
+        DeferOperation::CompleteRetrySuccess { key_index, offset } => {
+            apply_complete_retry(
+                store,
+                model,
+                *key_index,
+                *offset,
+                op_idx,
+                op,
+                key_components,
+            )
+            .await
         }
         DeferOperation::IncrementRetryCount {
-            defer_key,
+            key_index,
             current_retry_count,
-        } => apply_increment_retry(store, model, defer_key, *current_retry_count, op_idx, op).await,
+        } => {
+            apply_increment_retry(
+                store,
+                model,
+                *key_index,
+                *current_retry_count,
+                op_idx,
+                op,
+                key_components,
+            )
+            .await
+        }
         DeferOperation::Append {
-            defer_key,
+            key_index,
             offset,
             expected_retry_time,
         } => {
-            model.apply(op);
-            store
-                .append_deferred_message(defer_key, *offset, *expected_retry_time)
+            ctx.append(model, op, *key_index, *offset, *expected_retry_time)
                 .await
-                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} Append failed: {e:?}"))?;
-            Ok(())
         }
-        DeferOperation::Remove { defer_key, offset } => {
-            model.apply(op);
-            store
-                .remove_deferred_message(defer_key, *offset)
-                .await
-                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} Remove failed: {e:?}"))?;
-            Ok(())
+        DeferOperation::Remove { key_index, offset } => {
+            ctx.remove(model, op, *key_index, *offset).await
         }
         DeferOperation::SetRetryCount {
-            defer_key,
+            key_index,
             retry_count,
         } => {
-            model.apply(op);
-            store
-                .set_retry_count(defer_key, *retry_count)
+            ctx.set_retry_count(model, op, *key_index, *retry_count)
                 .await
-                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} SetRetryCount failed: {e:?}"))?;
-            Ok(())
         }
-        DeferOperation::DeleteKey(defer_key) => {
-            model.apply(op);
-            store
-                .delete_key(defer_key)
-                .await
-                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} DeleteKey failed: {e:?}"))?;
-            Ok(())
-        }
+        DeferOperation::DeleteKey(key_index) => ctx.delete_key(model, op, *key_index).await,
         _ => Err(color_eyre::eyre::eyre!(
             "Internal error: mutation operation expected"
         )),
@@ -651,6 +837,7 @@ async fn apply_operation<S>(
     model: &mut DeferModel,
     op: &DeferOperation,
     op_idx: usize,
+    key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
     S: DeferStore,
@@ -658,9 +845,9 @@ where
 {
     match op {
         DeferOperation::GetNext(_) | DeferOperation::IsDeferred(_) => {
-            apply_query_operation(store, model, op, op_idx).await
+            apply_query_operation(store, model, op, op_idx, key_components).await
         }
-        _ => apply_mutation_operation(store, model, op, op_idx).await,
+        _ => apply_mutation_operation(store, model, op, op_idx, key_components).await,
     }
 }
 
@@ -670,8 +857,8 @@ where
 ///
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
-/// 3. Verify that for every key ID:
-///    - `store.get_next(defer_key)` matches `model.get_next(defer_key)`
+/// 3. Verify that for every key:
+///    - `store.get_next(key_ref)` matches `model.get_next(uuid)`
 ///    - Both offset and `retry_count` are identical
 ///
 /// # Errors
@@ -688,9 +875,10 @@ where
     S::Error: Error + Send + Sync + 'static,
 {
     // Clean up keys from this trial to ensure isolation
-    for defer_key in &input.defer_keys {
+    for key_comp in &input.key_components {
+        let key_ref = key_comp.key_ref();
         store
-            .delete_key(defer_key)
+            .delete_key(&key_ref)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to clean up key: {e:?}"))?;
     }
@@ -699,7 +887,7 @@ where
 
     // Apply all operations to both store and model, verifying queries inline
     for (op_idx, op) in input.operations.iter().enumerate() {
-        apply_operation(store, &mut model, op, op_idx).await?;
+        apply_operation(store, &mut model, op, op_idx, &input.key_components).await?;
     }
 
     // Verify final state matches
