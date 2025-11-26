@@ -406,7 +406,7 @@ impl TestHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::tests::TEST_RUNTIME;
+    use crate::consumer::middleware::defer::handler::tests::TEST_RUNTIME;
     use crate::tracing::init_test_logging;
 
     #[test]

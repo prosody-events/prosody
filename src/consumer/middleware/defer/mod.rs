@@ -6,9 +6,6 @@ pub mod handler;
 pub mod loader;
 pub mod store;
 
-#[cfg(test)]
-pub mod tests;
-
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
 pub use decider::{AlwaysDefer, DeferralDecider, NeverDefer, TraceBasedDecider};
 pub use error::DeferInitError;

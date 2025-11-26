@@ -250,11 +250,11 @@ impl FallibleHandler for OutcomeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::tests::{MockContext, TEST_RUNTIME};
+    use crate::Key;
+    use crate::consumer::middleware::defer::handler::tests::{MockContext, TEST_RUNTIME};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use crate::tracing::init_test_logging;
-    use crate::{Key, Partition, Topic};
 
     fn make_test_trigger(key_name: &str) -> Trigger {
         let key: Key = Arc::from(key_name);
@@ -284,7 +284,7 @@ mod tests {
 
         TEST_RUNTIME.block_on(async {
             let handler = OutcomeHandler::new();
-            let context = MockContext::new(Topic::from("test"), Partition::from(0_i32));
+            let context = MockContext::new();
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Success);
@@ -299,7 +299,7 @@ mod tests {
 
         TEST_RUNTIME.block_on(async {
             let handler = OutcomeHandler::new();
-            let context = MockContext::new(Topic::from("test"), Partition::from(0_i32));
+            let context = MockContext::new();
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Permanent);
@@ -317,7 +317,7 @@ mod tests {
 
         TEST_RUNTIME.block_on(async {
             let handler = OutcomeHandler::new();
-            let context = MockContext::new(Topic::from("test"), Partition::from(0_i32));
+            let context = MockContext::new();
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Transient);

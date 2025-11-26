@@ -27,6 +27,9 @@ use crate::{Key, Partition, Topic};
 use std::sync::Arc;
 use tracing::{debug, error};
 
+#[cfg(test)]
+pub mod tests;
+
 /// Middleware that defers transiently failed messages for later retry.
 ///
 /// Intercepts transient failures from the inner handler and schedules them
@@ -50,21 +53,6 @@ where
     store: S,
     decider: D,
     consumer_group: Arc<str>,
-}
-
-impl<S, L, D> DeferMiddleware<S, L, D>
-where
-    S: DeferStore,
-    L: MessageLoader,
-    D: DeferralDecider,
-{
-    /// Returns a reference to the deferral decider.
-    ///
-    /// Useful for testing and monitoring.
-    #[must_use]
-    pub fn decider(&self) -> &D {
-        &self.decider
-    }
 }
 
 impl<S> DeferMiddleware<S, KafkaLoader, FailureTracker>
@@ -134,115 +122,6 @@ where
             store,
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
-        })
-    }
-}
-
-impl<S, L> DeferMiddleware<S, L, FailureTracker>
-where
-    S: DeferStore,
-    L: MessageLoader,
-{
-    /// Creates a new defer middleware with a custom loader.
-    ///
-    /// Use this constructor for testing with [`MemoryLoader`] or other
-    /// custom loader implementations. Uses [`FailureTracker`] for deferral
-    /// decisions.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Configuration for defer behavior
-    /// * `consumer_group` - Consumer group ID for state isolation
-    /// * `loader` - Message loader implementation
-    /// * `store` - Storage backend for deferred state
-    /// * `telemetry` - Telemetry system for failure tracking
-    /// * `heartbeats` - Registry for monitoring background actors
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new middleware if configuration is valid.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if configuration validation fails.
-    pub fn with_loader<G>(
-        config: DeferConfiguration,
-        consumer_group: G,
-        loader: L,
-        store: S,
-        telemetry: &Telemetry,
-        heartbeats: &HeartbeatRegistry,
-    ) -> Result<Self, DeferInitError>
-    where
-        G: Into<Arc<str>>,
-    {
-        use validator::Validate;
-
-        config.validate()?;
-
-        let decider = FailureTracker::new(
-            config.failure_window,
-            config.failure_threshold,
-            telemetry,
-            heartbeats,
-        );
-
-        Ok(Self {
-            config,
-            loader,
-            store,
-            decider,
-            consumer_group: consumer_group.into(),
-        })
-    }
-}
-
-impl<S, L, D> DeferMiddleware<S, L, D>
-where
-    S: DeferStore,
-    L: MessageLoader,
-    D: DeferralDecider,
-{
-    /// Creates a new defer middleware with a custom loader and decider.
-    ///
-    /// Use this constructor for property testing with [`MemoryLoader`] and
-    /// [`TraceBasedDecider`] or similar test doubles.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Configuration for defer behavior
-    /// * `consumer_group` - Consumer group ID for state isolation
-    /// * `loader` - Message loader implementation
-    /// * `store` - Storage backend for deferred state
-    /// * `decider` - Deferral decision implementation
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the new middleware if configuration is valid.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if configuration validation fails.
-    pub fn with_loader_and_decider<G>(
-        config: DeferConfiguration,
-        consumer_group: G,
-        loader: L,
-        store: S,
-        decider: D,
-    ) -> Result<Self, DeferInitError>
-    where
-        G: Into<Arc<str>>,
-    {
-        use validator::Validate;
-
-        config.validate()?;
-
-        Ok(Self {
-            config,
-            loader,
-            store,
-            decider,
-            consumer_group: consumer_group.into(),
         })
     }
 }
