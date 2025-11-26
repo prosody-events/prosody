@@ -31,6 +31,15 @@ use thiserror::Error;
 use tokio::runtime::Builder;
 use tokio::task::yield_now;
 
+// ============================================================================
+// Test Configuration Constants (shared by harness and generator)
+// ============================================================================
+
+/// Base backoff delay in seconds for test handler config.
+pub const TEST_BASE_BACKOFF_SECS: u32 = 1;
+/// Maximum backoff delay in seconds for test handler config.
+pub const TEST_MAX_BACKOFF_SECS: u32 = 3600;
+
 /// Test error that can be classified.
 #[derive(Debug, Error, Clone)]
 pub enum TestError {

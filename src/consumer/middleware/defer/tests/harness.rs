@@ -28,6 +28,7 @@ use crate::consumer::middleware::defer::store::DeferStore;
 use crate::consumer::middleware::defer::store::key_ref::DeferKeyRef;
 use crate::consumer::middleware::defer::store::memory::MemoryDeferStore;
 use crate::consumer::middleware::defer::store::CachedDeferStore;
+use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Offset, Partition, Topic};
 use color_eyre::eyre::eyre;
@@ -141,10 +142,10 @@ impl TestHarness {
         let store = MemoryDeferStore::new();
         let capture = TimerCapture::new();
 
-        // Create config with minimal backoff for fast tests
+        // Create config using shared test constants
         let config = DeferConfiguration::builder()
-            .base(Duration::from_secs(1))
-            .max_delay(Duration::from_secs(60))
+            .base(Duration::from_secs(u64::from(super::TEST_BASE_BACKOFF_SECS)))
+            .max_delay(Duration::from_secs(u64::from(super::TEST_MAX_BACKOFF_SECS)))
             .failure_threshold(0.9_f64)
             .build()
             .map_err(|e| eyre!("config error: {e}"))?;
@@ -197,6 +198,14 @@ impl TestHarness {
         &self.capture
     }
 
+    /// Returns all processed messages in order (drains the queue).
+    ///
+    /// Used by `prop_processing_order` to verify per-key message ordering.
+    #[must_use]
+    pub fn processed_messages(&self) -> Vec<super::handler::ProcessedMessage> {
+        self.inner_handler.processed()
+    }
+
     /// Creates a `DeferKeyRef` for the given key index.
     pub fn key_ref(&self, key_idx: usize) -> DeferKeyRef<'_> {
         DeferKeyRef::new(
@@ -221,7 +230,7 @@ impl TestHarness {
         KeyedCapturingContext::new(key.clone(), self.capture.clone())
     }
 
-    /// Executes a message event using the real DeferHandler.
+    /// Executes a message event using the real `DeferHandler`.
     pub async fn execute_message(&mut self, event: &MessageEvent) -> color_eyre::Result<()> {
         let key = &self.keys[event.key_idx];
 
@@ -293,7 +302,7 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Executes a timer event using the real DeferHandler.
+    /// Executes a timer event using the real `DeferHandler`.
     pub async fn execute_timer(&mut self, event: &TimerEvent) -> color_eyre::Result<()> {
         let key = &self.keys[event.key_idx];
 
@@ -308,7 +317,7 @@ impl TestHarness {
                 state,
                 self.capture.has_active_timer(key)
             );
-        }
+        };
 
         // Set the handler outcome based on the trace
         let outcome = match &event.outcome {
@@ -407,7 +416,7 @@ mod tests {
                 key_idx: 0,
                 offset: Offset::from(1_i64),
                 outcome: MessageOutcome::Transient {
-                    max_backoff: Duration::from_secs(60),
+                    max_backoff: CompactDuration::new(60),
                     defer: true,
                 },
             };
@@ -452,7 +461,7 @@ mod tests {
                 key_idx: 0,
                 offset: Offset::from(1_i64),
                 outcome: MessageOutcome::Transient {
-                    max_backoff: Duration::from_secs(60),
+                    max_backoff: CompactDuration::new(60),
                     defer: true,
                 },
             };
@@ -498,7 +507,7 @@ mod tests {
                 key_idx: 0,
                 offset: Offset::from(1_i64),
                 outcome: MessageOutcome::Transient {
-                    max_backoff: Duration::from_secs(60),
+                    max_backoff: CompactDuration::new(60),
                     defer: true,
                 },
             };
@@ -513,7 +522,7 @@ mod tests {
                 key_idx: 0,
                 offset: Offset::from(1_i64),
                 outcome: TimerOutcome::Transient {
-                    max_backoff: Duration::from_secs(120),
+                    max_backoff: CompactDuration::new(120),
                 },
             };
             harness.execute_timer(&timer).await.ok()?;

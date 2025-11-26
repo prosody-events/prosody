@@ -9,10 +9,20 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
 use crate::timers::Trigger;
+use crate::{Key, Offset};
 use parking_lot::Mutex;
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
 use std::sync::Arc;
+
+/// A processed message record: (key, offset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessedMessage {
+    /// The key of the processed message.
+    pub key: Key,
+    /// The offset of the processed message.
+    pub offset: Offset,
+}
 
 // ============================================================================
 // HandlerOutcome - What the trace specifies
@@ -114,6 +124,8 @@ impl ClassifyError for OutcomeError {
 pub struct OutcomeHandler {
     /// Next outcome to return (set by harness before each event).
     next_outcome: Arc<Mutex<Option<HandlerOutcome>>>,
+    /// Record of all messages processed by this handler (in order).
+    processed: Arc<scc::Queue<ProcessedMessage>>,
 }
 
 impl OutcomeHandler {
@@ -122,6 +134,7 @@ impl OutcomeHandler {
     pub fn new() -> Self {
         Self {
             next_outcome: Arc::new(Mutex::new(None)),
+            processed: Arc::new(scc::Queue::default()),
         }
     }
 
@@ -130,6 +143,21 @@ impl OutcomeHandler {
     /// Must be called before each `on_message()` or `on_timer()` invocation.
     pub fn set_outcome(&self, outcome: HandlerOutcome) {
         *self.next_outcome.lock() = Some(outcome);
+    }
+
+    /// Returns all processed messages in order (drains the queue).
+    #[must_use]
+    pub fn processed(&self) -> Vec<ProcessedMessage> {
+        let mut result = Vec::with_capacity(self.processed.len());
+        while let Some(entry) = self.processed.pop() {
+            result.push((**entry).clone());
+        }
+        result
+    }
+
+    /// Records a processed message.
+    fn record_processed(&self, key: Key, offset: Offset) {
+        self.processed.push(ProcessedMessage { key, offset });
     }
 
     /// Takes the next outcome, returning Success if none was set.
@@ -154,6 +182,7 @@ impl Debug for OutcomeHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OutcomeHandler")
             .field("next_outcome", &self.next_outcome.lock())
+            .field("processed_count", &self.processed.len())
             .finish()
     }
 }
@@ -171,13 +200,19 @@ impl FallibleHandler for OutcomeHandler {
         C: EventContext,
     {
         use crate::consumer::Keyed;
+        let key = message.key().clone();
+        let offset = message.offset();
         let outcome = self.take_outcome();
         tracing::info!(
             "OutcomeHandler.on_message: key={:?}, offset={}, outcome={:?}",
-            message.key(),
-            message.offset(),
+            key,
+            offset,
             outcome
         );
+
+        // Record this message as processed (for order verification)
+        self.record_processed(key, offset);
+
         match outcome {
             HandlerOutcome::Success => Ok(()),
             HandlerOutcome::Permanent => Err(OutcomeError::permanent()),

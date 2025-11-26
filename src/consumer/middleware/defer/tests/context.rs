@@ -101,7 +101,11 @@ impl TimerCapture {
     /// Returns all recorded events (draining the queue).
     #[must_use]
     pub fn drain_events(&self) -> Vec<OutputEvent> {
-        std::iter::from_fn(|| self.events.pop().map(|e| (**e).clone())).collect()
+        let mut result = Vec::with_capacity(self.events.len());
+        while let Some(entry) = self.events.pop() {
+            result.push((**entry).clone());
+        }
+        result
     }
 
     /// Returns the number of pending events.
@@ -129,7 +133,7 @@ impl TimerCapture {
     /// Returns the number of keys with active timers.
     ///
     /// Note: This returns the number of keys, not the total count of timer instances.
-    /// Each key may have multiple scheduled times in its BTreeSet.
+    /// Each key may have multiple scheduled times in its `BTreeSet`.
     #[must_use]
     pub fn active_timer_count(&self) -> usize {
         self.active_timers.len()

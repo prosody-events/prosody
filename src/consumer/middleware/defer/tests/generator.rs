@@ -5,11 +5,35 @@
 //! failing cases.
 
 use super::types::{MessageEvent, MessageOutcome, TimerEvent, TimerOutcome, Trace, TraceEvent};
+use super::{TEST_BASE_BACKOFF_SECS, TEST_MAX_BACKOFF_SECS};
 use crate::Offset;
+use crate::timers::duration::CompactDuration;
 use ahash::HashMap;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::VecDeque;
-use std::time::Duration;
+
+// ============================================================================
+// Backoff Calculation & Helper Types
+// ============================================================================
+
+/// Calculates expected max backoff for a given retry count.
+///
+/// Formula: `min(base * 2^retry_count, max_delay)`
+/// This is the upper bound - actual backoff will be `rand() * this`.
+fn expected_max_backoff(retry_count: u32) -> CompactDuration {
+    let multiplier = 1_u32.checked_shl(retry_count).unwrap_or(u32::MAX);
+    let exp_backoff = TEST_BASE_BACKOFF_SECS.saturating_mul(multiplier);
+    let capped = exp_backoff.min(TEST_MAX_BACKOFF_SECS);
+    CompactDuration::new(capped)
+}
+
+/// Timer outcome type (without `max_backoff` - calculated during state transition).
+#[derive(Clone, Copy)]
+enum TimerOutcomeType {
+    Success,
+    Permanent,
+    Transient,
+}
 
 // ============================================================================
 // Trace Builder (maintains validity during generation)
@@ -86,6 +110,7 @@ impl TraceBuilder {
             MessageOutcome::Queued => {
                 // Message queued to existing deferred key
                 self.deferred.entry(key_idx).or_default().push_back(offset);
+                self.retry_counts.insert((key_idx, offset), 0);
             }
         }
 
@@ -100,27 +125,51 @@ impl TraceBuilder {
     }
 
     /// Adds a timer event (if valid - key must be deferred).
-    fn add_timer_event(&mut self, g: &mut Gen, key_idx: usize, outcome: TimerOutcome) -> bool {
+    ///
+    /// For `Transient` outcomes, calculates `max_backoff` based on retry count
+    /// AFTER incrementing (since that's what the handler will use for scheduling).
+    fn add_timer_event(
+        &mut self,
+        g: &mut Gen,
+        key_idx: usize,
+        outcome_type: TimerOutcomeType,
+    ) -> bool {
         let Some(offset) = self.head_offset(key_idx) else {
             return false; // Key not deferred - invalid
         };
 
-        // Apply state transitions
-        match &outcome {
-            TimerOutcome::Success | TimerOutcome::Permanent => {
+        // Apply state transitions and calculate outcome
+        let outcome = match outcome_type {
+            TimerOutcomeType::Success => {
                 // Pop offset from queue
                 if let Some(queue) = self.deferred.get_mut(&key_idx) {
                     queue.pop_front();
                 }
                 self.retry_counts.remove(&(key_idx, offset));
+                TimerOutcome::Success
             }
-            TimerOutcome::Transient { .. } => {
-                // Increment retry count
-                if let Some(count) = self.retry_counts.get_mut(&(key_idx, offset)) {
+            TimerOutcomeType::Permanent => {
+                // Pop offset from queue
+                if let Some(queue) = self.deferred.get_mut(&key_idx) {
+                    queue.pop_front();
+                }
+                self.retry_counts.remove(&(key_idx, offset));
+                TimerOutcome::Permanent
+            }
+            TimerOutcomeType::Transient => {
+                // Increment retry count first
+                let new_retry_count = if let Some(count) = self.retry_counts.get_mut(&(key_idx, offset)) {
                     *count += 1;
+                    *count
+                } else {
+                    0
+                };
+                // Calculate max_backoff for the NEW retry count
+                TimerOutcome::Transient {
+                    max_backoff: expected_max_backoff(new_retry_count),
                 }
             }
-        }
+        };
 
         self.events.push(TraceEvent::Timer(TimerEvent {
             key_idx,
@@ -132,13 +181,6 @@ impl TraceBuilder {
         let _ = g;
 
         true
-    }
-
-    /// Generates a random backoff duration.
-    fn random_backoff(g: &mut Gen) -> Duration {
-        // 1-300 seconds (5 minutes max)
-        let secs = (u64::arbitrary(g) % 300) + 1;
-        Duration::from_secs(secs)
     }
 
     /// Adds a valid event based on current state.
@@ -160,11 +202,12 @@ impl TraceBuilder {
                     0 => MessageOutcome::Success,
                     1 => MessageOutcome::Permanent,
                     2 => MessageOutcome::Transient {
-                        max_backoff: Self::random_backoff(g),
+                        // First deferral: retry_count = 0
+                        max_backoff: expected_max_backoff(0),
                         defer: true,
                     },
                     _ => MessageOutcome::Transient {
-                        max_backoff: Self::random_backoff(g),
+                        max_backoff: expected_max_backoff(0),
                         defer: false,
                     },
                 }
@@ -172,21 +215,19 @@ impl TraceBuilder {
             self.add_message_event(g, key_idx, outcome);
         } else if is_deferred {
             // 40% timer events (only if key is deferred)
-            let outcome = match u8::arbitrary(g) % 3 {
-                0 => TimerOutcome::Success,
-                1 => TimerOutcome::Permanent,
-                _ => TimerOutcome::Transient {
-                    max_backoff: Self::random_backoff(g),
-                },
+            let outcome_type = match u8::arbitrary(g) % 3 {
+                0 => TimerOutcomeType::Success,
+                1 => TimerOutcomeType::Permanent,
+                _ => TimerOutcomeType::Transient,
             };
-            self.add_timer_event(g, key_idx, outcome);
+            self.add_timer_event(g, key_idx, outcome_type);
         } else {
             // Key not deferred, can't fire timer - generate message instead
             let outcome = match u8::arbitrary(g) % 3 {
                 0 => MessageOutcome::Success,
                 1 => MessageOutcome::Permanent,
                 _ => MessageOutcome::Transient {
-                    max_backoff: Self::random_backoff(g),
+                    max_backoff: expected_max_backoff(0),
                     defer: bool::arbitrary(g),
                 },
             };
@@ -353,7 +394,7 @@ mod tests {
                 key_idx: 0,
                 offset: Offset::from(1_i64),
                 outcome: MessageOutcome::Transient {
-                    max_backoff: Duration::from_secs(60),
+                    max_backoff: CompactDuration::new(60),
                     defer: true,
                 },
             }),
@@ -400,7 +441,7 @@ mod tests {
                 key_idx: 0,
                 offset: Offset::from(1_i64),
                 outcome: MessageOutcome::Transient {
-                    max_backoff: Duration::from_secs(60),
+                    max_backoff: CompactDuration::new(60),
                     defer: true,
                 },
             }),
@@ -424,7 +465,7 @@ mod tests {
                 key_idx: 0,
                 offset: Offset::from(1_i64),
                 outcome: MessageOutcome::Transient {
-                    max_backoff: Duration::from_secs(60),
+                    max_backoff: CompactDuration::new(60),
                     defer: true,
                 },
             }),

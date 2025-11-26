@@ -9,8 +9,10 @@
 
 use super::TEST_RUNTIME;
 use super::harness::TestHarness;
-use super::types::{TimerOutcome, Trace, TraceEvent};
+use super::types::{MessageOutcome, TimerOutcome, Trace, TraceEvent};
 use crate::consumer::middleware::defer::store::DeferStore;
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use crate::tracing::init_test_logging;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
@@ -154,7 +156,7 @@ fn prop_retry_increment(trace: Trace) -> TestResult {
 /// Property: Backoff duration is within bounds.
 ///
 /// **Invariant**: When a timer is scheduled, the delay is between 0 and
-/// `max_backoff` (plus jitter tolerance).
+/// `max_backoff`. The handler uses full jitter: `rand() * min(base * 2^retry, max)`.
 #[quickcheck]
 fn prop_backoff_bounds(trace: Trace) -> TestResult {
     init_test_logging();
@@ -167,10 +169,53 @@ fn prop_backoff_bounds(trace: Trace) -> TestResult {
         };
 
         for event in &events {
+            // Extract max_backoff and key_idx if this event schedules a timer
+            let backoff_check: Option<(usize, CompactDuration)> = match event {
+                TraceEvent::Message(msg) => match &msg.outcome {
+                    MessageOutcome::Transient {
+                        max_backoff,
+                        defer: true,
+                    } => Some((msg.key_idx, *max_backoff)),
+                    _ => None,
+                },
+                TraceEvent::Timer(timer) => match &timer.outcome {
+                    TimerOutcome::Transient { max_backoff } => Some((timer.key_idx, *max_backoff)),
+                    _ => None,
+                },
+            };
+
+            // Capture time before execution
+            let before = CompactDateTime::now().ok();
+
             if let Err(e) = harness.execute_event(event).await {
                 return TestResult::error(format!("Execution failed: {e}"));
             }
-            // TODO: Verify scheduled timer times against max_backoff bounds
+
+            // Verify backoff bounds if this event scheduled a timer
+            if let (Some((key_idx, max_backoff)), Some(before_time)) = (backoff_check, before) {
+                let key = harness.key(key_idx);
+                if let Some(scheduled_time) = harness.capture().get_timer_time(key) {
+                    // Scheduled time must be >= before_time (not in the past)
+                    if scheduled_time < before_time {
+                        return TestResult::error(format!(
+                            "Backoff violation: scheduled {scheduled_time} < before {before_time}"
+                        ));
+                    }
+
+                    // Scheduled time must be <= before_time + max_backoff
+                    // Add small tolerance (1 second) for timing variance
+                    let tolerance = CompactDuration::new(1);
+                    let total_backoff = max_backoff + tolerance; // saturating add
+                    let Ok(max_allowed) = before_time.add_duration(total_backoff) else {
+                        continue; // Skip if time overflows
+                    };
+                    if scheduled_time > max_allowed {
+                        return TestResult::error(format!(
+                            "Backoff violation: scheduled {scheduled_time} > max allowed {max_allowed} (max_backoff={max_backoff:?})"
+                        ));
+                    }
+                }
+            }
         }
 
         TestResult::passed()
@@ -223,6 +268,55 @@ fn prop_cleanup(trace: Trace) -> TestResult {
                 if is_deferred && !has_timer {
                     return TestResult::error(format!(
                         "Cleanup violation: key {key_idx} deferred but no timer"
+                    ));
+                }
+            }
+        }
+
+        TestResult::passed()
+    })
+}
+
+/// Property: Per-key message processing order is maintained.
+///
+/// **Invariant**: For any given key, messages are processed in offset order.
+/// At-least-once semantics allow duplicates, but not out-of-order processing.
+#[quickcheck]
+fn prop_processing_order(trace: Trace) -> TestResult {
+    init_test_logging();
+    let Trace { events, key_count } = trace;
+
+    TEST_RUNTIME.block_on(async {
+        let mut harness = match TestHarness::new(key_count) {
+            Ok(h) => h,
+            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
+        };
+
+        // Execute all events
+        for event in &events {
+            if let Err(e) = harness.execute_event(event).await {
+                return TestResult::error(format!("Execution failed: {e}"));
+            }
+        }
+
+        // Get all processed messages
+        let processed = harness.processed_messages();
+
+        // Group by key and verify order
+        let mut per_key_offsets: ahash::HashMap<&crate::Key, Vec<crate::Offset>> =
+            ahash::HashMap::default();
+        for msg in &processed {
+            per_key_offsets.entry(&msg.key).or_default().push(msg.offset);
+        }
+
+        // For each key, verify offsets are non-decreasing
+        for (key, offsets) in per_key_offsets {
+            for window in offsets.windows(2) {
+                let prev = window[0];
+                let curr = window[1];
+                if curr < prev {
+                    return TestResult::error(format!(
+                        "Processing order violation: key {key:?} processed offset {prev} before {curr}"
                     ));
                 }
             }

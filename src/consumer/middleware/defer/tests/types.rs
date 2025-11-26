@@ -5,8 +5,8 @@
 //! happens against real store state and [`OutputEvent`] records.
 
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use crate::{Key, Offset};
-use std::time::Duration;
 
 // ============================================================================
 // Output Events (recorded by CapturingContext)
@@ -51,7 +51,7 @@ pub enum MessageOutcome {
     /// Handler fails transiently.
     Transient {
         /// Maximum backoff for verification (actual: 0..=max due to jitter).
-        max_backoff: Duration,
+        max_backoff: CompactDuration,
         /// Whether deferral is enabled (controls [`TraceBasedDecider`]).
         defer: bool,
     },
@@ -94,7 +94,7 @@ pub enum TimerOutcome {
     /// Retry fails transiently - reschedule with backoff.
     Transient {
         /// Maximum backoff for verification.
-        max_backoff: Duration,
+        max_backoff: CompactDuration,
     },
 }
 
