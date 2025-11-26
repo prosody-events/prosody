@@ -251,8 +251,8 @@ impl FallibleHandler for OutcomeHandler {
 mod tests {
     use super::*;
     use crate::consumer::middleware::defer::tests::{MockContext, TEST_RUNTIME};
-    use crate::timers::datetime::CompactDateTime;
     use crate::timers::TimerType;
+    use crate::timers::datetime::CompactDateTime;
     use crate::tracing::init_test_logging;
     use crate::{Key, Partition, Topic};
 
@@ -288,9 +288,7 @@ mod tests {
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Success);
-            let result = handler
-                .on_timer(context, trigger, DemandType::Normal)
-                .await;
+            let result = handler.on_timer(context, trigger, DemandType::Normal).await;
             assert!(result.is_ok());
         });
     }
@@ -305,9 +303,7 @@ mod tests {
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Permanent);
-            let result = handler
-                .on_timer(context, trigger, DemandType::Normal)
-                .await;
+            let result = handler.on_timer(context, trigger, DemandType::Normal).await;
             assert!(matches!(
                 result.as_ref().err().map(OutcomeError::classify_error),
                 Some(ErrorCategory::Permanent)
@@ -325,9 +321,7 @@ mod tests {
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Transient);
-            let result = handler
-                .on_timer(context, trigger, DemandType::Normal)
-                .await;
+            let result = handler.on_timer(context, trigger, DemandType::Normal).await;
             assert!(matches!(
                 result.as_ref().err().map(OutcomeError::classify_error),
                 Some(ErrorCategory::Transient)

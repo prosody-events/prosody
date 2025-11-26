@@ -27,7 +27,8 @@ fn expected_max_backoff(retry_count: u32) -> CompactDuration {
     CompactDuration::new(capped)
 }
 
-/// Timer outcome type (without `max_backoff` - calculated during state transition).
+/// Timer outcome type (without `max_backoff` - calculated during state
+/// transition).
 #[derive(Clone, Copy)]
 enum TimerOutcomeType {
     Success,
@@ -59,7 +60,8 @@ pub struct TraceBuilder {
     deferred: HashMap<usize, VecDeque<Offset>>,
     /// Retry count per (`key_idx`, offset).
     retry_counts: HashMap<(usize, Offset), u32>,
-    /// Global offset counter for monotonic generation (Kafka offsets are partition-global).
+    /// Global offset counter for monotonic generation (Kafka offsets are
+    /// partition-global).
     next_offset: i64,
 }
 
@@ -85,7 +87,8 @@ impl TraceBuilder {
         self.deferred.get(&key_idx).and_then(|q| q.front().copied())
     }
 
-    /// Gets the next monotonic offset (global across all keys, like Kafka partitions).
+    /// Gets the next monotonic offset (global across all keys, like Kafka
+    /// partitions).
     fn get_next_offset(&mut self) -> Offset {
         self.next_offset += 1;
         Offset::from(self.next_offset)
@@ -127,7 +130,8 @@ impl TraceBuilder {
     /// Adds a timer event (if valid - key must be deferred).
     ///
     /// For `Transient` outcomes, calculates `max_backoff` based on retry count
-    /// AFTER incrementing (since that's what the handler will use for scheduling).
+    /// AFTER incrementing (since that's what the handler will use for
+    /// scheduling).
     fn add_timer_event(
         &mut self,
         g: &mut Gen,
@@ -158,12 +162,13 @@ impl TraceBuilder {
             }
             TimerOutcomeType::Transient => {
                 // Increment retry count first
-                let new_retry_count = if let Some(count) = self.retry_counts.get_mut(&(key_idx, offset)) {
-                    *count += 1;
-                    *count
-                } else {
-                    0
-                };
+                let new_retry_count =
+                    if let Some(count) = self.retry_counts.get_mut(&(key_idx, offset)) {
+                        *count += 1;
+                        *count
+                    } else {
+                        0
+                    };
                 // Calculate max_backoff for the NEW retry count
                 TimerOutcome::Transient {
                     max_backoff: expected_max_backoff(new_retry_count),

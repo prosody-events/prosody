@@ -156,7 +156,8 @@ fn prop_retry_increment(trace: Trace) -> TestResult {
 /// Property: Backoff duration is within bounds.
 ///
 /// **Invariant**: When a timer is scheduled, the delay is between 0 and
-/// `max_backoff`. The handler uses full jitter: `rand() * min(base * 2^retry, max)`.
+/// `max_backoff`. The handler uses full jitter: `rand() * min(base * 2^retry,
+/// max)`.
 #[quickcheck]
 fn prop_backoff_bounds(trace: Trace) -> TestResult {
     init_test_logging();
@@ -211,7 +212,8 @@ fn prop_backoff_bounds(trace: Trace) -> TestResult {
                     };
                     if scheduled_time > max_allowed {
                         return TestResult::error(format!(
-                            "Backoff violation: scheduled {scheduled_time} > max allowed {max_allowed} (max_backoff={max_backoff:?})"
+                            "Backoff violation: scheduled {scheduled_time} > max allowed \
+                             {max_allowed} (max_backoff={max_backoff:?})"
                         ));
                     }
                 }
@@ -306,7 +308,10 @@ fn prop_processing_order(trace: Trace) -> TestResult {
         let mut per_key_offsets: ahash::HashMap<&crate::Key, Vec<crate::Offset>> =
             ahash::HashMap::default();
         for msg in &processed {
-            per_key_offsets.entry(&msg.key).or_default().push(msg.offset);
+            per_key_offsets
+                .entry(&msg.key)
+                .or_default()
+                .push(msg.offset);
         }
 
         // For each key, verify offsets are non-decreasing
@@ -316,7 +321,8 @@ fn prop_processing_order(trace: Trace) -> TestResult {
                 let curr = window[1];
                 if curr < prev {
                     return TestResult::error(format!(
-                        "Processing order violation: key {key:?} processed offset {prev} before {curr}"
+                        "Processing order violation: key {key:?} processed offset {prev} before \
+                         {curr}"
                     ));
                 }
             }

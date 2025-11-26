@@ -24,10 +24,10 @@ use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::handler::DeferHandler;
 use crate::consumer::middleware::defer::loader::{MemoryLoader, MessageLoader};
+use crate::consumer::middleware::defer::store::CachedDeferStore;
 use crate::consumer::middleware::defer::store::DeferStore;
 use crate::consumer::middleware::defer::store::key_ref::DeferKeyRef;
 use crate::consumer::middleware::defer::store::memory::MemoryDeferStore;
-use crate::consumer::middleware::defer::store::CachedDeferStore;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Offset, Partition, Topic};
@@ -85,8 +85,12 @@ pub async fn verify_timer_coverage(
 // ============================================================================
 
 /// Type alias for the `DeferHandler` used in tests.
-type TestDeferHandler =
-    DeferHandler<OutcomeHandler, CachedDeferStore<MemoryDeferStore>, MemoryLoader, TraceBasedDecider>;
+type TestDeferHandler = DeferHandler<
+    OutcomeHandler,
+    CachedDeferStore<MemoryDeferStore>,
+    MemoryLoader,
+    TraceBasedDecider,
+>;
 
 /// Test harness for executing traces against the **real** `DeferHandler`.
 ///
@@ -106,7 +110,8 @@ pub struct TestHarness {
     decider: TraceBasedDecider,
     /// Loader for storing messages (shared via Arc).
     loader: MemoryLoader,
-    /// Store for verification (shared via Arc, wrapped in `CachedDeferStore` inside handler).
+    /// Store for verification (shared via Arc, wrapped in `CachedDeferStore`
+    /// inside handler).
     store: MemoryDeferStore,
     /// Timer capture for verification.
     capture: TimerCapture,
@@ -144,7 +149,9 @@ impl TestHarness {
 
         // Create config using shared test constants
         let config = DeferConfiguration::builder()
-            .base(Duration::from_secs(u64::from(super::TEST_BASE_BACKOFF_SECS)))
+            .base(Duration::from_secs(u64::from(
+                super::TEST_BASE_BACKOFF_SECS,
+            )))
             .max_delay(Duration::from_secs(u64::from(super::TEST_MAX_BACKOFF_SECS)))
             .failure_threshold(0.9_f64)
             .build()
@@ -184,7 +191,6 @@ impl TestHarness {
     pub fn key(&self, key_idx: usize) -> &Key {
         &self.keys[key_idx]
     }
-
 
     /// Returns a reference to the store for verification.
     #[must_use]
@@ -364,15 +370,14 @@ impl TestHarness {
             TimerOutcome::Permanent => {
                 // Permanent errors are propagated - this is expected
                 if result.is_ok() {
-                    return Err(eyre!(
-                        "Expected error for Permanent timer but got Ok"
-                    ));
+                    return Err(eyre!("Expected error for Permanent timer but got Ok"));
                 }
             }
         }
 
-        // The handler manages timers via context calls (schedule, clear_and_schedule, etc.)
-        // We don't clear timers here - that's the handler's responsibility.
+        // The handler manages timers via context calls (schedule, clear_and_schedule,
+        // etc.) We don't clear timers here - that's the handler's
+        // responsibility.
         Ok(())
     }
 

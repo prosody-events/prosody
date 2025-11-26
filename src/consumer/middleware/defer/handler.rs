@@ -555,8 +555,8 @@ where
 
             Ok(())
         } else {
-            // Permanent or terminal error - clean up current offset but check for more messages
-            // (cache updated by CachedDeferStore)
+            // Permanent or terminal error - clean up current offset but check for more
+            // messages (cache updated by CachedDeferStore)
             let result = self
                 .store
                 .complete_retry_success(key_ref, offset)
@@ -570,7 +570,8 @@ where
                     self.schedule_retry_timer(context, 0).await?;
 
                     debug!(
-                        "Permanent error for key {:?} offset {}, scheduled timer for next offset {}",
+                        "Permanent error for key {:?} offset {}, scheduled timer for next offset \
+                         {}",
                         message_key, offset, next_offset
                     );
                 }
@@ -778,13 +779,18 @@ where
             Ok(Some(result)) => {
                 tracing::info!(
                     "on_timer: got deferred message for key {:?}: offset={}, retry_count={}",
-                    message_key, result.0, result.1
+                    message_key,
+                    result.0,
+                    result.1
                 );
                 result
             }
             Ok(None) => {
                 // No deferred message found - possibly already succeeded or expired
-                tracing::info!("on_timer: No deferred message found for key {:?}", message_key);
+                tracing::info!(
+                    "on_timer: No deferred message found for key {:?}",
+                    message_key
+                );
                 return Ok(());
             }
             Err(e) => {

@@ -66,8 +66,7 @@ impl TimerCapture {
     /// Used when `commit()` is called after a timer fires - removes only the
     /// specific timer that was fired, not any newly scheduled timers.
     pub fn record_clear(&self, key: &Key, time: CompactDateTime) {
-        self.events
-            .push(OutputEvent::Cleared { key: key.clone() });
+        self.events.push(OutputEvent::Cleared { key: key.clone() });
 
         // Check if this is the only timer for the key
         let should_remove = self
@@ -86,8 +85,7 @@ impl TimerCapture {
     ///
     /// Used by `clear_scheduled` and the clear part of `clear_and_schedule`.
     pub fn record_clear_all(&self, key: &Key) {
-        self.events
-            .push(OutputEvent::Cleared { key: key.clone() });
+        self.events.push(OutputEvent::Cleared { key: key.clone() });
 
         let _ = self.active_timers.remove_sync(key);
     }
@@ -132,8 +130,9 @@ impl TimerCapture {
 
     /// Returns the number of keys with active timers.
     ///
-    /// Note: This returns the number of keys, not the total count of timer instances.
-    /// Each key may have multiple scheduled times in its `BTreeSet`.
+    /// Note: This returns the number of keys, not the total count of timer
+    /// instances. Each key may have multiple scheduled times in its
+    /// `BTreeSet`.
     #[must_use]
     pub fn active_timer_count(&self) -> usize {
         self.active_timers.len()
