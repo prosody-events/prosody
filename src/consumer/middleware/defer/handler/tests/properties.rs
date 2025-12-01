@@ -69,9 +69,9 @@ fn prop_fifo_order(trace: Trace) -> TestResult {
         for event in &events {
             // For timer events, verify FIFO before execution
             if let TraceEvent::Timer(timer) = event {
-                let key_ref = harness.key_ref(timer.key_idx);
+                let key = harness.key(timer.key_idx);
 
-                let result = harness.store().get_next_deferred_message(&key_ref).await;
+                let result = harness.store().get_next_deferred_message(key).await;
                 match result {
                     Ok(Some((head_offset, _))) => {
                         if head_offset != timer.offset {
@@ -247,11 +247,10 @@ fn prop_cleanup(trace: Trace) -> TestResult {
             // After each event, verify cleanup invariant
             for key_idx in 0..key_count {
                 let key = harness.key(key_idx);
-                let key_ref = harness.key_ref(key_idx);
 
                 let is_deferred = harness
                     .store()
-                    .get_next_deferred_message(&key_ref)
+                    .get_next_deferred_message(key)
                     .await
                     .ok()
                     .flatten()

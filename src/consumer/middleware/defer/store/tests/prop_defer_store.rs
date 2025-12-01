@@ -3,31 +3,23 @@
 //! Tests the `DeferStore` trait using a simple reference model to verify
 //! correctness across both memory and Cassandra implementations.
 
-use crate::consumer::middleware::defer::store::key_ref::DeferKeyRef;
 use crate::consumer::middleware::defer::store::{DeferStore, RetryCompletionResult};
 use crate::timers::datetime::CompactDateTime;
-use crate::{Key, Offset, Partition, Topic};
+use crate::{Key, Offset};
 use ahash::HashMap;
 use color_eyre::eyre::Report;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::sync::Arc;
-use uuid::Uuid;
 
-/// Test helper holding owned key component data.
+/// Test helper holding a message key.
 ///
-/// Allows creating `DeferKeyRef` instances that borrow from this struct.
-/// Each unique combination of components produces a unique UUID via
-/// `Uuid::from(&DeferKeyRef)`.
+/// Since stores are now constructed per-segment via the provider pattern,
+/// tests only need to track the message key. The model uses the key directly
+/// as the identifier.
 #[derive(Clone, Debug)]
 pub struct TestKeyComponents {
-    /// Consumer group for state isolation.
-    pub consumer_group: String,
-    /// Kafka topic.
-    pub topic: Topic,
-    /// Kafka partition.
-    pub partition: Partition,
     /// Message key (business key for ordering).
     pub key: Key,
 }
@@ -36,21 +28,8 @@ impl TestKeyComponents {
     /// Creates test key components with the given index for uniqueness.
     fn new(index: usize) -> Self {
         Self {
-            consumer_group: "test-group".to_owned(),
-            topic: Topic::from("test-topic"),
-            partition: Partition::from(0_i32),
             key: Arc::from(format!("test-key-{index}")),
         }
-    }
-
-    /// Returns a `DeferKeyRef` borrowing from this struct.
-    fn key_ref(&self) -> DeferKeyRef<'_> {
-        DeferKeyRef::new(&self.consumer_group, self.topic, self.partition, &self.key)
-    }
-
-    /// Returns the UUID for this key (computed via `DeferKeyRef`).
-    fn uuid(&self) -> Uuid {
-        Uuid::from(&self.key_ref())
     }
 }
 
@@ -257,14 +236,14 @@ impl Arbitrary for DeferTestInput {
 /// (created via `set_retry_count` on a non-existent key).
 #[derive(Clone, Debug)]
 pub struct DeferModel {
-    /// Map from `defer_key` to (offsets, `retry_count`).
+    /// Map from message key to (offsets, `retry_count`).
     ///
     /// States:
-    /// - Key not present: No partition in Cassandra
-    /// - `retry_count = None`: Static column is NULL (reads as 0)
-    /// - `retry_count = Some(n)`: Static column explicitly set to `n`
-    /// - Empty offsets: Partition exists but has no clustering rows
-    keys: HashMap<Uuid, (BTreeSet<Offset>, Option<u32>)>,
+    /// - Key not present: Key has no deferred messages
+    /// - `retry_count = None`: Retry count not explicitly set (reads as 0)
+    /// - `retry_count = Some(n)`: Retry count explicitly set to `n`
+    /// - Empty offsets: Key exists but has no deferred offsets
+    keys: HashMap<Key, (BTreeSet<Offset>, Option<u32>)>,
 }
 
 impl Default for DeferModel {
@@ -284,7 +263,7 @@ impl DeferModel {
 
     /// Applies an operation to the model.
     ///
-    /// Requires `key_components` to resolve key indices to UUIDs.
+    /// Requires `key_components` to resolve key indices to keys.
     pub fn apply(&mut self, op: &DeferOperation, key_components: &[TestKeyComponents]) {
         match op {
             // Queries don't modify state
@@ -294,12 +273,12 @@ impl DeferModel {
             DeferOperation::DeferFirst {
                 key_index, offset, ..
             } => {
-                let defer_key = key_components[*key_index].uuid();
+                let key = Arc::clone(&key_components[*key_index].key);
                 // Set retry_count=0 and append offset
-                // Note: Does NOT delete existing offsets (Cassandra INSERT behavior)
+                // Note: Does NOT delete existing offsets (INSERT behavior)
                 let entry = self
                     .keys
-                    .entry(defer_key)
+                    .entry(key)
                     .or_insert_with(|| (BTreeSet::new(), None));
                 entry.0.insert(*offset);
                 entry.1 = Some(0);
@@ -307,24 +286,24 @@ impl DeferModel {
             DeferOperation::DeferAdditional {
                 key_index, offset, ..
             } => {
-                let defer_key = key_components[*key_index].uuid();
+                let key = Arc::clone(&key_components[*key_index].key);
                 // Append offset without modifying retry_count
-                let entry = self.keys.entry(defer_key).or_insert_with(|| {
+                let entry = self.keys.entry(key).or_insert_with(|| {
                     // Shouldn't happen (should use DeferFirst first), but handle gracefully
                     (BTreeSet::new(), Some(0))
                 });
                 entry.0.insert(*offset);
             }
             DeferOperation::CompleteRetrySuccess { key_index, offset } => {
-                let defer_key = key_components[*key_index].uuid();
-                if let Some(entry) = self.keys.get_mut(&defer_key) {
+                let key = &key_components[*key_index].key;
+                if let Some(entry) = self.keys.get_mut(key.as_ref()) {
                     // Remove the offset
                     entry.0.remove(offset);
 
                     // Check if more messages exist
                     if entry.0.is_empty() {
                         // No more messages - delete entire key
-                        self.keys.remove(&defer_key);
+                        self.keys.remove(key.as_ref());
                     } else {
                         // More messages exist - reset retry_count to 0
                         entry.1 = Some(0);
@@ -335,13 +314,13 @@ impl DeferModel {
                 key_index,
                 current_retry_count,
             } => {
-                let defer_key = key_components[*key_index].uuid();
+                let key = Arc::clone(&key_components[*key_index].key);
                 // Increment retry count (saturating_add)
-                // Note: Creates partition if doesn't exist (via set_retry_count)
+                // Note: Creates entry if doesn't exist (via set_retry_count)
                 let new_count = current_retry_count.saturating_add(1);
                 let entry = self
                     .keys
-                    .entry(defer_key)
+                    .entry(key)
                     .or_insert_with(|| (BTreeSet::new(), None));
                 entry.1 = Some(new_count);
             }
@@ -350,16 +329,16 @@ impl DeferModel {
             DeferOperation::Append {
                 key_index, offset, ..
             } => {
-                let defer_key = key_components[*key_index].uuid();
-                let entry = self.keys.entry(defer_key).or_insert_with(|| {
-                    // When creating a new key, retry_count defaults to None (NULL in Cassandra)
+                let key = Arc::clone(&key_components[*key_index].key);
+                let entry = self.keys.entry(key).or_insert_with(|| {
+                    // When creating a new key, retry_count defaults to None
                     (BTreeSet::new(), None)
                 });
                 entry.0.insert(*offset);
             }
             DeferOperation::Remove { key_index, offset } => {
-                let defer_key = key_components[*key_index].uuid();
-                if let Some(entry) = self.keys.get_mut(&defer_key) {
+                let key = &key_components[*key_index].key;
+                if let Some(entry) = self.keys.get_mut(key.as_ref()) {
                     entry.0.remove(offset);
                 }
             }
@@ -367,18 +346,18 @@ impl DeferModel {
                 key_index,
                 retry_count,
             } => {
-                let defer_key = key_components[*key_index].uuid();
-                // Match Cassandra: UPDATE creates partition with static column even if no
+                let key = Arc::clone(&key_components[*key_index].key);
+                // Match store behavior: set_retry_count creates entry even if no
                 // offsets exist
                 let entry = self
                     .keys
-                    .entry(defer_key)
+                    .entry(key)
                     .or_insert_with(|| (BTreeSet::new(), None));
                 entry.1 = Some(*retry_count);
             }
             DeferOperation::DeleteKey(key_index) => {
-                let defer_key = key_components[*key_index].uuid();
-                self.keys.remove(&defer_key);
+                let key = &key_components[*key_index].key;
+                self.keys.remove(key.as_ref());
             }
         }
     }
@@ -386,36 +365,35 @@ impl DeferModel {
     /// Gets the next deferred message for a key.
     ///
     /// Returns `None` if the key has no offsets, even if `retry_count` is set.
-    /// This matches Cassandra behavior where partitions with only static
-    /// columns return empty result sets (zero rows).
     ///
     /// When returning a value, converts NULL `retry_count` (None) to 0,
-    /// matching the Cassandra read behavior in `get_next_deferred_message`.
+    /// matching the store behavior in `get_next_deferred_message`.
     #[must_use]
-    pub fn get_next(&self, defer_key: &Uuid) -> Option<(Offset, u32)> {
-        self.keys.get(defer_key).and_then(|(offsets, retry_count)| {
-            // Only return a result if there are actual offsets (BTreeSet iteration is
-            // ordered) Convert None (NULL) to 0 to match Cassandra read
-            // behavior
-            offsets
-                .iter()
-                .next()
-                .map(|&offset| (offset, retry_count.unwrap_or(0)))
-        })
+    pub fn get_next(&self, key: &Key) -> Option<(Offset, u32)> {
+        self.keys
+            .get(key.as_ref())
+            .and_then(|(offsets, retry_count)| {
+                // Only return a result if there are actual offsets (BTreeSet iteration is
+                // ordered) Convert None (NULL) to 0 to match store read behavior
+                offsets
+                    .iter()
+                    .next()
+                    .map(|&offset| (offset, retry_count.unwrap_or(0)))
+            })
     }
 
     /// Checks if a key is deferred.
     ///
     /// Returns `retry_count` if the key has offsets, `None` otherwise.
     #[must_use]
-    pub fn is_deferred(&self, defer_key: &Uuid) -> Option<u32> {
-        self.get_next(defer_key).map(|(_, retry_count)| retry_count)
+    pub fn is_deferred(&self, key: &Key) -> Option<u32> {
+        self.get_next(key).map(|(_, retry_count)| retry_count)
     }
 
-    /// Returns all key IDs in the model.
+    /// Returns all keys in the model.
     #[must_use]
-    pub fn all_defer_keys(&self) -> Vec<Uuid> {
-        self.keys.keys().copied().collect()
+    pub fn all_defer_keys(&self) -> Vec<Key> {
+        self.keys.keys().map(Arc::clone).collect()
     }
 }
 
@@ -429,16 +407,13 @@ where
     S: DeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
-    // Check ALL keys used in operations, not just those in model
-    // This catches Cassandra partitions with only static columns set (from
-    // SetRetryCount)
+    // Check ALL keys used in operations
     for key_comp in &input.key_components {
-        let defer_key = key_comp.uuid();
-        let key_ref = key_comp.key_ref();
+        let key = &key_comp.key;
 
-        let model_result = model.get_next(&defer_key);
+        let model_result = model.get_next(key);
         let store_result = store
-            .get_next_deferred_message(&key_ref)
+            .get_next_deferred_message(key)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Get next failed: {e:?}"))?;
 
@@ -446,13 +421,12 @@ where
             (Some((exp_offset, exp_retry)), Some((act_offset, act_retry))) => {
                 if exp_offset != act_offset {
                     return Err(color_eyre::eyre::eyre!(
-                        "Offset mismatch for {defer_key}: expected {exp_offset}, got {act_offset}"
+                        "Offset mismatch for key={key}: expected {exp_offset}, got {act_offset}"
                     ));
                 }
                 if exp_retry != act_retry {
                     return Err(color_eyre::eyre::eyre!(
-                        "Retry count mismatch for {defer_key}: expected {exp_retry}, got \
-                         {act_retry}"
+                        "Retry count mismatch for key={key}: expected {exp_retry}, got {act_retry}"
                     ));
                 }
             }
@@ -461,14 +435,14 @@ where
             }
             (Some((exp_offset, exp_retry)), None) => {
                 return Err(color_eyre::eyre::eyre!(
-                    "Key {defer_key} exists in model (offset={exp_offset}, retry={exp_retry}) but \
-                     not in store"
+                    "Key={key} exists in model (offset={exp_offset}, retry={exp_retry}) but not \
+                     in store"
                 ));
             }
             (None, Some((act_offset, act_retry))) => {
                 return Err(color_eyre::eyre::eyre!(
-                    "Key {defer_key} exists in store (offset={act_offset}, retry={act_retry}) but \
-                     not in model"
+                    "Key={key} exists in store (offset={act_offset}, retry={act_retry}) but not \
+                     in model"
                 ));
             }
         }
@@ -481,14 +455,14 @@ where
 fn verify_completion_result(
     expected_next: Option<(Offset, u32)>,
     result: RetryCompletionResult,
-    defer_key: &Uuid,
+    key: &Key,
     op_idx: usize,
 ) -> color_eyre::Result<()> {
     match (expected_next, result) {
         (Some((expected_offset, _)), RetryCompletionResult::MoreMessages { next_offset }) => {
             if expected_offset != next_offset {
                 return Err(color_eyre::eyre::eyre!(
-                    "Op #{op_idx} CompleteRetrySuccess offset mismatch for {defer_key}: expected \
+                    "Op #{op_idx} CompleteRetrySuccess offset mismatch for key={key}: expected \
                      next_offset={expected_offset}, got {next_offset}"
                 ));
             }
@@ -498,13 +472,13 @@ fn verify_completion_result(
         }
         (Some((expected_offset, _)), RetryCompletionResult::Completed) => {
             return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} CompleteRetrySuccess mismatch for {defer_key}: expected \
-                 MoreMessages with offset={expected_offset}, got Completed"
+                "Op #{op_idx} CompleteRetrySuccess mismatch for key={key}: expected MoreMessages \
+                 with offset={expected_offset}, got Completed"
             ));
         }
         (None, RetryCompletionResult::MoreMessages { next_offset }) => {
             return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} CompleteRetrySuccess mismatch for {defer_key}: expected Completed, \
+                "Op #{op_idx} CompleteRetrySuccess mismatch for key={key}: expected Completed, \
                  got MoreMessages with offset={next_offset}"
             ));
         }
@@ -527,38 +501,34 @@ where
 {
     match op {
         DeferOperation::GetNext(key_index) => {
-            let key_comp = &key_components[*key_index];
-            let defer_key = key_comp.uuid();
-            let key_ref = key_comp.key_ref();
+            let key = &key_components[*key_index].key;
 
-            let expected = model.get_next(&defer_key);
+            let expected = model.get_next(key);
             let actual = store
-                .get_next_deferred_message(&key_ref)
+                .get_next_deferred_message(key)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetNext failed: {e:?}"))?;
 
             if expected != actual {
                 return Err(color_eyre::eyre::eyre!(
-                    "Op #{op_idx} GetNext mismatch for {defer_key}: expected {expected:?}, got \
+                    "Op #{op_idx} GetNext mismatch for key={key}: expected {expected:?}, got \
                      {actual:?}"
                 ));
             }
             Ok(())
         }
         DeferOperation::IsDeferred(key_index) => {
-            let key_comp = &key_components[*key_index];
-            let defer_key = key_comp.uuid();
-            let key_ref = key_comp.key_ref();
+            let key = &key_components[*key_index].key;
 
-            let expected = model.is_deferred(&defer_key);
+            let expected = model.is_deferred(key);
             let actual = store
-                .is_deferred(&key_ref)
+                .is_deferred(key)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} IsDeferred failed: {e:?}"))?;
 
             if expected != actual {
                 return Err(color_eyre::eyre::eyre!(
-                    "Op #{op_idx} IsDeferred mismatch for {defer_key}: expected {expected:?}, got \
+                    "Op #{op_idx} IsDeferred mismatch for key={key}: expected {expected:?}, got \
                      {actual:?}"
                 ));
             }
@@ -584,19 +554,17 @@ where
     S: DeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
-    let key_comp = &key_components[key_index];
-    let defer_key = key_comp.uuid();
-    let key_ref = key_comp.key_ref();
+    let key = &key_components[key_index].key;
 
     model.apply(op, key_components);
 
     let result = store
-        .complete_retry_success(&key_ref, offset)
+        .complete_retry_success(key, offset)
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} CompleteRetrySuccess failed: {e:?}"))?;
 
-    let expected_next = model.get_next(&defer_key);
-    verify_completion_result(expected_next, result, &defer_key, op_idx)
+    let expected_next = model.get_next(key);
+    verify_completion_result(expected_next, result, key, op_idx)
 }
 
 /// Applies `increment_retry_count` with return value verification.
@@ -613,12 +581,11 @@ where
     S: DeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
-    let key_comp = &key_components[key_index];
-    let key_ref = key_comp.key_ref();
+    let key = &key_components[key_index].key;
 
     model.apply(op, key_components);
     let new_count = store
-        .increment_retry_count(&key_ref, current_retry_count)
+        .increment_retry_count(key, current_retry_count)
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} IncrementRetryCount failed: {e:?}"))?;
 
@@ -643,8 +610,8 @@ where
     S: DeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
-    fn key_ref(&self, key_index: usize) -> DeferKeyRef<'_> {
-        self.key_components[key_index].key_ref()
+    fn key(&self, key_index: usize) -> &Key {
+        &self.key_components[key_index].key
     }
 
     fn err(&self, op_name: &str, e: S::Error) -> Report {
@@ -659,10 +626,10 @@ where
         offset: Offset,
         time: CompactDateTime,
     ) -> color_eyre::Result<()> {
-        let key_ref = self.key_ref(key_index);
+        let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .defer_first_message(&key_ref, offset, time)
+            .defer_first_message(key, offset, time)
             .await
             .map_err(|e| self.err("DeferFirst", e))
     }
@@ -675,10 +642,10 @@ where
         offset: Offset,
         time: CompactDateTime,
     ) -> color_eyre::Result<()> {
-        let key_ref = self.key_ref(key_index);
+        let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .defer_additional_message(&key_ref, offset, time)
+            .defer_additional_message(key, offset, time)
             .await
             .map_err(|e| self.err("DeferAdditional", e))
     }
@@ -691,10 +658,10 @@ where
         offset: Offset,
         time: CompactDateTime,
     ) -> color_eyre::Result<()> {
-        let key_ref = self.key_ref(key_index);
+        let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .append_deferred_message(&key_ref, offset, time)
+            .append_deferred_message(key, offset, time)
             .await
             .map_err(|e| self.err("Append", e))
     }
@@ -706,10 +673,10 @@ where
         key_index: usize,
         offset: Offset,
     ) -> color_eyre::Result<()> {
-        let key_ref = self.key_ref(key_index);
+        let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .remove_deferred_message(&key_ref, offset)
+            .remove_deferred_message(key, offset)
             .await
             .map_err(|e| self.err("Remove", e))
     }
@@ -721,10 +688,10 @@ where
         key_index: usize,
         retry_count: u32,
     ) -> color_eyre::Result<()> {
-        let key_ref = self.key_ref(key_index);
+        let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .set_retry_count(&key_ref, retry_count)
+            .set_retry_count(key, retry_count)
             .await
             .map_err(|e| self.err("SetRetryCount", e))
     }
@@ -735,10 +702,10 @@ where
         op: &DeferOperation,
         key_index: usize,
     ) -> color_eyre::Result<()> {
-        let key_ref = self.key_ref(key_index);
+        let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .delete_key(&key_ref)
+            .delete_key(key)
             .await
             .map_err(|e| self.err("DeleteKey", e))
     }
@@ -858,7 +825,7 @@ where
 /// 1. Start with empty store and model
 /// 2. Apply sequence of random operations to both
 /// 3. Verify that for every key:
-///    - `store.get_next(key_ref)` matches `model.get_next(uuid)`
+///    - `store.get_next(&key)` matches `model.get_next(&key)`
 ///    - Both offset and `retry_count` are identical
 ///
 /// # Errors
@@ -876,9 +843,8 @@ where
 {
     // Clean up keys from this trial to ensure isolation
     for key_comp in &input.key_components {
-        let key_ref = key_comp.key_ref();
         store
-            .delete_key(&key_ref)
+            .delete_key(&key_comp.key)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to clean up key: {e:?}"))?;
     }

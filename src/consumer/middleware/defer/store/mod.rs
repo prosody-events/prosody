@@ -2,22 +2,23 @@
 
 pub mod cached;
 pub mod cassandra;
-pub mod key_ref;
 pub mod memory;
+pub mod provider;
 
 #[cfg(test)]
 pub mod tests;
 
-use crate::Offset;
 use crate::consumer::middleware::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
+use crate::{Key, Offset, Partition, Topic};
 use std::error::Error;
 use std::future::Future;
+use uuid::Uuid;
 
 pub use cached::CachedDeferStore;
-pub use cassandra::CassandraDeferStore;
-pub use key_ref::DeferKeyRef;
-pub use memory::MemoryDeferStore;
+pub use cassandra::{CassandraDeferStore, CassandraDeferStoreProvider};
+pub use memory::{MemoryDeferStore, MemoryDeferStoreProvider};
+pub use provider::DeferStoreProvider;
 
 /// Result of completing a successful retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,39 +45,29 @@ pub enum RetryCompletionResult {
 
 /// Storage backend for deferred message offsets.
 ///
-/// Tracks which keys have deferred messages using [`DeferKeyRef`] which
-/// encapsulates consumer group, topic, partition, and message key.
-/// Supports multiple offsets per key (FIFO queue) with a shared retry counter.
+/// Tracks which keys have deferred messages within a segment
+/// (`topic/partition/consumer_group`). The segment context is established at
+/// construction time via [`DeferStoreProvider`]. Supports multiple offsets per
+/// key (FIFO queue) with a shared retry counter.
 ///
-/// # API Change (FR-003)
+/// # API Change (002-segment-based-defer-schema)
 ///
-/// All methods take `&DeferKeyRef<'_>` instead of `&Uuid`. This eliminates
-/// the possibility of passing the wrong key type and encapsulates UUID
-/// generation within the store implementations.
+/// All methods now take `&Key` instead of requiring full segment context on
+/// every call. The `segment_id` is computed once at construction and stored in
+/// the store instance.
 ///
 /// # Usage Pattern
 ///
 /// ```text
-/// 1. Message fails (transient error)
-///    → defer_first_message(key_ref, offset, time)
-///    → Schedule timer with backoff(0)
+/// // 1. Create provider with shared resources
+/// let provider = CassandraDeferStoreProvider::new(session, keyspace).await?;
 ///
-/// 2. More messages arrive for same key
-///    → defer_additional_message(key_ref, offset, time)
-///    → No new timer (existing timer will retry)
+/// // 2. Create store for specific partition
+/// let store = provider.create_store(topic, partition, &consumer_group).await?;
 ///
-/// 3. Timer fires
-///    → get_next_deferred_message(key_ref) → Some((offset, retry_count))
-///    → Load and retry message
-///
-///    Success:
-///      → complete_retry_success(key_ref, offset)
-///      → If MoreMessages: schedule timer with backoff(0)
-///      → If Completed: cleanup cache
-///
-///    Failure:
-///      → increment_retry_count(key_ref, retry_count) → new_count
-///      → Schedule timer with backoff(new_count)
+/// // 3. Use store with key-only API
+/// store.defer_first_message(&key, offset, time).await?;
+/// let (next_offset, retry_count) = store.get_next_deferred_message(&key).await?;
 /// ```
 ///
 /// # Implementation Requirements
@@ -104,15 +95,15 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// # Panics
     ///
     /// MUST NOT be called if key already has deferred messages. Use
-    /// [`defer_additional_message`] instead. Behavior is implementation-defined
-    /// (may corrupt `retry_count`).
+    /// [`DeferStore::defer_additional_message`] instead. Behavior is
+    /// implementation-defined (may corrupt `retry_count`).
     ///
     /// # Errors
     ///
     /// Returns error if storage operation fails.
     fn defer_first_message(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
         offset: Offset,
         expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -124,20 +115,20 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     ///
     /// # Default Implementation
     ///
-    /// Delegates to [`append_deferred_message`]. Backends can override for
-    /// optimization.
+    /// Delegates to [`DeferStore::append_deferred_message`]. Backends can
+    /// override for optimization.
     ///
     /// # Panics
     ///
     /// MUST NOT be called for the first message on a key. Use
-    /// [`defer_first_message`] instead.
+    /// [`DeferStore::defer_first_message`] instead.
     ///
     /// # Errors
     ///
     /// Returns error if storage operation fails.
     fn defer_additional_message(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
         offset: Offset,
         expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -160,16 +151,17 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     ///
     /// # Default Implementation
     ///
-    /// Uses primitives: [`remove_deferred_message`],
-    /// [`get_next_deferred_message`], [`set_retry_count`], and
-    /// [`delete_key`]. Backends can override for atomic implementation.
+    /// Uses primitives: [`DeferStore::remove_deferred_message`],
+    /// [`DeferStore::get_next_deferred_message`],
+    /// [`DeferStore::set_retry_count`], and [`DeferStore::delete_key`].
+    /// Backends can override for atomic implementation.
     ///
     /// # Errors
     ///
     /// Returns error if any operation fails. State may be partially updated.
     fn complete_retry_success(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
         offset: Offset,
     ) -> impl Future<Output = Result<RetryCompletionResult, Self::Error>> + Send {
         async move {
@@ -193,8 +185,9 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
 
     /// Increments retry count after failed retry.
     ///
-    /// Takes the current `retry_count` (from [`get_next_deferred_message`]) and
-    /// updates it to current + 1. Returns the new count for scheduling backoff.
+    /// Takes the current `retry_count` (from
+    /// [`DeferStore::get_next_deferred_message`]) and updates it to current
+    /// + 1. Returns the new count for scheduling backoff.
     ///
     /// # Default Implementation
     ///
@@ -206,7 +199,7 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if storage operation fails.
     fn increment_retry_count(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
         current_retry_count: u32,
     ) -> impl Future<Output = Result<u32, Self::Error>> + Send {
         async move {
@@ -225,34 +218,36 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns `None` if no messages are deferred for this key.
     ///
     /// Use this when you need the specific offset (e.g., timer retries).
-    /// For existence checks, prefer [`is_deferred`] (may be more efficient).
+    /// For existence checks, prefer [`DeferStore::is_deferred`] (may be more
+    /// efficient).
     ///
     /// # Errors
     ///
     /// Returns error if query fails.
     fn get_next_deferred_message(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
     ) -> impl Future<Output = Result<Option<(Offset, u32)>, Self::Error>> + Send;
 
     /// Checks if this key has any deferred messages.
     ///
     /// Returns the `retry_count` if deferred, `None` if not.
     ///
-    /// More efficient than [`get_next_deferred_message`] when you only need
-    /// existence check and retry count (don't need specific offset).
+    /// More efficient than [`DeferStore::get_next_deferred_message`] when you
+    /// only need existence check and retry count (don't need specific
+    /// offset).
     ///
     /// # Default Implementation
     ///
-    /// Calls [`get_next_deferred_message`] and discards offset. Backends can
-    /// override to query only `retry_count`.
+    /// Calls [`DeferStore::get_next_deferred_message`] and discards offset.
+    /// Backends can override to query only `retry_count`.
     ///
     /// # Errors
     ///
     /// Returns error if query fails.
     fn is_deferred(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
     ) -> impl Future<Output = Result<Option<u32>, Self::Error>> + Send {
         async move {
             Ok(self
@@ -269,8 +264,9 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Appends an offset to the deferred queue (low-level primitive).
     ///
     /// Does NOT modify `retry_count`. Use compound operations instead:
-    /// - [`defer_first_message`] - for first failure (sets `retry_count=0`)
-    /// - [`defer_additional_message`] - for additional messages
+    /// - [`DeferStore::defer_first_message`] - for first failure (sets
+    ///   `retry_count=0`)
+    /// - [`DeferStore::defer_additional_message`] - for additional messages
     ///
     /// Direct usage is only for edge cases (e.g., manual data repair).
     ///
@@ -279,7 +275,7 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if storage operation fails.
     fn append_deferred_message(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
         offset: Offset,
         expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -287,7 +283,8 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Removes a specific offset from the deferred queue (low-level primitive).
     ///
     /// Does NOT modify `retry_count` or delete key. Use compound operations:
-    /// - [`complete_retry_success`] - for successful retries (handles cleanup)
+    /// - [`DeferStore::complete_retry_success`] - for successful retries
+    ///   (handles cleanup)
     ///
     /// Direct usage is only for edge cases (e.g., manual cleanup).
     ///
@@ -296,7 +293,7 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     /// Returns error if storage operation fails.
     fn remove_deferred_message(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
         offset: Offset,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -306,8 +303,9 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
 
     /// Sets `retry_count` to an explicit value (internal primitive).
     ///
-    /// Used internally by [`increment_retry_count`] and
-    /// [`complete_retry_success`]. Should not be called directly by users.
+    /// Used internally by [`DeferStore::increment_retry_count`] and
+    /// [`DeferStore::complete_retry_success`]. Should not be called directly by
+    /// users.
     ///
     /// # Errors
     ///
@@ -315,21 +313,39 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
     #[doc(hidden)]
     fn set_retry_count(
         &self,
-        key: &DeferKeyRef<'_>,
+        key: &Key,
         retry_count: u32,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Deletes entire key partition (internal primitive).
     ///
-    /// Used internally by [`complete_retry_success`]. Should not be called
-    /// directly by users.
+    /// Used internally by [`DeferStore::complete_retry_success`]. Should not be
+    /// called directly by users.
     ///
     /// # Errors
     ///
     /// Returns error if storage operation fails.
     #[doc(hidden)]
-    fn delete_key(
-        &self,
-        key: &DeferKeyRef<'_>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn delete_key(&self, key: &Key) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Computes the segment ID for a given topic, partition, and consumer group.
+///
+/// The segment ID is a `UUIDv5` hash of the format
+/// `"{topic}/{partition}:{consumer_group}"`. This is deterministic - the same
+/// inputs always produce the same ID.
+///
+/// # Arguments
+///
+/// * `topic` - Kafka topic
+/// * `partition` - Kafka partition
+/// * `consumer_group` - Consumer group ID
+///
+/// # Returns
+///
+/// A `UUIDv5` identifier for this segment
+#[must_use]
+pub fn compute_segment_id(topic: Topic, partition: Partition, consumer_group: &str) -> Uuid {
+    let input = format!("{topic}/{partition}:{consumer_group}");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
 }

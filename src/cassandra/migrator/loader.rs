@@ -4,8 +4,8 @@
 //! substitution, and parse CQL statements for execution.
 
 use crate::cassandra::{
-    TABLE_DEFERRED_MESSAGES, TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS, TABLE_SLABS,
-    TABLE_TYPED_KEYS, TABLE_TYPED_SLABS,
+    TABLE_DEFERRED_OFFSETS, TABLE_DEFERRED_SEGMENTS, TABLE_KEYS, TABLE_SCHEMA_MIGRATIONS,
+    TABLE_SEGMENTS, TABLE_SLABS, TABLE_TYPED_KEYS, TABLE_TYPED_SLABS,
 };
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
@@ -80,7 +80,8 @@ pub fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, super:
             .replace("{{TABLE_TYPED_SLABS}}", TABLE_TYPED_SLABS)
             .replace("{{TABLE_TYPED_KEYS}}", TABLE_TYPED_KEYS)
             .replace("{{TABLE_SCHEMA_MIGRATIONS}}", TABLE_SCHEMA_MIGRATIONS)
-            .replace("{{TABLE_DEFERRED_MESSAGES}}", TABLE_DEFERRED_MESSAGES);
+            .replace("{{TABLE_DEFERRED_SEGMENTS}}", TABLE_DEFERRED_SEGMENTS)
+            .replace("{{TABLE_DEFERRED_OFFSETS}}", TABLE_DEFERRED_OFFSETS);
 
         let checksum = calculate_checksum(&content_str);
         let timestamp = extract_timestamp(&filename)?;

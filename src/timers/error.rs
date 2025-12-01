@@ -50,6 +50,14 @@ where
     /// processed.
     #[error("The context is no longer valid because the event has already been processed")]
     InvalidContext,
+
+    /// Attempted to schedule a timer at the same time and type as the
+    /// currently processing timer.
+    ///
+    /// This would cause a collision in the active triggers registry, where
+    /// committing the current timer would deactivate the newly scheduled one.
+    #[error("Cannot schedule timer at the same time and type as the current timer being processed")]
+    ConflictsWithCurrentTimer,
 }
 
 /// Errors encountered when parsing timer-related data.
@@ -89,7 +97,13 @@ where
 
             // Context no longer valid because event already processed. Duplicate processing
             // attempt with stale context. Permanent to drop duplicate rather than retry endlessly.
-            TimerManagerError::InvalidContext => ErrorCategory::Permanent,
+            //
+            // ConflictsWithCurrentTimer: Attempted to schedule at the same time/type as current
+            // timer. This is a programming error - the caller should use a different time.
+            // Permanent to surface the bug.
+            TimerManagerError::InvalidContext | TimerManagerError::ConflictsWithCurrentTimer => {
+                ErrorCategory::Permanent
+            }
         }
     }
 }

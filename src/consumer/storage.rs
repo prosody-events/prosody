@@ -7,8 +7,10 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::consumer::middleware::defer::store::cassandra::CassandraDeferStore;
-use crate::consumer::middleware::defer::store::memory::MemoryDeferStore;
+use crate::consumer::middleware::defer::store::cassandra::{
+    CassandraDeferStoreError, CassandraDeferStoreProvider,
+};
+use crate::consumer::middleware::defer::store::memory::MemoryDeferStoreProvider;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::adapter::TableAdapter;
@@ -104,9 +106,9 @@ impl StorageBackend {
     }
 }
 
-/// Atomically-created pair of trigger and defer stores.
+/// Atomically-created pair of trigger and defer store providers.
 ///
-/// This enum ensures that trigger and defer stores always use matching
+/// This enum ensures that trigger and defer store providers always use matching
 /// backends, making mismatched stores unrepresentable in the type system.
 ///
 /// # Examples
@@ -117,18 +119,16 @@ impl StorageBackend {
 /// # use prosody::timers::duration::CompactDuration;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = TriggerStoreConfiguration::InMemory;
-/// let backend = StorageBackend::new(&config, false).await?;
-///
 /// let slab_size = CompactDuration::new(3600);
-/// let stores = StorePair::new(&backend, slab_size).await?;
+/// let stores = StorePair::new(&config, slab_size, false).await?;
 ///
-/// // Pattern match to get both stores - they're guaranteed to match
+/// // Pattern match to get both providers - they're guaranteed to match
 /// match stores {
 ///     StorePair::Memory { trigger, defer } => {
-///         // Both are in-memory stores
+///         // Both are in-memory store providers
 ///     }
 ///     StorePair::Cassandra { trigger, defer } => {
-///         // Both are Cassandra stores
+///         // Both are Cassandra store providers
 ///     }
 /// }
 /// # Ok(())
@@ -140,15 +140,15 @@ pub enum StorePair {
     Memory {
         /// In-memory trigger store wrapped in `TableAdapter`.
         trigger: TableAdapter<InMemoryTriggerStore>,
-        /// In-memory defer store.
-        defer: MemoryDeferStore,
+        /// In-memory defer store provider.
+        defer: MemoryDeferStoreProvider,
     },
     /// Both stores use Cassandra storage with a shared session.
     Cassandra {
         /// Cassandra trigger store wrapped in `TableAdapter`.
         trigger: TableAdapter<CassandraTriggerStore>,
-        /// Cassandra defer store.
-        defer: CassandraDeferStore,
+        /// Cassandra defer store provider.
+        defer: CassandraDeferStoreProvider,
     },
 }
 
@@ -162,6 +162,10 @@ pub enum StoreCreationError {
     /// Failed to create defer store.
     #[error("failed to create defer store: {0:#}")]
     DeferStore(Box<CassandraStoreError>),
+
+    /// Defer store initialization error (non-Cassandra).
+    #[error("defer store initialization error: {0:#}")]
+    DeferStoreInit(Box<CassandraDeferStoreError>),
 }
 
 impl From<CassandraTriggerStoreError> for StoreCreationError {
@@ -173,6 +177,17 @@ impl From<CassandraTriggerStoreError> for StoreCreationError {
 impl From<CassandraStoreError> for StoreCreationError {
     fn from(e: CassandraStoreError) -> Self {
         Self::DeferStore(Box::new(e))
+    }
+}
+
+impl From<CassandraDeferStoreError> for StoreCreationError {
+    fn from(e: CassandraDeferStoreError) -> Self {
+        match e {
+            CassandraDeferStoreError::Cassandra(cassandra_err) => {
+                Self::DeferStore(Box::new(cassandra_err))
+            }
+            other => Self::DeferStoreInit(Box::new(other)),
+        }
     }
 }
 
@@ -217,7 +232,7 @@ impl StorePair {
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
                 trigger: memory_store(),
-                defer: MemoryDeferStore::default(),
+                defer: MemoryDeferStoreProvider::new(),
             }),
 
             StorageBackend::Cassandra { store, keyspace } => {
@@ -225,7 +240,8 @@ impl StorePair {
                 let trigger =
                     CassandraTriggerStore::with_store(store.clone(), keyspace, slab_size).await?;
 
-                let defer = CassandraDeferStore::with_store(store.clone(), keyspace).await?;
+                let defer =
+                    CassandraDeferStoreProvider::with_store(store.clone(), keyspace).await?;
 
                 Ok(Self::Cassandra {
                     trigger: TableAdapter::new(trigger),

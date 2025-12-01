@@ -165,6 +165,8 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 - Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer middleware (001-simplified-prop-tests)
 - N/A (tests use `MemoryDeferStore`) (001-simplified-prop-tests)
 - Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6, tokio, parking_lo (001-simplified-prop-tests)
+- Rust Edition 2024 (stable) + scylla-rust-driver, tokio, scc, parking_lot, uuid, thiserror (002-segment-based-defer-schema)
+- Apache Cassandra (via scylla driver) (002-segment-based-defer-schema)
 
 ## Recent Changes
 - 001-simplified-prop-tests: Added Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer middleware

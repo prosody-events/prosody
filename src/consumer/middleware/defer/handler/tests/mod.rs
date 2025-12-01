@@ -58,6 +58,12 @@ pub struct MockContext {
     operations: Arc<Mutex<Vec<TimerOperation>>>,
 }
 
+impl Default for MockContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockContext {
     /// Create a new mock context for the given topic and partition.
     #[must_use]

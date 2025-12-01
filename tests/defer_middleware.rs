@@ -22,7 +22,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
-use prosody::consumer::middleware::defer::store::cassandra::CassandraDeferStore;
+use prosody::consumer::middleware::defer::store::cassandra::CassandraDeferStoreProvider;
 use prosody::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};
 use prosody::consumer::middleware::log::LogMiddleware;
 use prosody::consumer::middleware::scheduler::SchedulerConfiguration;
@@ -261,7 +261,8 @@ impl DeferTestEnvironment {
             .build()?;
 
         let cassandra_store = CassandraStore::new(&cassandra_config).await?;
-        let defer_store = CassandraDeferStore::with_store(cassandra_store, &keyspace).await?;
+        let defer_provider =
+            CassandraDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
 
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
@@ -269,7 +270,7 @@ impl DeferTestEnvironment {
             defer_config,
             &consumer_config,
             &scheduler_config,
-            defer_store,
+            defer_provider,
             &telemetry,
             &heartbeats,
         )?;
@@ -339,7 +340,8 @@ impl DeferTestEnvironment {
             .build()?;
 
         let cassandra_store = CassandraStore::new(&cassandra_config).await?;
-        let defer_store = CassandraDeferStore::with_store(cassandra_store, &keyspace).await?;
+        let defer_provider =
+            CassandraDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
 
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
@@ -347,7 +349,7 @@ impl DeferTestEnvironment {
             defer_config,
             &consumer_config,
             &scheduler_config,
-            defer_store,
+            defer_provider,
             &telemetry,
             &heartbeats,
         )?;

@@ -394,30 +394,43 @@ async fn handle_messages<T, S>(
     let process = |event: UncommittedEvent<S>| async {
         // Process message with handler
         debug!(?event, "calling handler");
-        let context = TimerContext::new(
-            event.key().clone(),
-            shutdown_rx.clone(),
-            timer_manager.clone(),
-        );
 
-        let cloned_context = context.clone();
         match event {
             UncommittedEvent::Message(message) => {
+                let context = TimerContext::new(
+                    message.key().clone(),
+                    None,
+                    shutdown_rx.clone(),
+                    timer_manager.clone(),
+                );
+                let cloned_context = context.clone();
+
                 let _guard = message.process_scope();
                 handler
                     .on_message(context, message, DemandType::Normal)
                     .await;
+
+                // Prevent the context from being used outside of processing
+                cloned_context.invalidate();
             }
             UncommittedEvent::Timer(timer) => {
                 if timer.is_active().await {
+                    let context = TimerContext::new(
+                        timer.key().clone(),
+                        Some((timer.time(), timer.timer_type())),
+                        shutdown_rx.clone(),
+                        timer_manager.clone(),
+                    );
+                    let cloned_context = context.clone();
+
                     let _guard = timer.process_scope();
                     handler.on_timer(context, timer, DemandType::Normal).await;
+
+                    // Prevent the context from being used outside of processing
+                    cloned_context.invalidate();
                 }
             }
         }
-
-        // Prevent the context from being used outside of processing
-        cloned_context.invalidate();
     };
 
     // Create key manager to handle concurrent processing while maintaining key

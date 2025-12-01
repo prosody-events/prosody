@@ -31,6 +31,7 @@
 //! use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 //! use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 //! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
+//! use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
 //! use prosody::consumer::middleware::{FallibleHandler, ClassifyError};
 //! use prosody::consumer::DemandType;
 //! use prosody::consumer::message::ConsumerMessage;
@@ -103,6 +104,7 @@
 //!         failure_topic: FailureTopicConfigurationBuilder::default(),
 //!         scheduler: SchedulerConfigurationBuilder::default(),
 //!         monopolization: Default::default(),
+//!         defer: DeferConfigurationBuilder::default(),
 //!         timeout: TimeoutConfigurationBuilder::default(),
 //!     };
 //!     let cassandra_config = CassandraConfigurationBuilder::default();
@@ -308,6 +310,11 @@ pub type Partition = i32;
 ///
 /// Uses an Arc so the key can be cheaply cloned
 pub type Key = Arc<str>;
+
+/// A consumer group identifier.
+///
+/// Uses an Arc so the consumer group can be cheaply cloned across components.
+pub type ConsumerGroup = Arc<str>;
 
 /// A JSON value containing a Kafka message's content.
 ///

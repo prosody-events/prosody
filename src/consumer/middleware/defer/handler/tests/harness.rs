@@ -26,7 +26,6 @@ use crate::consumer::middleware::defer::handler::DeferHandler;
 use crate::consumer::middleware::defer::loader::{MemoryLoader, MessageLoader};
 use crate::consumer::middleware::defer::store::CachedDeferStore;
 use crate::consumer::middleware::defer::store::DeferStore;
-use crate::consumer::middleware::defer::store::key_ref::DeferKeyRef;
 use crate::consumer::middleware::defer::store::memory::MemoryDeferStore;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
@@ -46,16 +45,11 @@ pub async fn verify_timer_coverage(
     capture: &TimerCapture,
     store: &MemoryDeferStore,
     keys: &[Key],
-    consumer_group: &str,
-    topic: Topic,
-    partition: Partition,
 ) -> color_eyre::Result<()> {
     for key in keys {
-        let key_ref = DeferKeyRef::new(consumer_group, topic, partition, key);
-
-        // Check if key is deferred in store
+        // Check if key is deferred in store (now uses &Key directly)
         let is_deferred = store
-            .get_next_deferred_message(&key_ref)
+            .get_next_deferred_message(key)
             .await
             .map_err(|e| eyre!("store error: {e}"))?
             .is_some();
@@ -115,8 +109,6 @@ pub struct TestHarness {
     store: MemoryDeferStore,
     /// Timer capture for verification.
     capture: TimerCapture,
-    /// Consumer group for key refs.
-    consumer_group: Arc<str>,
     /// Topic for messages.
     topic: Topic,
     /// Partition for messages.
@@ -136,7 +128,6 @@ impl TestHarness {
             .map(|i| Arc::from(format!("key-{i}")))
             .collect();
 
-        let consumer_group: Arc<str> = Arc::from("test-group");
         let topic = Topic::from("test-topic");
         let partition = Partition::from(0_i32);
 
@@ -169,7 +160,6 @@ impl TestHarness {
             config,
             topic,
             partition,
-            consumer_group: consumer_group.clone(),
         };
 
         Ok(Self {
@@ -179,7 +169,6 @@ impl TestHarness {
             loader,
             store,
             capture,
-            consumer_group,
             topic,
             partition,
             keys,
@@ -212,21 +201,11 @@ impl TestHarness {
         self.inner_handler.processed()
     }
 
-    /// Creates a `DeferKeyRef` for the given key index.
-    pub fn key_ref(&self, key_idx: usize) -> DeferKeyRef<'_> {
-        DeferKeyRef::new(
-            self.consumer_group.as_ref(),
-            self.topic,
-            self.partition,
-            &self.keys[key_idx],
-        )
-    }
-
     /// Gets the retry count for a key from the store.
     pub async fn get_retry_count(&self, key_idx: usize) -> color_eyre::Result<Option<u32>> {
-        let key_ref = self.key_ref(key_idx);
+        let key = &self.keys[key_idx];
         self.store
-            .is_deferred(&key_ref)
+            .is_deferred(key)
             .await
             .map_err(|e| eyre!("store error: {e}"))
     }
@@ -314,8 +293,7 @@ impl TestHarness {
 
         // Log state before execution
         {
-            let key_ref = self.key_ref(event.key_idx);
-            let state = self.store.get_next_deferred_message(&key_ref).await;
+            let state = self.store.get_next_deferred_message(key).await;
             debug!(
                 "execute_timer START: key_idx={}, trace_offset={}, store_state={:?}, has_timer={}",
                 event.key_idx,
@@ -391,15 +369,7 @@ impl TestHarness {
 
     /// Verifies all invariants after executing an event.
     pub async fn verify_invariants(&self) -> color_eyre::Result<()> {
-        verify_timer_coverage(
-            &self.capture,
-            &self.store,
-            &self.keys,
-            &self.consumer_group,
-            self.topic,
-            self.partition,
-        )
-        .await
+        verify_timer_coverage(&self.capture, &self.store, &self.keys).await
     }
 }
 
