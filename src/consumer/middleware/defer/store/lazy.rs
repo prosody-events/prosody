@@ -1,7 +1,6 @@
 //! Lazy-initialized store wrapper for deferred message storage.
 
 use super::{DeferStore, RetryCompletionResult};
-use crate::timers::datetime::CompactDateTime;
 use crate::{Key, Offset};
 use std::future::Future;
 use std::sync::Arc;
@@ -87,13 +86,13 @@ impl<F: StoreFactory> DeferStore for LazyStore<F> {
     type Error = <F::Store as DeferStore>::Error;
 
     delegate_defer_store! {
-        defer_first_message(key: &Key, offset: Offset, expected_retry_time: CompactDateTime) -> Result<(), Self::Error>;
-        defer_additional_message(key: &Key, offset: Offset, expected_retry_time: CompactDateTime) -> Result<(), Self::Error>;
+        defer_first_message(key: &Key, offset: Offset) -> Result<(), Self::Error>;
+        defer_additional_message(key: &Key, offset: Offset) -> Result<(), Self::Error>;
         complete_retry_success(key: &Key, offset: Offset) -> Result<RetryCompletionResult, Self::Error>;
         increment_retry_count(key: &Key, current_retry_count: u32) -> Result<u32, Self::Error>;
         get_next_deferred_message(key: &Key) -> Result<Option<(Offset, u32)>, Self::Error>;
         is_deferred(key: &Key) -> Result<Option<u32>, Self::Error>;
-        append_deferred_message(key: &Key, offset: Offset, expected_retry_time: CompactDateTime) -> Result<(), Self::Error>;
+        append_deferred_message(key: &Key, offset: Offset) -> Result<(), Self::Error>;
         remove_deferred_message(key: &Key, offset: Offset) -> Result<(), Self::Error>;
         set_retry_count(key: &Key, retry_count: u32) -> Result<(), Self::Error>;
         delete_key(key: &Key) -> Result<(), Self::Error>;
@@ -107,7 +106,6 @@ mod tests {
     use crate::consumer::middleware::defer::store::memory::{
         MemoryDeferStore, MemoryDeferStoreProvider,
     };
-    use crate::timers::datetime::CompactDateTime;
     use crate::{Partition, Topic};
 
     /// Test factory that creates memory-backed stores.
@@ -162,12 +160,9 @@ mod tests {
 
         let key: Key = Arc::from("test-key");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
 
         // Defer a message
-        lazy_store
-            .defer_first_message(&key, offset, retry_time)
-            .await?;
+        lazy_store.defer_first_message(&key, offset).await?;
 
         // Verify it's stored
         let result = lazy_store.get_next_deferred_message(&key).await?;
@@ -184,10 +179,7 @@ mod tests {
         // Initialize via original
         let key: Key = Arc::from("test-key");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
-        lazy_store
-            .defer_first_message(&key, offset, retry_time)
-            .await?;
+        lazy_store.defer_first_message(&key, offset).await?;
 
         // Clone shares the same OnceCell, so sees the same data
         let result = clone.get_next_deferred_message(&key).await?;

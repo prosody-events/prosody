@@ -24,7 +24,6 @@
 //! production use where persistence across restarts is required.
 
 use super::{DeferStore, DeferStoreProvider};
-use crate::timers::datetime::CompactDateTime;
 use crate::{Key, Offset, Partition, Topic};
 
 #[cfg(test)]
@@ -113,12 +112,7 @@ impl DeferStore for MemoryDeferStore {
         Ok(result)
     }
 
-    async fn defer_first_message(
-        &self,
-        key: &Key,
-        offset: Offset,
-        _expected_retry_time: CompactDateTime,
-    ) -> Result<(), Self::Error> {
+    async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         // Calculate expiry time (TTL simulation)
         let expiry = Instant::now() + Duration::from_secs(3600);
 
@@ -141,12 +135,7 @@ impl DeferStore for MemoryDeferStore {
         Ok(())
     }
 
-    async fn append_deferred_message(
-        &self,
-        key: &Key,
-        offset: Offset,
-        _expected_retry_time: CompactDateTime,
-    ) -> Result<(), Self::Error> {
+    async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         // Calculate expiry time (TTL simulation)
         let expiry = Instant::now() + Duration::from_secs(3600);
 
@@ -248,7 +237,6 @@ impl DeferStoreProvider for MemoryDeferStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timers::datetime::CompactDateTime;
     use crate::{Key, Partition, Topic};
 
     async fn create_test_store() -> MemoryDeferStore {
@@ -278,10 +266,9 @@ mod tests {
         let store = create_test_store().await;
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
 
         // Use defer_first_message for first failure
-        store.defer_first_message(&key, offset, retry_time).await?;
+        store.defer_first_message(&key, offset).await?;
 
         let result = store.get_next_deferred_message(&key).await?;
         assert_eq!(result, Some((offset, 0)));
@@ -292,18 +279,17 @@ mod tests {
     async fn test_multiple_offsets_returns_oldest() -> color_eyre::Result<()> {
         let store = create_test_store().await;
         let key: Key = Arc::from("test-key-1");
-        let retry_time = CompactDateTime::now()?;
 
         // Defer first message
         store
-            .defer_first_message(&key, Offset::from(100_i64), retry_time)
+            .defer_first_message(&key, Offset::from(100_i64))
             .await?;
         // Append additional messages
         store
-            .append_deferred_message(&key, Offset::from(50_i64), retry_time)
+            .append_deferred_message(&key, Offset::from(50_i64))
             .await?;
         store
-            .append_deferred_message(&key, Offset::from(150_i64), retry_time)
+            .append_deferred_message(&key, Offset::from(150_i64))
             .await?;
 
         // Should return the oldest (smallest) offset
@@ -317,9 +303,8 @@ mod tests {
         let store = create_test_store().await;
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
 
-        store.defer_first_message(&key, offset, retry_time).await?;
+        store.defer_first_message(&key, offset).await?;
         store.remove_deferred_message(&key, offset).await?;
 
         let result = store.get_next_deferred_message(&key).await?;
@@ -344,10 +329,9 @@ mod tests {
         let store = create_test_store().await;
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
 
         // Defer first message
-        store.defer_first_message(&key, offset, retry_time).await?;
+        store.defer_first_message(&key, offset).await?;
 
         // Update retry_count to 5
         store.set_retry_count(&key, 5).await?;
@@ -360,7 +344,6 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_access() -> color_eyre::Result<()> {
         let store = create_test_store().await;
-        let retry_time = CompactDateTime::now()?;
 
         let key1: Key = Arc::from("test-key-1");
         let key2: Key = Arc::from("test-key-2");
@@ -369,7 +352,7 @@ mod tests {
         let k1 = key1.clone();
         let handle1 = tokio::spawn(async move {
             store_clone
-                .defer_first_message(&k1, Offset::from(1_i64), retry_time)
+                .defer_first_message(&k1, Offset::from(1_i64))
                 .await
         });
 
@@ -377,7 +360,7 @@ mod tests {
         let k2 = key2.clone();
         let handle2 = tokio::spawn(async move {
             store_clone
-                .defer_first_message(&k2, Offset::from(2_i64), retry_time)
+                .defer_first_message(&k2, Offset::from(2_i64))
                 .await
         });
 

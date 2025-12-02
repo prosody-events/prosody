@@ -179,7 +179,7 @@ The following table lists the available configuration options and their associat
 | `PROSODY_CASSANDRA_NODES`        | Comma-separated list of Cassandra contact nodes (required for timer storage)         | -            | ✓        |          |
 | `PROSODY_CASSANDRA_PASSWORD`     | Password for Cassandra authentication                                                | -            | ✓        |          |
 | `PROSODY_CASSANDRA_RACK`         | Preferred rack identifier for Cassandra topology-aware routing                       | -            | ✓        |          |
-| `PROSODY_CASSANDRA_RETENTION`    | How long to keep failed/unprocessed timer data                                       | 30d          | ✓        |          |
+| `PROSODY_CASSANDRA_RETENTION`    | Retention period for timer and failure data                                          | 1y           | ✓        |          |
 | `PROSODY_CASSANDRA_USER`         | Username for Cassandra authentication                                                | -            | ✓        |          |
 | `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                                   | 1s           | ✓        |          |
 | `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                        | -            | ✓        |          |
@@ -345,7 +345,7 @@ The timer system is automatically configured based on the consumer configuration
 - **Mock Mode**: Uses in-memory storage for testing (`PROSODY_MOCK=true`)
 - **Production Mode**: Uses Cassandra for persistent storage
 - **Slab Size**: Configure time-based partitioning with `PROSODY_SLAB_SIZE` (default: 10 minutes)
-- **Retention**: How long to keep failed/unprocessed timer data with `PROSODY_CASSANDRA_RETENTION` (default: 30 days)
+- **Retention**: Retention period for timer and failure data via `PROSODY_CASSANDRA_RETENTION` (default: 1 year)
 
 ### Usage in Handlers
 

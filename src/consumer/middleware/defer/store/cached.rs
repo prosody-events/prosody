@@ -4,7 +4,6 @@
 //! [`DeferStore`] implementation to reduce store queries.
 
 use super::{DeferStore, RetryCompletionResult};
-use crate::timers::datetime::CompactDateTime;
 use crate::{Key, Offset};
 use quick_cache::sync::Cache;
 use std::sync::Arc;
@@ -128,16 +127,9 @@ where
 {
     type Error = S::Error;
 
-    async fn defer_first_message(
-        &self,
-        key: &Key,
-        offset: Offset,
-        expected_retry_time: CompactDateTime,
-    ) -> Result<(), Self::Error> {
+    async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         // Write through to store first (for durability)
-        self.store
-            .defer_first_message(key, offset, expected_retry_time)
-            .await?;
+        self.store.defer_first_message(key, offset).await?;
 
         // Pre-populate cache ONLY if we're confident this is truly the first message
         match self.cache.get(key.as_ref()) {
@@ -155,16 +147,9 @@ where
         Ok(())
     }
 
-    async fn defer_additional_message(
-        &self,
-        key: &Key,
-        offset: Offset,
-        expected_retry_time: CompactDateTime,
-    ) -> Result<(), Self::Error> {
+    async fn defer_additional_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         // Write through to store first
-        self.store
-            .defer_additional_message(key, offset, expected_retry_time)
-            .await?;
+        self.store.defer_additional_message(key, offset).await?;
 
         // Update cache using smart invalidation
         self.update_cache_after_append(key, offset);
@@ -240,16 +225,9 @@ where
         Ok(result)
     }
 
-    async fn append_deferred_message(
-        &self,
-        key: &Key,
-        offset: Offset,
-        expected_retry_time: CompactDateTime,
-    ) -> Result<(), Self::Error> {
+    async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         // Write through to store first
-        self.store
-            .append_deferred_message(key, offset, expected_retry_time)
-            .await?;
+        self.store.append_deferred_message(key, offset).await?;
 
         // Update cache using smart invalidation
         self.update_cache_after_append(key, offset);
@@ -311,7 +289,6 @@ mod tests {
     use crate::consumer::middleware::defer::store::memory::{
         MemoryDeferStore, MemoryDeferStoreProvider,
     };
-    use crate::timers::datetime::CompactDateTime;
     use crate::{Key, Partition, Topic};
 
     async fn create_test_store() -> MemoryDeferStore {
@@ -332,12 +309,9 @@ mod tests {
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
 
         // First defer
-        cached_store
-            .defer_first_message(&key, offset, retry_time)
-            .await?;
+        cached_store.defer_first_message(&key, offset).await?;
 
         // First get (cache miss, populates cache)
         let result1 = cached_store.get_next_deferred_message(&key).await?;
@@ -356,12 +330,9 @@ mod tests {
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
 
         // Defer and populate cache
-        cached_store
-            .defer_first_message(&key, offset, retry_time)
-            .await?;
+        cached_store.defer_first_message(&key, offset).await?;
         cached_store.get_next_deferred_message(&key).await?;
 
         // Increment retry count (should update cache in-place)
@@ -387,14 +358,13 @@ mod tests {
         let store = create_test_store().await;
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
-        let retry_time = CompactDateTime::now()?;
 
         // Defer two messages
         cached_store
-            .defer_first_message(&key, Offset::from(100_i64), retry_time)
+            .defer_first_message(&key, Offset::from(100_i64))
             .await?;
         cached_store
-            .defer_additional_message(&key, Offset::from(200_i64), retry_time)
+            .defer_additional_message(&key, Offset::from(200_i64))
             .await?;
 
         // Complete first message
@@ -421,12 +391,9 @@ mod tests {
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
 
         // Defer one message
-        cached_store
-            .defer_first_message(&key, offset, retry_time)
-            .await?;
+        cached_store.defer_first_message(&key, offset).await?;
 
         // Complete it
         let result = cached_store.complete_retry_success(&key, offset).await?;
@@ -445,18 +412,17 @@ mod tests {
         let store = create_test_store().await;
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
-        let retry_time = CompactDateTime::now()?;
 
         // Defer first message - cache pre-populated
         cached_store
-            .defer_first_message(&key, Offset::from(100_i64), retry_time)
+            .defer_first_message(&key, Offset::from(100_i64))
             .await?;
         // No need to call get_next - defer_first_message pre-warms cache
 
         // Defer additional message with SMALLER offset (out-of-order scenario)
         // Smart invalidation should update cache with new minimum
         cached_store
-            .defer_additional_message(&key, Offset::from(50_i64), retry_time)
+            .defer_additional_message(&key, Offset::from(50_i64))
             .await?;
 
         // Next read should see offset 50 (the smaller one) as next (cache hit!)
@@ -471,16 +437,15 @@ mod tests {
         let store = create_test_store().await;
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
-        let retry_time = CompactDateTime::now()?;
 
         // Defer first message - cache pre-populated
         cached_store
-            .defer_first_message(&key, Offset::from(100_i64), retry_time)
+            .defer_first_message(&key, Offset::from(100_i64))
             .await?;
 
         // Append monotonically increasing offsets - cache should be preserved
         cached_store
-            .defer_additional_message(&key, Offset::from(200_i64), retry_time)
+            .defer_additional_message(&key, Offset::from(200_i64))
             .await?;
 
         // Cache should still have offset 100 as minimum (not invalidated!)
@@ -489,7 +454,7 @@ mod tests {
 
         // Append another - still monotonic
         cached_store
-            .defer_additional_message(&key, Offset::from(300_i64), retry_time)
+            .defer_additional_message(&key, Offset::from(300_i64))
             .await?;
 
         // Still cached at 100
@@ -522,12 +487,9 @@ mod tests {
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
-        let retry_time = CompactDateTime::now()?;
 
         // Defer message and populate cache
-        cached_store
-            .defer_first_message(&key, offset, retry_time)
-            .await?;
+        cached_store.defer_first_message(&key, offset).await?;
         cached_store.get_next_deferred_message(&key).await?;
 
         // Delete key (should update cache to None)

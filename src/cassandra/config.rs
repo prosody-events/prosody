@@ -76,10 +76,10 @@ pub struct CassandraConfiguration {
     /// to calculate Cassandra TTLs.
     ///
     /// Environment variable: `PROSODY_CASSANDRA_RETENTION`
-    /// Default: 30 days
+    /// Default: 1 year
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_CASSANDRA_RETENTION\", \
-                   Duration::from_secs(30 * 24 * 60 * 60))?",
+                   Duration::from_secs(365 * 24 * 60 * 60))?",
         setter(into)
     )]
     pub retention: Duration,

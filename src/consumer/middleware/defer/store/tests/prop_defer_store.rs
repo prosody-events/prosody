@@ -4,7 +4,6 @@
 //! correctness across both memory and Cassandra implementations.
 
 use crate::consumer::middleware::defer::store::{DeferStore, RetryCompletionResult};
-use crate::timers::datetime::CompactDateTime;
 use crate::{Key, Offset};
 use ahash::HashMap;
 use color_eyre::eyre::Report;
@@ -48,8 +47,6 @@ pub enum DeferOperation {
         key_index: usize,
         /// Offset to defer.
         offset: Offset,
-        /// Expected retry time (for TTL).
-        expected_retry_time: CompactDateTime,
     },
     /// Defer additional message for an already-deferred key (compound
     /// operation).
@@ -58,8 +55,6 @@ pub enum DeferOperation {
         key_index: usize,
         /// Offset to defer.
         offset: Offset,
-        /// Expected retry time (for TTL).
-        expected_retry_time: CompactDateTime,
     },
     /// Complete successful retry (compound operation).
     CompleteRetrySuccess {
@@ -81,8 +76,6 @@ pub enum DeferOperation {
         key_index: usize,
         /// Offset to append.
         offset: Offset,
-        /// Expected retry time (for TTL).
-        expected_retry_time: CompactDateTime,
     },
     /// Remove an offset for a key (primitive operation).
     Remove {
@@ -130,11 +123,8 @@ impl Arbitrary for DeferTestInput {
         for _ in 0..op_count {
             let key_index = usize::arbitrary(g) % key_components.len();
 
-            // Helper to generate offset and retry time
+            // Helper to generate offset
             let offset = Offset::from(i64::from(u32::arbitrary(g)));
-            let now_timestamp = chrono::Utc::now().timestamp() as u32;
-            let offset_seconds = (u32::arbitrary(g) % 3600) + 60; // 1-60 mins
-            let expected_retry_time = CompactDateTime::from(now_timestamp + offset_seconds);
 
             let op = match u8::arbitrary(g) % 100 {
                 // Compound operations (60%)
@@ -142,27 +132,15 @@ impl Arbitrary for DeferTestInput {
                     // DeferFirst (15%) - only if not already deferred
                     if deferred_indices.contains(&key_index) {
                         // Use DeferAdditional instead
-                        DeferOperation::DeferAdditional {
-                            key_index,
-                            offset,
-                            expected_retry_time,
-                        }
+                        DeferOperation::DeferAdditional { key_index, offset }
                     } else {
                         deferred_indices.insert(key_index);
-                        DeferOperation::DeferFirst {
-                            key_index,
-                            offset,
-                            expected_retry_time,
-                        }
+                        DeferOperation::DeferFirst { key_index, offset }
                     }
                 }
                 15..=29 => {
                     // DeferAdditional (15%)
-                    DeferOperation::DeferAdditional {
-                        key_index,
-                        offset,
-                        expected_retry_time,
-                    }
+                    DeferOperation::DeferAdditional { key_index, offset }
                 }
                 30..=44 => {
                     // CompleteRetrySuccess (15%)
@@ -190,11 +168,7 @@ impl Arbitrary for DeferTestInput {
                 // Primitive operations (20%)
                 80..=84 => {
                     // Append (5%)
-                    DeferOperation::Append {
-                        key_index,
-                        offset,
-                        expected_retry_time,
-                    }
+                    DeferOperation::Append { key_index, offset }
                 }
                 85..=89 => {
                     // Remove (5%)
@@ -270,9 +244,7 @@ impl DeferModel {
             DeferOperation::GetNext(_) | DeferOperation::IsDeferred(_) => {}
 
             // Compound operations
-            DeferOperation::DeferFirst {
-                key_index, offset, ..
-            } => {
+            DeferOperation::DeferFirst { key_index, offset } => {
                 let key = Arc::clone(&key_components[*key_index].key);
                 // Set retry_count=0 and append offset
                 // Note: Does NOT delete existing offsets (INSERT behavior)
@@ -283,9 +255,7 @@ impl DeferModel {
                 entry.0.insert(*offset);
                 entry.1 = Some(0);
             }
-            DeferOperation::DeferAdditional {
-                key_index, offset, ..
-            } => {
+            DeferOperation::DeferAdditional { key_index, offset } => {
                 let key = Arc::clone(&key_components[*key_index].key);
                 // Append offset without modifying retry_count
                 let entry = self.keys.entry(key).or_insert_with(|| {
@@ -326,9 +296,7 @@ impl DeferModel {
             }
 
             // Primitive operations
-            DeferOperation::Append {
-                key_index, offset, ..
-            } => {
+            DeferOperation::Append { key_index, offset } => {
                 let key = Arc::clone(&key_components[*key_index].key);
                 let entry = self.keys.entry(key).or_insert_with(|| {
                     // When creating a new key, retry_count defaults to None
@@ -624,12 +592,11 @@ where
         op: &DeferOperation,
         key_index: usize,
         offset: Offset,
-        time: CompactDateTime,
     ) -> color_eyre::Result<()> {
         let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .defer_first_message(key, offset, time)
+            .defer_first_message(key, offset)
             .await
             .map_err(|e| self.err("DeferFirst", e))
     }
@@ -640,12 +607,11 @@ where
         op: &DeferOperation,
         key_index: usize,
         offset: Offset,
-        time: CompactDateTime,
     ) -> color_eyre::Result<()> {
         let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .defer_additional_message(key, offset, time)
+            .defer_additional_message(key, offset)
             .await
             .map_err(|e| self.err("DeferAdditional", e))
     }
@@ -656,12 +622,11 @@ where
         op: &DeferOperation,
         key_index: usize,
         offset: Offset,
-        time: CompactDateTime,
     ) -> color_eyre::Result<()> {
         let key = self.key(key_index);
         model.apply(op, self.key_components);
         self.store
-            .append_deferred_message(key, offset, time)
+            .append_deferred_message(key, offset)
             .await
             .map_err(|e| self.err("Append", e))
     }
@@ -730,21 +695,11 @@ where
     };
 
     match op {
-        DeferOperation::DeferFirst {
-            key_index,
-            offset,
-            expected_retry_time,
-        } => {
-            ctx.defer_first(model, op, *key_index, *offset, *expected_retry_time)
-                .await
+        DeferOperation::DeferFirst { key_index, offset } => {
+            ctx.defer_first(model, op, *key_index, *offset).await
         }
-        DeferOperation::DeferAdditional {
-            key_index,
-            offset,
-            expected_retry_time,
-        } => {
-            ctx.defer_additional(model, op, *key_index, *offset, *expected_retry_time)
-                .await
+        DeferOperation::DeferAdditional { key_index, offset } => {
+            ctx.defer_additional(model, op, *key_index, *offset).await
         }
         DeferOperation::CompleteRetrySuccess { key_index, offset } => {
             apply_complete_retry(
@@ -773,13 +728,8 @@ where
             )
             .await
         }
-        DeferOperation::Append {
-            key_index,
-            offset,
-            expected_retry_time,
-        } => {
-            ctx.append(model, op, *key_index, *offset, *expected_retry_time)
-                .await
+        DeferOperation::Append { key_index, offset } => {
+            ctx.append(model, op, *key_index, *offset).await
         }
         DeferOperation::Remove { key_index, offset } => {
             ctx.remove(model, op, *key_index, *offset).await

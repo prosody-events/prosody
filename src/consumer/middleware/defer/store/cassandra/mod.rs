@@ -8,7 +8,6 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::defer::store::DeferStore;
 use crate::consumer::middleware::defer::store::cassandra::queries::Queries;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
-use crate::timers::datetime::CompactDateTime;
 use crate::{Key, Offset, Partition, Topic};
 use scylla::client::session::Session;
 use std::sync::Arc;
@@ -42,8 +41,7 @@ pub fn compute_segment_id(topic: Topic, partition: Partition, consumer_group: &s
 ///   (computed once at construction)
 /// - **Retry count**: Stored as static column (shared across all offsets for a
 ///   key)
-/// - **TTL management**: Uses `CassandraStore::calculate_ttl()` for safe TTL
-///   values
+/// - **TTL management**: Uses fixed TTL from `CassandraStore::base_ttl()`
 /// - **Ordering**: Clustering by offset ASC ensures FIFO processing
 #[derive(Clone, Debug)]
 pub struct CassandraDeferStore {
@@ -63,16 +61,8 @@ impl DeferStore for CassandraDeferStore {
     type Error = CassandraDeferStoreError;
 
     #[instrument(skip(self), err)]
-    async fn defer_first_message(
-        &self,
-        key: &Key,
-        offset: Offset,
-        expected_retry_time: CompactDateTime,
-    ) -> Result<(), Self::Error> {
-        let ttl = self
-            .store
-            .calculate_ttl(expected_retry_time)
-            .ok_or(CassandraDeferStoreError::TtlCalculationFailed)?;
+    async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
+        let ttl = self.store.base_ttl();
 
         // INSERT with retry_count=0 for first failure
         self.session()
@@ -118,16 +108,8 @@ impl DeferStore for CassandraDeferStore {
     }
 
     #[instrument(skip(self), err)]
-    async fn append_deferred_message(
-        &self,
-        key: &Key,
-        offset: Offset,
-        expected_retry_time: CompactDateTime,
-    ) -> Result<(), Self::Error> {
-        let ttl = self
-            .store
-            .calculate_ttl(expected_retry_time)
-            .ok_or(CassandraDeferStoreError::TtlCalculationFailed)?;
+    async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
+        let ttl = self.store.base_ttl();
 
         // Don't include retry_count in INSERT - leaves static column unchanged
         self.session()
@@ -193,10 +175,6 @@ pub enum CassandraDeferStoreError {
     #[error("cassandra error: {0:#}")]
     Cassandra(#[from] CassandraStoreError),
 
-    /// TTL calculation failed (time too far in future).
-    #[error("TTL calculation failed - time exceeds Cassandra limits")]
-    TtlCalculationFailed,
-
     /// Invalid retry count value.
     #[error("invalid retry count {retry_count}: {reason}")]
     InvalidRetryCount {
@@ -212,9 +190,6 @@ impl ClassifyError for CassandraDeferStoreError {
         match self {
             // Delegate Cassandra errors to their classification
             Self::Cassandra(error) => error.classify_error(),
-
-            // TTL calculation failures are permanent - the requested time is invalid
-            Self::TtlCalculationFailed => ErrorCategory::Permanent,
 
             // Invalid retry count is a programming error - terminal
             Self::InvalidRetryCount { .. } => ErrorCategory::Terminal,

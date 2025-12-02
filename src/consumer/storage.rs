@@ -186,7 +186,9 @@ impl From<CassandraDeferStoreError> for StoreCreationError {
             CassandraDeferStoreError::Cassandra(cassandra_err) => {
                 Self::DeferStore(Box::new(cassandra_err))
             }
-            other => Self::DeferStoreInit(Box::new(other)),
+            other @ CassandraDeferStoreError::InvalidRetryCount { .. } => {
+                Self::DeferStoreInit(Box::new(other))
+            }
         }
     }
 }

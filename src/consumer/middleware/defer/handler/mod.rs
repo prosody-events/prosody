@@ -238,19 +238,16 @@ where
         &self,
         message_key: &Key,
         offset: Offset,
-        retry_count: u32,
     ) -> DeferResult<(), S::Error, T::Error, L::Error> {
-        let expected_retry_time = self.expected_retry_time(retry_count)?;
-
         // Append to deferred queue (doesn't modify retry_count)
         self.store
-            .defer_additional_message(message_key, offset, expected_retry_time)
+            .defer_additional_message(message_key, offset)
             .await
             .map_err(DeferError::Store)?;
 
         debug!(
-            "Appended offset {} to deferred queue for key {:?} (retry_count={})",
-            offset, message_key, retry_count
+            "Appended offset {} to deferred queue for key {:?}",
+            offset, message_key
         );
 
         Ok(())
@@ -424,21 +421,16 @@ where
     where
         C: EventContext,
     {
-        let expected_retry_time = self.expected_retry_time(0)?;
-
         // CRITICAL ORDERING (Invariant 1: Timer Coverage):
         // Schedule timer FIRST, then write to store. If timer scheduling fails,
         // error propagates and nothing is stored. If store write fails after timer
         // scheduled, RetryMiddleware retries the entire operation.
         //
         // We use clear_and_schedule to handle retries idempotently.
-        context
-            .clear_and_schedule(expected_retry_time, TimerType::DeferRetry)
-            .await
-            .map_err(|e| DeferError::Timer(Box::new(e)))?;
+        self.schedule_retry_timer(&context, 0).await?;
 
         self.store
-            .defer_first_message(message_key, offset, expected_retry_time)
+            .defer_first_message(message_key, offset)
             .await
             .map_err(DeferError::Store)?;
 
@@ -514,15 +506,14 @@ where
         let offset = message.offset();
 
         // If key is already deferred, append this message to the queue
-        if let Some(retry_count) = self
+        if self
             .store
             .is_deferred(&message_key)
             .await
             .map_err(DeferError::Store)?
+            .is_some()
         {
-            return self
-                .handle_deferred_key_message(&message_key, offset, retry_count)
-                .await;
+            return self.handle_deferred_key_message(&message_key, offset).await;
         }
 
         // Key is not deferred - try to process the message with the inner handler

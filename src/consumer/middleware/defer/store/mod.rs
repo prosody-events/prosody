@@ -10,7 +10,6 @@ pub mod provider;
 pub mod tests;
 
 use crate::consumer::middleware::ClassifyError;
-use crate::timers::datetime::CompactDateTime;
 use crate::{Key, Offset};
 use std::error::Error;
 use std::future::Future;
@@ -70,7 +69,6 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
         &self,
         key: &Key,
         offset: Offset,
-        expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Defers an additional message for an already-deferred key.
@@ -85,12 +83,8 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
         &self,
         key: &Key,
         offset: Offset,
-        expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            self.append_deferred_message(key, offset, expected_retry_time)
-                .await
-        }
+        async move { self.append_deferred_message(key, offset).await }
     }
 
     /// Completes a successful retry and advances or clears the queue.
@@ -169,7 +163,6 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
         &self,
         key: &Key,
         offset: Offset,
-        expected_retry_time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Removes an offset without modifying `retry_count` or deleting the key.
