@@ -583,11 +583,37 @@ where
             // Check if we should defer again
             if !self.decider.should_defer() {
                 debug!("Deferral disabled due to high failure rate");
-                // Clean up this offset and propagate error
-                self.store
-                    .remove_deferred_message(message_key, offset)
+
+                // Clean up current offset and prepare next message (if any).
+                // This mirrors the permanent error handling below - we need to
+                // ensure remaining queued messages still have timer coverage.
+                let result = self
+                    .store
+                    .complete_retry_success(message_key, offset)
                     .await
                     .map_err(DeferError::Store)?;
+
+                // Handle timer management before propagating the error
+                match result {
+                    RetryCompletionResult::MoreMessages { next_offset } => {
+                        // Schedule timer for the next deferred message (retry_count reset to 0)
+                        self.schedule_retry_timer(context, 0).await?;
+
+                        debug!(
+                            "Deferral disabled for key {:?} offset {}, scheduled timer for next \
+                             offset {}",
+                            message_key, offset, next_offset
+                        );
+                    }
+                    RetryCompletionResult::Completed => {
+                        // No more messages - clear the timer
+                        context
+                            .clear_scheduled(TimerType::DeferRetry)
+                            .await
+                            .map_err(|e| DeferError::Timer(Box::new(e)))?;
+                    }
+                }
+
                 return Err(DeferError::Configuration(ConfigurationError::Invalid(
                     format!("Deferral disabled: {error}"),
                 )));
@@ -684,11 +710,16 @@ where
         // scheduling).
         //
         // This ensures every deferred message has timer coverage.
+        //
+        // NOTE: We use clear_and_schedule (not plain schedule) to handle the
+        // retry scenario: if store write fails after timer was scheduled, the
+        // retry will attempt to schedule again. clear_and_schedule ensures we
+        // don't create duplicate timers - it clears any stale timer first.
 
         // 1. Schedule timer FIRST (for first failure only)
         if retry_count == 0 {
             context
-                .schedule(expected_retry_time, TimerType::DeferRetry)
+                .clear_and_schedule(expected_retry_time, TimerType::DeferRetry)
                 .await
                 .map_err(|e| DeferError::Timer(Box::new(e)))?;
         }
@@ -774,7 +805,7 @@ where
                     self.defer_message(context, &message_key, &message).await?;
                     Ok(())
                 } else {
-                    // Transient or terminal errors - don't defer, propagate immediately
+                    // Permanent or terminal errors - don't defer, propagate immediately
                     Err(DeferError::Handler(error))
                 }
             }
@@ -817,11 +848,18 @@ where
                 result
             }
             Ok(None) => {
-                // No deferred message found - possibly already succeeded or expired
+                // No deferred message found - possibly already succeeded or expired.
+                // Clear the timer to ensure clean state (defensive - the timer that
+                // just fired won't fire again, but this handles any edge cases with
+                // stale scheduled timers).
                 tracing::info!(
-                    "on_timer: No deferred message found for key {:?}",
+                    "on_timer: No deferred message found for key {:?}, clearing timer",
                     message_key
                 );
+                context
+                    .clear_scheduled(TimerType::DeferRetry)
+                    .await
+                    .map_err(|e| DeferError::Timer(Box::new(e)))?;
                 return Ok(());
             }
             Err(e) => {
