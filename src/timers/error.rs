@@ -93,17 +93,17 @@ where
             // Message processing was cancelled due to timeout or graceful shutdown. Transient
             // allows retry after system recovers - cancellation was due to external constraint,
             // not bad data.
-            TimerManagerError::Cancelled => ErrorCategory::Transient,
+            //
+            // ConflictsWithCurrentTimer: Attempted to schedule at the same time/type as current
+            // timer. The caller should use a different time, which is likely if they're using the
+            // current time, which is why this is transient.
+            TimerManagerError::Cancelled | TimerManagerError::ConflictsWithCurrentTimer => {
+                ErrorCategory::Transient
+            }
 
             // Context no longer valid because event already processed. Duplicate processing
             // attempt with stale context. Permanent to drop duplicate rather than retry endlessly.
-            //
-            // ConflictsWithCurrentTimer: Attempted to schedule at the same time/type as current
-            // timer. This is a programming error - the caller should use a different time.
-            // Permanent to surface the bug.
-            TimerManagerError::InvalidContext | TimerManagerError::ConflictsWithCurrentTimer => {
-                ErrorCategory::Permanent
-            }
+            TimerManagerError::InvalidContext => ErrorCategory::Permanent,
         }
     }
 }

@@ -47,9 +47,9 @@ use crate::defer_store_tests;
 /// # Usage
 ///
 /// ```rust,no_run
+/// use prosody::consumer::middleware::defer::store::DeferStoreProvider;
 /// use prosody::consumer::middleware::defer::store::cached::CachedDeferStore;
 /// use prosody::consumer::middleware::defer::store::memory::MemoryDeferStoreProvider;
-/// use prosody::consumer::middleware::defer::store::DeferStoreProvider;
 /// use prosody::{Partition, Topic};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
