@@ -1,10 +1,10 @@
 //! Provider for creating Cassandra defer stores with shared resources.
 
 use super::queries::Queries;
-use super::{CassandraDeferStore, CassandraDeferStoreError};
+use super::{CassandraDeferStore, CassandraDeferStoreError, compute_segment_id};
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::consumer::middleware::defer::store::{DeferStoreProvider, compute_segment_id};
+use crate::consumer::middleware::defer::store::DeferStoreProvider;
 use crate::{Partition, Topic};
 use std::sync::Arc;
 use tracing::instrument;

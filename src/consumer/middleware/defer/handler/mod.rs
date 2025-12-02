@@ -446,6 +446,50 @@ where
 
         Ok(())
     }
+
+    /// Loads a deferred message from storage and Kafka, validating key
+    /// consistency.
+    ///
+    /// Returns `None` if no message is deferred for this key, or if the loaded
+    /// message has a key mismatch (which is cleaned up automatically).
+    async fn load_deferred_message(
+        &self,
+        message_key: &Key,
+    ) -> DeferResult<Option<(ConsumerMessage, Offset, u32)>, S::Error, T::Error, L::Error> {
+        // Get the next deferred message metadata from store
+        let Some((offset, retry_count)) = self
+            .store
+            .get_next_deferred_message(message_key)
+            .await
+            .map_err(DeferError::Store)?
+        else {
+            return Ok(None);
+        };
+
+        // Load the actual message from Kafka
+        let message = self
+            .loader
+            .load_message(self.topic, self.partition, offset)
+            .await
+            .map_err(DeferError::Loader)?;
+
+        // Verify the key matches (sanity check against data corruption)
+        if message.key() != message_key {
+            warn!(
+                "Key mismatch: expected {:?}, got {:?} - removing offset {}",
+                message_key,
+                message.key(),
+                offset
+            );
+            self.store
+                .remove_deferred_message(message_key, offset)
+                .await
+                .map_err(DeferError::Store)?;
+            return Ok(None);
+        }
+
+        Ok(Some((message, offset, retry_count)))
+    }
 }
 
 impl<T, S, L, D> FallibleHandler for DeferHandler<T, S, L, D>
@@ -513,9 +557,8 @@ where
     where
         C: EventContext,
     {
-        // Check if this is a defer retry timer
+        // Not our timer - pass to inner handler
         if trigger.timer_type != TimerType::DeferRetry {
-            // Not our timer, pass to inner handler
             return self
                 .handler
                 .on_timer(context, trigger, demand_type)
@@ -523,18 +566,11 @@ where
                 .map_err(DeferError::Handler);
         }
 
-        // This is a defer retry timer - load and retry the deferred message
         let message_key = &trigger.key;
 
-        // Get the next deferred message for this key
-        let Some((offset, retry_count)) = self
-            .store
-            .get_next_deferred_message(message_key)
-            .await
-            .map_err(DeferError::Store)?
+        // Load the deferred message, clearing timer if not found
+        let Some((message, offset, retry_count)) = self.load_deferred_message(message_key).await?
         else {
-            // No deferred message found - possibly already succeeded or expired.
-            // Clear the timer defensively to ensure clean state.
             debug!(
                 "No deferred message found for key {:?}, clearing timer",
                 message_key
@@ -545,28 +581,6 @@ where
                 .map_err(|e| DeferError::Timer(Box::new(e)))?;
             return Ok(());
         };
-
-        // Load the actual message
-        let message = self
-            .loader
-            .load_message(self.topic, self.partition, offset)
-            .await
-            .map_err(DeferError::Loader)?;
-
-        // Verify the key matches (sanity check)
-        if message.key() != message_key {
-            warn!(
-                "Key mismatch: expected {:?}, got {:?} - removing offset {}",
-                message_key,
-                message.key(),
-                offset
-            );
-            self.store
-                .remove_deferred_message(message_key, offset)
-                .await
-                .map_err(DeferError::Store)?;
-            return Ok(());
-        }
 
         // Retry the handler
         match self

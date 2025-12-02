@@ -9,7 +9,7 @@ use crate::consumer::middleware::defer::store::DeferStore;
 use crate::consumer::middleware::defer::store::cassandra::queries::Queries;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
-use crate::{Key, Offset};
+use crate::{Key, Offset, Partition, Topic};
 use scylla::client::session::Session;
 use std::sync::Arc;
 use thiserror::Error;
@@ -20,6 +20,13 @@ pub mod provider;
 mod queries;
 
 pub use provider::CassandraDeferStoreProvider;
+
+/// Deterministic `UUIDv5` from `"{topic}/{partition}:{consumer_group}"`.
+#[must_use]
+pub fn compute_segment_id(topic: Topic, partition: Partition, consumer_group: &str) -> Uuid {
+    let input = format!("{topic}/{partition}:{consumer_group}");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
+}
 
 /// Cassandra-based implementation of [`DeferStore`].
 ///

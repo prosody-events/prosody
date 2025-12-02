@@ -11,10 +11,9 @@ pub mod tests;
 
 use crate::consumer::middleware::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
-use crate::{Key, Offset, Partition, Topic};
+use crate::{Key, Offset};
 use std::error::Error;
 use std::future::Future;
-use uuid::Uuid;
 
 pub use cached::CachedDeferStore;
 pub use cassandra::{CassandraDeferStore, CassandraDeferStoreProvider};
@@ -195,11 +194,4 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
 
     /// Deletes all data for a key. Used by default implementations.
     fn delete_key(&self, key: &Key) -> impl Future<Output = Result<(), Self::Error>> + Send;
-}
-
-/// Deterministic `UUIDv5` from `"{topic}/{partition}:{consumer_group}"`.
-#[must_use]
-pub fn compute_segment_id(topic: Topic, partition: Partition, consumer_group: &str) -> Uuid {
-    let input = format!("{topic}/{partition}:{consumer_group}");
-    Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
 }
