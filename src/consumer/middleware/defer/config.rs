@@ -71,15 +71,18 @@ pub struct DeferConfiguration {
     )]
     pub failure_window: Duration,
 
-    /// Cache size for deferred key state.
+    /// Cache size for defer middleware caches.
     ///
-    /// Caches the defer state (`NotDeferred` vs `Deferred { retry_count }`) for
-    /// each key to avoid Cassandra reads on every message.
+    /// Controls capacity for two caches:
+    /// - **Store cache**: Caches each key's next deferred message (offset and
+    ///   retry count) to avoid store queries when checking if a key is deferred
+    /// - **Loader cache**: Caches decoded Kafka messages to avoid redundant
+    ///   reads when retrying deferred messages
     ///
     /// Environment variable: `PROSODY_DEFER_CACHE_SIZE`
-    /// Default: 10,000 keys
+    /// Default: 1,024 entries
     #[builder(
-        default = "from_env_with_fallback(\"PROSODY_DEFER_CACHE_SIZE\", 10_000)?",
+        default = "from_env_with_fallback(\"PROSODY_DEFER_CACHE_SIZE\", 1_024)?",
         setter(into)
     )]
     #[validate(range(min = 1_usize))]
