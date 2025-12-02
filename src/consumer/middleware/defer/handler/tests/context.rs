@@ -9,6 +9,7 @@ use crate::Key;
 use crate::consumer::event_context::EventContext;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
+use ahash::RandomState;
 use futures::stream::{self, Stream};
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -26,12 +27,21 @@ use std::sync::Arc;
 ///
 /// Timers are tracked per key with a set of scheduled times, allowing
 /// multiple timers per key and precise removal of specific timers.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TimerCapture {
     /// Recorded operations in order (for debugging/verification).
     events: Arc<scc::Queue<OutputEvent>>,
     /// Currently active timers: key -> set of scheduled times.
-    active_timers: Arc<scc::HashMap<Key, BTreeSet<CompactDateTime>>>,
+    active_timers: Arc<scc::HashMap<Key, BTreeSet<CompactDateTime>, RandomState>>,
+}
+
+impl Default for TimerCapture {
+    fn default() -> Self {
+        Self {
+            events: Arc::new(scc::Queue::default()),
+            active_timers: Arc::new(scc::HashMap::with_hasher(RandomState::new())),
+        }
+    }
 }
 
 impl TimerCapture {

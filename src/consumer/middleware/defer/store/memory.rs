@@ -28,6 +28,7 @@ use crate::{Key, Offset, Partition, Topic};
 
 #[cfg(test)]
 use crate::defer_store_tests;
+use ahash::RandomState;
 use scc::HashMap;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -78,10 +79,18 @@ impl Default for MemoryDeferStore {
 /// - `BTreeMap<Offset, Instant>`: Sorted offsets (oldest first) with TTL
 ///   simulation
 /// - `u32`: Shared retry counter for this key
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
     /// Storage: `message_key` -> (`offsets_with_expiry`, `retry_count`)
-    deferred: HashMap<Key, (BTreeMap<Offset, Instant>, u32)>,
+    deferred: HashMap<Key, (BTreeMap<Offset, Instant>, u32), RandomState>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            deferred: HashMap::with_hasher(RandomState::new()),
+        }
+    }
 }
 
 impl DeferStore for MemoryDeferStore {

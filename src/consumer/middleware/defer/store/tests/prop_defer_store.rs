@@ -5,10 +5,10 @@
 
 use crate::consumer::middleware::defer::store::{DeferStore, RetryCompletionResult};
 use crate::{Key, Offset};
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use color_eyre::eyre::Report;
 use quickcheck::{Arbitrary, Gen};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -118,7 +118,7 @@ impl Arbitrary for DeferTestInput {
 
         // Track which key indices have had DeferFirst called to avoid calling it
         // multiple times
-        let mut deferred_indices = HashSet::new();
+        let mut deferred_indices = HashSet::default();
 
         for _ in 0..op_count {
             let key_index = usize::arbitrary(g) % key_components.len();
