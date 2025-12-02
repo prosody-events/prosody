@@ -10,6 +10,18 @@ use std::fmt::Debug;
 use thiserror::Error;
 use validator::ValidationErrors;
 
+/// Result type alias for defer operations.
+///
+/// Wraps the standard `Result` with [`DeferError`] as the error type.
+///
+/// # Type Parameters
+///
+/// * `T` - Success value type
+/// * `S` - Store error type (from `DeferStore::Error`)
+/// * `H` - Handler error type (from inner `FallibleHandler::Error`)
+/// * `L` - Loader error type (from `MessageLoader::Error`)
+pub type DeferResult<T, S, H, L> = Result<T, DeferError<S, H, L>>;
+
 /// Errors that can occur in defer middleware operations.
 ///
 /// Generic over store, handler, and loader error types. Timer errors use type
