@@ -334,6 +334,28 @@ where
         }
     }
 
+    /// Removes a message from the deferred queue and reschedules for remaining.
+    ///
+    /// Used after successfully processing a message, giving up on a permanent
+    /// failure, or skipping a corrupted message. Maintains the invariant that
+    /// all remaining messages will be processed.
+    async fn remove_and_reschedule<C>(
+        &self,
+        context: &C,
+        message_key: &Key,
+        offset: Offset,
+    ) -> DeferResult<(), S::Error, T::Error, L::Error>
+    where
+        C: EventContext,
+    {
+        let result = self
+            .store
+            .complete_retry_success(message_key, offset)
+            .await
+            .map_err(DeferError::Store)?;
+        self.handle_completion_result(context, result).await
+    }
+
     /// Removes the successfully processed message and manages remaining queue.
     async fn handle_retry_success<C>(
         &self,
@@ -345,13 +367,8 @@ where
     where
         C: EventContext,
     {
-        let result = self
-            .store
-            .complete_retry_success(message_key, offset)
-            .await
-            .map_err(DeferError::Store)?;
-
-        self.handle_completion_result(context, result).await?;
+        self.remove_and_reschedule(context, message_key, offset)
+            .await?;
 
         debug!(
             "Deferred message succeeded for key {:?} after {} retries",
@@ -397,17 +414,11 @@ where
             return Ok(());
         }
 
-        // Not re-deferring: clean up this offset and manage timer for remaining
-        // messages
-        let result = self
-            .store
-            .complete_retry_success(message_key, offset)
-            .await
-            .map_err(DeferError::Store)?;
+        // Not re-deferring: clean up this offset and reschedule for remaining
+        self.remove_and_reschedule(context, message_key, offset)
+            .await?;
 
-        self.handle_completion_result(context, result).await?;
-
-        // Not re-deferring: propagate the original handler error
+        // Propagate the original handler error
         Err(DeferError::Handler(error))
     }
 
@@ -438,18 +449,57 @@ where
                 message_key, offset, error
             );
 
-            // Remove this offset and schedule timer for remaining messages.
-            // This ensures remaining messages are still processed in order.
-            let result = self
-                .store
-                .complete_retry_success(message_key, offset)
-                .await
-                .map_err(DeferError::Store)?;
-
-            self.handle_completion_result(context, result).await?;
+            self.remove_and_reschedule(context, message_key, offset)
+                .await?;
         }
 
         Err(DeferError::Loader(error))
+    }
+
+    /// Loads a deferred message from Kafka and validates it.
+    ///
+    /// Returns `Ok(Some(message))` if the message was loaded and validated.
+    /// Returns `Ok(None)` if a permanent error occurred and was handled
+    /// (remaining messages rescheduled). Returns `Err` for transient loader
+    /// errors that should be retried.
+    async fn load_deferred_message<C>(
+        &self,
+        context: &C,
+        message_key: &Key,
+        offset: Offset,
+    ) -> DeferResult<Option<ConsumerMessage>, S::Error, T::Error, L::Error>
+    where
+        C: EventContext,
+    {
+        // Load the actual message from Kafka.
+        let message = match self
+            .loader
+            .load_message(self.topic, self.partition, offset)
+            .await
+        {
+            Ok(msg) => msg,
+            Err(error) => {
+                // Permanent errors are cleaned up; transient errors propagate.
+                self.handle_loader_failure(context, message_key, offset, error)
+                    .await?;
+                return Ok(None);
+            }
+        };
+
+        // Verify the key matches (sanity check against data corruption).
+        if message.key() != message_key {
+            warn!(
+                "Key mismatch: expected {:?}, got {:?} - skipping offset {}",
+                message_key,
+                message.key(),
+                offset
+            );
+            self.handle_message_skip(context, message_key, offset)
+                .await?;
+            return Ok(None);
+        }
+
+        Ok(Some(message))
     }
 
     /// Handles messages that should be skipped (e.g., key mismatch due to
@@ -467,16 +517,8 @@ where
     where
         C: EventContext,
     {
-        // Remove this offset and manage remaining queue.
-        // complete_retry_success returns whether more messages exist.
-        let result = self
-            .store
-            .complete_retry_success(message_key, offset)
+        self.remove_and_reschedule(context, message_key, offset)
             .await
-            .map_err(DeferError::Store)?;
-
-        // Schedule timer for remaining messages, or clear if none left.
-        self.handle_completion_result(context, result).await
     }
 
     /// Defers a message for the first time (key not already deferred).
@@ -526,21 +568,26 @@ where
     where
         C: EventContext,
     {
-        let message_key = message.key().clone();
-        let offset = message.offset();
-
-        // If key is already deferred, append this message to the queue
+        // If key is already deferred, append this message to the queue.
+        // Borrow from message to avoid cloning in this path.
         if self
             .store
-            .is_deferred(&message_key)
+            .is_deferred(message.key())
             .await
             .map_err(DeferError::Store)?
             .is_some()
         {
-            return self.handle_deferred_key_message(&message_key, offset).await;
+            let offset = message.offset();
+            return self
+                .handle_deferred_key_message(message.key(), offset)
+                .await;
         }
 
-        // Key is not deferred - try to process the message with the inner handler
+        // Key is not deferred - clone key before handler consumes message
+        let message_key = message.key().clone();
+        let offset = message.offset();
+
+        // Try to process the message with the inner handler
         let Err(error) = self
             .handler
             .on_message(context.clone(), message, demand_type)
@@ -602,37 +649,16 @@ where
             return Ok(());
         };
 
-        // Step 2: Load the actual message from Kafka.
-        // On permanent loader errors, we must clean up the offset and reschedule
-        // for remaining messages to maintain invariants.
-        let message = match self
-            .loader
-            .load_message(self.topic, self.partition, offset)
-            .await
-        {
-            Ok(msg) => msg,
-            Err(error) => {
-                return self
-                    .handle_loader_failure(&context, message_key, offset, error)
-                    .await;
-            }
+        // Step 2: Load and validate the message from Kafka.
+        let Some(message) = self
+            .load_deferred_message(&context, message_key, offset)
+            .await?
+        else {
+            // Permanent error handled and remaining messages rescheduled.
+            return Ok(());
         };
 
-        // Step 3: Verify the key matches (sanity check against data corruption).
-        // On mismatch, skip this message and reschedule for remaining.
-        if message.key() != message_key {
-            warn!(
-                "Key mismatch: expected {:?}, got {:?} - skipping offset {}",
-                message_key,
-                message.key(),
-                offset
-            );
-            return self
-                .handle_message_skip(&context, message_key, offset)
-                .await;
-        }
-
-        // Step 4: Retry the handler
+        // Step 3: Retry the handler
         match self
             .handler
             .on_message(context.clone(), message, DemandType::Failure)
