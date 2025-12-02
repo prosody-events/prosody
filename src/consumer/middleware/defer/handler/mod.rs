@@ -635,7 +635,7 @@ where
         // Step 4: Retry the handler
         match self
             .handler
-            .on_message(context.clone(), message, demand_type)
+            .on_message(context.clone(), message, DemandType::Failure)
             .await
         {
             Ok(()) => {
