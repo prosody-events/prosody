@@ -27,9 +27,8 @@ use crate::consumer::middleware::defer::loader::{MemoryLoader, MessageLoader};
 use crate::consumer::middleware::defer::store::CachedDeferStore;
 use crate::consumer::middleware::defer::store::DeferStore;
 use crate::consumer::middleware::defer::store::memory::MemoryDeferStore;
-use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
-use crate::{Key, Offset, Partition, Topic};
+use crate::{Key, Partition, Topic};
 use color_eyre::eyre::eyre;
 use serde_json::json;
 use std::sync::Arc;
@@ -97,11 +96,11 @@ type TestDeferHandler = DeferHandler<
 /// - `TimerCapture`: Captures timer operations for verification
 pub struct TestHarness {
     /// The real defer handler under test.
-    handler: TestDeferHandler,
+    pub(crate) handler: TestDeferHandler,
     /// Inner handler for setting outcomes (shared via Arc).
-    inner_handler: OutcomeHandler,
+    pub(crate) inner_handler: OutcomeHandler,
     /// Decider for setting defer decisions (shared via Arc).
-    decider: TraceBasedDecider,
+    pub(crate) decider: TraceBasedDecider,
     /// Loader for storing messages (shared via Arc).
     loader: MemoryLoader,
     /// Store for verification (shared via Arc, wrapped in `CachedDeferStore`
@@ -370,143 +369,5 @@ impl TestHarness {
     /// Verifies all invariants after executing an event.
     pub async fn verify_invariants(&self) -> color_eyre::Result<()> {
         verify_timer_coverage(&self.capture, &self.store, &self.keys).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::consumer::middleware::defer::handler::tests::TEST_RUNTIME;
-    use crate::tracing::init_test_logging;
-
-    #[test]
-    fn harness_executes_simple_defer_sequence() {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            let mut harness = TestHarness::new(1).ok()?;
-
-            // Message arrives and is deferred
-            let msg = MessageEvent {
-                key_idx: 0,
-                offset: Offset::from(1_i64),
-                outcome: MessageOutcome::Transient {
-                    max_backoff: CompactDuration::new(60),
-                    defer: true,
-                },
-            };
-            harness.execute_message(&msg).await.ok()?;
-
-            // Key should be deferred
-            let retry_count = harness.get_retry_count(0).await.ok()??;
-            assert_eq!(retry_count, 0);
-
-            // Timer should be active
-            let key = harness.key(0).clone();
-            assert!(harness.capture().has_active_timer(&key));
-
-            // Timer fires successfully
-            let timer = TimerEvent {
-                key_idx: 0,
-                offset: Offset::from(1_i64),
-                outcome: TimerOutcome::Success,
-            };
-            harness.execute_timer(&timer).await.ok()?;
-
-            // Key should not be deferred
-            let retry_count = harness.get_retry_count(0).await.ok()?;
-            assert!(retry_count.is_none());
-
-            // Timer should be cleared
-            assert!(!harness.capture().has_active_timer(&key));
-
-            Some(())
-        });
-    }
-
-    #[test]
-    fn harness_queues_additional_messages() {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            let mut harness = TestHarness::new(1).ok()?;
-
-            // First message defers
-            let msg1 = MessageEvent {
-                key_idx: 0,
-                offset: Offset::from(1_i64),
-                outcome: MessageOutcome::Transient {
-                    max_backoff: CompactDuration::new(60),
-                    defer: true,
-                },
-            };
-            harness.execute_message(&msg1).await.ok()?;
-
-            // Second message queues
-            let msg2 = MessageEvent {
-                key_idx: 0,
-                offset: Offset::from(2_i64),
-                outcome: MessageOutcome::Queued,
-            };
-            harness.execute_message(&msg2).await.ok()?;
-
-            // Timer fires for first message
-            let timer1 = TimerEvent {
-                key_idx: 0,
-                offset: Offset::from(1_i64),
-                outcome: TimerOutcome::Success,
-            };
-            harness.execute_timer(&timer1).await.ok()?;
-
-            // Key should still be deferred (has second message)
-            let retry_count = harness.get_retry_count(0).await.ok()?;
-            assert!(retry_count.is_some());
-
-            // Timer should still be active
-            let key = harness.key(0).clone();
-            assert!(harness.capture().has_active_timer(&key));
-
-            Some(())
-        });
-    }
-
-    #[test]
-    fn harness_increments_retry_count_on_transient_timer() {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            let mut harness = TestHarness::new(1).ok()?;
-
-            // Message defers
-            let msg = MessageEvent {
-                key_idx: 0,
-                offset: Offset::from(1_i64),
-                outcome: MessageOutcome::Transient {
-                    max_backoff: CompactDuration::new(60),
-                    defer: true,
-                },
-            };
-            harness.execute_message(&msg).await.ok()?;
-
-            // Initial retry count is 0
-            let retry_count = harness.get_retry_count(0).await.ok()??;
-            assert_eq!(retry_count, 0);
-
-            // Timer fires with transient failure
-            let timer = TimerEvent {
-                key_idx: 0,
-                offset: Offset::from(1_i64),
-                outcome: TimerOutcome::Transient {
-                    max_backoff: CompactDuration::new(120),
-                },
-            };
-            harness.execute_timer(&timer).await.ok()?;
-
-            // Retry count should be incremented
-            let retry_count = harness.get_retry_count(0).await.ok()??;
-            assert_eq!(retry_count, 1);
-
-            Some(())
-        });
     }
 }

@@ -12,6 +12,7 @@ mod context;
 mod generator;
 mod handler;
 mod harness;
+mod integration;
 mod properties;
 mod types;
 
