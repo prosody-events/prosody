@@ -32,7 +32,7 @@ mod kafka;
 mod memory;
 
 pub use kafka::{KafkaLoader, KafkaLoaderError, LoaderConfiguration};
-pub use memory::MemoryLoader;
+pub use memory::{MemoryLoader, MemoryLoaderError};
 
 /// Loads messages by their exact offset coordinates for retry.
 ///

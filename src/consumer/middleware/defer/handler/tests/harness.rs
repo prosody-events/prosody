@@ -17,6 +17,7 @@
 
 use super::context::{KeyedCapturingContext, TimerCapture};
 use super::handler::{HandlerOutcome, OutcomeHandler};
+use super::loader::{FailableLoader, LoaderFailureType};
 use super::types::{MessageEvent, MessageOutcome, TimerEvent, TimerOutcome, TraceEvent};
 use crate::consumer::DemandType;
 use crate::consumer::middleware::FallibleHandler;
@@ -81,7 +82,7 @@ pub async fn verify_timer_coverage(
 type TestDeferHandler = DeferHandler<
     OutcomeHandler,
     CachedDeferStore<MemoryDeferStore>,
-    MemoryLoader,
+    FailableLoader,
     TraceBasedDecider,
 >;
 
@@ -101,8 +102,8 @@ pub struct TestHarness {
     pub(crate) inner_handler: OutcomeHandler,
     /// Decider for setting defer decisions (shared via Arc).
     pub(crate) decider: TraceBasedDecider,
-    /// Loader for storing messages (shared via Arc).
-    loader: MemoryLoader,
+    /// Loader for storing messages and injecting failures (shared via Arc).
+    loader: FailableLoader,
     /// Store for verification (shared via Arc, wrapped in `CachedDeferStore`
     /// inside handler).
     store: MemoryDeferStore,
@@ -133,7 +134,8 @@ impl TestHarness {
         // Create shared components (all use Arc internally)
         let inner_handler = OutcomeHandler::new();
         let decider = TraceBasedDecider::new();
-        let loader = MemoryLoader::new();
+        let memory_loader = MemoryLoader::new();
+        let loader = FailableLoader::new(memory_loader);
         let store = MemoryDeferStore::new();
         let capture = TimerCapture::new();
 
@@ -190,6 +192,12 @@ impl TestHarness {
     #[must_use]
     pub fn capture(&self) -> &TimerCapture {
         &self.capture
+    }
+
+    /// Returns a reference to the loader for failure injection.
+    #[must_use]
+    pub fn loader(&self) -> &FailableLoader {
+        &self.loader
     }
 
     /// Returns all processed messages in order (drains the queue).
@@ -302,7 +310,25 @@ impl TestHarness {
             );
         };
 
+        // Inject loader failure based on outcome (before setting handler outcome)
+        match &event.outcome {
+            TimerOutcome::LoaderPermanent => {
+                self.loader
+                    .set_next_failure(Some(LoaderFailureType::Permanent));
+            }
+            TimerOutcome::LoaderTransient { .. } => {
+                self.loader
+                    .set_next_failure(Some(LoaderFailureType::Transient));
+            }
+            _ => {
+                // No loader failure - clear any previous setting
+                self.loader.set_next_failure(None);
+            }
+        }
+
         // Set the handler outcome based on the trace
+        // Note: For loader failures, the handler won't be called, but we set a
+        // safe default anyway
         let outcome = match &event.outcome {
             TimerOutcome::Success => HandlerOutcome::Success,
             TimerOutcome::Permanent => HandlerOutcome::Permanent,
@@ -310,6 +336,10 @@ impl TestHarness {
                 // Timer transient failures always defer (no decider check in retry path)
                 self.decider.set_next(true);
                 HandlerOutcome::Transient
+            }
+            TimerOutcome::LoaderPermanent | TimerOutcome::LoaderTransient { .. } => {
+                // Loader fails before handler is called - set safe default
+                HandlerOutcome::Success
             }
         };
         self.inner_handler.set_outcome(outcome);
@@ -337,15 +367,22 @@ impl TestHarness {
         // - Success: completes, schedules next if queue not empty, returns Ok
         // - Transient: increments retry count, reschedules same offset, returns Ok
         // - Permanent: removes offset, schedules next if queued, PROPAGATES error
+        // - LoaderPermanent: loader fails permanently, offset removed, schedules next,
+        //   returns Ok
+        // - LoaderTransient: loader fails transiently, reschedules same offset, returns
+        //   Ok
         match &event.outcome {
-            TimerOutcome::Success | TimerOutcome::Transient { .. } => {
-                // These should succeed (errors handled internally)
+            TimerOutcome::Success
+            | TimerOutcome::Transient { .. }
+            | TimerOutcome::LoaderPermanent
+            | TimerOutcome::LoaderTransient { .. } => {
+                // These should succeed (errors handled internally by DeferHandler)
                 if let Err(e) = result {
                     return Err(eyre!("Timer failed unexpectedly: {e}"));
                 }
             }
             TimerOutcome::Permanent => {
-                // Permanent errors are propagated - this is expected
+                // Handler permanent errors are propagated - this is expected
                 if result.is_ok() {
                     return Err(eyre!("Expected error for Permanent timer but got Ok"));
                 }

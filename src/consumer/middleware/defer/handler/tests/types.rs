@@ -85,6 +85,7 @@ pub struct MessageEvent {
 /// No `defer` flag needed - key is already deferred when timer fires.
 #[derive(Clone, Debug)]
 pub enum TimerOutcome {
+    // Handler outcomes (loader succeeded, handler executed)
     /// Retry succeeds - offset complete, next message or clear.
     Success,
 
@@ -94,6 +95,19 @@ pub enum TimerOutcome {
     /// Retry fails transiently - reschedule with backoff.
     Transient {
         /// Maximum backoff for verification.
+        max_backoff: CompactDuration,
+    },
+
+    // Loader outcomes (handler NOT executed)
+    /// Loader fails permanently - offset complete, next message or clear.
+    /// Same state transition as `Success`/`Permanent`.
+    LoaderPermanent,
+
+    /// Loader fails transiently - reschedule with backoff.
+    /// Unlike handler `Transient`, does NOT increment retry count.
+    LoaderTransient {
+        /// Maximum backoff for verification (based on current `retry_count`,
+        /// not incremented).
         max_backoff: CompactDuration,
     },
 }

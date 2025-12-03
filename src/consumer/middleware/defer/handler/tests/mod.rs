@@ -13,8 +13,11 @@ mod generator;
 mod handler;
 mod harness;
 mod integration;
+mod loader;
 mod properties;
 mod types;
+
+pub use loader::{FailableLoader, FailableLoaderError, LoaderFailureType};
 
 /// Base backoff delay in seconds for test handler config.
 pub const TEST_BASE_BACKOFF_SECS: u32 = 1;

@@ -34,6 +34,8 @@ enum TimerOutcomeType {
     Success,
     Permanent,
     Transient,
+    LoaderPermanent,
+    LoaderTransient,
 }
 
 // ============================================================================
@@ -174,6 +176,26 @@ impl TraceBuilder {
                     max_backoff: expected_max_backoff(new_retry_count),
                 }
             }
+            TimerOutcomeType::LoaderPermanent => {
+                // Same state transition as Success/Permanent: pop head, clear retry count
+                if let Some(queue) = self.deferred.get_mut(&key_idx) {
+                    queue.pop_front();
+                }
+                self.retry_counts.remove(&(key_idx, offset));
+                TimerOutcome::LoaderPermanent
+            }
+            TimerOutcomeType::LoaderTransient => {
+                // Keep offset at head, DON'T increment retry_count
+                // Use current retry_count for max_backoff calculation
+                let current_retry_count = self
+                    .retry_counts
+                    .get(&(key_idx, offset))
+                    .copied()
+                    .unwrap_or(0);
+                TimerOutcome::LoaderTransient {
+                    max_backoff: expected_max_backoff(current_retry_count),
+                }
+            }
         };
 
         self.events.push(TraceEvent::Timer(TimerEvent {
@@ -220,10 +242,14 @@ impl TraceBuilder {
             self.add_message_event(g, key_idx, outcome);
         } else if is_deferred {
             // 40% timer events (only if key is deferred)
-            let outcome_type = match u8::arbitrary(g) % 3 {
-                0 => TimerOutcomeType::Success,
-                1 => TimerOutcomeType::Permanent,
-                _ => TimerOutcomeType::Transient,
+            // Distribution: ~20% each Success/Permanent/Transient, ~14% each
+            // LoaderPermanent/LoaderTransient
+            let outcome_type = match u8::arbitrary(g) % 7 {
+                0 | 5 => TimerOutcomeType::Success,     // ~28%
+                1 => TimerOutcomeType::Permanent,       // ~14%
+                2 | 6 => TimerOutcomeType::Transient,   // ~28%
+                3 => TimerOutcomeType::LoaderPermanent, // ~14%
+                _ => TimerOutcomeType::LoaderTransient, // ~14%
             };
             self.add_timer_event(g, key_idx, outcome_type);
         } else {
@@ -332,10 +358,12 @@ impl Trace {
                     }
 
                     match &timer.outcome {
-                        TimerOutcome::Success | TimerOutcome::Permanent => {
+                        TimerOutcome::Success
+                        | TimerOutcome::Permanent
+                        | TimerOutcome::LoaderPermanent => {
                             queue.pop_front();
                         }
-                        TimerOutcome::Transient { .. } => {
+                        TimerOutcome::Transient { .. } | TimerOutcome::LoaderTransient { .. } => {
                             // Offset stays at head
                         }
                     }
