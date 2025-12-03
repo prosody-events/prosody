@@ -103,8 +103,10 @@ where
             // Configuration errors are terminal - system cannot operate
             Self::Configuration(_) => ErrorCategory::Terminal,
 
+            // Store errors: treat all store errors as transient to prevent data loss.
+            Self::Store(error) => ErrorCategory::Transient,
+
             // Delegate to inner error classifications
-            Self::Store(error) => error.classify_error(),
             Self::Handler(error) => error.classify_error(),
             Self::Timer(error) => error.classify_error(),
             Self::Loader(error) => error.classify_error(),
