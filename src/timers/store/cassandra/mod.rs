@@ -34,7 +34,7 @@ pub(crate) mod v1;
 /// Cassandra-only).
 pub(crate) mod migration;
 
-/// Cassandra-based implementation of [`TriggerStore`].
+/// Cassandra-based implementation of [`TriggerStore`](super::TriggerStore).
 ///
 /// Provides persistent storage for timer triggers using Apache Cassandra
 /// with automatic schema migration and optimized TTL management.

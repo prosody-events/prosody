@@ -104,7 +104,7 @@ where
             Self::Configuration(_) => ErrorCategory::Terminal,
 
             // Store errors: treat all store errors as transient to prevent data loss.
-            Self::Store(error) => ErrorCategory::Transient,
+            Self::Store(_) => ErrorCategory::Transient,
 
             // Delegate to inner error classifications
             Self::Handler(error) => error.classify_error(),

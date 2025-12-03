@@ -97,7 +97,7 @@ impl TraceBuilder {
     }
 
     /// Adds a message event with the given outcome (if valid).
-    fn add_message_event(&mut self, g: &mut Gen, key_idx: usize, outcome: MessageOutcome) {
+    fn add_message_event(&mut self, key_idx: usize, outcome: MessageOutcome) {
         let offset = self.get_next_offset();
 
         // Apply state transitions
@@ -124,9 +124,6 @@ impl TraceBuilder {
             offset,
             outcome,
         }));
-
-        // Suppress unused warning - g is used for future randomization
-        let _ = g;
     }
 
     /// Adds a timer event (if valid - key must be deferred).
@@ -134,34 +131,37 @@ impl TraceBuilder {
     /// For `Transient` outcomes, calculates `max_backoff` based on retry count
     /// AFTER incrementing (since that's what the handler will use for
     /// scheduling).
-    fn add_timer_event(
-        &mut self,
-        g: &mut Gen,
-        key_idx: usize,
-        outcome_type: TimerOutcomeType,
-    ) -> bool {
+    fn add_timer_event(&mut self, key_idx: usize, outcome_type: TimerOutcomeType) -> bool {
         let Some(offset) = self.head_offset(key_idx) else {
             return false; // Key not deferred - invalid
         };
 
-        // Apply state transitions and calculate outcome
-        let outcome = match outcome_type {
-            TimerOutcomeType::Success => {
-                // Pop offset from queue
-                if let Some(queue) = self.deferred.get_mut(&key_idx) {
+        // Helper: complete offset (pop from queue, clear retry count)
+        let complete_offset =
+            |deferred: &mut HashMap<usize, VecDeque<Offset>>,
+             retry_counts: &mut HashMap<(usize, Offset), u32>| {
+                if let Some(queue) = deferred.get_mut(&key_idx) {
                     queue.pop_front();
                 }
-                self.retry_counts.remove(&(key_idx, offset));
+                retry_counts.remove(&(key_idx, offset));
+            };
+
+        // Apply state transitions and calculate outcome
+        let outcome = match outcome_type {
+            // Completing outcomes: pop head, clear retry count
+            TimerOutcomeType::Success => {
+                complete_offset(&mut self.deferred, &mut self.retry_counts);
                 TimerOutcome::Success
             }
             TimerOutcomeType::Permanent => {
-                // Pop offset from queue
-                if let Some(queue) = self.deferred.get_mut(&key_idx) {
-                    queue.pop_front();
-                }
-                self.retry_counts.remove(&(key_idx, offset));
+                complete_offset(&mut self.deferred, &mut self.retry_counts);
                 TimerOutcome::Permanent
             }
+            TimerOutcomeType::LoaderPermanent => {
+                complete_offset(&mut self.deferred, &mut self.retry_counts);
+                TimerOutcome::LoaderPermanent
+            }
+            // Rescheduling outcomes: keep head, adjust retry count
             TimerOutcomeType::Transient => {
                 // Increment retry count first
                 let new_retry_count =
@@ -171,22 +171,12 @@ impl TraceBuilder {
                     } else {
                         0
                     };
-                // Calculate max_backoff for the NEW retry count
                 TimerOutcome::Transient {
                     max_backoff: expected_max_backoff(new_retry_count),
                 }
             }
-            TimerOutcomeType::LoaderPermanent => {
-                // Same state transition as Success/Permanent: pop head, clear retry count
-                if let Some(queue) = self.deferred.get_mut(&key_idx) {
-                    queue.pop_front();
-                }
-                self.retry_counts.remove(&(key_idx, offset));
-                TimerOutcome::LoaderPermanent
-            }
             TimerOutcomeType::LoaderTransient => {
-                // Keep offset at head, DON'T increment retry_count
-                // Use current retry_count for max_backoff calculation
+                // DON'T increment retry_count - use current for backoff
                 let current_retry_count = self
                     .retry_counts
                     .get(&(key_idx, offset))
@@ -203,9 +193,6 @@ impl TraceBuilder {
             offset,
             outcome,
         }));
-
-        // Suppress unused warning
-        let _ = g;
 
         true
     }
@@ -239,7 +226,7 @@ impl TraceBuilder {
                     },
                 }
             };
-            self.add_message_event(g, key_idx, outcome);
+            self.add_message_event(key_idx, outcome);
         } else if is_deferred {
             // 40% timer events (only if key is deferred)
             // Distribution: ~20% each Success/Permanent/Transient, ~14% each
@@ -251,7 +238,7 @@ impl TraceBuilder {
                 3 => TimerOutcomeType::LoaderPermanent, // ~14%
                 _ => TimerOutcomeType::LoaderTransient, // ~14%
             };
-            self.add_timer_event(g, key_idx, outcome_type);
+            self.add_timer_event(key_idx, outcome_type);
         } else {
             // Key not deferred, can't fire timer - generate message instead
             let outcome = match u8::arbitrary(g) % 3 {
@@ -262,7 +249,7 @@ impl TraceBuilder {
                     defer: bool::arbitrary(g),
                 },
             };
-            self.add_message_event(g, key_idx, outcome);
+            self.add_message_event(key_idx, outcome);
         }
     }
 
@@ -524,5 +511,105 @@ mod tests {
 
         let result = Trace::from_events_if_valid(events, 1);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn from_events_accepts_loader_permanent_sequence() {
+        let events = vec![
+            // Message defers key 0
+            TraceEvent::Message(MessageEvent {
+                key_idx: 0,
+                offset: Offset::from(1_i64),
+                outcome: MessageOutcome::Transient {
+                    max_backoff: CompactDuration::new(60),
+                    defer: true,
+                },
+            }),
+            // Second message is queued
+            TraceEvent::Message(MessageEvent {
+                key_idx: 0,
+                offset: Offset::from(2_i64),
+                outcome: MessageOutcome::Queued,
+            }),
+            // Loader permanent failure - should pop head like Success
+            TraceEvent::Timer(TimerEvent {
+                key_idx: 0,
+                offset: Offset::from(1_i64),
+                outcome: TimerOutcome::LoaderPermanent,
+            }),
+            // Timer fires for second message (now at head)
+            TraceEvent::Timer(TimerEvent {
+                key_idx: 0,
+                offset: Offset::from(2_i64),
+                outcome: TimerOutcome::Success,
+            }),
+        ];
+
+        let result = Trace::from_events_if_valid(events, 1);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn from_events_accepts_loader_transient_sequence() {
+        let events = vec![
+            // Message defers key 0
+            TraceEvent::Message(MessageEvent {
+                key_idx: 0,
+                offset: Offset::from(1_i64),
+                outcome: MessageOutcome::Transient {
+                    max_backoff: CompactDuration::new(60),
+                    defer: true,
+                },
+            }),
+            // Loader transient failure - keeps offset at head
+            TraceEvent::Timer(TimerEvent {
+                key_idx: 0,
+                offset: Offset::from(1_i64),
+                outcome: TimerOutcome::LoaderTransient {
+                    max_backoff: CompactDuration::new(60),
+                },
+            }),
+            // Same offset can fire again (still at head)
+            TraceEvent::Timer(TimerEvent {
+                key_idx: 0,
+                offset: Offset::from(1_i64),
+                outcome: TimerOutcome::Success,
+            }),
+        ];
+
+        let result = Trace::from_events_if_valid(events, 1);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn from_events_rejects_loader_transient_wrong_offset() {
+        let events = vec![
+            // Message defers key 0
+            TraceEvent::Message(MessageEvent {
+                key_idx: 0,
+                offset: Offset::from(1_i64),
+                outcome: MessageOutcome::Transient {
+                    max_backoff: CompactDuration::new(60),
+                    defer: true,
+                },
+            }),
+            // Loader transient - keeps head at offset 1
+            TraceEvent::Timer(TimerEvent {
+                key_idx: 0,
+                offset: Offset::from(1_i64),
+                outcome: TimerOutcome::LoaderTransient {
+                    max_backoff: CompactDuration::new(60),
+                },
+            }),
+            // Wrong! Trying to fire offset 2 but head is still 1
+            TraceEvent::Timer(TimerEvent {
+                key_idx: 0,
+                offset: Offset::from(2_i64),
+                outcome: TimerOutcome::Success,
+            }),
+        ];
+
+        let result = Trace::from_events_if_valid(events, 1);
+        assert!(result.is_none());
     }
 }

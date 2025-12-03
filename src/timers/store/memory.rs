@@ -35,8 +35,8 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::join;
 
-/// In-memory, concurrent implementation of [`TriggerStore`] for testing and
-/// development.
+/// In-memory, concurrent implementation of
+/// [`TriggerStore`](super::TriggerStore) for testing and development.
 ///
 /// All data is held in memory; timers and segments are lost when the process
 /// exits. This store supports the full `TriggerStore` trait API with

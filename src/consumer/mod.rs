@@ -359,8 +359,8 @@ pub trait EventHandler {
     /// # Processing Requirements
     ///
     /// Implementations must ensure that the timer is properly acknowledged:
-    /// - Call [`timer.commit()`] after successful processing
-    /// - Call [`timer.abort()`] if processing fails or should be retried
+    /// - Call `timer.commit()` after successful processing
+    /// - Call `timer.abort()` if processing fails or should be retried
     ///
     /// # Returns
     ///

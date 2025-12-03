@@ -153,6 +153,59 @@ fn prop_retry_increment(trace: Trace) -> TestResult {
     })
 }
 
+/// Property: Loader transient does NOT increment retry count.
+///
+/// **Invariant**: After a `TimerOutcome::LoaderTransient`, the retry count
+/// remains unchanged. This is critical: loader failures are infrastructure
+/// issues, not business logic failures, so they shouldn't affect backoff.
+#[quickcheck]
+fn prop_loader_transient_no_retry_increment(trace: Trace) -> TestResult {
+    init_test_logging();
+    let Trace { events, key_count } = trace;
+
+    TEST_RUNTIME.block_on(async {
+        let mut harness = match TestHarness::new(key_count) {
+            Ok(h) => h,
+            Err(e) => return TestResult::error(format!("Harness construction failed: {e}")),
+        };
+
+        for event in &events {
+            if let TraceEvent::Timer(timer) = event
+                && matches!(timer.outcome, TimerOutcome::LoaderTransient { .. })
+            {
+                // Get retry count before
+                let before = harness.get_retry_count(timer.key_idx).await.ok().flatten();
+
+                if let Err(e) = harness.execute_event(event).await {
+                    return TestResult::error(format!("Execution failed: {e}"));
+                }
+
+                // Get retry count after
+                let after = harness.get_retry_count(timer.key_idx).await.ok().flatten();
+
+                // Verify NO increment - retry count should be unchanged
+                let expected = before.unwrap_or(0);
+                let actual = after.unwrap_or(0);
+
+                if actual != expected {
+                    return TestResult::error(format!(
+                        "LoaderTransient retry violation: expected {expected} (unchanged), got \
+                         {actual}"
+                    ));
+                }
+
+                continue;
+            }
+
+            if let Err(e) = harness.execute_event(event).await {
+                return TestResult::error(format!("Execution failed: {e}"));
+            }
+        }
+
+        TestResult::passed()
+    })
+}
+
 /// Property: Backoff duration is within bounds.
 ///
 /// **Invariant**: When a timer is scheduled, the delay is between 0 and
@@ -180,7 +233,10 @@ fn prop_backoff_bounds(trace: Trace) -> TestResult {
                     _ => None,
                 },
                 TraceEvent::Timer(timer) => match &timer.outcome {
-                    TimerOutcome::Transient { max_backoff } => Some((timer.key_idx, *max_backoff)),
+                    TimerOutcome::Transient { max_backoff }
+                    | TimerOutcome::LoaderTransient { max_backoff } => {
+                        Some((timer.key_idx, *max_backoff))
+                    }
                     _ => None,
                 },
             };

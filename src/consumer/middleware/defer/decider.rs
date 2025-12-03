@@ -1,8 +1,9 @@
 //! Deferral decision abstraction for defer middleware.
 //!
 //! Provides [`DeferralDecider`] trait for controlling when transient failures
-//! should be deferred for retry. Production code uses [`FailureTracker`] which
-//! tracks failure rates. Tests use [`AlwaysDefer`], [`NeverDefer`], or
+//! should be deferred for retry. Production code uses
+//! [`failure_tracker::FailureTracker`](super::failure_tracker::FailureTracker)
+//! which tracks failure rates. Tests use [`AlwaysDefer`], [`NeverDefer`], or
 //! [`TraceBasedDecider`] for deterministic control.
 
 use portable_atomic::{AtomicBool, Ordering};
@@ -12,8 +13,8 @@ use std::sync::Arc;
 ///
 /// # Implementors
 ///
-/// - [`FailureTracker`]: Production implementation - defers based on failure
-///   rate
+/// - [`FailureTracker`](super::failure_tracker::FailureTracker): Production
+///   implementation - defers based on failure rate
 /// - [`AlwaysDefer`]: Test double - always enables deferral
 /// - [`NeverDefer`]: Test double - always disables deferral
 /// - [`TraceBasedDecider`]: Test double - returns value set by test harness
@@ -35,7 +36,7 @@ use std::sync::Arc;
 pub trait DeferralDecider: Clone + Send + Sync + 'static {
     /// Returns `true` if messages should be deferred on transient failure.
     ///
-    /// # Production Behavior ([`FailureTracker`])
+    /// # Production Behavior ([`FailureTracker`](super::failure_tracker::FailureTracker))
     ///
     /// Returns `failure_rate < threshold` where:
     /// - `failure_rate` = failures / (failures + successes) in sliding window

@@ -9,7 +9,7 @@
 //!
 //! - [`OutcomeHandler`]: Inner handler returning trace-specified outcomes
 //! - [`TraceBasedDecider`]: Deferral decisions from trace
-//! - [`MemoryLoader`]: Message storage for timer retries
+//! - [`FailableLoader`]: Wraps `MemoryLoader` with failure injection
 //! - [`MemoryDeferStore`]: Deferred message state
 //! - [`TimerCapture`]/[`KeyedCapturingContext`]: Timer operation capture
 //!
@@ -192,12 +192,6 @@ impl TestHarness {
     #[must_use]
     pub fn capture(&self) -> &TimerCapture {
         &self.capture
-    }
-
-    /// Returns a reference to the loader for failure injection.
-    #[must_use]
-    pub fn loader(&self) -> &FailableLoader {
-        &self.loader
     }
 
     /// Returns all processed messages in order (drains the queue).
