@@ -787,7 +787,7 @@ pub enum KafkaLoaderError {
     OffsetDeleted(Topic, Partition, Offset, Offset),
 
     /// Failed to create the Kafka consumer.
-    #[error("Failed to create Kafka consumer: {0}")]
+    #[error("Failed to create Kafka consumer: {0:#}")]
     ConsumerCreation(KafkaError),
 
     /// A Kafka operation error occurred.

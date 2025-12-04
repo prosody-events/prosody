@@ -395,7 +395,7 @@ where
 #[derive(Debug, Error)]
 pub enum MonopolizationInitError {
     /// Configuration validation failed.
-    #[error("Invalid configuration: {0}")]
+    #[error("Invalid configuration: {0:#}")]
     Validation(#[from] ValidationErrors),
 }
 

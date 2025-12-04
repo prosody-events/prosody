@@ -111,7 +111,7 @@ pub enum FailableLoaderError {
     Transient,
 
     /// Error from inner loader.
-    #[error("inner loader error: {0}")]
+    #[error("inner loader error: {0:#}")]
     Inner(#[from] MemoryLoaderError),
 }
 

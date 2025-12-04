@@ -18,10 +18,8 @@ use uuid::Uuid;
 
 /// Creates a Cassandra session for testing.
 async fn create_test_session() -> Result<Session> {
-    let session = SessionBuilder::new()
-        .known_node("localhost:9042")
-        .build()
-        .await?;
+    let session = Box::pin(SessionBuilder::new().known_node("localhost:9042").build()).await?;
+
     Ok(session)
 }
 

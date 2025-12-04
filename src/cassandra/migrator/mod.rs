@@ -384,7 +384,7 @@ pub enum MigrationError {
     MigrationFileLoadFailed(String),
 
     /// Migration file contains invalid UTF-8.
-    #[error("Invalid UTF-8 in migration file {file}: {source}")]
+    #[error("Invalid UTF-8 in migration file {file}: {source:#}")]
     InvalidUtf8 {
         /// The filename that contains invalid UTF-8.
         file: String,

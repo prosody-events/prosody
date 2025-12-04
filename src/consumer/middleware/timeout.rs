@@ -84,7 +84,7 @@ pub enum TimeoutError<E> {
 #[derive(Debug, Error)]
 pub enum TimeoutInitError {
     /// Configuration validation failed.
-    #[error("Invalid configuration: {0}")]
+    #[error("Invalid configuration: {0:#}")]
     Validation(#[from] ValidationErrors),
 }
 
