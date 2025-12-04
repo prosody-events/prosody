@@ -194,9 +194,9 @@ impl KafkaLoader {
         let group_id = format!("{}-deferred", config.group_id);
         let client_id = hostname().map_err(|error| KafkaLoaderError::Hostname(Arc::new(error)))?;
 
-        // Minimize prefetch buffering - we seek to specific offsets and load
-        // individual messages, so aggressive prefetching wastes memory and
-        // bandwidth. Defaults are 100k messages / 64MB per partition.
+        // Point lookups don't benefit from prefetching. Start with small fetch
+        // sizes for ~1KB messages; rdkafka auto-adjusts if larger messages appear.
+        // fetch.max.bytes >= message.max.bytes is required by rdkafka.
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("client.id", &client_id)
@@ -205,9 +205,11 @@ impl KafkaLoader {
             .set("enable.auto.offset.store", "false")
             .set("auto.offset.reset", "earliest")
             .set("queued.min.messages", "1")
-            .set("queued.max.messages.kbytes", "128")
-            .set("fetch.max.bytes", "131072") // 128KB per fetch request
-            .set("fetch.wait.max.ms", "100") // Don't wait long to fill batches
+            .set("queued.max.messages.kbytes", "64")
+            .set("fetch.message.max.bytes", "16384")
+            .set("message.max.bytes", "1048576")
+            .set("fetch.max.bytes", "1048576")
+            .set("fetch.wait.max.ms", "100")
             .set_log_level(RDKafkaLogLevel::Error)
             .create()
             .map_err(KafkaLoaderError::ConsumerCreation)?;
