@@ -197,7 +197,7 @@ async fn create_session(config: &CassandraConfiguration) -> Result<Session, Cass
         session = session.user(user.clone(), config.password.clone().unwrap_or_default());
     }
 
-    Ok(session.build().await?)
+    Ok(Box::pin(session.build()).await?)
 }
 
 // Scylla trait implementations for Prosody types
