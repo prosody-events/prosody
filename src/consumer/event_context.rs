@@ -280,7 +280,7 @@ where
             return true;
         };
 
-        *inner.message_cancel_rx.borrow()
+        *inner.message_cancel_rx.borrow() | *inner.shutdown_rx.borrow()
     }
 
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -305,11 +305,21 @@ where
             return ready(()).left_future();
         };
 
+        let mut shutdown_rx = inner.shutdown_rx.clone();
         let mut message_cancel_rx = inner.message_cancel_rx.clone();
 
         async move {
-            if let Err(error) = message_cancel_rx.wait_for(|is_shutdown| *is_shutdown).await {
-                error!("message cancellation hook failed: {error:#}");
+            select! {
+                result = shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => {
+                    if let Err(error) = result {
+                        error!("shutdown hook failed: {error:#}");
+                    }
+                }
+                result = message_cancel_rx.wait_for(|is_cancelled| *is_cancelled) => {
+                    if let Err(error) = result {
+                        error!("message cancellation hook failed: {error:#}");
+                    }
+                }
             }
         }
         .right_future()
