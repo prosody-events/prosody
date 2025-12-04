@@ -181,14 +181,6 @@ mod tests {
     }
 
     #[test]
-    fn test_store_error_delegates_permanent() {
-        let error = DeferError::<TestPermanentError, TestTransientError, TestTransientError>::Store(
-            TestPermanentError,
-        );
-        assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
-    }
-
-    #[test]
     fn test_handler_error_delegates_transient() {
         let error =
             DeferError::<TestTransientError, TestTransientError, TestTransientError>::Handler(

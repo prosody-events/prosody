@@ -75,6 +75,17 @@ tokio::select! {
 
 **Use `assert` or `color_eyre::Result` in tests - never `expect`/`unwrap`**
 
+**Integration tests:** When running slow integration tests, write output to a temp file rather than piping to `grep`, `head`, or `tail`. Re-running tests is expensive; keep output files around for exploration:
+
+```bash
+# Good: preserve output for exploration
+cargo test 2>&1 | tee /tmp/test_output.log
+grep FAILED /tmp/test_output.log
+
+# Bad: loses output, forces expensive re-runs
+cargo test 2>&1 | grep FAILED
+```
+
 ## API Design
 
 **Traits:** Keep generic with associated types; use type erasure only for FFI (JS/Python/Ruby)
