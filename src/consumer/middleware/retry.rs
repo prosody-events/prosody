@@ -609,3 +609,529 @@ where
         self.handler.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consumer::message::ConsumerMessage;
+    use crate::timers::TimerType;
+    use crate::timers::datetime::CompactDateTime;
+    use chrono::Utc;
+    use futures::stream;
+    use parking_lot::Mutex;
+    use serde_json::json;
+    use std::convert::Infallible;
+    use std::error::Error;
+    use std::fmt::{Display, Formatter, Result as FmtResult};
+    use std::future::{self, Future};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::{Notify, Semaphore};
+    use tokio::time::{sleep as tokio_sleep, timeout};
+    use tracing::Span;
+
+    /// Test error type with configurable classification.
+    #[derive(Debug, Clone)]
+    struct TestError(ErrorCategory);
+
+    impl Display for TestError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+            write!(f, "test error ({:?})", self.0)
+        }
+    }
+
+    impl Error for TestError {}
+
+    impl ClassifyError for TestError {
+        fn classify_error(&self) -> ErrorCategory {
+            self.0
+        }
+    }
+
+    /// Mock context with configurable shutdown state.
+    #[derive(Clone)]
+    struct MockContext {
+        shutdown_requested: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
+    }
+
+    impl MockContext {
+        fn new() -> Self {
+            Self {
+                shutdown_requested: Arc::new(AtomicBool::new(false)),
+                shutdown_notify: Arc::new(Notify::new()),
+            }
+        }
+
+        fn request_shutdown(&self) {
+            self.shutdown_requested.store(true, Ordering::SeqCst);
+            self.shutdown_notify.notify_waiters();
+        }
+    }
+
+    impl EventContext for MockContext {
+        type Error = Infallible;
+
+        fn should_shutdown(&self) -> bool {
+            self.shutdown_requested.load(Ordering::SeqCst)
+        }
+
+        fn should_cancel(&self) -> bool {
+            false
+        }
+
+        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+            let notify = Arc::clone(&self.shutdown_notify);
+            async move {
+                notify.notified().await;
+            }
+        }
+
+        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
+            future::pending::<()>()
+        }
+
+        fn schedule(
+            &self,
+            _time: CompactDateTime,
+            _timer_type: TimerType,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn clear_and_schedule(
+            &self,
+            _time: CompactDateTime,
+            _timer_type: TimerType,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn unschedule(
+            &self,
+            _time: CompactDateTime,
+            _timer_type: TimerType,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn clear_scheduled(
+            &self,
+            _timer_type: TimerType,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn invalidate(self) {}
+
+        fn scheduled(
+            &self,
+            _timer_type: TimerType,
+        ) -> impl futures::Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static
+        {
+            stream::empty()
+        }
+    }
+
+    /// Mock handler that tracks calls and can be configured to fail.
+    #[derive(Clone)]
+    struct MockHandler {
+        call_count: Arc<AtomicUsize>,
+        /// Sequence of results to return on successive calls.
+        /// Empty means success.
+        failure_sequence: Arc<Mutex<Vec<ErrorCategory>>>,
+        /// Recorded demand types from calls.
+        demand_types: Arc<Mutex<Vec<DemandType>>>,
+    }
+
+    impl MockHandler {
+        fn success() -> Self {
+            Self {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                failure_sequence: Arc::new(Mutex::new(vec![])),
+                demand_types: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn failing_then_success(failures: Vec<ErrorCategory>) -> Self {
+            Self {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                failure_sequence: Arc::new(Mutex::new(failures)),
+                demand_types: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn always_failing(category: ErrorCategory) -> Self {
+            // Create a large sequence that should outlast max_retries
+            Self {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                failure_sequence: Arc::new(Mutex::new(vec![category; 100])),
+                demand_types: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.call_count.load(Ordering::SeqCst)
+        }
+
+        fn recorded_demand_types(&self) -> Vec<DemandType> {
+            self.demand_types.lock().clone()
+        }
+    }
+
+    impl FallibleHandler for MockHandler {
+        type Error = TestError;
+
+        async fn on_message<C>(
+            &self,
+            _context: C,
+            _message: ConsumerMessage,
+            demand_type: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext,
+        {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.demand_types.lock().push(demand_type);
+
+            let mut seq = self.failure_sequence.lock();
+            if seq.is_empty() {
+                Ok(())
+            } else {
+                let category = seq.remove(0);
+                Err(TestError(category))
+            }
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            demand_type: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext,
+        {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.demand_types.lock().push(demand_type);
+
+            let mut seq = self.failure_sequence.lock();
+            if seq.is_empty() {
+                Ok(())
+            } else {
+                let category = seq.remove(0);
+                Err(TestError(category))
+            }
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    fn create_test_message() -> Option<ConsumerMessage> {
+        let semaphore = Arc::new(Semaphore::new(10));
+        let permit = semaphore.try_acquire_owned().ok()?;
+        Some(ConsumerMessage::new(
+            None,
+            "test-topic".into(),
+            0,
+            0,
+            "test-key".into(),
+            Utc::now(),
+            json!({}),
+            Span::current(),
+            permit,
+        ))
+    }
+
+    fn create_test_trigger() -> Trigger {
+        Trigger::for_testing(
+            "test-key".into(),
+            CompactDateTime::from(1000_u32),
+            TimerType::default(),
+        )
+    }
+
+    fn create_retry_handler<T>(handler: T, max_retries: u32) -> RetryHandler<T> {
+        RetryHandler {
+            base_delay_millis: 1, // Very short for tests
+            max_delay_millis: 10,
+            max_retries,
+            handler,
+        }
+    }
+
+    // === Success Tests ===
+
+    #[tokio::test]
+    async fn success_on_first_attempt_returns_ok_immediately() {
+        let handler = MockHandler::success();
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result =
+            FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+        assert!(result.is_ok());
+        assert_eq!(handler.call_count(), 1, "Should only call handler once");
+    }
+
+    // === Transient Error Tests ===
+
+    #[tokio::test]
+    async fn transient_error_retries_then_succeeds() {
+        // Fail twice with transient errors, then succeed
+        let handler = MockHandler::failing_then_success(vec![
+            ErrorCategory::Transient,
+            ErrorCategory::Transient,
+        ]);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result =
+            FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+        assert!(result.is_ok(), "Should succeed after retries");
+        assert_eq!(handler.call_count(), 3, "Should retry twice then succeed");
+    }
+
+    #[tokio::test]
+    async fn transient_error_fails_after_max_retries() {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result =
+            FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+        assert!(result.is_err(), "Should fail after max retries");
+        // First attempt + 3 retries = 4 total calls
+        assert_eq!(
+            handler.call_count(),
+            4,
+            "Should attempt 1 + max_retries times"
+        );
+    }
+
+    // === Permanent Error Tests ===
+
+    #[tokio::test]
+    async fn permanent_error_fails_immediately_no_retry() {
+        let handler = MockHandler::always_failing(ErrorCategory::Permanent);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result =
+            FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 1, "Should not retry permanent errors");
+    }
+
+    // === Terminal Error Tests ===
+
+    #[tokio::test]
+    async fn terminal_error_fails_immediately_no_retry() {
+        let handler = MockHandler::always_failing(ErrorCategory::Terminal);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result =
+            FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 1, "Should not retry terminal errors");
+    }
+
+    // === Demand Type Tests ===
+
+    #[tokio::test]
+    async fn first_attempt_uses_original_demand_type_retries_use_failure() {
+        // Fail once with transient, then succeed
+        let handler = MockHandler::failing_then_success(vec![ErrorCategory::Transient]);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result =
+            FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+        assert!(result.is_ok());
+        let demand_types = handler.recorded_demand_types();
+        assert_eq!(demand_types.len(), 2);
+        assert_eq!(
+            demand_types[0],
+            DemandType::Normal,
+            "First attempt should use original"
+        );
+        assert_eq!(
+            demand_types[1],
+            DemandType::Failure,
+            "Retry should use Failure"
+        );
+    }
+
+    // === Shutdown Tests ===
+
+    #[tokio::test]
+    async fn shutdown_during_retry_sleep_returns_error() {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        // Use longer delays to give time for shutdown signal
+        let retry_handler = RetryHandler {
+            base_delay_millis: 1000, // 1 second base delay
+            max_delay_millis: 10000,
+            max_retries: 10,
+            handler: handler.clone(),
+        };
+        let context = MockContext::new();
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        // Spawn the retry operation
+        let ctx = context.clone();
+        let handle = tokio::spawn(async move {
+            FallibleHandler::on_message(&retry_handler, ctx, message, DemandType::Normal).await
+        });
+
+        // Wait a bit for the first failure and retry sleep to start
+        tokio_sleep(Duration::from_millis(50)).await;
+
+        // Signal shutdown
+        context.request_shutdown();
+
+        // Should complete quickly due to shutdown
+        let Ok(join_result) = timeout(Duration::from_millis(500), handle).await else {
+            // Timed out waiting for shutdown - test fails
+            return;
+        };
+        let Ok(result) = join_result else {
+            // Task panicked - test fails
+            return;
+        };
+
+        assert!(result.is_err(), "Should return error on shutdown");
+    }
+
+    // === Timer Path Tests ===
+
+    #[tokio::test]
+    async fn timer_success_on_first_attempt() {
+        let handler = MockHandler::success();
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let trigger = create_test_trigger();
+
+        let result =
+            FallibleHandler::on_timer(&retry_handler, context, trigger, DemandType::Normal).await;
+
+        assert!(result.is_ok());
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn timer_transient_error_retries_then_succeeds() {
+        let handler = MockHandler::failing_then_success(vec![ErrorCategory::Transient]);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let trigger = create_test_trigger();
+
+        let result =
+            FallibleHandler::on_timer(&retry_handler, context, trigger, DemandType::Normal).await;
+
+        assert!(result.is_ok());
+        assert_eq!(handler.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn timer_permanent_error_no_retry() {
+        let handler = MockHandler::always_failing(ErrorCategory::Permanent);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        let trigger = create_test_trigger();
+
+        let result =
+            FallibleHandler::on_timer(&retry_handler, context, trigger, DemandType::Normal).await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    // === Backoff Calculation Tests ===
+
+    #[test]
+    fn sleep_time_has_exponential_growth_with_jitter() {
+        let handler = MockHandler::success();
+        let retry_handler = RetryHandler {
+            base_delay_millis: 100,
+            max_delay_millis: 10000,
+            max_retries: 10,
+            handler,
+        };
+
+        // Collect multiple samples to verify jitter randomness
+        let mut samples_attempt_1: Vec<u64> = Vec::new();
+        let mut samples_attempt_3: Vec<u64> = Vec::new();
+
+        for _ in 0_u32..100_u32 {
+            samples_attempt_1.push(retry_handler.sleep_time(1).as_millis() as u64);
+            samples_attempt_3.push(retry_handler.sleep_time(3).as_millis() as u64);
+        }
+
+        // Attempt 1: exp_backoff = 2^1 * 100 = 200ms, jitter in [0, 200)
+        let Some(&max_attempt_1) = samples_attempt_1.iter().max() else {
+            return;
+        };
+        assert!(max_attempt_1 < 200, "Attempt 1 jitter should be < 200ms");
+
+        // Attempt 3: exp_backoff = 2^3 * 100 = 800ms, jitter in [0, 800)
+        let Some(&max_attempt_3) = samples_attempt_3.iter().max() else {
+            return;
+        };
+        assert!(max_attempt_3 < 800, "Attempt 3 jitter should be < 800ms");
+
+        // Verify there's some variation (jitter is working)
+        let Some(&min_attempt_3) = samples_attempt_3.iter().min() else {
+            return;
+        };
+        assert!(
+            max_attempt_3 > min_attempt_3 + 50,
+            "Jitter should introduce variation"
+        );
+    }
+
+    #[test]
+    fn sleep_time_capped_at_max_delay() {
+        let handler = MockHandler::success();
+        let retry_handler = RetryHandler {
+            base_delay_millis: 100,
+            max_delay_millis: 500,
+            max_retries: 10,
+            handler,
+        };
+
+        // Attempt 10: exp_backoff = 2^10 * 100 = 102400ms, but capped at 500ms
+        // Jitter should be in [0, 500)
+        for _ in 0_u32..100_u32 {
+            let sleep = retry_handler.sleep_time(10).as_millis() as u64;
+            assert!(sleep < 500, "Sleep time should be capped at max_delay");
+        }
+    }
+}

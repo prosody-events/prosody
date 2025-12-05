@@ -1,8 +1,10 @@
 //! Dead letter queue (failure topic) middleware.
 //!
-//! Routes permanently failed messages to a designated failure topic for later
-//! analysis or reprocessing. Only handles [`ErrorCategory::Permanent`] errors -
-//! transient errors pass through for potential retry by outer layers.
+//! Routes failed messages to a designated failure topic for later analysis or
+//! reprocessing. All non-terminal errors (both [`ErrorCategory::Permanent`] and
+//! [`ErrorCategory::Transient`]) are sent to the failure topic. Only
+//! [`ErrorCategory::Terminal`] errors bypass the DLQ and propagate immediately,
+//! as they indicate partition shutdown rather than recoverable failures.
 //!
 //! # Execution Order
 //!
@@ -11,8 +13,10 @@
 //!
 //! **Response Path:**
 //! 1. Receive result from inner layers
-//! 2. **If error is permanent**: Send message to failure topic with metadata
-//! 3. **If error is transient/terminal**: Pass through unchanged
+//! 2. **If error is terminal**: Pass through unchanged (triggers partition
+//!    shutdown)
+//! 3. **If error is permanent or transient**: Send message to failure topic
+//!    with metadata
 //! 4. **If failure topic write fails**: Return that error for outer retry
 //!    middleware
 //!
@@ -66,6 +70,8 @@
 //! ```
 //!
 //! [`ErrorCategory::Permanent`]: crate::consumer::middleware::ErrorCategory::Permanent
+//! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
+//! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use derive_builder::Builder;
@@ -386,5 +392,92 @@ where
             FailureTopicError::Handler(error) => error.classify_error(),
             FailureTopicError::Producer(_) => ErrorCategory::Transient,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consumer::middleware::ErrorCategory;
+    use std::error::Error;
+    use std::fmt::{Display, Formatter, Result as FmtResult};
+    use std::io;
+
+    /// Test error type with configurable classification.
+    #[derive(Debug, Clone)]
+    struct TestError(ErrorCategory);
+
+    impl Display for TestError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+            write!(f, "test error ({:?})", self.0)
+        }
+    }
+
+    impl Error for TestError {}
+
+    impl ClassifyError for TestError {
+        fn classify_error(&self) -> ErrorCategory {
+            self.0
+        }
+    }
+
+    // === Error Classification Tests ===
+
+    #[test]
+    fn handler_error_delegates_classification_transient() {
+        let error: FailureTopicError<TestError> =
+            FailureTopicError::Handler(TestError(ErrorCategory::Transient));
+        assert!(matches!(error.classify_error(), ErrorCategory::Transient));
+    }
+
+    #[test]
+    fn handler_error_delegates_classification_permanent() {
+        let error: FailureTopicError<TestError> =
+            FailureTopicError::Handler(TestError(ErrorCategory::Permanent));
+        assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
+    }
+
+    #[test]
+    fn handler_error_delegates_classification_terminal() {
+        let error: FailureTopicError<TestError> =
+            FailureTopicError::Handler(TestError(ErrorCategory::Terminal));
+        assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
+    }
+
+    #[test]
+    fn producer_error_classifies_as_transient() {
+        // Create a ProducerError for testing using io::Error which is easy to construct
+        // Producer errors should always be transient since they may succeed on retry
+        let io_error = io::Error::new(io::ErrorKind::ConnectionRefused, "test error");
+        let error: FailureTopicError<TestError> =
+            FailureTopicError::Producer(ProducerError::Hostname(io_error));
+        assert!(
+            matches!(error.classify_error(), ErrorCategory::Transient),
+            "Producer errors should be transient to allow outer retry middleware to retry"
+        );
+    }
+
+    // === Configuration Tests ===
+
+    #[test]
+    fn configuration_requires_non_empty_failure_topic() {
+        let config = FailureTopicConfiguration {
+            failure_topic: String::new(),
+        };
+        assert!(
+            config.validate().is_err(),
+            "Empty failure topic should fail validation"
+        );
+    }
+
+    #[test]
+    fn configuration_accepts_valid_failure_topic() {
+        let config = FailureTopicConfiguration {
+            failure_topic: String::from("dlq-topic"),
+        };
+        assert!(
+            config.validate().is_ok(),
+            "Non-empty failure topic should pass validation"
+        );
     }
 }

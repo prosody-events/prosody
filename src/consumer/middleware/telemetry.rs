@@ -230,3 +230,399 @@ where
         self.handler.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleCloneProvider};
+    use crate::telemetry::event::{Data, KeyState};
+    use crate::timers::TimerType;
+    use crate::timers::datetime::CompactDateTime;
+    use chrono::Utc;
+    use futures::stream;
+    use serde_json::json;
+    use std::convert::Infallible;
+    use std::error::Error;
+    use std::fmt::{Display, Formatter, Result as FmtResult};
+    use std::future::{self, Future};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    use tokio::time::sleep as tokio_sleep;
+    use tracing::Span;
+
+    /// Test error type with configurable classification.
+    #[derive(Debug, Clone)]
+    struct TestError(ErrorCategory);
+
+    impl Display for TestError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+            write!(f, "test error ({:?})", self.0)
+        }
+    }
+
+    impl Error for TestError {}
+
+    impl ClassifyError for TestError {
+        fn classify_error(&self) -> ErrorCategory {
+            self.0
+        }
+    }
+
+    /// Mock context that satisfies [`EventContext`].
+    #[derive(Clone)]
+    struct MockContext;
+
+    impl EventContext for MockContext {
+        type Error = Infallible;
+
+        fn should_shutdown(&self) -> bool {
+            false
+        }
+
+        fn should_cancel(&self) -> bool {
+            false
+        }
+
+        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+            future::pending::<()>()
+        }
+
+        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
+            future::pending::<()>()
+        }
+
+        fn schedule(
+            &self,
+            _time: CompactDateTime,
+            _timer_type: TimerType,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn clear_and_schedule(
+            &self,
+            _time: CompactDateTime,
+            _timer_type: TimerType,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn unschedule(
+            &self,
+            _time: CompactDateTime,
+            _timer_type: TimerType,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn clear_scheduled(
+            &self,
+            _timer_type: TimerType,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn invalidate(self) {}
+
+        fn scheduled(
+            &self,
+            _timer_type: TimerType,
+        ) -> impl futures::Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static
+        {
+            stream::empty()
+        }
+    }
+
+    /// Mock handler with configurable behavior.
+    #[derive(Clone)]
+    struct MockHandler {
+        call_count: Arc<AtomicUsize>,
+        result: Result<(), TestError>,
+    }
+
+    impl MockHandler {
+        fn success() -> Self {
+            Self {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                result: Ok(()),
+            }
+        }
+
+        fn failing(category: ErrorCategory) -> Self {
+            Self {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                result: Err(TestError(category)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl FallibleHandler for MockHandler {
+        type Error = TestError;
+
+        async fn on_message<C>(
+            &self,
+            _context: C,
+            _message: ConsumerMessage,
+            _demand_type: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext,
+        {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext,
+        {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    fn create_test_message() -> Option<ConsumerMessage> {
+        let semaphore = Arc::new(Semaphore::new(10));
+        let permit = semaphore.try_acquire_owned().ok()?;
+        Some(ConsumerMessage::new(
+            None,
+            "test-topic".into(),
+            0,
+            0,
+            "test-key".into(),
+            Utc::now(),
+            json!({}),
+            Span::current(),
+            permit,
+        ))
+    }
+
+    fn create_test_trigger() -> Trigger {
+        Trigger::for_testing(
+            "test-key".into(),
+            CompactDateTime::from(1000_u32),
+            TimerType::default(),
+        )
+    }
+
+    // === Handler Pass-Through Tests ===
+
+    #[tokio::test]
+    async fn success_result_passed_through_unchanged() {
+        let telemetry = Telemetry::new();
+        let handler = MockHandler::success();
+        let telemetry_handler = TelemetryHandler {
+            handler: handler.clone(),
+            sender: telemetry.partition_sender("test-topic".into(), 0),
+        };
+        let context = MockContext;
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result = telemetry_handler
+            .on_message(context, message, DemandType::Normal)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn error_result_passed_through_unchanged() {
+        let telemetry = Telemetry::new();
+        let handler = MockHandler::failing(ErrorCategory::Permanent);
+        let telemetry_handler = TelemetryHandler {
+            handler: handler.clone(),
+            sender: telemetry.partition_sender("test-topic".into(), 0),
+        };
+        let context = MockContext;
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result = telemetry_handler
+            .on_message(context, message, DemandType::Normal)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn timer_success_passed_through() {
+        let telemetry = Telemetry::new();
+        let handler = MockHandler::success();
+        let telemetry_handler = TelemetryHandler {
+            handler: handler.clone(),
+            sender: telemetry.partition_sender("test-topic".into(), 0),
+        };
+        let context = MockContext;
+        let trigger = create_test_trigger();
+
+        let result = telemetry_handler
+            .on_timer(context, trigger, DemandType::Normal)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn timer_error_passed_through() {
+        let telemetry = Telemetry::new();
+        let handler = MockHandler::failing(ErrorCategory::Transient);
+        let telemetry_handler = TelemetryHandler {
+            handler: handler.clone(),
+            sender: telemetry.partition_sender("test-topic".into(), 0),
+        };
+        let context = MockContext;
+        let trigger = create_test_trigger();
+
+        let result = telemetry_handler
+            .on_timer(context, trigger, DemandType::Normal)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    // === Telemetry Event Recording Tests ===
+
+    #[tokio::test]
+    async fn message_success_emits_invoked_and_succeeded_events() {
+        let telemetry = Telemetry::new();
+        let mut rx = telemetry.subscribe();
+        let handler = MockHandler::success();
+        let telemetry_handler = TelemetryHandler {
+            handler,
+            sender: telemetry.partition_sender("test-topic".into(), 0),
+        };
+        let context = MockContext;
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let _ = telemetry_handler
+            .on_message(context, message, DemandType::Normal)
+            .await;
+
+        // Give events time to propagate
+        tokio_sleep(Duration::from_millis(10)).await;
+
+        // Collect events
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Should have invoked and succeeded events
+        let has_invoked = events.iter().any(
+            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
+        );
+        let has_succeeded = events.iter().any(
+            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerSucceeded)),
+        );
+
+        assert!(has_invoked, "Should emit HandlerInvoked event");
+        assert!(has_succeeded, "Should emit HandlerSucceeded event");
+    }
+
+    #[tokio::test]
+    async fn message_failure_emits_invoked_and_failed_events() {
+        let telemetry = Telemetry::new();
+        let mut rx = telemetry.subscribe();
+        let handler = MockHandler::failing(ErrorCategory::Permanent);
+        let telemetry_handler = TelemetryHandler {
+            handler,
+            sender: telemetry.partition_sender("test-topic".into(), 0),
+        };
+        let context = MockContext;
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let _ = telemetry_handler
+            .on_message(context, message, DemandType::Normal)
+            .await;
+
+        // Give events time to propagate
+        tokio_sleep(Duration::from_millis(10)).await;
+
+        // Collect events
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // Should have invoked and failed events
+        let has_invoked = events.iter().any(
+            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
+        );
+        let has_failed = events.iter().any(
+            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerFailed)),
+        );
+
+        assert!(has_invoked, "Should emit HandlerInvoked event");
+        assert!(has_failed, "Should emit HandlerFailed event");
+    }
+
+    #[tokio::test]
+    async fn timer_success_emits_events() {
+        let telemetry = Telemetry::new();
+        let mut rx = telemetry.subscribe();
+        let handler = MockHandler::success();
+        let telemetry_handler = TelemetryHandler {
+            handler,
+            sender: telemetry.partition_sender("test-topic".into(), 0),
+        };
+        let context = MockContext;
+        let trigger = create_test_trigger();
+
+        let _ = telemetry_handler
+            .on_timer(context, trigger, DemandType::Normal)
+            .await;
+
+        tokio_sleep(Duration::from_millis(10)).await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let has_invoked = events.iter().any(
+            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
+        );
+        let has_succeeded = events.iter().any(
+            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerSucceeded)),
+        );
+
+        assert!(has_invoked, "Should emit HandlerInvoked event");
+        assert!(has_succeeded, "Should emit HandlerSucceeded event");
+    }
+
+    // === Middleware Composition Tests ===
+
+    #[test]
+    fn middleware_creates_provider() {
+        let telemetry = Telemetry::new();
+        let middleware = TelemetryMiddleware::new(telemetry);
+        let inner_provider = FallibleCloneProvider::new(MockHandler::success());
+        let _provider = middleware.with_provider(inner_provider);
+        // If this compiles, middleware composition works
+    }
+}
