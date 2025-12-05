@@ -398,11 +398,11 @@ fn poll_loop(
             config.discard_threshold,
             config.seek_timeout,
         ) {
-            warn!("seek failed: {error:#}, skipping poll and retrying");
-            continue;
+            warn!("seek failed: {error:#}, will retry after poll");
+            // Fall through to poll() which provides backoff via its timeout
         }
 
-        // Poll once per iteration (normal operation or recovery from seek failure)
+        // Poll once per iteration
         let Some(result) = consumer.poll(Timeout::After(config.poll_interval)) else {
             continue;
         };
