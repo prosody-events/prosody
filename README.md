@@ -168,38 +168,122 @@ Prosody can be configured through environment variables or programmatically usin
 environment variables for any unspecified field. This means you can mix and match programmatic configuration with
 environment variables, giving you flexibility in how you set up your Kafka clients.
 
-The following table lists the available configuration options and their associated environment variables:
+The following tables list available environment variables by category:
 
-| Environment Variable             | Description                                                                          | Default      | Consumer | Producer |
-|----------------------------------|--------------------------------------------------------------------------------------|--------------|----------|----------|
-| `PROSODY_ALLOWED_EVENTS`         | Allowed event type prefixes (comma-separated). All allowed if unset.                 | -            | ✓        |          |
-| `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                      | -            | ✓        | ✓        |
-| `PROSODY_CASSANDRA_DATACENTER`   | Preferred datacenter for Cassandra query routing                                     | -            | ✓        |          |
-| `PROSODY_CASSANDRA_KEYSPACE`     | Cassandra keyspace for timer storage                                                 | prosody      | ✓        |          |
-| `PROSODY_CASSANDRA_NODES`        | Comma-separated list of Cassandra contact nodes (required for timer storage)         | -            | ✓        |          |
-| `PROSODY_CASSANDRA_PASSWORD`     | Password for Cassandra authentication                                                | -            | ✓        |          |
-| `PROSODY_CASSANDRA_RACK`         | Preferred rack identifier for Cassandra topology-aware routing                       | -            | ✓        |          |
-| `PROSODY_CASSANDRA_RETENTION`    | Retention period for timer and failure data                                          | 1y           | ✓        |          |
-| `PROSODY_CASSANDRA_USER`         | Username for Cassandra authentication                                                | -            | ✓        |          |
-| `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                                   | 1s           | ✓        |          |
-| `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                        | -            | ✓        |          |
-| `PROSODY_GROUP_ID`               | Consumer group identifier                                                            | -            | ✓        |          |
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.                  | 4096         | ✓        |          |
-| `PROSODY_MAX_CONCURRENCY`        | Maximum global concurrency limit                                                     | 32           | ✓        |          |
-| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure)       | 8            | ✓        |          |
-| `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                        | 3            | ✓        |          |
-| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages across all partitions                         | 64           | ✓        |          |
-| `PROSODY_MOCK`                   | Use mock Kafka brokers and in-memory timer storage for testing                       | false        | ✓        | ✓        |
-| `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                             | 100ms        | ✓        |          |
-| `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.                 | 8000         | ✓        |          |
-| `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                                 | 20ms         | ✓        |          |
-| `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                                  | 5m           | ✓        |          |
-| `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                         | 1s           |          | ✓        |
-| `PROSODY_SHUTDOWN_TIMEOUT`       | Timeout to wait for in-flight tasks to complete during partition shutdown            | 30s          | ✓        |          |
-| `PROSODY_SLAB_SIZE`              | Duration for timer slab partitioning                                                 | 1h           | ✓        |          |
-| `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                                 | `<group id>` |          | ✓        |
-| `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                                | 5m           | ✓        |          |
-| `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to. Also creates topics in mock cluster. | -            | ✓        |          |
+### Core
+
+| Environment Variable        | Description                                        | Default      | Consumer | Producer |
+|-----------------------------|----------------------------------------------------|--------------|----------|----------|
+| `PROSODY_BOOTSTRAP_SERVERS` | Kafka servers to connect to                        | -            | ✓        | ✓        |
+| `PROSODY_GROUP_ID`          | Consumer group name                                | -            | ✓        |          |
+| `PROSODY_SUBSCRIBED_TOPICS` | Topics to read from                                | -            | ✓        |          |
+| `PROSODY_ALLOWED_EVENTS`    | Only process events matching these prefixes        | (all)        | ✓        |          |
+| `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
+| `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
+| `PROSODY_LOG`               | Log level (e.g., `info`, `prosody=debug`)          | info         | ✓        | ✓        |
+
+### Consumer
+
+| Environment Variable             | Description                                          | Default                |
+|----------------------------------|------------------------------------------------------|------------------------|
+| `PROSODY_MAX_CONCURRENCY`        | Max messages being processed simultaneously          | 32                     |
+| `PROSODY_MAX_UNCOMMITTED`        | Max queued messages before pausing consumption       | 64                     |
+| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Max queued messages per key before pausing           | 8                      |
+| `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
+| `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |
+| `PROSODY_POLL_INTERVAL`          | How often to fetch new messages from Kafka           | 100ms                  |
+| `PROSODY_SHUTDOWN_TIMEOUT`       | Wait this long for in-flight work before force-quit  | 30s                    |
+| `PROSODY_STALL_THRESHOLD`        | Report unhealthy if no progress for this long        | 5m                     |
+| `PROSODY_PROBE_PORT`             | HTTP port for health checks ('none' to disable)      | 8000                   |
+| `PROSODY_FAILURE_TOPIC`          | Send unprocessable messages here (dead letter queue) | -                      |
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Track this many message IDs to skip duplicates       | 4096                   |
+| `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1d                     |
+
+### Producer
+
+| Environment Variable   | Description                     | Default |
+|------------------------|---------------------------------|---------|
+| `PROSODY_SEND_TIMEOUT` | Give up sending after this long | 1s      |
+
+### Retry
+
+When a handler fails, retry with exponential backoff:
+
+| Environment Variable      | Description                      | Default |
+|---------------------------|----------------------------------|---------|
+| `PROSODY_MAX_RETRIES`     | Give up after this many attempts | 3       |
+| `PROSODY_RETRY_BASE`      | Wait this long before first retry | 20ms    |
+| `PROSODY_RETRY_MAX_DELAY` | Never wait longer than this      | 5m      |
+
+### Deferral
+
+When a key keeps failing (e.g., downstream is down), stop retrying immediately
+and schedule retries for much later. This prevents one broken dependency from
+blocking all processing.
+
+| Environment Variable              | Description                                       | Default |
+|-----------------------------------|---------------------------------------------------|---------|
+| `PROSODY_DEFER_BASE`              | Wait this long before first deferred retry        | 1s      |
+| `PROSODY_DEFER_MAX_DELAY`         | Never wait longer than this                       | 24h     |
+| `PROSODY_DEFER_FAILURE_THRESHOLD` | Trigger deferral when failure rate exceeds this   | 0.9     |
+| `PROSODY_DEFER_FAILURE_WINDOW`    | Measure failure rate over this time window        | 5m      |
+| `PROSODY_DEFER_CACHE_SIZE`        | Track this many deferred keys in memory           | 1024    |
+| `PROSODY_DEFER_SEEK_TIMEOUT`      | Timeout when loading deferred messages            | 30s     |
+| `PROSODY_DEFER_DISCARD_THRESHOLD` | Read optimization (rarely needs changing)         | 100     |
+
+### Cassandra
+
+Persistent storage for scheduled retries (not needed if `PROSODY_MOCK=true`):
+
+| Environment Variable           | Description                        | Default |
+|--------------------------------|------------------------------------|---------|
+| `PROSODY_CASSANDRA_NODES`      | Servers to connect to (host:port)  | -       |
+| `PROSODY_CASSANDRA_KEYSPACE`   | Keyspace name                      | prosody |
+| `PROSODY_CASSANDRA_USER`       | Username                           | -       |
+| `PROSODY_CASSANDRA_PASSWORD`   | Password                           | -       |
+| `PROSODY_CASSANDRA_DATACENTER` | Prefer this datacenter for queries | -       |
+| `PROSODY_CASSANDRA_RACK`       | Prefer this rack for queries       | -       |
+| `PROSODY_CASSANDRA_RETENTION`  | Delete data older than this        | 1y      |
+
+### Hot Key Protection (Advanced)
+
+If one key dominates processing (e.g., a single customer sending tons of events),
+other keys get starved. This feature detects hot keys and temporarily slows them
+down so other keys can make progress.
+
+Example: With defaults, if key "customer-123" is processing for more than 4.5
+minutes out of any 5-minute window, it gets throttled.
+
+| Environment Variable                | Description                            | Default |
+|-------------------------------------|----------------------------------------|---------|
+| `PROSODY_MONOPOLIZATION_THRESHOLD`  | Max handler time as fraction of window | 0.9     |
+| `PROSODY_MONOPOLIZATION_WINDOW`     | Measurement window                     | 5m      |
+| `PROSODY_MONOPOLIZATION_CACHE_SIZE` | Max distinct keys to track             | 8192    |
+
+### Scheduler Tuning (Advanced)
+
+Controls how the scheduler picks which message to process next. The scheduler
+balances two goals: (1) fair time between retries and new messages, and
+(2) preventing any message from waiting too long.
+
+| Environment Variable               | Description                                                      | Default |
+|------------------------------------|------------------------------------------------------------------|---------|
+| `PROSODY_SCHEDULER_FAILURE_WEIGHT` | Fraction of processing time reserved for retries                 | 0.3     |
+| `PROSODY_SCHEDULER_MAX_WAIT_SECS`  | Messages waiting this long get maximum priority                  | 2m      |
+| `PROSODY_SCHEDULER_WAIT_WEIGHT`    | Priority boost for waiting messages (higher = more aggressive)   | 200.0   |
+| `PROSODY_SCHEDULER_CACHE_SIZE`     | Max distinct keys to track                                       | 8192    |
+
+### Topic Creation
+
+For creating Kafka topics programmatically:
+
+| Environment Variable               | Description                            | Default         |
+|------------------------------------|----------------------------------------|-----------------|
+| `PROSODY_TOPIC_NAME`               | Topic to create                        | -               |
+| `PROSODY_TOPIC_PARTITIONS`         | Number of partitions                   | broker default  |
+| `PROSODY_TOPIC_REPLICATION_FACTOR` | Number of replicas per partition       | broker default  |
+| `PROSODY_TOPIC_RETENTION`          | Delete messages older than this        | cluster default |
+| `PROSODY_TOPIC_CLEANUP_POLICY`     | Cleanup policy (delete, compact, both) | cluster default |
 
 ## Mock Mode for Testing
 
@@ -344,7 +428,7 @@ The timer system is automatically configured based on the consumer configuration
 
 - **Mock Mode**: Uses in-memory storage for testing (`PROSODY_MOCK=true`)
 - **Production Mode**: Uses Cassandra for persistent storage
-- **Slab Size**: Configure time-based partitioning with `PROSODY_SLAB_SIZE` (default: 10 minutes)
+- **Slab Size**: Configure time-based partitioning with `PROSODY_SLAB_SIZE` (default: 1 day)
 - **Retention**: Retention period for timer and failure data via `PROSODY_CASSANDRA_RETENTION` (default: 1 year)
 
 ### Usage in Handlers
