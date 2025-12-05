@@ -624,8 +624,6 @@ mod tests {
     async fn test_monopolizing_key_triggers_error() -> Result<()> {
         init_test_logging();
 
-        init_test_logging();
-
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()

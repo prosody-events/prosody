@@ -156,7 +156,7 @@ where
         C: EventContext,
     {
         // Since EventHandler::on_message doesn't return a Result, we can't actually
-        // fail This is a conceptual wrapper - in practice, infallible handlers
+        // fail. This is a conceptual wrapper - in practice, infallible handlers
         // should use CloneProvider
         Ok(())
     }
