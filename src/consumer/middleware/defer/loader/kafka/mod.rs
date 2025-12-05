@@ -731,13 +731,16 @@ fn assign_if_needed(
         return Ok(());
     }
 
-    // Assign partition at requested offset
-    // Experiments show assign() with deleted offset auto-resets
-    // to LSO cleanly (no erroneous state). Lazy validation in process_poll_result
-    // will detect when received offset != requested offset.
+    // Incrementally assign partition at requested offset.
+    // Must use incremental_assign() to ADD to existing assignments, not replace
+    // them. This pairs with incremental_unassign() used when partitions are
+    // fulfilled.
+    //
+    // Note: incremental_assign() with deleted offset auto-resets to LSO cleanly.
+    // Lazy validation in process_poll_result detects when received != requested.
     let mut to_assign = TopicPartitionList::new();
     to_assign.add_partition_offset(topic.as_ref(), partition, rdkafka::Offset::Offset(offset))?;
-    consumer.assign(&to_assign)?;
+    consumer.incremental_assign(&to_assign)?;
 
     Ok(())
 }

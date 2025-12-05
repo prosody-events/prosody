@@ -40,8 +40,15 @@ fn admin() -> color_eyre::Result<&'static ProsodyAdminClient> {
 }
 
 async fn create_topic(name: &str) -> color_eyre::Result<()> {
+    create_topic_with_partitions(name, 1).await
+}
+
+async fn create_topic_with_partitions(name: &str, partitions: u16) -> color_eyre::Result<()> {
     let admin = admin()?;
-    let topic_config = TopicConfiguration::new(name)?;
+    let topic_config = TopicConfiguration::builder()
+        .name(name)
+        .partition_count(partitions)
+        .build()?;
     admin.create_topic(&topic_config).await?;
     sleep(Duration::from_secs(2)).await;
     Ok(())
@@ -54,6 +61,14 @@ async fn delete_topic(name: &str) -> color_eyre::Result<()> {
 }
 
 async fn produce_messages(topic: &str, count: usize) -> color_eyre::Result<Vec<i64>> {
+    produce_messages_to_partition(topic, 0, count).await
+}
+
+async fn produce_messages_to_partition(
+    topic: &str,
+    partition: i32,
+    count: usize,
+) -> color_eyre::Result<Vec<i64>> {
     let producer = producer()?;
     let mut offsets = Vec::new();
 
@@ -64,6 +79,7 @@ async fn produce_messages(topic: &str, count: usize) -> color_eyre::Result<Vec<i
         let delivery = producer
             .send(
                 FutureRecord::to(topic)
+                    .partition(partition)
                     .key(&format!("key-{i}"))
                     .payload(&payload)
                     .headers(OwnedHeaders::new()),
@@ -951,10 +967,155 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
     result
 }
 
+/// Test: Concurrent loading from multiple partitions
+///
+/// This test verifies that `incremental_assign()` works correctly by loading
+/// messages from multiple partitions concurrently. With the old `assign()`
+/// approach (full replacement), loading from partition 1 would unassign
+/// partition 0, breaking concurrent multi-partition requests.
+///
+/// The test:
+/// 1. Creates a topic with 3 partitions
+/// 2. Produces messages to each partition
+/// 3. Concurrently loads messages from all partitions
+/// 4. Verifies all messages are loaded correctly
+#[tokio::test]
+async fn test_concurrent_multi_partition_loading() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+    init_test_logging();
+
+    let topic_name = test_topic("multi_partition");
+    create_topic_with_partitions(&topic_name, 3).await?;
+
+    let result = async {
+        // Produce messages to each partition
+        let offsets_p0 = produce_messages_to_partition(&topic_name, 0, 10).await?;
+        let offsets_p1 = produce_messages_to_partition(&topic_name, 1, 10).await?;
+        let offsets_p2 = produce_messages_to_partition(&topic_name, 2, 10).await?;
+
+        let topic = Topic::from(topic_name.as_str());
+        let loader = Arc::new(KafkaLoader::new(
+            loader_config(),
+            &HeartbeatRegistry::test(),
+        )?);
+
+        // Request messages from all 3 partitions concurrently
+        // With old assign() behavior, this would fail because assigning
+        // partition 1 would replace the assignment for partition 0
+        let loader_a = Arc::clone(&loader);
+        let loader_b = Arc::clone(&loader);
+        let loader_c = Arc::clone(&loader);
+
+        let target_0 = offsets_p0[5];
+        let target_1 = offsets_p1[5];
+        let target_2 = offsets_p2[5];
+
+        let h0 = tokio::spawn(async move {
+            timeout(
+                Duration::from_secs(10),
+                loader_a.load_message(topic, 0, target_0),
+            )
+            .await
+        });
+        let h1 = tokio::spawn(async move {
+            timeout(
+                Duration::from_secs(10),
+                loader_b.load_message(topic, 1, target_1),
+            )
+            .await
+        });
+        let h2 = tokio::spawn(async move {
+            timeout(
+                Duration::from_secs(10),
+                loader_c.load_message(topic, 2, target_2),
+            )
+            .await
+        });
+
+        let (r0, r1, r2) = tokio::join!(h0, h1, h2);
+
+        // All should succeed
+        let msg0 = r0???;
+        assert_eq!(msg0.partition(), 0_i32);
+        assert_eq!(msg0.offset(), target_0);
+
+        let msg1 = r1???;
+        assert_eq!(msg1.partition(), 1_i32);
+        assert_eq!(msg1.offset(), target_1);
+
+        let msg2 = r2???;
+        assert_eq!(msg2.partition(), 2_i32);
+        assert_eq!(msg2.offset(), target_2);
+
+        Ok(())
+    }
+    .await;
+
+    delete_topic(&topic_name).await?;
+    result
+}
+
+/// Test: Sequential loads from multiple partitions maintains assignments
+///
+/// Verifies that loading from partition 0, then partition 1, then partition 0
+/// again works correctly. With old `assign()` behavior, the second load from
+/// partition 0 would require re-assignment because partition 1's assignment
+/// replaced it.
+#[tokio::test]
+async fn test_sequential_multi_partition_loading() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+    init_test_logging();
+
+    let topic_name = test_topic("seq_multi_partition");
+    create_topic_with_partitions(&topic_name, 2).await?;
+
+    let result = async {
+        let offsets_p0 = produce_messages_to_partition(&topic_name, 0, 10).await?;
+        let offsets_p1 = produce_messages_to_partition(&topic_name, 1, 10).await?;
+
+        let topic = Topic::from(topic_name.as_str());
+        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
+
+        // Load from partition 0
+        let msg0 = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets_p0[3]),
+        )
+        .await??;
+        assert_eq!(msg0.partition(), 0_i32);
+        assert_eq!(msg0.offset(), offsets_p0[3]);
+
+        // Load from partition 1
+        let msg1 = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 1, offsets_p1[5]),
+        )
+        .await??;
+        assert_eq!(msg1.partition(), 1_i32);
+        assert_eq!(msg1.offset(), offsets_p1[5]);
+
+        // Load again from partition 0 (different offset)
+        // With old assign() this would fail or timeout
+        let msg0_again = timeout(
+            Duration::from_secs(10),
+            loader.load_message(topic, 0, offsets_p0[7]),
+        )
+        .await??;
+        assert_eq!(msg0_again.partition(), 0_i32);
+        assert_eq!(msg0_again.offset(), offsets_p0[7]);
+
+        Ok(())
+    }
+    .await;
+
+    delete_topic(&topic_name).await?;
+    result
+}
+
 /// Unit tests for seek decision logic (no Kafka required)
 mod seek_decision {
-    /// Helper to compute should_seek using the same logic as
-    /// seek_to_first_active_offset. This mirrors the production logic for
+    /// Helper to compute `should_seek` using the same logic as
+    /// `seek_to_first_active_offset`. This mirrors the production logic for
     /// testability.
     fn should_seek(current_position: Option<i64>, min_offset: i64, discard_threshold: i64) -> bool {
         current_position.is_some_and(|position| {
