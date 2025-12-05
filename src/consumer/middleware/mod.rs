@@ -157,7 +157,6 @@ use crate::consumer::{DemandType, EventHandler, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::{Partition, Topic};
 
-pub mod concurrency;
 /// Message retry mechanism that loads failed messages from specific Kafka
 /// offsets.
 pub mod defer;
