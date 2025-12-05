@@ -57,6 +57,7 @@ use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::spawn_blocking;
@@ -66,6 +67,7 @@ use whoami::fallible::hostname;
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
+use tokio::select;
 
 #[cfg(test)]
 mod tests;
@@ -362,28 +364,30 @@ fn poll_loop(
     loop {
         heartbeat.beat();
 
-        // Drain all pending requests (non-blocking)
+        // Drain all pending requests
         loop {
             match rx.try_recv() {
-                Ok(request) => {
-                    handle_request(request, &mut active, consumer);
-                }
+                Ok(request) => handle_request(request, &mut active, consumer),
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     debug!("Loader poll loop shutdown");
                     return;
                 }
-                Err(TryRecvError::Empty) => break,
             }
         }
 
-        // If no active requests, block until we receive one
+        // If idle, wait for a request (with heartbeat timeout)
         if active.is_empty() {
-            let Some(request) = rx.blocking_recv() else {
-                debug!("Loader poll loop shutdown");
-                return;
-            };
+            if let Some(request) = Handle::current().block_on(async {
+                select! {
+                    r = rx.recv() => r,
+                    () = heartbeat.next() => None,
+                }
+            }) {
+                handle_request(request, &mut active, consumer);
+            }
 
-            handle_request(request, &mut active, consumer);
+            // Channel close (None from recv) detected on next drain iteration
             continue;
         }
 
