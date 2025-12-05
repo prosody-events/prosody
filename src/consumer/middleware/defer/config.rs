@@ -16,15 +16,15 @@ use validator::Validate;
 pub struct DeferConfiguration {
     /// Base exponential backoff delay for deferred retries.
     ///
-    /// This is much longer than `RetryMiddleware`'s base delay because
+    /// This is longer than `RetryMiddleware`'s base delay because
     /// deferred retries handle persistent failures that need time to
     /// recover (e.g., downstream service outages).
     ///
     /// Environment variable: `PROSODY_DEFER_BASE`
-    /// Default: 1 minute
+    /// Default: 1 second
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_DEFER_BASE\", \
-                   Duration::from_secs(60))?",
+                   Duration::from_secs(1))?",
         setter(into)
     )]
     #[validate(custom(function = "validate_base_delay"))]

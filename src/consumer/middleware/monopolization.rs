@@ -46,7 +46,7 @@ use crate::consumer::{DemandType, Keyed};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
 use crate::timers::Trigger;
-use crate::util::from_env_with_fallback;
+use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Key, Partition, Topic};
 
 /// Configuration for monopolization detection.
@@ -66,9 +66,13 @@ pub struct MonopolizationConfiguration {
     /// Rolling window duration for monopolization detection.
     ///
     /// Environment variable: `PROSODY_MONOPOLIZATION_WINDOW`
-    /// Default: 5 minutes (300 seconds)
-    #[builder(default = "from_env_with_fallback(\"PROSODY_MONOPOLIZATION_WINDOW\", 300)?")]
-    pub window_duration_secs: u64,
+    /// Default: 5 minutes
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_MONOPOLIZATION_WINDOW\", \
+                   Duration::from_secs(5 * 60))?",
+        setter(into)
+    )]
+    pub window_duration: Duration,
 
     /// LRU cache size for tracking key execution intervals.
     ///
@@ -142,7 +146,7 @@ impl MonopolizationMiddleware {
 
         let telemetry_rx = telemetry.subscribe();
         let key_intervals_clone = Arc::clone(&key_intervals);
-        let window_duration = Duration::from_secs(config.window_duration_secs);
+        let window_duration = config.window_duration;
 
         spawn(run_event_loop(
             reference_instant,
@@ -571,7 +575,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(300)
+            .window_duration(Duration::from_secs(300))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -626,7 +630,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(100)
+            .window_duration(Duration::from_secs(100))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -686,7 +690,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(100)
+            .window_duration(Duration::from_secs(100))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -767,7 +771,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(10)
+            .window_duration(Duration::from_secs(10))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -857,7 +861,7 @@ mod tests {
         let telemetry = Telemetry::new();
 
         let config = MonopolizationConfiguration::builder()
-            .window_duration_secs(100)
+            .window_duration(Duration::from_secs(100))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -919,7 +923,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(100)
+            .window_duration(Duration::from_secs(100))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -974,7 +978,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(100)
+            .window_duration(Duration::from_secs(100))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -1027,7 +1031,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(100)
+            .window_duration(Duration::from_secs(100))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -1081,7 +1085,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(100)
+            .window_duration(Duration::from_secs(100))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -1134,7 +1138,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration_secs(100)
+            .window_duration(Duration::from_secs(100))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
