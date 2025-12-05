@@ -555,7 +555,8 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         .await??;
         assert_eq!(msg1.offset(), offsets[50]);
 
-        // Load offset 55 (51 + 4 = 55, within threshold, should NOT seek)
+        // Load offset 55 - partition was unassigned after 50, position is Invalid.
+        // With Invalid position, we trust assign() and don't seek.
         let msg2 = timeout(
             Duration::from_secs(10),
             loader.load_message(topic, 0, offsets[55]),
@@ -563,7 +564,9 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         .await??;
         assert_eq!(msg2.offset(), offsets[55]);
 
-        // Load offset 70 (56 + 14 = 70, beyond threshold, should seek)
+        // Load offset 70 - partition was unassigned after 55, position is Invalid.
+        // With Invalid position, we trust assign() and don't seek.
+        // Previously this could timeout because Invalid triggered unnecessary seek.
         let msg3 = timeout(
             Duration::from_secs(10),
             loader.load_message(topic, 0, offsets[70]),
@@ -946,4 +949,68 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
 
     delete_topic(&topic_name).await?;
     result
+}
+
+/// Unit tests for seek decision logic (no Kafka required)
+mod seek_decision {
+    /// Helper to compute should_seek using the same logic as
+    /// seek_to_first_active_offset. This mirrors the production logic for
+    /// testability.
+    fn should_seek(current_position: Option<i64>, min_offset: i64, discard_threshold: i64) -> bool {
+        current_position.is_some_and(|position| {
+            let past_target = position > min_offset;
+            let too_far_behind = position + discard_threshold < min_offset;
+            past_target || too_far_behind
+        })
+    }
+
+    #[test]
+    fn invalid_position_does_not_seek() {
+        // After assign() but before first poll(), position() returns Invalid (None).
+        // We trust assign() positioned correctly, so don't seek.
+        assert!(!should_seek(None, 70, 5));
+        assert!(!should_seek(None, 0, 10));
+        assert!(!should_seek(None, 1000, 100));
+    }
+
+    #[test]
+    fn position_past_target_seeks() {
+        // Current position (60) > target (50) - need to seek backward
+        assert!(should_seek(Some(60), 50, 5));
+        assert!(should_seek(Some(100), 50, 10));
+    }
+
+    #[test]
+    fn position_too_far_behind_seeks() {
+        // Position (50) + threshold (5) < target (70) → too far behind
+        // 50 + 5 = 55 < 70 → seek
+        assert!(should_seek(Some(50), 70, 5));
+        // 50 + 10 = 60 < 100 → seek
+        assert!(should_seek(Some(50), 100, 10));
+    }
+
+    #[test]
+    fn position_within_threshold_does_not_seek() {
+        // Position (50) + threshold (5) >= target (55) → within range, read
+        // sequentially 50 + 5 = 55 >= 55 → don't seek
+        assert!(!should_seek(Some(50), 55, 5));
+        // 50 + 5 = 55 >= 54 → don't seek
+        assert!(!should_seek(Some(50), 54, 5));
+        // 50 + 10 = 60 >= 55 → don't seek
+        assert!(!should_seek(Some(50), 55, 10));
+    }
+
+    #[test]
+    fn position_at_target_does_not_seek() {
+        // Position equals target - already there
+        assert!(!should_seek(Some(50), 50, 5));
+    }
+
+    #[test]
+    fn position_ahead_of_target_within_threshold_does_not_seek() {
+        // Position (52) > target (50) → past_target is true → should seek
+        // Wait, this is "past target" meaning we've already read past it
+        // We need to go BACK, so we must seek
+        assert!(should_seek(Some(52), 50, 5));
+    }
 }

@@ -637,8 +637,14 @@ fn seek_to_first_active_offset(
         // Avoid expensive seeks when close enough to read sequentially.
         // Seek (~10-100ms) vs sequential read of N messages (~1-10ms):
         // - Don't seek: within threshold and before target (sequential read cheaper)
-        // - Seek: past target (backward), too far behind, or unknown position
-        let should_seek = current_position.is_none_or(|position| {
+        // - Seek: past target (backward), too far behind
+        // - Don't seek: unknown position (Invalid) - trust assign() positioned
+        //   correctly
+        //
+        // Note: position() returns Invalid after assign() until first message is
+        // consumed. In this state, assign() already positioned the consumer at
+        // the requested offset, so seeking is unnecessary and adds latency.
+        let should_seek = current_position.is_some_and(|position| {
             let past_target = position > min_offset;
             let too_far_behind = position + discard_threshold < min_offset;
             past_target || too_far_behind
