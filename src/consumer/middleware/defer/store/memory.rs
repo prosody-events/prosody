@@ -30,10 +30,9 @@ use crate::{Key, Offset, Partition, Topic};
 use crate::defer_store_tests;
 use ahash::RandomState;
 use scc::HashMap;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// In-memory implementation of [`DeferStore`] for testing and development.
 ///
@@ -76,13 +75,12 @@ impl Default for MemoryDeferStore {
 /// Internal state for [`MemoryDeferStore`].
 ///
 /// Maps each message key to:
-/// - `BTreeMap<Offset, Instant>`: Sorted offsets (oldest first) with TTL
-///   simulation
+/// - `BTreeSet<Offset>`: Sorted offsets (oldest first)
 /// - `u32`: Shared retry counter for this key
 #[derive(Debug)]
 struct Inner {
-    /// Storage: `message_key` -> (`offsets_with_expiry`, `retry_count`)
-    deferred: HashMap<Key, (BTreeMap<Offset, Instant>, u32), RandomState>,
+    /// Storage: `message_key` -> (`offsets`, `retry_count`)
+    deferred: HashMap<Key, (BTreeSet<Offset>, u32), RandomState>,
 }
 
 impl Default for Inner {
@@ -100,9 +98,6 @@ impl DeferStore for MemoryDeferStore {
         &self,
         key: &Key,
     ) -> Result<Option<(Offset, u32)>, Self::Error> {
-        let now = Instant::now();
-
-        // Get the entry for this key
         let result = self
             .inner
             .deferred
@@ -110,34 +105,24 @@ impl DeferStore for MemoryDeferStore {
             .await
             .and_then(|entry| {
                 let (offsets, retry_count) = entry.get();
-
-                // Find the oldest (first) non-expired offset
-                offsets
-                    .iter()
-                    .find(|&(_, expiry)| *expiry > now)
-                    .map(|(&offset, _)| (offset, *retry_count))
+                offsets.first().map(|&offset| (offset, *retry_count))
             });
 
         Ok(result)
     }
 
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        // Calculate expiry time (TTL simulation)
-        let expiry = Instant::now() + Duration::from_secs(3600);
-
-        // Set retry_count=0 and append offset
-        // Match Cassandra: INSERT doesn't delete existing offsets
         self.inner
             .deferred
             .entry_async(Arc::clone(key))
             .await
             .and_modify(|(offsets, retry_count)| {
-                offsets.insert(offset, expiry);
+                offsets.insert(offset);
                 *retry_count = 0;
             })
             .or_insert_with(|| {
-                let mut offsets = BTreeMap::new();
-                offsets.insert(offset, expiry);
+                let mut offsets = BTreeSet::new();
+                offsets.insert(offset);
                 (offsets, 0)
             });
 
@@ -145,22 +130,18 @@ impl DeferStore for MemoryDeferStore {
     }
 
     async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        // Calculate expiry time (TTL simulation)
-        let expiry = Instant::now() + Duration::from_secs(3600);
-
-        // Insert offset without modifying retry_count
         self.inner
             .deferred
             .entry_async(Arc::clone(key))
             .await
-            .and_modify(|(offsets, _retry_count)| {
-                offsets.insert(offset, expiry);
+            .and_modify(|(offsets, _)| {
+                offsets.insert(offset);
             })
             .or_insert_with(|| {
                 // Shouldn't happen (should use defer_first_message first)
                 // but handle gracefully with retry_count=0
-                let mut offsets = BTreeMap::new();
-                offsets.insert(offset, expiry);
+                let mut offsets = BTreeSet::new();
+                offsets.insert(offset);
                 (offsets, 0)
             });
 
@@ -168,17 +149,12 @@ impl DeferStore for MemoryDeferStore {
     }
 
     async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        // Remove the specific offset
-        // Note: Unlike Cassandra's DELETE on clustering column, we don't remove the
-        // entry entirely when offsets become empty. This preserves retry_count
-        // (static column equivalent), matching Cassandra behavior where static
-        // columns persist after deleting all clustering rows.
         let _ = self
             .inner
             .deferred
             .entry_async(Arc::clone(key))
             .await
-            .and_modify(|(offsets, _retry_count)| {
+            .and_modify(|(offsets, _)| {
                 offsets.remove(&offset);
             });
 
@@ -186,19 +162,14 @@ impl DeferStore for MemoryDeferStore {
     }
 
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        // Match Cassandra: UPDATE creates partition with static column even if no
-        // offsets exist
         self.inner
             .deferred
             .entry_async(Arc::clone(key))
             .await
-            .and_modify(|(_offsets, current_retry_count)| {
-                *current_retry_count = retry_count;
+            .and_modify(|(_, current)| {
+                *current = retry_count;
             })
-            .or_insert_with(|| {
-                // Create entry with empty offsets and the specified retry_count
-                (BTreeMap::new(), retry_count)
-            });
+            .or_insert_with(|| (BTreeSet::new(), retry_count));
 
         Ok(())
     }
