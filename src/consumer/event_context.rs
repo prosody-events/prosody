@@ -24,6 +24,7 @@ use futures::{FutureExt, Stream, StreamExt, TryStreamExt, pin_mut};
 use serde::de::StdError;
 use std::error::Error;
 use std::future::{Future, ready};
+use std::ops::AsyncFnOnce;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::select;
@@ -257,6 +258,45 @@ where
 
         Self { inner }
     }
+
+    /// Run a cancellable operation, short-circuiting if already shutdown or
+    /// cancelled.
+    ///
+    /// Takes an async closure that receives `Arc<Inner<T>>` by value. This
+    /// ensures no work is done when already cancelled, and the caller writes
+    /// natural async code without explicit cloning.
+    ///
+    /// Uses separate watch channels directly rather than `on_cancel` (which
+    /// redundantly includes shutdown checking).
+    async fn run_cancellable<F, R>(&self, operation: F) -> Result<R, TimerManagerError<T::Error>>
+    where
+        F: AsyncFnOnce(Arc<Inner<T>>) -> Result<R, TimerManagerError<T::Error>>,
+    {
+        let guard = self.inner.load();
+        let Some(inner) = guard.as_ref() else {
+            return Err(TimerManagerError::InvalidContext);
+        };
+
+        // Short-circuit before constructing the future
+        if *inner.shutdown_rx.borrow() {
+            return Err(TimerManagerError::Shutdown);
+        }
+        if *inner.message_cancel_rx.borrow() {
+            return Err(TimerManagerError::Cancelled);
+        }
+
+        // Clone once here; caller receives owned Arc in async closure
+        let mut shutdown_rx = inner.shutdown_rx.clone();
+        let mut cancel_rx = inner.message_cancel_rx.clone();
+        let inner = Arc::clone(inner);
+
+        select! {
+            biased;
+            _ = shutdown_rx.wait_for(|v| *v) => Err(TimerManagerError::Shutdown),
+            _ = cancel_rx.wait_for(|v| *v) => Err(TimerManagerError::Cancelled),
+            result = operation(inner) => result,
+        }
+    }
 }
 
 impl<T> EventContext for TimerContext<T>
@@ -331,24 +371,16 @@ where
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), Self::Error> {
-        let inner = self.inner.load();
-        let Some(inner) = inner.as_ref() else {
-            return Err(TimerManagerError::InvalidContext);
-        };
+        self.run_cancellable(async |inner| {
+            // Prevent scheduling at the same time/type as the current timer
+            if inner.maybe_current_timer == Some((time, timer_type)) {
+                return Err(TimerManagerError::ConflictsWithCurrentTimer);
+            }
 
-        // Prevent scheduling at the same time/type as the current timer
-        if inner.maybe_current_timer == Some((time, timer_type)) {
-            return Err(TimerManagerError::ConflictsWithCurrentTimer);
-        }
-
-        let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
-
-        select! {
-            biased;
-            () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
-            () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
-            result = inner.timers.schedule(trigger) => result,
-        }
+            let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
+            inner.timers.schedule(trigger).await
+        })
+        .await
     }
 
     async fn clear_and_schedule(
@@ -356,18 +388,14 @@ where
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let span = Span::current();
-        let inner = self.inner.load();
-        let Some(inner) = inner.as_ref() else {
-            return Err(TimerManagerError::InvalidContext);
-        };
+        self.run_cancellable(async |inner| {
+            // Prevent scheduling at the same time/type as the current timer
+            if inner.maybe_current_timer == Some((time, timer_type)) {
+                return Err(TimerManagerError::ConflictsWithCurrentTimer);
+            }
 
-        // Prevent scheduling at the same time/type as the current timer
-        if inner.maybe_current_timer == Some((time, timer_type)) {
-            return Err(TimerManagerError::ConflictsWithCurrentTimer);
-        }
+            let span = Span::current();
 
-        let operation = async {
             // Get scheduled triggers of this type
             let mut triggers_to_delete = inner
                 .timers
@@ -390,6 +418,7 @@ where
             iter(triggers_to_delete)
                 .map(|trigger| {
                     let span_clone = span.clone();
+                    let inner = Arc::clone(&inner);
                     async move {
                         // Link new span with the original trigger's span.
                         span_clone.follows_from(trigger.span());
@@ -402,14 +431,8 @@ where
                 .buffer_unordered(DELETE_CONCURRENCY)
                 .try_collect::<()>()
                 .await
-        };
-
-        select! {
-            biased;
-            () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
-            () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
-            result = operation => result,
-        }
+        })
+        .await
     }
 
     async fn unschedule(
@@ -417,34 +440,20 @@ where
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let inner = self.inner.load();
-        let Some(inner) = inner.as_ref() else {
-            return Err(TimerManagerError::InvalidContext);
-        };
-
-        select! {
-            biased;
-            () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
-            () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
-            result = inner.timers.unschedule(&inner.key, time, timer_type) => result,
-        }
+        self.run_cancellable(async |inner| {
+            inner.timers.unschedule(&inner.key, time, timer_type).await
+        })
+        .await
     }
 
     async fn clear_scheduled(
         &self,
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let inner = self.inner.load();
-        let Some(inner) = inner.as_ref() else {
-            return Err(TimerManagerError::InvalidContext);
-        };
-
-        select! {
-            biased;
-            () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
-            () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
-            result = inner.timers.unschedule_all(&inner.key, timer_type) => result,
-        }
+        self.run_cancellable(async |inner| {
+            inner.timers.unschedule_all(&inner.key, timer_type).await
+        })
+        .await
     }
 
     fn invalidate(self) {
@@ -465,27 +474,31 @@ where
         &self,
         timer_type: TimerType,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        let on_shutdown = EventContext::on_shutdown(self);
-        let on_cancel = EventContext::on_cancel(self);
-
         let inner = self.inner.load();
         let Some(inner) = inner.as_ref() else {
             return once(ready(Err(TimerManagerError::InvalidContext))).left_stream();
         };
 
+        // Short-circuit before creating the stream
+        if *inner.shutdown_rx.borrow() {
+            return once(ready(Err(TimerManagerError::Shutdown))).left_stream();
+        }
+        if *inner.message_cancel_rx.borrow() {
+            return once(ready(Err(TimerManagerError::Cancelled))).left_stream();
+        }
+
+        let mut shutdown_rx = inner.shutdown_rx.clone();
+        let mut cancel_rx = inner.message_cancel_rx.clone();
         let inner = Arc::clone(inner);
 
         try_stream! {
             let scheduled_timers = inner.timers.scheduled_times(&inner.key, timer_type);
-
-            pin_mut!(on_shutdown);
-            pin_mut!(on_cancel);
             pin_mut!(scheduled_timers);
 
             while let Some(time) = select! {
                 biased;
-                () = &mut on_shutdown => Err(TimerManagerError::Shutdown),
-                () = &mut on_cancel => Err(TimerManagerError::Cancelled),
+                _ = shutdown_rx.wait_for(|v| *v) => Err(TimerManagerError::Shutdown),
+                _ = cancel_rx.wait_for(|v| *v) => Err(TimerManagerError::Cancelled),
                 item = scheduled_timers.try_next() => item,
             }? {
                 yield time;
