@@ -29,7 +29,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
-use tracing::{Span, error};
+use tracing::Span;
 
 /// Marker trait for errors that can be returned from event context operations.
 ///
@@ -332,16 +332,8 @@ where
         async move {
             select! {
                 biased;
-                result = shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => {
-                    if let Err(error) = result {
-                        error!("shutdown hook failed: {error:#}");
-                    }
-                }
-                result = message_cancel_rx.wait_for(|is_cancelled| *is_cancelled) => {
-                    if let Err(error) = result {
-                        error!("message cancellation hook failed: {error:#}");
-                    }
-                }
+                _ = shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => {}
+                _ = message_cancel_rx.wait_for(|is_cancelled| *is_cancelled) => {}
             }
         }
         .right_future()
