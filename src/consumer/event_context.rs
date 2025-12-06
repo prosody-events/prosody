@@ -39,39 +39,45 @@ pub trait EventContextError: StdError + ClassifyError + Send + Sync + 'static {}
 
 impl<T> EventContextError for T where T: StdError + ClassifyError + Send + Sync + 'static {}
 
-/// Provides shutdown notifications and timer operations to message handlers.
+/// Provides cancellation notifications and timer operations to message
+/// handlers.
 ///
 /// Handlers receive an implementation of `EventContext` that allows them to:
-/// - Await a shutdown signal.
+/// - Await a cancellation signal (includes partition shutdown).
 /// - Schedule a new timer for the current message key.
 /// - Unschedule one or all existing timers for the key.
 /// - Clear any scheduled timers and reschedule a fresh one.
 /// - Inspect all scheduled timer execution times for the key.
-/// - Check synchronously if shutdown has been requested.
+/// - Check synchronously if cancellation has been requested.
 pub trait EventContext: Clone + Send + Sync + 'static {
     /// Error type returned by timer-related operations.
     type Error: EventContextError;
 
-    /// Returns `true` if a partition shutdown signal has been issued.
-    fn should_shutdown(&self) -> bool;
-
     /// Returns `true` if this message processing has been cancelled.
+    ///
+    /// Cancellation includes both message-level cancellation and partition
+    /// shutdown.
     fn should_cancel(&self) -> bool;
 
-    /// Returns a future that resolves when a partition shutdown signal is
-    /// received.
-    ///
-    /// # Returns
-    ///
-    /// A future that completes with `()` once partition shutdown is triggered.
-    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static;
-
     /// Returns a future that resolves when message processing is cancelled.
+    ///
+    /// Cancellation includes both message-level cancellation and partition
+    /// shutdown.
     ///
     /// # Returns
     ///
     /// A future that completes with `()` once cancellation is triggered.
     fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static;
+
+    /// Trigger cancellation for this context.
+    ///
+    /// Signals that the current operation should be cancelled. Handlers should
+    /// check `should_cancel()` or await `on_cancel()` and clean up promptly.
+    ///
+    /// This is used by middleware (e.g., timeout) to signal cancellation while
+    /// continuing to wait for the handler to finish cleanup. Calling multiple
+    /// times is idempotent.
+    fn cancel(&self);
 
     /// Schedule a new timer at the given execution time for this key.
     ///
@@ -305,15 +311,6 @@ where
 {
     type Error = TimerManagerError<T::Error>;
 
-    fn should_shutdown(&self) -> bool {
-        let inner = self.inner.load();
-        let Some(inner) = inner.as_ref() else {
-            return true;
-        };
-
-        *inner.shutdown_rx.borrow()
-    }
-
     fn should_cancel(&self) -> bool {
         let inner = self.inner.load();
         let Some(inner) = inner.as_ref() else {
@@ -321,22 +318,6 @@ where
         };
 
         *inner.message_cancel_rx.borrow() | *inner.shutdown_rx.borrow()
-    }
-
-    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-        let inner = self.inner.load();
-        let Some(inner) = inner.as_ref() else {
-            return ready(()).left_future();
-        };
-
-        let mut shutdown_rx = inner.shutdown_rx.clone();
-
-        async move {
-            if let Err(error) = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await {
-                error!("shutdown hook failed: {error:#}");
-            }
-        }
-        .right_future()
     }
 
     fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -456,12 +437,16 @@ where
         .await
     }
 
-    fn invalidate(self) {
-        // Signal cancellation to notify processors waiting on futures from `on_cancel`
-        // to abort ongoing operations.
+    fn cancel(&self) {
         if let Some(inner) = self.inner.load().as_ref() {
             let _ = inner.message_cancel_tx.send(true);
         }
+    }
+
+    fn invalidate(self) {
+        // Signal cancellation to notify processors waiting on futures from `on_cancel`
+        // to abort ongoing operations.
+        self.cancel();
 
         // Clear the inner state to prevent any further operations on this context.
         // This ensures resource cleanup (spans, channels) and prevents usage after
@@ -524,10 +509,8 @@ pub type BoxEventContextError = Box<dyn EventContextError>;
 /// check.
 #[async_trait]
 pub trait DynEventContext: DynClone + Send + Sync + 'static {
-    /// Async wait for partition shutdown signal.
-    async fn on_shutdown(&self);
-
-    /// Async wait for message cancellation signal.
+    /// Async wait for message cancellation signal (includes partition
+    /// shutdown).
     async fn on_cancel(&self);
 
     /// Schedule a timer for the current key.
@@ -586,10 +569,8 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
         timer_type: TimerType,
     ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxEventContextError>> + Send + 'static>>;
 
-    /// Synchronously check if partition shutdown has been requested.
-    fn should_shutdown(&self) -> bool;
-
-    /// Synchronously check if message cancellation has been requested.
+    /// Synchronously check if message cancellation has been requested (includes
+    /// partition shutdown).
     fn should_cancel(&self) -> bool;
 }
 
@@ -601,10 +582,6 @@ where
     C: EventContext + Send + Sync + 'static,
     C::Error: Error + Send + Sync + 'static,
 {
-    async fn on_shutdown(&self) {
-        EventContext::on_shutdown(self).await;
-    }
-
     async fn on_cancel(&self) {
         EventContext::on_cancel(self).await;
     }
@@ -654,10 +631,6 @@ where
             EventContext::scheduled(self, timer_type)
                 .map_err(|e| Box::new(e) as BoxEventContextError),
         )
-    }
-
-    fn should_shutdown(&self) -> bool {
-        EventContext::should_shutdown(self)
     }
 
     fn should_cancel(&self) -> bool {

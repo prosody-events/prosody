@@ -148,7 +148,7 @@ where
     where
         C: EventContext,
     {
-        if context.should_shutdown() {
+        if context.should_cancel() {
             return Err(ShutdownError::Shutdown);
         }
 
@@ -167,7 +167,7 @@ where
     where
         C: EventContext,
     {
-        if context.should_shutdown() {
+        if context.should_cancel() {
             return Err(ShutdownError::Shutdown);
         }
         self.handler
@@ -266,16 +266,8 @@ mod tests {
     impl EventContext for MockContext {
         type Error = Infallible;
 
-        fn should_shutdown(&self) -> bool {
-            self.shutdown
-        }
-
         fn should_cancel(&self) -> bool {
-            false
-        }
-
-        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-            future::pending::<()>()
+            self.shutdown
         }
 
         fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -312,6 +304,8 @@ mod tests {
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             future::ready(Ok(()))
         }
+
+        fn cancel(&self) {}
 
         fn invalidate(self) {}
 

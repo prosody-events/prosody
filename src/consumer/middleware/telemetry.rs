@@ -278,16 +278,8 @@ mod tests {
     impl EventContext for MockContext {
         type Error = Infallible;
 
-        fn should_shutdown(&self) -> bool {
-            false
-        }
-
         fn should_cancel(&self) -> bool {
             false
-        }
-
-        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-            future::pending::<()>()
         }
 
         fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -324,6 +316,8 @@ mod tests {
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             future::ready(Ok(()))
         }
+
+        fn cancel(&self) {}
 
         fn invalidate(self) {}
 

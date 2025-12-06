@@ -13,9 +13,11 @@
 //!
 //! - `timeout`: Fixed timeout duration (default: 80% of stall threshold)
 
+use std::future::Future;
 use std::time::Duration;
 
 use derive_builder::Builder;
+use futures::pin_mut;
 use thiserror::Error;
 use tokio::select;
 use tokio::time::sleep;
@@ -24,9 +26,7 @@ use validator::{Validate, ValidationErrors};
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
-};
+use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::timers::Trigger;
 use crate::util::from_option_duration_env;
 use crate::{Partition, Topic};
@@ -68,16 +68,28 @@ pub struct TimeoutHandler<T> {
     timeout: Duration,
 }
 
-/// Errors that can occur during timeout handling.
-#[derive(Debug, Error)]
-pub enum TimeoutError<E> {
-    /// The inner handler returned an error.
-    #[error(transparent)]
-    Handler(E),
+impl<T> TimeoutHandler<T> {
+    /// Run an operation with timeout, signaling cancellation if exceeded.
+    ///
+    /// If the timeout fires before the operation completes, cancellation is
+    /// signaled via `context.cancel()` and we continue waiting for the
+    /// operation to finish. This ensures the handler has a chance to clean up
+    /// before returning its result.
+    async fn run_with_timeout<C, F, R, E>(&self, context: C, operation: F) -> Result<R, E>
+    where
+        C: EventContext,
+        F: Future<Output = Result<R, E>>,
+    {
+        pin_mut!(operation);
 
-    /// The operation timed out.
-    #[error("Operation timed out after {0:?}")]
-    Timeout(Duration),
+        select! {
+            result = &mut operation => result,
+            () = sleep(self.timeout) => {
+                context.cancel();
+                operation.await
+            }
+        }
+    }
 }
 
 /// Errors that can occur during timeout middleware initialization.
@@ -86,18 +98,6 @@ pub enum TimeoutInitError {
     /// Configuration validation failed.
     #[error("Invalid configuration: {0:#}")]
     Validation(#[from] ValidationErrors),
-}
-
-impl<E> ClassifyError for TimeoutError<E>
-where
-    E: ClassifyError,
-{
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            TimeoutError::Handler(error) => error.classify_error(),
-            TimeoutError::Timeout(_) => ErrorCategory::Transient,
-        }
-    }
 }
 
 impl TimeoutConfiguration {
@@ -163,7 +163,7 @@ impl<T> FallibleHandler for TimeoutHandler<T>
 where
     T: FallibleHandler,
 {
-    type Error = TimeoutError<T::Error>;
+    type Error = T::Error;
 
     async fn on_message<C>(
         &self,
@@ -174,14 +174,11 @@ where
     where
         C: EventContext,
     {
-        select! {
-            result = self.handler.on_message(context, message, demand_type) => {
-                result.map_err(TimeoutError::Handler)
-            }
-            () = sleep(self.timeout) => {
-                Err(TimeoutError::Timeout(self.timeout))
-            }
-        }
+        self.run_with_timeout(
+            context.clone(),
+            self.handler.on_message(context, message, demand_type),
+        )
+        .await
     }
 
     async fn on_timer<C>(
@@ -193,14 +190,11 @@ where
     where
         C: EventContext,
     {
-        select! {
-            result = self.handler.on_timer(context, trigger, demand_type) => {
-                result.map_err(TimeoutError::Handler)
-            }
-            () = sleep(self.timeout) => {
-                Err(TimeoutError::Timeout(self.timeout))
-            }
-        }
+        self.run_with_timeout(
+            context.clone(),
+            self.handler.on_timer(context, trigger, demand_type),
+        )
+        .await
     }
 
     async fn shutdown(self) {
@@ -212,6 +206,7 @@ where
 mod tests {
     use super::*;
     use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::middleware::{ClassifyError, ErrorCategory};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
@@ -222,19 +217,20 @@ mod tests {
     use std::fmt::{Display, Formatter, Result as FmtResult};
     use std::future::{self, Future};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Semaphore;
-    use tokio::time::sleep as tokio_sleep;
+    use tokio::task::yield_now;
+    use tokio::time::Instant;
     use tracing::Span;
 
-    /// Test error type with configurable classification.
+    /// Test error type.
     #[derive(Debug, Clone)]
-    struct TestError(ErrorCategory);
+    struct TestError(&'static str);
 
     impl Display for TestError {
         fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-            write!(f, "test error ({:?})", self.0)
+            write!(f, "test error: {}", self.0)
         }
     }
 
@@ -242,31 +238,37 @@ mod tests {
 
     impl ClassifyError for TestError {
         fn classify_error(&self) -> ErrorCategory {
-            self.0
+            ErrorCategory::Transient
         }
     }
 
-    /// Mock context that satisfies [`EventContext`].
+    /// Mock context that satisfies [`EventContext`] and tracks cancellation.
     #[derive(Clone)]
-    struct MockContext;
+    struct MockContext {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl MockContext {
+        fn new() -> Self {
+            Self {
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
 
     impl EventContext for MockContext {
         type Error = Infallible;
 
-        fn should_shutdown(&self) -> bool {
-            false
-        }
-
         fn should_cancel(&self) -> bool {
-            false
-        }
-
-        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-            future::pending::<()>()
+            self.cancelled.load(Ordering::Relaxed)
         }
 
         fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
             future::pending::<()>()
+        }
+
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::Relaxed);
         }
 
         fn schedule(
@@ -300,7 +302,9 @@ mod tests {
             future::ready(Ok(()))
         }
 
-        fn invalidate(self) {}
+        fn invalidate(self) {
+            self.cancel();
+        }
 
         fn scheduled(
             &self,
@@ -336,16 +340,16 @@ mod tests {
             }
         }
 
-        fn failing(category: ErrorCategory) -> Self {
+        fn failing() -> Self {
             Self {
                 call_count: Arc::new(AtomicUsize::new(0)),
                 delay: None,
-                result: Err(TestError(category)),
+                result: Err(TestError("handler failed")),
             }
         }
 
         fn call_count(&self) -> usize {
-            self.call_count.load(Ordering::SeqCst)
+            self.call_count.load(Ordering::Relaxed)
         }
     }
 
@@ -354,32 +358,48 @@ mod tests {
 
         async fn on_message<C>(
             &self,
-            _context: C,
+            context: C,
             _message: ConsumerMessage,
             _demand_type: DemandType,
         ) -> Result<(), Self::Error>
         where
             C: EventContext,
         {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.call_count.fetch_add(1, Ordering::Relaxed);
             if let Some(delay) = self.delay {
-                tokio_sleep(delay).await;
+                // Poll for cancellation during delay to support cooperative cancellation.
+                let deadline = Instant::now() + delay;
+                while Instant::now() < deadline {
+                    if context.should_cancel() {
+                        return Err(TestError("cancelled"));
+                    }
+                    // Yield to allow other tasks (like timeout) to run
+                    yield_now().await;
+                }
             }
             self.result.clone()
         }
 
         async fn on_timer<C>(
             &self,
-            _context: C,
+            context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
         ) -> Result<(), Self::Error>
         where
             C: EventContext,
         {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.call_count.fetch_add(1, Ordering::Relaxed);
             if let Some(delay) = self.delay {
-                tokio_sleep(delay).await;
+                // Poll for cancellation during delay to support cooperative cancellation.
+                let deadline = Instant::now() + delay;
+                while Instant::now() < deadline {
+                    if context.should_cancel() {
+                        return Err(TestError("cancelled"));
+                    }
+                    // Yield to allow other tasks (like timeout) to run
+                    yield_now().await;
+                }
             }
             self.result.clone()
         }
@@ -411,33 +431,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn timeout_error_classifies_as_transient() {
-        let error: TimeoutError<TestError> = TimeoutError::Timeout(Duration::from_secs(10));
-        assert!(matches!(error.classify_error(), ErrorCategory::Transient));
-    }
-
-    #[test]
-    fn handler_error_delegates_classification_transient() {
-        let error: TimeoutError<TestError> =
-            TimeoutError::Handler(TestError(ErrorCategory::Transient));
-        assert!(matches!(error.classify_error(), ErrorCategory::Transient));
-    }
-
-    #[test]
-    fn handler_error_delegates_classification_permanent() {
-        let error: TimeoutError<TestError> =
-            TimeoutError::Handler(TestError(ErrorCategory::Permanent));
-        assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
-    }
-
-    #[test]
-    fn handler_error_delegates_classification_terminal() {
-        let error: TimeoutError<TestError> =
-            TimeoutError::Handler(TestError(ErrorCategory::Terminal));
-        assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
-    }
-
     #[tokio::test]
     async fn handler_completes_before_timeout_returns_ok() {
         let handler = MockHandler::success();
@@ -445,7 +438,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext;
+        let context = MockContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -460,12 +453,12 @@ mod tests {
 
     #[tokio::test]
     async fn handler_completes_before_timeout_returns_handler_error() {
-        let handler = MockHandler::failing(ErrorCategory::Permanent);
+        let handler = MockHandler::failing();
         let timeout_handler = TimeoutHandler {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext;
+        let context = MockContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -474,30 +467,34 @@ mod tests {
             .on_message(context, message, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(TimeoutError::Handler(_))));
+        assert!(result.is_err());
         assert_eq!(handler.call_count(), 1);
     }
 
     #[tokio::test]
-    async fn handler_exceeds_timeout_returns_timeout_error() {
+    async fn handler_exceeds_timeout_signals_cancellation_and_waits() {
         // Handler takes 100ms but timeout is 10ms
+        // After timeout, cancellation is signaled and we wait for handler
         let handler = MockHandler::with_delay(Duration::from_millis(100));
         let timeout_handler = TimeoutHandler {
             handler: handler.clone(),
             timeout: Duration::from_millis(10),
         };
-        let context = MockContext;
+        let context = MockContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
 
         let result = timeout_handler
-            .on_message(context, message, DemandType::Normal)
+            .on_message(context.clone(), message, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(TimeoutError::Timeout(_))));
-        // Handler was invoked (started running)
+        // Handler should return error after seeing cancellation
+        assert!(result.is_err());
+        // Handler was invoked and responded to cancellation
         assert_eq!(handler.call_count(), 1);
+        // Context should be marked as cancelled
+        assert!(context.should_cancel());
     }
 
     #[tokio::test]
@@ -507,7 +504,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext;
+        let context = MockContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler
@@ -519,51 +516,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timer_handler_exceeds_timeout_returns_timeout_error() {
+    async fn timer_handler_exceeds_timeout_signals_cancellation_and_waits() {
+        // Timer handler takes 100ms but timeout is 10ms
         let handler = MockHandler::with_delay(Duration::from_millis(100));
         let timeout_handler = TimeoutHandler {
             handler: handler.clone(),
             timeout: Duration::from_millis(10),
         };
-        let context = MockContext;
+        let context = MockContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler
-            .on_timer(context, trigger, DemandType::Normal)
+            .on_timer(context.clone(), trigger, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(TimeoutError::Timeout(_))));
+        // Handler should return error after seeing cancellation
+        assert!(result.is_err());
         assert_eq!(handler.call_count(), 1);
+        assert!(context.should_cancel());
     }
 
     #[tokio::test]
-    async fn timer_handler_error_wrapped_correctly() {
-        let handler = MockHandler::failing(ErrorCategory::Transient);
+    async fn timer_handler_error_passed_through() {
+        let handler = MockHandler::failing();
         let timeout_handler = TimeoutHandler {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext;
+        let context = MockContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler
             .on_timer(context, trigger, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(TimeoutError::Handler(_))));
-        if let Err(TimeoutError::Handler(inner)) = result {
-            assert!(matches!(inner.classify_error(), ErrorCategory::Transient));
-        }
-    }
-
-    #[test]
-    fn timeout_error_message_contains_duration() {
-        let duration = Duration::from_secs(30);
-        let error: TimeoutError<TestError> = TimeoutError::Timeout(duration);
-        let message = error.to_string();
-        assert!(
-            message.contains("30"),
-            "Error message should contain duration: {message}"
-        );
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 1);
     }
 }

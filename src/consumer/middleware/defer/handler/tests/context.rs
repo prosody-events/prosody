@@ -189,16 +189,8 @@ impl KeyedCapturingContext {
 impl EventContext for KeyedCapturingContext {
     type Error = Infallible;
 
-    fn should_shutdown(&self) -> bool {
-        false
-    }
-
     fn should_cancel(&self) -> bool {
         false
-    }
-
-    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-        future::pending::<()>()
     }
 
     fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -250,6 +242,10 @@ impl EventContext for KeyedCapturingContext {
             self.capture.record_clear_all(&self.key);
         }
         future::ready(Ok(()))
+    }
+
+    fn cancel(&self) {
+        // No-op for tests
     }
 
     fn invalidate(self) {

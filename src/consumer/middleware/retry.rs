@@ -303,7 +303,7 @@ where
                 return Ok(());
             };
 
-            if context.should_shutdown() {
+            if context.should_cancel() {
                 return Err(error);
             }
 
@@ -338,7 +338,7 @@ where
 
                     select! {
                         () = sleep(sleep_time) => {}
-                        () = context.on_shutdown() => {
+                        () = context.on_cancel() => {
                             return Err(error);
                         }
                     }
@@ -399,7 +399,7 @@ where
                 return Ok(());
             };
             // If shutdown was requested, stop retrying
-            if context.should_shutdown() {
+            if context.should_cancel() {
                 return Err(error);
             }
             match error.classify_error() {
@@ -415,7 +415,7 @@ where
                     );
                     select! {
                         () = sleep(sleep_time) => {},
-                        () = context.on_shutdown() => return Err(error),
+                        () = context.on_cancel() => return Err(error),
                     }
                 }
                 ErrorCategory::Permanent => {
@@ -482,7 +482,7 @@ where
                 break;
             };
 
-            if context.should_shutdown() {
+            if context.should_cancel() {
                 uncommitted_offset.abort();
                 break;
             }
@@ -503,7 +503,7 @@ where
 
                     select! {
                         () = sleep(sleep_time) => {}
-                        () = context.on_shutdown() => {
+                        () = context.on_cancel() => {
                             uncommitted_offset.abort();
                             break;
                         }
@@ -565,7 +565,7 @@ where
                 break;
             };
             // If shutdown was requested, abort and stop retrying
-            if context.should_shutdown() {
+            if context.should_cancel() {
                 uncommitted.abort().await;
                 break;
             }
@@ -578,7 +578,7 @@ where
                     );
                     select! {
                         () = sleep(sleep_time) => {},
-                        () = context.on_shutdown() => {
+                        () = context.on_cancel() => {
                             uncommitted.abort().await;
                             break;
                         }
@@ -673,23 +673,15 @@ mod tests {
     impl EventContext for MockContext {
         type Error = Infallible;
 
-        fn should_shutdown(&self) -> bool {
+        fn should_cancel(&self) -> bool {
             self.shutdown_requested.load(Ordering::SeqCst)
         }
 
-        fn should_cancel(&self) -> bool {
-            false
-        }
-
-        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
             let notify = Arc::clone(&self.shutdown_notify);
             async move {
                 notify.notified().await;
             }
-        }
-
-        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
-            future::pending::<()>()
         }
 
         fn schedule(
@@ -722,6 +714,8 @@ mod tests {
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             future::ready(Ok(()))
         }
+
+        fn cancel(&self) {}
 
         fn invalidate(self) {}
 
