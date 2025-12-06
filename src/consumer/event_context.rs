@@ -310,6 +310,7 @@ where
 
         async move {
             select! {
+                biased;
                 result = shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => {
                     if let Err(error) = result {
                         error!("shutdown hook failed: {error:#}");
@@ -343,6 +344,7 @@ where
         let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
 
         select! {
+            biased;
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
             () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
             result = inner.timers.schedule(trigger) => result,
@@ -403,6 +405,7 @@ where
         };
 
         select! {
+            biased;
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
             () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
             result = operation => result,
@@ -420,6 +423,7 @@ where
         };
 
         select! {
+            biased;
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
             () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
             result = inner.timers.unschedule(&inner.key, time, timer_type) => result,
@@ -436,6 +440,7 @@ where
         };
 
         select! {
+            biased;
             () = EventContext::on_shutdown(self) => Err(TimerManagerError::Shutdown),
             () = EventContext::on_cancel(self) => Err(TimerManagerError::Cancelled),
             result = inner.timers.unschedule_all(&inner.key, timer_type) => result,
@@ -478,6 +483,7 @@ where
             pin_mut!(scheduled_timers);
 
             while let Some(time) = select! {
+                biased;
                 () = &mut on_shutdown => Err(TimerManagerError::Shutdown),
                 () = &mut on_cancel => Err(TimerManagerError::Cancelled),
                 item = scheduled_timers.try_next() => item,
