@@ -34,8 +34,7 @@ impl<'a> MigrationExecutor<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraStoreError`] if statement execution or migration
-    /// recording fails.
+    /// Returns an error if statement execution or migration recording fails.
     pub async fn apply_migration(
         &self,
         migration: &Migration,

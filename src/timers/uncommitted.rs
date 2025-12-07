@@ -5,15 +5,18 @@
 //!
 //! - [`UncommittedTimer`] - A trait providing timer metadata and transaction
 //!   operations while hiding the concrete store implementation.
-//! - [`PendingTimer`] - The concrete implementation of [`UncommittedTimer`].
+//! - [`PendingTimer`] - Timer delivered from the queue but not yet firing.
+//! - [`FiringTimer`] - Timer currently being processed by a handler.
 //!
-//! Enforces a transaction-like pattern:
+//! Enforces a type-safe transaction pattern:
 //!
-//! 1. Delivery: timers arrive as [`UncommittedTimer`]
-//! 2. Processing: application handles the timer event
-//! 3. Acknowledgment: application calls [`Uncommitted::commit()`] or
-//!    [`Uncommitted::abort()`]
-//! 4. Cleanup: timers are removed from storage or left for retry
+//! 1. Delivery: timers arrive as [`PendingTimer`]
+//! 2. Activation: call [`PendingTimer::fire()`] to transition to
+//!    [`FiringTimer`]
+//! 3. Processing: application handles the timer event
+//! 4. Acknowledgment: application calls [`Uncommitted::commit()`] or
+//!    [`Uncommitted::abort()`] on [`FiringTimer`]
+//! 5. Cleanup: timers are removed from storage or left for retry
 //!
 //! Timers use at-least-once delivery and survive restarts. Successful commits
 //! remove timers permanently; aborts deactivate them in-memory while preserving
@@ -28,7 +31,6 @@ use crate::timers::store::TriggerStore;
 use crate::{Key, ProcessScope};
 use arc_swap::ArcSwap;
 use educe::Educe;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -41,6 +43,9 @@ const RETRY_DURATION: Duration = Duration::from_secs(1);
 ///
 /// Provides access to timer metadata and transaction operations,
 /// hiding the concrete store implementation from clients.
+///
+/// Implemented by [`FiringTimer`] which represents a timer actively being
+/// processed by a handler.
 pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     /// The commit guard type for this timer.
     type CommitGuard: Uncommitted + Send;
@@ -56,9 +61,6 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     /// Returns `Span::none()` if processing resources have been released.
     fn span(&self) -> Span;
 
-    /// Check if this timer is still active in the in-memory scheduler.
-    fn is_active(&self) -> impl Future<Output = bool> + Send;
-
     /// Decompose into the raw [`Trigger`] and the commit guard.
     ///
     /// Useful for advanced scenarios needing direct control over commit
@@ -70,15 +72,32 @@ pub trait UncommittedTimer: Uncommitted + Keyed<Key = Key> + Send {
     fn into_inner(self) -> (Trigger, Self::CommitGuard);
 }
 
-/// The concrete implementation of an uncommitted timer event.
+/// Timer delivered from the queue but not yet transitioned to firing state.
 ///
-/// Wraps a [`Trigger`] and an internal transaction state. After processing,
-/// applications must call [`Uncommitted::commit()`] to remove the timer from
-/// storage, or [`Uncommitted::abort()`] to deactivate it in-memory while
-/// leaving persistent data.
+/// Wraps a [`Trigger`] and an internal transaction state. Call
+/// [`PendingTimer::fire()`] to transition to [`FiringTimer`] before processing.
+/// If the timer was cancelled while queued, `fire()` returns `None`.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
 pub struct PendingTimer<T>
+where
+    T: TriggerStore,
+{
+    /// The underlying timer data: key, execution time, and tracing span.
+    trigger: Trigger,
+
+    /// Transaction state and coordination with [`TimerManager`].
+    #[educe(Debug(ignore))]
+    uncommitted: UncommittedTrigger<T>,
+}
+
+/// Timer currently being processed by a handler.
+///
+/// Created by calling [`PendingTimer::fire()`]. Owns the `commit()`/`abort()`
+/// capability. Processing must end with either `commit()` or `abort()`.
+#[derive(Educe)]
+#[educe(Debug(bound = ""))]
+pub struct FiringTimer<T>
 where
     T: TriggerStore,
 {
@@ -130,7 +149,7 @@ impl<T> PendingTimer<T>
 where
     T: TriggerStore,
 {
-    /// Create a new uncommitted timer from a fired trigger.
+    /// Create a new pending timer from a delivered trigger.
     ///
     /// # Arguments
     ///
@@ -156,9 +175,35 @@ where
             },
         }
     }
+
+    /// Transition this timer to the firing state.
+    ///
+    /// Consumes the `PendingTimer` and returns a [`FiringTimer`] if the timer
+    /// is still active in the scheduler and successfully transitions to
+    /// `Firing` state. If the timer was cancelled while queued, returns
+    /// `None` and the timer is marked as completed.
+    ///
+    /// # Returns
+    ///
+    /// `Some(FiringTimer)` if the timer is still active and can be processed,
+    /// `None` if the timer was cancelled while waiting in the queue.
+    pub async fn fire(mut self) -> Option<FiringTimer<T>> {
+        // Attempt to transition from Scheduled → Firing
+        if !self.uncommitted.fire().await {
+            // Timer was cancelled or not in Scheduled state; mark as completed
+            self.uncommitted.completed = true;
+            return None;
+        }
+
+        // Transfer ownership to FiringTimer
+        Some(FiringTimer {
+            trigger: self.trigger,
+            uncommitted: self.uncommitted,
+        })
+    }
 }
 
-impl<T> Uncommitted for PendingTimer<T>
+impl<T> Uncommitted for FiringTimer<T>
 where
     T: TriggerStore,
 {
@@ -175,6 +220,18 @@ where
     /// The timer is deactivated in-memory; it may be reloaded later.
     async fn abort(mut self) {
         self.uncommitted.abort().await;
+    }
+}
+
+impl<T> Keyed for FiringTimer<T>
+where
+    T: TriggerStore,
+{
+    type Key = Key;
+
+    /// Returns the key associated with this timer.
+    fn key(&self) -> &Self::Key {
+        &self.trigger.key
     }
 }
 
@@ -198,18 +255,6 @@ where
     fn new(trigger: UncommittedTrigger<T>) -> Self {
         Self {
             inner: Some(trigger),
-        }
-    }
-
-    /// Check if the timer remains active in the scheduler.
-    ///
-    /// # Returns
-    ///
-    /// `true` if still loaded, `false` if completed or no longer scheduled.
-    pub async fn is_active(&self) -> bool {
-        match &self.inner {
-            Some(trigger) => trigger.is_active().await,
-            None => false,
         }
     }
 }
@@ -237,14 +282,15 @@ impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Check if the timer remains active in the scheduler.
+    /// Attempt to transition the timer from `Scheduled` to `Firing` state.
     ///
     /// # Returns
     ///
-    /// `true` if still loaded, `false` if completed or no longer scheduled.
-    pub async fn is_active(&self) -> bool {
+    /// `true` if the transition succeeded, `false` if the timer is not in
+    /// `Scheduled` state (e.g., cancelled or already firing).
+    pub async fn fire(&self) -> bool {
         self.manager
-            .is_active(&self.key, self.time, self.timer_type)
+            .fire(&self.key, self.time, self.timer_type)
             .await
     }
 
@@ -293,7 +339,7 @@ where
     }
 }
 
-impl<T> UncommittedTimer for PendingTimer<T>
+impl<T> UncommittedTimer for FiringTimer<T>
 where
     T: TriggerStore,
 {
@@ -314,11 +360,6 @@ where
     /// Returns `Span::none()` if processing resources have been released.
     fn span(&self) -> Span {
         self.trigger.span.load().as_ref().clone()
-    }
-
-    /// Check if this timer is still active in the in-memory scheduler.
-    async fn is_active(&self) -> bool {
-        self.uncommitted.is_active().await
     }
 
     /// Decompose into the raw [`Trigger`] and the commit guard.
@@ -353,7 +394,7 @@ impl Drop for TriggerProcessGuard {
     }
 }
 
-impl<T> ProcessScope for PendingTimer<T>
+impl<T> ProcessScope for FiringTimer<T>
 where
     T: TriggerStore,
 {
@@ -361,5 +402,167 @@ where
 
     fn process_scope(&self) -> Self::Guard {
         TriggerProcessGuard(self.trigger.span.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consumer::Uncommitted;
+    use crate::heartbeat::HeartbeatRegistry;
+    use crate::timers::duration::CompactDuration;
+    use crate::timers::manager::TimerManager;
+    use crate::timers::store::adapter::TableAdapter;
+    use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+    use color_eyre::eyre::{Result, eyre};
+    use futures::{StreamExt, TryStreamExt};
+    use std::time::Duration;
+    use tokio::task;
+    use tokio::time::{self, advance};
+    use uuid::Uuid;
+
+    /// Helper function to set up a timer manager for testing
+    async fn setup_timer_manager() -> Result<(
+        impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+        TimerManager<TableAdapter<InMemoryTriggerStore>>,
+    )> {
+        let store = memory_store();
+        let segment_id = Uuid::new_v4();
+        let slab_size = CompactDuration::new(300);
+
+        TimerManager::new(
+            segment_id,
+            slab_size,
+            "test-manager",
+            store,
+            HeartbeatRegistry::test(),
+        )
+        .await
+        .map_err(|e| eyre!("Failed to create timer manager: {}", e))
+    }
+
+    /// Helper function to create a test trigger
+    fn create_test_trigger(
+        key: &str,
+        seconds_offset: u32,
+        timer_type: TimerType,
+    ) -> Result<Trigger> {
+        let time = CompactDateTime::now()?.add_duration(CompactDuration::new(seconds_offset))?;
+
+        Ok(Trigger::new(
+            Key::from(key),
+            time,
+            timer_type,
+            tracing::Span::current(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_pending_timer_fire_consumes() -> Result<()> {
+        time::pause();
+
+        let (mut stream, manager) = setup_timer_manager().await?;
+        let trigger = create_test_trigger("fire-test", 1, TimerType::Application)?;
+
+        manager.schedule(trigger.clone()).await?;
+
+        // Advance time to trigger emission
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        // Get the pending timer
+        let pending_timer = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("Expected a pending timer"))?;
+
+        // Verify fire() consumes the PendingTimer and returns FiringTimer
+        let firing_timer = pending_timer
+            .fire()
+            .await
+            .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
+
+        // Verify the FiringTimer has correct metadata
+        assert_eq!(firing_timer.time(), trigger.time);
+        assert_eq!(firing_timer.timer_type(), TimerType::Application);
+        assert_eq!(firing_timer.key(), &trigger.key);
+
+        // Clean up by committing
+        firing_timer.commit().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_firing_timer_commit() -> Result<()> {
+        time::pause();
+
+        let (mut stream, manager) = setup_timer_manager().await?;
+        let trigger = create_test_trigger("commit-test", 1, TimerType::Application)?;
+
+        manager.schedule(trigger.clone()).await?;
+
+        // Advance time to trigger emission
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        // Get and fire the timer
+        let pending_timer = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("Expected a pending timer"))?;
+        let firing_timer = pending_timer
+            .fire()
+            .await
+            .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
+
+        // Commit the timer
+        firing_timer.commit().await;
+
+        // Verify the timer was removed from storage
+        let times = manager
+            .scheduled_times(&trigger.key, TimerType::Application)
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert!(times.is_empty(), "Timer should be removed after commit");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_firing_timer_abort() -> Result<()> {
+        time::pause();
+
+        let (mut stream, manager) = setup_timer_manager().await?;
+        let trigger = create_test_trigger("abort-test", 1, TimerType::Application)?;
+
+        manager.schedule(trigger.clone()).await?;
+
+        // Advance time to trigger emission
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        // Get and fire the timer
+        let pending_timer = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("Expected a pending timer"))?;
+        let firing_timer = pending_timer
+            .fire()
+            .await
+            .ok_or_else(|| eyre!("Expected fire() to return Some"))?;
+
+        // Abort the timer
+        firing_timer.abort().await;
+
+        // Verify the timer is still in storage (abort preserves DB state)
+        let times = manager
+            .scheduled_times(&trigger.key, TimerType::Application)
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(times.len(), 1, "Timer should remain in storage after abort");
+        assert!(times.contains(&trigger.time));
+
+        Ok(())
     }
 }

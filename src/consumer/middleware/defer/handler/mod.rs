@@ -234,19 +234,26 @@ where
 
     /// Calculates jittered exponential backoff: `random(1, min(base *
     /// 2^retry_count, max_delay))`.
+    ///
+    /// Returns 0 when `retry_count` is 0 (no delay for initial attempt).
     fn calculate_backoff(&self, retry_count: u32) -> CompactDuration {
+        // No delay for the initial attempt
+        if retry_count == 0 {
+            return CompactDuration::MIN;
+        }
+
         let base_seconds = self.config.base.as_secs();
         let max_delay_seconds = self.config.max_delay.as_secs();
 
-        // Calculate exponential backoff: base * 2^retry_count
+        // Calculate exponential backoff: base * 2^(retry_count - 1)
+        // Subtract 1 so first retry (count=1) uses base delay
         // Using checked operations to avoid overflow
-        let multiplier = 2_u64.checked_pow(retry_count).unwrap_or(u64::MAX);
+        let multiplier = 2_u64.checked_pow(retry_count - 1).unwrap_or(u64::MAX);
         let delay_seconds = base_seconds.saturating_mul(multiplier);
 
         // Cap at max_delay, with minimum of 1 second.
-        // Minimum 1 second prevents ConflictsWithCurrentTimer error when jitter
-        // would otherwise produce 0, causing the new timer to be scheduled at
-        // the same time as the currently-processing timer.
+        // Minimum 1 second ensures a meaningful delay when jitter would
+        // otherwise produce 0.
         let capped_seconds = min(delay_seconds, max_delay_seconds).max(1);
 
         // Apply full jitter: random(1, capped_seconds)

@@ -7,7 +7,7 @@
 //!
 //! The module handles:
 //! - Cassandra session creation and configuration
-//! - Schema migration execution via [`EmbeddedMigrator`]
+//! - Schema migration execution via the embedded migrator
 //! - Preparation of all CQL statements for CRUD operations
 //! - Load balancing and retry policy configuration
 //! - TTL and non-TTL variants of insert statements

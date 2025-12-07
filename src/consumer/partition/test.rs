@@ -5,6 +5,7 @@ use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
+use crate::timers::UncommittedTimer;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::tracing::init_test_logging;

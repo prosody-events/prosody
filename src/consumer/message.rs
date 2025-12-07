@@ -63,27 +63,6 @@ where
     }
 }
 
-impl<T> Uncommitted for UncommittedEvent<T>
-where
-    T: TriggerStore,
-{
-    /// Commit the underlying message or timer.
-    async fn commit(self) {
-        match self {
-            UncommittedEvent::Message(message) => message.commit().await,
-            UncommittedEvent::Timer(timer) => timer.commit().await,
-        }
-    }
-
-    /// Abort the underlying message or timer.
-    async fn abort(self) {
-        match self {
-            UncommittedEvent::Message(message) => message.abort().await,
-            UncommittedEvent::Timer(timer) => timer.abort().await,
-        }
-    }
-}
-
 impl<T> From<UncommittedMessage> for UncommittedEvent<T>
 where
     T: TriggerStore,

@@ -206,13 +206,6 @@ struct Inner<T> {
     /// Key for which timers are scoped.
     key: Key,
 
-    /// The timer currently being processed, if any.
-    ///
-    /// When processing a timer event, this is set to `Some((time, type))` to
-    /// prevent scheduling a new timer at the same time and type, which would
-    /// cause a collision in the active triggers registry.
-    maybe_current_timer: Option<(CompactDateTime, TimerType)>,
-
     #[educe(Debug(ignore))]
     shutdown_rx: watch::Receiver<bool>,
 
@@ -235,16 +228,11 @@ where
     /// # Arguments
     ///
     /// * `key` – The message key for affinity and timer scoping.
-    /// * `maybe_current_timer` – If processing a timer event, the `(time,
-    ///   type)` of that timer. This prevents scheduling collisions where a new
-    ///   timer at the same time/type would be deactivated when the current
-    ///   timer commits.
     /// * `shutdown_rx` – A `watch::Receiver<bool>` that signals shutdown when
     ///   set.
     /// * `timers` – The `TimerManager<T>` instance.
     pub(crate) fn new(
         key: Key,
-        maybe_current_timer: Option<(CompactDateTime, TimerType)>,
         shutdown_rx: watch::Receiver<bool>,
         timers: TimerManager<T>,
     ) -> Self {
@@ -252,7 +240,6 @@ where
         let inner = ArcSwapOption::new(Some(
             Inner {
                 key,
-                maybe_current_timer,
                 shutdown_rx,
                 message_cancel_tx,
                 message_cancel_rx,
@@ -339,17 +326,18 @@ where
         .right_future()
     }
 
+    fn cancel(&self) {
+        if let Some(inner) = self.inner.load().as_ref() {
+            let _ = inner.message_cancel_tx.send(true);
+        }
+    }
+
     async fn schedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<(), Self::Error> {
         self.run_cancellable(async |inner| {
-            // Prevent scheduling at the same time/type as the current timer
-            if inner.maybe_current_timer == Some((time, timer_type)) {
-                return Err(TimerManagerError::ConflictsWithCurrentTimer);
-            }
-
             let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
             inner.timers.schedule(trigger).await
         })
@@ -362,11 +350,6 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         self.run_cancellable(async |inner| {
-            // Prevent scheduling at the same time/type as the current timer
-            if inner.maybe_current_timer == Some((time, timer_type)) {
-                return Err(TimerManagerError::ConflictsWithCurrentTimer);
-            }
-
             let span = Span::current();
 
             // Get scheduled triggers of this type
@@ -427,12 +410,6 @@ where
             inner.timers.unschedule_all(&inner.key, timer_type).await
         })
         .await
-    }
-
-    fn cancel(&self) {
-        if let Some(inner) = self.inner.load().as_ref() {
-            let _ = inner.message_cancel_tx.send(true);
-        }
     }
 
     fn invalidate(self) {

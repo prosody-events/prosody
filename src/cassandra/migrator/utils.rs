@@ -51,7 +51,7 @@ pub fn calculate_backoff(attempt: u32) -> Duration {
 ///
 /// # Errors
 ///
-/// Returns [`CassandraStoreError`] if table creation fails.
+/// Returns an error if table creation fails.
 pub async fn ensure_migration_tables_exist(
     session: &Session,
     keyspace: &str,

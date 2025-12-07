@@ -1,7 +1,7 @@
 //! In-memory message loader for testing defer middleware.
 //!
 //! Provides a [`MemoryLoader`] that stores messages in memory and loads them by
-//! offset coordinates. Unlike [`KafkaLoader`], this loader requires explicit
+//! offset coordinates. Unlike the Kafka loader, this loader requires explicit
 //! message storage via [`MemoryLoader::store_message`].
 
 use super::MessageLoader;

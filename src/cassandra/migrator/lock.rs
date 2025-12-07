@@ -79,7 +79,7 @@ impl<'a> LockManager<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraStoreError`] if:
+    /// Returns an error if:
     /// - Lock is already held by another process
     /// - Database query fails due to network or cluster issues
     /// - LWT result parsing fails

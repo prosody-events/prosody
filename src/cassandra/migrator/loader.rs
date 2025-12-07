@@ -53,7 +53,7 @@ struct MigrationAssets;
 ///
 /// # Errors
 ///
-/// Returns [`CassandraStoreError`] if:
+/// Returns an error if:
 /// - Migration files cannot be loaded from embedded assets
 /// - File content contains invalid UTF-8
 /// - Timestamp extraction from filename fails
@@ -177,7 +177,7 @@ fn calculate_checksum(content: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`CassandraStoreError`] if:
+/// Returns an error if:
 /// - Filename is shorter than 8 characters
 /// - First 8 characters are not all digits
 fn extract_timestamp(filename: &str) -> Result<String, super::MigrationError> {

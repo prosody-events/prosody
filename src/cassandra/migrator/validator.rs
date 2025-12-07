@@ -30,8 +30,8 @@ pub struct AppliedMigration {
 ///
 /// # Errors
 ///
-/// Returns [`CassandraStoreError`] if any applied migration has
-/// a different checksum than the current embedded file.
+/// Returns an error if any applied migration has a different checksum
+/// than the current embedded file.
 pub fn validate_applied_migrations(
     migrations: &[Migration],
     applied_migrations: &HashMap<String, AppliedMigration>,

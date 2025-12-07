@@ -22,7 +22,7 @@ use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
-use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
+use crate::timers::{PendingTimer, TimerManager};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use ahash::RandomState;
 use aho_corasick::{AhoCorasick, Anchored, Input};
@@ -399,7 +399,6 @@ async fn handle_messages<T, S>(
             UncommittedEvent::Message(message) => {
                 let context = TimerContext::new(
                     message.key().clone(),
-                    None,
                     shutdown_rx.clone(),
                     timer_manager.clone(),
                 );
@@ -414,17 +413,16 @@ async fn handle_messages<T, S>(
                 cloned_context.invalidate();
             }
             UncommittedEvent::Timer(timer) => {
-                if timer.is_active().await {
+                if let Some(firing) = timer.fire().await {
                     let context = TimerContext::new(
-                        timer.key().clone(),
-                        Some((timer.time(), timer.timer_type())),
+                        firing.key().clone(),
                         shutdown_rx.clone(),
                         timer_manager.clone(),
                     );
                     let cloned_context = context.clone();
 
-                    let _guard = timer.process_scope();
-                    handler.on_timer(context, timer, DemandType::Normal).await;
+                    let _guard = firing.process_scope();
+                    handler.on_timer(context, firing, DemandType::Normal).await;
 
                     // Prevent the context from being used outside of processing
                     cloned_context.invalidate();

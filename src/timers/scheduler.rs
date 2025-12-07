@@ -59,6 +59,19 @@ enum CommandOperation {
 
     /// Remove a trigger from the scheduler.
     Remove,
+
+    /// Add a trigger to the `DelayQueue` only (for rescheduling while firing).
+    ///
+    /// Unlike `Add`, this does not modify `ActiveTriggers` state since
+    /// the caller has already transitioned to `FiringRescheduled`.
+    AddToQueue,
+
+    /// Remove a trigger from the `DelayQueue` only (for canceling a
+    /// reschedule).
+    ///
+    /// Unlike `Remove`, this does not modify `ActiveTriggers` state since
+    /// the caller handles state transitions separately.
+    RemoveFromQueue,
 }
 
 impl TriggerScheduler {
@@ -161,10 +174,12 @@ impl TriggerScheduler {
         &self.active_triggers
     }
 
-    /// Checks if a specific trigger is currently active.
+    /// Transitions a timer from `Scheduled` to `Firing` state.
     ///
-    /// A trigger is active if it has been scheduled and not yet removed
-    /// or deactivated.
+    /// Called when a timer is delivered from the queue and about to be
+    /// processed by a handler. If the timer is still in `Scheduled` state,
+    /// transitions it to `Firing` and returns `true`. If the timer is not
+    /// present or not in `Scheduled` state, returns `false`.
     ///
     /// # Arguments
     ///
@@ -174,16 +189,31 @@ impl TriggerScheduler {
     ///
     /// # Returns
     ///
-    /// `true` if the trigger is in the active set.
-    pub async fn is_active(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) -> bool {
-        self.active_triggers.contains(key, time, timer_type).await
+    /// `true` if the timer was successfully transitioned to `Firing`.
+    pub(crate) async fn fire(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> bool {
+        use crate::timers::active::TimerState;
+
+        // Only transition if currently in Scheduled state
+        if let Some(TimerState::Scheduled) =
+            self.active_triggers.get_state(key, time, timer_type).await
+        {
+            self.active_triggers
+                .set_state(key, time, timer_type, TimerState::Firing)
+                .await
+        } else {
+            false
+        }
     }
 
     /// Deactivate a trigger without removing it from the persistent queue.
     ///
-    /// Removes the trigger from the active set, preventing future
-    /// [`is_active`](Self::is_active) queries from returning true.
-    /// Does not cancel pending emission.
+    /// Removes the trigger from the active set. Does not cancel pending
+    /// emission.
     ///
     /// # Arguments
     ///
@@ -192,6 +222,66 @@ impl TriggerScheduler {
     /// * `timer_type` - The [`TimerType`] of the trigger.
     pub async fn deactivate(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
         self.active_triggers.remove(key, time, timer_type).await;
+    }
+
+    /// Add a trigger to the `DelayQueue` without modifying `ActiveTriggers`.
+    ///
+    /// Used for rescheduling: the caller has already transitioned the state
+    /// to `FiringRescheduled` and only needs the timer re-added to the queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The [`Trigger`] to add to the queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerSchedulerError::Shutdown`] if the scheduler task has
+    /// shut down or the command channel is closed.
+    pub async fn add_to_queue(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        let operation = CommandOperation::AddToQueue;
+
+        self.command_tx
+            .send(Command {
+                result_tx,
+                trigger,
+                operation,
+            })
+            .map_err(|_| TimerSchedulerError::Shutdown)
+            .await?;
+
+        result_rx.await.map_err(|_| TimerSchedulerError::Shutdown)
+    }
+
+    /// Remove a trigger from the `DelayQueue` without modifying
+    /// `ActiveTriggers`.
+    ///
+    /// Used for canceling a reschedule: the caller transitions the state
+    /// from `FiringRescheduled` back to `Firing` and needs the timer removed
+    /// from the queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The [`Trigger`] to remove from the queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerSchedulerError::Shutdown`] if the scheduler task has
+    /// shut down or the command channel is closed.
+    pub async fn remove_from_queue(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        let operation = CommandOperation::RemoveFromQueue;
+
+        self.command_tx
+            .send(Command {
+                result_tx,
+                trigger,
+                operation,
+            })
+            .map_err(|_| TimerSchedulerError::Shutdown)
+            .await?;
+
+        result_rx.await.map_err(|_| TimerSchedulerError::Shutdown)
     }
 }
 
@@ -264,6 +354,7 @@ async fn process_commands(
 /// Execute a scheduling command against the [`TriggerQueue`].
 ///
 /// Insertion and removal update both the delay queue and the active set.
+/// Queue-only operations modify only the delay queue.
 /// Signals the caller via `result_tx` afterward.
 async fn process_command(
     triggers: &mut TriggerQueue,
@@ -276,6 +367,8 @@ async fn process_command(
     match operation {
         CommandOperation::Add => triggers.insert(trigger.clone()).await,
         CommandOperation::Remove => triggers.remove(&trigger).await,
+        CommandOperation::AddToQueue => triggers.insert_queue_only(trigger),
+        CommandOperation::RemoveFromQueue => triggers.remove_queue_only(&trigger),
     }
 
     // Ignore send errors: caller will observe a shutdown if necessary.
@@ -340,7 +433,8 @@ mod tests {
 
         // Verify the trigger is active
         if !scheduler
-            .is_active(&key, time, TimerType::Application)
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
             .await
         {
             return Err("Trigger is not active after scheduling".to_owned());
@@ -354,7 +448,8 @@ mod tests {
 
         // Verify the trigger is no longer active
         if scheduler
-            .is_active(&key, time, TimerType::Application)
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
             .await
         {
             return Err("Trigger is still active after unscheduling".to_owned());
@@ -404,7 +499,8 @@ mod tests {
 
         // Verify the trigger is still active
         if !scheduler
-            .is_active(&key, time, TimerType::Application)
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
             .await
         {
             return Err(format!(
@@ -460,7 +556,8 @@ mod tests {
 
         // Verify the first trigger is still active
         if !scheduler
-            .is_active(&key1, time1, TimerType::Application)
+            .active_triggers()
+            .contains(&key1, time1, TimerType::Application)
             .await
         {
             return Err(format!(
@@ -484,7 +581,8 @@ mod tests {
 
         // Verify the second trigger is still active
         if !scheduler
-            .is_active(&key2, time2, TimerType::Application)
+            .active_triggers()
+            .contains(&key2, time2, TimerType::Application)
             .await
         {
             return Err(format!(
@@ -532,7 +630,8 @@ mod tests {
 
         // Verify the trigger is no longer active
         if scheduler
-            .is_active(&key, time, TimerType::Application)
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
             .await
         {
             return Err("Trigger is still active after deactivation".to_owned());
@@ -594,7 +693,8 @@ mod tests {
         // Verify the first trigger is still active
         assert!(
             scheduler
-                .is_active(&key, time1, TimerType::Application)
+                .active_triggers()
+                .contains(&key, time1, TimerType::Application)
                 .await,
             "First trigger is not active after emission"
         );
@@ -614,7 +714,8 @@ mod tests {
         // Verify the second trigger is still active
         assert!(
             scheduler
-                .is_active(&key, time2, TimerType::Application)
+                .active_triggers()
+                .contains(&key, time2, TimerType::Application)
                 .await,
             "Second trigger is not active after emission"
         );
@@ -634,7 +735,8 @@ mod tests {
         // Verify the third trigger is still active
         assert!(
             scheduler
-                .is_active(&key, time3, TimerType::Application)
+                .active_triggers()
+                .contains(&key, time3, TimerType::Application)
                 .await,
             "Third trigger is not active after emission"
         );
@@ -653,19 +755,22 @@ mod tests {
         // Verify all triggers are no longer active
         assert!(
             !scheduler
-                .is_active(&key, time1, TimerType::Application)
+                .active_triggers()
+                .contains(&key, time1, TimerType::Application)
                 .await,
             "First trigger is still active after deactivation"
         );
         assert!(
             !scheduler
-                .is_active(&key, time2, TimerType::Application)
+                .active_triggers()
+                .contains(&key, time2, TimerType::Application)
                 .await,
             "Second trigger is still active after deactivation"
         );
         assert!(
             !scheduler
-                .is_active(&key, time3, TimerType::Application)
+                .active_triggers()
+                .contains(&key, time3, TimerType::Application)
                 .await,
             "Third trigger is still active after deactivation"
         );
@@ -731,7 +836,8 @@ mod tests {
 
         // Verify the command was processed by checking if trigger is active
         if !scheduler
-            .is_active(
+            .active_triggers()
+            .contains(
                 &command_test_trigger.key,
                 command_test_trigger.time,
                 TimerType::Application,
@@ -763,7 +869,8 @@ mod tests {
             .map_err(|_| "Unschedule failed during backpressure")?;
 
         if scheduler
-            .is_active(
+            .active_triggers()
+            .contains(
                 &command_test_trigger.key,
                 command_test_trigger.time,
                 TimerType::Application,

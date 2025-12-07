@@ -96,7 +96,7 @@ use tracing::{debug, info, instrument, warn};
 ///
 /// # Errors
 ///
-/// Returns [`TimerManagerError`] if any migration phase fails.
+/// Returns an error if any migration phase fails.
 #[instrument(level = "debug", skip(store), err)]
 pub async fn migrate_segment_if_needed(
     store: &CassandraTriggerStore,
@@ -146,7 +146,7 @@ pub fn needs_migration(segment: &Segment) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`TimerManagerError`] if:
+/// Returns an error if:
 /// - Reading v1 triggers fails
 /// - Writing v2 triggers fails
 /// - Updating segment version fails
@@ -503,7 +503,7 @@ async fn cleanup_old_slabs_with_overlap_protection(
 ///
 /// # Errors
 ///
-/// Returns [`TimerManagerError`] if:
+/// Returns an error if:
 /// - Segment is not v2 (must run version migration first)
 /// - Reading old triggers fails
 /// - Writing new triggers fails
