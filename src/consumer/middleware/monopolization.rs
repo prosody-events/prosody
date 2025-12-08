@@ -52,6 +52,16 @@ use crate::{Key, Partition, Topic};
 /// Configuration for monopolization detection.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct MonopolizationConfiguration {
+    /// Whether monopolization detection is enabled.
+    ///
+    /// When disabled, the monopolization middleware is entirely bypassed and
+    /// all messages/timers pass through to the inner handler without checks.
+    ///
+    /// Environment variable: `PROSODY_MONOPOLIZATION_ENABLED`
+    /// Default: true
+    #[builder(default = "from_env_with_fallback(\"PROSODY_MONOPOLIZATION_ENABLED\", true)?")]
+    pub enabled: bool,
+
     /// Threshold for monopolization detection.
     ///
     /// If a key's execution time exceeds this fraction of the window duration,
@@ -127,6 +137,10 @@ impl MonopolizationConfiguration {
 impl MonopolizationMiddleware {
     /// Creates a new monopolization middleware with the given configuration.
     ///
+    /// Returns `None` if monopolization detection is disabled in the config.
+    /// The returned `Option<Self>` implements `HandlerMiddleware` directly,
+    /// passing through to the inner handler when `None`.
+    ///
     /// # Arguments
     ///
     /// * `config` - Configuration for monopolization detection
@@ -138,8 +152,12 @@ impl MonopolizationMiddleware {
     pub fn new(
         config: &MonopolizationConfiguration,
         telemetry: &Telemetry,
-    ) -> Result<Self, MonopolizationInitError> {
+    ) -> Result<Option<Self>, MonopolizationInitError> {
         config.validate()?;
+
+        if !config.enabled {
+            return Ok(None);
+        }
 
         let reference_instant = Instant::now();
         let key_intervals = Arc::new(Cache::new(config.cache_size));
@@ -155,12 +173,12 @@ impl MonopolizationMiddleware {
             telemetry_rx,
         ));
 
-        Ok(Self {
+        Ok(Some(Self {
             monopolization_threshold: config.monopolization_threshold,
             window_duration,
             reference_instant,
             key_intervals,
-        })
+        }))
     }
 }
 
@@ -410,6 +428,7 @@ mod tests {
     use crate::consumer::DemandType;
     use crate::consumer::event_context::EventContext;
     use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::middleware::optional::OptionHandler;
     use crate::consumer::middleware::{
         FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
     };
@@ -420,6 +439,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::sleep;
+
+    /// Helper to extract the inner monopolization handler from the option
+    /// wrapper.
+    fn unwrap_handler<T>(
+        handler: OptionHandler<MonopolizationHandler<T>, T>,
+    ) -> MonopolizationHandler<T> {
+        let OptionHandler::Enabled(h) = handler else {
+            unreachable!("Expected enabled monopolization handler in test")
+        };
+        h
+    }
 
     #[derive(Clone, Debug, Error)]
     #[error("Mock error")]
@@ -523,6 +553,20 @@ mod tests {
     }
 
     #[test]
+    fn test_disabled_returns_none() -> Result<()> {
+        let telemetry = Telemetry::new();
+
+        let config = MonopolizationConfiguration::builder()
+            .enabled(false)
+            .build()?;
+
+        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
+        assert!(middleware.is_none(), "Disabled config should return None");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_monopolization_error_classification() {
         let error: MonopolizationError<MockError> = MonopolizationError::Monopolization {
             key: "test-key".into(),
@@ -585,7 +629,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let key: Key = "test-key".into();
         let reference_instant = handler.reference_instant;
@@ -638,7 +682,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let key: Key = "monopolizer".into();
         let reference_instant = handler.reference_instant;
@@ -698,7 +742,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let key1: Key = "key-1".into();
         let key2: Key = "key-2".into();
@@ -779,7 +823,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let key: Key = "test-key".into();
         let reference_instant = handler.reference_instant;
@@ -869,7 +913,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let key: Key = "test-key".into();
         let reference_instant = handler.reference_instant;
@@ -931,7 +975,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let reference_instant = handler.reference_instant;
 
@@ -986,7 +1030,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let reference_instant = handler.reference_instant;
 
@@ -1039,7 +1083,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let reference_instant = handler.reference_instant;
 
@@ -1093,7 +1137,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let reference_instant = handler.reference_instant;
 
@@ -1146,7 +1190,7 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = provider.handler_for_partition("test-topic".into(), 0);
+        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
 
         let reference_instant = handler.reference_instant;
         let key: Key = "key-multiple-at-boundary".into();
