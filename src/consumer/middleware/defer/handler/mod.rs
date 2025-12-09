@@ -1,9 +1,18 @@
-//! Defer middleware for handling transient failures.
+//! Defer middleware for transient failure handling.
 //!
-//! When a message fails with a transient error, this middleware defers it
-//! for later retry via timers rather than blocking the partition. This
-//! maintains partition throughput during downstream outages while preserving
-//! per-key ordering guarantees.
+//! Defers transiently-failed messages to timer-based retry instead of blocking
+//! the partition, maintaining throughput during downstream outages.
+//!
+//! # Invariants
+//!
+//! 1. **Ordering**: Messages for a key are processed in offset order.
+//!
+//! 2. **Completion**: All messages are processed. Deferred keys always have an
+//!    active timer ensuring eventual processing.
+//!
+//! 3. **Deferral**: When enabled, all transient errors are deferred. Once
+//!    deferred, transient errors always re-defer (config/decider only gate
+//!    initial deferral).
 
 use super::config::DeferConfiguration;
 use super::decider::DeferralDecider;
@@ -32,15 +41,11 @@ use std::cmp::min;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-/// Test support module for property-based testing of defer handler.
+/// Property-based tests for defer handler invariants.
 #[cfg(test)]
 pub mod tests;
 
-/// Middleware that defers transiently failed messages for later retry.
-///
-/// Wraps an inner handler and intercepts transient failures. Failed messages
-/// are stored with their metadata and a timer is scheduled. When the timer
-/// fires, the message is reloaded from Kafka and retried.
+/// Middleware that defers transiently-failed messages for timer-based retry.
 #[derive(Clone)]
 pub struct DeferMiddleware<P, L = KafkaLoader, D = FailureTracker>
 where
@@ -59,13 +64,11 @@ impl<P> DeferMiddleware<P, KafkaLoader, FailureTracker>
 where
     P: DeferStoreProvider,
 {
-    /// Creates the middleware with default [`KafkaLoader`] and
-    /// [`FailureTracker`].
+    /// Creates middleware with default [`KafkaLoader`] and [`FailureTracker`].
     ///
     /// # Errors
     ///
-    /// Returns an error if configuration validation or `KafkaLoader`
-    /// construction fails.
+    /// Returns error if config validation or loader construction fails.
     pub fn new(
         config: DeferConfiguration,
         consumer_config: &ConsumerConfiguration,
@@ -111,7 +114,7 @@ where
     }
 }
 
-/// Provider that creates defer handlers for each partition.
+/// Creates [`DeferHandler`]s for each partition.
 #[derive(Clone)]
 pub struct DeferProvider<T, P, L = KafkaLoader, D = FailureTracker>
 where
@@ -127,7 +130,7 @@ where
     consumer_group: ConsumerGroup,
 }
 
-/// Per-partition handler that wraps an inner handler with defer logic.
+/// Per-partition handler wrapping an inner handler with defer logic.
 #[derive(Clone)]
 pub struct DeferHandler<T, S, L = KafkaLoader, D = FailureTracker>
 where
@@ -167,7 +170,7 @@ where
     }
 }
 
-/// Factory for creating cached defer stores.
+/// Factory for cached defer stores.
 #[derive(Clone)]
 pub struct DeferStoreFactory<P: DeferStoreProvider> {
     provider: P,
@@ -189,7 +192,7 @@ impl<P: DeferStoreProvider> StoreFactory for DeferStoreFactory<P> {
     }
 }
 
-/// Lazy cached store for [`DeferHandler`].
+/// Lazily-initialized cached store for [`DeferHandler`].
 pub type DeferLazyStore<P> = LazyStore<DeferStoreFactory<P>>;
 
 impl<T, P, L, D> FallibleHandlerProvider for DeferProvider<T, P, L, D>
@@ -230,12 +233,8 @@ where
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    // ==================== Backoff & Timing ====================
-
-    /// Calculates jittered exponential backoff: `random(1, min(base *
-    /// 2^retry_count, max_delay))`.
-    ///
-    /// Returns 0 when `retry_count` is 0 (no delay for initial attempt).
+    /// Jittered exponential backoff: `random(1, min(base * 2^retry, max))`.
+    /// Returns 0 for `retry_count == 0`.
     fn calculate_backoff(&self, retry_count: u32) -> CompactDuration {
         // No delay for the initial attempt
         if retry_count == 0 {
@@ -266,7 +265,7 @@ where
         CompactDuration::new(compact_seconds)
     }
 
-    /// Returns `now + backoff(retry_count)`.
+    /// Returns `now + backoff(retry_count)`; used for scheduling timers.
     fn next_retry_time(
         &self,
         retry_count: u32,
@@ -276,9 +275,7 @@ where
         Ok(now.add_duration(delay)?)
     }
 
-    // ==================== Timer Operations ====================
-
-    /// Schedules a `DeferRetry` timer using backoff for the given retry count.
+    /// Schedules a `DeferRetry` timer with backoff based on retry count.
     async fn schedule_retry_timer<C>(
         &self,
         context: &C,
@@ -297,8 +294,7 @@ where
         Ok(())
     }
 
-    /// After completing a message, schedules the next retry or clears the
-    /// timer.
+    /// Schedules timer for next message or clears if queue empty.
     async fn schedule_next_or_clear<C>(
         &self,
         context: &C,
@@ -322,11 +318,8 @@ where
         }
     }
 
-    /// Removes a message from the deferred queue and reschedules for remaining.
-    ///
-    /// Used after successfully processing a message, giving up on a permanent
-    /// failure, or skipping a corrupted message. Maintains the invariant that
-    /// all remaining messages will be processed.
+    /// Removes message from queue and schedules timer for next (or clears).
+    /// Used after success, permanent failure, or skipping corrupted messages.
     async fn complete_and_advance<C>(
         &self,
         context: &C,
@@ -344,12 +337,7 @@ where
         self.schedule_next_or_clear(context, result).await
     }
 
-    // ==================== Queue Management ====================
-
-    /// Appends a new message to an already-deferred key's queue.
-    ///
-    /// Per-key ordering requires queuing subsequent messages when a key is
-    /// already deferred, rather than processing them out of order.
+    /// Appends message to an already-deferred key's queue (maintains ordering).
     async fn append_to_deferred_queue(
         &self,
         message_key: &Key,
@@ -368,10 +356,10 @@ where
         Ok(())
     }
 
-    // ==================== Error Handling ====================
-
-    /// Either re-defers on transient error or propagates the error after
-    /// cleanup.
+    /// Handles retry failures by error category:
+    /// - **Transient**: Always re-defer (maintains completion invariant)
+    /// - **Permanent**: Remove and advance (unblocks queue)
+    /// - **Terminal**: Propagate without state change (shutdown handling)
     async fn handle_retry_failure<C>(
         &self,
         context: &C,
@@ -383,42 +371,40 @@ where
     where
         C: EventContext,
     {
-        // Transient errors may be re-deferred; permanent errors are cleaned up and
-        // propagated
-        let is_transient = matches!(error.classify_error(), ErrorCategory::Transient);
-        let should_redefer = is_transient && self.decider.should_defer();
+        match error.classify_error() {
+            ErrorCategory::Transient => {
+                // Always re-defer: message is committed to queue, dropping would
+                // violate ordering for messages queued behind it.
+                let new_retry_count = self
+                    .store
+                    .increment_retry_count(message_key, retry_count)
+                    .await
+                    .map_err(DeferError::Store)?;
 
-        if should_redefer {
-            // Increment retry count and schedule next retry
-            let new_retry_count = self
-                .store
-                .increment_retry_count(message_key, retry_count)
-                .await
-                .map_err(DeferError::Store)?;
+                self.schedule_retry_timer(context, new_retry_count).await?;
 
-            self.schedule_retry_timer(context, new_retry_count).await?;
+                debug!(
+                    "Re-deferred message for key {:?} (retry_count now {})",
+                    message_key, new_retry_count
+                );
 
-            debug!(
-                "Re-deferred message for key {:?} (retry_count now {})",
-                message_key, new_retry_count
-            );
-
-            return Ok(());
+                Ok(())
+            }
+            ErrorCategory::Permanent => {
+                warn!(
+                    "Permanent handler error for key {:?} at offset {}: {} - removing from queue",
+                    message_key, offset, error
+                );
+                self.complete_and_advance(context, message_key, offset)
+                    .await?;
+                Err(DeferError::Handler(error))
+            }
+            ErrorCategory::Terminal => Err(DeferError::Handler(error)),
         }
-
-        // Not re-deferring: clean up this offset and reschedule for remaining
-        self.complete_and_advance(context, message_key, offset)
-            .await?;
-
-        // Propagate the original handler error
-        Err(DeferError::Handler(error))
     }
 
-    /// Loads a deferred message from Kafka.
-    ///
-    /// Returns `Ok(Some(message))` on success, or `Ok(None)` if the load failed
-    /// and was handled internally (timer rescheduled). Only returns `Err` for
-    /// terminal errors (shutdown).
+    /// Loads message from Kafka. Returns `None` if load failed and was handled
+    /// (timer rescheduled). Returns `Err` only for terminal errors.
     async fn load_deferred_message<C>(
         &self,
         context: &C,
@@ -457,11 +443,8 @@ where
         Ok(Some(message))
     }
 
-    /// Handles loader errors while maintaining timer coverage invariant.
-    ///
-    /// - Permanent: complete this offset, schedule timer for next message
-    /// - Transient: schedule retry timer for current message
-    /// - Terminal: propagate for shutdown
+    /// Handles loader errors: permanent skips, transient retries, terminal
+    /// propagates.
     async fn handle_load_failure<C>(
         &self,
         context: &C,
@@ -496,9 +479,8 @@ where
         Ok(None)
     }
 
-    // ==================== Initial Deferral ====================
-
-    /// Defers a message for the first time (key not already deferred).
+    /// Defers a message for the first time. Schedules timer before storing
+    /// to ensure timer coverage on partial failure.
     async fn defer_message<C>(
         &self,
         context: C,
@@ -508,12 +490,7 @@ where
     where
         C: EventContext,
     {
-        // CRITICAL ORDERING (Invariant 1: Timer Coverage):
-        // Schedule timer FIRST, then write to store. If timer scheduling fails,
-        // error propagates and nothing is stored. If store write fails after timer
-        // scheduled, RetryMiddleware retries the entire operation.
-        //
-        // We use clear_and_schedule to handle retries idempotently.
+        // Timer first, then store: ensures timer coverage on partial failure.
         self.schedule_retry_timer(&context, 0).await?;
 
         self.store
@@ -545,8 +522,7 @@ where
     where
         C: EventContext,
     {
-        // If key is already deferred, append this message to the queue.
-        // Borrow from message to avoid cloning in this path.
+        // Already deferred: queue behind existing messages (ordering invariant).
         if self
             .store
             .is_deferred(message.key())
@@ -558,11 +534,10 @@ where
             return self.append_to_deferred_queue(message.key(), offset).await;
         }
 
-        // Key is not deferred - clone key before handler consumes message
+        // Not deferred: try handler, defer on transient failure if enabled.
         let message_key = message.key().clone();
         let offset = message.offset();
 
-        // Try to process the message with the inner handler
         let Err(error) = self
             .handler
             .on_message(context.clone(), message, demand_type)
@@ -571,14 +546,12 @@ where
             return Ok(());
         };
 
-        // Only defer transient (recoverable) errors
         if !matches!(error.classify_error(), ErrorCategory::Transient) {
             return Err(DeferError::Handler(error));
         }
 
-        // Check if deferral is enabled based on failure rate
-        if !self.decider.should_defer() {
-            debug!("Deferral disabled due to high failure rate");
+        // Only gate initial deferral; once deferred, always re-defer transient.
+        if !self.config.enabled || !self.decider.should_defer() {
             return Err(DeferError::Handler(error));
         }
 
@@ -594,7 +567,6 @@ where
     where
         C: EventContext,
     {
-        // Not our timer - pass to inner handler
         if trigger.timer_type != TimerType::DeferRetry {
             return self
                 .handler
@@ -605,18 +577,13 @@ where
 
         let message_key = &trigger.key;
 
-        // Step 1: Get the next deferred message metadata from store.
-        // The offset must remain in scope for error handling paths.
         let Some((offset, retry_count)) = self
             .store
             .get_next_deferred_message(message_key)
             .await
             .map_err(DeferError::Store)?
         else {
-            debug!(
-                "No deferred message found for key {:?}, clearing timer",
-                message_key
-            );
+            // Queue empty (race or already processed): clear orphaned timer.
             context
                 .clear_scheduled(TimerType::DeferRetry)
                 .await
@@ -624,16 +591,14 @@ where
             return Ok(());
         };
 
-        // Step 2: Load and validate the message from Kafka.
         let Some(message) = self
             .load_deferred_message(&context, message_key, offset, retry_count)
             .await?
         else {
-            // Load failure handled: timer rescheduled for next or current message.
-            return Ok(());
+            return Ok(()); // Load failure handled internally.
         };
 
-        // Step 3: Retry the handler
+        // Retry handler; on failure, handle_retry_failure maintains invariants.
         match self
             .handler
             .on_message(context.clone(), message, DemandType::Failure)

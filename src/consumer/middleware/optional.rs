@@ -84,6 +84,17 @@ pub enum OptionHandler<E, D> {
     Disabled(D),
 }
 
+impl<E, D> OptionHandler<E, D> {
+    /// Returns the enabled handler, if present.
+    #[must_use]
+    pub fn enabled(self) -> Option<E> {
+        match self {
+            Self::Enabled(h) => Some(h),
+            Self::Disabled(_) => None,
+        }
+    }
+}
+
 impl<E, D> FallibleHandler for OptionHandler<E, D>
 where
     E: FallibleHandler,

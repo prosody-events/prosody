@@ -148,10 +148,15 @@ fn increments_retry_count_on_transient_failure() {
     });
 }
 
-/// Tests that when deferral is disabled mid-retry (due to high failure rate),
-/// remaining queued messages still get timer coverage.
+/// Tests that transient errors are ALWAYS re-deferred, regardless of decider
+/// state.
+///
+/// This is critical for maintaining ordering invariants: once a message is
+/// committed to the defer queue, it cannot be dropped on transient failure. The
+/// decider only gates *initial* deferral, not re-deferral of already-queued
+/// messages.
 #[test]
-fn deferral_disabled_preserves_timer_for_remaining_messages() {
+fn transient_errors_always_redeferred_ignoring_decider() {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -186,40 +191,44 @@ fn deferral_disabled_preserves_timer_for_remaining_messages() {
             .await
             .ok()??;
         assert_eq!(state.0, Offset::from(1_i64));
+        assert_eq!(state.1, 0, "Initial retry count should be 0");
 
-        // Now simulate deferral being disabled (decider returns false)
-        // Timer fires with transient failure but deferral is disabled
+        // Set decider to false - this should NOT affect re-deferral
         harness.decider.set_next(false);
         harness
             .inner_handler
             .set_outcome(super::handler::HandlerOutcome::Transient);
 
-        // Create context and trigger manually since execute_timer expects success
+        // Create context and trigger manually
         let trigger_time = harness.capture().get_timer_time(&key)?;
         let key_context = KeyedCapturingContext::new(key.clone(), harness.capture().clone());
         let trigger = Trigger::for_testing(key.clone(), trigger_time, TimerType::DeferRetry);
 
-        // This should fail (deferral disabled) but schedule timer for next message
+        // Transient failures are ALWAYS re-deferred (decider is ignored for retry path)
         let result = harness
             .handler
             .on_timer(key_context, trigger, DemandType::Normal)
             .await;
 
-        // Should return error (deferral disabled)
-        assert!(result.is_err());
-
-        // BUT: timer should still be active for the next queued message
+        // Should succeed (re-deferred) even though decider returned false
         assert!(
-            harness.capture().has_active_timer(&key),
-            "Timer should be scheduled for next queued message"
+            result.is_ok(),
+            "Transient errors must always be re-deferred"
         );
 
-        // And the store should show offset 2 as next (offset 1 was removed)
+        // Timer should still be active for the SAME message (re-deferred)
+        assert!(
+            harness.capture().has_active_timer(&key),
+            "Timer should be rescheduled for re-deferred message"
+        );
+
+        // Store should still show offset 1 (NOT advanced to 2) with incremented retry
+        // count
         let next_state = harness.store().get_next_deferred_message(&key).await.ok()?;
         assert_eq!(
             next_state,
-            Some((Offset::from(2_i64), 0)),
-            "Next message should be offset 2 with retry_count reset to 0"
+            Some((Offset::from(1_i64), 1)),
+            "Same message should be re-deferred with retry_count incremented to 1"
         );
 
         Some(())

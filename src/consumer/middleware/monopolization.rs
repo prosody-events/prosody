@@ -428,7 +428,6 @@ mod tests {
     use crate::consumer::DemandType;
     use crate::consumer::event_context::EventContext;
     use crate::consumer::message::ConsumerMessage;
-    use crate::consumer::middleware::optional::OptionHandler;
     use crate::consumer::middleware::{
         FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
     };
@@ -439,17 +438,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::sleep;
-
-    /// Helper to extract the inner monopolization handler from the option
-    /// wrapper.
-    fn unwrap_handler<T>(
-        handler: OptionHandler<MonopolizationHandler<T>, T>,
-    ) -> MonopolizationHandler<T> {
-        let OptionHandler::Enabled(h) = handler else {
-            unreachable!("Expected enabled monopolization handler in test")
-        };
-        h
-    }
 
     #[derive(Clone, Debug, Error)]
     #[error("Mock error")]
@@ -629,7 +617,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let key: Key = "test-key".into();
         let reference_instant = handler.reference_instant;
@@ -682,7 +673,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let key: Key = "monopolizer".into();
         let reference_instant = handler.reference_instant;
@@ -742,7 +736,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let key1: Key = "key-1".into();
         let key2: Key = "key-2".into();
@@ -823,7 +820,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let key: Key = "test-key".into();
         let reference_instant = handler.reference_instant;
@@ -913,7 +913,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let key: Key = "test-key".into();
         let reference_instant = handler.reference_instant;
@@ -975,7 +978,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
 
@@ -1030,7 +1036,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
 
@@ -1083,7 +1092,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
 
@@ -1137,7 +1149,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
 
@@ -1190,7 +1205,10 @@ mod tests {
         };
 
         let provider = middleware.with_provider(provider);
-        let handler = unwrap_handler(provider.handler_for_partition("test-topic".into(), 0));
+        let handler = provider
+            .handler_for_partition("test-topic".into(), 0)
+            .enabled()
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
         let key: Key = "key-multiple-at-boundary".into();

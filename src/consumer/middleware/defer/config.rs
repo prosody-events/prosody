@@ -14,6 +14,17 @@ use validator::Validate;
 #[builder(build_fn(private, name = "build_internal"))]
 #[validate(schema(function = "validate_delays"))]
 pub struct DeferConfiguration {
+    /// Whether deferral is enabled for new messages.
+    ///
+    /// When disabled, transient failures will not be deferred and will instead
+    /// propagate to the retry middleware. Already-deferred messages will still
+    /// complete their retry cycles to maintain ordering guarantees.
+    ///
+    /// Environment variable: `PROSODY_DEFER_ENABLED`
+    /// Default: true
+    #[builder(default = "from_env_with_fallback(\"PROSODY_DEFER_ENABLED\", true)?")]
+    pub enabled: bool,
+
     /// Base exponential backoff delay for deferred retries.
     ///
     /// This is longer than `RetryMiddleware`'s base delay because
@@ -232,5 +243,19 @@ mod tests {
     fn test_default_store_is_in_memory() {
         let result = DeferConfiguration::builder().build();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_enabled_defaults_to_true() {
+        let config = DeferConfiguration::builder().build();
+        assert!(config.is_ok());
+        assert!(config.as_ref().is_ok_and(|c| c.enabled));
+    }
+
+    #[test]
+    fn test_enabled_can_be_disabled() {
+        let config = DeferConfiguration::builder().enabled(false).build();
+        assert!(config.is_ok());
+        assert!(config.as_ref().is_ok_and(|c| !c.enabled));
     }
 }
