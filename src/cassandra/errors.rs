@@ -594,21 +594,21 @@ impl ClassifyError for CqlErrorParseError {
 impl ClassifyError for DbError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            // Terminal: code bugs or server config requiring manual fix
-            DbError::SyntaxError | DbError::Invalid | DbError::ConfigError => {
-                ErrorCategory::Terminal
-            }
+            // Terminal: code bugs that require deployment to fix
+            DbError::SyntaxError | DbError::Invalid => ErrorCategory::Terminal,
 
-            // Permanent: idempotent operations (e.g., CREATE IF NOT EXISTS race)
-            DbError::AlreadyExists { .. } => ErrorCategory::Permanent,
-
-            // Transient: cluster/server states that may resolve on retry
-            // - Auth/permissions: AuthenticationError, Unauthorized
+            // Transient: cluster/server states that may resolve on retry or config change
+            //
+            // - AlreadyExists: Idempotent success - resource exists, operation succeeded
+            // - ConfigError: Server config can be changed by operators without deployment
+            // - Auth/permissions: AuthenticationError, Unauthorized - credentials/ACLs can be fixed
             // - Availability: Unavailable, Overloaded, IsBootstrapping
             // - Timeouts/failures: ReadTimeout, WriteTimeout, ReadFailure, WriteFailure
             // - Operations: FunctionFailure, TruncateError, Unprepared
             // - Protocol: ServerError, ProtocolError, RateLimitReached
-            DbError::FunctionFailure { .. }
+            DbError::AlreadyExists { .. }
+            | DbError::ConfigError
+            | DbError::FunctionFailure { .. }
             | DbError::AuthenticationError
             | DbError::Unauthorized
             | DbError::Unavailable { .. }

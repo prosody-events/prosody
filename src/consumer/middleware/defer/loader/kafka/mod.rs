@@ -291,9 +291,9 @@ impl KafkaLoader {
 
     /// Loads a message from Kafka and caches the decoded result.
     ///
-    /// Acquires a temporary decode permit from `self.semaphore` for the decode
-    /// operation. The decoded message (without any permit) is cached. Cache
-    /// capacity is managed purely by `quick_cache`'s internal S3-FIFO eviction.
+    /// Sends a load request to the background poll loop, which handles Kafka
+    /// polling and message decoding. The decoded message is cached using
+    /// `quick_cache`'s S3-FIFO eviction policy for efficient repeated access.
     ///
     /// # Arguments
     ///
@@ -498,6 +498,18 @@ fn process_poll_result(
             msg_partition,
             msg_offset
         );
+
+        // Clean up if all requests were deleted (partition_requests is now empty)
+        if partition_requests.is_empty() {
+            active.remove(&(msg_topic, msg_partition));
+
+            if let Err(error) = unassign_partition(consumer, msg_topic, msg_partition) {
+                warn!(
+                    "failed to unassign partition {}/{msg_partition}: {error:#}",
+                    msg_topic.as_ref(),
+                );
+            }
+        }
         return;
     };
 
@@ -869,45 +881,42 @@ fn classify_kafka_error(error: &KafkaError) -> ErrorCategory {
 /// Note: [`RDKafkaErrorCode`] is marked `#[non_exhaustive]`, so a wildcard is
 /// required. New error codes added by rdkafka will be treated as transient by
 /// default, since the loader is reloading messages that previously existed.
+///
+/// # Classification Rubric
+///
+/// - **Permanent**: The message itself is corrupt, malformed, or invalid. No
+///   configuration change can salvage it. Data loss is unavoidable.
+/// - **Transient**: The error is due to authorization, configuration, network,
+///   or availability issues. These can potentially be resolved by changing
+///   broker/client configuration, fixing ACLs, or waiting for recovery.
+///
+/// We bias heavily toward transient to avoid data loss. Only message-level
+/// corruption errors that cannot be fixed by any configuration change are
+/// marked permanent.
 fn classify_kafka_error_code(code: RDKafkaErrorCode) -> ErrorCategory {
     match code {
-        // Permanent authorization and configuration errors
-        RDKafkaErrorCode::TopicAuthorizationFailed
-        | RDKafkaErrorCode::GroupAuthorizationFailed
-        | RDKafkaErrorCode::ClusterAuthorizationFailed
-        | RDKafkaErrorCode::InvalidConfig
-        | RDKafkaErrorCode::UnknownTopicOrPartition
-        | RDKafkaErrorCode::InvalidRequest
-        | RDKafkaErrorCode::MessageSizeTooLarge
-        | RDKafkaErrorCode::UnsupportedVersion
-        | RDKafkaErrorCode::InvalidRequiredAcks
-        | RDKafkaErrorCode::IllegalGeneration
-        | RDKafkaErrorCode::InconsistentGroupProtocol
-        | RDKafkaErrorCode::InvalidGroupId
-        | RDKafkaErrorCode::UnknownMemberId
-        | RDKafkaErrorCode::InvalidSessionTimeout
-        | RDKafkaErrorCode::InvalidCommitOffsetSize
-        | RDKafkaErrorCode::OffsetMetadataTooLarge
-        | RDKafkaErrorCode::UnsupportedForMessageFormat
-        | RDKafkaErrorCode::PolicyViolation
-        | RDKafkaErrorCode::DelegationTokenAuthDisabled
-        | RDKafkaErrorCode::DelegationTokenNotFound
-        | RDKafkaErrorCode::DelegationTokenOwnerMismatch
-        | RDKafkaErrorCode::DelegationTokenRequestNotAllowed
-        | RDKafkaErrorCode::DelegationTokenAuthorizationFailed
-        | RDKafkaErrorCode::DelegationTokenExpired
-        | RDKafkaErrorCode::InvalidPrincipalType => ErrorCategory::Permanent,
+        // Permanent: Message content is fundamentally broken
+        // These indicate the message data itself is corrupt or malformed.
+        // No configuration change can fix the message - data loss is unavoidable.
+        //
+        // - BadMessage (-199): librdkafka client detected received message is incorrect
+        // - InvalidMessage (2): Kafka CORRUPT_MESSAGE - CRC failure, invalid size, null key on
+        //   compacted topic, or other corruption
+        // - InvalidRecord (87): Broker failed to validate record content
+        RDKafkaErrorCode::BadMessage
+        | RDKafkaErrorCode::InvalidMessage
+        | RDKafkaErrorCode::InvalidRecord => ErrorCategory::Permanent,
 
-        // Transient network and availability errors
-        RDKafkaErrorCode::NetworkException
-        | RDKafkaErrorCode::RequestTimedOut
-        | RDKafkaErrorCode::BrokerNotAvailable
-        | RDKafkaErrorCode::LeaderNotAvailable
-        | RDKafkaErrorCode::NotEnoughReplicas
-        | RDKafkaErrorCode::NotEnoughReplicasAfterAppend
-        | RDKafkaErrorCode::NotCoordinator
-        | RDKafkaErrorCode::NotController
-        | RDKafkaErrorCode::ReplicaNotAvailable
-        | _ => ErrorCategory::Transient,
+        // All other errors are transient - they can potentially be resolved by:
+        // - Fixing ACLs (authorization errors)
+        // - Adjusting broker/client config (size limits, timeouts, etc.)
+        // - Creating topics or waiting for metadata refresh
+        // - Upgrading brokers or refreshing tokens
+        // - Network recovery or rebalancing
+        //
+        // Note: InvalidMessageSize (4) is Kafka's INVALID_FETCH_SIZE - about fetch
+        // request parameters, not message content. MessageSizeTooLarge (10) can be
+        // fixed by increasing broker's max.message.bytes.
+        _ => ErrorCategory::Transient,
     }
 }
