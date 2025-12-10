@@ -21,7 +21,7 @@ use thiserror::Error;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio::{select, spawn};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Dispatches handler permits using virtual time fairness and urgency boosting.
 ///
@@ -112,12 +112,23 @@ async fn run_event_loop(
 ) {
     let permits = Arc::new(Semaphore::new(max_concurrency));
 
+    debug!(
+        max_concurrency,
+        cache_size = selector.key_times.capacity(),
+        "scheduler dispatcher started"
+    );
+
     loop {
         select! {
             maybe_task = tasks.recv() => {
-                match maybe_task {
-                    Some(task) => selector.enqueue_task(task),
-                    None => break,
+                if let Some(task) = maybe_task {
+                    selector.enqueue_task(task);
+                } else {
+                    debug!(
+                        pending_tasks = selector.tasks.len(),
+                        "task channel closed, shutting down dispatcher"
+                    );
+                    break;
                 }
             }
 
@@ -125,9 +136,19 @@ async fn run_event_loop(
                 match result {
                     Ok(event) => selector.process_telemetry(event),
                     Err(RecvError::Lagged(skipped)) => {
-                        warn!("telemetry lagged by {skipped} events");
+                        warn!(
+                            skipped,
+                            pending_tasks = selector.tasks.len(),
+                            "telemetry lagged, scheduling decisions may be suboptimal"
+                        );
                     }
-                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Closed) => {
+                        debug!(
+                            pending_tasks = selector.tasks.len(),
+                            "telemetry channel closed, shutting down dispatcher"
+                        );
+                        break;
+                    }
                 }
             }
 
@@ -140,6 +161,8 @@ async fn run_event_loop(
             }
         }
     }
+
+    debug!("scheduler dispatcher stopped");
 }
 
 impl Selector {
@@ -160,6 +183,15 @@ impl Selector {
 
     fn enqueue_task(&mut self, mut task: Task) {
         task.key_time = self.key_times.get(&task.key).copied();
+
+        debug!(
+            key = %task.key,
+            demand_type = ?task.demand_type,
+            has_prior_vt = task.key_time.is_some(),
+            queue_depth = self.tasks.len() + 1,
+            "task enqueued for scheduling"
+        );
+
         self.tasks.push(task);
     }
 
@@ -180,13 +212,32 @@ impl Selector {
 
         match state {
             KeyState::HandlerInvoked => {
+                debug!(
+                    key = %key,
+                    demand_type = ?demand_type,
+                    "handler invocation recorded for VT tracking"
+                );
                 self.invocation_times.insert(key, timestamp);
             }
             KeyState::HandlerSucceeded | KeyState::HandlerFailed => {
                 let Some(duration) = self.get_duration(timestamp, &key) else {
-                    warn!("failed to get execution duration for key {key}");
+                    warn!(
+                        key = %key,
+                        demand_type = ?demand_type,
+                        state = ?state,
+                        "missing invocation time for completed handler; \
+                         VT accounting may be inaccurate (possible telemetry lag or restart)"
+                    );
                     return;
                 };
+
+                debug!(
+                    key = %key,
+                    demand_type = ?demand_type,
+                    succeeded = matches!(state, KeyState::HandlerSucceeded),
+                    duration_ms = duration.as_millis(),
+                    "handler completion recorded, updating VT"
+                );
 
                 match demand_type {
                     DemandType::Normal => self.success_time += duration,
@@ -247,7 +298,19 @@ impl Selector {
             (None, None) => return None,
         };
 
-        Some(self.tasks.swap_remove(selected_index))
+        let task = self.tasks.swap_remove(selected_index);
+
+        debug!(
+            key = %task.key,
+            demand_type = ?task.demand_type,
+            wait_time_ms = (now - task.timestamp).as_millis(),
+            remaining_tasks = self.tasks.len(),
+            normal_pending = normal_best.is_some(),
+            failure_pending = failure_best.is_some(),
+            "task selected for permit grant"
+        );
+
+        Some(task)
     }
 
     fn get_duration(&mut self, timestamp: Instant, key: &Key) -> Option<Duration> {

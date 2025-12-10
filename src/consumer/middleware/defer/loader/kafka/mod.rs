@@ -260,6 +260,13 @@ impl KafkaLoader {
     ) -> Result<ConsumerMessage, KafkaLoaderError> {
         let span = Span::current();
 
+        debug!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "Acquiring permit for deferred message load"
+        );
+
         // Acquire load permit for the returned message (backpressure)
         let load_permit = self
             .semaphore
@@ -273,6 +280,12 @@ impl KafkaLoader {
         // Get decoded message from cache or load from Kafka
         let decoded_message = if let Some(cached) = self.cache.get(&cache_key) {
             span.record("cached", true);
+            debug!(
+                topic = %topic,
+                partition = partition,
+                offset = offset,
+                "Loading deferred message from cache"
+            );
             cached
         } else {
             span.record("cached", false);
@@ -311,6 +324,13 @@ impl KafkaLoader {
         partition: Partition,
         offset: Offset,
     ) -> Result<DecodedMessage, KafkaLoaderError> {
+        debug!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "Loading deferred message from Kafka"
+        );
+
         // Create response channel
         let (tx, rx) = oneshot::channel();
 
@@ -325,12 +345,26 @@ impl KafkaLoader {
             .await
             .map_err(|_| KafkaLoaderError::LoaderShutdown)?;
 
+        debug!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "Load request queued, awaiting response"
+        );
+
         // Wait for decoded message (decode permit was dropped in poll loop)
         let decoded = rx.await.map_err(|_| KafkaLoaderError::LoaderShutdown)??;
 
         // Cache the decoded message (no permit needed, quick_cache manages capacity)
         let cache_key = (topic, partition, offset);
         self.cache.insert(cache_key, decoded.clone());
+
+        debug!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "Deferred message cached for future loads"
+        );
 
         Ok(decoded)
     }
@@ -361,6 +395,8 @@ fn poll_loop(
     #[cfg(not(target_arch = "arm"))]
     let mut buffers = Buffers::default();
 
+    debug!("Deferred message loader poll loop started");
+
     loop {
         heartbeat.beat();
 
@@ -370,7 +406,7 @@ fn poll_loop(
                 Ok(request) => handle_request(request, &mut active, consumer),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    debug!("Loader poll loop shutdown");
+                    debug!("Deferred message loader poll loop shutting down");
                     return;
                 }
             }
@@ -378,6 +414,7 @@ fn poll_loop(
 
         // If idle, wait for a request (with heartbeat timeout)
         if active.is_empty() {
+            debug!("Poll loop idle, waiting for requests");
             if let Some(request) = Handle::current().block_on(async {
                 select! {
                     r = rx.recv() => r,
@@ -391,6 +428,12 @@ fn poll_loop(
             continue;
         }
 
+        debug!(
+            active_partitions = active.len(),
+            total_pending_offsets = active.values().map(BTreeMap::len).sum::<usize>(),
+            "Poll loop iteration with active requests"
+        );
+
         // Seek to first active offset if beneficial
         if let Err(error) = seek_to_first_active_offset(
             &active,
@@ -398,12 +441,13 @@ fn poll_loop(
             config.discard_threshold,
             config.seek_timeout,
         ) {
-            warn!("seek failed: {error:#}, will retry after poll");
+            warn!(error = %format_args!("{error:#}"), "Seek failed, will retry after poll");
             // Fall through to poll() which provides backoff via its timeout
         }
 
         // Poll once per iteration
         let Some(result) = consumer.poll(Timeout::After(config.poll_interval)) else {
+            debug!("Poll returned no message");
             continue;
         };
 
@@ -424,14 +468,6 @@ fn poll_loop(
 /// offsets against the received offset. Decodes the message using the first
 /// response's permit and sends the result to all waiting channels. Unassigns
 /// the partition if all requests are fulfilled.
-///
-/// # Arguments
-///
-/// * `result` - Poll result containing message or error
-/// * `propagator` - OpenTelemetry propagator for distributed tracing
-/// * `buffers` - (Non-ARM only) SIMD JSON parsing buffers
-/// * `active` - Active requests map to update
-/// * `consumer` - Kafka consumer for unassigning partitions
 fn process_poll_result(
     result: Result<BorrowedMessage, KafkaError>,
     propagator: &TextMapCompositePropagator,
@@ -442,7 +478,7 @@ fn process_poll_result(
     let message = match result {
         Ok(message) => message,
         Err(error) => {
-            error!("error polling for message: {error:#}");
+            error!(error = %format_args!("{error:#}"), "Error polling for deferred message");
             return;
         }
     };
@@ -451,110 +487,117 @@ fn process_poll_result(
     let msg_partition = message.partition();
     let msg_offset = message.offset();
 
-    debug!(
-        "Received message: {}/{}:{}",
-        msg_topic.as_ref(),
-        msg_partition,
-        msg_offset
-    );
+    debug!(topic = %msg_topic, partition = msg_partition, offset = msg_offset, "Polled message");
 
-    // Check if this message fulfills any active requests
     let Some(partition_requests) = active.get_mut(&(msg_topic, msg_partition)) else {
-        warn!(
-            "received message for partition with no active requests: \
-             {}/{msg_partition}:{msg_offset}",
-            msg_topic.as_ref(),
-        );
+        debug!(topic = %msg_topic, partition = msg_partition, offset = msg_offset,
+            "Received message for partition with no active requests");
         return;
     };
 
-    // LAZY VALIDATION: Detect deleted offsets
-    // If we received offset N but have requests for offsets < N, those offsets
-    // were deleted (LSO moved forward due to retention/compaction).
-    // assign() with deleted offset auto-resets to LSO.
+    // LAZY VALIDATION: Detect deleted offsets (LSO moved forward)
     let mut deleted_offsets = partition_requests.split_off(&msg_offset);
     mem::swap(&mut deleted_offsets, partition_requests);
-    // Now `deleted_offsets` has < msg_offset, `partition_requests` has >=
-    // msg_offset
+    notify_deleted_offsets(deleted_offsets, msg_topic, msg_partition, msg_offset);
 
+    let Some(senders) = partition_requests.remove(&msg_offset) else {
+        debug!(topic = %msg_topic, partition = msg_partition, offset = msg_offset,
+            "Discarding intermediate message (not requested)");
+        cleanup_if_empty(active, consumer, msg_topic, msg_partition);
+        return;
+    };
+
+    fulfill_requests(
+        senders,
+        &message,
+        propagator,
+        #[cfg(not(target_arch = "arm"))]
+        buffers,
+        msg_topic,
+        msg_partition,
+        msg_offset,
+    );
+
+    cleanup_if_empty(active, consumer, msg_topic, msg_partition);
+}
+
+/// Notifies senders about deleted offsets and logs warnings.
+fn notify_deleted_offsets(
+    deleted_offsets: BTreeMap<Offset, Responses>,
+    topic: Topic,
+    partition: Partition,
+    log_start_offset: Offset,
+) {
     for (deleted_offset, senders) in deleted_offsets {
         warn!(
-            "offset {deleted_offset} in {}/{msg_partition} was deleted (LSO >= {msg_offset})",
-            msg_topic.as_ref()
+            topic = %topic,
+            partition = partition,
+            requested_offset = deleted_offset,
+            log_start_offset = log_start_offset,
+            affected_requests = senders.len(),
+            "Deferred message was deleted due to retention/compaction"
         );
         let error =
-            KafkaLoaderError::OffsetDeleted(msg_topic, msg_partition, deleted_offset, msg_offset);
+            KafkaLoaderError::OffsetDeleted(topic, partition, deleted_offset, log_start_offset);
         for sender in senders {
             let _ = sender.send(Err(error.clone()));
         }
     }
+}
 
-    // Check if this offset has active requests
-    let Some(senders) = partition_requests.remove(&msg_offset) else {
-        // No active requests for this offset - discard without decoding
-        debug!(
-            "discarding intermediate message: {}/{}/{}",
-            msg_topic.as_ref(),
-            msg_partition,
-            msg_offset
-        );
+/// Decodes and fulfills requests for a specific offset.
+fn fulfill_requests(
+    senders: Responses,
+    message: &BorrowedMessage<'_>,
+    propagator: &TextMapCompositePropagator,
+    #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
+    topic: Topic,
+    partition: Partition,
+    offset: Offset,
+) {
+    let request_count = senders.len();
+    debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,
+        "Fulfilling active requests for deferred message");
 
-        // Clean up if all requests were deleted (partition_requests is now empty)
-        if partition_requests.is_empty() {
-            active.remove(&(msg_topic, msg_partition));
-
-            if let Err(error) = unassign_partition(consumer, msg_topic, msg_partition) {
-                warn!(
-                    "failed to unassign partition {}/{msg_partition}: {error:#}",
-                    msg_topic.as_ref(),
-                );
-            }
-        }
-        return;
-    };
-
-    // This offset has active requests - decode and fulfill them
-    debug!(
-        "fulfilling {} active requests: {}/{msg_partition}:{msg_offset}",
-        senders.len(),
-        msg_topic.as_ref(),
-    );
-
-    // Decode message (permit dropped after decode)
     let decoded_message = decode_message(
-        &message,
+        message,
         propagator,
         #[cfg(not(target_arch = "arm"))]
         buffers,
     );
 
-    // Send decoded message to all requesters (they'll create ConsumerMessage with
-    // their own permits)
     if let Some(decoded) = decoded_message {
+        debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,
+            "Deferred message loaded successfully");
         for sender in senders {
             let _ = sender.send(Ok(decoded.clone()));
         }
     } else {
-        // Decoding failed - send error to all
-        error!(
-            "failed to decode message: {}/{msg_partition}/{msg_offset}",
-            msg_topic.as_ref(),
-        );
-        let error = KafkaLoaderError::DecodeError(msg_topic, msg_partition, msg_offset);
+        error!(topic = %topic, partition = partition, offset = offset,
+            "Failed to decode deferred message");
+        let error = KafkaLoaderError::DecodeError(topic, partition, offset);
         for sender in senders {
             let _ = sender.send(Err(error.clone()));
         }
     }
+}
 
-    // Clean up empty partition entries and unassign
-    if partition_requests.is_empty() {
-        active.remove(&(msg_topic, msg_partition));
+/// Cleans up partition entry and unassigns if no more requests remain.
+fn cleanup_if_empty(
+    active: &mut ActiveRequests,
+    consumer: &BaseConsumer,
+    topic: Topic,
+    partition: Partition,
+) {
+    let should_cleanup = active
+        .get(&(topic, partition))
+        .is_some_and(BTreeMap::is_empty);
 
-        if let Err(error) = unassign_partition(consumer, msg_topic, msg_partition) {
-            warn!(
-                "failed to unassign partition {}/{msg_partition}: {error:#}",
-                msg_topic.as_ref(),
-            );
+    if should_cleanup {
+        active.remove(&(topic, partition));
+        if let Err(error) = unassign_partition(consumer, topic, partition) {
+            warn!(topic = %topic, partition = partition, error = %format_args!("{error:#}"),
+                "Failed to unassign partition after fulfilling all requests");
         }
     }
 }
@@ -581,10 +624,21 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
         tx,
     } = request;
 
-    debug!("Handling request for {topic}/{partition}:{offset}");
+    debug!(
+        topic = %topic,
+        partition = partition,
+        offset = offset,
+        "Processing load request for deferred message"
+    );
 
     if let Err(error) = assign_if_needed(active, consumer, topic, partition, offset) {
-        error!("Failed to assign {topic}/{partition}:{offset}: {error:#}");
+        error!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            error = %format_args!("{error:#}"),
+            "Failed to assign partition for deferred message load"
+        );
         let _ = tx.send(Err(KafkaLoaderError::Kafka(error)));
         return;
     }
@@ -593,13 +647,26 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
 
     match partition_requests.entry(offset) {
         Entry::Vacant(entry) => {
-            // First request for this offset - use the permit
+            // First request for this offset
+            debug!(
+                topic = %topic,
+                partition = partition,
+                offset = offset,
+                "First request for offset, will decode when polled"
+            );
             let mut senders = SmallVec::new();
             senders.push(tx);
             entry.insert(senders);
         }
         Entry::Occupied(mut entry) => {
-            // Subsequent request - just add sender, permit drops
+            // Subsequent request - coalesce with existing
+            debug!(
+                topic = %topic,
+                partition = partition,
+                offset = offset,
+                coalesced_count = entry.get().len() + 1,
+                "Coalescing with existing request for same offset"
+            );
             entry.get_mut().push(tx);
         }
     }
@@ -667,20 +734,20 @@ fn seek_to_first_active_offset(
         });
 
         debug!(
-            "Seek decision for {}/{}: min_offset={}, current_pos={:?}, should_seek={}",
-            AsRef::<str>::as_ref(topic),
-            partition,
-            min_offset,
-            current_position,
-            should_seek
+            topic = %AsRef::<str>::as_ref(topic),
+            partition = partition,
+            min_offset = min_offset,
+            current_position = ?current_position,
+            should_seek = should_seek,
+            "Evaluating seek decision for partition"
         );
 
         if should_seek {
             debug!(
-                "Adding to seek list: {}/{}:{}",
-                AsRef::<str>::as_ref(topic),
-                partition,
-                min_offset
+                topic = %AsRef::<str>::as_ref(topic),
+                partition = partition,
+                target_offset = min_offset,
+                "Adding partition to seek list"
             );
             seek_list.add_partition_offset(
                 topic.as_ref(),
@@ -691,26 +758,29 @@ fn seek_to_first_active_offset(
     }
 
     if seek_list.count() > 0 {
-        debug!("Executing seek for {} partitions", seek_list.count());
+        debug!(
+            partition_count = seek_list.count(),
+            "Executing seek operation"
+        );
         let result = consumer.seek_partitions(seek_list, Timeout::After(seek_timeout))?;
 
         // Check for seek failures (network errors, timeouts, etc.)
         for elem in result.elements() {
             if let Err(e) = elem.error() {
-                debug!(
-                    "Seek failed for {}/{}:{:?} - {}",
-                    elem.topic(),
-                    elem.partition(),
-                    elem.offset(),
-                    e
+                warn!(
+                    topic = elem.topic(),
+                    partition = elem.partition(),
+                    offset = ?elem.offset(),
+                    error = %format_args!("{e:#}"),
+                    "Seek failed for partition"
                 );
                 return Err(e);
             }
             debug!(
-                "Seek succeeded for {}/{}:{:?}",
-                elem.topic(),
-                elem.partition(),
-                elem.offset()
+                topic = elem.topic(),
+                partition = elem.partition(),
+                offset = ?elem.offset(),
+                "Seek succeeded for partition"
             );
         }
     }
@@ -744,6 +814,12 @@ fn assign_if_needed(
     offset: Offset,
 ) -> KafkaResult<()> {
     if active.contains_key(&(topic, partition)) {
+        debug!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "Partition already assigned, skipping assignment"
+        );
         return Ok(());
     }
 
@@ -757,6 +833,13 @@ fn assign_if_needed(
     let mut to_assign = TopicPartitionList::new();
     to_assign.add_partition_offset(topic.as_ref(), partition, rdkafka::Offset::Offset(offset))?;
     consumer.incremental_assign(&to_assign)?;
+
+    debug!(
+        topic = %topic,
+        partition = partition,
+        offset = offset,
+        "Assigned partition for deferred message loading"
+    );
 
     Ok(())
 }
@@ -784,7 +867,11 @@ fn unassign_partition(
     let mut to_unassign = TopicPartitionList::new();
     to_unassign.add_partition(topic.as_ref(), partition);
     consumer.incremental_unassign(&to_unassign)?;
-    debug!("unassigned partition: {}/{}", topic.as_ref(), partition);
+    debug!(
+        topic = %topic,
+        partition = partition,
+        "Unassigned partition after fulfilling all deferred load requests"
+    );
     Ok(())
 }
 

@@ -18,9 +18,11 @@ use std::time::Duration;
 
 use derive_builder::Builder;
 use futures::pin_mut;
+use humantime::format_duration;
 use thiserror::Error;
 use tokio::select;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
+use tracing::{debug, warn};
 use validator::{Validate, ValidationErrors};
 
 use crate::consumer::DemandType;
@@ -75,18 +77,49 @@ impl<T> TimeoutHandler<T> {
     /// signaled via `context.cancel()` and we continue waiting for the
     /// operation to finish. This ensures the handler has a chance to clean up
     /// before returning its result.
-    async fn run_with_timeout<C, F, R, E>(&self, context: C, operation: F) -> Result<R, E>
+    async fn run_with_timeout<C, F, R, E>(
+        &self,
+        context: C,
+        operation: F,
+        event_type: &str,
+    ) -> Result<R, E>
     where
         C: EventContext,
         F: Future<Output = Result<R, E>>,
     {
+        let start = Instant::now();
         pin_mut!(operation);
 
         select! {
-            result = &mut operation => result,
+            result = &mut operation => {
+                debug!(
+                    event_type,
+                    elapsed = ?start.elapsed(),
+                    "Handler completed within timeout"
+                );
+                result
+            }
             () = sleep(self.timeout) => {
+                warn!(
+                    event_type,
+                    timeout = %format_duration(self.timeout),
+                    "Handler exceeded timeout, signaling cancellation"
+                );
                 context.cancel();
-                operation.await
+
+                // Wait for handler to finish cleanup after cancellation
+                let cancel_start = Instant::now();
+                let result = operation.await;
+                let cleanup_elapsed = cancel_start.elapsed();
+
+                debug!(
+                    event_type,
+                    cleanup_time = ?cleanup_elapsed,
+                    total_elapsed = ?start.elapsed(),
+                    "Handler completed after cancellation signal"
+                );
+
+                result
             }
         }
     }
@@ -127,6 +160,14 @@ impl TimeoutMiddleware {
     ) -> Result<Self, TimeoutInitError> {
         config.validate()?;
         let timeout = config.timeout.unwrap_or_else(|| stall_threshold * 4 / 5);
+
+        debug!(
+            timeout = %format_duration(timeout),
+            stall_threshold = %format_duration(stall_threshold),
+            custom = config.timeout.is_some(),
+            "Timeout middleware initialized"
+        );
+
         Ok(Self { timeout })
     }
 }
@@ -177,6 +218,7 @@ where
         self.run_with_timeout(
             context.clone(),
             self.handler.on_message(context, message, demand_type),
+            "message",
         )
         .await
     }
@@ -193,11 +235,13 @@ where
         self.run_with_timeout(
             context.clone(),
             self.handler.on_timer(context, trigger, demand_type),
+            "timer",
         )
         .await
     }
 
     async fn shutdown(self) {
+        debug!("Timeout handler shutting down");
         self.handler.shutdown().await;
     }
 }

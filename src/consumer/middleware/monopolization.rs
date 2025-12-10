@@ -34,7 +34,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::broadcast;
-use tracing::{debug, debug_span, warn};
+use tracing::{debug, info, trace, warn};
 use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
@@ -156,6 +156,7 @@ impl MonopolizationMiddleware {
         config.validate()?;
 
         if !config.enabled {
+            info!("Monopolization detection disabled by configuration");
             return Ok(None);
         }
 
@@ -165,6 +166,13 @@ impl MonopolizationMiddleware {
         let telemetry_rx = telemetry.subscribe();
         let key_intervals_clone = Arc::clone(&key_intervals);
         let window_duration = config.window_duration;
+
+        info!(
+            threshold_pct = %format_args!("{:.1}%", config.monopolization_threshold * 100.0_f64),
+            window = %format_duration(window_duration),
+            cache_size = config.cache_size,
+            "Monopolization detection enabled"
+        );
 
         spawn(run_event_loop(
             reference_instant,
@@ -261,6 +269,10 @@ where
     }
 
     async fn shutdown(self) {
+        debug!(
+            tracked_keys = self.key_intervals.len(),
+            "Monopolization handler shutting down"
+        );
         self.handler.shutdown().await;
     }
 }
@@ -275,16 +287,7 @@ where
         key: &Key,
         now: Instant,
     ) -> Option<MonopolizationError<T::Error>> {
-        let _span = debug_span!(
-            "check_monopolization",
-            key = %key,
-            monopolization_threshold_pct = %format!("{:.1}%", self.monopolization_threshold * 100.0_f64),
-            window_secs = self.window_duration.as_secs(),
-        )
-            .entered();
-
-        debug!("Checking key for monopolization");
-
+        // No intervals tracked for this key yet - fast path
         let intervals = self.key_intervals.get(key)?;
 
         let now_nanos = now
@@ -302,24 +305,29 @@ where
             .sum();
 
         let monopolization_ratio = key_time_nanos as f64 / window_nanos as f64;
-        let percentage = monopolization_ratio * 100.0_f64;
 
-        debug!(
-            execution_time_pct = %format!("{:.1}%", percentage),
-            is_monopolizing = monopolization_ratio > self.monopolization_threshold,
-            "Monopolization check complete"
-        );
+        if monopolization_ratio > self.monopolization_threshold {
+            let percentage = monopolization_ratio * 100.0_f64;
+            let threshold_pct = self.monopolization_threshold * 100.0_f64;
 
-        (monopolization_ratio > self.monopolization_threshold).then(|| {
-            debug!("Key exceeded monopolization threshold - returning error");
+            // Only log when we're actually rejecting - this is the important event
+            warn!(
+                %key,
+                usage = %format_args!("{percentage:.1}%"),
+                limit = %format_args!("{threshold_pct:.1}%"),
+                window = %format_duration(self.window_duration),
+                "Key exceeded monopolization threshold"
+            );
 
-            MonopolizationError::Monopolization {
+            return Some(MonopolizationError::Monopolization {
                 key: key.clone(),
                 percentage,
-                threshold: self.monopolization_threshold * 100.0_f64,
+                threshold: threshold_pct,
                 window: self.window_duration,
-            }
-        })
+            });
+        }
+
+        None
     }
 }
 
@@ -331,14 +339,20 @@ async fn run_event_loop(
 ) {
     let window_nanos = window_duration.as_nanos() as u64;
 
+    debug!("Event loop started, listening for key state transitions");
+
     loop {
         let event = match telemetry_rx.recv().await {
             Ok(event) => event,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!("telemetry lagged by {skipped} events");
+                warn!(
+                    skipped_events = skipped,
+                    "Telemetry channel lagged - some key execution intervals may be inaccurate"
+                );
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => {
+                debug!("Telemetry channel closed, event loop shutting down");
                 break;
             }
         };
@@ -359,8 +373,10 @@ async fn run_event_loop(
 
                 if let Some(intervals) = key_intervals.get(&key) {
                     key_intervals.insert(key.clone(), intervals.union(&open_interval_set));
+                    trace!(%key, "Handler invoked - extended execution interval");
                 } else {
                     key_intervals.insert(key.clone(), open_interval_set);
+                    trace!(%key, "Handler invoked - opened new execution interval");
                 }
             }
             KeyState::HandlerSucceeded | KeyState::HandlerFailed => {
@@ -368,12 +384,25 @@ async fn run_event_loop(
                 let window_interval_set = [(window_start, elapsed_nanos)].to_interval_set();
 
                 if let Some(intervals) = key_intervals.get(&key) {
-                    key_intervals.insert(key.clone(), intervals.intersection(&window_interval_set));
+                    let windowed = intervals.intersection(&window_interval_set);
+                    key_intervals.insert(key.clone(), windowed);
+
+                    trace!(%key, ?state, "Handler completed - closed execution interval");
+                } else {
+                    // Handler completed without a corresponding invocation event
+                    // (possibly due to telemetry lag or cache eviction)
+                    debug!(
+                        %key,
+                        ?state,
+                        "Handler completed but no open interval found"
+                    );
                 }
             }
             _ => {}
         }
     }
+
+    debug!("Event loop terminated");
 }
 
 /// Errors that can occur during monopolization detection.

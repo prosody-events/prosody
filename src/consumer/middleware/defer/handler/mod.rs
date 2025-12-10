@@ -39,7 +39,7 @@ use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
 use rand::Rng;
 use std::cmp::min;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Property-based tests for defer handler invariants.
 #[cfg(test)]
@@ -291,6 +291,14 @@ where
             .await
             .map_err(|e| DeferError::Timer(Box::new(e)))?;
 
+        debug!(
+            fire_time = %fire_time,
+            retry_count = retry_count,
+            topic = %self.topic,
+            partition = self.partition,
+            "Scheduled defer retry timer"
+        );
+
         Ok(())
     }
 
@@ -349,8 +357,11 @@ where
             .map_err(DeferError::Store)?;
 
         debug!(
-            "Appended offset {} to deferred queue for key {:?}",
-            offset, message_key
+            key = ?message_key,
+            offset = offset,
+            topic = %self.topic,
+            partition = self.partition,
+            "Queued message behind already-deferred key"
         );
 
         Ok(())
@@ -383,17 +394,25 @@ where
 
                 self.schedule_retry_timer(context, new_retry_count).await?;
 
-                debug!(
-                    "Re-deferred message for key {:?} (retry_count now {})",
-                    message_key, new_retry_count
+                info!(
+                    key = ?message_key,
+                    offset = offset,
+                    retry_count = new_retry_count,
+                    topic = %self.topic,
+                    partition = self.partition,
+                    "Re-deferred message after transient failure"
                 );
 
                 Ok(())
             }
             ErrorCategory::Permanent => {
                 warn!(
-                    "Permanent handler error for key {:?} at offset {}: {} - removing from queue",
-                    message_key, offset, error
+                    key = ?message_key,
+                    offset = offset,
+                    retry_count = retry_count,
+                    topic = %self.topic,
+                    partition = self.partition,
+                    "Permanent handler error during retry - removing from queue: {error:#}"
                 );
                 self.complete_and_advance(context, message_key, offset)
                     .await?;
@@ -430,10 +449,12 @@ where
 
         if message.key() != message_key {
             warn!(
-                "Key mismatch: expected {:?}, got {:?} - skipping offset {}",
-                message_key,
-                message.key(),
-                offset
+                expected_key = ?message_key,
+                actual_key = ?message.key(),
+                offset = offset,
+                topic = %self.topic,
+                partition = self.partition,
+                "Key mismatch at offset - skipping corrupted entry"
             );
             self.complete_and_advance(context, message_key, offset)
                 .await?;
@@ -459,16 +480,23 @@ where
         match error.classify_error() {
             ErrorCategory::Permanent => {
                 warn!(
-                    "Permanent loader error for key {:?} at offset {}: {} - skipping",
-                    message_key, offset, error
+                    key = ?message_key,
+                    offset = offset,
+                    topic = %self.topic,
+                    partition = self.partition,
+                    "Permanent loader error - skipping message: {error:#}"
                 );
                 self.complete_and_advance(context, message_key, offset)
                     .await?;
             }
             ErrorCategory::Transient => {
                 warn!(
-                    "Transient loader error for key {:?} at offset {}: {} - scheduling retry",
-                    message_key, offset, error
+                    key = ?message_key,
+                    offset = offset,
+                    retry_count = retry_count,
+                    topic = %self.topic,
+                    partition = self.partition,
+                    "Transient loader error - scheduling retry: {error:#}"
                 );
                 self.schedule_retry_timer(context, retry_count).await?;
             }
@@ -498,7 +526,13 @@ where
             .await
             .map_err(DeferError::Store)?;
 
-        debug!("Deferred message for key {:?}", message_key);
+        info!(
+            key = ?message_key,
+            offset = offset,
+            topic = %self.topic,
+            partition = self.partition,
+            "Deferred message for timer-based retry"
+        );
 
         Ok(())
     }
@@ -551,7 +585,25 @@ where
         }
 
         // Only gate initial deferral; once deferred, always re-defer transient.
-        if !self.config.enabled || !self.decider.should_defer() {
+        if !self.config.enabled {
+            debug!(
+                key = ?message_key,
+                offset = offset,
+                topic = %self.topic,
+                partition = self.partition,
+                "Deferral skipped: middleware disabled"
+            );
+            return Err(DeferError::Handler(error));
+        }
+
+        if !self.decider.should_defer() {
+            debug!(
+                key = ?message_key,
+                offset = offset,
+                topic = %self.topic,
+                partition = self.partition,
+                "Deferral skipped: decider threshold not met"
+            );
             return Err(DeferError::Handler(error));
         }
 
@@ -577,6 +629,14 @@ where
 
         let message_key = &trigger.key;
 
+        debug!(
+            key = ?message_key,
+            scheduled_time = %trigger.time,
+            topic = %self.topic,
+            partition = self.partition,
+            "Defer retry timer fired"
+        );
+
         let Some((offset, retry_count)) = self
             .store
             .get_next_deferred_message(message_key)
@@ -584,6 +644,12 @@ where
             .map_err(DeferError::Store)?
         else {
             // Queue empty (race or already processed): clear orphaned timer.
+            debug!(
+                key = ?message_key,
+                topic = %self.topic,
+                partition = self.partition,
+                "Clearing orphaned defer timer: queue empty"
+            );
             context
                 .clear_scheduled(TimerType::DeferRetry)
                 .await
@@ -598,6 +664,15 @@ where
             return Ok(()); // Load failure handled internally.
         };
 
+        debug!(
+            key = ?message_key,
+            offset = offset,
+            retry_count = retry_count,
+            topic = %self.topic,
+            partition = self.partition,
+            "Loaded deferred message - attempting retry"
+        );
+
         // Retry handler; on failure, handle_retry_failure maintains invariants.
         match self
             .handler
@@ -607,9 +682,13 @@ where
             Ok(()) => {
                 self.complete_and_advance(&context, message_key, offset)
                     .await?;
-                debug!(
-                    "Deferred message succeeded for key {:?} after {} retries",
-                    message_key, retry_count
+                info!(
+                    key = ?message_key,
+                    offset = offset,
+                    retry_count = retry_count,
+                    topic = %self.topic,
+                    partition = self.partition,
+                    "Deferred message retry succeeded"
                 );
                 Ok(())
             }
