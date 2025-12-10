@@ -12,9 +12,10 @@ create table {{KEYSPACE}}.{{TABLE_DEFERRED_SEGMENTS}}
     primary key ((id))
 )
     with compression = { 'class': 'ZstdCompressor' }
-     and compaction = { 'class': 'UnifiedCompactionStrategy' };
+     and compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' };
 
 -- Deferred offsets per key within a segment
+-- L10: Leveled compaction optimal for high DELETE rate, long TTLs, FIFO reads
 create table {{KEYSPACE}}.{{TABLE_DEFERRED_OFFSETS}}
 (
     segment_id  uuid,
@@ -25,4 +26,4 @@ create table {{KEYSPACE}}.{{TABLE_DEFERRED_OFFSETS}}
 )
     with clustering order by (offset asc)
      and compression = { 'class': 'ZstdCompressor' }
-     and compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'T2' };
+     and compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' };

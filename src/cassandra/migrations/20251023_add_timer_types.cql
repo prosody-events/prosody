@@ -4,6 +4,16 @@
 -- Add version column to segments table
 alter table {{KEYSPACE}}.{{TABLE_SEGMENTS}} add version tinyint static;
 
+-- Update V1 tables to L10 (leveled compaction with fanout=10)
+alter table {{KEYSPACE}}.{{TABLE_SEGMENTS}}
+    with compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' };
+
+alter table {{KEYSPACE}}.{{TABLE_SLABS}}
+    with compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' };
+
+alter table {{KEYSPACE}}.{{TABLE_KEYS}}
+    with compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' };
+
 -- V2 time-based index with timer type support
 create table {{KEYSPACE}}.{{TABLE_TYPED_SLABS}}
 (
@@ -17,7 +27,7 @@ create table {{KEYSPACE}}.{{TABLE_TYPED_SLABS}}
     primary key ((segment_id, slab_size, id), timer_type, key, time)
 )
     with compression = { 'class': 'ZstdCompressor' }
-     and compaction = { 'class': 'UnifiedCompactionStrategy' };
+     and compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' };
 
 -- V2 key-based index with timer type support
 create table {{KEYSPACE}}.{{TABLE_TYPED_KEYS}}
@@ -30,4 +40,4 @@ create table {{KEYSPACE}}.{{TABLE_TYPED_KEYS}}
     primary key ((segment_id, key), timer_type, time)
 )
     with compression = { 'class': 'ZstdCompressor' }
-     and compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'T2' };
+     and compaction = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' };
