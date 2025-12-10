@@ -223,6 +223,7 @@ blocking all processing.
 
 | Environment Variable              | Description                                       | Default |
 |-----------------------------------|---------------------------------------------------|---------|
+| `PROSODY_DEFER_ENABLED`           | Enable deferral for new messages                  | true    |
 | `PROSODY_DEFER_BASE`              | Wait this long before first deferred retry        | 1s      |
 | `PROSODY_DEFER_MAX_DELAY`         | Never wait longer than this                       | 24h     |
 | `PROSODY_DEFER_FAILURE_THRESHOLD` | Trigger deferral when failure rate exceeds this   | 0.9     |
@@ -256,6 +257,7 @@ minutes out of any 5-minute window, it gets throttled.
 
 | Environment Variable                | Description                            | Default |
 |-------------------------------------|----------------------------------------|---------|
+| `PROSODY_MONOPOLIZATION_ENABLED`    | Enable hot key protection              | true    |
 | `PROSODY_MONOPOLIZATION_THRESHOLD`  | Max handler time as fraction of window | 0.9     |
 | `PROSODY_MONOPOLIZATION_WINDOW`     | Measurement window                     | 5m      |
 | `PROSODY_MONOPOLIZATION_CACHE_SIZE` | Max distinct keys to track             | 8192    |
