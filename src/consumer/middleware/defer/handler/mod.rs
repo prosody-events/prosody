@@ -241,13 +241,13 @@ where
             return CompactDuration::MIN;
         }
 
-        let base_seconds = self.config.base.as_secs();
-        let max_delay_seconds = self.config.max_delay.as_secs();
+        let base_seconds = u32::try_from(self.config.base.as_secs()).unwrap_or(u32::MAX);
+        let max_delay_seconds = u32::try_from(self.config.max_delay.as_secs()).unwrap_or(u32::MAX);
 
         // Calculate exponential backoff: base * 2^(retry_count - 1)
         // Subtract 1 so first retry (count=1) uses base delay
         // Using checked operations to avoid overflow
-        let multiplier = 2_u64.saturating_pow(retry_count - 1);
+        let multiplier = 2_u32.saturating_pow(retry_count - 1);
         let delay_seconds = base_seconds.saturating_mul(multiplier);
 
         // Cap at max_delay, with minimum of 1 second.
@@ -259,10 +259,7 @@ where
         // This prevents thundering herd when many keys retry simultaneously.
         let jittered_seconds = rand::rng().random_range(1..=capped_seconds);
 
-        // Convert to u32 for CompactDuration, saturating at MAX
-        let compact_seconds = u32::try_from(jittered_seconds).unwrap_or(u32::MAX);
-
-        CompactDuration::new(compact_seconds)
+        CompactDuration::new(jittered_seconds)
     }
 
     /// Returns `now + backoff(retry_count)`; used for scheduling timers.
