@@ -193,7 +193,7 @@ impl KafkaLoader {
         config: LoaderConfiguration,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, KafkaLoaderError> {
-        let group_id = format!("{}-deferred", config.group_id);
+        let group_id = format!("{}-deferred-loader", config.group_id);
         let client_id = hostname().map_err(|error| KafkaLoaderError::Hostname(Arc::new(error)))?;
 
         // Point lookups don't benefit from prefetching. Start with small fetch
