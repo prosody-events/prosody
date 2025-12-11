@@ -339,6 +339,7 @@ where
             .complete_retry_success(message_key, offset)
             .await
             .map_err(DeferError::Store)?;
+
         self.schedule_next_or_clear(context, result).await
     }
 
@@ -411,8 +412,10 @@ where
                     partition = self.partition,
                     "Permanent handler error during retry - removing from queue: {error:#}"
                 );
+
                 self.complete_and_advance(context, message_key, offset)
                     .await?;
+
                 Err(DeferError::Handler(error))
             }
             ErrorCategory::Terminal => Err(DeferError::Handler(error)),
@@ -453,8 +456,10 @@ where
                 partition = self.partition,
                 "Key mismatch at offset - skipping corrupted entry"
             );
+
             self.complete_and_advance(context, message_key, offset)
                 .await?;
+
             return Ok(None);
         }
 
@@ -487,15 +492,22 @@ where
                     .await?;
             }
             ErrorCategory::Transient => {
+                let new_retry_count = self
+                    .store
+                    .increment_retry_count(message_key, retry_count)
+                    .await
+                    .map_err(DeferError::Store)?;
+
+                self.schedule_retry_timer(context, new_retry_count).await?;
+
                 warn!(
                     key = ?message_key,
                     offset = offset,
-                    retry_count = retry_count,
+                    retry_count = new_retry_count,
                     topic = %self.topic,
                     partition = self.partition,
                     "Transient loader error - scheduling retry: {error:#}"
                 );
-                self.schedule_retry_timer(context, retry_count).await?;
             }
             ErrorCategory::Terminal => {
                 return Err(DeferError::Loader(error));
@@ -647,10 +659,13 @@ where
                 partition = self.partition,
                 "Clearing orphaned defer timer: queue empty"
             );
-            context
-                .clear_scheduled(TimerType::DeferRetry)
+
+            // Clean up any orphaned store state for this key
+            self.store
+                .delete_key(message_key)
                 .await
-                .map_err(|e| DeferError::Timer(Box::new(e)))?;
+                .map_err(DeferError::Store)?;
+
             return Ok(());
         };
 
@@ -679,6 +694,7 @@ where
             Ok(()) => {
                 self.complete_and_advance(&context, message_key, offset)
                     .await?;
+
                 info!(
                     key = ?message_key,
                     offset = offset,
