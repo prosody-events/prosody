@@ -57,7 +57,7 @@ impl DeferStoreProvider for CassandraDeferStoreProvider {
     type Error = CassandraDeferStoreError;
     type Store = CassandraDeferStore;
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn create_store(
         &self,
         topic: Topic,

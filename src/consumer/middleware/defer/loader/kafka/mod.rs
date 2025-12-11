@@ -251,7 +251,7 @@ impl KafkaLoader {
     /// - The response channel is closed (loader shut down)
     /// - The message cannot be found or decoded
     /// - A Kafka error occurs during loading
-    #[instrument(skip(self), fields(cached = Empty), err)]
+    #[instrument(level = "debug", skip(self), fields(cached = Empty), err)]
     async fn load_message_impl(
         &self,
         topic: Topic,
@@ -297,7 +297,7 @@ impl KafkaLoader {
         // Create consumer message from decoded message with load permit
         Ok(ConsumerMessage::from_decoded(
             decoded_message.value,
-            span,
+            decoded_message.span,
             load_permit,
         ))
     }

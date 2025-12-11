@@ -60,7 +60,7 @@ impl CassandraDeferStore {
 impl DeferStore for CassandraDeferStore {
     type Error = CassandraDeferStoreError;
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         let ttl = self.store.base_ttl();
 
@@ -76,7 +76,7 @@ impl DeferStore for CassandraDeferStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn get_next_deferred_message(
         &self,
         key: &Key,
@@ -107,7 +107,7 @@ impl DeferStore for CassandraDeferStore {
         }))
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         let ttl = self.store.base_ttl();
 
@@ -123,7 +123,7 @@ impl DeferStore for CassandraDeferStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(
@@ -136,7 +136,7 @@ impl DeferStore for CassandraDeferStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
         let retry_count_i32: i32 =
             retry_count
@@ -157,7 +157,7 @@ impl DeferStore for CassandraDeferStore {
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = "debug", skip(self), err)]
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(&self.queries.delete_key, (&self.segment_id, key.as_ref()))

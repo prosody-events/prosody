@@ -34,7 +34,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::spawn;
 use tokio::sync::broadcast;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
@@ -156,7 +156,7 @@ impl MonopolizationMiddleware {
         config.validate()?;
 
         if !config.enabled {
-            info!("Monopolization detection disabled by configuration");
+            debug!("Monopolization detection disabled by configuration");
             return Ok(None);
         }
 
@@ -167,7 +167,7 @@ impl MonopolizationMiddleware {
         let key_intervals_clone = Arc::clone(&key_intervals);
         let window_duration = config.window_duration;
 
-        info!(
+        debug!(
             threshold_pct = %format_args!("{:.1}%", config.monopolization_threshold * 100.0_f64),
             window = %format_duration(window_duration),
             cache_size = config.cache_size,
