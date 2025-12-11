@@ -184,14 +184,16 @@ async fn create_session(config: &CassandraConfiguration) -> Result<Session, Cass
         }
     }
 
-    let _profile = ExecutionProfile::builder()
+    let profile = ExecutionProfile::builder()
         .consistency(Consistency::LocalQuorum)
         .load_balancing_policy(lb_policy.build())
-        .retry_policy(Arc::new(DefaultRetryPolicy::new()));
+        .retry_policy(Arc::new(DefaultRetryPolicy::new()))
+        .build();
 
     let mut session = SessionBuilder::new()
         .known_nodes(&config.nodes)
-        .compression(Some(Compression::Lz4));
+        .compression(Some(Compression::Lz4))
+        .default_execution_profile_handle(profile.into_handle());
 
     if let Some(user) = &config.user {
         session = session.user(user.clone(), config.password.clone().unwrap_or_default());
