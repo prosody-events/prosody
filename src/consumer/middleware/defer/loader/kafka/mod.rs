@@ -878,10 +878,6 @@ fn unassign_partition(
 /// Errors that can occur during Kafka message loading.
 #[derive(Clone, Debug, Error)]
 pub enum KafkaLoaderError {
-    /// The requested message was not found at the specified offset.
-    #[error("Message {0}/{1}:{2} not found")]
-    NotFound(Topic, Partition, Offset),
-
     /// Failed to decode the message payload.
     #[error("Failed to decode message {0}/{1}:{2}")]
     DecodeError(Topic, Partition, Offset),
@@ -925,9 +921,7 @@ impl ClassifyError for KafkaLoaderError {
             Self::Kafka(kafka_error) => classify_kafka_error(kafka_error),
 
             // Permanent errors - data issues that won't resolve
-            Self::NotFound(..) | Self::DecodeError(..) | Self::OffsetDeleted(..) => {
-                ErrorCategory::Permanent
-            }
+            Self::DecodeError(..) | Self::OffsetDeleted(..) => ErrorCategory::Permanent,
         }
     }
 }
