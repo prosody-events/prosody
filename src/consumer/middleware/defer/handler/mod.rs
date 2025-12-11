@@ -247,7 +247,7 @@ where
         // Calculate exponential backoff: base * 2^(retry_count - 1)
         // Subtract 1 so first retry (count=1) uses base delay
         // Using checked operations to avoid overflow
-        let multiplier = 2_u64.checked_pow(retry_count - 1).unwrap_or(u64::MAX);
+        let multiplier = 2_u64.saturating_pow(retry_count - 1);
         let delay_seconds = base_seconds.saturating_mul(multiplier);
 
         // Cap at max_delay, with minimum of 1 second.
