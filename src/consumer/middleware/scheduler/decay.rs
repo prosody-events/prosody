@@ -24,7 +24,10 @@ pub struct DecayingDuration<const HALF_LIFE_SECS: u64> {
 }
 
 impl<const HALF_LIFE_SECS: u64> DecayingDuration<HALF_LIFE_SECS> {
-    pub const HALF_LIFE: Duration = Duration::from_secs(HALF_LIFE_SECS);
+    pub const HALF_LIFE: Duration = {
+        assert!(HALF_LIFE_SECS > 0, "half-life must be positive");
+        Duration::from_secs(HALF_LIFE_SECS)
+    };
 
     pub const fn new(value: Duration, measured_at: Instant) -> Self {
         Self {
