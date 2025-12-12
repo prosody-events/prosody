@@ -131,7 +131,41 @@ Prosody's `HighLevelClient` supports two operational modes:
 
 ### Pipeline Mode
 
-Designed for applications that require all messages to be processed or sent in order. It ensures:
+Designed for applications that require all messages to be processed or sent in order. Pipeline mode implements
+**Quality of Service (QoS)** mechanisms that maintain throughput under adverse conditions while preserving per-key
+ordering guarantees.
+
+**The Problem:** A Kafka partition processes messages in order. When one key fails repeatedly or takes too long, it
+blocks everything behind it. A single problematic key can halt an entire partition.
+
+**The Solution:** Three mechanisms work together:
+
+1. **Fair Scheduling** - Keys compete for execution slots based on accumulated runtime. Heavy keys get deprioritized;
+   starving keys get priority boosts.
+
+2. **Deferred Retry** - Persistently failing keys move to timer-based retry. The partition continues processing other
+   keys while failures retry in the background.
+
+3. **Monopolization Detection** - Keys consuming excessive execution time are rejected, forcing them through the defer
+   path.
+
+Messages flow through a middleware stack where each layer handles a specific concern:
+
+```
+Kafka → Retry → Defer → Monopolization → Shutdown → Scheduler → Timeout → Telemetry → Handler
+```
+
+| Layer          | Purpose                                                  |
+|----------------|----------------------------------------------------------|
+| Retry          | Infinite retry on transient errors                       |
+| Defer          | Persistent retry via timers, releases partition on fail  |
+| Monopolization | Rejects keys consuming >90% of execution window          |
+| Shutdown       | Handles graceful partition revocation                    |
+| Scheduler      | Fair permit acquisition with virtual-time priority       |
+| Timeout        | Cancels handlers exceeding deadline                      |
+| Telemetry      | Records handler lifecycle events                         |
+
+Pipeline mode ensures:
 
 - Ordered handling of all messages
 - Indefinite retries for failed operations based on the retry configuration
@@ -197,7 +231,7 @@ The following tables list available environment variables by category:
 | `PROSODY_PROBE_PORT`             | HTTP port for health checks ('none' to disable)      | 8000                   |
 | `PROSODY_FAILURE_TOPIC`          | Send unprocessable messages here (dead letter queue) | -                      |
 | `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Track this many message IDs to skip duplicates       | 4096                   |
-| `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1d                     |
+| `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1h                     |
 
 ### Producer
 
@@ -221,12 +255,20 @@ When a key keeps failing (e.g., downstream is down), stop retrying immediately
 and schedule retries for much later. This prevents one broken dependency from
 blocking all processing.
 
+**How it works:** On transient failure, defer middleware stores the message offset in Cassandra, schedules a timer, and
+returns success—freeing the partition to process other keys. When the timer fires, the message is reloaded from Kafka
+and retried.
+
+**Failure Rate Gating:** When the global failure rate exceeds the threshold (default: 90%), deferral is disabled. Errors
+propagate to retry middleware which retries forever, intentionally blocking the partition to provide backpressure during
+total downstream failure.
+
 | Environment Variable              | Description                                       | Default |
 |-----------------------------------|---------------------------------------------------|---------|
 | `PROSODY_DEFER_ENABLED`           | Enable deferral for new messages                  | true    |
 | `PROSODY_DEFER_BASE`              | Wait this long before first deferred retry        | 1s      |
 | `PROSODY_DEFER_MAX_DELAY`         | Never wait longer than this                       | 24h     |
-| `PROSODY_DEFER_FAILURE_THRESHOLD` | Trigger deferral when failure rate exceeds this   | 0.9     |
+| `PROSODY_DEFER_FAILURE_THRESHOLD` | Disable deferral when failure rate exceeds this   | 0.9     |
 | `PROSODY_DEFER_FAILURE_WINDOW`    | Measure failure rate over this time window        | 5m      |
 | `PROSODY_DEFER_CACHE_SIZE`        | Track this many deferred keys in memory           | 1024    |
 | `PROSODY_DEFER_SEEK_TIMEOUT`      | Timeout when loading deferred messages            | 30s     |
@@ -264,9 +306,13 @@ minutes out of any 5-minute window, it gets throttled.
 
 ### Scheduler Tuning (Advanced)
 
-Controls how the scheduler picks which message to process next. The scheduler
-balances two goals: (1) fair time between retries and new messages, and
-(2) preventing any message from waiting too long.
+Controls how the scheduler picks which message to process next using **virtual-time fairness**.
+
+Each key accumulates "virtual time" equal to its execution duration. Keys with lower accumulated time get priority. To
+prevent starvation, tasks waiting too long receive quadratic urgency boosts. Virtual times decay with a 120-second
+half-life, so past monopolization doesn't permanently penalize a key.
+
+Normal processing and failure retries have separate accounting (default: 70/30 split).
 
 | Environment Variable               | Description                                                      | Default |
 |------------------------------------|------------------------------------------------------------------|---------|
@@ -430,7 +476,7 @@ The timer system is automatically configured based on the consumer configuration
 
 - **Mock Mode**: Uses in-memory storage for testing (`PROSODY_MOCK=true`)
 - **Production Mode**: Uses Cassandra for persistent storage
-- **Slab Size**: Configure time-based partitioning with `PROSODY_SLAB_SIZE` (default: 1 day)
+- **Slab Size**: Configure time-based partitioning with `PROSODY_SLAB_SIZE` (default: 1 hour)
 - **Retention**: Retention period for timer and failure data via `PROSODY_CASSANDRA_RETENTION` (default: 1 year)
 
 ### Usage in Handlers
