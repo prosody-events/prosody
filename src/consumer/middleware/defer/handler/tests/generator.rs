@@ -272,7 +272,7 @@ impl Arbitrary for Trace {
         let key_count = (usize::arbitrary(g) % 5) + 1;
         let mut builder = TraceBuilder::new(key_count);
 
-        // Generate 5-20 events based on generator size
+        // Generate 5 to (5 + g.size()) events, scaling with generator size
         let event_count = (usize::arbitrary(g) % (g.size().max(1))) + 5;
 
         for _ in 0..event_count {
