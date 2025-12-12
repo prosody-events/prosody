@@ -173,15 +173,24 @@ pub enum TracingError {
 /// initialization will only happen once. Call this at the beginning of any
 /// test that uses tracing or OpenTelemetry span operations.
 ///
-/// Uses the standard `initialize_tracing` function without OTLP configuration,
-/// which results in a subscriber with fmt and filter layers but no telemetry
-/// export.
+/// Defaults to ERROR level to reduce test noise. Set `PROSODY_LOG` environment
+/// variable to override (e.g., `PROSODY_LOG=debug cargo test`).
 pub fn init_test_logging() {
     use std::sync::Once;
 
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {
-        let _ = initialize_tracing(Some(fmt::layer().compact()));
+        // Use ERROR level by default for tests to reduce noise
+        let env_filter = EnvFilter::builder()
+            .with_env_var("PROSODY_LOG")
+            .with_default_directive(LevelFilter::ERROR.into())
+            .from_env_lossy();
+
+        let subscriber = Registry::default()
+            .with(fmt::layer().compact())
+            .with(env_filter);
+
+        let _ = set_global_default(subscriber);
     });
 }
