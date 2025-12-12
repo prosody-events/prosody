@@ -293,14 +293,17 @@ mod tests {
 
     async fn create_test_store() -> MemoryDeferStore {
         let provider = MemoryDeferStoreProvider::new();
-        provider
+        match provider
             .create_store(
                 Topic::from("test-topic"),
                 Partition::from(0_i32),
                 "test-group",
             )
             .await
-            .expect("store creation is infallible")
+        {
+            Ok(store) => store,
+            Err(infallible) => match infallible {},
+        }
     }
 
     #[tokio::test]
