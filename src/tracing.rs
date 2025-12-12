@@ -181,11 +181,19 @@ pub fn init_test_logging() {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {
-        // Use ERROR level by default for tests to reduce noise
+        // Use ERROR level by default for tests to reduce noise.
+        // Suppress "failed to set parent span" errors from modules that use
+        // OpenTelemetry span parenting (not available in test environment).
         let env_filter = EnvFilter::builder()
             .with_env_var("PROSODY_LOG")
             .with_default_directive(LevelFilter::ERROR.into())
-            .from_env_lossy();
+            .from_env_lossy()
+            .add_directive("prosody::consumer::decode=off".parse().unwrap_or_default())
+            .add_directive(
+                "prosody::timers::store::cassandra=off"
+                    .parse()
+                    .unwrap_or_default(),
+            );
 
         let subscriber = Registry::default()
             .with(fmt::layer().compact())
