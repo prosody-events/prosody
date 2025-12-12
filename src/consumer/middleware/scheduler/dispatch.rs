@@ -64,7 +64,7 @@ struct Selector {
     key_times: Cache<Key, DecayingDuration120, UnitWeighter, RandomState>,
     failure_weight: f64,
     normal_weight: f64,
-    max_wait_secs: f64,
+    max_wait: f64,
     wait_weight: f64,
 }
 
@@ -176,7 +176,7 @@ impl Selector {
             key_times: Cache::new(config.cache_size),
             failure_weight: config.failure_weight,
             normal_weight: 1.0 - config.failure_weight,
-            max_wait_secs: config.max_wait_secs.as_secs_f64(),
+            max_wait: config.max_wait.as_secs_f64(),
             wait_weight: config.wait_weight,
         }
     }
@@ -269,7 +269,7 @@ impl Selector {
                         .map_or(0.0_f64, |vt| vt.at(now).as_micros() as f64);
 
                     let wait_time = (now - task.timestamp).as_secs_f64();
-                    let wait_ratio = (wait_time / self.max_wait_secs).min(1.0);
+                    let wait_ratio = (wait_time / self.max_wait).min(1.0);
                     let wait_urgency_micros =
                         self.wait_weight * wait_ratio.powi(2) * 1_000_000.0_f64;
                     let priority = key_vt_micros - wait_urgency_micros;
