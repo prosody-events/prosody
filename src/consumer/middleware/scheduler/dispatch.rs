@@ -1113,11 +1113,11 @@ mod tests {
 
         // Execute all normal tasks - failure class is empty
         for _ in 0_i32..10_i32 {
-            let task = selector.get_next_task();
-            assert!(task.is_some(), "Should select from non-empty class");
+            let Some(task) = selector.get_next_task() else {
+                bail!("Should select from non-empty class");
+            };
             assert_eq!(
-                task.unwrap_or_else(|| create_task("", DemandType::Normal, 0))
-                    .demand_type,
+                task.demand_type,
                 DemandType::Normal,
                 "Should select from Normal class when Failure is empty"
             );
@@ -1136,11 +1136,11 @@ mod tests {
 
         // Should select from failure class now
         for _ in 0_i32..5_i32 {
-            let task = selector.get_next_task();
-            assert!(task.is_some(), "Should select from non-empty class");
+            let Some(task) = selector.get_next_task() else {
+                bail!("Should select from non-empty class");
+            };
             assert_eq!(
-                task.unwrap_or_else(|| create_task("", DemandType::Normal, 0))
-                    .demand_type,
+                task.demand_type,
                 DemandType::Failure,
                 "Should select from Failure class when Normal is empty"
             );
