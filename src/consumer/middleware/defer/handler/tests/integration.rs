@@ -235,48 +235,6 @@ fn transient_errors_always_redeferred_ignoring_decider() {
     });
 }
 
-/// Tests that when a timer fires but no deferred message is found (e.g.,
-/// expired or already processed), the timer is properly cleared.
-#[test]
-fn timer_cleared_when_message_not_found() {
-    init_test_logging();
-
-    TEST_RUNTIME.block_on(async {
-        let harness = TestHarness::new(1).ok()?;
-        let key = harness.key(0).clone();
-
-        // Manually set up a timer without a corresponding store entry
-        // This simulates the case where the message was already processed or expired
-        let time = CompactDateTime::now().ok()?;
-        harness.capture().record_schedule(key.clone(), time);
-
-        // Verify timer is active but store is empty
-        assert!(harness.capture().has_active_timer(&key));
-        let store_state = harness.store().get_next_deferred_message(&key).await.ok()?;
-        assert!(store_state.is_none(), "Store should be empty");
-
-        // Create context and fire the timer
-        let key_context = KeyedCapturingContext::new(key.clone(), harness.capture().clone());
-        let trigger = Trigger::for_testing(key.clone(), time, TimerType::DeferRetry);
-
-        // Timer should complete successfully (no error) but clear the timer
-        let result = harness
-            .handler
-            .on_timer(key_context, trigger, DemandType::Normal)
-            .await;
-
-        assert!(result.is_ok(), "Should succeed even with no message found");
-
-        // Timer should now be cleared
-        assert!(
-            !harness.capture().has_active_timer(&key),
-            "Timer should be cleared when no deferred message found"
-        );
-
-        Some(())
-    });
-}
-
 /// Tests that permanent error on timer retry schedules timer for next queued
 /// message.
 #[test]

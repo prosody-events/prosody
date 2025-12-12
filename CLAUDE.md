@@ -5,20 +5,24 @@ Development patterns and practices for Prosody: distributed Kafka consumer with 
 ## Critical Rules
 
 **Error Handling:**
-- Never use `expect`, `unwrap`, `panic`, `unwrap_or`, or `ok()` - forbidden by lints
+
+- Never use `expect`, `unwrap`, `panic`, or `ok()` - forbidden by lints
 - Propagate errors with `?` unless explicitly authorized to swallow
 - Use `thiserror` for structured errors; box only when Clippy warns
 
 **Code Quality:**
+
 - Clippy must pass for code and tests - zero warnings tolerated
 - Never suppress warnings with `#[allow(...)]` without permission
 - Run: `cargo clippy`, `cargo clippy --tests`, `cargo doc`, `cargo +nightly fmt`
 
 **Debugging Discipline:**
+
 - Never claim "found the issue" without rigorous proof
 - Evidence first (logs, tests, reproducible behavior) → hypothesis → test → verify
 
 **Style:**
+
 - Prefer `use` statements over fully qualified prefixes
 - Methods without `self` should be functions (except `new` and similar)
 - Ask before large structural changes
@@ -26,13 +30,16 @@ Development patterns and practices for Prosody: distributed Kafka consumer with 
 ## Code Organization
 
 **Order within files (topological by dependencies):**
+
 1. Constants → Statics → Types → Implementations → Functions → Errors (bottom)
 
 ```rust
 const MAX_RETRIES: usize = 3;
 static CONFIG: LazyLock<Config> = LazyLock::new(Config::default);
 
-pub struct Manager { /* ... */ }
+pub struct Manager {
+    /* ... */
+}
 impl Manager { /* ... */ }
 pub fn helper_fn() { /* ... */ }
 
@@ -75,7 +82,8 @@ tokio::select! {
 
 **Use `assert` or `color_eyre::Result` in tests - never `expect`/`unwrap`**
 
-**Integration tests:** When running slow integration tests, write output to a temp file rather than piping to `grep`, `head`, or `tail`. Re-running tests is expensive; keep output files around for exploration:
+**Integration tests:** When running slow integration tests, write output to a temp file rather than piping to `grep`,
+`head`, or `tail`. Re-running tests is expensive; keep output files around for exploration:
 
 ```bash
 # Good: preserve output for exploration
@@ -106,16 +114,19 @@ pub struct Configuration {
 ## Architecture
 
 **Consumer:** Hierarchical (Consumer → PartitionManager → KeyedManager)
+
 - Partition-level parallelism with per-key ordering
 - Cross-key concurrency, capacity-based backpressure
 
 **Timer System:** Slab-based time partitioning (TimerManager → Store + Scheduler + SlabLoader)
+
 - Persistent storage via `TriggerStore` trait (Cassandra/Memory)
 - In-memory scheduler with background preloading
 
 ## Cassandra
 
 **CRITICAL Anti-Patterns - NEVER USE:**
+
 1. **ALLOW FILTERING** - Full table scans destroy cluster
 2. **Secondary Indices** - Coordinator bottlenecks
 3. **Materialized Views** - Breaks under write load
@@ -127,14 +138,14 @@ pub struct Configuration {
 ```rust
 // Static columns return NULL for non-first clustering rows
 let stream = session
-    .execute_iter("SELECT slab_id FROM segments WHERE id = ?", (segment_id,))
-    .await?
-    .rows_stream::<(Option<i32>,)>()?;
+.execute_iter("SELECT slab_id FROM segments WHERE id = ?", (segment_id,))
+.await?
+.rows_stream::<(Option<i32>, ) > () ?;
 
 while let Some((slab_id_opt,)) = stream.try_next().await? {
-    if let Some(slab_id) = slab_id_opt {
-        yield slab_id;
-    }
+if let Some(slab_id) = slab_id_opt {
+yield slab_id;
+}
 }
 ```
 
@@ -152,7 +163,7 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
             .try_into()
             .unwrap_or(MAX_TTL),
     )
-    .filter(|&ttl| ttl < MAX_TTL)
+        .filter(|&ttl| ttl < MAX_TTL)
 }
 ```
 
@@ -173,11 +184,17 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 - Automatically use context7 for code generation and library documentation.
 
 ## Active Technologies
-- Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer middleware (001-simplified-prop-tests)
+
+- Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer
+  middleware (001-simplified-prop-tests)
 - N/A (tests use `MemoryDeferStore`) (001-simplified-prop-tests)
-- Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6, tokio, parking_lo (001-simplified-prop-tests)
-- Rust Edition 2024 (stable) + scylla-rust-driver, tokio, scc, parking_lot, uuid, thiserror (002-segment-based-defer-schema)
+- Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6, tokio, parking_lo (
+  001-simplified-prop-tests)
+- Rust Edition 2024 (stable) + scylla-rust-driver, tokio, scc, parking_lot, uuid, thiserror (
+  002-segment-based-defer-schema)
 - Apache Cassandra (via scylla driver) (002-segment-based-defer-schema)
 
 ## Recent Changes
-- 001-simplified-prop-tests: Added Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer middleware
+
+- 001-simplified-prop-tests: Added Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (
+  dev-dependencies), existing defer middleware

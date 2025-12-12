@@ -153,13 +153,13 @@ fn prop_retry_increment(trace: Trace) -> TestResult {
     })
 }
 
-/// Property: Loader transient does NOT increment retry count.
+/// Property: Loader transient increments retry count.
 ///
 /// **Invariant**: After a `TimerOutcome::LoaderTransient`, the retry count
-/// remains unchanged. This is critical: loader failures are infrastructure
-/// issues, not business logic failures, so they shouldn't affect backoff.
+/// increases by exactly 1. All transient failures (handler or loader) should
+/// affect backoff to prevent retry storms against flaky infrastructure.
 #[quickcheck]
-fn prop_loader_transient_no_retry_increment(trace: Trace) -> TestResult {
+fn prop_loader_transient_increments_retry(trace: Trace) -> TestResult {
     init_test_logging();
     let Trace { events, key_count } = trace;
 
@@ -183,13 +183,13 @@ fn prop_loader_transient_no_retry_increment(trace: Trace) -> TestResult {
                 // Get retry count after
                 let after = harness.get_retry_count(timer.key_idx).await.ok().flatten();
 
-                // Verify NO increment - retry count should be unchanged
-                let expected = before.unwrap_or(0);
+                // Verify increment - retry count should increase by 1
+                let expected = before.unwrap_or(0) + 1;
                 let actual = after.unwrap_or(0);
 
                 if actual != expected {
                     return TestResult::error(format!(
-                        "LoaderTransient retry violation: expected {expected} (unchanged), got \
+                        "LoaderTransient retry violation: expected {expected} (incremented), got \
                          {actual}"
                     ));
                 }
