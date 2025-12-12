@@ -12,7 +12,6 @@ use crate::consumer::DemandType;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::handler::tests::context::KeyedCapturingContext;
 use crate::consumer::middleware::defer::store::DeferStore;
-use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;

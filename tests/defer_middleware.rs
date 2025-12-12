@@ -48,7 +48,7 @@ use thiserror::Error;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
-use tracing::{error, info};
+use tracing::info;
 use uuid::Uuid;
 
 /// Shared runtime for integration tests.

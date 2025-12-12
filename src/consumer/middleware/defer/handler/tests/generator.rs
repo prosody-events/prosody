@@ -176,14 +176,17 @@ impl TraceBuilder {
                 }
             }
             TimerOutcomeType::LoaderTransient => {
-                // DON'T increment retry_count - use current for backoff
-                let current_retry_count = self
-                    .retry_counts
-                    .get(&(key_idx, offset))
-                    .copied()
-                    .unwrap_or(0);
+                // Increment retry count first - same as handler behavior
+                // (loader transient failures also increment to prevent retry storms)
+                let new_retry_count =
+                    if let Some(count) = self.retry_counts.get_mut(&(key_idx, offset)) {
+                        *count += 1;
+                        *count
+                    } else {
+                        0
+                    };
                 TimerOutcome::LoaderTransient {
-                    max_backoff: expected_max_backoff(current_retry_count),
+                    max_backoff: expected_max_backoff(new_retry_count),
                 }
             }
         };
