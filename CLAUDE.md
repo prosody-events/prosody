@@ -27,6 +27,11 @@ Development patterns and practices for Prosody: distributed Kafka consumer with 
 - Methods without `self` should be functions (except `new` and similar)
 - Ask before large structural changes
 
+**Git:**
+
+- Never add self-attribution to commits, PR descriptions, or code comments
+- Use conventional commits (e.g., `fix:`, `feat:`, `docs:`, `refactor:`)
+
 ## Code Organization
 
 **Order within files (topological by dependencies):**
