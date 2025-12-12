@@ -289,8 +289,19 @@ impl Selector {
         // Select based on class scores with fallback
         let selected_index = match (normal_best, failure_best) {
             (Some((n, ..)), Some((f, ..))) => {
-                let normal_score = self.success_time.at(now).as_secs_f64() / self.normal_weight;
-                let failure_score = self.failure_time.at(now).as_secs_f64() / self.failure_weight;
+                // Guard against division by zero when weight is 0.0 (class disabled).
+                // A zero-weight class gets infinite score, so it's never selected
+                // when the other class has pending tasks.
+                let normal_score = if self.normal_weight == 0.0_f64 {
+                    f64::INFINITY
+                } else {
+                    self.success_time.at(now).as_secs_f64() / self.normal_weight
+                };
+                let failure_score = if self.failure_weight == 0.0_f64 {
+                    f64::INFINITY
+                } else {
+                    self.failure_time.at(now).as_secs_f64() / self.failure_weight
+                };
                 if normal_score <= failure_score { n } else { f }
             }
             (Some((n, ..)), None) => n,

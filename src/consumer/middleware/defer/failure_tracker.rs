@@ -201,7 +201,7 @@ fn update_failure_rate(
     let total = failure_count + successes.len();
 
     let rate = if total == 0 {
-        0.0
+        0.0_f64
     } else {
         failure_count as f64 / total as f64
     };
