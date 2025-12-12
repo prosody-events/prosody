@@ -260,8 +260,11 @@ fn prop_backoff_bounds(trace: Trace) -> TestResult {
                     }
 
                     // Scheduled time must be <= before_time + max_backoff
-                    // Add small tolerance (1 second) for timing variance
-                    let tolerance = CompactDuration::new(1);
+                    // Add tolerance for timing variance:
+                    // - 1 second for potential clock drift between before_time capture and now()
+                    //   inside next_retry_time()
+                    // - 1 second for CompactDateTime's second-level granularity rounding
+                    let tolerance = CompactDuration::new(2);
                     let total_backoff = max_backoff + tolerance; // saturating add
                     let Ok(max_allowed) = before_time.add_duration(total_backoff) else {
                         continue; // Skip if time overflows
