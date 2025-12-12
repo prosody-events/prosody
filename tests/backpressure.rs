@@ -6,11 +6,14 @@
 
 use crate::common::SlowTestHandler;
 use color_eyre::eyre::Result;
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
 };
 use serde_json::json;
 use tokio::spawn;
@@ -32,14 +35,14 @@ mod common;
 #[tokio::test]
 async fn test_backpressure() -> Result<()> {
     // Initialize the logger.
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique topic for the test
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Setup an admin client to manage the topic creation
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()
@@ -62,10 +65,11 @@ async fn test_backpressure() -> Result<()> {
         .build()?;
 
     let slow_handler = SlowTestHandler { messages_tx };
-    let consumer = ProsodyConsumer::new::<SlowTestHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        slow_handler,
+        CloneProvider::new(slow_handler),
+        Telemetry::new(),
     )
     .await?;
 

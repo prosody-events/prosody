@@ -8,12 +8,16 @@
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::consumer::event_context::EventContext;
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::message::UncommittedMessage,
-    consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
+    consumer::middleware::CloneProvider,
+    consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
+    timers::TimerType,
     timers::UncommittedTimer,
     timers::datetime::CompactDateTime,
     timers::duration::CompactDuration,
@@ -52,7 +56,7 @@ struct MessageEvent {
 }
 
 impl EventHandler for TimerTestHandler {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage, _demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -85,7 +89,10 @@ impl EventHandler for TimerTestHandler {
                     {
                         // Absolute time scheduling
                         let schedule_time = CompactDateTime::from(target_time_secs as u32);
-                        if let Err(e) = context.schedule(schedule_time).await {
+                        if let Err(e) = context
+                            .schedule(schedule_time, TimerType::Application)
+                            .await
+                        {
                             error!("Failed to schedule timer for key {key}: {e}");
                         } else {
                             info!("Scheduled timer for key {key} at time {schedule_time}");
@@ -98,7 +105,10 @@ impl EventHandler for TimerTestHandler {
                         let delay = CompactDuration::new(delay_secs as u32);
                         match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
                             Ok(schedule_time) => {
-                                if let Err(e) = context.schedule(schedule_time).await {
+                                if let Err(e) = context
+                                    .schedule(schedule_time, TimerType::Application)
+                                    .await
+                                {
                                     error!("Failed to schedule timer for key {key}: {e}");
                                 } else {
                                     info!("Scheduled timer for key {key} at time {schedule_time}");
@@ -112,7 +122,7 @@ impl EventHandler for TimerTestHandler {
                 }
                 "cancel_timer" => {
                     // Clear all scheduled timers for this key
-                    if let Err(e) = context.clear_scheduled().await {
+                    if let Err(e) = context.clear_scheduled(TimerType::Application).await {
                         error!("Failed to cancel timers for key {key}: {e}");
                     } else {
                         info!("Canceled all timers for key {key}");
@@ -127,7 +137,7 @@ impl EventHandler for TimerTestHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<C, U>(&self, _context: C, timer: U)
+    async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -157,7 +167,7 @@ impl EventHandler for TimerTestHandler {
 /// Test environment that encapsulates common setup and provides helper methods
 struct TestEnvironment {
     topic: Topic,
-    admin_client: ProsodyAdminClient,
+    admin_client: &'static ProsodyAdminClient,
     consumer: ProsodyConsumer,
     producer: ProsodyProducer,
     timer_rx: Receiver<TimerEvent>,
@@ -169,7 +179,8 @@ impl TestEnvironment {
     async fn new(test_name: &str) -> Result<Self> {
         let topic: Topic = format!("{}-{}", test_name, Uuid::new_v4()).as_str().into();
         let bootstrap = vec!["localhost:9094".to_owned()];
-        let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+        let admin_client =
+            ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
         admin_client
             .create_topic(
                 &TopicConfiguration::builder()
@@ -189,6 +200,7 @@ impl TestEnvironment {
             timer_tx,
             message_tx,
         };
+        let handler_provider = CloneProvider::new(handler);
 
         let group_id = format!("{}-consumer-{}", test_name, Uuid::new_v4());
         let consumer_config = ConsumerConfiguration::builder()
@@ -201,7 +213,8 @@ impl TestEnvironment {
         let consumer = ProsodyConsumer::new(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
-            handler,
+            handler_provider,
+            Telemetry::new(),
         )
         .await?;
 
@@ -433,7 +446,7 @@ where
     F: FnOnce(TestEnvironment) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    common::init_test_logging()?;
+    init_test_logging();
 
     let result = timeout(Duration::from_secs(timeout_secs), async {
         let env = TestEnvironment::new(test_name).await?;

@@ -41,15 +41,18 @@ use color_eyre::eyre::{Result, eyre};
 use prosody::consumer::Uncommitted;
 use prosody::consumer::event_context::EventContext;
 use prosody::timers::UncommittedTimer;
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::ConsumerConfiguration,
-    consumer::EventHandler,
     consumer::ProsodyConsumer,
     consumer::message::UncommittedMessage,
+    consumer::middleware::CloneProvider,
+    consumer::{DemandType, EventHandler},
     producer::ProducerConfiguration,
     producer::ProsodyProducer,
+    telemetry::Telemetry,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
@@ -79,8 +82,12 @@ struct ConcurrencyTestHandler {
 }
 
 impl EventHandler for ConcurrencyTestHandler {
-    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
-    where
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         // Increment the current processing count and update maximum observed
@@ -107,7 +114,7 @@ impl EventHandler for ConcurrencyTestHandler {
         }
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -162,13 +169,13 @@ async fn produce_messages(
 #[tokio::test]
 async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     // Initialize logging
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a topic with 3 partitions
     let partitions = 3_u16;
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()
@@ -184,12 +191,12 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     let total_messages = 30;
     let num_keys = 30;
 
-    // Configure the consumer with the global concurrency limit
+    // Configure the consumer (concurrency limit will be set via environment
+    // variable)
     let consumer_config = ConsumerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
         .group_id("test-global-concurrency-consumer-multi")
         .subscribed_topics(&[topic.to_string()])
-        .max_concurrency(global_limit)
         .build()?;
 
     // Create a watch channel for controlling message handlers
@@ -206,10 +213,11 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     };
 
     // Create the consumer with the test handler
-    let consumer: ProsodyConsumer = ProsodyConsumer::new::<ConcurrencyTestHandler>(
+    let consumer: ProsodyConsumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        handler.clone(),
+        CloneProvider::new(handler.clone()),
+        Telemetry::new(),
     )
     .await?;
 

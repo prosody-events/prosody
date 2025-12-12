@@ -4,8 +4,11 @@
 use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
-use crate::consumer::{EventContext, EventHandler, Uncommitted};
-use crate::timers::store::memory::InMemoryTriggerStore;
+use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
+use crate::timers::UncommittedTimer;
+use crate::timers::store::adapter::TableAdapter;
+use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
@@ -25,7 +28,7 @@ trait HasProcessedOffsets {
 }
 
 /// Returns a default `PartitionConfiguration` with sensible defaults.
-fn default_config() -> PartitionConfiguration<InMemoryTriggerStore> {
+fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>> {
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
         buffer_size: 10,
@@ -36,14 +39,15 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStore> {
         shutdown_timeout: Duration::from_secs(1),
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
-        global_limit: Arc::new(Semaphore::new(10)),
-        trigger_store: InMemoryTriggerStore::new(),
+        trigger_store: memory_store(),
         timer_slab_size: CompactDuration::new(30),
     }
 }
 
 #[tokio::test]
 async fn test_partition_manager_capacity() {
+    init_test_logging();
+
     let handler = TestHandler::new();
     let mut config = default_config();
     config.buffer_size = 5;
@@ -70,6 +74,8 @@ async fn test_partition_manager_capacity() {
 
 #[tokio::test]
 async fn test_partition_manager_ordering() {
+    init_test_logging();
+
     let handler = TestHandler::new();
     let mut config = default_config();
     config.max_enqueued_per_key = 2;
@@ -102,6 +108,8 @@ async fn test_partition_manager_ordering() {
 
 #[tokio::test]
 async fn test_partition_manager_concurrent_processing() {
+    init_test_logging();
+
     let handler = TestHandler::new();
     let config = default_config();
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
@@ -133,6 +141,8 @@ async fn test_partition_manager_concurrent_processing() {
 
 #[tokio::test]
 async fn test_partition_manager_watermark() {
+    init_test_logging();
+
     let handler = TestHandler::new();
     let config = default_config();
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
@@ -160,11 +170,12 @@ async fn test_partition_manager_watermark() {
 
 #[tokio::test]
 async fn test_partition_manager_max_uncommitted() {
+    init_test_logging();
+
     let handler = TestHandler::new();
     let max_uncommitted = 5;
     let mut config = default_config();
     config.max_uncommitted = max_uncommitted;
-    config.global_limit = Arc::new(Semaphore::new(max_uncommitted));
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send more messages than max_uncommitted
@@ -207,6 +218,7 @@ async fn test_partition_manager_is_stalled() {
             &self,
             _context: C,
             message: UncommittedMessage,
+            _demand_type: DemandType,
         ) -> impl Future<Output = ()> + Send
         where
             C: EventContext,
@@ -225,7 +237,7 @@ async fn test_partition_manager_is_stalled() {
             }
         }
 
-        async fn on_timer<C, U>(&self, _context: C, _timer: U)
+        async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
         where
             C: EventContext,
             U: UncommittedTimer,
@@ -245,6 +257,8 @@ async fn test_partition_manager_is_stalled() {
             &self.notify
         }
     }
+
+    init_test_logging();
 
     let handler = StallTestHandler::new();
     let mut config = default_config();
@@ -281,6 +295,8 @@ async fn test_partition_manager_is_stalled() {
 
 #[tokio::test]
 async fn test_partition_manager_event_type_filtering() {
+    init_test_logging();
+
     let handler = TestHandler::new();
     let mut config = default_config();
     // Only allow events whose "type" field contains "allowed"
@@ -304,7 +320,7 @@ async fn test_partition_manager_event_type_filtering() {
         "key".into(),
         Utc::now(),
         json!({ "type": "disallowed" }),
-        Span::none(),
+        Span::current(),
         test_semaphore
             .clone()
             .try_acquire_owned()
@@ -321,7 +337,7 @@ async fn test_partition_manager_event_type_filtering() {
         "key".into(),
         Utc::now(),
         json!({ "type": "allowed" }),
-        Span::none(),
+        Span::current(),
         test_semaphore
             .clone()
             .try_acquire_owned()
@@ -346,6 +362,8 @@ async fn test_partition_manager_event_type_filtering() {
 
 #[tokio::test]
 async fn test_partition_manager_deduplication() {
+    init_test_logging();
+
     let handler = TestHandler::new();
     let mut config = default_config();
     config.idempotence_cache_size = 100;
@@ -462,6 +480,7 @@ impl EventHandler for TestHandler {
         &self,
         _context: C,
         message: UncommittedMessage,
+        _demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
         C: EventContext,
@@ -495,7 +514,7 @@ impl EventHandler for TestHandler {
         }
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -517,7 +536,7 @@ fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
         key.into(),
         Utc::now(),
         serde_json::json!({}),
-        Span::none(),
+        Span::current(),
         semaphore
             .try_acquire_owned()
             .expect("Failed to acquire permit"),
@@ -543,7 +562,7 @@ fn create_test_message_with_event_id(
         key.into(),
         Utc::now(),
         payload,
-        Span::none(),
+        Span::current(),
         semaphore
             .try_acquire_owned()
             .expect("Failed to acquire permit"),
@@ -552,6 +571,8 @@ fn create_test_message_with_event_id(
 
 #[tokio::test]
 async fn test_partition_manager_timer_heartbeat_integration() {
+    init_test_logging();
+
     // Test verifies that timer heartbeats are properly integrated into partition
     // stall detection
     let handler = TestHandler::new();

@@ -8,9 +8,12 @@ use eyre::Result;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::UncommittedMessage;
-use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+use prosody::consumer::middleware::CloneProvider;
+use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::telemetry::Telemetry;
 use prosody::timers::UncommittedTimer;
+use prosody::tracing::init_test_logging;
 use prosody::{Payload, Topic};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -27,7 +30,7 @@ struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage)
+    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage, _demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -38,7 +41,7 @@ impl EventHandler for TestHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -257,12 +260,12 @@ async fn case_return_to_original_id(
 #[tokio::test]
 async fn test_producer_deduplication() -> Result<()> {
     // Initialize tracing for easier debugging
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Setup test environment with Kafka broker
     let brokers = vec!["localhost:9094".to_owned()];
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
-    let admin = ProsodyAdminClient::new(&AdminConfiguration::new(brokers.clone())?)?;
+    let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(brokers.clone())?)?;
     admin
         .create_topic(
             &TopicConfiguration::builder()
@@ -295,10 +298,11 @@ async fn test_producer_deduplication() -> Result<()> {
         let (tx, rx) = channel(16);
         let handler = TestHandler { tx };
         (
-            ProsodyConsumer::new::<TestHandler>(
+            ProsodyConsumer::new(
                 &cfg,
                 &common::create_cassandra_trigger_store_config(),
-                handler,
+                CloneProvider::new(handler),
+                Telemetry::new(),
             )
             .await?,
             rx,

@@ -1,261 +1,222 @@
 use crate::Key;
-use crate::propagator::new_propagator;
-use crate::timers::Trigger;
+use crate::cassandra::errors::CassandraStoreError;
+use crate::cassandra::{CassandraConfiguration, CassandraStore};
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::{CompactDuration, CompactDurationError};
+use crate::timers::duration::CompactDuration;
+use crate::timers::error::ParseError;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::queries::Queries;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use crate::util::{
-    from_duration_env_with_fallback, from_env_with_fallback, from_option_env, from_vec_env,
-};
+use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::{InvalidSegmentVersionError, Segment, SegmentId, SegmentVersion};
+use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
-use derive_builder::Builder;
-use educe::Educe;
 use futures::{Stream, TryStreamExt, pin_mut};
-use humantime::Duration;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
-use scylla::_macro_internal::{
-    CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
-    SerializeValue, TypeCheckError, WrittenCellProof,
-};
 use scylla::client::session::Session;
-use scylla::cluster::metadata::NativeType;
-use scylla::errors::{
-    ExecutionError, IntoRowsResultError, MaybeFirstRowError, NewSessionError, NextRowError,
-    PagerExecutionError, PrepareError, RowsError, UseKeyspaceError,
-};
+use scylla::serialize::row::SerializeRow;
+use scylla::statement::prepared::PreparedStatement;
 use std::collections::HashMap;
-use std::error;
-use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
-
 use thiserror::Error;
 use tokio::task::coop::cooperative;
-use tracing::{debug_span, info_span, instrument};
+use tracing::{error, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use validator::Validate;
 
-mod migrator;
 mod queries;
 
-/// Table name for storing segment metadata and slab IDs.
-pub const TABLE_SEGMENTS: &str = "timer_segments";
+/// V1 schema operations (internal, Cassandra-only).
+pub(crate) mod v1;
 
-/// Table name for storing timer triggers organized by time slabs.
-pub const TABLE_SLABS: &str = "timer_slabs";
+/// Migration utilities for V1→V2 and slab size changes (internal,
+/// Cassandra-only).
+pub(crate) mod migration;
 
-/// Table name for storing timer triggers indexed by key for efficient key-based
-/// lookups.
-pub const TABLE_KEYS: &str = "timer_keys";
-
-/// Table name for tracking applied database migrations.
-pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
-
-/// Table name for distributed migration locking.
-pub const TABLE_LOCKS: &str = "locks";
-
-/// Configuration for the Cassandra-based timer storage backend.
-#[derive(Builder, Clone, Educe, Validate)]
-#[educe(Debug)]
-pub struct CassandraConfiguration {
-    /// List of Cassandra contact nodes (hostnames or IPs).
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_NODES`
-    /// Default: None (must be specified)
-    ///
-    /// At least one Cassandra node must be provided to establish an initial
-    /// connection with the cluster. Multiple nodes improve failover behavior.
-    #[builder(default = "from_vec_env(\"PROSODY_CASSANDRA_NODES\")?", setter(into))]
-    #[validate(length(min = 1_u64))]
-    pub nodes: Vec<String>,
-
-    /// Keyspace to use for storing timer data.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_KEYSPACE`
-    /// Default: `"prosody"`
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_CASSANDRA_KEYSPACE\", \"prosody\".to_owned())?",
-        setter(into)
-    )]
-    #[validate(length(min = 1_u64))]
-    pub keyspace: String,
-
-    /// Preferred datacenter for query routing.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_DATACENTER`
-    /// Default: None
-    #[builder(
-        default = "from_option_env(\"PROSODY_CASSANDRA_DATACENTER\")?",
-        setter(into)
-    )]
-    pub datacenter: Option<String>,
-
-    /// Preferred rack identifier for topology-aware routing.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_RACK`
-    /// Default: None
-    #[builder(default = "from_option_env(\"PROSODY_CASSANDRA_RACK\")?", setter(into))]
-    pub rack: Option<String>,
-
-    /// Username for authenticating with Cassandra.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_USER`
-    /// Default: None
-    #[builder(default = "from_option_env(\"PROSODY_CASSANDRA_USER\")?", setter(into))]
-    pub user: Option<String>,
-
-    /// Password for authenticating with Cassandra.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_PASSWORD`
-    /// Default: None
-    #[builder(
-        default = "from_option_env(\"PROSODY_CASSANDRA_PASSWORD\")?",
-        setter(into)
-    )]
-    #[educe(Debug(ignore))]
-    pub password: Option<String>,
-
-    /// Retention period for failed/unprocessed timer data in Cassandra.
-    ///
-    /// This defines how long timer data remains available for timers that are
-    /// not successfully processed (aborted or failed). Successfully committed
-    /// timers are immediately deleted from storage and do not rely on this
-    /// retention period.
-    ///
-    /// The retention period is added to the timer's execution time to calculate
-    /// the Cassandra TTL, ensuring failed timers don't accumulate indefinitely.
-    ///
-    /// Structural metadata (e.g., segment definitions) may persist beyond this
-    /// period and is not subject to TTL-based eviction.
-    ///
-    /// Environment variable: `PROSODY_CASSANDRA_RETENTION`
-    /// Default: 30 days
-    #[builder(
-        default = "Duration::from(from_duration_env_with_fallback(\"PROSODY_CASSANDRA_RETENTION\", \
-        std::time::Duration::from_secs(30 * 24 * 60 * 60))?)",
-        setter(into)
-    )]
-    pub retention: Duration,
-}
-
-/// Cassandra-based implementation of [`TriggerStore`].
+/// Cassandra-based implementation of [`TriggerStore`](super::TriggerStore).
 ///
 /// Provides persistent storage for timer triggers using Apache Cassandra
 /// with automatic schema migration and optimized TTL management.
 #[derive(Clone, Debug)]
-pub struct CassandraTriggerStore(Arc<Inner>);
-
-#[derive(Debug)]
-struct Inner {
-    queries: Queries,
-    propagator: TextMapCompositePropagator,
-    base_ttl: CompactDuration,
+pub struct CassandraTriggerStore {
+    store: CassandraStore,
+    queries: Arc<Queries>,
+    slab_size: CompactDuration,
 }
 
 impl CassandraTriggerStore {
-    /// Creates a new Cassandra trigger store with the given configuration.
+    /// Creates a new Cassandra trigger store using an existing
+    /// `CassandraStore`.
     ///
-    /// Initializes the connection to Cassandra, runs schema migrations,
-    /// and prepares all required queries.
+    /// This allows sharing a single Cassandra session across multiple stores
+    /// (e.g., trigger store and defer store), avoiding the creation of multiple
+    /// sessions which is not allowed.
     ///
     /// # Arguments
     ///
-    /// * `config` - Cassandra connection and TTL configuration
+    /// * `store` - Existing `CassandraStore` to share
+    /// * `keyspace` - Cassandra keyspace name for query preparation
+    /// * `slab_size` - Target slab size for automatic migration
     ///
     /// # Errors
     ///
-    /// Returns [`CassandraTriggerStoreError`] if:
-    /// - Connection to Cassandra fails
-    /// - Schema migration fails
-    /// - Query preparation fails
-    pub async fn new(config: &CassandraConfiguration) -> Result<Self, CassandraTriggerStoreError> {
-        let base_ttl: StdDuration = config.retention.into();
-        let base_ttl = base_ttl.try_into()?;
+    /// Returns error if query preparation fails.
+    pub async fn with_store(
+        store: CassandraStore,
+        keyspace: &str,
+        slab_size: CompactDuration,
+    ) -> Result<Self, CassandraTriggerStoreError> {
+        let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
-        Ok(Self(Arc::new(Inner {
-            queries: Box::pin(Queries::new(config.clone())).await?,
-            propagator: new_propagator(),
-            base_ttl,
-        })))
+        Ok(Self {
+            store,
+            queries,
+            slab_size,
+        })
     }
 
     fn session(&self) -> &Session {
-        &self.0.queries.session
+        self.store.session()
     }
 
     fn queries(&self) -> &Queries {
-        &self.0.queries
+        &self.queries
     }
 
     fn propagator(&self) -> &TextMapCompositePropagator {
-        &self.0.propagator
-    }
-
-    fn base_ttl(&self) -> CompactDuration {
-        self.0.base_ttl
+        self.store.propagator()
     }
 
     fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
-        const MAX_TTL: i32 = 630_720_000;
+        self.store.calculate_ttl(time)
+    }
 
-        let Ok(duration) = time.compact_duration_from_now() else {
-            // Return the base TTL if the time is in the past
-            return self.base_ttl().seconds().try_into().ok();
+    /// Helper to execute a query conditionally based on TTL.
+    ///
+    /// Executes `query_with_ttl` if TTL is available, otherwise executes
+    /// `query_no_ttl`. The `params_with_ttl` builder receives the TTL value.
+    async fn execute_with_optional_ttl<P1, P2>(
+        &self,
+        time: CompactDateTime,
+        query_with_ttl: &PreparedStatement,
+        query_no_ttl: &PreparedStatement,
+        params_with_ttl: impl FnOnce(i32) -> P1,
+        params_no_ttl: impl FnOnce() -> P2,
+    ) -> Result<(), CassandraTriggerStoreError>
+    where
+        P1: SerializeRow,
+        P2: SerializeRow,
+    {
+        match self.calculate_ttl(time) {
+            Some(ttl) => {
+                self.session()
+                    .execute_unpaged(query_with_ttl, params_with_ttl(ttl))
+                    .await
+                    .map_err(CassandraStoreError::from)?;
+            }
+            None => {
+                self.session()
+                    .execute_unpaged(query_no_ttl, params_no_ttl())
+                    .await
+                    .map_err(CassandraStoreError::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates V1 operations on-demand for migration support.
+    ///
+    /// This method constructs a `V1Operations` instance that provides access
+    /// to V1 schema operations (reading/writing data without `timer_type`).
+    /// Only used during V1→V2 migration.
+    pub(crate) fn v1(&self) -> v1::V1Operations {
+        v1::V1Operations::new(self.store.clone(), Arc::clone(&self.queries))
+    }
+
+    /// Reads a segment from the database without applying any migrations.
+    ///
+    /// This is an internal helper used during migration to reload segments
+    /// after version or slab size updates, avoiding infinite recursion.
+    async fn get_segment_unchecked(
+        &self,
+        segment_id: &SegmentId,
+    ) -> Result<Option<Segment>, CassandraTriggerStoreError> {
+        let row = self
+            .session()
+            .execute_unpaged(&self.queries().get_segment, (segment_id,))
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<(String, CompactDuration, Option<i8>)>()
+            .map_err(CassandraStoreError::from)?;
+
+        let Some((name, slab_size, version)) = row else {
+            return Ok(None);
         };
 
-        duration
-            .checked_add(self.base_ttl())
-            .ok()?
-            .seconds()
-            .try_into()
-            .ok()
-            .filter(|&ttl| ttl < MAX_TTL)
+        let version = version
+            .map(SegmentVersion::try_from)
+            .transpose()?
+            .unwrap_or(SegmentVersion::V1);
+
+        Ok(Some(Segment {
+            id: *segment_id,
+            name,
+            slab_size,
+            version,
+        }))
     }
 }
 
-impl TriggerStore for CassandraTriggerStore {
+impl TriggerOperations for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
 
     #[instrument(level = "debug", skip(self), err)]
     async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
+        // Validate that the segment's slab_size matches the configured slab_size
+        if segment.slab_size != self.slab_size {
+            return Err(CassandraTriggerStoreError::SlabSizeMismatch {
+                segment_id: segment.id,
+                segment_slab_size: segment.slab_size,
+                configured_slab_size: self.slab_size,
+            });
+        }
+
         self.session()
             .execute_unpaged(
                 &self.queries().insert_segment,
-                (segment.id, segment.name, segment.slab_size),
+                (
+                    segment.id,
+                    segment.name,
+                    segment.slab_size,
+                    i8::from(segment.version),
+                ),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
 
     #[instrument(level = "debug", skip(self), err)]
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
-        let row = self
-            .session()
-            .execute_unpaged(&self.queries().get_segment, (segment_id,))
-            .await?
-            .into_rows_result()?
-            .maybe_first_row::<(String, CompactDuration)>()?;
-
-        let Some((name, slab_size)) = row else {
+        let Some(segment) = self.get_segment_unchecked(segment_id).await? else {
             return Ok(None);
         };
 
-        Ok(Some(Segment {
-            id: *segment_id,
-            name,
-            slab_size,
-        }))
+        let segment = migration::migrate_segment_if_needed(self, segment, self.slab_size).await?;
+
+        Ok(Some(segment))
     }
 
     #[instrument(level = "debug", skip(self), err)]
     async fn delete_segment(&self, segment_id: &SegmentId) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(&self.queries().delete_segment, (segment_id,))
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -269,11 +230,16 @@ impl TriggerStore for CassandraTriggerStore {
             let stream = self
                 .session()
                 .execute_iter(self.queries().get_slabs.clone(), (segment_id,))
-                .await?
-                .rows_stream::<(Option<i32>,)>()?;
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(Option<i32>,)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((value,)) = cooperative(stream.try_next()).await? {
+            while let Some((value,)) = cooperative(stream.try_next())
+                .await
+                .map_err(CassandraStoreError::from)?
+            {
                 let Some(value) = value else {
                     continue;
                 };
@@ -331,11 +297,16 @@ impl TriggerStore for CassandraTriggerStore {
                         self.queries().get_slab_range.clone(),
                         (segment_id, start, i32::MAX),
                     )
-                    .await?
-                    .rows_stream::<(Option<i32>,)>()?;
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .rows_stream::<(Option<i32>,)>()
+                    .map_err(CassandraStoreError::from)?;
 
                 pin_mut!(stream1);
-                while let Some((value,)) = cooperative(stream1.try_next()).await? {
+                while let Some((value,)) = cooperative(stream1.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                {
                     let Some(value) = value else {
                         continue;
                     };
@@ -351,11 +322,16 @@ impl TriggerStore for CassandraTriggerStore {
                         self.queries().get_slab_range.clone(),
                         (segment_id, i32::MIN, end),
                     )
-                    .await?
-                    .rows_stream::<(Option<i32>,)>()?;
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .rows_stream::<(Option<i32>,)>()
+                    .map_err(CassandraStoreError::from)?;
 
                 pin_mut!(stream2);
-                while let Some((value,)) = cooperative(stream2.try_next()).await? {
+                while let Some((value,)) = cooperative(stream2.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                {
                     let Some(value) = value else {
                         continue;
                     };
@@ -371,11 +347,16 @@ impl TriggerStore for CassandraTriggerStore {
                         self.queries().get_slab_range.clone(),
                         (segment_id, start, end),
                     )
-                    .await?
-                    .rows_stream::<(Option<i32>,)>()?;
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .rows_stream::<(Option<i32>,)>()
+                    .map_err(CassandraStoreError::from)?;
 
                 pin_mut!(stream);
-                while let Some((value,)) = cooperative(stream.try_next()).await? {
+                while let Some((value,)) = cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                {
                     let Some(value) = value else {
                         continue;
                     };
@@ -390,20 +371,14 @@ impl TriggerStore for CassandraTriggerStore {
     async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
-        match self.calculate_ttl(slab.range().end) {
-            Some(ttl) => {
-                self.session()
-                    .execute_unpaged(&self.queries().insert_slab, (segment_id, slab_id, ttl))
-                    .await?;
-            }
-            None => {
-                self.session()
-                    .execute_unpaged(&self.queries().insert_slab_no_ttl, (segment_id, slab_id))
-                    .await?;
-            }
-        }
-
-        Ok(())
+        self.execute_with_optional_ttl(
+            slab.range().end,
+            &self.queries().insert_slab,
+            &self.queries().insert_slab_no_ttl,
+            |ttl| (segment_id, slab_id, ttl),
+            || (segment_id, slab_id),
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -417,7 +392,8 @@ impl TriggerStore for CassandraTriggerStore {
                 &self.queries().delete_slab,
                 (segment_id, i32::from_le_bytes(slab_id.to_le_bytes())),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -426,24 +402,75 @@ impl TriggerStore for CassandraTriggerStore {
     fn get_slab_triggers(
         &self,
         slab: &Slab,
+        timer_type: TimerType,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let segment_id = slab.segment_id();
+        let slab_size = slab.size().seconds() as i32;
+        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
+        let timer_type_i8 = i8::from(timer_type);
+
+        try_stream! {
+            let stream = self
+                .session()
+                .execute_iter(
+                    self.queries().get_slab_triggers.clone(),
+                    (segment_id, slab_size, slab_id, timer_type_i8),
+                )
+                .await.map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>().map_err(CassandraStoreError::from)?;
+
+            pin_mut!(stream);
+            while let Some((key, time, timer_type_returned, span_map)) =
+                cooperative(stream.try_next()).await.map_err(CassandraStoreError::from)?
+            {
+                let context = self.propagator().extract(&span_map);
+                let span = info_span!("fetch_slab_trigger");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
+
+                let timer_type = TimerType::try_from(timer_type_returned)?;
+
+                yield Trigger::new(key.into(), time, timer_type, span);
+            }
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn get_slab_triggers_all_types(
+        &self,
+        slab: &Slab,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        let segment_id = slab.segment_id();
+        let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
         try_stream! {
             let stream = self
                 .session()
-                .execute_iter(self.queries().get_slab_triggers.clone(), (segment_id, slab_id))
-                .await?
-                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
+                .execute_iter(
+                    self.queries().get_slab_triggers_all_types.clone(),
+                    (segment_id, slab_size, slab_id),
+                )
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, timer_type_returned, span_map)) =
+                cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+            {
                 let context = self.propagator().extract(&span_map);
-                let span = info_span!("fetch_slab_trigger");
-                span.set_parent(context);
+                let span = info_span!("fetch_slab_trigger_all_types");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
 
-                yield Trigger::new(key.into(), time, span);
+                let timer_type = TimerType::try_from(timer_type_returned)?;
+                yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
     }
@@ -455,36 +482,35 @@ impl TriggerStore for CassandraTriggerStore {
         self.propagator().inject_context(&context, &mut span_map);
 
         let segment_id = slab.segment_id();
+        let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
-        let key = trigger.key.as_str();
+        let key = trigger.key.as_ref();
         let time = trigger.time;
+        let timer_type = i8::from(trigger.timer_type);
 
-        match self.calculate_ttl(slab.range().end) {
-            Some(ttl) => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().insert_slab_trigger,
-                        (segment_id, slab_id, key, time, span_map, ttl),
-                    )
-                    .await?;
-            }
-            None => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().insert_slab_trigger_no_ttl,
-                        (segment_id, slab_id, key, time, span_map),
-                    )
-                    .await?;
-            }
-        }
-
-        Ok(())
+        self.execute_with_optional_ttl(
+            slab.range().end,
+            &self.queries().insert_slab_trigger,
+            &self.queries().insert_slab_trigger_no_ttl,
+            |ttl| {
+                (
+                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, ttl,
+                )
+            },
+            || {
+                (
+                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map,
+                )
+            },
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip(self), err)]
     async fn delete_slab_trigger(
         &self,
         slab: &Slab,
+        timer_type: TimerType,
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
@@ -493,12 +519,15 @@ impl TriggerStore for CassandraTriggerStore {
                 &self.queries().delete_slab_trigger,
                 (
                     slab.segment_id(),
+                    slab.size().seconds() as i32,
                     i32::from_le_bytes(slab.id().to_le_bytes()),
-                    key.as_str(),
+                    i8::from(timer_type),
+                    key.as_ref(),
                     time,
                 ),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -510,10 +539,12 @@ impl TriggerStore for CassandraTriggerStore {
                 &self.queries().clear_slab_triggers,
                 (
                     slab.segment_id(),
+                    slab.size().seconds() as i32,
                     i32::from_le_bytes(slab.id().to_le_bytes()),
                 ),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -522,17 +553,26 @@ impl TriggerStore for CassandraTriggerStore {
     fn get_key_times(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
         try_stream! {
             let stream = self
                 .session()
-                .execute_iter(self.queries().get_key_times.clone(), (segment_id, key.as_str()))
-                .await?
-                .rows_stream::<(CompactDateTime,)>()?;
+                .execute_iter(
+                    self.queries().get_key_times.clone(),
+                    (segment_id, key.as_ref(), i8::from(timer_type)),
+                )
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(CompactDateTime,)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((time,)) = cooperative(stream.try_next()).await? {
+            while let Some((time,)) = cooperative(stream.try_next())
+                .await
+                .map_err(CassandraStoreError::from)?
+            {
                 yield time
             }
         }
@@ -542,22 +582,71 @@ impl TriggerStore for CassandraTriggerStore {
     fn get_key_triggers(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         try_stream! {
             let stream = self
                 .session()
-                .execute_iter(self.queries().get_key_triggers.clone(), (segment_id, key.as_str()))
-                .await?
-                .rows_stream::<(String, CompactDateTime, HashMap<String, String>)>()?;
+                .execute_iter(
+                    self.queries().get_key_triggers.clone(),
+                    (segment_id, key.as_ref(), i8::from(timer_type)),
+                )
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
+                .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((key, time, span_map)) = cooperative(stream.try_next()).await? {
+            while let Some((key, time, timer_type_returned, span_map)) =
+                cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+            {
                 let context = self.propagator().extract(&span_map);
-                let span = debug_span!("fetch_key_trigger");
-                span.set_parent(context);
+                let span = info_span!("fetch_key_trigger");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
 
-                yield Trigger::new(key.into(), time, span);
+                let timer_type = TimerType::try_from(timer_type_returned)?;
+                yield Trigger::new(key.into(), time, timer_type, span);
+            }
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn get_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        try_stream! {
+            let stream = self
+                .session()
+                .execute_iter(
+                    self.queries().get_key_triggers_all_types.clone(),
+                    (segment_id, key.as_ref()),
+                )
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
+                .map_err(CassandraStoreError::from)?;
+
+            pin_mut!(stream);
+            while let Some((key, time, timer_type_returned, span_map)) =
+                cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+            {
+                let context = self.propagator().extract(&span_map);
+                let span = info_span!("fetch_key_trigger_all_types");
+                if let Err(error) = span.set_parent(context) {
+                    error!("failed to set parent span: {error:#}");
+                }
+
+                let timer_type = TimerType::try_from(timer_type_returned)?;
+                yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
     }
@@ -572,44 +661,35 @@ impl TriggerStore for CassandraTriggerStore {
         let context = trigger.span.load().context();
         self.propagator().inject_context(&context, &mut span_map);
 
-        let key = trigger.key.as_str();
+        let key = trigger.key.as_ref();
         let time = trigger.time;
+        let timer_type = i8::from(trigger.timer_type);
 
-        match self.calculate_ttl(trigger.time) {
-            Some(ttl) => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().insert_key_trigger,
-                        (segment_id, key, time, span_map, ttl),
-                    )
-                    .await?;
-            }
-            None => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().insert_key_trigger_no_ttl,
-                        (segment_id, key, time, span_map),
-                    )
-                    .await?;
-            }
-        }
-
-        Ok(())
+        self.execute_with_optional_ttl(
+            trigger.time,
+            &self.queries().insert_key_trigger,
+            &self.queries().insert_key_trigger_no_ttl,
+            |ttl| (segment_id, key, timer_type, time, &span_map, ttl),
+            || (segment_id, key, timer_type, time, &span_map),
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip(self), err)]
     async fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(
                 &self.queries().delete_key_trigger,
-                (segment_id, key.as_str(), time),
+                (segment_id, key.as_ref(), i8::from(timer_type), time),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
@@ -618,213 +698,233 @@ impl TriggerStore for CassandraTriggerStore {
     async fn clear_key_triggers(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
     ) -> Result<(), Self::Error> {
         self.session()
             .execute_unpaged(
                 &self.queries().clear_key_triggers,
-                (segment_id, key.as_str()),
+                (segment_id, key.as_ref(), i8::from(timer_type)),
             )
-            .await?;
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn clear_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(
+                &self.queries().clear_key_triggers_all_types,
+                (segment_id, key.as_ref()),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        Ok(())
+    }
+
+    // -- V1 migration methods --
+
+    /// Updates the segment's version field after v1 to v2 migration.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn update_segment_version(
+        &self,
+        segment_id: &SegmentId,
+        new_version: SegmentVersion,
+        new_slab_size: CompactDuration,
+    ) -> Result<(), Self::Error> {
+        self.session()
+            .execute_unpaged(
+                &self.queries().update_segment_version,
+                (
+                    i8::from(new_version),
+                    new_slab_size.seconds() as i32,
+                    segment_id,
+                ),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
 
         Ok(())
     }
 }
 
-impl SerializeValue for CompactDuration {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i32::from(*self).serialize(typ, writer)
-    }
+/// Creates a new Cassandra trigger store.
+///
+/// Returns an implementation of `TriggerStore` backed by Apache Cassandra.
+/// This is the recommended way to create a Cassandra store.
+///
+/// # Arguments
+///
+/// * `config` - Cassandra connection and TTL configuration
+/// * `slab_size` - Target slab size for automatic migration
+///
+/// # Errors
+///
+/// Returns [`CassandraTriggerStoreError`] if:
+/// - Connection to Cassandra fails
+/// - Schema migration fails
+/// - Query preparation fails
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let config = CassandraConfiguration { ... };
+/// let slab_size = CompactDuration::new(3600);
+/// let store = cassandra_store(&config, slab_size).await?;
+/// let manager = TimerManager::new(..., store);
+/// ```
+pub async fn cassandra_store(
+    config: &CassandraConfiguration,
+    slab_size: CompactDuration,
+) -> Result<TableAdapter<CassandraTriggerStore>, CassandraTriggerStoreError> {
+    let store = CassandraStore::new(config).await?;
+    let cassandra = CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await?;
+    Ok(TableAdapter::new(cassandra))
 }
 
-impl SerializeValue for CompactDateTime {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i32::from(*self).serialize(typ, writer)
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDuration {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        match typ {
-            ColumnType::Native(NativeType::Int) => Ok(()),
-            _ => Err(TypeCheckError::new(InnerError::IntExpected)),
-        }
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        Ok(CompactDuration::from(i32::deserialize(typ, v)?))
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDateTime {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        match typ {
-            ColumnType::Native(NativeType::Int) => Ok(()),
-            _ => Err(TypeCheckError::new(InnerError::IntExpected)),
-        }
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        Ok(CompactDateTime::from(i32::deserialize(typ, v)?))
-    }
-}
-
-/// Internal error types for Cassandra operations.
+/// Errors that can occur during Cassandra trigger store operations.
 #[derive(Debug, Error)]
-pub enum InnerError {
-    /// Invalid duration
-    #[error(transparent)]
-    Duration(#[from] CompactDurationError),
+pub enum CassandraTriggerStoreError {
+    /// Database error
+    #[error("database error: {0:#}")]
+    Database(#[from] CassandraStoreError),
 
-    /// Failed to create Cassandra session.
-    #[error(transparent)]
-    Session(#[from] NewSessionError),
+    /// Invalid segment version value.
+    #[error("Invalid segment version: {0:#}")]
+    InvalidSegmentVersion(#[from] InvalidSegmentVersionError),
 
-    /// Schema migration failed.
-    #[error("migration failed: {0:#}")]
-    Migration(String),
+    /// Slab size mismatch during segment insertion.
+    #[error(
+        "Cannot insert segment {segment_id} with slab_size {segment_slab_size} that differs from \
+         configured slab_size {configured_slab_size}"
+    )]
+    SlabSizeMismatch {
+        /// The ID of the segment being inserted.
+        segment_id: SegmentId,
+        /// The slab size of the segment being inserted.
+        segment_slab_size: CompactDuration,
+        /// The configured slab size for this store.
+        configured_slab_size: CompactDuration,
+    },
 
-    /// Failed to set keyspace.
-    #[error("failed to set keyspace: {0:#}")]
-    UseKeyspace(#[from] UseKeyspaceError),
+    /// Segment disappeared during data migration.
+    #[error("Segment {segment_id} disappeared during {operation}")]
+    SegmentDisappeared {
+        /// The ID of the segment that disappeared.
+        segment_id: SegmentId,
+        /// The operation that was being performed when the segment disappeared.
+        operation: &'static str,
+    },
 
-    /// Failed to prepare statement.
-    #[error("failed to prepare statement: {0:#}")]
-    Prepare(#[from] PrepareError),
-
-    /// Failed to execute statement.
-    #[error("failed to execute statement: {0:#}")]
-    Execution(#[from] ExecutionError),
-
-    /// Invalid column type.
-    #[error("invalid type: {0:#}")]
-    TypeCheck(#[from] TypeCheckError),
-
-    /// Failed to retrieve the next row.
-    #[error("failed to retrieve the next row: {0:#}")]
-    NextRow(#[from] NextRowError),
-
-    /// Failed to retrieve the next page.
-    #[error("failed to retrieve the next page: {0:#}")]
-    PageExecution(#[from] PagerExecutionError),
-
-    /// Failed to retrieve the first row.
-    #[error("failed to retrieve the first row: {0:#}")]
-    MaybeFirstRow(#[from] MaybeFirstRowError),
-
-    /// Failed to get rows.
-    #[error("failed to get rows: {0:#}")]
-    IntoRows(#[from] IntoRowsResultError),
-
-    /// Rows error.
-    #[error("rows error: {0:#}")]
-    Rows(#[from] RowsError),
-
-    /// Expected integer type but got something else.
-    #[error("expected and integer type")]
-    IntExpected,
-
-    /// Segment not found in storage.
-    #[error("segment not found")]
-    SegmentNotFound,
-
-    /// Failed to calculate TTL duration.
-    #[error("failed to calculate TTL duration")]
-    TtlCalculationFailed,
-
-    /// TTL calculation overflow.
-    #[error("TTL calculation overflow")]
-    TtlOverflow,
+    /// Invalid timer type value in database.
+    #[error("Invalid timer type: {0:#}")]
+    Parse(#[from] ParseError),
 }
 
-/// Error type for Cassandra trigger store operations.
-pub struct CassandraTriggerStoreError(Box<InnerError>);
+impl ClassifyError for CassandraTriggerStoreError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Database(e) => e.classify_error(),
+            Self::InvalidSegmentVersion(e) => e.classify_error(),
 
-impl<E> From<E> for CassandraTriggerStoreError
-where
-    InnerError: From<E>,
-{
-    fn from(err: E) -> Self {
-        Self(Box::new(InnerError::from(err)))
+            // Attempting to insert segment with slab_size different from store's configured
+            // slab_size. Configuration mismatch that prevents ALL insertions of mismatched
+            // segments. Requires configuration or data fix.
+            Self::SlabSizeMismatch { .. } => ErrorCategory::Terminal,
+
+            // Segment disappeared during data migration, likely due to concurrent deletion or
+            // race condition. Retrying might succeed if segment reappears or operation completes.
+            Self::SegmentDisappeared { .. } => ErrorCategory::Transient,
+
+            Self::Parse(e) => e.classify_error(),
+        }
     }
 }
-
-impl Debug for CassandraTriggerStoreError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        Debug::fmt(&self.0, f)
-    }
-}
-
-impl Display for CassandraTriggerStoreError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        Display::fmt(&self.0, f)
-    }
-}
-
-impl error::Error for CassandraTriggerStoreError {}
 
 #[cfg(test)]
 mod test {
-    use super::{CassandraConfiguration, CassandraTriggerStore};
+    use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
+    use crate::cassandra::CassandraStore;
     use crate::timers::duration::CompactDuration;
     use crate::timers::slab::{Slab, SlabId};
-    use crate::timers::store::{Segment, SegmentId, TriggerStore};
+    use crate::timers::store::operations::TriggerOperations;
+    use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+    use crate::tracing::init_test_logging;
     use crate::trigger_store_tests;
     use color_eyre::Result;
+    use futures::TryStreamExt;
     use futures::pin_mut;
     use futures::stream::StreamExt;
     use std::collections::HashSet;
+    use std::env;
     use std::ops::RangeInclusive;
     use std::time::Duration;
     use uuid::Uuid;
 
-    // Run the full suite of TriggerStore compliance tests on this implementation.
-    trigger_store_tests!(
-        CassandraTriggerStore,
-        CassandraTriggerStore::new(&CassandraConfiguration {
+    /// Creates a test configuration for Cassandra integration tests.
+    fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
+        CassandraConfiguration {
             datacenter: None,
             rack: None,
             nodes: vec!["localhost:9042".to_owned()],
-            keyspace: "prosody".to_owned(),
+            keyspace: keyspace.to_owned(),
             user: None,
             password: None,
-            retention: Duration::from_secs(10 * 60).into(),
-        }),
-        25
+            retention: Duration::from_secs(10 * 60),
+        }
+    }
+
+    // Determine the number of tests to run from an environment variable,
+    // defaulting to 25 if the variable is not set or invalid.
+    // Uses INTEGRATION_TESTS since these tests hit a real Cassandra database.
+    fn get_test_count() -> u64 {
+        env::var("INTEGRATION_TESTS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(25)
+    }
+
+    // Run the full suite of TriggerStore compliance tests on this implementation.
+    // Low-level tests use CassandraTriggerStore directly
+    // High-level tests use TableAdapter<CassandraTriggerStore>
+    trigger_store_tests!(
+        CassandraTriggerStore,
+        |slab_size| async move {
+            let config = test_cassandra_config("prosody_test");
+            let store = CassandraStore::new(&config).await?;
+            CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await
+        },
+        crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
+        |slab_size| async move {
+            let config = test_cassandra_config("prosody_test");
+            cassandra_store(&config, slab_size).await
+        },
+        get_test_count()
     );
 
     #[tokio::test]
     async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
-        let store = CassandraTriggerStore::new(&CassandraConfiguration {
-            datacenter: None,
-            rack: None,
-            nodes: vec!["localhost:9042".to_owned()],
-            keyspace: "prosody_test".to_owned(),
-            user: None,
-            password: None,
-            retention: Duration::from_secs(10 * 60).into(),
-        })
-        .await?;
+        init_test_logging();
+
+        let slab_size = CompactDuration::new(60); // 1 minute slabs
+        let config = test_cassandra_config("prosody_test");
+        let cassandra_store = CassandraStore::new(&config).await?;
+        let store =
+            CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {
             id: segment_id,
             name: "test_segment".to_owned(),
-            slab_size: CompactDuration::new(60), // 1 minute slabs
+            slab_size,
+            version: SegmentVersion::V1,
         };
 
         // Insert the test segment
@@ -851,10 +951,8 @@ mod test {
         let cross_boundary_range = RangeInclusive::new(boundary - 1, boundary + 1);
         let result: HashSet<SlabId> = store
             .get_slab_range(&segment_id, cross_boundary_range)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<HashSet<_>, _>>()?;
+            .try_collect()
+            .await?;
 
         let expected: HashSet<SlabId> = vec![boundary - 1, boundary, boundary + 1]
             .into_iter()
@@ -865,10 +963,8 @@ mod test {
         let high_range = RangeInclusive::new(boundary, SlabId::MAX);
         let result: HashSet<SlabId> = store
             .get_slab_range(&segment_id, high_range)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<HashSet<_>, _>>()?;
+            .try_collect()
+            .await?;
 
         let expected: HashSet<SlabId> = vec![boundary, boundary + 1, SlabId::MAX - 1, SlabId::MAX]
             .into_iter()
@@ -879,10 +975,8 @@ mod test {
         let low_range = RangeInclusive::new(boundary - 2, boundary - 1);
         let result: HashSet<SlabId> = store
             .get_slab_range(&segment_id, low_range)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<HashSet<_>, _>>()?;
+            .try_collect()
+            .await?;
 
         let expected: HashSet<SlabId> = vec![boundary - 2, boundary - 1].into_iter().collect();
         assert_eq!(result, expected, "Low range (positive i32) failed");
@@ -902,10 +996,8 @@ mod test {
         let invalid_range = RangeInclusive::new(SlabId::MAX - 1, boundary - 2);
         let result: HashSet<SlabId> = store
             .get_slab_range(&segment_id, invalid_range)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<HashSet<_>, _>>()?;
+            .try_collect()
+            .await?;
 
         let expected: HashSet<SlabId> = HashSet::new();
         assert_eq!(result, expected, "Invalid range should return empty set");
@@ -918,22 +1010,20 @@ mod test {
 
     #[tokio::test]
     async fn test_simple_wrap_around() -> Result<()> {
-        let store = CassandraTriggerStore::new(&CassandraConfiguration {
-            datacenter: None,
-            rack: None,
-            nodes: vec!["localhost:9042".to_owned()],
-            keyspace: "prosody_test_simple".to_owned(),
-            user: None,
-            password: None,
-            retention: Duration::from_secs(10 * 60).into(),
-        })
-        .await?;
+        init_test_logging();
+
+        let slab_size = CompactDuration::new(60);
+        let config = test_cassandra_config("prosody_test");
+        let cassandra_store = CassandraStore::new(&config).await?;
+        let store =
+            CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
 
         let segment_id = SegmentId::from(Uuid::new_v4());
         let segment = Segment {
             id: segment_id,
             name: "simple_test".to_owned(),
-            slab_size: CompactDuration::new(60),
+            slab_size,
+            version: SegmentVersion::V1,
         };
 
         store.insert_segment(segment.clone()).await?;

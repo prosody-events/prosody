@@ -4,11 +4,14 @@
 
 use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
 };
 use serde_json::json;
 use tokio::sync::mpsc::channel;
@@ -29,14 +32,14 @@ mod common;
 #[tokio::test]
 async fn test_allowed_events_filtering() -> Result<()> {
     // Initialize logging
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique topic to isolate the test environment
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
 
     // Create a Kafka topic using the admin client for testing
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()
@@ -66,10 +69,11 @@ async fn test_allowed_events_filtering() -> Result<()> {
     let (messages_tx, mut messages_rx) = channel(10);
 
     // Initialize consumer and producer
-    let consumer = ProsodyConsumer::new::<TestHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        TestHandler { messages_tx },
+        CloneProvider::new(TestHandler { messages_tx }),
+        Telemetry::new(),
     )
     .await?;
     let producer = ProsodyProducer::new(&producer_config)?;

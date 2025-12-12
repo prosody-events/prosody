@@ -5,14 +5,17 @@
 //! backpressure handling capabilities of the timer system.
 
 use color_eyre::eyre::Result;
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::event_context::EventContext,
     consumer::message::UncommittedMessage,
-    consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer},
+    consumer::middleware::CloneProvider,
+    consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
-    timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
+    telemetry::Telemetry,
+    timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
 use serde_json::json;
 use std::time::Duration;
@@ -33,7 +36,7 @@ pub struct SlowTimerHandler {
 }
 
 impl EventHandler for SlowTimerHandler {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage, _demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -50,7 +53,10 @@ impl EventHandler for SlowTimerHandler {
             let delay = CompactDuration::new(delay_secs);
             match CompactDateTime::now().and_then(|now| now.add_duration(delay)) {
                 Ok(schedule_time) => {
-                    if let Err(e) = context.schedule(schedule_time).await {
+                    if let Err(e) = context
+                        .schedule(schedule_time, TimerType::Application)
+                        .await
+                    {
                         error!("Failed to schedule timer for key {}: {e}", key);
                     }
                 }
@@ -63,7 +69,7 @@ impl EventHandler for SlowTimerHandler {
         uncommitted.commit();
     }
 
-    async fn on_timer<C, U>(&self, _context: C, timer: U)
+    async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -96,14 +102,14 @@ impl EventHandler for SlowTimerHandler {
 #[tokio::test]
 async fn test_timer_backpressure() -> Result<()> {
     // Initialize the logger.
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique topic for the test
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Setup an admin client to manage the topic creation
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()
@@ -126,10 +132,11 @@ async fn test_timer_backpressure() -> Result<()> {
         .build()?;
 
     let slow_timer_handler = SlowTimerHandler { timers_tx };
-    let consumer = ProsodyConsumer::new::<SlowTimerHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        slow_timer_handler,
+        CloneProvider::new(slow_timer_handler),
+        Telemetry::new(),
     )
     .await?;
 

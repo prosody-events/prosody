@@ -4,6 +4,7 @@
 //! [`super::manager::TimerManager`]: storage failures, scheduling failures,
 //! invalid datetime values, and timer lifecycle errors.
 
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTimeError;
 use crate::timers::scheduler::TimerSchedulerError;
 use chrono::OutOfRangeError;
@@ -19,7 +20,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TimerManagerError<T>
 where
-    T: Error + Debug,
+    T: ClassifyError + Error + Debug,
 {
     /// An error occurred in the persistent store layer.
     #[error("Timer store error: {0:#}")]
@@ -37,20 +38,79 @@ where
     #[error("Time must be in the future: {0:#}")]
     PastTime(#[from] OutOfRangeError),
 
-    /// No timer matching the specified key and time was found.
-    #[error("Time not found")]
-    NotFound,
-
-    /// The timer is currently inactive in the scheduler.
-    #[error("Timer is inactive")]
-    Inactive,
-
-    /// The scheduler has been shut down and cannot process operations.
-    #[error("Timer has been shutdown")]
+    /// The partition has been shut down and cannot process operations.
+    #[error("Partition has been shutdown")]
     Shutdown,
+
+    /// Message processing has been cancelled.
+    #[error("Message processing has been cancelled")]
+    Cancelled,
 
     /// The context is no longer valid because the event has already been
     /// processed.
     #[error("The context is no longer valid because the event has already been processed")]
     InvalidContext,
+}
+
+/// Errors encountered when parsing timer-related data.
+#[derive(Debug, Error)]
+pub enum ParseError {
+    /// Unknown timer type value encountered.
+    #[error("Unknown timer type: {0}")]
+    UnknownTimerType(i8),
+}
+
+impl<T> ClassifyError for TimerManagerError<T>
+where
+    T: ClassifyError + Error + Debug,
+{
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            // Persistent store error. Delegate to nested error's classification.
+            TimerManagerError::Store(e) => e.classify_error(),
+
+            // Scheduler error. Delegate to nested error's classification.
+            TimerManagerError::Scheduler(e) => e.classify_error(),
+
+            // DateTime conversion/arithmetic failed. Delegate to nested error's classification.
+            TimerManagerError::DateTime(e) => e.classify_error(),
+
+            // Provided time was not in the future. Delegate to nested error's classification.
+            TimerManagerError::PastTime(e) => e.classify_error(),
+
+            // Partition has been shut down. System is shutting down - cannot process operations.
+            // Terminal to crash and signal that partition is no longer operational.
+            TimerManagerError::Shutdown => ErrorCategory::Terminal,
+
+            // Message processing was cancelled due to timeout or graceful shutdown. Transient
+            // allows retry after system recovers - cancellation was due to external constraint,
+            // not bad data.
+            TimerManagerError::Cancelled => ErrorCategory::Transient,
+
+            // Context no longer valid because event already processed. Duplicate processing
+            // attempt with stale context. Permanent to drop duplicate rather than retry endlessly.
+            TimerManagerError::InvalidContext => ErrorCategory::Permanent,
+        }
+    }
+}
+
+// ClassifyError for external chrono type
+impl ClassifyError for OutOfRangeError {
+    fn classify_error(&self) -> ErrorCategory {
+        // Time is outside representable range (before 1970 or after 2106, or negative
+        // duration). Data-dependent - specific message has invalid time value.
+        // Permanent to drop this bad message rather than retry endlessly.
+        ErrorCategory::Permanent
+    }
+}
+
+impl ClassifyError for ParseError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            // UnknownTimerType: Failed to parse timer type from database. Indicates
+            // corrupted data (invalid i8 value) or version skew where database has
+            // timer types our code doesn't recognize. Not recoverable by retry.
+            Self::UnknownTimerType(_) => ErrorCategory::Permanent,
+        }
+    }
 }

@@ -6,26 +6,32 @@
 //! data consistency across all storage backends.
 
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::Segment;
+use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::{TimerType, Trigger};
 use quickcheck::{Arbitrary, Gen};
 use std::fmt::Debug;
 use uuid::Uuid;
 
-/// Tests for cleanup operations of the trigger store.
-pub mod cleanup_operations;
 /// Common utilities and helpers for trigger store tests.
 pub mod common;
 /// Tests for key contention scenarios in the trigger store.
 pub mod contention;
 /// Tests for operations spanning multiple slabs.
 pub mod cross_slab;
-/// Tests for primitive trigger store operations.
-pub mod primitive_operations;
+/// Property-based tests for V2 high-level dual-index operations.
+pub mod prop_high_level;
+/// Property-based tests for key trigger table operations.
+pub mod prop_key_triggers;
+/// Property-based tests for segment table operations.
+pub mod prop_segments;
+/// Property-based tests for slab metadata table operations.
+pub mod prop_slab_metadata;
+/// Property-based tests for slab trigger table operations.
+pub mod prop_slab_triggers;
 /// Tests for segment management in the trigger store.
-pub mod segment;
+// Removed segment.rs - redundant with prop_segments.rs property-based tests
 /// Tests for sequential interleavings of trigger operations.
 pub mod sequential_interleavings;
 /// Tests for slab-related functionality in the trigger store.
@@ -71,6 +77,7 @@ impl Arbitrary for Segment {
             id,
             name,
             slab_size,
+            version: SegmentVersion::V2,
         }
     }
 }
@@ -129,6 +136,7 @@ impl Arbitrary for TriggerTestInput {
                 triggers.push(Trigger::new(
                     Key::from(key.clone()),
                     time,
+                    TimerType::Application,
                     tracing::Span::current(),
                 ));
             }
@@ -212,65 +220,182 @@ impl Arbitrary for TriggerSequence {
 /// * `$test_count` - Number of property tests to run for each test function
 #[macro_export]
 macro_rules! trigger_store_tests {
-    ($store_type:ty, $store_constructor:expr, $test_count:expr) => {
+    // Variant without test_count - uses QuickCheck's default
+    ($operations_type:ty, $operations_constructor:expr, $store_type:ty, $store_constructor:expr) => {
         #[cfg(test)]
         mod tests {
             use super::*;
             use quickcheck::{QuickCheck, TestResult};
             use std::sync::LazyLock;
-            use tokio::runtime::Builder;
+            use tokio::runtime::{Builder, Runtime};
             use $crate::timers::store::tests;
 
-            // Shared runtime instance, created lazily
-            static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+            /// Shared runtime for property tests.
+            #[allow(clippy::expect_used)]
+            static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
                 Builder::new_multi_thread()
                     .enable_all()
                     .build()
-                    .unwrap()
+                    .expect("Failed to create tokio runtime")
             });
 
-            // Shared store instance, created lazily
-            static STORE: LazyLock<$store_type> = LazyLock::new(|| {
-                RUNTIME.block_on(async {
-                    ($store_constructor).await
-                        .expect("Failed to create shared store instance")
-                })
-            });
-
-            // Helper function to get the shared runtime
-            fn get_runtime() -> &'static tokio::runtime::Runtime {
-                &RUNTIME
-            }
-
-            // Helper function to get the shared store
-            fn get_store() -> &'static $store_type {
-                &STORE
-            }
-
-            trigger_store_tests!(@test_functions, $test_count);
-            trigger_store_tests!(@prop_functions);
+            trigger_store_tests!(@test_functions_default);
+            trigger_store_tests!(@prop_functions, $operations_type, $operations_constructor, $store_type, $store_constructor);
         }
     };
 
-    // Common test function definitions
-    (@test_functions, $test_count:expr) => {
-        #[test]
-        fn test_segment_operations() {
-            QuickCheck::new().tests($test_count).quickcheck(
-                prop_segment_operations
-                    as fn($crate::timers::store::tests::SegmentTestInput) -> TestResult,
-            );
-        }
+    // Variant with explicit test_count
+    ($operations_type:ty, $operations_constructor:expr, $store_type:ty, $store_constructor:expr, $test_count:expr) => {
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use quickcheck::{QuickCheck, TestResult};
+            use std::sync::LazyLock;
+            use tokio::runtime::{Builder, Runtime};
+            use $crate::timers::store::tests;
 
+            /// Shared runtime for property tests.
+            #[allow(clippy::expect_used)]
+            static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+                Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime")
+            });
+
+            trigger_store_tests!(@test_functions, $test_count);
+            trigger_store_tests!(@prop_functions, $operations_type, $operations_constructor, $store_type, $store_constructor);
+        }
+    };
+
+    // Helper to initialize test tracing with OpenTelemetry layer and active span
+    (@init_test_tracing) => {{
+        $crate::tracing::init_test_logging();
+
+        // Return an active span guard to ensure Span::current() works during test
+        tracing::info_span!("test").entered()
+    }};
+
+    // Test functions using QuickCheck's default
+    (@test_functions_default) => {
         #[test]
-        fn test_slab_operations() {
-            QuickCheck::new().tests($test_count).quickcheck(
-                prop_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
+        fn test_get_slab_range() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_get_slab_range as fn($crate::timers::store::Segment) -> TestResult,
             );
         }
 
         #[test]
         fn test_trigger_operations() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_trigger_operations
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_trigger_consistency() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_trigger_consistency
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_operation_sequences() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_operation_sequences
+                    as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_cross_slab_operations() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_key_contention() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_sequential_interleavings() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_sequential_interleavings
+                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_segment_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_segment_model_equivalence as fn($crate::timers::store::tests::prop_segments::SegmentTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_slab_metadata_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_slab_trigger_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_key_trigger_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_high_level_dual_index_consistency() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().quickcheck(
+                prop_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_high_level::HighLevelTestInput) -> TestResult,
+            );
+        }
+    };
+
+    // Test functions with explicit test count
+    (@test_functions, $test_count:expr) => {
+        // Removed test_segment_operations - redundant with prop_segment_model_equivalence
+
+        // Removed test_slab_operations - uses non-public API (insert_slab, get_slabs)
+
+        #[test]
+        fn test_get_slab_range() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_get_slab_range as fn($crate::timers::store::Segment) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_trigger_operations() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_trigger_operations
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
@@ -279,6 +404,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_trigger_consistency() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_trigger_consistency
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
@@ -287,6 +413,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_operation_sequences() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_operation_sequences
                     as fn($crate::timers::store::tests::TriggerSequence) -> TestResult,
@@ -295,6 +422,7 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_cross_slab_operations() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_cross_slab_operations as fn($crate::timers::store::Segment) -> TestResult,
             );
@@ -302,175 +430,329 @@ macro_rules! trigger_store_tests {
 
         #[test]
         fn test_key_contention() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count / 2).quickcheck(
                 prop_key_contention as fn($crate::timers::store::Segment) -> TestResult,
             );
         }
 
         #[test]
-        fn test_primitive_operations() {
-            QuickCheck::new().tests($test_count).quickcheck(
-                prop_primitive_operations
-                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
-        fn test_cleanup_operations() {
-            QuickCheck::new().tests($test_count).quickcheck(
-                prop_cleanup_operations
-                    as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
-            );
-        }
-
-        #[test]
         fn test_sequential_interleavings() {
+            let _span = trigger_store_tests!(@init_test_tracing);
             QuickCheck::new().tests($test_count).quickcheck(
                 prop_sequential_interleavings
                     as fn($crate::timers::store::tests::TriggerTestInput) -> TestResult,
             );
+        }#[test]
+        fn test_prop_segment_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_segment_model_equivalence as fn($crate::timers::store::tests::prop_segments::SegmentTestInput) -> TestResult,
+            );
         }
 
+        #[test]
+        fn test_prop_slab_metadata_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_slab_metadata_model_equivalence as fn($crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput) -> TestResult,
+            );
+        }
 
-    };
+        #[test]
+        fn test_prop_slab_trigger_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_slab_trigger_model_equivalence as fn($crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput) -> TestResult,
+            );
+        }
+
+        #[test]
+        fn test_prop_key_trigger_model_equivalence() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_key_trigger_model_equivalence as fn($crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput) -> TestResult,
+            );
+        }#[test]
+        fn test_prop_high_level_dual_index_consistency() {
+            let _span = trigger_store_tests!(@init_test_tracing);
+            QuickCheck::new().tests($test_count).quickcheck(
+                prop_high_level_dual_index_consistency as fn($crate::timers::store::tests::prop_high_level::HighLevelTestInput) -> TestResult,
+            );
+        }};
 
     // Property functions
-    (@prop_functions) => {
-        fn prop_segment_operations(
-            input: $crate::timers::store::tests::SegmentTestInput,
+    (@prop_functions, $operations_type:ty, $operations_constructor:expr, $store_type:ty, $store_constructor:expr) => {
+        fn prop_segment_model_equivalence(
+            input: $crate::timers::store::tests::prop_segments::SegmentTestInput,
         ) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+            use $crate::timers::store::tests::prop_segments::prop_segment_model_equivalence;
+            use tracing::Instrument;
 
-            match runtime.block_on(tests::segment::test_segment_operations(store, &input)) {
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
+
+            // Create operations instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let operations = match TEST_RUNTIME.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(ops) => ops,
+                Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
+            };
+
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_segment_model_equivalence(&operations, input).await }.instrument(span)) {
                 Ok(()) => TestResult::passed(),
-                Err(e) => TestResult::error(e),
+                Err(e) => TestResult::error(format!("{e:?}")),
             }
         }
 
-        fn prop_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+        fn prop_slab_metadata_model_equivalence(
+            input: $crate::timers::store::tests::prop_slab_metadata::SlabMetadataTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_slab_metadata::prop_slab_metadata_model_equivalence;
+            use tracing::Instrument;
 
-            match runtime.block_on(tests::slabs::test_slab_operations(store, &segment)) {
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
+
+            // Create operations instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let operations = match TEST_RUNTIME.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(ops) => ops,
+                Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
+            };
+
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_slab_metadata_model_equivalence(&operations, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
+        }
+
+        fn prop_slab_trigger_model_equivalence(
+            input: $crate::timers::store::tests::prop_slab_triggers::SlabTriggerTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_slab_triggers::prop_slab_trigger_model_equivalence;
+            use tracing::Instrument;
+
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
+
+            // Create operations instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let operations = match TEST_RUNTIME.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(ops) => ops,
+                Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
+            };
+
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_slab_trigger_model_equivalence(&operations, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
+        }
+
+        fn prop_key_trigger_model_equivalence(
+            input: $crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_key_triggers::prop_key_trigger_model_equivalence;
+            use tracing::Instrument;
+
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
+
+            // Create operations instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let operations = match TEST_RUNTIME.block_on(async { ($operations_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(ops) => ops,
+                Err(e) => return TestResult::error(format!("Failed to create operations: {e:?}")),
+            };
+
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_key_trigger_model_equivalence(&operations, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
+        }
+
+        fn prop_high_level_dual_index_consistency(
+            input: $crate::timers::store::tests::prop_high_level::HighLevelTestInput,
+        ) -> TestResult {
+            use $crate::timers::store::tests::prop_high_level::prop_high_level_dual_index_consistency;
+            use tracing::Instrument;
+
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
+
+            // Create store instance with the test's slab_size
+            let slab_size = input.slab_size;
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            // Call the async test function within the shared runtime
+            match TEST_RUNTIME.block_on(async { prop_high_level_dual_index_consistency(&store, input).await }.instrument(span)) {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
+        }
+
+        fn prop_get_slab_range(segment: $crate::timers::store::Segment) -> TestResult {
+            use tracing::Instrument;
+
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
+
+            // Create store instance with segment's slab_size
+            let slab_size = segment.slab_size;
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match TEST_RUNTIME.block_on(tests::slabs::test_get_slab_range(&store, &segment).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_trigger_operations(input: tests::TriggerTestInput) -> TestResult {
+            use tracing::Instrument;
+
             if input.triggers.is_empty() {
                 return TestResult::discard();
             }
 
-            let runtime = get_runtime();
-            let store = get_store();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
-            match runtime.block_on(tests::trigger_operations::test_trigger_operations(
-                store, &input,
-            )) {
+            // Create store instance with segment's slab_size
+            let slab_size = input.segment.slab_size;
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match TEST_RUNTIME.block_on(tests::trigger_operations::test_trigger_operations(
+                &store, &input,
+            ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_trigger_consistency(input: tests::TriggerTestInput) -> TestResult {
+            use tracing::Instrument;
+
             if input.triggers.is_empty() {
                 return TestResult::discard();
             }
 
-            let runtime = get_runtime();
-            let store = get_store();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
-            match runtime.block_on(tests::trigger_consistency::test_trigger_consistency(
-                store, &input,
-            )) {
+            // Create store instance with segment's slab_size
+            let slab_size = input.segment.slab_size;
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match TEST_RUNTIME.block_on(tests::trigger_consistency::test_trigger_consistency(
+                &store, &input,
+            ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_operation_sequences(input: tests::TriggerSequence) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+            use tracing::Instrument;
 
-            match runtime.block_on(tests::trigger_operations::test_operation_sequences(
-                store, &input,
-            )) {
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
+
+            // Create store instance with segment's slab_size
+            let slab_size = input.segment.slab_size;
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match TEST_RUNTIME.block_on(tests::trigger_operations::test_operation_sequences(
+                &store, &input,
+            ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_cross_slab_operations(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+            use tracing::Instrument;
 
-            match runtime.block_on(tests::cross_slab::test_cross_slab_operations(
-                store, &segment,
-            )) {
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
+
+            // Create store instance with segment's slab_size
+            let slab_size = segment.slab_size;
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match TEST_RUNTIME.block_on(tests::cross_slab::test_cross_slab_operations(
+                &store, &segment,
+            ).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_key_contention(segment: $crate::timers::store::Segment) -> TestResult {
-            let runtime = get_runtime();
-            let store = get_store();
+            use tracing::Instrument;
 
-            match runtime.block_on(tests::contention::test_key_contention(store, &segment)) {
-                Ok(()) => TestResult::passed(),
-                Err(e) => TestResult::error(e),
-            }
-        }
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
-        fn prop_primitive_operations(input: tests::TriggerTestInput) -> TestResult {
-            if input.triggers.is_empty() {
-                return TestResult::discard();
-            }
+            // Create store instance with segment's slab_size
+            let slab_size = segment.slab_size;
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
 
-            let runtime = get_runtime();
-            let store = get_store();
-
-            match runtime.block_on(tests::primitive_operations::test_primitive_operations(
-                store, &input,
-            )) {
-                Ok(()) => TestResult::passed(),
-                Err(e) => TestResult::error(e),
-            }
-        }
-
-        fn prop_cleanup_operations(input: tests::TriggerTestInput) -> TestResult {
-            if input.triggers.is_empty() {
-                return TestResult::discard();
-            }
-
-            let runtime = get_runtime();
-            let store = get_store();
-
-            match runtime.block_on(tests::cleanup_operations::test_cleanup_operations(
-                store, &input,
-            )) {
+            match TEST_RUNTIME.block_on(tests::contention::test_key_contention(&store, &segment).instrument(span)) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
 
         fn prop_sequential_interleavings(input: tests::TriggerTestInput) -> TestResult {
+            use tracing::Instrument;
+
             if input.triggers.is_empty() {
                 return TestResult::discard();
             }
 
-            let runtime = get_runtime();
-            let store = get_store();
+            // Capture the current span to propagate into async runtime
+            let span = tracing::Span::current();
 
-            match runtime.block_on(
-                tests::sequential_interleavings::test_sequential_interleavings(store, &input),
+            // Create store instance with segment's slab_size
+            let slab_size = input.segment.slab_size;
+            let store = match TEST_RUNTIME.block_on(async { ($store_constructor)(slab_size).await }.instrument(span.clone())) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match TEST_RUNTIME.block_on(
+                tests::sequential_interleavings::test_sequential_interleavings(&store, &input).instrument(span),
             ) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(e),
             }
         }
+
     };
 
 

@@ -93,7 +93,7 @@ impl<T> SlabLock<T> {
     ///
     /// Returns a guard that allows concurrent access with other trigger
     /// operations. Use this for operations that work with individual timers
-    /// without modifying the overall system structure.
+    /// without modifying slab ownership.
     pub async fn trigger_lock(&self) -> SlabLockTriggerGuard<'_, T> {
         SlabLockTriggerGuard(self.inner.read().await)
     }
@@ -101,8 +101,7 @@ impl<T> SlabLock<T> {
     /// Acquires exclusive access for slab operations.
     ///
     /// Returns a guard that provides exclusive access to the protected data.
-    /// Use this for operations that modify the timer system's structure,
-    /// such as loading slabs or changing ownership.
+    /// Use this for operations that modify slab ownership.
     pub async fn slab_lock(&self) -> SlabLockSlabGuard<'_, T> {
         SlabLockSlabGuard(self.inner.write().await)
     }

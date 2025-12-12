@@ -3,7 +3,6 @@
     reason = "Trigger's ArcSwap field is excluded from hash/equality via Educe"
 )]
 
-use crate::timers::Trigger;
 use crate::timers::slab::Slab;
 use crate::timers::store::TriggerStore;
 use crate::timers::store::tests::common::{
@@ -13,6 +12,7 @@ use crate::timers::store::tests::common::{
 use crate::timers::store::tests::{
     TestStoreResult, TriggerOperation, TriggerSequence, TriggerTestInput,
 };
+use crate::timers::{TimerType, Trigger};
 use ahash::HashSet;
 use std::fmt::Debug;
 
@@ -117,13 +117,7 @@ where
 
     // Test clear_triggers_for_key
     if let Some(trigger) = input.triggers.first() {
-        clear_triggers_for_key(
-            store,
-            &input.segment.id,
-            &trigger.key,
-            input.segment.slab_size,
-        )
-        .await?;
+        clear_triggers_for_key(store, &input.segment, trigger.timer_type, &trigger.key).await?;
 
         let remaining_key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
 
@@ -165,7 +159,12 @@ where
 
         match op {
             TriggerOperation::Add => {
-                let trigger = Trigger::new(input.key.clone(), time, Span::current());
+                let trigger = Trigger::new(
+                    input.key.clone(),
+                    time,
+                    TimerType::Application,
+                    Span::current(),
+                );
 
                 add_trigger(store, &input.segment, &trigger).await?;
                 expected_times.insert(time);
@@ -175,13 +174,8 @@ where
                 expected_times.remove(&time);
             }
             TriggerOperation::Clear => {
-                clear_triggers_for_key(
-                    store,
-                    &input.segment.id,
-                    &input.key,
-                    input.segment.slab_size,
-                )
-                .await?;
+                clear_triggers_for_key(store, &input.segment, TimerType::Application, &input.key)
+                    .await?;
                 expected_times.clear();
             }
         }

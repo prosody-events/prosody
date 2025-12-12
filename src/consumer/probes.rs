@@ -13,7 +13,7 @@
 //! current operational state of the service.
 
 use crate::consumer::{Managers, get_assigned_partition_count, get_is_stalled};
-use crate::heartbeat::Heartbeat;
+use crate::heartbeat::HeartbeatRegistry;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -64,8 +64,8 @@ struct ProbeState {
     /// Reference to partition managers for checking assignment status
     managers: Arc<Managers>,
 
-    /// Heartbeat for checking if the poll loop is active
-    poll_heartbeat: Heartbeat,
+    /// Registry for checking if consumer-level actors are stalled
+    heartbeats: HeartbeatRegistry,
 }
 
 impl ProbeServer {
@@ -75,7 +75,7 @@ impl ProbeServer {
     ///
     /// * `port` - Port number to bind the server to
     /// * `managers` - Reference to partition managers for status checks
-    /// * `poll_heartbeat` - Heartbeat used to detect poll loop stalls
+    /// * `heartbeats` - Registry for monitoring consumer-level actors
     ///
     /// # Returns
     ///
@@ -87,12 +87,12 @@ impl ProbeServer {
     pub fn new(
         port: u16,
         managers: Arc<Managers>,
-        poll_heartbeat: Heartbeat,
+        heartbeats: HeartbeatRegistry,
     ) -> Result<Self, io::Error> {
         // Create application state with references to components
         let state = ProbeState {
             managers,
-            poll_heartbeat,
+            heartbeats,
         };
 
         // Define router with health check endpoints
@@ -197,14 +197,14 @@ async fn readiness_probe(
 
 /// Handles liveness probe requests.
 ///
-/// A consumer is considered live when neither the poll loop nor any partition
+/// A consumer is considered live when no consumer-level actors or partition
 /// processing has stalled. Stalls indicate that the consumer is no longer
 /// making progress and may need to be restarted.
 ///
 /// # Arguments
 ///
-/// * `State(ProbeState { managers, poll_heartbeat })` - Shared state containing
-///   partition managers and heartbeat
+/// * `State(ProbeState { managers, heartbeats })` - Shared state containing
+///   partition managers and consumer-level heartbeat registry
 ///
 /// # Returns
 ///
@@ -215,14 +215,15 @@ async fn readiness_probe(
 async fn liveness_probe(
     State(ProbeState {
         managers,
-        poll_heartbeat,
+        heartbeats,
     }): State<ProbeState>,
 ) -> (StatusCode, &'static str) {
-    if poll_heartbeat.is_stalled() || get_is_stalled(&managers) {
-        // Either the poll loop or a partition has stalled
+    if heartbeats.any_stalled() || get_is_stalled(&managers) {
+        // Either a consumer-level actor or a partition has stalled
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Poll loop or one or more partitions have stalled. See logs for more details.",
+            "Consumer-level actor or one or more partitions have stalled. See logs for more \
+             details.",
         )
     } else {
         // Consumer is actively processing messages
@@ -243,11 +244,11 @@ mod tests {
     async fn test_probe_server_endpoints_respond() {
         // Create mock components
         let managers = Arc::default();
-        let heartbeat = Heartbeat::new("test", Duration::from_secs(30));
+        let heartbeats = HeartbeatRegistry::test();
 
         // Create ProbeServer instance on a random port (0)
         let server =
-            ProbeServer::new(0, managers, heartbeat).expect("Failed to create ProbeServer");
+            ProbeServer::new(0, managers, heartbeats).expect("Failed to create ProbeServer");
 
         let address = server.local_addr();
 

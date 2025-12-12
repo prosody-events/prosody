@@ -12,38 +12,29 @@
 //! The main entry point is the [`poll`] function, which orchestrates all these
 //! operations within a continuous loop until shutdown is signaled.
 
-use chrono::{MappedLocalTime, TimeZone, Utc};
-use internment::Intern;
-use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
-use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::util::Timeout;
-use rdkafka::{Message, Offset, Timestamp, TopicPartitionList};
-use std::str;
+use rdkafka::{Message, Offset, TopicPartitionList};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::field::Empty;
-use tracing::{debug, error, info_span, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing::{debug, error, warn};
 
-use crate::consumer::extractor::MessageExtractor;
+use crate::Topic;
+use crate::consumer::decode::decode_message;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
 use crate::propagator::new_propagator;
-use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 use crate::timers::store::TriggerStore;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
-#[cfg(not(target_arch = "arm"))]
-use simd_json::serde::from_reader_with_buffers;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Configuration for the Kafka message polling process.
@@ -170,17 +161,18 @@ where
         let offset = message.offset();
         debug!(topic, partition, offset, "received message");
 
-        // Process message through extraction, validation, and filtering
-        let maybe_msg = process_message(
+        // Decode message through extraction, validation, and filtering
+        let maybe_decoded = decode_message(
             &message,
-            permit,
             &propagator,
             #[cfg(not(target_arch = "arm"))]
             &mut buffers,
         );
 
-        // Dispatch valid messages to their partition manager
-        if let Some(consumer_message) = maybe_msg {
+        // Create consumer message with processing state and dispatch
+        if let Some(decoded) = maybe_decoded {
+            let consumer_message =
+                ConsumerMessage::from_decoded(decoded.value, decoded.span, permit);
             dispatch_with_retry(consumer_message, poll_interval, managers);
         }
 
@@ -188,137 +180,6 @@ where
     }
 
     debug!("polling stopped");
-}
-
-/// Extracts and validates data from a Kafka message.
-///
-/// This function performs several critical operations:
-/// 1. Creates a tracing span with message metadata for observability
-/// 2. Extracts distributed tracing context from message headers
-/// 3. Parses the payload and validates it as JSON
-/// 4. Extracts the message key and timestamp
-///
-/// # Arguments
-///
-/// * `message` - The Kafka message to process
-/// * `propagator` - Distributed tracing context propagator
-/// * `buffers` - (Non-ARM only) Buffers for SIMD JSON parsing
-///
-/// # Returns
-///
-/// * `Some(ConsumerMessage)` - A validated, parsed message with tracing context
-/// * `None` - If the message is invalid or should be filtered out
-fn process_message(
-    message: &BorrowedMessage,
-    permit: OwnedSemaphorePermit,
-    propagator: &TextMapCompositePropagator,
-    #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
-) -> Option<ConsumerMessage> {
-    // Extract basic message coordinates
-    let topic: Topic = Intern::from(message.topic());
-    let partition = message.partition();
-    let offset = message.offset();
-
-    debug!(
-        topic = message.topic(),
-        partition, offset, "processing message"
-    );
-
-    // Create and configure tracing span with distributed context
-    let context = propagator.extract(&MessageExtractor::new(message));
-    let span = info_span!(
-        "receive",
-        partition,
-        offset,
-        topic = topic.as_ref(),
-        key = Empty,
-        payload_size = Empty,
-        skipped = Empty,
-        event_type = Empty,
-    );
-    span.set_parent(context);
-    let _enter = span.enter();
-
-    // Extract source system header if present
-    let source_system = match message
-        .headers()
-        .into_iter()
-        .flat_map(|headers| headers.iter())
-        .find(|header| header.key == SOURCE_SYSTEM_HEADER)
-        .and_then(|header| header.value)
-        .map(str::from_utf8)
-        .transpose()
-    {
-        Ok(source_system) => source_system.map(SourceSystem::from),
-        Err(error) => {
-            error!("invalid source system encoding: {error:#}; ignoring");
-            None
-        }
-    };
-
-    // Validate message has payload
-    let Some(payload_data) = message.payload() else {
-        error!("missing payload; discarding message");
-        return None;
-    };
-    span.record("payload_size", payload_data.len());
-
-    // Parse payload as JSON, using platform-optimized implementations
-    #[cfg(target_arch = "arm")]
-    let payload = serde_json::from_slice(payload_data);
-    #[cfg(not(target_arch = "arm"))]
-    let payload = from_reader_with_buffers(payload_data, buffers);
-
-    let payload: crate::Payload = match payload {
-        Ok(p) => p,
-        Err(error) => {
-            error!("invalid payload: {error:#}; discarding message");
-            return None;
-        }
-    };
-
-    // Validate message has key
-    let Some(key_data) = message.key() else {
-        error!("missing key; discarding message");
-        return None;
-    };
-
-    // Parse key as UTF-8 string
-    let key = match str::from_utf8(key_data) {
-        Ok(key_str) => {
-            span.record("key", key_str);
-            key_str.into()
-        }
-        Err(error) => {
-            error!("invalid key encoding: {error:#}; discarding message");
-            return None;
-        }
-    };
-
-    // Determine message timestamp based on available metadata
-    let timestamp = match message.timestamp() {
-        Timestamp::NotAvailable => Utc::now(),
-        Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => {
-            match Utc.timestamp_millis_opt(millis) {
-                MappedLocalTime::Single(ts) => ts,
-                MappedLocalTime::Ambiguous(earliest, ..) => earliest,
-                MappedLocalTime::None => Utc::now(),
-            }
-        }
-    };
-
-    // Create and return complete consumer message
-    Some(ConsumerMessage::new(
-        source_system,
-        topic,
-        partition,
-        offset,
-        key,
-        timestamp,
-        payload,
-        span.clone(),
-        permit,
-    ))
 }
 
 /// Attempts to dispatch a message to its partition manager with retries.

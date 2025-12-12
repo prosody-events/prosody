@@ -18,24 +18,25 @@
 //! in [`BTreeSet`] to maintain sorted order where needed.
 
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::timers::store::adapter::TableAdapter;
+use crate::timers::store::operations::TriggerOperations;
+use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::TryStreamExt;
 use futures::stream::Stream;
 use scc::HashMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::join;
-use tracing::Span;
 
-/// In-memory, concurrent implementation of [`TriggerStore`] for testing and
-/// development.
+/// In-memory, concurrent implementation of
+/// [`TriggerStore`](super::TriggerStore) for testing and development.
 ///
 /// All data is held in memory; timers and segments are lost when the process
 /// exits. This store supports the full `TriggerStore` trait API with
@@ -44,34 +45,51 @@ use tracing::Span;
 /// # Examples
 ///
 /// ```rust,no_run
-/// use prosody::timers::store::TriggerStore;
-/// use prosody::timers::store::memory::InMemoryTriggerStore;
+/// use prosody::timers::store::memory::memory_store;
 ///
-/// let store = InMemoryTriggerStore::new();
+/// let store = memory_store();
 /// // Now you can call TriggerStore methods on `store`
 /// ```
+///
+/// For tests that need the concrete type, you can use
+/// `InMemoryTriggerStore::new()` directly.
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryTriggerStore(Arc<Inner>);
 
+/// Partition key for slab triggers: (`segment_id`, `slab_size`, `slab_id`)
+type SlabPartitionKey = (SegmentId, CompactDuration, SlabId);
+
+/// Clustering key for slab triggers: (`timer_type`, `key`, `time`)
+type SlabClusteringKey = (TimerType, Key, CompactDateTime);
+
+/// Partition key for key triggers: (`segment_id`, `key`)
+type KeyPartitionKey = (SegmentId, Key);
+
+/// Clustering key for key triggers: (`timer_type`, `time`)
+type KeyClusteringKey = (TimerType, CompactDateTime);
+
 /// Internal state for `InMemoryTriggerStore`.
 ///
-/// Maintains four concurrent maps to support dual indexing and segment
-/// management.
+/// Maintains concurrent maps to support dual indexing and segment management.
 #[derive(Debug, Default)]
 struct Inner {
-    /// Maps each segment ID to its (name, `slab_size`).
-    segments: HashMap<SegmentId, (String, CompactDuration)>,
+    /// Maps each segment ID to its (name, `slab_size`, version).
+    segments: HashMap<SegmentId, (String, CompactDuration, SegmentVersion)>,
 
     /// Maps each segment ID to its active set of slab IDs.
     segment_slabs: HashMap<SegmentId, BTreeSet<SlabId>>,
 
-    /// Time-based index: maps each `Slab` to the set of `Trigger`s in that
-    /// slab.
-    slab_triggers: HashMap<Slab, BTreeSet<Trigger>>,
+    /// V2 time-based index: maps (`segment_id`, `slab_size`, `slab_id`) to a
+    /// map of triggers organized by (`timer_type`, `key`, `time`). Matches v2
+    /// `timer_typed_slabs` table structure: partition key + clustering key.
+    /// This allows efficient queries for all timer types within a slab.
+    slab_triggers: HashMap<SlabPartitionKey, BTreeMap<SlabClusteringKey, Trigger>>,
 
-    /// Key-based index: maps (segment, key) to the set of `Trigger`s for that
+    /// Key-based index: maps (`segment_id`, `key`) to a map of triggers
+    /// organized by (`timer_type`, `time`). Matches v2 `timer_typed_keys`
+    /// table structure. This allows efficient queries for all timer types for a
     /// key.
-    key_triggers: HashMap<(SegmentId, Key), BTreeSet<Trigger>>,
+    key_triggers: HashMap<KeyPartitionKey, BTreeMap<KeyClusteringKey, Trigger>>,
 }
 
 impl InMemoryTriggerStore {
@@ -86,7 +104,7 @@ impl InMemoryTriggerStore {
     }
 }
 
-impl TriggerStore for InMemoryTriggerStore {
+impl TriggerOperations for InMemoryTriggerStore {
     type Error = Infallible;
 
     // -- Segment management operations --
@@ -105,7 +123,10 @@ impl TriggerStore for InMemoryTriggerStore {
     async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
         self.0
             .segments
-            .upsert_async(segment.id, (segment.name, segment.slab_size))
+            .upsert_async(
+                segment.id,
+                (segment.name, segment.slab_size, segment.version),
+            )
             .await;
 
         Ok(())
@@ -124,11 +145,12 @@ impl TriggerStore for InMemoryTriggerStore {
     /// * Never returns `Err`.
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
         Ok(self.0.segments.get_async(segment_id).await.map(|e| {
-            let (name, slab_size) = e.get();
+            let (name, slab_size, version) = e.get();
             Segment {
                 id: *segment_id,
                 name: name.clone(),
                 slab_size: *slab_size,
+                version: *version,
             }
         }))
     }
@@ -254,7 +276,41 @@ impl TriggerStore for InMemoryTriggerStore {
 
     // -- Slab trigger operations (time index) --
 
-    /// Stream all triggers within a given slab.
+    /// Stream all triggers of a specific type within a given slab.
+    ///
+    /// # Arguments
+    ///
+    /// * `slab` - The slab specification to query.
+    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
+    ///
+    /// # Returns
+    ///
+    /// A stream of `Trigger` for the specified type. Never yields an error.
+    fn get_slab_triggers(
+        &self,
+        slab: &Slab,
+        timer_type: TimerType,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> {
+        let segment_id = *slab.segment_id();
+        let slab_size = slab.size();
+        let slab_id = slab.id();
+
+        try_stream! {
+            let partition_key = (segment_id, slab_size, slab_id);
+            let Some(triggers_map) = self.0.slab_triggers.get_async(&partition_key).await else {
+                return;
+            };
+
+            // Filter triggers by timer_type using range query on BTreeMap
+            for ((t_type, _key, _time), trigger) in triggers_map.iter() {
+                if *t_type == timer_type {
+                    yield trigger.clone();
+                }
+            }
+        }
+    }
+
+    /// Stream ALL triggers within a slab across all timer types.
     ///
     /// # Arguments
     ///
@@ -262,14 +318,23 @@ impl TriggerStore for InMemoryTriggerStore {
     ///
     /// # Returns
     ///
-    /// A stream of `Trigger`. Never yields an error.
-    fn get_slab_triggers(&self, slab: &Slab) -> impl Stream<Item = Result<Trigger, Self::Error>> {
+    /// A stream of all `Trigger`s in the slab, regardless of timer type.
+    fn get_slab_triggers_all_types(
+        &self,
+        slab: &Slab,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> {
+        let segment_id = *slab.segment_id();
+        let slab_size = slab.size();
+        let slab_id = slab.id();
+
         try_stream! {
-            let Some(set) = self.0.slab_triggers.get_async(slab).await else {
+            let partition_key = (segment_id, slab_size, slab_id);
+            let Some(triggers_map) = self.0.slab_triggers.get_async(&partition_key).await else {
                 return;
             };
 
-            for trigger in set.iter() {
+            // Stream all triggers from the partition
+            for (_clustering_key, trigger) in triggers_map.iter() {
                 yield trigger.clone();
             }
         }
@@ -286,13 +351,16 @@ impl TriggerStore for InMemoryTriggerStore {
     ///
     /// Never returns an error.
     async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
+        let partition_key = (*slab.segment_id(), slab.size(), slab.id());
+        let clustering_key = (trigger.timer_type, trigger.key.clone(), trigger.time);
+
         self.0
             .slab_triggers
-            .entry_async(slab)
+            .entry_async(partition_key)
             .await
             .or_default()
             .get_mut()
-            .insert(trigger);
+            .insert(clustering_key, trigger);
 
         Ok(())
     }
@@ -302,6 +370,7 @@ impl TriggerStore for InMemoryTriggerStore {
     /// # Arguments
     ///
     /// * `slab` - Slab to modify.
+    /// * `timer_type` - The timer type (Application or `DeferRetry`).
     /// * `key` - Trigger's key.
     /// * `time` - Trigger's scheduled time.
     ///
@@ -311,16 +380,18 @@ impl TriggerStore for InMemoryTriggerStore {
     async fn delete_slab_trigger(
         &self,
         slab: &Slab,
+        timer_type: TimerType,
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
-        let Some(mut entry) = self.0.slab_triggers.get_async(slab).await else {
+        let partition_key = (*slab.segment_id(), slab.size(), slab.id());
+        let clustering_key = (timer_type, key.clone(), time);
+
+        let Some(mut entry) = self.0.slab_triggers.get_async(&partition_key).await else {
             return Ok(());
         };
 
-        let trigger = Trigger::new(key.clone(), time, Span::current());
-
-        entry.get_mut().remove(&trigger);
+        entry.get_mut().remove(&clustering_key);
         if entry.is_empty() {
             let _ = entry.remove();
         }
@@ -328,7 +399,10 @@ impl TriggerStore for InMemoryTriggerStore {
         Ok(())
     }
 
-    /// Remove all triggers from a slab's time index.
+    /// Remove all triggers from a slab's time index across ALL timer types.
+    ///
+    /// This clears both Application and `DeferRetry` timers. Used for
+    /// `slab_size` migration and cleanup operations.
     ///
     /// # Arguments
     ///
@@ -338,17 +412,20 @@ impl TriggerStore for InMemoryTriggerStore {
     ///
     /// Never returns an error.
     async fn clear_slab_triggers(&self, slab: &Slab) -> Result<(), Self::Error> {
-        self.0.slab_triggers.remove_async(slab).await;
+        // Clear the entire partition (all timer types)
+        let partition_key = (*slab.segment_id(), slab.size(), slab.id());
+        self.0.slab_triggers.remove_async(&partition_key).await;
         Ok(())
     }
 
     // -- Key trigger operations (entity index) --
 
-    /// Stream all scheduled times for a given key.
+    /// Stream all scheduled times for a given key and timer type.
     ///
     /// # Arguments
     ///
     /// * `segment_id` - Segment to query.
+    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
     /// * `key` - Entity key.
     ///
     /// # Returns
@@ -357,17 +434,19 @@ impl TriggerStore for InMemoryTriggerStore {
     fn get_key_times(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
-        self.get_key_triggers(segment_id, key)
+        self.get_key_triggers(segment_id, timer_type, key)
             .map_ok(|trigger| trigger.time)
     }
 
-    /// Stream all triggers for a given key.
+    /// Stream all triggers for a given key and timer type.
     ///
     /// # Arguments
     ///
     /// * `segment_id` - Segment to query.
+    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
     /// * `key` - Entity key.
     ///
     /// # Returns
@@ -376,15 +455,47 @@ impl TriggerStore for InMemoryTriggerStore {
     fn get_key_triggers(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         try_stream! {
-            let map_key = (*segment_id, key.clone());
-            let Some(entry) = self.0.key_triggers.get_async(&map_key).await else {
+            let partition_key = (*segment_id, key.clone());
+            let Some(triggers_map) = self.0.key_triggers.get_async(&partition_key).await else {
                 return;
             };
 
-            for trigger in entry.iter() {
+            // Filter triggers by timer_type
+            for ((t_type, _time), trigger) in triggers_map.iter() {
+                if *t_type == timer_type {
+                    yield trigger.clone();
+                }
+            }
+        }
+    }
+
+    /// Stream ALL triggers for a given key across all timer types.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment to query.
+    /// * `key` - Entity key.
+    ///
+    /// # Returns
+    ///
+    /// A stream of all `Trigger`s for the key, regardless of timer type.
+    fn get_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        try_stream! {
+            let partition_key = (*segment_id, key.clone());
+            let Some(triggers_map) = self.0.key_triggers.get_async(&partition_key).await else {
+                return;
+            };
+
+            // Stream all triggers from the partition
+            for (_clustering_key, trigger) in triggers_map.iter() {
                 yield trigger.clone();
             }
         }
@@ -405,14 +516,16 @@ impl TriggerStore for InMemoryTriggerStore {
         segment_id: &SegmentId,
         trigger: Trigger,
     ) -> Result<(), Self::Error> {
-        let map_key = (*segment_id, trigger.key.clone());
+        let partition_key = (*segment_id, trigger.key.clone());
+        let clustering_key = (trigger.timer_type, trigger.time);
+
         self.0
             .key_triggers
-            .entry_async(map_key)
+            .entry_async(partition_key)
             .await
             .or_default()
             .get_mut()
-            .insert(trigger);
+            .insert(clustering_key, trigger);
 
         Ok(())
     }
@@ -422,6 +535,7 @@ impl TriggerStore for InMemoryTriggerStore {
     /// # Arguments
     ///
     /// * `segment_id` - Segment for the key.
+    /// * `timer_type` - The timer type (Application or `DeferRetry`).
     /// * `key` - Trigger's key.
     /// * `time` - Trigger's scheduled time.
     ///
@@ -431,17 +545,18 @@ impl TriggerStore for InMemoryTriggerStore {
     async fn delete_key_trigger(
         &self,
         segment_id: &SegmentId,
+        timer_type: TimerType,
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
-        let map_key = (*segment_id, key.clone());
-        let Some(mut entry) = self.0.key_triggers.get_async(&map_key).await else {
+        let partition_key = (*segment_id, key.clone());
+        let clustering_key = (timer_type, time);
+
+        let Some(mut entry) = self.0.key_triggers.get_async(&partition_key).await else {
             return Ok(());
         };
 
-        let trigger = Trigger::new(key.clone(), time, Span::none());
-
-        entry.get_mut().remove(&trigger);
+        entry.get_mut().remove(&clustering_key);
         if entry.is_empty() {
             let _ = entry.remove();
         }
@@ -449,33 +564,126 @@ impl TriggerStore for InMemoryTriggerStore {
         Ok(())
     }
 
-    /// Remove all triggers for a key across both indices.
+    /// Remove all triggers for a key and timer type across both indices.
     ///
     /// # Arguments
     ///
     /// * `segment` - Segment ID.
+    /// * `timer_type` - The timer type to clear (Application or `DeferRetry`).
     /// * `key` - Entity key.
     ///
     /// # Errors
     ///
     /// Never returns an error.
-    async fn clear_key_triggers(&self, segment: &SegmentId, key: &Key) -> Result<(), Self::Error> {
-        let map_key = (*segment, key.clone());
-        self.0.key_triggers.remove_async(&map_key).await;
+    async fn clear_key_triggers(
+        &self,
+        segment: &SegmentId,
+        timer_type: TimerType,
+        key: &Key,
+    ) -> Result<(), Self::Error> {
+        let partition_key = (*segment, key.clone());
+        let Some(mut entry) = self.0.key_triggers.get_async(&partition_key).await else {
+            return Ok(());
+        };
+
+        // Remove all triggers matching the timer_type
+        entry
+            .get_mut()
+            .retain(|(t_type, _time), _trigger| *t_type != timer_type);
+
+        if entry.is_empty() {
+            let _ = entry.remove();
+        }
+
+        Ok(())
+    }
+
+    /// Remove all triggers for a key across ALL timer types from the key index.
+    ///
+    /// This is a low-level primitive that clears the entire partition
+    /// `(segment_id, key)` which contains all `(timer_type, time)` clustering
+    /// keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment ID.
+    /// * `key` - Entity key.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error.
+    async fn clear_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> Result<(), Self::Error> {
+        let partition_key = (*segment_id, key.clone());
+        self.0.key_triggers.remove_async(&partition_key).await;
+        Ok(())
+    }
+
+    // -- V1 migration methods --
+
+    /// Update segment metadata including version and slab size.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment to update.
+    /// * `new_version` - New schema version (1 or 2).
+    /// * `new_slab_size` - New slab size for the segment.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error.
+    async fn update_segment_version(
+        &self,
+        segment_id: &SegmentId,
+        new_version: SegmentVersion,
+        new_slab_size: CompactDuration,
+    ) -> Result<(), Self::Error> {
+        if let Some(entry) = self.0.segments.get_async(segment_id).await {
+            let (name, ..) = entry.get();
+            let name = name.clone();
+            drop(entry);
+            self.0
+                .segments
+                .upsert_async(*segment_id, (name, new_slab_size, new_version))
+                .await;
+        }
         Ok(())
     }
 }
 
+/// Creates a new in-memory trigger store.
+///
+/// Returns an implementation of `TriggerStore` backed by in-memory data
+/// structures. This is the recommended way to create an in-memory store.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let store = memory_store();
+/// let manager = TimerManager::new(..., store);
+/// ```
+#[must_use]
+pub fn memory_store() -> TableAdapter<InMemoryTriggerStore> {
+    TableAdapter::new(InMemoryTriggerStore::new())
+}
+
 #[cfg(test)]
 mod test {
-    use super::InMemoryTriggerStore;
+    use super::{InMemoryTriggerStore, memory_store};
     use crate::trigger_store_tests;
     use std::convert::Infallible;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
+    // Low-level tests use InMemoryTriggerStore directly
+    // High-level tests use TableAdapter<InMemoryTriggerStore>
+    // Uses QuickCheck's default test count (no external systems involved)
     trigger_store_tests!(
         InMemoryTriggerStore,
-        async { Result::<_, Infallible>::Ok(InMemoryTriggerStore::new()) },
-        100
+        |_slab_size| async { Result::<_, Infallible>::Ok(InMemoryTriggerStore::new()) },
+        crate::timers::store::adapter::TableAdapter<InMemoryTriggerStore>,
+        |_slab_size| async { Result::<_, Infallible>::Ok(memory_store()) }
     );
 }

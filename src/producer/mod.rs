@@ -4,9 +4,11 @@
 //! Kafka topics. It handles configuration, message serialization, and injection
 //! of OpenTelemetry context for distributed tracing.
 
+use ahash::RandomState;
 use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
+use quick_cache::UnitWeighter;
 use quick_cache::sync::Cache;
 use rdkafka::ClientConfig;
 use rdkafka::client::{Client, DefaultClientContext};
@@ -159,7 +161,7 @@ pub struct ProsodyProducer {
     producer: FutureProducer,
 
     /// Idempotence cache for deduplicating messages.
-    idempotence_cache: Option<Arc<Cache<Key, EventId>>>,
+    idempotence_cache: Option<Arc<Cache<Key, EventId, UnitWeighter, RandomState>>>,
 
     /// OpenTelemetry context propagator.
     #[educe(Debug(ignore))]
@@ -355,7 +357,7 @@ impl ProsodyProducer {
 
         // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
-            .key(key.as_str())
+            .key(key.as_ref())
             .payload(&serialized)
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 

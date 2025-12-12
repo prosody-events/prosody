@@ -21,12 +21,12 @@ use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
+use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
 
@@ -54,6 +54,8 @@ where
 
     /// Thread-safe storage for partition managers
     managers: Arc<Managers>,
+
+    telemetry: TelemetrySender,
 }
 
 impl<T, S> Context<T, S>
@@ -80,6 +82,7 @@ where
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers>,
         allowed_events: Option<AhoCorasick>,
+        telemetry: TelemetrySender,
     ) -> Self {
         let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
             error!("invalid timer slab size: {error:#}; using default");
@@ -96,7 +99,6 @@ where
             shutdown_timeout: config.shutdown_timeout,
             stall_threshold: config.stall_threshold,
             watermark_version,
-            global_limit: Arc::new(Semaphore::new(config.max_concurrency)),
             trigger_store,
             timer_slab_size,
         };
@@ -105,6 +107,7 @@ where
             config,
             handler_provider,
             managers,
+            telemetry,
         }
     }
 }
@@ -151,7 +154,9 @@ where
                 for element in partitions.elements() {
                     let topic = Topic::from(element.topic());
                     let partition = element.partition();
+
                     info!("assigning {topic}:{partition}");
+                    self.telemetry.partition_assigned(topic, partition);
 
                     let mut managers = self.managers.write();
 
@@ -196,6 +201,8 @@ where
 
                     // Queue shutdown task
                     shutdown_futures.push(manager.shutdown());
+
+                    self.telemetry.partition_revoked(topic, partition);
                 }
 
                 // Wait for all shutdowns to complete concurrently

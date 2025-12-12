@@ -6,21 +6,58 @@
 //! custom error type for handling configuration-related errors.
 
 use crate::Topic;
-use crate::consumer::failure::retry::{
+use crate::cassandra::{
+    CassandraConfiguration,
+    config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
+};
+use crate::consumer::middleware::defer::{
+    DeferConfigError, DeferConfiguration, DeferConfigurationBuilder,
+};
+use crate::consumer::middleware::monopolization::{
+    MonopolizationConfiguration, MonopolizationConfigurationBuilder,
+    MonopolizationConfigurationBuilderError,
+};
+use crate::consumer::middleware::retry::{
     RetryConfiguration, RetryConfigurationBuilder, RetryConfigurationBuilderError,
 };
-use crate::consumer::failure::topic::{
+use crate::consumer::middleware::scheduler::{
+    SchedulerConfigurationBuilder, SchedulerConfigurationBuilderError, SchedulerInitError,
+};
+use crate::consumer::middleware::timeout::{
+    TimeoutConfigurationBuilder, TimeoutConfigurationBuilderError,
+};
+use crate::consumer::middleware::topic::{
     FailureTopicConfiguration, FailureTopicConfigurationBuilder,
     FailureTopicConfigurationBuilderError,
 };
 use crate::consumer::{
-    ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerConfigurationBuilderError,
+    CommonMiddlewareConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
+    ConsumerConfigurationBuilderError,
 };
 use crate::high_level::mode::Mode;
-use crate::timers::store::cassandra::{
-    CassandraConfiguration, CassandraConfigurationBuilder, CassandraConfigurationBuilderError,
-};
 use thiserror::Error;
+
+/// Parameters for building a mode configuration.
+pub(crate) struct ModeConfigurationBuildParams<'a> {
+    /// The operational mode.
+    pub mode: Mode,
+    /// Builder for the consumer configuration.
+    pub consumer_builder: &'a ConsumerConfigurationBuilder,
+    /// Builder for the retry configuration.
+    pub retry_builder: &'a RetryConfigurationBuilder,
+    /// Builder for the failure topic configuration.
+    pub failure_topic_builder: &'a FailureTopicConfigurationBuilder,
+    /// Builder for the scheduler configuration.
+    pub scheduler_builder: &'a SchedulerConfigurationBuilder,
+    /// Builder for the monopolization configuration.
+    pub monopolization_builder: &'a MonopolizationConfigurationBuilder,
+    /// Builder for the defer configuration.
+    pub defer_builder: &'a DeferConfigurationBuilder,
+    /// Builder for the timeout configuration.
+    pub timeout_builder: &'a TimeoutConfigurationBuilder,
+    /// Builder for the Cassandra configuration.
+    pub cassandra_builder: &'a CassandraConfigurationBuilder,
+}
 
 /// Configuration for timer storage backends.
 #[derive(Debug)]
@@ -40,6 +77,12 @@ pub enum ModeConfiguration {
         consumer: ConsumerConfiguration,
         /// The retry configuration.
         retry: RetryConfiguration,
+        /// Monopolization detection configuration.
+        monopolization: MonopolizationConfiguration,
+        /// Defer middleware configuration.
+        defer: DeferConfiguration,
+        /// Common middleware configuration (scheduler, timeout).
+        common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -51,6 +94,8 @@ pub enum ModeConfiguration {
         retry: RetryConfiguration,
         /// The failure topic configuration.
         failure_topic: FailureTopicConfiguration,
+        /// Common middleware configuration (scheduler, timeout).
+        common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
@@ -58,22 +103,20 @@ pub enum ModeConfiguration {
     BestEffort {
         /// The consumer configuration.
         consumer: ConsumerConfiguration,
+        /// Common middleware configuration (scheduler, timeout).
+        common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
         trigger_store: TriggerStoreConfiguration,
     },
 }
 
 impl ModeConfiguration {
-    /// Builds a new `ModeConfiguration` based on the provided mode and
-    /// configuration builders.
+    /// Builds a new `ModeConfiguration` based on the provided parameters.
     ///
     /// # Arguments
     ///
-    /// * `mode` - The operational mode for the configuration.
-    /// * `consumer_builder` - Builder for the consumer configuration.
-    /// * `retry_builder` - Builder for the retry configuration.
-    /// * `failure_topic_builder` - Builder for the failure topic configuration.
-    /// * `cassandra_builder` - Builder for the Cassandra configuration.
+    /// * `params` - The build parameters containing all required configuration
+    ///   builders.
     ///
     /// # Returns
     ///
@@ -84,40 +127,50 @@ impl ModeConfiguration {
     ///
     /// Returns an error if any of the configuration builds fail.
     pub(crate) fn build(
-        mode: Mode,
-        consumer_builder: &ConsumerConfigurationBuilder,
-        retry_builder: &RetryConfigurationBuilder,
-        failure_topic_builder: &FailureTopicConfigurationBuilder,
-        cassandra_builder: &CassandraConfigurationBuilder,
+        params: &ModeConfigurationBuildParams,
     ) -> Result<Self, ModeConfigurationError> {
-        let consumer = consumer_builder.build()?;
-        let retry = retry_builder.build()?;
+        let consumer = params.consumer_builder.build()?;
+        let retry = params.retry_builder.build()?;
+        let scheduler = params.scheduler_builder.build()?;
+        let timeout = params.timeout_builder.build()?;
+
+        // Build common middleware configuration
+        let common = CommonMiddlewareConfiguration { scheduler, timeout };
 
         // Create trigger store configuration based on mock mode
         let trigger_store = if consumer.mock {
             TriggerStoreConfiguration::InMemory
         } else {
-            let cassandra_config = cassandra_builder.build()?;
+            let cassandra_config = params.cassandra_builder.build()?;
             TriggerStoreConfiguration::Cassandra(cassandra_config)
         };
 
-        Ok(match mode {
-            Mode::Pipeline => Self::Pipeline {
-                consumer,
-                retry,
-                trigger_store,
-            },
+        Ok(match params.mode {
+            Mode::Pipeline => {
+                let monopolization = params.monopolization_builder.build()?;
+                let defer = params.defer_builder.clone().build()?;
+                Self::Pipeline {
+                    consumer,
+                    retry,
+                    monopolization,
+                    defer,
+                    common,
+                    trigger_store,
+                }
+            }
             Mode::LowLatency => {
-                let failure_topic = failure_topic_builder.build()?;
+                let failure_topic = params.failure_topic_builder.build()?;
                 Self::LowLatency {
                     consumer,
                     retry,
                     failure_topic,
+                    common,
                     trigger_store,
                 }
             }
             Mode::BestEffort => Self::BestEffort {
                 consumer,
+                common,
                 trigger_store,
             },
         })
@@ -131,7 +184,7 @@ impl ModeConfiguration {
     #[must_use]
     pub fn configured_topics(&self) -> Vec<Topic> {
         match self {
-            Self::Pipeline { consumer, .. } | ModeConfiguration::BestEffort { consumer, .. } => {
+            Self::Pipeline { consumer, .. } | Self::BestEffort { consumer, .. } => {
                 subscription(consumer).collect()
             }
             Self::LowLatency {
@@ -169,9 +222,9 @@ impl ModeConfiguration {
     #[must_use]
     pub fn consumer_config(&self) -> &ConsumerConfiguration {
         match self {
-            ModeConfiguration::Pipeline { consumer, .. }
-            | ModeConfiguration::LowLatency { consumer, .. }
-            | ModeConfiguration::BestEffort { consumer, .. } => consumer,
+            Self::Pipeline { consumer, .. }
+            | Self::LowLatency { consumer, .. }
+            | Self::BestEffort { consumer, .. } => consumer,
         }
     }
 }
@@ -190,6 +243,26 @@ pub enum ModeConfigurationError {
     /// Error when the failure topic configuration is invalid.
     #[error("invalid failure topic configuration: {0:#}")]
     FailureTopic(#[from] FailureTopicConfigurationBuilderError),
+
+    /// Error when the scheduler configuration builder fails.
+    #[error("invalid scheduler configuration: {0:#}")]
+    SchedulerConfigurationBuilder(#[from] SchedulerConfigurationBuilderError),
+
+    /// Error when the scheduler initialization fails.
+    #[error("scheduler initialization failed: {0:#}")]
+    Scheduler(#[from] SchedulerInitError),
+
+    /// Error when the monopolization configuration builder fails.
+    #[error("invalid monopolization configuration: {0:#}")]
+    MonopolizationConfigurationBuilder(#[from] MonopolizationConfigurationBuilderError),
+
+    /// Error when the defer configuration builder fails.
+    #[error("invalid defer configuration: {0:#}")]
+    DeferConfiguration(#[from] DeferConfigError),
+
+    /// Error when the timeout configuration builder fails.
+    #[error("invalid timeout configuration: {0:#}")]
+    TimeoutConfigurationBuilder(#[from] TimeoutConfigurationBuilderError),
 
     /// Error when the Cassandra configuration is invalid.
     #[error("invalid cassandra configuration: {0:#}")]

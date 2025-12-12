@@ -13,7 +13,7 @@ license = "UNLICENSED"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/cincpro/prosody"
-version = "0.10.8"
+version = "0.11.0"
 
 [dependencies]
 ahash = "0.8"
@@ -22,7 +22,7 @@ arc-swap = "1.7"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
-axum-extra = "0.10"
+axum-extra = { version = "0.12", features = ["routing"] }
 chrono = "0.4"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
@@ -32,16 +32,20 @@ fixedstr = { version = "0.5", features = ["flex-str"] }
 futures = "0.3"
 humantime = "2.2"
 internment = "0.8"
+intervallum = "1.4"
 nohash-hasher = "0.2"
-opentelemetry = "0.30"
-opentelemetry-otlp = { version = "0.30", features = [
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", features = [
     "grpc-tonic",
     "http-json",
     "http-proto",
 ] }
-opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
+paste = "1.0"
 pin-project = "1.1"
+portable-atomic = { version = "1.0", features = ["float"] }
+quanta = "0.12"
 quick_cache = "0.6"
 rand = "0.9"
 rdkafka = { version = "0.38", features = ["tracing"] }
@@ -51,13 +55,14 @@ scylla = { version = "1.2", features = ["chrono-04"] }
 serde = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
-simd-json = { version = "0.16", features = ["serde_impl"], optional = true }
+simd-json = { version = "0.17", features = ["serde_impl"], optional = true }
+smallvec = { version = "1.15", features = ["const_generics", "union"] }
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["macros", "sync"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["time"] }
 tracing = { version = "0.1", features = ["log"] }
-tracing-opentelemetry = "0.31"
+tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.17", features = ["v5"] }
 validator = { version = "0.20", features = ["derive"] }
@@ -73,7 +78,7 @@ ssl = ["rdkafka/ssl"]
 ssl-vendored = ["rdkafka/ssl-vendored"]
 
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
-simd-json = { version = "0.16", features = ["serde_impl"] }
+simd-json = { version = "0.17", features = ["serde_impl"] }
 
 [dev-dependencies]
 color-eyre = "0.6"
@@ -106,6 +111,7 @@ expect_used = "deny"
 format_push_string = "warn"
 if_then_some_else_none = "warn"
 impl_trait_in_params = "warn"
+implicit_clone = "warn"
 missing_assert_message = "warn"
 module_name_repetitions = "allow"
 multiple_inherent_impl = "warn"
@@ -123,7 +129,6 @@ self_named_module_files = "warn"
 semicolon_outside_block = "warn"
 str_to_string = "warn"
 string_lit_chars_any = "warn"
-string_to_string = "warn"
 todo = "warn"
 try_err = "warn"
 unimplemented = "warn"

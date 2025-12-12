@@ -18,18 +18,20 @@ use crate::consumer::event_context::{EventContext, TimerContext};
 use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
-use crate::consumer::{EventHandler, Keyed, Uncommitted};
+use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
-use crate::timers::{PendingTimer, TimerManager, UncommittedTimer};
+use crate::timers::{PendingTimer, TimerManager};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
+use ahash::RandomState;
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::stream::select;
 use futures::{Stream, StreamExt, pin_mut};
+use quick_cache::UnitWeighter;
 use quick_cache::unsync::Cache;
 use serde_json::Value;
 use std::future::{Ready, ready};
@@ -40,7 +42,7 @@ use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
@@ -95,9 +97,6 @@ pub struct PartitionConfiguration<T> {
 
     /// Shared counter tracking watermark updates
     pub watermark_version: Arc<CachePadded<AtomicUsize>>,
-
-    /// Global concurrency limit
-    pub global_limit: Arc<Semaphore>,
 
     /// Timer store
     pub trigger_store: T,
@@ -393,44 +392,43 @@ async fn handle_messages<T, S>(
 
     // Define how to process each message
     let process = |event: UncommittedEvent<S>| async {
-        // Acquire a semaphore to bound global concurrency
-        debug!(?event, "acquiring permit");
-        let _permit = match config.global_limit.acquire().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                error!(
-                    ?event,
-                    "failed to acquire permit: {error:#}; aborting message"
-                );
-                event.abort().await;
-                return;
-            }
-        };
-
         // Process message with handler
-        debug!(?event, "permit acquired; calling handler");
-        let context = TimerContext::new(
-            event.key().clone(),
-            shutdown_rx.clone(),
-            timer_manager.clone(),
-        );
+        debug!(?event, "calling handler");
 
-        let cloned_context = context.clone();
         match event {
             UncommittedEvent::Message(message) => {
+                let context = TimerContext::new(
+                    message.key().clone(),
+                    shutdown_rx.clone(),
+                    timer_manager.clone(),
+                );
+                let cloned_context = context.clone();
+
                 let _guard = message.process_scope();
-                handler.on_message(context, message).await;
+                handler
+                    .on_message(context, message, DemandType::Normal)
+                    .await;
+
+                // Prevent the context from being used outside of processing
+                cloned_context.invalidate();
             }
             UncommittedEvent::Timer(timer) => {
-                if timer.is_active().await {
-                    let _guard = timer.process_scope();
-                    handler.on_timer(context, timer).await;
+                if let Some(firing) = timer.fire().await {
+                    let context = TimerContext::new(
+                        firing.key().clone(),
+                        shutdown_rx.clone(),
+                        timer_manager.clone(),
+                    );
+                    let cloned_context = context.clone();
+
+                    let _guard = firing.process_scope();
+                    handler.on_timer(context, firing, DemandType::Normal).await;
+
+                    // Prevent the context from being used outside of processing
+                    cloned_context.invalidate();
                 }
             }
         }
-
-        // Prevent the context from being used outside of processing
-        cloned_context.invalidate();
     };
 
     // Create key manager to handle concurrent processing while maintaining key
@@ -475,7 +473,7 @@ fn build_message_stream<T>(
     mut message_rx: Receiver<ConsumerMessage>,
     group_id: &str,
     highest_offset_seen: &mut i64,
-    idempotence_cache: &mut Option<Cache<Key, EventId>>,
+    idempotence_cache: &mut Option<Cache<Key, EventId, UnitWeighter, RandomState>>,
     allowed_events: Option<&AhoCorasick>,
 ) -> impl Stream<Item = UncommittedEvent<T>>
 where
@@ -692,7 +690,7 @@ async fn filter_event_type(
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out as a duplicate
 async fn filter_duplicate(
-    idempotence_cache: &mut Option<Cache<Key, EventId>>,
+    idempotence_cache: &mut Option<Cache<Key, EventId, UnitWeighter, RandomState>>,
     message: UncommittedMessage,
 ) -> Option<UncommittedMessage> {
     // Skip deduplication if no cache is configured

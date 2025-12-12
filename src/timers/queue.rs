@@ -85,25 +85,76 @@ impl TriggerQueue {
         Some(expired.into_inner())
     }
 
-    /// Removes a scheduled [`Trigger`] from both the delay queue and the active
-    /// registry.
+    /// Removes a [`Trigger`] from both the delay queue and the active registry.
     ///
-    /// If the trigger was not previously scheduled, this call has no effect.
+    /// Handles two cases:
+    /// 1. Timer is still in the delay queue: removes from both queue and
+    ///    [`ActiveTriggers`]
+    /// 2. Timer was delivered but not yet fired: removes from
+    ///    [`ActiveTriggers`] only (queue removal is a no-op)
+    ///
+    /// This is idempotent: calling remove on an already-removed trigger has no
+    /// effect.
     ///
     /// # Arguments
     ///
     /// * `trigger` - The trigger to remove.
     pub async fn remove(&mut self, trigger: &Trigger) {
-        // Look up and remove the trigger's delay queue key.
-        let Some((owned_trigger, queue_key)) = self.queue_keys.remove_entry(trigger) else {
+        // Remove from delay queue if present (may have already been delivered).
+        if let Some(queue_key) = self.queue_keys.remove(trigger) {
+            self.queue.remove(&queue_key);
+        }
+
+        // Always remove from ActiveTriggers. This handles the case where the
+        // timer was delivered from the queue (removed from queue_keys) but not
+        // yet transitioned to Firing via fire(). The remove is idempotent.
+        self.active
+            .remove(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+    }
+
+    /// Adds a [`Trigger`] to the `DelayQueue` without modifying
+    /// `ActiveTriggers`.
+    ///
+    /// Used for rescheduling: the caller has already set the state to
+    /// `FiringRescheduled` and only needs the timer re-added to the queue.
+    /// If the same [`Trigger`] is already in the queue, this is a no-op.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The timer event to add to the queue.
+    pub fn insert_queue_only(&mut self, trigger: Trigger) {
+        // Skip if the trigger is already in the queue.
+        let Entry::Vacant(vacant) = self.queue_keys.entry(trigger.clone()) else {
             return;
         };
 
-        // Remove from the delay queue and deactivate in the registry.
+        // Compute delay until trigger time, defaulting to zero if in the past.
+        let delay = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
+
+        // Schedule the trigger and record its key in the map.
+        let queue_key = self.queue.insert(trigger, delay);
+        vacant.insert(queue_key);
+    }
+
+    /// Removes a [`Trigger`] from the `DelayQueue` without modifying
+    /// `ActiveTriggers`.
+    ///
+    /// Used for canceling a reschedule: the caller transitions the state
+    /// from `FiringRescheduled` back to `Firing` and only needs the timer
+    /// removed from the queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The trigger to remove from the queue.
+    pub fn remove_queue_only(&mut self, trigger: &Trigger) {
+        // Look up and remove the trigger's delay queue key.
+        let Some(queue_key) = self.queue_keys.remove(trigger) else {
+            return;
+        };
+
+        // Remove from the delay queue only, not from ActiveTriggers.
         self.queue.remove(&queue_key);
-        self.active
-            .remove(&owned_trigger.key, owned_trigger.time)
-            .await;
     }
 }
 
@@ -115,6 +166,7 @@ mod tests {
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
     use crate::timers::scheduler::TimerSchedulerError;
+    use crate::timers::{TimerType, Trigger};
     use tokio::task::coop::cooperative;
     use tokio::time::{Duration, advance, pause};
     use tracing::Span;
@@ -130,7 +182,7 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(1))
             .map_err(TimerSchedulerError::DateTime)?; // 1 second in the future
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;
@@ -158,7 +210,7 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(5))
             .map_err(TimerSchedulerError::DateTime)?; // 5 seconds in the future
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;
@@ -167,7 +219,12 @@ mod tests {
         triggers.remove(&trigger).await;
 
         // Verify the trigger is no longer active
-        assert!(!triggers.active_triggers().contains(&key, time).await);
+        assert!(
+            !triggers
+                .active_triggers()
+                .contains(&key, time, TimerType::Application)
+                .await
+        );
 
         // Advance time by 5 seconds to simulate the trigger's original expiration time
         advance(Duration::from_secs(5)).await;
@@ -189,14 +246,24 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(1))
             .map_err(TimerSchedulerError::DateTime)?; // 1 second in the future
-        let trigger_first = Trigger::new(key_first.clone(), time_first, Span::current());
+        let trigger_first = Trigger::new(
+            key_first.clone(),
+            time_first,
+            TimerType::Application,
+            Span::current(),
+        );
 
         let key_second = Key::from("key2");
         let time_second = CompactDateTime::now()
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(2))
             .map_err(TimerSchedulerError::DateTime)?; // 2 seconds in the future
-        let trigger_second = Trigger::new(key_second.clone(), time_second, Span::current());
+        let trigger_second = Trigger::new(
+            key_second.clone(),
+            time_second,
+            TimerType::Application,
+            Span::current(),
+        );
 
         // Insert both triggers
         triggers.insert(trigger_first.clone()).await;
@@ -230,19 +297,29 @@ mod tests {
             .map_err(TimerSchedulerError::DateTime)?
             .add_duration(CompactDuration::new(5))
             .map_err(TimerSchedulerError::DateTime)?; // 5 seconds in the future
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger
         triggers.insert(trigger.clone()).await;
 
         // Verify the trigger is active
-        assert!(triggers.active_triggers().contains(&key, time).await);
+        assert!(
+            triggers
+                .active_triggers()
+                .contains(&key, time, TimerType::Application)
+                .await
+        );
 
         // Remove the trigger
         triggers.remove(&trigger).await;
 
         // Verify the trigger is no longer active
-        assert!(!triggers.active_triggers().contains(&key, time).await);
+        assert!(
+            !triggers
+                .active_triggers()
+                .contains(&key, time, TimerType::Application)
+                .await
+        );
 
         Ok(())
     }

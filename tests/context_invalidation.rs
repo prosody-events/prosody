@@ -5,14 +5,17 @@
 //! partition ownership changes.
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::event_context::{BoxEventContext, EventContext},
     consumer::message::UncommittedMessage,
-    consumer::{ConsumerConfiguration, EventHandler, ProsodyConsumer, Uncommitted},
+    consumer::middleware::CloneProvider,
+    consumer::{ConsumerConfiguration, DemandType, EventHandler, ProsodyConsumer, Uncommitted},
     producer::{ProducerConfiguration, ProsodyProducer},
-    timers::{UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
+    telemetry::Telemetry,
+    timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
 use serde_json::json;
 use tokio::sync::mpsc::{Sender, channel};
@@ -37,7 +40,7 @@ impl ContextInvalidationHandler {
 }
 
 impl EventHandler for ContextInvalidationHandler {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage)
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage, _demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -57,7 +60,7 @@ impl EventHandler for ContextInvalidationHandler {
         // When this method returns, the context should be invalidated
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -84,14 +87,14 @@ impl EventHandler for ContextInvalidationHandler {
 #[tokio::test]
 async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
     // Initialize logging
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique topic for the test
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Setup admin client and create topic
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()
@@ -119,10 +122,11 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
         .build()?;
 
     // Create consumer
-    let consumer = ProsodyConsumer::new::<ContextInvalidationHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        handler,
+        CloneProvider::new(handler),
+        Telemetry::new(),
     )
     .await?;
 
@@ -154,7 +158,10 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
     // Now try to use the cloned context - this should fail with InvalidContext
     let future_time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
 
-    match cloned_context.schedule(future_time).await {
+    match cloned_context
+        .schedule(future_time, TimerType::Application)
+        .await
+    {
         Ok(()) => {
             return Err(eyre!(
                 "UNEXPECTED: Cloned context usage succeeded when it should have failed"

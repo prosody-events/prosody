@@ -4,11 +4,14 @@
 
 use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
 };
 use serde_json::json;
 use tokio::sync::mpsc::channel;
@@ -34,13 +37,12 @@ mod common;
 /// Panics if initializing the tracing subscriber fails.
 #[tokio::test]
 async fn test_deduplication_of_same_event_id() -> Result<()> {
-    // Initialize compact tracing format
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Create a unique Kafka topic for isolated testing
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
 
     // Create the Kafka topic with a single partition and replica
     admin_client
@@ -72,10 +74,11 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
 
     // Initialize the producer and consumer
     let producer = ProsodyProducer::new(&producer_config)?;
-    let consumer = ProsodyConsumer::new::<TestHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        handler.clone(),
+        CloneProvider::new(handler.clone()),
+        Telemetry::new(),
     )
     .await?;
 

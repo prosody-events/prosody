@@ -34,10 +34,12 @@
 //! ```
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::consumer::message::UncommittedMessage;
+//! use prosody::consumer::middleware::CloneProvider;
 //! use prosody::consumer::{
-//!     ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
+//!     ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer, Uncommitted,
 //! };
 //! use prosody::high_level::config::TriggerStoreConfiguration;
+//! use prosody::telemetry::Telemetry;
 //! use prosody::timers::{UncommittedTimer, store::TriggerStore};
 //!
 //! // Implement your message handler
@@ -45,8 +47,12 @@
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
-//!     async fn on_message<C>(&self, context: C, message: UncommittedMessage)
-//!     where
+//!     async fn on_message<C>(
+//!         &self,
+//!         context: C,
+//!         message: UncommittedMessage,
+//!         _demand_type: DemandType,
+//!     ) where
 //!         C: EventContext,
 //!     {
 //!         // Process the message
@@ -56,7 +62,7 @@
 //!         message.commit().await;
 //!     }
 //!
-//!     async fn on_timer<C, U>(&self, context: C, timer: U)
+//!     async fn on_timer<C, U>(&self, context: C, timer: U, _demand_type: DemandType)
 //!     where
 //!         C: EventContext,
 //!         U: UncommittedTimer,
@@ -81,8 +87,15 @@
 //!     .subscribed_topics(vec!["my-topic".to_string()])
 //!     .build()?;
 //!
-//! let consumer =
-//!     ProsodyConsumer::new(&config, &TriggerStoreConfiguration::InMemory, MyHandler).await?;
+//! let telemetry = Telemetry::new();
+//!
+//! let consumer = ProsodyConsumer::new(
+//!     &config,
+//!     &TriggerStoreConfiguration::InMemory,
+//!     CloneProvider::new(MyHandler),
+//!     telemetry,
+//! )
+//! .await?;
 //!
 //! // The consumer will process messages until shutdown is called
 //! # Ok(())
@@ -138,35 +151,53 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::event_context::EventContext;
-use crate::consumer::failure::log::LogStrategy;
-use crate::consumer::failure::retry::{RetryConfiguration, RetryStrategy};
-use crate::consumer::failure::shutdown::ShutdownStrategy;
-use crate::consumer::failure::topic::{FailureTopicConfiguration, FailureTopicStrategy};
-use crate::consumer::failure::{FailureStrategy, FallibleHandler};
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
+use crate::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};
+use crate::consumer::middleware::log::LogMiddleware;
+use crate::consumer::middleware::monopolization::{
+    MonopolizationConfiguration, MonopolizationInitError, MonopolizationMiddleware,
+};
+use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
+use crate::consumer::middleware::scheduler::{
+    SchedulerConfiguration, SchedulerInitError, SchedulerMiddleware,
+};
+use crate::consumer::middleware::shutdown::ShutdownMiddleware;
+use crate::consumer::middleware::telemetry::TelemetryMiddleware;
+use crate::consumer::middleware::timeout::{
+    TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
+};
+use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
+use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::poll;
-use crate::heartbeat::Heartbeat;
+use crate::consumer::storage::StorePair;
+use crate::heartbeat::HeartbeatRegistry;
 use crate::producer::ProsodyProducer;
+use crate::telemetry::Telemetry;
+use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
+use crate::timers::duration::CompactDurationError;
 use crate::timers::store::TriggerStore;
-use crate::timers::store::cassandra::{CassandraTriggerStore, CassandraTriggerStoreError};
-use crate::timers::store::memory::InMemoryTriggerStore;
+use crate::timers::store::cassandra::CassandraTriggerStoreError;
+use crate::timers::store::cassandra::cassandra_store;
+use crate::timers::store::memory::memory_store;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
 use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 
+pub mod decode;
 pub mod event_context;
 mod extractor;
-pub mod failure;
 mod kafka_context;
 pub mod message;
+pub mod middleware;
 mod partition;
 mod poll;
 mod probes;
+pub mod storage;
 
 /// Atomic counter for tracking changes in partition watermarks.
 ///
@@ -193,6 +224,22 @@ const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 
 /// Defines a type with an associated key.
 ///
+/// Represents the type of demand being processed.
+///
+/// Demand types allow the system to distinguish between normal processing
+/// and failure handling scenarios, enabling different processing behaviors
+/// for the same event type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemandType {
+    /// Normal demand represents the initial processing attempt of an event.
+    Normal,
+
+    /// Failure demand represents retry processing after a previous failure.
+    /// This is typically created by retry middleware when an event fails
+    /// and needs to be reprocessed.
+    Failure,
+}
+
 /// This trait is implemented by message types that have a key field,
 /// allowing key-based message routing and processing.
 pub trait Keyed {
@@ -281,6 +328,7 @@ pub trait EventHandler {
     /// * `context` - The message context providing metadata and shutdown
     ///   notification.
     /// * `message` - The uncommitted message to process.
+    /// * `demand_type` - Whether this is normal processing or failure retry.
     ///
     /// # Returns
     ///
@@ -289,6 +337,7 @@ pub trait EventHandler {
         &self,
         context: C,
         message: UncommittedMessage,
+        demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
         C: EventContext;
@@ -305,18 +354,24 @@ pub trait EventHandler {
     /// * `context` - The event processing context with access to timer
     ///   management
     /// * `timer` - The uncommitted timer event that fired
+    /// * `demand_type` - Whether this is normal processing or failure retry.
     ///
     /// # Processing Requirements
     ///
     /// Implementations must ensure that the timer is properly acknowledged:
-    /// - Call [`timer.commit()`] after successful processing
-    /// - Call [`timer.abort()`] if processing fails or should be retried
+    /// - Call `timer.commit()` after successful processing
+    /// - Call `timer.abort()` if processing fails or should be retried
     ///
     /// # Returns
     ///
     /// A future that resolves when timer processing is complete. Note that
     /// this future completing does not automatically commit the timer.
-    fn on_timer<C, T>(&self, context: C, timer: T) -> impl Future<Output = ()> + Send
+    fn on_timer<C, T>(
+        &self,
+        context: C,
+        timer: T,
+        demand_type: DemandType,
+    ) -> impl Future<Output = ()> + Send
     where
         C: EventContext,
         T: UncommittedTimer;
@@ -330,20 +385,6 @@ pub trait EventHandler {
     ///
     /// A future that resolves when the shutdown is complete.
     fn shutdown(self) -> impl Future<Output = ()> + Send;
-}
-
-/// Implements `HandlerProvider` for any `EventHandler` that is clonable.
-///
-/// This allows a single handler instance to be used for all partitions.
-impl<T> HandlerProvider for T
-where
-    T: EventHandler + Clone + Send + Sync + 'static,
-{
-    type Handler = Self;
-
-    fn handler_for_partition(&self, _: Topic, _: Partition) -> Self::Handler {
-        self.clone()
-    }
 }
 
 /// Configuration for the Kafka consumer.
@@ -398,21 +439,6 @@ pub struct ConsumerConfiguration {
     )]
     #[validate(length(min = 1_u64))]
     pub allowed_events: Option<Vec<String>>,
-
-    /// Maximum global concurrency limit.
-    ///
-    /// Environment variable: `PROSODY_MAX_CONCURRENCY`
-    /// Default: 32
-    ///
-    /// Controls the maximum number of messages that can be processed
-    /// concurrently across all partitions. This helps prevent resource
-    /// exhaustion.
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MAX_CONCURRENCY\", 32)?",
-        setter(into)
-    )]
-    #[validate(range(min = 1_usize))]
-    pub max_concurrency: usize,
 
     /// Maximum number of uncommitted messages.
     ///
@@ -541,8 +567,7 @@ pub struct ConsumerConfiguration {
     pub probe_port: Option<u16>,
 
     #[builder(
-        default = "from_duration_env_with_fallback(\"PROSODY_SLAB_SIZE\", Duration::from_secs(10 \
-                   * 60))?",
+        default = "from_duration_env_with_fallback(\"PROSODY_SLAB_SIZE\", Duration::from_secs(3600))?",
         setter(into)
     )]
     /// Duration for timer slab partitioning.
@@ -560,7 +585,7 @@ pub struct ConsumerConfiguration {
     ///
     /// # Default
     ///
-    /// Defaults to 10 minutes if not specified or if parsing from environment
+    /// Defaults to 1 hour if not specified or if parsing from environment
     /// fails.
     pub slab_size: Duration,
 }
@@ -607,6 +632,19 @@ impl ConsumerConfigurationBuilder {
     }
 }
 
+/// Configuration for middleware common to all consumer types.
+///
+/// Contains configurations for the telemetry, timeout, scheduler, and shutdown
+/// middleware that are applied to all consumer types (pipeline, low-latency,
+/// and best-effort).
+#[derive(Clone, Debug)]
+pub struct CommonMiddlewareConfiguration {
+    /// Scheduler configuration for fair work-conserving dispatch.
+    pub scheduler: SchedulerConfiguration,
+    /// Timeout configuration for handler execution limits.
+    pub timeout: TimeoutConfiguration,
+}
+
 /// High-level Kafka consumer implementation.
 ///
 /// `ProsodyConsumer` is the main entry point for consuming messages from Kafka
@@ -631,14 +669,115 @@ pub struct ProsodyConsumer {
     /// Runtime state of the consumer.
     #[educe(Debug(ignore))]
     runtime_state: Arc<Mutex<Option<RuntimeState>>>,
+
+    /// Heartbeat registry for consumer-level actors.
+    #[educe(Debug(ignore))]
+    heartbeats: HeartbeatRegistry,
+}
+
+/// Builds the common middleware stack applied to all consumer types.
+///
+/// Creates and layers the following middleware in order (innermost to
+/// outermost):
+/// 1. Telemetry middleware - records handler lifecycle events
+/// 2. Timeout middleware - enforces handler execution timeout
+/// 3. Scheduler middleware - fair work-conserving dispatch with concurrency
+///    limits
+/// 4. Shutdown middleware - stops processing during partition shutdown
+///
+/// # Arguments
+///
+/// * `config` - Common middleware configuration containing scheduler and
+///   timeout settings
+/// * `stall_threshold` - Duration from consumer config used to calculate
+///   default timeout
+/// * `telemetry` - Telemetry system for observability
+///
+/// # Returns
+///
+/// A middleware stack that can be further layered with consumer-specific
+/// middleware
+///
+/// # Errors
+///
+/// Returns a `ConsumerError` if middleware initialization fails
+fn build_common_middleware(
+    config: &CommonMiddlewareConfiguration,
+    stall_threshold: Duration,
+    telemetry: &Telemetry,
+) -> Result<impl HandlerMiddleware, ConsumerError> {
+    let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, telemetry)?;
+    let timeout_middleware = TimeoutMiddleware::new(&config.timeout, stall_threshold)?;
+    let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
+
+    // Layer common middleware: telemetry -> timeout -> scheduler -> shutdown
+    Ok(telemetry_middleware
+        .layer(timeout_middleware)
+        .layer(scheduler_middleware)
+        .layer(ShutdownMiddleware))
+}
+
+/// Helper function to initialize a consumer with a pre-built trigger store.
+///
+/// Used when sharing a `CassandraStore` between trigger and defer stores.
+fn initialize_consumer_with_store<T, S>(
+    consumer_config: &ConsumerConfiguration,
+    handler_provider: T,
+    trigger_store: S,
+    telemetry: &Telemetry,
+    heartbeats: HeartbeatRegistry,
+) -> Result<ProsodyConsumer, ConsumerError>
+where
+    T: HandlerProvider,
+    S: TriggerStore,
+{
+    // Validate the configuration
+    consumer_config.validate()?;
+
+    // Initialize shared state
+    let watermark_version: Arc<WatermarkVersion> = Arc::default();
+    let managers: Arc<Managers> = Arc::default();
+    let shutdown: Arc<AtomicBool> = Arc::default();
+    let telemetry_sender = telemetry.sender();
+
+    // Build event type search automaton for filtering messages
+    let allowed_events = consumer_config
+        .allowed_events
+        .as_ref()
+        .map(|prefixes| {
+            AhoCorasick::builder()
+                .start_kind(StartKind::Anchored)
+                .build(prefixes)
+        })
+        .transpose()?;
+
+    let (managers, runtime_state) = initialize_consumer(ConsumerInitParams {
+        config: consumer_config.clone(),
+        handler_provider,
+        trigger_store,
+        watermark_version: watermark_version.clone(),
+        managers: managers.clone(),
+        allowed_events,
+        telemetry: telemetry_sender,
+        shutdown: shutdown.clone(),
+        heartbeats: heartbeats.clone(),
+    })?;
+
+    Ok(ProsodyConsumer {
+        shutdown,
+        managers,
+        runtime_state,
+        heartbeats,
+    })
 }
 
 impl ProsodyConsumer {
-    /// Creates a new `ProsodyConsumer` instance.
+    /// Creates a new `ProsodyConsumer` with the given configuration and handler
+    /// provider.
     ///
-    /// This is the low-level constructor that takes a custom handler provider.
-    /// For common use cases, consider using the specialized constructors like
-    /// `pipeline_consumer` or `low_latency_consumer`.
+    /// This is the standard constructor which is usually wrapped by
+    /// higher-level functions like `pipeline_consumer` or
+    /// `low_latency_consumer`.
     ///
     /// # Arguments
     ///
@@ -662,6 +801,7 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         handler_provider: T,
+        telemetry: Telemetry,
     ) -> Result<Self, ConsumerError>
     where
         T: HandlerProvider,
@@ -673,6 +813,11 @@ impl ProsodyConsumer {
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
         let managers: Arc<Managers> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
+        let telemetry_sender = telemetry.sender();
+        let heartbeats = HeartbeatRegistry::new(
+            consumer_config.group_id.clone(),
+            consumer_config.stall_threshold,
+        );
 
         // Build event type search automaton for filtering messages
         let allowed_events = consumer_config
@@ -686,30 +831,39 @@ impl ProsodyConsumer {
             .transpose()?;
 
         let (managers, runtime_state) = match trigger_store_config {
-            TriggerStoreConfiguration::InMemory => initialize_consumer(
-                consumer_config,
+            TriggerStoreConfiguration::InMemory => initialize_consumer(ConsumerInitParams {
+                config: consumer_config.clone(),
                 handler_provider,
-                InMemoryTriggerStore::new(),
-                watermark_version.clone(),
-                managers.clone(),
+                trigger_store: memory_store(),
+                watermark_version: watermark_version.clone(),
+                managers: managers.clone(),
                 allowed_events,
-                shutdown.clone(),
-            )?,
-            TriggerStoreConfiguration::Cassandra(cassandra_config) => initialize_consumer(
-                consumer_config,
-                handler_provider,
-                CassandraTriggerStore::new(cassandra_config).await?,
-                watermark_version.clone(),
-                managers.clone(),
-                allowed_events,
-                shutdown.clone(),
-            )?,
+                telemetry: telemetry_sender,
+                shutdown: shutdown.clone(),
+                heartbeats: heartbeats.clone(),
+            })?,
+            TriggerStoreConfiguration::Cassandra(cassandra_config) => {
+                let slab_size = consumer_config.slab_size.try_into()?;
+                let trigger_store = cassandra_store(cassandra_config, slab_size).await?;
+                initialize_consumer(ConsumerInitParams {
+                    config: consumer_config.clone(),
+                    handler_provider,
+                    trigger_store,
+                    watermark_version: watermark_version.clone(),
+                    managers: managers.clone(),
+                    allowed_events,
+                    telemetry: telemetry_sender,
+                    shutdown: shutdown.clone(),
+                    heartbeats: heartbeats.clone(),
+                })?
+            }
         };
 
         Ok(Self {
             shutdown,
             managers,
             runtime_state,
+            heartbeats,
         })
     }
 
@@ -718,13 +872,16 @@ impl ProsodyConsumer {
     ///
     /// Pipeline processing emphasizes reliability with automatic retries on
     /// failure. Messages that fail processing will be retried with
-    /// exponential backoff.
+    /// exponential backoff. Includes monopolization detection to prevent
+    /// single keys from consuming excessive processing time.
     ///
     /// # Arguments
     ///
     /// * `consumer_config` - The consumer configuration.
     /// * `trigger_store_config` - The trigger store configuration.
     /// * `retry_config` - The retry configuration.
+    /// * `monopolization_config` - The monopolization detection configuration.
+    /// * `common_config` - The common middleware configuration.
     /// * `handler` - The fallible message handler.
     ///
     /// # Returns
@@ -739,15 +896,97 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
+        monopolization_config: MonopolizationConfiguration,
+        defer_config: DeferConfiguration,
+        common_config: &CommonMiddlewareConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let retry_strategy = RetryStrategy::new(retry_config)?;
-        let strategy = ShutdownStrategy.and_then(retry_strategy);
-        let handler = strategy.with_handler(handler);
-        Self::new(consumer_config, trigger_store_config, handler).await
+        // Create both stores atomically - ensures trigger and defer stores match
+        let slab_size = consumer_config.slab_size.try_into()?;
+        let stores = StorePair::new(trigger_store_config, slab_size, consumer_config.mock).await?;
+
+        let telemetry = Telemetry::new();
+        let retry_middleware = RetryMiddleware::new(retry_config)?;
+        let monopolization_middleware =
+            MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
+        let heartbeats = HeartbeatRegistry::new(
+            consumer_config.group_id.clone(),
+            consumer_config.stall_threshold,
+        );
+
+        // Build the complete middleware stack and consumer
+        // StorePair enum guarantees stores match - no unreachable!() needed
+        match stores {
+            StorePair::Memory {
+                trigger: trigger_store,
+                defer: defer_store,
+            } => {
+                let defer_middleware = DeferMiddleware::new(
+                    defer_config,
+                    consumer_config,
+                    &common_config.scheduler,
+                    defer_store,
+                    &telemetry,
+                    &heartbeats,
+                )?;
+
+                let common_middleware = build_common_middleware(
+                    common_config,
+                    consumer_config.stall_threshold,
+                    &telemetry,
+                )?;
+
+                let provider = common_middleware
+                    .layer(monopolization_middleware)
+                    .layer(defer_middleware)
+                    .layer(retry_middleware)
+                    .into_provider(handler);
+
+                initialize_consumer_with_store(
+                    consumer_config,
+                    provider,
+                    trigger_store,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
+            StorePair::Cassandra {
+                trigger: trigger_store,
+                defer: defer_store,
+            } => {
+                let defer_middleware = DeferMiddleware::new(
+                    defer_config,
+                    consumer_config,
+                    &common_config.scheduler,
+                    defer_store,
+                    &telemetry,
+                    &heartbeats,
+                )?;
+
+                let common_middleware = build_common_middleware(
+                    common_config,
+                    consumer_config.stall_threshold,
+                    &telemetry,
+                )?;
+
+                let provider = common_middleware
+                    .layer(monopolization_middleware)
+                    .layer(defer_middleware)
+                    .layer(retry_middleware)
+                    .into_provider(handler);
+
+                initialize_consumer_with_store(
+                    consumer_config,
+                    provider,
+                    trigger_store,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
+        }
     }
 
     /// Creates a new `ProsodyConsumer` with a low-latency strategy.
@@ -783,31 +1022,34 @@ impl ProsodyConsumer {
         trigger_store_config: &TriggerStoreConfiguration,
         retry_config: RetryConfiguration,
         topic_config: FailureTopicConfiguration,
+        common_config: &CommonMiddlewareConfiguration,
         producer: ProsodyProducer,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
+        let telemetry = Telemetry::new();
         let group_id = consumer_config.group_id.clone();
-        let retry_strategy = RetryStrategy::new(retry_config)?;
-        let topic_strategy = FailureTopicStrategy::new(topic_config, group_id, producer)?;
+        let retry_middleware = RetryMiddleware::new(retry_config)?;
+        let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
+        let common_middleware =
+            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
 
-        // Compose strategies: shutdown → retry → failure topic → retry
-        let strategy = ShutdownStrategy // stop processing if shutting down partition
-            .and_then(retry_strategy.clone()) // retry processing up to limit
-            .and_then(topic_strategy) // write to failure topic
-            .and_then(retry_strategy); // retry writing to failure topic
+        let provider = common_middleware
+            .layer(retry_middleware.clone()) // retry the task a fixed number of times
+            .layer(topic_middleware) // write to failure topic
+            .layer(retry_middleware) // retry writing to the failure topic indefinitely
+            .into_provider(handler);
 
-        let handler = strategy.with_handler(handler);
-        Self::new(consumer_config, trigger_store_config, handler).await
+        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
     }
 
-    /// Creates a new `ProsodyConsumer` with a logging strategy for failure
+    /// Creates a new `ProsodyConsumer` with logging middleware for failure
     /// handling.
     ///
-    /// The best-effort strategy is the simplest approach - it tries to process
-    /// messages once, logs any failures, and moves on. This strategy should
+    /// The best-effort approach is the simplest - it tries to process
+    /// messages once, logs any failures, and moves on. This approach should
     /// only be used for development or for services where occasional
     /// message loss is acceptable.
     ///
@@ -828,18 +1070,22 @@ impl ProsodyConsumer {
     pub async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
+        common_config: &CommonMiddlewareConfiguration,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let strategy = ShutdownStrategy.and_then(LogStrategy);
-        Self::new(
-            consumer_config,
-            trigger_store_config,
-            strategy.with_handler(handler),
-        )
-        .await
+        let telemetry = Telemetry::new();
+        let common_middleware =
+            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
+
+        // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then log
+        let provider = common_middleware
+            .layer(LogMiddleware)
+            .into_provider(handler);
+
+        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
     }
 
     /// Returns the number of currently assigned partitions.
@@ -856,17 +1102,19 @@ impl ProsodyConsumer {
         get_assigned_partition_count(&self.managers)
     }
 
-    /// Checks if any assigned partition is stalled.
+    /// Checks if any assigned partition or consumer-level actor is stalled.
     ///
     /// A partition is considered stalled if it hasn't processed messages
-    /// within the configured stall threshold duration.
+    /// within the configured stall threshold duration. Consumer-level actors
+    /// (main poll loop, defer middleware) are also monitored for stalls.
     ///
     /// # Returns
     ///
-    /// `true` if any partition is stalled, `false` otherwise.
+    /// `true` if any partition or consumer-level actor is stalled, `false`
+    /// otherwise.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
-        get_is_stalled(&self.managers)
+        get_is_stalled(&self.managers) || self.heartbeats.any_stalled()
     }
 
     /// Initiates a graceful shutdown of the Kafka consumer.
@@ -949,6 +1197,31 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
 ///
 /// # Returns
 ///
+/// Parameters for initializing a consumer
+struct ConsumerInitParams<T, S>
+where
+    T: HandlerProvider,
+    S: TriggerStore,
+{
+    config: ConsumerConfiguration,
+    handler_provider: T,
+    trigger_store: S,
+    watermark_version: Arc<WatermarkVersion>,
+    managers: Arc<Managers>,
+    allowed_events: Option<AhoCorasick>,
+    telemetry: TelemetrySender,
+    shutdown: Arc<AtomicBool>,
+    heartbeats: HeartbeatRegistry,
+}
+
+/// Initializes a Prosody consumer with the provided parameters.
+///
+/// # Arguments
+///
+/// * `params` - Consumer initialization parameters
+///
+/// # Returns
+///
 /// A Result containing the initialized consumer components (managers and
 /// runtime state) or a `ConsumerError` if initialization fails.
 ///
@@ -960,13 +1233,7 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
 /// - Topic subscription fails
 /// - The probe server cannot be started (if enabled)
 fn initialize_consumer<T, S>(
-    config: &ConsumerConfiguration,
-    handler_provider: T,
-    trigger_store: S,
-    watermark_version: Arc<WatermarkVersion>,
-    managers: Arc<Managers>,
-    allowed_events: Option<AhoCorasick>,
-    shutdown: Arc<AtomicBool>,
+    params: ConsumerInitParams<T, S>,
 ) -> Result<ConsumerComponents, ConsumerError>
 where
     T: HandlerProvider,
@@ -974,19 +1241,20 @@ where
 {
     // Create the consumer context with the message handler and shared state
     let context = Context::new(
-        config,
-        handler_provider,
-        trigger_store,
-        watermark_version.clone(),
-        managers.clone(),
-        allowed_events,
+        &params.config,
+        params.handler_provider,
+        params.trigger_store,
+        params.watermark_version.clone(),
+        params.managers.clone(),
+        params.allowed_events,
+        params.telemetry,
     );
 
     // Use mock cluster for testing or real bootstrap servers
-    let bootstrap = if config.mock {
+    let bootstrap = if params.config.mock {
         MOCK_CLUSTER_BOOTSTRAP.clone()
     } else {
-        config.bootstrap_servers.join(",")
+        params.config.bootstrap_servers.join(",")
     };
 
     // Configure and create the Kafka consumer with optimal settings
@@ -994,11 +1262,11 @@ where
     client_config
         .set("bootstrap.servers", bootstrap)
         .set("client.id", hostname()?)
-        .set("group.id", &config.group_id)
+        .set("group.id", &params.config.group_id)
         .set("enable.auto.commit", "true")
         .set(
             "auto.commit.interval.ms",
-            config.commit_interval.as_millis().to_string(),
+            params.config.commit_interval.as_millis().to_string(),
         )
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
@@ -1008,7 +1276,8 @@ where
     let consumer: BaseConsumer<_> = client_config.create_with_context(context)?;
 
     // Subscribe to the specified topics
-    let topics: Vec<&str> = config
+    let topics: Vec<&str> = params
+        .config
         .subscribed_topics
         .iter()
         .map(String::as_str)
@@ -1017,28 +1286,29 @@ where
     consumer.subscribe(&topics)?;
 
     // Spawn the background polling task with monitoring
-    let poll_interval = config.poll_interval;
-    let heartbeat = Heartbeat::new("Kafka poll loop", config.stall_threshold);
-    let cloned_managers = managers.clone();
+    let poll_interval = params.config.poll_interval;
+    let heartbeat = params.heartbeats.register("Kafka poll loop");
+    let cloned_managers = params.managers.clone();
     let cloned_heartbeat = heartbeat.clone();
-    let max_message_count = config.max_uncommitted;
+    let max_message_count = params.config.max_uncommitted;
     let poll_handle = spawn_blocking(move || {
         poll(PollConfig {
             poll_interval,
             max_message_count,
             consumer,
-            watermark_version: &watermark_version,
+            watermark_version: &params.watermark_version,
             managers: &cloned_managers,
             heartbeat: &cloned_heartbeat,
-            shutdown: &shutdown,
+            shutdown: &params.shutdown,
         });
     });
 
     // Start optional probe server for health monitoring
-    let probe_server = config
+    let probe_server = params
+        .config
         .probe_port
-        .filter(|_| !config.mock)
-        .map(|port| ProbeServer::new(port, managers.clone(), heartbeat))
+        .filter(|_| !params.config.mock)
+        .map(|port| ProbeServer::new(port, params.managers.clone(), params.heartbeats.clone()))
         .transpose()?;
 
     let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
@@ -1046,7 +1316,7 @@ where
         probe_server,
     })));
 
-    Ok((managers, runtime_state))
+    Ok((params.managers, runtime_state))
 }
 
 /// Checks if any partition is stalled.
@@ -1090,6 +1360,42 @@ pub enum ConsumerError {
     Kafka(#[from] KafkaError),
 
     /// Indicates a Cassandra trigger store operation failure.
-    #[error("Cassandra operation failed: {0:#}")]
-    Cassandra(#[from] CassandraTriggerStoreError),
+    #[error("Cassandra trigger store operation failed: {0:#}")]
+    CassandraTriggerStore(Box<CassandraTriggerStoreError>),
+
+    /// Indicates a scheduler initialization failure.
+    #[error("Scheduler initialization failed: {0:#}")]
+    Scheduler(#[from] SchedulerInitError),
+
+    /// Indicates a timeout middleware initialization failure.
+    #[error("Timeout initialization failed: {0:#}")]
+    Timeout(#[from] TimeoutInitError),
+
+    /// Indicates a monopolization middleware initialization failure.
+    #[error("Monopolization initialization failed: {0:#}")]
+    Monopolization(#[from] MonopolizationInitError),
+
+    /// Indicates a defer middleware initialization failure.
+    #[error("Defer initialization failed: {0:#}")]
+    Defer(#[from] middleware::defer::DeferInitError),
+
+    /// Indicates storage backend creation failure.
+    #[error("Failed to create storage backend: {0:#}")]
+    StorageBackend(Box<storage::StoreCreationError>),
+
+    /// Indicates an invalid timer slab size.
+    #[error("Invalid timer slab size: {0:#}")]
+    InvalidSlabSize(#[from] CompactDurationError),
+}
+
+impl From<CassandraTriggerStoreError> for ConsumerError {
+    fn from(e: CassandraTriggerStoreError) -> Self {
+        Self::CassandraTriggerStore(Box::new(e))
+    }
+}
+
+impl From<storage::StoreCreationError> for ConsumerError {
+    fn from(e: storage::StoreCreationError) -> Self {
+        Self::StorageBackend(Box::new(e))
+    }
 }

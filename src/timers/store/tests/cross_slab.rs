@@ -4,7 +4,6 @@
 )]
 
 use crate::Key;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::slab::Slab;
 use crate::timers::store::tests::TestStoreResult;
@@ -12,6 +11,7 @@ use crate::timers::store::tests::common::{
     add_trigger, get_key_triggers, get_slab_triggers, insert_segment,
 };
 use crate::timers::store::{Segment, TriggerStore};
+use crate::timers::{TimerType, Trigger};
 use ahash::HashSet;
 use std::fmt::Debug;
 use tracing::Span;
@@ -59,7 +59,7 @@ where
 
     // Add triggers at all test times
     for &time in &test_times {
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         add_trigger(store, segment, &trigger).await?;
     }

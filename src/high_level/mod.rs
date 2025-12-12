@@ -4,11 +4,16 @@
 //! consumption in various operational modes through the `HighLevelClient`
 //! struct.
 
-use crate::consumer::failure::FallibleHandler;
-use crate::consumer::failure::retry::RetryConfigurationBuilder;
-use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
+use crate::cassandra::config::CassandraConfigurationBuilder;
+use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::defer::DeferConfigurationBuilder;
+use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
+use crate::consumer::middleware::retry::RetryConfigurationBuilder;
+use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, SchedulerInitError};
+use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
+use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{ConsumerConfigurationBuilder, ConsumerError, ProsodyConsumer};
-use crate::high_level::config::ModeConfiguration;
+use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams};
 use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::producer::{
@@ -16,7 +21,6 @@ use crate::producer::{
     ProducerError, ProsodyProducer,
 };
 use crate::propagator::new_propagator;
-use crate::timers::store::cassandra::CassandraConfigurationBuilder;
 use crate::{Payload, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
@@ -31,6 +35,28 @@ pub mod state;
 
 #[cfg(test)]
 mod tests;
+
+/// Builder configuration for consumer and middleware components.
+///
+/// Bundles all consumer-related configuration builders to reduce parameter
+/// count in `HighLevelClient::new`.
+#[derive(Default)]
+pub struct ConsumerBuilders {
+    /// Consumer configuration builder.
+    pub consumer: ConsumerConfigurationBuilder,
+    /// Retry middleware configuration builder.
+    pub retry: RetryConfigurationBuilder,
+    /// Failure topic middleware configuration builder.
+    pub failure_topic: FailureTopicConfigurationBuilder,
+    /// Scheduler middleware configuration builder.
+    pub scheduler: SchedulerConfigurationBuilder,
+    /// Monopolization middleware configuration builder.
+    pub monopolization: MonopolizationConfigurationBuilder,
+    /// Defer middleware configuration builder.
+    pub defer: DeferConfigurationBuilder,
+    /// Timeout middleware configuration builder.
+    pub timeout: TimeoutConfigurationBuilder,
+}
 
 /// A combined client that manages both producer and consumer operations.
 #[derive(Debug)]
@@ -82,9 +108,8 @@ impl<T> HighLevelClient<T> {
     ///
     /// * `mode` - The operational mode for the client.
     /// * `producer_builder` - Builder for the producer configuration.
-    /// * `consumer_builder` - Builder for the consumer configuration.
-    /// * `retry_builder` - Builder for the retry configuration.
-    /// * `failure_topic_builder` - Builder for the failure topic configuration.
+    /// * `consumer_builders` - Bundled consumer and middleware configuration
+    ///   builders.
     /// * `cassandra_builder` - Builder for the Cassandra configuration.
     ///
     /// # Errors
@@ -96,15 +121,13 @@ impl<T> HighLevelClient<T> {
     pub fn new(
         mode: Mode,
         producer_builder: &mut ProducerConfigurationBuilder,
-        consumer_builder: &ConsumerConfigurationBuilder,
-        retry_builder: &RetryConfigurationBuilder,
-        failure_topic_builder: &FailureTopicConfigurationBuilder,
+        consumer_builders: &ConsumerBuilders,
         cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Result<Self, HighLevelClientError> {
         // Set the producer source system to the consumer group if unspecified
         if let (None, Some(group_id)) = (
             producer_builder.configured_source_system(),
-            consumer_builder.configured_consumer_group(),
+            consumer_builders.consumer.configured_consumer_group(),
         ) {
             producer_builder.source_system(group_id);
         }
@@ -117,13 +140,17 @@ impl<T> HighLevelClient<T> {
             Mode::BestEffort => ProsodyProducer::best_effort_producer(cloned_config),
         }?;
 
-        let consumer_state = ConsumerState::build(
+        let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
             mode,
-            consumer_builder,
-            retry_builder,
-            failure_topic_builder,
+            consumer_builder: &consumer_builders.consumer,
+            retry_builder: &consumer_builders.retry,
+            failure_topic_builder: &consumer_builders.failure_topic,
+            scheduler_builder: &consumer_builders.scheduler,
+            monopolization_builder: &consumer_builders.monopolization,
+            defer_builder: &consumer_builders.defer,
+            timeout_builder: &consumer_builders.timeout,
             cassandra_builder,
-        );
+        });
 
         // Check for topic existence only if not in mock mode
         if !producer_config.mock {
@@ -175,7 +202,7 @@ impl<T> HighLevelClient<T> {
     /// - Consumer initialization fails.
     pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
     where
-        T: FallibleHandler,
+        T: FallibleHandler + Clone,
     {
         let mut guard = self.consumer.lock().await;
         let consumer_ref = &mut *guard;
@@ -194,13 +221,18 @@ impl<T> HighLevelClient<T> {
             ModeConfiguration::Pipeline {
                 consumer,
                 retry,
+                monopolization,
+                defer,
+                common,
                 trigger_store,
-                ..
             } => {
                 ProsodyConsumer::pipeline_consumer(
                     consumer,
                     trigger_store,
                     retry.clone(),
+                    monopolization.clone(),
+                    defer.clone(),
+                    common,
                     handler.clone(),
                 )
                 .await?
@@ -209,6 +241,7 @@ impl<T> HighLevelClient<T> {
                 consumer,
                 retry,
                 failure_topic,
+                common,
                 trigger_store,
                 ..
             } => {
@@ -217,6 +250,7 @@ impl<T> HighLevelClient<T> {
                     trigger_store,
                     retry.clone(),
                     failure_topic.clone(),
+                    common,
                     self.producer.clone(),
                     handler.clone(),
                 )
@@ -224,11 +258,17 @@ impl<T> HighLevelClient<T> {
             }
             ModeConfiguration::BestEffort {
                 consumer,
+                common,
                 trigger_store,
                 ..
             } => {
-                ProsodyConsumer::best_effort_consumer(consumer, trigger_store, handler.clone())
-                    .await?
+                ProsodyConsumer::best_effort_consumer(
+                    consumer,
+                    trigger_store,
+                    common,
+                    handler.clone(),
+                )
+                .await?
             }
         };
 
@@ -376,6 +416,10 @@ pub enum HighLevelClientError {
     /// Error when initializing the consumer fails.
     #[error("failed to initialize consumer: {0:#}")]
     Consumer(#[from] ConsumerError),
+
+    /// Error when the scheduler configuration is invalid.
+    #[error("invalid scheduler configuration: {0:#}")]
+    SchedulerConfiguration(#[from] SchedulerInitError),
 
     /// Error when attempting to use an unconfigured consumer.
     #[error("unconfigured consumer; client does not have a valid consumer configuration")]

@@ -12,17 +12,16 @@ integrated OpenTelemetry support for distributed tracing.
 
 ## Features
 
-- **Kafka Consumer**: Efficiently consume messages with support for offset management and consumer groups.
-- **Kafka Producer**: Reliably produce messages with idempotent delivery.
-- **Timer System**: Distributed scheduling with persistent storage backends (Cassandra, memory).
-- **Distributed Tracing**: Seamless integration with OpenTelemetry for enhanced observability in microservice
-  architectures.
-- **Configurable**: Flexible configuration through environment variables.
-- **Asynchronous**: Built on top of Tokio for high-performance asynchronous operations.
-- **Backpressure Management**: Intelligent partition pausing to handle processing backlogs.
-- **Mocking Support**: Ability to use mock Kafka brokers for testing purposes.
-- **High-Level Client**: Unified management of producer and consumer operations.
-- **Failure Handling**: Configurable strategies for handling message processing failures.
+- **Kafka Consumer**: Per-key ordering with cross-key concurrency, offset management, consumer groups.
+- **Kafka Producer**: Idempotent delivery with configurable retries.
+- **Timer System**: Persistent scheduled execution backed by Cassandra or in-memory store.
+- **Quality of Service**: Fair scheduling limits concurrency and prevents failures from starving fresh traffic. Pipeline
+  mode adds deferred retry and monopolization detection.
+- **Distributed Tracing**: OpenTelemetry integration for tracing message flow across services.
+- **Backpressure**: Pauses partitions when handlers fall behind.
+- **Mocking**: In-memory Kafka broker for tests (`PROSODY_MOCK=true`).
+- **High-Level Client**: Combines producer and consumer with timer support.
+- **Failure Handling**: Pipeline (retry forever), Low-Latency (dead letter), Best-Effort (log and skip).
 
 ## Usage
 
@@ -125,81 +124,187 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## High-Level Client Modes
+## Quality of Service
 
-Prosody's `HighLevelClient` supports two operational modes:
+All modes use **fair scheduling** to limit concurrency and distribute execution time. Pipeline mode adds **deferred
+retry** and **monopolization detection**.
+
+### Fair Scheduling (All Modes)
+
+The scheduler controls which message runs next and how many run concurrently.
+
+**Virtual Time (VT):** Each key accumulates VT equal to its handler execution time. The scheduler picks the key with the
+lowest VT. A key that runs for 500ms accumulates 500ms of VT; a key that hasn't run recently has zero VT and gets
+priority.
+
+**Two-Class Split:** Normal messages and failure retries have separate VT pools. The scheduler allocates execution time
+between them (default: 70% normal, 30% failure). During a failure spike, retries get at most 30% of execution time—fresh
+messages continue processing.
+
+**Starvation Prevention:** Tasks receive a quadratic priority boost based on wait time. A task waiting 2 minutes
+(configurable) gets maximum boost, overriding VT disadvantage.
+
+**Decay:** VT decays exponentially (120s half-life). A key that monopolized 10 minutes ago has negligible penalty now.
+
+### Deferred Retry (Pipeline Mode)
+
+Moves failing keys to timer-based retry so the partition can continue processing other keys.
+
+On transient failure: store the message offset in Cassandra, schedule a timer, return success. The partition advances.
+When the timer fires, reload the message from Kafka and retry.
+
+**Failure Rate Gating:** When >90% of recent messages fail, deferral disables. The retry middleware blocks the
+partition, applying backpressure.
+
+### Monopolization Detection (Pipeline Mode)
+
+Rejects keys that consume too much execution time.
+
+The middleware tracks per-key execution time in 5-minute rolling windows. Keys exceeding 90% of window time are rejected
+with a transient error, routing them through defer.
+
+## High-Level Client Modes
 
 ### Pipeline Mode
 
-Designed for applications that require all messages to be processed or sent in order. It ensures:
+All messages must be processed. Retries indefinitely. Uses defer and monopolization detection.
 
-- Ordered handling of all messages
-- Indefinite retries for failed operations based on the retry configuration
-- Ideal for pipeline applications where order is crucial
+```
+Kafka → Retry → Defer → Monopolization → Shutdown → Scheduler → Timeout → Telemetry → Handler
+```
+
+| Layer          | Purpose                                                  |
+|----------------|----------------------------------------------------------|
+| Retry          | Retries transient errors indefinitely                    |
+| Defer          | Stores failing messages for timer-based retry            |
+| Monopolization | Rejects keys exceeding execution time threshold          |
+| Shutdown       | Drains in-flight work on partition revocation            |
+| Scheduler      | Enforces concurrency limits and VT-based priority        |
+| Timeout        | Cancels handlers exceeding deadline                      |
+| Telemetry      | Emits handler lifecycle events                           |
 
 ### Low-Latency Mode
 
-Optimized for applications prioritizing quick processing or sending, tolerating occasional message failures. It
-features:
+Tries a few times, then routes failures to a dead letter topic.
 
-- Low-latency operations
-- A retry mechanism for failed operations
-- For consumers: Sends persistently failing messages to a failure topic
-- For producers: Returns an error after a configurable number of retries
-- Ideal for applications where speed is crucial and failed messages can be handled separately
+- Retries up to `PROSODY_MAX_RETRIES` times, then writes to failure topic
+- Fair scheduling limits how much time retries consume
+- Use when you need to keep moving and can reprocess failures later
 
 ### Best-Effort Mode
 
-Designed for development environments or services where message processing failures are acceptable. It features:
+Logs failures and moves on.
 
-- Simple error logging without retries
-- Failed messages are logged and discarded
-- For consumers: Failed messages are logged and committed
-- For producers: Returns an error after configured timeout
-- Ideal for:
-    - Development and testing environments
-    - Services that can tolerate message loss
-    - Applications where retrying failed messages is not critical
+- No retries; failed messages are logged and committed
+- Fair scheduling still enforces concurrency limits
+- Use for development or when message loss is acceptable
 
 ## Configuration
 
-Prosody can be configured through environment variables or programmatically using the builder pattern. Both
-`ConsumerConfiguration` and `ProducerConfiguration` use this approach. The builder pattern automatically falls back to
-environment variables for any unspecified field. This means you can mix and match programmatic configuration with
-environment variables, giving you flexibility in how you set up your Kafka clients.
+Configure via environment variables or the builder pattern. Builders fall back to environment variables for unset
+fields, so you can mix both approaches.
 
-The following table lists the available configuration options and their associated environment variables:
+### Core
 
-| Environment Variable             | Description                                                                          | Default      | Consumer | Producer |
-|----------------------------------|--------------------------------------------------------------------------------------|--------------|----------|----------|
-| `PROSODY_ALLOWED_EVENTS`         | Allowed event type prefixes (comma-separated). All allowed if unset.                 | -            | ✓        |          |
-| `PROSODY_BOOTSTRAP_SERVERS`      | Comma-separated list of Kafka bootstrap servers                                      | -            | ✓        | ✓        |
-| `PROSODY_CASSANDRA_DATACENTER`   | Preferred datacenter for Cassandra query routing                                     | -            | ✓        |          |
-| `PROSODY_CASSANDRA_KEYSPACE`     | Cassandra keyspace for timer storage                                                 | prosody      | ✓        |          |
-| `PROSODY_CASSANDRA_NODES`        | Comma-separated list of Cassandra contact nodes (required for timer storage)         | -            | ✓        |          |
-| `PROSODY_CASSANDRA_PASSWORD`     | Password for Cassandra authentication                                                | -            | ✓        |          |
-| `PROSODY_CASSANDRA_RACK`         | Preferred rack identifier for Cassandra topology-aware routing                       | -            | ✓        |          |
-| `PROSODY_CASSANDRA_RETENTION`    | How long to keep failed/unprocessed timer data                                       | 30d          | ✓        |          |
-| `PROSODY_CASSANDRA_USER`         | Username for Cassandra authentication                                                | -            | ✓        |          |
-| `PROSODY_COMMIT_INTERVAL`        | Interval between commit operations                                                   | 1s           | ✓        |          |
-| `PROSODY_FAILURE_TOPIC`          | Topic for failed messages in low-latency mode                                        | -            | ✓        |          |
-| `PROSODY_GROUP_ID`               | Consumer group identifier                                                            | -            | ✓        |          |
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Size of LRU caches for deduplicating messages. Set to 0 to disable.                  | 4096         | ✓        |          |
-| `PROSODY_MAX_CONCURRENCY`        | Maximum global concurrency limit                                                     | 32           | ✓        |          |
-| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Maximum number of enqueued messages per key (additional messages backpressure)       | 8            | ✓        |          |
-| `PROSODY_MAX_RETRIES`            | Maximum number of retries in low-latency mode                                        | 3            | ✓        |          |
-| `PROSODY_MAX_UNCOMMITTED`        | Maximum number of uncommitted messages across all partitions                         | 64           | ✓        |          |
-| `PROSODY_MOCK`                   | Use mock Kafka brokers and in-memory timer storage for testing                       | false        | ✓        | ✓        |
-| `PROSODY_POLL_INTERVAL`          | Maximum interval between poll operations                                             | 100ms        | ✓        |          |
-| `PROSODY_PROBE_PORT`             | Port for the probe server (health checks). Set to 'none' to disable.                 | 8000         | ✓        |          |
-| `PROSODY_RETRY_BASE`             | Base retry exponential backoff delay                                                 | 20ms         | ✓        |          |
-| `PROSODY_RETRY_MAX_DELAY`        | Maximum retry delay                                                                  | 5m           | ✓        |          |
-| `PROSODY_SEND_TIMEOUT`           | Timeout for send operations in the low-latency mode producer                         | 1s           |          | ✓        |
-| `PROSODY_SHUTDOWN_TIMEOUT`       | Timeout to wait for in-flight tasks to complete during partition shutdown            | 30s          | ✓        |          |
-| `PROSODY_SLAB_SIZE`              | Duration for timer slab partitioning                                                 | 10m          | ✓        |          |
-| `PROSODY_SOURCE_SYSTEM`          | Identifier for the producing system to prevent loops                                 | `<group id>` |          | ✓        |
-| `PROSODY_STALL_THRESHOLD`        | Duration after which processing is considered stalled                                | 5m           | ✓        |          |
-| `PROSODY_SUBSCRIBED_TOPICS`      | Comma-separated list of topics to subscribe to. Also creates topics in mock cluster. | -            | ✓        |          |
+| Environment Variable        | Description                                        | Default      | Consumer | Producer |
+|-----------------------------|----------------------------------------------------|--------------|----------|----------|
+| `PROSODY_BOOTSTRAP_SERVERS` | Kafka servers to connect to                        | -            | ✓        | ✓        |
+| `PROSODY_GROUP_ID`          | Consumer group name                                | -            | ✓        |          |
+| `PROSODY_SUBSCRIBED_TOPICS` | Topics to read from                                | -            | ✓        |          |
+| `PROSODY_ALLOWED_EVENTS`    | Only process events matching these prefixes        | (all)        | ✓        |          |
+| `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
+| `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
+| `PROSODY_LOG`               | Log level (e.g., `info`, `prosody=debug`)          | info         | ✓        | ✓        |
+
+### Consumer
+
+| Environment Variable             | Description                                          | Default                |
+|----------------------------------|------------------------------------------------------|------------------------|
+| `PROSODY_MAX_CONCURRENCY`        | Max messages being processed simultaneously          | 32                     |
+| `PROSODY_MAX_UNCOMMITTED`        | Max queued messages before pausing consumption       | 64                     |
+| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Max queued messages per key before pausing           | 8                      |
+| `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
+| `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |
+| `PROSODY_POLL_INTERVAL`          | How often to fetch new messages from Kafka           | 100ms                  |
+| `PROSODY_SHUTDOWN_TIMEOUT`       | Wait this long for in-flight work before force-quit  | 30s                    |
+| `PROSODY_STALL_THRESHOLD`        | Report unhealthy if no progress for this long        | 5m                     |
+| `PROSODY_PROBE_PORT`             | HTTP port for health checks ('none' to disable)      | 8000                   |
+| `PROSODY_FAILURE_TOPIC`          | Send unprocessable messages here (dead letter queue) | -                      |
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Track this many message IDs to skip duplicates       | 4096                   |
+| `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1h                     |
+
+### Producer
+
+| Environment Variable   | Description                     | Default |
+|------------------------|---------------------------------|---------|
+| `PROSODY_SEND_TIMEOUT` | Give up sending after this long | 1s      |
+
+### Retry
+
+When a handler fails, retry with exponential backoff:
+
+| Environment Variable      | Description                      | Default |
+|---------------------------|----------------------------------|---------|
+| `PROSODY_MAX_RETRIES`     | Give up after this many attempts | 3       |
+| `PROSODY_RETRY_BASE`      | Wait this long before first retry | 20ms    |
+| `PROSODY_RETRY_MAX_DELAY` | Never wait longer than this      | 5m      |
+
+### Deferral (Pipeline Mode)
+
+| Environment Variable              | Description                                       | Default |
+|-----------------------------------|---------------------------------------------------|---------|
+| `PROSODY_DEFER_ENABLED`           | Enable deferral for new messages                  | true    |
+| `PROSODY_DEFER_BASE`              | Wait this long before first deferred retry        | 1s      |
+| `PROSODY_DEFER_MAX_DELAY`         | Never wait longer than this                       | 24h     |
+| `PROSODY_DEFER_FAILURE_THRESHOLD` | Disable deferral when failure rate exceeds this   | 0.9     |
+| `PROSODY_DEFER_FAILURE_WINDOW`    | Measure failure rate over this time window        | 5m      |
+| `PROSODY_DEFER_CACHE_SIZE`        | Track this many deferred keys in memory           | 1024    |
+| `PROSODY_DEFER_SEEK_TIMEOUT`      | Timeout when loading deferred messages            | 30s     |
+| `PROSODY_DEFER_DISCARD_THRESHOLD` | Read optimization (rarely needs changing)         | 100     |
+
+### Cassandra
+
+Persistent storage for scheduled retries (not needed if `PROSODY_MOCK=true`):
+
+| Environment Variable           | Description                        | Default |
+|--------------------------------|------------------------------------|---------|
+| `PROSODY_CASSANDRA_NODES`      | Servers to connect to (host:port)  | -       |
+| `PROSODY_CASSANDRA_KEYSPACE`   | Keyspace name                      | prosody |
+| `PROSODY_CASSANDRA_USER`       | Username                           | -       |
+| `PROSODY_CASSANDRA_PASSWORD`   | Password                           | -       |
+| `PROSODY_CASSANDRA_DATACENTER` | Prefer this datacenter for queries | -       |
+| `PROSODY_CASSANDRA_RACK`       | Prefer this rack for queries       | -       |
+| `PROSODY_CASSANDRA_RETENTION`  | Delete data older than this        | 1y      |
+
+### Monopolization Detection (Pipeline Mode)
+
+| Environment Variable                | Description                            | Default |
+|-------------------------------------|----------------------------------------|---------|
+| `PROSODY_MONOPOLIZATION_ENABLED`    | Enable hot key protection              | true    |
+| `PROSODY_MONOPOLIZATION_THRESHOLD`  | Max handler time as fraction of window | 0.9     |
+| `PROSODY_MONOPOLIZATION_WINDOW`     | Measurement window                     | 5m      |
+| `PROSODY_MONOPOLIZATION_CACHE_SIZE` | Max distinct keys to track             | 8192    |
+
+### Fair Scheduling (All Modes)
+
+| Environment Variable               | Description                                                      | Default |
+|------------------------------------|------------------------------------------------------------------|---------|
+| `PROSODY_SCHEDULER_FAILURE_WEIGHT` | Fraction of processing time reserved for retries                 | 0.3     |
+| `PROSODY_SCHEDULER_MAX_WAIT_SECS`  | Messages waiting this long get maximum priority                  | 2m      |
+| `PROSODY_SCHEDULER_WAIT_WEIGHT`    | Priority boost for waiting messages (higher = more aggressive)   | 200.0   |
+| `PROSODY_SCHEDULER_CACHE_SIZE`     | Max distinct keys to track                                       | 8192    |
+
+### Topic Creation
+
+For creating Kafka topics programmatically:
+
+| Environment Variable               | Description                            | Default         |
+|------------------------------------|----------------------------------------|-----------------|
+| `PROSODY_TOPIC_NAME`               | Topic to create                        | -               |
+| `PROSODY_TOPIC_PARTITIONS`         | Number of partitions                   | broker default  |
+| `PROSODY_TOPIC_REPLICATION_FACTOR` | Number of replicas per partition       | broker default  |
+| `PROSODY_TOPIC_RETENTION`          | Delete messages older than this        | cluster default |
+| `PROSODY_TOPIC_CLEANUP_POLICY`     | Cleanup policy (delete, compact, both) | cluster default |
 
 ## Mock Mode for Testing
 
@@ -344,8 +449,8 @@ The timer system is automatically configured based on the consumer configuration
 
 - **Mock Mode**: Uses in-memory storage for testing (`PROSODY_MOCK=true`)
 - **Production Mode**: Uses Cassandra for persistent storage
-- **Slab Size**: Configure time-based partitioning with `PROSODY_SLAB_SIZE` (default: 10 minutes)
-- **Retention**: How long to keep failed/unprocessed timer data with `PROSODY_CASSANDRA_RETENTION` (default: 30 days)
+- **Slab Size**: Configure time-based partitioning with `PROSODY_SLAB_SIZE` (default: 1 hour)
+- **Retention**: Retention period for timer and failure data via `PROSODY_CASSANDRA_RETENTION` (default: 1 year)
 
 ### Usage in Handlers
 
@@ -425,11 +530,13 @@ graph TD
 5. **Polling Mechanism**: The `KafkaConsumer` uses a polling mechanism to efficiently fetch messages from Kafka brokers.
 
 6. **Backpressure Management**: Prosody provides multiple levels of backpressure control:
-   - **Global buffering**: A global semaphore limits the total number of messages being processed across all partitions
-   - **Partition pausing**: If a partition becomes backed up (i.e., its queues are full), Prosody will pause consumption
-     from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in one partition
-     doesn't affect the entire consumer
-   - **Per-key queuing**: Each key has bounded queues to prevent memory exhaustion
+    - **Global buffering**: A global semaphore limits the total number of messages being processed across all partitions
+    - **Partition pausing**: If a partition becomes backed up (i.e., its queues are full), Prosody will pause
+      consumption
+      from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in one
+      partition
+      doesn't affect the entire consumer
+    - **Per-key queuing**: Each key has bounded queues to prevent memory exhaustion
 
 ### Message Flow
 
@@ -473,8 +580,10 @@ limiting the number of in-flight messages per key and partition through bounded 
 
 ```mermaid
 flowchart TD
-    classDef subgraphStyle fill: #f5f5f5, stroke: #666
-    HLC["<a href='https://github.com/cincpro/prosody/tree/main/src/high_level/mod.rs'>HighLevelClient</a>"] --> Producer["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/mod.rs'>ProsodyProducer</a>"]
+    classDef subgraphStyle fill:#f5f5f5,stroke:#666
+
+    HLC["<a href='https://github.com/cincpro/prosody/tree/main/src/high_level/mod.rs'>HighLevelClient</a>"]
+    HLC --> Producer["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/mod.rs'>ProsodyProducer</a>"]
     HLC --> ConsumerMain["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/mod.rs'>ProsodyConsumer</a>"]
 
     subgraph ProducerComponents["Producer Components"]
@@ -484,7 +593,7 @@ flowchart TD
     end
 
     subgraph ConsumerComponents["Consumer Components"]
-        ConsumerMain --> Context["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/context.rs'>ConsumerContext</a>"]
+        ConsumerMain --> Context["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/kafka_context.rs'>ConsumerContext</a>"]
         ConsumerMain --> PollLoop["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/poll.rs'>Poll Loop</a>"]
         ConsumerMain --> ProbeServer["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/probes.rs'>Probe Server</a>"]
         Context --> PMgr
@@ -492,29 +601,31 @@ flowchart TD
     end
 
     subgraph PartitionComponents["Partition Processing"]
-        PMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/mod.rs'>Partition Manager</a>"] --> KeyMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/keyed/mod.rs'>Key Manager</a>"]
+        PMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/mod.rs'>Partition Manager</a>"]
+        PMgr --> KeyMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/keyed/mod.rs'>Key Manager</a>"]
         PMgr --> OTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Offset Tracker</a>"]
         PMgr --> ICache2["<a href='https://github.com/cincpro/prosody/tree/main/src/deduplication.rs'>Idempotence Cache</a>"]
         KeyMgr --> EHandler["Event Handler"]
         OTracker --> WTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Watermark Tracker</a>"]
     end
 
-    subgraph FailureHandling["Failure Strategies"]
-        RetryS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/retry.rs'>Retry Strategy</a>"]
-        LogS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/log.rs'>Log Strategy</a>"]
-        ShutdownS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/shutdown.rs'>Shutdown Strategy</a>"]
-        TopicS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/failure/topic.rs'>Failure Topic Strategy</a>"]
+    subgraph MiddlewareHandling["Middleware Components"]
+        RetryS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/retry.rs'>Retry Middleware</a>"]
+        DeferS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/defer/mod.rs'>Defer Middleware</a>"]
+        MonoS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/monopolization.rs'>Monopolization Middleware</a>"]
+        SchedS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/scheduler/mod.rs'>Scheduler Middleware</a>"]
+        TelS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/telemetry.rs'>Telemetry Middleware</a>"]
+        LogS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/log.rs'>Log Middleware</a>"]
+        ShutdownS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/shutdown.rs'>Shutdown Middleware</a>"]
+        TopicS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/topic.rs'>Failure Topic Middleware</a>"]
     end
 
-    ConsumerMain -..-> RetryS
-    ConsumerMain -..-> LogS
-    ConsumerMain -..-> ShutdownS
-    ConsumerMain -..-> TopicS
+    KeyMgr -.-> MiddlewareHandling
     TopicS --> FTopic["Failure Topic"]
     Producer --> FTopic
 
     subgraph TracingSystem["OpenTelemetry Integration"]
-        OTel["<a href='https://github.com/cincpro/prosody/tree/main/src/tracing.rs'>OpenTelemetry Core</a>"]
+        OTel["<a href='https://github.com/cincpro/prosody/tree/main/src/telemetry/mod.rs'>Telemetry</a>"]
         Prop["<a href='https://github.com/cincpro/prosody/tree/main/src/propagator.rs'>Propagator</a>"]
         MExtract["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/extractor.rs'>Message Extractor</a>"]
         RInject["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/injector.rs'>Record Injector</a>"]
@@ -523,13 +634,8 @@ flowchart TD
         Prop --> RInject
     end
 
-    ConsumerMain -..-> OTel
-    Producer -..-> OTel
-%% External edges
-    EHandler --> RetryS
-    EHandler --> LogS
-    EHandler --> ShutdownS
-    EHandler --> TopicS
-%% Styling
-class ProducerComponents,ConsumerComponents,PartitionComponents,FailureHandling,TracingSystem subgraphStyle
+    ConsumerMain -.-> OTel
+    Producer -.-> OTel
+
+    class ProducerComponents,ConsumerComponents,PartitionComponents,MiddlewareHandling,TracingSystem subgraphStyle
 ```

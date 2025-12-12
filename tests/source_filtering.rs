@@ -8,11 +8,14 @@
 
 use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
+    telemetry::Telemetry,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc::channel;
@@ -24,7 +27,7 @@ mod common;
 /// Tests the filtering functionality of the source system.
 #[tokio::test]
 async fn test_source_system_filtering() -> Result<()> {
-    common::init_test_logging()?;
+    init_test_logging();
     let timeout_duration = Duration::from_secs(30);
 
     // Scenario 1: Both source system and group ID are the same, so no messages
@@ -71,7 +74,7 @@ async fn run_scenario(
     let topic_string = Uuid::new_v4().to_string();
     let topic: Topic = topic_string.as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap.clone())?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
     admin_client
         .create_topic(
             &TopicConfiguration::builder()
@@ -97,10 +100,11 @@ async fn run_scenario(
 
     // Set up a channel to communicate received messages.
     let (tx, mut rx) = channel(10);
-    let consumer = ProsodyConsumer::new::<TestHandler>(
+    let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        TestHandler { messages_tx: tx },
+        CloneProvider::new(TestHandler { messages_tx: tx }),
+        Telemetry::new(),
     )
     .await?;
     let producer = ProsodyProducer::new(&producer_config)?;

@@ -20,13 +20,14 @@ use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
 use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use prosody::cassandra::config::CassandraConfiguration;
 use prosody::consumer::event_context::EventContext;
-use prosody::consumer::failure::{ClassifyError, ErrorCategory, FallibleHandler};
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
-use prosody::consumer::{ConsumerConfiguration, EventHandler, Keyed, ProsodyConsumer};
+use prosody::consumer::middleware::{ClassifyError, CloneProvider, ErrorCategory, FallibleHandler};
+use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
-use prosody::timers::store::cassandra::CassandraConfiguration;
+use prosody::telemetry::Telemetry;
 use prosody::timers::{Trigger, UncommittedTimer};
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
@@ -34,9 +35,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tracing::level_filters::LevelFilter;
 use tracing::{error, info, instrument};
-use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
 
 /// A small, non-zero count used in tests.
@@ -111,10 +110,12 @@ pub struct TestInput {
 /// # Errors
 ///
 /// Returns an error if the topic creation fails.
-pub async fn create_test_topic(partition_count: SmallCount) -> Result<(Topic, ProsodyAdminClient)> {
+pub async fn create_test_topic(
+    partition_count: SmallCount,
+) -> Result<(Topic, &'static ProsodyAdminClient)> {
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap)?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap)?)?;
 
     admin_client
         .create_topic(
@@ -232,12 +233,14 @@ pub fn spawn_consumers(
         let mut shutdown_rx = shutdown_rx.clone();
 
         let handler = TestHandler { messages_tx };
+        let handler_provider = CloneProvider::new(handler);
 
         tasks.spawn(async move {
-            let consumer = ProsodyConsumer::new::<TestHandler>(
+            let consumer = ProsodyConsumer::new(
                 &consumer_config,
                 &create_cassandra_trigger_store_config(),
-                handler,
+                handler_provider,
+                Telemetry::new(),
             )
             .await?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?; // Wait for shutdown signal
@@ -400,10 +403,10 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
         datacenter: None,
         rack: None,
         nodes: vec!["localhost:9042".to_owned()],
-        keyspace: "prosody_integration_test".to_owned(),
+        keyspace: "prosody_test".to_owned(),
         user: None,
         password: None,
-        retention: StdDuration::from_secs(10 * 60).into(),
+        retention: StdDuration::from_secs(10 * 60),
     };
 
     TriggerStoreConfiguration::Cassandra(cassandra_config)
@@ -418,8 +421,12 @@ pub struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
-    where
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
@@ -436,7 +443,7 @@ impl EventHandler for TestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -457,9 +464,14 @@ pub struct SlowTestHandler {
 }
 
 impl EventHandler for SlowTestHandler {
+    #[allow(clippy::used_underscore_binding)]
     #[instrument(skip(self, _context))]
-    async fn on_message<C>(&self, _context: C, message: UncommittedMessage)
-    where
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
@@ -475,7 +487,7 @@ impl EventHandler for SlowTestHandler {
         uncommitted.commit(); // Commit message to mark as processed
     }
 
-    async fn on_timer<C, U>(&self, _context: C, _timer: U)
+    async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext,
         U: UncommittedTimer,
@@ -516,7 +528,12 @@ pub struct FallibleTestHandler {
 impl FallibleHandler for FallibleTestHandler {
     type Error = TestError;
 
-    async fn on_message<C>(&self, _context: C, message: ConsumerMessage) -> Result<(), Self::Error>
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
@@ -528,39 +545,21 @@ impl FallibleHandler for FallibleTestHandler {
         Ok(())
     }
 
-    async fn on_timer<C>(&self, _context: C, _timer: Trigger) -> Result<(), Self::Error>
+    async fn on_timer<C>(
+        &self,
+        _context: C,
+        _timer: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
     where
         C: EventContext,
     {
         Ok(())
     }
-}
 
-/// Initializes logging for integration tests with scylla noise filtering.
-///
-/// Sets up a compact tracing subscriber with the scylla crate set to WARN level
-/// to reduce noise from database driver logs during testing.
-///
-/// # Errors
-///
-/// Returns an error if the tracing subscriber cannot be initialized.
-pub fn init_test_logging() -> Result<()> {
-    if fmt()
-        .compact()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_env_var("PROSODY_LOG")
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy()
-                .add_directive("scylla=warn".parse()?),
-        )
-        .try_init()
-        .is_err()
-    {
-        info!("logging already initialized");
+    async fn shutdown(self) {
+        // No cleanup needed for test handler
     }
-
-    Ok(())
 }
 
 /// Collects exactly the expected number of messages within a timeout period.

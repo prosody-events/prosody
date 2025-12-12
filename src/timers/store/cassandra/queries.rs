@@ -7,536 +7,239 @@
 //!
 //! The module handles:
 //! - Cassandra session creation and configuration
-//! - Schema migration execution via [`EmbeddedMigrator`]
+//! - Schema migration execution via the embedded migrator
 //! - Preparation of all CQL statements for CRUD operations
 //! - Load balancing and retry policy configuration
 //! - TTL and non-TTL variants of insert statements
 
-use super::migrator::EmbeddedMigrator;
-use crate::timers::store::cassandra::{
-    CassandraConfiguration, CassandraTriggerStoreError, TABLE_KEYS, TABLE_SEGMENTS, TABLE_SLABS,
+#![allow(dead_code, reason = "fields used in tests")]
+
+use crate::cassandra::{
+    TABLE_KEYS, TABLE_SEGMENTS, TABLE_SLABS, TABLE_TYPED_KEYS, TABLE_TYPED_SLABS,
 };
-use educe::Educe;
-use scylla::client::Compression;
-use scylla::client::execution_profile::ExecutionProfile;
-use scylla::client::session::Session;
-use scylla::client::session_builder::SessionBuilder;
-use scylla::policies::load_balancing::DefaultPolicy;
-use scylla::policies::retry::DefaultRetryPolicy;
-use scylla::statement::Consistency;
+use crate::cassandra_queries;
 
-use scylla::statement::prepared::PreparedStatement;
-use std::sync::Arc;
-
-/// Container for all prepared Cassandra CQL statements used by the timer store.
-///
-/// This struct holds the Cassandra session and all prepared statements needed
-/// for timer storage operations. Prepared statements provide better performance
-/// and security compared to ad-hoc query strings.
-///
-/// The struct contains prepared statements for:
-/// - Segment management (create, read, delete)
-/// - Slab operations (insert, delete, range queries)
-/// - Trigger operations for both time-based and key-based indices
-/// - TTL and non-TTL variants for data lifecycle management
-#[derive(Educe)]
-#[educe(Debug)]
-pub struct Queries {
-    #[educe(Debug(ignore))]
-    pub session: Session,
-
-    #[educe(Debug(ignore))]
-    pub insert_segment: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub get_segment: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub delete_segment: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub get_slabs: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub get_slab_range: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub insert_slab: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub delete_slab: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub get_slab_triggers: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub insert_slab_trigger: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub delete_slab_trigger: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub clear_slab_triggers: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub get_key_times: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub get_key_triggers: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub insert_key_trigger: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub delete_key_trigger: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub clear_key_triggers: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub insert_slab_no_ttl: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub insert_slab_trigger_no_ttl: PreparedStatement,
-
-    #[educe(Debug(ignore))]
-    pub insert_key_trigger_no_ttl: PreparedStatement,
-}
-
-impl Queries {
-    /// Creates a new Queries instance with prepared statements for all timer
-    /// operations.
+cassandra_queries! {
+    /// Container for all prepared Cassandra CQL statements used by the timer store.
     ///
-    /// This method establishes a connection to Cassandra, runs schema
-    /// migrations, and prepares all CQL statements needed for timer storage
-    /// operations.
+    /// This struct holds the Cassandra session and all prepared statements needed
+    /// for timer storage operations. Prepared statements provide better performance
+    /// and security compared to ad-hoc query strings.
     ///
-    /// # Arguments
-    ///
-    /// * `configuration` - Cassandra connection settings including nodes,
-    ///   credentials, keyspace, and load balancing preferences.
-    ///
-    /// # Returns
-    ///
-    /// A [`Queries`] instance with all prepared statements ready for use.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CassandraTriggerStoreError`] if:
-    /// - Connection to Cassandra cluster fails
-    /// - Schema migration fails
-    /// - Keyspace cannot be selected
-    /// - Statement preparation fails
-    pub async fn new(
-        configuration: CassandraConfiguration,
-    ) -> Result<Self, CassandraTriggerStoreError> {
-        let mut lb_policy = DefaultPolicy::builder()
-            .token_aware(true)
-            .permit_dc_failover(true);
+    /// The struct contains prepared statements for:
+    /// - Segment management (create, read, delete)
+    /// - Slab operations (insert, delete, range queries)
+    /// - Trigger operations for both time-based and key-based indices
+    /// - TTL and non-TTL variants for data lifecycle management
+    pub struct Queries {
+        /// Inserts a new segment with id, name, `slab_size`, and version
+        insert_segment: (
+            "INSERT INTO $keyspace.{} (id, name, slab_size, version) VALUES (?, ?, ?, ?)",
+            TABLE_SEGMENTS
+        ),
 
-        if let Some(dc) = configuration.datacenter {
-            lb_policy = match configuration.rack {
-                None => lb_policy.prefer_datacenter(dc),
-                Some(rack) => lb_policy.prefer_datacenter_and_rack(dc, rack),
-            }
-        }
+        /// Gets segment metadata by ID
+        get_segment: (
+            "SELECT name, slab_size, version FROM $keyspace.{} WHERE id = ? LIMIT 1",
+            TABLE_SEGMENTS
+        ),
 
-        let _profile = ExecutionProfile::builder()
-            .consistency(Consistency::LocalQuorum)
-            .load_balancing_policy(lb_policy.build())
-            .retry_policy(Arc::new(DefaultRetryPolicy::new()));
+        /// Deletes a segment by ID
+        delete_segment: (
+            "DELETE FROM $keyspace.{} WHERE id = ?",
+            TABLE_SEGMENTS
+        ),
 
-        let mut session = SessionBuilder::new()
-            .known_nodes(configuration.nodes)
-            .compression(Some(Compression::Lz4));
+        /// Gets all slab IDs for a segment
+        get_slabs: (
+            "SELECT slab_id FROM $keyspace.{} WHERE id = ?",
+            TABLE_SEGMENTS
+        ),
 
-        if let Some(user) = configuration.user {
-            session = session.user(user, configuration.password.unwrap_or_default());
-        }
+        /// Gets slab IDs within a range for a segment
+        get_slab_range: (
+            "SELECT slab_id FROM $keyspace.{} WHERE id = ? AND slab_id >= ? AND slab_id <= ?",
+            TABLE_SEGMENTS
+        ),
 
-        let session = session.build().await?;
-        let migrator = EmbeddedMigrator::new(&session, &configuration.keyspace).await?;
-        migrator.migrate().await?;
+        /// Inserts a slab with TTL
+        insert_slab: (
+            "INSERT INTO $keyspace.{} (id, slab_id) VALUES (?, ?) USING TTL ?",
+            TABLE_SEGMENTS
+        ),
 
-        let keyspace = &configuration.keyspace;
+        /// Deletes a slab
+        delete_slab: (
+            "DELETE FROM $keyspace.{} WHERE id = ? AND slab_id = ?",
+            TABLE_SEGMENTS
+        ),
 
-        let insert_segment = prepare_insert_segment(&session, keyspace).await?;
-        let get_segment = prepare_get_segment(&session, keyspace).await?;
-        let delete_segment = prepare_delete_segment(&session, keyspace).await?;
-        let get_slabs = prepare_get_slabs(&session, keyspace).await?;
-        let get_slab_range = prepare_get_slab_range(&session, keyspace).await?;
-        let insert_slab = prepare_insert_slab(&session, keyspace).await?;
-        let delete_slab = prepare_delete_slab(&session, keyspace).await?;
-        let get_slab_triggers = prepare_get_slab_triggers(&session, keyspace).await?;
-        let insert_slab_trigger = prepare_insert_slab_trigger(&session, keyspace).await?;
-        let delete_slab_trigger = prepare_delete_slab_trigger(&session, keyspace).await?;
-        let clear_slab_triggers = prepare_clear_slab_triggers(&session, keyspace).await?;
-        let get_key_times = prepare_get_key_times(&session, keyspace).await?;
-        let get_key_triggers = prepare_get_key_triggers(&session, keyspace).await?;
-        let insert_key_trigger = prepare_insert_key_trigger(&session, keyspace).await?;
-        let delete_key_trigger = prepare_delete_key_trigger(&session, keyspace).await?;
-        let clear_key_triggers = prepare_clear_key_triggers(&session, keyspace).await?;
-        let insert_slab_no_ttl = prepare_insert_slab_no_ttl(&session, keyspace).await?;
-        let insert_slab_trigger_no_ttl =
-            prepare_insert_slab_trigger_no_ttl(&session, keyspace).await?;
-        let insert_key_trigger_no_ttl =
-            prepare_insert_key_trigger_no_ttl(&session, keyspace).await?;
+        /// Gets all triggers of a specific type in a slab
+        get_slab_triggers: (
+            "SELECT key, time, timer_type, span FROM $keyspace.{} WHERE segment_id = ? AND slab_size = ? AND id = ? AND timer_type = ?",
+            TABLE_TYPED_SLABS
+        ),
 
-        Ok(Self {
-            session,
-            insert_segment,
-            get_segment,
-            delete_segment,
-            get_slabs,
-            get_slab_range,
-            insert_slab,
-            delete_slab,
-            get_slab_triggers,
-            insert_slab_trigger,
-            delete_slab_trigger,
-            clear_slab_triggers,
-            get_key_times,
-            get_key_triggers,
-            insert_key_trigger,
-            delete_key_trigger,
-            clear_key_triggers,
-            insert_slab_no_ttl,
-            insert_slab_trigger_no_ttl,
-            insert_key_trigger_no_ttl,
-        })
+        /// Inserts a trigger into a slab with TTL
+        insert_slab_trigger: (
+            "INSERT INTO $keyspace.{} (segment_id, slab_size, id, timer_type, key, time, span) VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?",
+            TABLE_TYPED_SLABS
+        ),
+
+        /// Deletes a specific trigger from a slab
+        delete_slab_trigger: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND slab_size = ? AND id = ? AND timer_type = ? AND key = ? AND time = ?",
+            TABLE_TYPED_SLABS
+        ),
+
+        /// Clears all triggers from a slab
+        clear_slab_triggers: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND slab_size = ? AND id = ?",
+            TABLE_TYPED_SLABS
+        ),
+
+        /// Gets all scheduled times for a key and timer type
+        get_key_times: (
+            "SELECT time FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Gets all triggers for a key and timer type
+        get_key_triggers: (
+            "SELECT key, time, timer_type, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Gets ALL triggers in a slab across all timer types
+        get_slab_triggers_all_types: (
+            "SELECT key, time, timer_type, span FROM $keyspace.{} WHERE segment_id = ? AND slab_size = ? AND id = ?",
+            TABLE_TYPED_SLABS
+        ),
+
+        /// Gets ALL triggers for a key across all timer types
+        get_key_triggers_all_types: (
+            "SELECT key, time, timer_type, span FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Inserts a trigger into the key index with TTL
+        insert_key_trigger: (
+            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Deletes a specific trigger from the key index
+        delete_key_trigger: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Clears all triggers for a key and timer type
+        clear_key_triggers: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Clears all triggers for a key across ALL timer types
+        clear_key_triggers_all_types: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Inserts a slab without TTL
+        insert_slab_no_ttl: (
+            "INSERT INTO $keyspace.{} (id, slab_id) VALUES (?, ?)",
+            TABLE_SEGMENTS
+        ),
+
+        /// Inserts a trigger into a slab without TTL
+        insert_slab_trigger_no_ttl: (
+            "INSERT INTO $keyspace.{} (segment_id, slab_size, id, timer_type, key, time, span) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            TABLE_TYPED_SLABS
+        ),
+
+        /// Inserts a trigger into the key index without TTL
+        insert_key_trigger_no_ttl: (
+            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?)",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Updates segment version
+        update_segment_version: (
+            "UPDATE $keyspace.{} SET version = ?, slab_size = ? WHERE id = ?",
+            TABLE_SEGMENTS
+        ),
+
+        /// Enumerates active v1 slabs for a segment
+        get_slabs_v1: (
+            "SELECT slab_id FROM $keyspace.{} WHERE id = ?",
+            TABLE_SEGMENTS
+        ),
+
+        /// Retrieves v1 triggers from a slab
+        get_slab_triggers_v1: (
+            "SELECT key, time, span FROM $keyspace.{} WHERE segment_id = ? AND id = ?",
+            TABLE_SLABS
+        ),
+
+        /// Deletes v1 slab metadata
+        delete_slab_metadata_v1: (
+            "DELETE FROM $keyspace.{} WHERE id = ? AND slab_id = ?",
+            TABLE_SEGMENTS
+        ),
+
+        /// Deletes a single v1 trigger from a slab
+        delete_slab_trigger_v1: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND id = ? AND key = ? AND time = ?",
+            TABLE_SLABS
+        ),
+
+        /// Clears all v1 triggers for a slab
+        clear_slab_triggers_v1: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND id = ?",
+            TABLE_SLABS
+        ),
+
+        /// Deletes a single v1 trigger from the key index
+        delete_key_trigger_v1: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND time = ?",
+            TABLE_KEYS
+        ),
+
+        /// Clears v1 triggers for a key
+        clear_key_triggers_v1: (
+            "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_KEYS
+        ),
+
+        /// Inserts a v1 trigger into the key index
+        insert_key_trigger_v1: (
+            "INSERT INTO $keyspace.{} (segment_id, key, time, span) VALUES (?, ?, ?, ?)",
+            TABLE_KEYS
+        ),
+
+        /// Gets v1 triggers for a key
+        get_key_triggers_v1: (
+            "SELECT key, time, span FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_KEYS
+        ),
+
+        /// Inserts a v1 slab ID (for testing)
+        insert_slab_v1: (
+            "INSERT INTO $keyspace.{} (id, slab_id) VALUES (?, ?)",
+            TABLE_SEGMENTS
+        ),
+
+        /// Inserts a v1 trigger (for testing)
+        insert_slab_trigger_v1: (
+            "INSERT INTO $keyspace.{} (segment_id, id, key, time, span) VALUES (?, ?, ?, ?, ?)",
+            TABLE_SLABS
+        ),
+
+        /// Inserts a V1 segment without version (for testing)
+        insert_segment_v1: (
+            "INSERT INTO $keyspace.{} (id, name, slab_size) VALUES (?, ?, ?)",
+            TABLE_SEGMENTS
+        ),
     }
-}
-
-/// Prepares a CQL statement for inserting a new segment.
-///
-/// Creates a prepared statement for: `INSERT INTO segments (id, name,
-/// slab_size) VALUES (?, ?, ?)`
-async fn prepare_insert_segment(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("insert into {keyspace}.{TABLE_SEGMENTS} (id, name, slab_size) values (?, ?, ?)"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for retrieving a segment by ID.
-///
-/// Creates a prepared statement for: `SELECT name, slab_size FROM segments
-/// WHERE id = ? LIMIT 1`
-async fn prepare_get_segment(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("select name, slab_size from {keyspace}.{TABLE_SEGMENTS} where id = ? limit 1"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for deleting a segment.
-///
-/// Creates a prepared statement for: `DELETE FROM segments WHERE id = ?`
-async fn prepare_delete_segment(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("delete from {keyspace}.{TABLE_SEGMENTS} where id = ?"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for retrieving all slab IDs for a segment.
-///
-/// Creates a prepared statement for: `SELECT slab_id FROM segments WHERE id =
-/// ?`
-async fn prepare_get_slabs(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("select slab_id from {keyspace}.{TABLE_SEGMENTS} where id = ?"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for retrieving slab IDs within a range.
-///
-/// Creates a prepared statement for: `SELECT slab_id FROM segments WHERE id = ?
-/// AND slab_id >= ? AND slab_id <= ?`
-async fn prepare_get_slab_range(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "select slab_id from {keyspace}.{TABLE_SEGMENTS} where id = ? and slab_id >= ? and \
-             slab_id <= ?"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for inserting a slab with TTL.
-///
-/// Creates a prepared statement for: `INSERT INTO segments (id, slab_id) VALUES
-/// (?, ?) USING TTL ?`
-async fn prepare_insert_slab(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("insert into {keyspace}.{TABLE_SEGMENTS} (id, slab_id) values (?, ?) using ttl ?"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for deleting a slab.
-///
-/// Creates a prepared statement for: `DELETE FROM segments WHERE id = ? AND
-/// slab_id = ?`
-async fn prepare_delete_slab(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("delete from {keyspace}.{TABLE_SEGMENTS} where id = ? and slab_id = ?"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for retrieving all triggers in a slab.
-///
-/// Creates a prepared statement for: `SELECT key, time, span FROM slabs WHERE
-/// segment_id = ? AND id = ?`
-async fn prepare_get_slab_triggers(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "select key, time, span from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ?"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for inserting a trigger into a slab with TTL.
-///
-/// Creates a prepared statement for: `INSERT INTO slabs (segment_id, id, key,
-/// time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?`
-async fn prepare_insert_slab_trigger(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "insert into {keyspace}.{TABLE_SLABS} (segment_id, id, key, time, span) values (?, ?, \
-             ?, ?, ?) using ttl ?"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for deleting a specific trigger from a slab.
-///
-/// Creates a prepared statement for: `DELETE FROM slabs WHERE segment_id = ?
-/// AND id = ? AND key = ? AND time = ?`
-async fn prepare_delete_slab_trigger(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "delete from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ? and key = ? and \
-             time = ?"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for clearing all triggers from a slab.
-///
-/// Creates a prepared statement for: `DELETE FROM slabs WHERE segment_id = ?
-/// AND id = ?`
-async fn prepare_clear_slab_triggers(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("delete from {keyspace}.{TABLE_SLABS} where segment_id = ? and id = ?"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for retrieving all scheduled times for a key.
-///
-/// Creates a prepared statement for: `SELECT time FROM keys WHERE segment_id =
-/// ? AND key = ?`
-async fn prepare_get_key_times(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("select time from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ?"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for retrieving all triggers for a key.
-///
-/// Creates a prepared statement for: `SELECT key, time, span FROM keys WHERE
-/// segment_id = ? AND key = ?`
-async fn prepare_get_key_triggers(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "select key, time, span from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ?"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for inserting a trigger into the key index with
-/// TTL.
-///
-/// Creates a prepared statement for: `INSERT INTO keys (segment_id, key, time,
-/// span) VALUES (?, ?, ?, ?) USING TTL ?`
-async fn prepare_insert_key_trigger(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "insert into {keyspace}.{TABLE_KEYS} (segment_id, key, time, span) values (?, ?, ?, \
-             ?) using ttl ?"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for deleting a specific trigger from the key index.
-///
-/// Creates a prepared statement for: `DELETE FROM keys WHERE segment_id = ? AND
-/// key = ? AND time = ?`
-async fn prepare_delete_key_trigger(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "delete from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ? and time = ?"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for clearing all triggers for a key.
-///
-/// Creates a prepared statement for: `DELETE FROM keys WHERE segment_id = ? AND
-/// key = ?`
-async fn prepare_clear_key_triggers(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("delete from {keyspace}.{TABLE_KEYS} where segment_id = ? and key = ?"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for inserting a slab without TTL.
-///
-/// Creates a prepared statement for: `INSERT INTO segments (id, slab_id) VALUES
-/// (?, ?)`
-async fn prepare_insert_slab_no_ttl(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!("insert into {keyspace}.{TABLE_SEGMENTS} (id, slab_id) values (?, ?)"),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for inserting a trigger into a slab without TTL.
-///
-/// Creates a prepared statement for: `INSERT INTO slabs (segment_id, id, key,
-/// time, span) VALUES (?, ?, ?, ?, ?)`
-async fn prepare_insert_slab_trigger_no_ttl(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "insert into {keyspace}.{TABLE_SLABS} (segment_id, id, key, time, span) values (?, ?, \
-             ?, ?, ?)"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement for inserting a trigger into the key index without
-/// TTL.
-///
-/// Creates a prepared statement for: `INSERT INTO keys (segment_id, key, time,
-/// span) VALUES (?, ?, ?, ?)`
-async fn prepare_insert_key_trigger_no_ttl(
-    session: &Session,
-    keyspace: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    prepare(
-        session,
-        &format!(
-            "insert into {keyspace}.{TABLE_KEYS} (segment_id, key, time, span) values (?, ?, ?, ?)"
-        ),
-    )
-    .await
-}
-
-/// Prepares a CQL statement with optimized settings.
-///
-/// Prepares the given CQL statement and applies performance optimizations:
-/// - Enables cached result metadata for better performance
-/// - Marks the statement as idempotent for safer retries
-///
-/// # Arguments
-///
-/// * `session` - The Cassandra session to use for preparation
-/// * `statement` - The CQL statement string to prepare
-///
-/// # Returns
-///
-/// A [`PreparedStatement`] ready for execution with optimizations applied.
-async fn prepare(
-    session: &Session,
-    statement: &str,
-) -> Result<PreparedStatement, CassandraTriggerStoreError> {
-    let mut statement = session.prepare(statement).await?;
-    statement.set_use_cached_result_metadata(true);
-    statement.set_is_idempotent(true);
-
-    Ok(statement)
 }

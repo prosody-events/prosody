@@ -3,21 +3,32 @@
 //! received in the order they were produced per key, utilizing integration
 //! tests with Kafka, via the Prosody library.
 
-use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use std::env;
-use tokio::runtime::Builder;
+use std::sync::LazyLock;
+use tokio::runtime::{Builder, Runtime};
 
 mod common;
 use common::{TestInput, run_test};
+use prosody::tracing::init_test_logging;
+
+/// Shared runtime for integration tests.
+#[allow(clippy::expect_used)]
+static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+        .expect("Failed to create tokio runtime")
+});
 
 /// Tests that messages are received in the order they were produced for each
 /// key. This function leverages property-based testing using `QuickCheck`,
 /// which generates various input scenarios to ensure correct order. It supports
 /// integration testing with Kafka through the Prosody library.
 #[test]
-fn receives_all_in_key_order() -> Result<()> {
+fn receives_all_in_key_order() {
     // Determine the number of tests to run from an environment variable,
     // defaulting to 3 if the variable is not set or invalid.
     let test_count = env::var("INTEGRATION_TESTS")
@@ -26,19 +37,17 @@ fn receives_all_in_key_order() -> Result<()> {
         .unwrap_or(3);
 
     // Start tracing for logging and debugging.
-    common::init_test_logging()?;
+    init_test_logging();
 
     // Use QuickCheck to run property-based tests that validate message ordering.
     QuickCheck::new()
         .tests(test_count)
         .quickcheck(prop as fn(TestInput) -> TestResult);
-
-    Ok(())
 }
 
 /// Property function for `QuickCheck` to verify message ordering.
 ///
-/// Sets up a Tokio runtime to asynchronously run the `run_test` function
+/// Uses a shared Tokio runtime to asynchronously run the `run_test` function
 /// with generated test input to ensure the correct ordering of messages.
 ///
 /// # Arguments
@@ -57,20 +66,8 @@ fn prop(input: TestInput) -> TestResult {
         return TestResult::discard();
     }
 
-    // Establish a Tokio runtime to execute the asynchronous test logic.
-    let runtime = Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build();
-
-    // Handle any errors during the runtime setup.
-    let runtime = match runtime {
-        Ok(rt) => rt,
-        Err(e) => return TestResult::error(format!("failed to initialize runtime: {e}")),
-    };
-
-    // Run the test within the Tokio runtime and return the outcome.
-    match runtime.block_on(run_test(input)) {
+    // Run the test within the shared Tokio runtime and return the outcome.
+    match TEST_RUNTIME.block_on(run_test(input)) {
         Ok(()) => TestResult::passed(),
         Err(e) => TestResult::error(e.to_string()),
     }

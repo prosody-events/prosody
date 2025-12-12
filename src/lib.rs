@@ -27,15 +27,19 @@
 //!
 //! ```no_run
 //! use prosody::consumer::ConsumerConfiguration;
-//! use prosody::consumer::failure::retry::RetryConfiguration;
-//! use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
-//! use prosody::consumer::failure::{FallibleHandler, ClassifyError};
+//! use prosody::consumer::middleware::retry::RetryConfiguration;
+//! use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
+//! use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
+//! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
+//! use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
+//! use prosody::consumer::middleware::{FallibleHandler, ClassifyError};
+//! use prosody::consumer::DemandType;
 //! use prosody::consumer::message::ConsumerMessage;
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::timers::{Trigger, store::TriggerStore};
-//! use prosody::timers::store::cassandra::CassandraConfigurationBuilder;
+//! use prosody::cassandra::config::CassandraConfigurationBuilder;
 //! use prosody::high_level::mode::Mode;
-//! use prosody::high_level::{HighLevelClient};
+//! use prosody::high_level::{ConsumerBuilders, HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
 //! use serde_json::json;
 //! use std::convert::Infallible;
@@ -50,7 +54,8 @@
 //!     async fn on_message<C>(
 //!         &self,
 //!         context: C,
-//!         message: ConsumerMessage
+//!         message: ConsumerMessage,
+//!         _demand_type: DemandType
 //!     ) -> Result<(), Self::Error>
 //!     where
 //!         C: EventContext,
@@ -63,12 +68,17 @@
 //!         &self,
 //!         context: C,
 //!         trigger: Trigger,
+//!         _demand_type: DemandType,
 //!     ) -> Result<(), Self::Error>
 //!     where
 //!         C: EventContext,
 //!     {
 //!         println!("Timer triggered: {trigger:?}");
 //!         Ok(())
+//!     }
+//!
+//!     async fn shutdown(self) {
+//!         println!("Handler shutting down");
 //!     }
 //! }
 //!
@@ -88,15 +98,21 @@
 //!         .group_id("my-group")
 //!         .subscribed_topics(["my-topic".to_owned()]);
 //!
-//!     let retry_config = RetryConfiguration::builder();
+//!     let consumer_builders = ConsumerBuilders {
+//!         consumer: consumer_config,
+//!         retry: RetryConfiguration::builder(),
+//!         failure_topic: FailureTopicConfigurationBuilder::default(),
+//!         scheduler: SchedulerConfigurationBuilder::default(),
+//!         monopolization: Default::default(),
+//!         defer: DeferConfigurationBuilder::default(),
+//!         timeout: TimeoutConfigurationBuilder::default(),
+//!     };
 //!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
 //!     let client = HighLevelClient::new(
 //!         Mode::Pipeline,
 //!         &mut producer_config,
-//!         &consumer_config,
-//!         &retry_config,
-//!         &FailureTopicConfigurationBuilder::default(),
+//!         &consumer_builders,
 //!         &cassandra_config,
 //!     )?;
 //!
@@ -230,14 +246,16 @@ use rdkafka::mocking::MockCluster;
 use serde_json::Value;
 use std::env;
 use std::mem::forget;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 pub mod admin;
+pub mod cassandra;
 pub mod consumer;
 pub mod heartbeat;
 pub mod high_level;
 pub mod producer;
 pub mod propagator;
+pub mod telemetry;
 pub mod timers;
 pub mod tracing;
 mod util;
@@ -290,9 +308,13 @@ pub type Partition = i32;
 
 /// A compact string optimized for UUID-length keys.
 ///
-/// Uses `Flexstr` to efficiently store message keys up to UUID length without
-/// heap allocation.
-pub type Key = Flexstr<UUID_STR_LEN>;
+/// Uses an Arc so the key can be cheaply cloned
+pub type Key = Arc<str>;
+
+/// A consumer group identifier.
+///
+/// Uses an Arc so the consumer group can be cheaply cloned across components.
+pub type ConsumerGroup = Arc<str>;
 
 /// A JSON value containing a Kafka message's content.
 ///

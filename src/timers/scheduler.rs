@@ -9,11 +9,12 @@
 //! on a spawned Tokio task.
 
 use crate::Key;
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
-use crate::timers::Trigger;
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::queue::TriggerQueue;
+use crate::timers::{TimerType, Trigger};
 use futures::TryFutureExt;
 use std::fmt::Debug;
 use thiserror::Error;
@@ -58,6 +59,19 @@ enum CommandOperation {
 
     /// Remove a trigger from the scheduler.
     Remove,
+
+    /// Add a trigger to the `DelayQueue` only (for rescheduling while firing).
+    ///
+    /// Unlike `Add`, this does not modify `ActiveTriggers` state since
+    /// the caller has already transitioned to `FiringRescheduled`.
+    AddToQueue,
+
+    /// Remove a trigger from the `DelayQueue` only (for canceling a
+    /// reschedule).
+    ///
+    /// Unlike `Remove`, this does not modify `ActiveTriggers` state since
+    /// the caller handles state transitions separately.
+    RemoveFromQueue,
 }
 
 impl TriggerScheduler {
@@ -160,35 +174,114 @@ impl TriggerScheduler {
         &self.active_triggers
     }
 
-    /// Checks if a specific trigger is currently active.
+    /// Transitions a timer from `Scheduled` to `Firing` state.
     ///
-    /// A trigger is active if it has been scheduled and not yet removed
-    /// or deactivated.
+    /// Called when a timer is delivered from the queue and about to be
+    /// processed by a handler. If the timer is still in `Scheduled` state,
+    /// transitions it to `Firing` and returns `true`. If the timer is not
+    /// present or not in `Scheduled` state, returns `false`.
     ///
     /// # Arguments
     ///
     /// * `key` - The [`Key`] of the trigger.
     /// * `time` - The scheduled time of the trigger.
+    /// * `timer_type` - The [`TimerType`] of the trigger.
     ///
     /// # Returns
     ///
-    /// `true` if the trigger is in the active set.
-    pub async fn is_active(&self, key: &Key, time: CompactDateTime) -> bool {
-        self.active_triggers.contains(key, time).await
+    /// `true` if the timer was successfully transitioned to `Firing`.
+    pub(crate) async fn fire(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> bool {
+        use crate::timers::active::TimerState;
+
+        // Only transition if currently in Scheduled state
+        if let Some(TimerState::Scheduled) =
+            self.active_triggers.get_state(key, time, timer_type).await
+        {
+            self.active_triggers
+                .set_state(key, time, timer_type, TimerState::Firing)
+                .await
+        } else {
+            false
+        }
     }
 
     /// Deactivate a trigger without removing it from the persistent queue.
     ///
-    /// Removes the trigger from the active set, preventing future
-    /// [`is_active`](Self::is_active) queries from returning true.
-    /// Does not cancel pending emission.
+    /// Removes the trigger from the active set. Does not cancel pending
+    /// emission.
     ///
     /// # Arguments
     ///
     /// * `key` - The [`Key`] of the trigger.
     /// * `time` - The scheduled time of the trigger.
-    pub async fn deactivate(&self, key: &Key, time: CompactDateTime) {
-        self.active_triggers.remove(key, time).await;
+    /// * `timer_type` - The [`TimerType`] of the trigger.
+    pub async fn deactivate(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
+        self.active_triggers.remove(key, time, timer_type).await;
+    }
+
+    /// Add a trigger to the `DelayQueue` without modifying `ActiveTriggers`.
+    ///
+    /// Used for rescheduling: the caller has already transitioned the state
+    /// to `FiringRescheduled` and only needs the timer re-added to the queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The [`Trigger`] to add to the queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerSchedulerError::Shutdown`] if the scheduler task has
+    /// shut down or the command channel is closed.
+    pub async fn add_to_queue(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        let operation = CommandOperation::AddToQueue;
+
+        self.command_tx
+            .send(Command {
+                result_tx,
+                trigger,
+                operation,
+            })
+            .map_err(|_| TimerSchedulerError::Shutdown)
+            .await?;
+
+        result_rx.await.map_err(|_| TimerSchedulerError::Shutdown)
+    }
+
+    /// Remove a trigger from the `DelayQueue` without modifying
+    /// `ActiveTriggers`.
+    ///
+    /// Used for canceling a reschedule: the caller transitions the state
+    /// from `FiringRescheduled` back to `Firing` and needs the timer removed
+    /// from the queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The [`Trigger`] to remove from the queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerSchedulerError::Shutdown`] if the scheduler task has
+    /// shut down or the command channel is closed.
+    pub async fn remove_from_queue(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        let operation = CommandOperation::RemoveFromQueue;
+
+        self.command_tx
+            .send(Command {
+                result_tx,
+                trigger,
+                operation,
+            })
+            .map_err(|_| TimerSchedulerError::Shutdown)
+            .await?;
+
+        result_rx.await.map_err(|_| TimerSchedulerError::Shutdown)
     }
 }
 
@@ -261,6 +354,7 @@ async fn process_commands(
 /// Execute a scheduling command against the [`TriggerQueue`].
 ///
 /// Insertion and removal update both the delay queue and the active set.
+/// Queue-only operations modify only the delay queue.
 /// Signals the caller via `result_tx` afterward.
 async fn process_command(
     triggers: &mut TriggerQueue,
@@ -273,6 +367,8 @@ async fn process_command(
     match operation {
         CommandOperation::Add => triggers.insert(trigger.clone()).await,
         CommandOperation::Remove => triggers.remove(&trigger).await,
+        CommandOperation::AddToQueue => triggers.insert_queue_only(trigger),
+        CommandOperation::RemoveFromQueue => triggers.remove_queue_only(&trigger),
     }
 
     // Ignore send errors: caller will observe a shutdown if necessary.
@@ -291,17 +387,34 @@ pub enum TimerSchedulerError {
     Shutdown,
 }
 
+impl ClassifyError for TimerSchedulerError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            // DateTime conversion error. Delegate to nested error's classification.
+            Self::DateTime(e) => e.classify_error(),
+
+            // Scheduler has been shut down. System is shutting down or partition is being
+            // rebalanced. Transient allows retry after rebalance completes or on different
+            // partition.
+            Self::Shutdown => ErrorCategory::Transient,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Key;
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
+    use crate::timers::{TimerType, Trigger};
+    use crate::tracing::init_test_logging;
     use tokio::time::{Duration, advance, pause, sleep};
     use tracing::Span;
 
     #[tokio::test]
     async fn test_schedule_and_unschedule() -> Result<(), String> {
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -310,7 +423,7 @@ mod tests {
         let time = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(5)))
             .map_err(|e| format!("Failed to calculate future time: {e:?}"))?;
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Schedule the trigger
         scheduler
@@ -319,7 +432,11 @@ mod tests {
             .map_err(|e| format!("Failed to schedule trigger: {e:?}"))?;
 
         // Verify the trigger is active
-        if !scheduler.is_active(&key, time).await {
+        if !scheduler
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
+            .await
+        {
             return Err("Trigger is not active after scheduling".to_owned());
         }
 
@@ -330,7 +447,11 @@ mod tests {
             .map_err(|e| format!("Failed to unschedule trigger: {e:?}"))?;
 
         // Verify the trigger is no longer active
-        if scheduler.is_active(&key, time).await {
+        if scheduler
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
+            .await
+        {
             return Err("Trigger is still active after unscheduling".to_owned());
         }
 
@@ -345,6 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_emission() -> Result<(), String> {
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -353,7 +475,7 @@ mod tests {
         let time = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(2)))
             .map_err(|e| format!("Failed to calculate future time: {e:?}"))?;
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Schedule the trigger
         scheduler
@@ -376,7 +498,11 @@ mod tests {
         }
 
         // Verify the trigger is still active
-        if !scheduler.is_active(&key, time).await {
+        if !scheduler
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
+            .await
+        {
             return Err(format!(
                 "Trigger is not active after emission. Key: {key:?}, Time: {time:?}"
             ));
@@ -387,6 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_triggers() -> Result<(), String> {
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -395,13 +522,13 @@ mod tests {
         let time1 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(1)))
             .map_err(|e| format!("Failed to calculate future time for key1: {e:?}"))?;
-        let trigger1 = Trigger::new(key1.clone(), time1, Span::current());
+        let trigger1 = Trigger::new(key1.clone(), time1, TimerType::Application, Span::current());
 
         let key2 = Key::from("key2");
         let time2 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(3)))
             .map_err(|e| format!("Failed to calculate future time for key2: {e:?}"))?;
-        let trigger2 = Trigger::new(key2.clone(), time2, Span::current());
+        let trigger2 = Trigger::new(key2.clone(), time2, TimerType::Application, Span::current());
 
         // Schedule both triggers
         scheduler
@@ -428,7 +555,11 @@ mod tests {
         }
 
         // Verify the first trigger is still active
-        if !scheduler.is_active(&key1, time1).await {
+        if !scheduler
+            .active_triggers()
+            .contains(&key1, time1, TimerType::Application)
+            .await
+        {
             return Err(format!(
                 "First trigger is not active after emission. Key: {key1:?}, Time: {time1:?}"
             ));
@@ -449,7 +580,11 @@ mod tests {
         }
 
         // Verify the second trigger is still active
-        if !scheduler.is_active(&key2, time2).await {
+        if !scheduler
+            .active_triggers()
+            .contains(&key2, time2, TimerType::Application)
+            .await
+        {
             return Err(format!(
                 "Second trigger is not active after emission. Key: {key2:?}, Time: {time2:?}"
             ));
@@ -460,6 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deactivate_trigger() -> Result<(), String> {
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -468,7 +604,7 @@ mod tests {
             .and_then(|t| t.add_duration(CompactDuration::new(2)))
             .map_err(|e| format!("Failed to calculate future time: {e:?}"))?;
 
-        let trigger = Trigger::new(key.clone(), time, Span::current());
+        let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Schedule the trigger
         scheduler
@@ -488,10 +624,16 @@ mod tests {
             .map_err(|_| "Expected trigger to be emitted".to_owned())?;
 
         // Deactivate a trigger
-        scheduler.deactivate(&key, time).await;
+        scheduler
+            .deactivate(&key, time, TimerType::Application)
+            .await;
 
         // Verify the trigger is no longer active
-        if scheduler.is_active(&key, time).await {
+        if scheduler
+            .active_triggers()
+            .contains(&key, time, TimerType::Application)
+            .await
+        {
             return Err("Trigger is still active after deactivation".to_owned());
         }
 
@@ -500,6 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_times_for_single_key() -> Result<(), String> {
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -509,17 +652,17 @@ mod tests {
         let time1 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(1)))
             .map_err(|e| format!("Failed to calculate future time for time1: {e:?}"))?;
-        let trigger1 = Trigger::new(key.clone(), time1, Span::current());
+        let trigger1 = Trigger::new(key.clone(), time1, TimerType::Application, Span::current());
 
         let time2 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(3)))
             .map_err(|e| format!("Failed to calculate future time for time2: {e:?}"))?;
-        let trigger2 = Trigger::new(key.clone(), time2, Span::current());
+        let trigger2 = Trigger::new(key.clone(), time2, TimerType::Application, Span::current());
 
         let time3 = CompactDateTime::now()
             .and_then(|t| t.add_duration(CompactDuration::new(5)))
             .map_err(|e| format!("Failed to calculate future time for time3: {e:?}"))?;
-        let trigger3 = Trigger::new(key.clone(), time3, Span::current());
+        let trigger3 = Trigger::new(key.clone(), time3, TimerType::Application, Span::current());
 
         // Schedule all triggers
         scheduler
@@ -549,7 +692,10 @@ mod tests {
 
         // Verify the first trigger is still active
         assert!(
-            scheduler.is_active(&key, time1).await,
+            scheduler
+                .active_triggers()
+                .contains(&key, time1, TimerType::Application)
+                .await,
             "First trigger is not active after emission"
         );
 
@@ -567,7 +713,10 @@ mod tests {
 
         // Verify the second trigger is still active
         assert!(
-            scheduler.is_active(&key, time2).await,
+            scheduler
+                .active_triggers()
+                .contains(&key, time2, TimerType::Application)
+                .await,
             "Second trigger is not active after emission"
         );
 
@@ -585,26 +734,44 @@ mod tests {
 
         // Verify the third trigger is still active
         assert!(
-            scheduler.is_active(&key, time3).await,
+            scheduler
+                .active_triggers()
+                .contains(&key, time3, TimerType::Application)
+                .await,
             "Third trigger is not active after emission"
         );
 
         // Deactivate all triggers
-        scheduler.deactivate(&key, time1).await;
-        scheduler.deactivate(&key, time2).await;
-        scheduler.deactivate(&key, time3).await;
+        scheduler
+            .deactivate(&key, time1, TimerType::Application)
+            .await;
+        scheduler
+            .deactivate(&key, time2, TimerType::Application)
+            .await;
+        scheduler
+            .deactivate(&key, time3, TimerType::Application)
+            .await;
 
         // Verify all triggers are no longer active
         assert!(
-            !scheduler.is_active(&key, time1).await,
+            !scheduler
+                .active_triggers()
+                .contains(&key, time1, TimerType::Application)
+                .await,
             "First trigger is still active after deactivation"
         );
         assert!(
-            !scheduler.is_active(&key, time2).await,
+            !scheduler
+                .active_triggers()
+                .contains(&key, time2, TimerType::Application)
+                .await,
             "Second trigger is still active after deactivation"
         );
         assert!(
-            !scheduler.is_active(&key, time3).await,
+            !scheduler
+                .active_triggers()
+                .contains(&key, time3, TimerType::Application)
+                .await,
             "Third trigger is still active after deactivation"
         );
 
@@ -613,6 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backpressure_handling() -> Result<(), String> {
+        init_test_logging();
         pause();
 
         let (mut trigger_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -626,8 +794,9 @@ mod tests {
         let num_triggers = 69_usize; // 64 (buffer) + 5 (to test backpressure)
         for i in 0_usize..num_triggers {
             let trigger = Trigger::new(
-                Key::from(&format!("trigger-{i}")),
+                Key::from(format!("trigger-{i}")),
                 fire_time,
+                TimerType::Application,
                 Span::current(),
             );
 
@@ -652,8 +821,12 @@ mod tests {
             .and_then(|t| t.add_duration(CompactDuration::new(10)))
             .map_err(|e| format!("Failed to calculate later time: {e:?}"))?;
 
-        let command_test_trigger =
-            Trigger::new(Key::from("command-test"), later_time, Span::current());
+        let command_test_trigger = Trigger::new(
+            Key::from("command-test"),
+            later_time,
+            TimerType::Application,
+            Span::current(),
+        );
 
         // This should succeed even though trigger output is backed up
         scheduler
@@ -663,7 +836,12 @@ mod tests {
 
         // Verify the command was processed by checking if trigger is active
         if !scheduler
-            .is_active(&command_test_trigger.key, command_test_trigger.time)
+            .active_triggers()
+            .contains(
+                &command_test_trigger.key,
+                command_test_trigger.time,
+                TimerType::Application,
+            )
             .await
         {
             return Err(
@@ -691,7 +869,12 @@ mod tests {
             .map_err(|_| "Unschedule failed during backpressure")?;
 
         if scheduler
-            .is_active(&command_test_trigger.key, command_test_trigger.time)
+            .active_triggers()
+            .contains(
+                &command_test_trigger.key,
+                command_test_trigger.time,
+                TimerType::Application,
+            )
             .await
         {
             return Err("Trigger still active after unscheduling during backpressure".to_owned());

@@ -4,6 +4,7 @@
 //! seconds, reducing memory usage for timer systems that process large volumes
 //! of events. Supports the range 1970-2106 with second-level precision.
 
+use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use chrono::{DateTime, Utc};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
@@ -339,6 +340,18 @@ pub enum CompactDateTimeError {
     /// in a negative interval.
     #[error("Time is in the past")]
     PastDateTime,
+}
+
+impl ClassifyError for CompactDateTimeError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            // Time is outside representable range (before 1970 or after 2106) or time
+            // subtraction resulted in negative interval (past datetime). Both are data-dependent
+            // errors where specific message has invalid time value or ordering. Permanent to
+            // drop this bad message rather than retry endlessly.
+            Self::OutOfRange | Self::PastDateTime => ErrorCategory::Permanent,
+        }
+    }
 }
 
 #[cfg(test)]

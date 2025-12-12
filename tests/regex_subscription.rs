@@ -6,16 +6,19 @@
 
 use crate::common::{FallibleTestHandler, collect_messages_with_timeout};
 use color_eyre::eyre::{Result, ensure};
+use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
+    cassandra::config::CassandraConfigurationBuilder,
     consumer::ConsumerConfigurationBuilder,
-    consumer::failure::{
-        retry::RetryConfigurationBuilder, topic::FailureTopicConfigurationBuilder,
+    consumer::middleware::{
+        defer::DeferConfigurationBuilder, monopolization::MonopolizationConfigurationBuilder,
+        retry::RetryConfigurationBuilder, scheduler::SchedulerConfigurationBuilder,
+        timeout::TimeoutConfigurationBuilder, topic::FailureTopicConfigurationBuilder,
     },
-    high_level::{HighLevelClient, HighLevelClientError, mode::Mode},
+    high_level::{ConsumerBuilders, HighLevelClient, HighLevelClientError, mode::Mode},
     producer::ProducerConfigurationBuilder,
-    timers::store::cassandra::CassandraConfigurationBuilder,
 };
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -49,7 +52,9 @@ impl TestTopic {
 }
 
 /// Creates test topics for regex subscription testing.
-async fn create_test_topics(topic_prefix: &str) -> Result<(Vec<TestTopic>, ProsodyAdminClient)> {
+async fn create_test_topics(
+    topic_prefix: &str,
+) -> Result<(Vec<TestTopic>, &'static ProsodyAdminClient)> {
     let topics = vec![
         TestTopic::new(
             format!("{topic_prefix}_events").as_str().into(),
@@ -69,7 +74,7 @@ async fn create_test_topics(topic_prefix: &str) -> Result<(Vec<TestTopic>, Proso
     ];
 
     let bootstrap = vec![BOOTSTRAP_SERVER.to_owned()];
-    let admin_client = ProsodyAdminClient::new(&AdminConfiguration::new(bootstrap)?)?;
+    let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap)?)?;
 
     // Create all test topics with 1 partition and 1 replica
     for topic in &topics {
@@ -106,17 +111,22 @@ fn create_high_level_client(
         .probe_port(None)
         .subscribed_topics(vec![regex_pattern]);
 
-    let retry_builder = RetryConfigurationBuilder::default();
-    let failure_topic_builder = FailureTopicConfigurationBuilder::default();
+    let consumer_builders = ConsumerBuilders {
+        consumer: consumer_builder,
+        retry: RetryConfigurationBuilder::default(),
+        failure_topic: FailureTopicConfigurationBuilder::default(),
+        scheduler: SchedulerConfigurationBuilder::default(),
+        monopolization: MonopolizationConfigurationBuilder::default(),
+        defer: DeferConfigurationBuilder::default(),
+        timeout: TimeoutConfigurationBuilder::default(),
+    };
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
     HighLevelClient::new(
         Mode::BestEffort,
         &mut producer_builder,
-        &consumer_builder,
-        &retry_builder,
-        &failure_topic_builder,
+        &consumer_builders,
         &cassandra_builder,
     )
 }
@@ -225,7 +235,7 @@ async fn cleanup_topics(admin_client: &ProsodyAdminClient, topics: &[TestTopic])
 /// sending/receiving, or cleanup fails.
 #[tokio::test]
 async fn test_regex_topic_subscription() -> Result<()> {
-    common::init_test_logging()?;
+    init_test_logging();
 
     let uuid = Uuid::new_v4().to_string();
     let topic_prefix = format!("regex_test_{}", &uuid[0..8]);
@@ -262,7 +272,7 @@ async fn test_regex_topic_subscription() -> Result<()> {
     verify_messages(&received_messages, &topics)?;
 
     // Cleanup test topics
-    cleanup_topics(&admin_client, &topics).await?;
+    cleanup_topics(admin_client, &topics).await?;
 
     Ok(())
 }

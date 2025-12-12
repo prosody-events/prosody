@@ -63,27 +63,6 @@ where
     }
 }
 
-impl<T> Uncommitted for UncommittedEvent<T>
-where
-    T: TriggerStore,
-{
-    /// Commit the underlying message or timer.
-    async fn commit(self) {
-        match self {
-            UncommittedEvent::Message(message) => message.commit().await,
-            UncommittedEvent::Timer(timer) => timer.commit().await,
-        }
-    }
-
-    /// Abort the underlying message or timer.
-    async fn abort(self) {
-        match self {
-            UncommittedEvent::Message(message) => message.abort().await,
-            UncommittedEvent::Timer(timer) => timer.abort().await,
-        }
-    }
-}
-
 impl<T> From<UncommittedMessage> for UncommittedEvent<T>
 where
     T: TriggerStore,
@@ -175,7 +154,7 @@ impl UncommittedMessage {
     }
 
     fn processing_state(&self) -> Arc<ArcSwapOption<ProcessingState>> {
-        self.inner.0.processing_state.clone()
+        self.inner.processing_state.clone()
     }
 }
 
@@ -185,7 +164,7 @@ impl Uncommitted for UncommittedMessage {
         debug!(
             topic = self.topic().as_ref(),
             partition = self.partition(),
-            key = self.key().as_str(),
+            key = self.key().as_ref(),
             offset = self.offset(),
             "committing message"
         );
@@ -197,7 +176,7 @@ impl Uncommitted for UncommittedMessage {
         debug!(
             topic = self.topic().as_ref(),
             partition = self.partition(),
-            key = self.key().as_str(),
+            key = self.key().as_ref(),
             offset = self.offset(),
             "aborting message"
         );
@@ -244,9 +223,13 @@ impl ProcessScope for UncommittedMessage {
 
 /// A lightweight, clonable Kafka message without offset tracking.
 ///
-/// Internally wraps its data in an `Arc<ConsumerMessageValue>`.
+/// Internally wraps its data in an `Arc<ConsumerMessageValue>` with shared
+/// processing state across clones.
 #[derive(Clone, Debug)]
-pub struct ConsumerMessage(Arc<ConsumerMessageValue>);
+pub struct ConsumerMessage {
+    value: Arc<ConsumerMessageValue>,
+    processing_state: Arc<ArcSwapOption<ProcessingState>>,
+}
 
 #[derive(Educe)]
 #[educe(Debug)]
@@ -286,10 +269,6 @@ pub struct ConsumerMessageValue {
     /// JSON payload of the message.
     #[educe(Debug(ignore))]
     pub payload: Payload,
-
-    /// Processing state containing span and semaphore permit.
-    #[educe(Debug(ignore))]
-    processing_state: Arc<ArcSwapOption<ProcessingState>>,
 }
 
 impl ConsumerMessage {
@@ -319,9 +298,7 @@ impl ConsumerMessage {
         span: Span,
         permit: OwnedSemaphorePermit,
     ) -> Self {
-        let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
-
-        Self(Arc::new(ConsumerMessageValue {
+        let value = Arc::new(ConsumerMessageValue {
             source_system,
             topic,
             partition,
@@ -329,44 +306,74 @@ impl ConsumerMessage {
             key,
             timestamp,
             payload,
+        });
+
+        let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
+
+        Self {
+            value,
             processing_state,
-        }))
+        }
+    }
+
+    /// Create a `ConsumerMessage` from a decoded message with processing state.
+    ///
+    /// This is used after `decode_message` returns a `DecodedMessage` to
+    /// attach the semaphore permit and span for the processing phase.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Shared immutable message data
+    /// * `span` - Tracing span for this processing phase
+    /// * `permit` - Semaphore permit for backpressure management
+    #[must_use]
+    pub fn from_decoded(
+        value: Arc<ConsumerMessageValue>,
+        span: Span,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
+
+        Self {
+            value,
+            processing_state,
+        }
     }
 
     /// Returns the optional source system identifier.
     #[must_use]
     pub fn source_system(&self) -> Option<&SourceSystem> {
-        self.0.source_system.as_ref()
+        self.value.source_system.as_ref()
     }
 
     /// Returns the message's topic.
     #[must_use]
     pub fn topic(&self) -> Topic {
-        self.0.topic
+        self.value.topic
     }
 
     /// Returns the message's partition.
     #[must_use]
     pub fn partition(&self) -> Partition {
-        self.0.partition
+        self.value.partition
     }
 
     /// Returns the message's offset.
     #[must_use]
     pub fn offset(&self) -> Offset {
-        self.0.offset
+        self.value.offset
     }
 
     /// Returns the message's timestamp.
     #[must_use]
     pub fn timestamp(&self) -> &DateTime<Utc> {
-        &self.0.timestamp
+        &self.value.timestamp
     }
 
     /// Returns the JSON payload.
     #[must_use]
     pub fn payload(&self) -> &Payload {
-        &self.0.payload
+        &self.value.payload
     }
 
     /// Returns the tracing span associated with this message.
@@ -374,7 +381,7 @@ impl ConsumerMessage {
     /// Returns `Span::none()` if processing resources have been released.
     #[must_use]
     pub fn span(&self) -> Span {
-        let state = self.0.processing_state.load();
+        let state = self.processing_state.load();
         state
             .as_deref()
             .map_or_else(Span::none, |state| state.span.clone())
@@ -392,12 +399,58 @@ impl ConsumerMessage {
             uncommitted_offset,
         }
     }
+
+    /// Create a test message with minimal dependencies.
+    ///
+    /// Creates a `ConsumerMessage` suitable for unit testing without requiring
+    /// complex setup. Each message gets its own semaphore permit.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - Kafka topic
+    /// * `partition` - Partition index
+    /// * `offset` - Message offset
+    /// * `key` - Message key
+    /// * `payload` - JSON payload
+    ///
+    /// # Panics
+    ///
+    /// Panics if semaphore permit acquisition fails (should never happen).
+    #[cfg(test)]
+    #[must_use]
+    #[allow(clippy::panic)]
+    pub fn for_testing(
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+        key: Key,
+        payload: Payload,
+    ) -> Self {
+        use tokio::sync::Semaphore;
+        let semaphore = Arc::new(Semaphore::new(10));
+        let Ok(permit) = semaphore.try_acquire_owned() else {
+            // Semaphore with 10 permits, acquiring 1 - cannot fail
+            panic!("Semaphore should always have capacity")
+        };
+
+        Self::new(
+            None,
+            topic,
+            partition,
+            offset,
+            key,
+            chrono::Utc::now(),
+            payload,
+            tracing::Span::current(),
+            permit,
+        )
+    }
 }
 
 impl Keyed for ConsumerMessage {
     type Key = Key;
 
     fn key(&self) -> &Self::Key {
-        &self.0.key
+        &self.value.key
     }
 }

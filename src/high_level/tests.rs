@@ -1,10 +1,14 @@
 use super::*;
 use crate::consumer::ConsumerConfiguration;
-use crate::consumer::failure::retry::RetryConfiguration;
-use crate::consumer::failure::topic::FailureTopicConfigurationBuilder;
+use crate::consumer::middleware::defer::DeferConfigurationBuilder;
+use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
+use crate::consumer::middleware::retry::RetryConfiguration;
+use crate::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
+use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
+use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
+use crate::high_level::CassandraConfigurationBuilder;
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
-use crate::timers::store::cassandra::CassandraConfigurationBuilder;
 use color_eyre::Result;
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
@@ -190,16 +194,21 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Hig
         .subscribed_topics(&["test-topic".to_owned()])
         .mock(true);
 
-    let retry_builder = RetryConfiguration::builder();
-    let failure_topic_builder = FailureTopicConfigurationBuilder::default();
+    let consumer_builders = ConsumerBuilders {
+        consumer: consumer_builder,
+        retry: RetryConfiguration::builder(),
+        failure_topic: FailureTopicConfigurationBuilder::default(),
+        scheduler: SchedulerConfigurationBuilder::default(),
+        monopolization: MonopolizationConfigurationBuilder::default(),
+        defer: DeferConfigurationBuilder::default(),
+        timeout: TimeoutConfigurationBuilder::default(),
+    };
     let cassandra_builder = CassandraConfigurationBuilder::default();
 
     Ok(HighLevelClient::new(
         Mode::Pipeline,
         &mut producer_builder,
-        &consumer_builder,
-        &retry_builder,
-        &failure_topic_builder,
+        &consumer_builders,
         &cassandra_builder,
     )?)
 }
