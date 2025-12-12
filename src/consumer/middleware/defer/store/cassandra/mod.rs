@@ -138,6 +138,7 @@ impl DeferStore for CassandraDeferStore {
 
     #[instrument(level = "debug", skip(self), err)]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
+        let ttl = self.store.base_ttl();
         let retry_count_i32: i32 =
             retry_count
                 .try_into()
@@ -149,7 +150,7 @@ impl DeferStore for CassandraDeferStore {
         self.session()
             .execute_unpaged(
                 &self.queries.update_retry_count,
-                (retry_count_i32, &self.segment_id, key.as_ref()),
+                (ttl, retry_count_i32, &self.segment_id, key.as_ref()),
             )
             .await
             .map_err(CassandraStoreError::from)?;

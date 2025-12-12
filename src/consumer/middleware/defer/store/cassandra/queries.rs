@@ -56,7 +56,7 @@ cassandra_queries! {
 
         /// Updates the retry count for all messages of a key (static column)
         update_retry_count: (
-            "UPDATE $keyspace.{} SET retry_count = ? WHERE segment_id = ? AND key = ?",
+            "UPDATE $keyspace.{} USING TTL ? SET retry_count = ? WHERE segment_id = ? AND key = ?",
             TABLE_DEFERRED_OFFSETS
         ),
 
