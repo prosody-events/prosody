@@ -586,7 +586,7 @@ pub struct ConsumerConfiguration {
     ///
     /// # Default
     ///
-    /// Defaults to 1 hour if not specified or if parsing from environment
+    /// Defaults to 1 day if not specified or if parsing from environment
     /// fails.
     pub slab_size: Duration,
 }
