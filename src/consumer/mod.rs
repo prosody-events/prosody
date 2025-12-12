@@ -567,7 +567,8 @@ pub struct ConsumerConfiguration {
     pub probe_port: Option<u16>,
 
     #[builder(
-        default = "from_duration_env_with_fallback(\"PROSODY_SLAB_SIZE\", Duration::from_secs(3600))?",
+        default = "from_duration_env_with_fallback(\"PROSODY_SLAB_SIZE\", \
+                   Duration::from_secs(3600))?",
         setter(into)
     )]
     /// Duration for timer slab partitioning.

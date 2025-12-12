@@ -72,9 +72,9 @@ pub struct SchedulerConfiguration {
     /// boost uses quadratic scaling: `urgency = wait_weight * (t / T)²` where
     /// `t` is actual wait time and `T` is this parameter.
     ///
-    /// - At 50% of `max_wait_secs`: task gets 25% of maximum urgency boost
-    /// - At 100% of `max_wait_secs`: task gets 100% of maximum urgency boost
-    /// - Beyond `max_wait_secs`: urgency is capped at maximum
+    /// - At 50% of `max_wait`: task gets 25% of maximum urgency boost
+    /// - At 100% of `max_wait`: task gets 100% of maximum urgency boost
+    /// - Beyond `max_wait`: urgency is capped at maximum
     ///
     /// **Shorter values** make the scheduler more responsive to wait time,
     /// with urgency ramping up faster. This prioritizes starvation prevention
@@ -84,24 +84,24 @@ pub struct SchedulerConfiguration {
     /// virtual time fairness. This improves long-term fairness but may allow
     /// longer wait times before intervention.
     ///
-    /// Environment variable: `PROSODY_SCHEDULER_MAX_WAIT_SECS`
+    /// Environment variable: `PROSODY_SCHEDULER_MAX_WAIT`
     /// Default: 2 minutes
     #[builder(
-        default = "from_duration_env_with_fallback(\"PROSODY_SCHEDULER_MAX_WAIT_SECS\", \
+        default = "from_duration_env_with_fallback(\"PROSODY_SCHEDULER_MAX_WAIT\", \
                    Duration::from_secs(120))?",
         setter(into)
     )]
-    pub max_wait_secs: Duration,
+    pub max_wait: Duration,
 
     /// Maximum urgency boost (in seconds of virtual time) for waiting tasks.
     ///
     /// This is the "weight" in the priority formula that balances virtual time
     /// fairness against starvation prevention. When a task waits for
-    /// `max_wait_secs`, it receives an urgency boost equivalent to this many
+    /// `max_wait`, it receives an urgency boost equivalent to this many
     /// seconds of negative virtual time, making it more likely to be selected.
     ///
     /// The priority formula is: `priority = key_vt - urgency_boost` where
-    /// `urgency_boost = wait_weight * (wait_time / max_wait_secs)² * 1e6 μs`.
+    /// `urgency_boost = wait_weight * (wait_time / max_wait)² * 1e6 μs`.
     /// Lower priority values are selected first.
     ///
     /// **Higher values** increase the importance of wait time relative to
@@ -114,7 +114,7 @@ pub struct SchedulerConfiguration {
     /// deprioritized longer. This ensures stricter fairness but may allow
     /// longer wait times.
     ///
-    /// Example: With default `wait_weight = 200.0` and `max_wait_secs = 120s`,
+    /// Example: With default `wait_weight = 200.0` and `max_wait = 120s`,
     /// a task waiting 120s gets priority equivalent to a key with 200s less
     /// virtual time.
     ///

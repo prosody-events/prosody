@@ -290,7 +290,7 @@ Persistent storage for scheduled retries (not needed if `PROSODY_MOCK=true`):
 | Environment Variable               | Description                                                      | Default |
 |------------------------------------|------------------------------------------------------------------|---------|
 | `PROSODY_SCHEDULER_FAILURE_WEIGHT` | Fraction of processing time reserved for retries                 | 0.3     |
-| `PROSODY_SCHEDULER_MAX_WAIT_SECS`  | Messages waiting this long get maximum priority                  | 2m      |
+| `PROSODY_SCHEDULER_MAX_WAIT`       | Messages waiting this long get maximum priority                  | 2m      |
 | `PROSODY_SCHEDULER_WAIT_WEIGHT`    | Priority boost for waiting messages (higher = more aggressive)   | 200.0   |
 | `PROSODY_SCHEDULER_CACHE_SIZE`     | Max distinct keys to track                                       | 8192    |
 
