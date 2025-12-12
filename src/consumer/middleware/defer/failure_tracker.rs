@@ -140,34 +140,22 @@ async fn run_event_loop(
         heartbeat.beat();
 
         tokio::select! {
-            result = telemetry_rx.recv() => {
-                match result {
-                    Ok(event) => {
-                        // Only process key-level handler events
-                        if let Data::Key(KeyEvent { state, .. }) = event.data {
-                            match state {
-                                KeyState::HandlerSucceeded => {
-                                    successes.push_back(event.timestamp);
-                                }
-                                KeyState::HandlerFailed => {
-                                    failures.push_back(event.timestamp);
-                                }
-                                _ => {}
-                            }
-                        }
+            result = telemetry_rx.recv() => match result {
+                Ok(event) => match event.data {
+                    Data::Key(KeyEvent { state: KeyState::HandlerSucceeded, .. }) => {
+                        successes.push_back(event.timestamp);
                     }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("failure tracker telemetry lagged by {skipped} events");
+                    Data::Key(KeyEvent { state: KeyState::HandlerFailed, .. }) => {
+                        failures.push_back(event.timestamp);
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
+                    _ => {}
+                },
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("failure tracker telemetry lagged by {skipped} events");
                 }
-            }
-
-            () = heartbeat.next() => {
-                // Periodic wake-up to prune old events even when idle
-            }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            () = heartbeat.next() => {} // Periodic wake-up to prune old events
         }
 
         // Prune expired events and update failure rate after each wake-up
@@ -212,9 +200,10 @@ fn update_failure_rate(
     let failure_count = failures.len();
     let total = failure_count + successes.len();
 
-    let rate = match total {
-        0 => 0.0_f64,
-        _ => failure_count as f64 / total as f64,
+    let rate = if total == 0 {
+        0.0
+    } else {
+        failure_count as f64 / total as f64
     };
 
     failure_rate.store(rate, Ordering::Relaxed);
