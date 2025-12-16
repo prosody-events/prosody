@@ -19,7 +19,7 @@ use crate::consumer::{DemandType, Keyed};
 use crate::telemetry::Telemetry;
 use crate::timers::Trigger;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
-use crate::{Partition, Topic};
+use crate::{Partition, Topic, TopicPartitionKey};
 
 mod decay;
 mod dispatch;
@@ -178,6 +178,8 @@ pub struct SchedulerProvider<T> {
 pub struct SchedulerHandler<T> {
     handler: T,
     dispatcher: Dispatcher,
+    topic: Topic,
+    partition: Partition,
 }
 
 /// Errors that can occur during scheduled handler execution.
@@ -260,6 +262,8 @@ where
         SchedulerHandler {
             handler: self.provider.handler_for_partition(topic, partition),
             dispatcher: self.dispatcher.clone(),
+            topic,
+            partition,
         }
     }
 }
@@ -279,10 +283,8 @@ where
     where
         C: EventContext,
     {
-        let _permit = self
-            .dispatcher
-            .get_permit(message.key().clone(), demand_type)
-            .await?;
+        let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
+        let _permit = self.dispatcher.get_permit(tp_key, demand_type).await?;
 
         self.handler
             .on_message(context, message, demand_type)
@@ -299,10 +301,8 @@ where
     where
         C: EventContext,
     {
-        let _permit = self
-            .dispatcher
-            .get_permit(trigger.key.clone(), demand_type)
-            .await?;
+        let tp_key = TopicPartitionKey::new(self.topic, self.partition, trigger.key.clone());
+        let _permit = self.dispatcher.get_permit(tp_key, demand_type).await?;
 
         self.handler
             .on_timer(context, trigger, demand_type)

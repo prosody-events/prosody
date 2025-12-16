@@ -6,7 +6,7 @@
 
 use super::SchedulerConfiguration;
 use super::decay::DecayingDuration;
-use crate::Key;
+use crate::TopicPartitionKey;
 use crate::consumer::DemandType;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::telemetry::Telemetry;
@@ -39,8 +39,8 @@ type DecayingDuration120 = DecayingDuration<120>;
 struct Task {
     /// When this task was enqueued.
     timestamp: Instant,
-    /// The key this task belongs to.
-    key: Key,
+    /// The topic-partition-qualified key this task belongs to.
+    tp_key: TopicPartitionKey,
     /// Whether this is normal processing or failure handling.
     demand_type: DemandType,
     /// Cached virtual time for this key, avoiding `HashMap` lookup during
@@ -60,8 +60,8 @@ struct Selector {
     tasks: Vec<Task>,
     success_time: DecayingDuration120,
     failure_time: DecayingDuration120,
-    invocation_times: Cache<Key, Instant, UnitWeighter, RandomState>,
-    key_times: Cache<Key, DecayingDuration120, UnitWeighter, RandomState>,
+    invocation_times: Cache<TopicPartitionKey, Instant, UnitWeighter, RandomState>,
+    key_times: Cache<TopicPartitionKey, DecayingDuration120, UnitWeighter, RandomState>,
     failure_weight: f64,
     normal_weight: f64,
     max_wait: f64,
@@ -84,13 +84,13 @@ impl Dispatcher {
 
     pub async fn get_permit(
         &self,
-        key: Key,
+        tp_key: TopicPartitionKey,
         demand_type: DemandType,
     ) -> Result<OwnedSemaphorePermit, DispatchError> {
         let (tx, rx) = oneshot::channel();
         let task = Task {
             timestamp: Instant::now(),
-            key,
+            tp_key,
             demand_type,
             key_time: None,
             tx,
@@ -182,10 +182,12 @@ impl Selector {
     }
 
     fn enqueue_task(&mut self, mut task: Task) {
-        task.key_time = self.key_times.get(&task.key).copied();
+        task.key_time = self.key_times.get(&task.tp_key).copied();
 
         debug!(
-            key = %task.key,
+            topic = %task.tp_key.topic,
+            partition = task.tp_key.partition,
+            key = %task.tp_key.key,
             demand_type = ?task.demand_type,
             has_prior_vt = task.key_time.is_some(),
             queue_depth = self.tasks.len() + 1,
@@ -198,7 +200,10 @@ impl Selector {
     fn process_telemetry(
         &mut self,
         TelemetryEvent {
-            timestamp, data, ..
+            timestamp,
+            topic,
+            partition,
+            data,
         }: TelemetryEvent,
     ) {
         let Data::Key(KeyEvent {
@@ -210,19 +215,25 @@ impl Selector {
             return;
         };
 
+        let tp_key = TopicPartitionKey::new(topic, partition, key);
+
         match state {
             KeyState::HandlerInvoked => {
                 debug!(
-                    key = %key,
+                    topic = %tp_key.topic,
+                    partition = tp_key.partition,
+                    key = %tp_key.key,
                     demand_type = ?demand_type,
                     "handler invocation recorded for VT tracking"
                 );
-                self.invocation_times.insert(key, timestamp);
+                self.invocation_times.insert(tp_key, timestamp);
             }
             KeyState::HandlerSucceeded | KeyState::HandlerFailed => {
-                let Some(duration) = self.get_duration(timestamp, &key) else {
+                let Some(duration) = self.get_duration(timestamp, &tp_key) else {
                     warn!(
-                        key = %key,
+                        topic = %tp_key.topic,
+                        partition = tp_key.partition,
+                        key = %tp_key.key,
                         demand_type = ?demand_type,
                         state = ?state,
                         "missing invocation time for completed handler; \
@@ -232,7 +243,9 @@ impl Selector {
                 };
 
                 debug!(
-                    key = %key,
+                    topic = %tp_key.topic,
+                    partition = tp_key.partition,
+                    key = %tp_key.key,
                     demand_type = ?demand_type,
                     succeeded = matches!(state, KeyState::HandlerSucceeded),
                     duration_ms = duration.as_millis(),
@@ -244,7 +257,7 @@ impl Selector {
                     DemandType::Failure => self.failure_time += duration,
                 }
 
-                self.increment_key_time(&key, duration);
+                self.increment_key_time(&tp_key, duration);
             }
             _ => {}
         }
@@ -312,7 +325,9 @@ impl Selector {
         let task = self.tasks.swap_remove(selected_index);
 
         debug!(
-            key = %task.key,
+            topic = %task.tp_key.topic,
+            partition = task.tp_key.partition,
+            key = %task.tp_key.key,
             demand_type = ?task.demand_type,
             wait_time_ms = (now - task.timestamp).as_millis(),
             remaining_tasks = self.tasks.len(),
@@ -324,13 +339,13 @@ impl Selector {
         Some(task)
     }
 
-    fn get_duration(&mut self, timestamp: Instant, key: &Key) -> Option<Duration> {
-        let (_, time) = self.invocation_times.remove(key)?;
+    fn get_duration(&mut self, timestamp: Instant, tp_key: &TopicPartitionKey) -> Option<Duration> {
+        let (_, time) = self.invocation_times.remove(tp_key)?;
         Some(timestamp - time)
     }
 
-    fn increment_key_time(&mut self, key: &Key, duration: Duration) {
-        match self.key_times.get_mut_or_guard(key) {
+    fn increment_key_time(&mut self, tp_key: &TopicPartitionKey, duration: Duration) {
+        match self.key_times.get_mut_or_guard(tp_key) {
             Ok(Some(mut value)) => *value += duration,
             Err(guard) => guard.insert(duration.into()),
             _ => {}
@@ -375,9 +390,16 @@ impl ClassifyError for DispatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Partition, Topic};
+    use crate::{Key, Partition};
     use color_eyre::eyre::{Result, bail};
     use tokio::time::{sleep, timeout};
+
+    const TEST_TOPIC: &str = "test-topic";
+    const TEST_PARTITION: Partition = 0;
+
+    fn test_tp_key(key: &str) -> TopicPartitionKey {
+        TopicPartitionKey::new(TEST_TOPIC.into(), TEST_PARTITION, Key::from(key))
+    }
 
     fn create_selector() -> Result<Selector> {
         let config = SchedulerConfiguration::builder().build()?;
@@ -388,7 +410,7 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         Task {
             timestamp: Instant::now() - Duration::from_secs(age_secs),
-            key: Key::from(key),
+            tp_key: test_tp_key(key),
             demand_type,
             key_time: None,
             tx,
@@ -406,13 +428,13 @@ mod tests {
     fn single_task_returns_that_task() -> Result<()> {
         let mut selector = create_selector()?;
         let task = create_task("key1", DemandType::Normal, 0);
-        let expected_key = task.key.clone();
+        let expected_key = task.tp_key.key.clone();
         selector.enqueue_task(task);
 
         let selected = selector.get_next_task();
         assert!(selected.is_some());
         if let Some(task) = selected {
-            assert_eq!(task.key, expected_key);
+            assert_eq!(task.tp_key.key, expected_key);
         }
         Ok(())
     }
@@ -449,10 +471,10 @@ mod tests {
 
         selector
             .key_times
-            .insert(Key::from("high_vt"), Duration::from_secs(10).into());
+            .insert(test_tp_key("high_vt"), Duration::from_secs(10).into());
         selector
             .key_times
-            .insert(Key::from("low_vt"), Duration::from_millis(100).into());
+            .insert(test_tp_key("low_vt"), Duration::from_millis(100).into());
 
         selector.enqueue_task(create_task("high_vt", DemandType::Normal, 0));
         selector.enqueue_task(create_task("low_vt", DemandType::Normal, 0));
@@ -462,7 +484,7 @@ mod tests {
         let Some(selected) = selected else {
             bail!("Expected task but got None");
         };
-        assert_eq!(selected.key, Key::from("low_vt"));
+        assert_eq!(selected.tp_key.key, Key::from("low_vt"));
         Ok(())
     }
 
@@ -478,7 +500,7 @@ mod tests {
         let Some(selected) = selected else {
             bail!("Expected task but got None");
         };
-        assert_eq!(selected.key, Key::from("key1"));
+        assert_eq!(selected.tp_key.key, Key::from("key1"));
         Ok(())
     }
 
@@ -488,7 +510,7 @@ mod tests {
 
         selector
             .key_times
-            .insert(Key::from("old_key"), Duration::from_secs(5).into());
+            .insert(test_tp_key("old_key"), Duration::from_secs(5).into());
 
         selector.enqueue_task(create_task("new_key", DemandType::Normal, 0));
         selector.enqueue_task(create_task("old_key", DemandType::Normal, 0));
@@ -498,7 +520,7 @@ mod tests {
         let Some(selected) = selected else {
             bail!("Expected task but got None");
         };
-        assert_eq!(selected.key, Key::from("new_key"));
+        assert_eq!(selected.tp_key.key, Key::from("new_key"));
         Ok(())
     }
 
@@ -546,10 +568,10 @@ mod tests {
 
         selector
             .key_times
-            .insert(Key::from("low_vt"), Duration::from_millis(10).into());
+            .insert(test_tp_key("low_vt"), Duration::from_millis(10).into());
         selector
             .key_times
-            .insert(Key::from("high_vt"), Duration::from_secs(5).into());
+            .insert(test_tp_key("high_vt"), Duration::from_secs(5).into());
 
         selector.enqueue_task(create_task("low_vt", DemandType::Normal, 0));
         // With WAIT_WEIGHT = 200, need 120s wait to get max boost of 200 points
@@ -561,7 +583,7 @@ mod tests {
         let Some(selected) = selected else {
             bail!("Expected task but got None");
         };
-        assert_eq!(selected.key, Key::from("high_vt"));
+        assert_eq!(selected.tp_key.key, Key::from("high_vt"));
         Ok(())
     }
 
@@ -575,7 +597,7 @@ mod tests {
             let key = format!("new_{i}");
             selector
                 .key_times
-                .insert(Key::from(key.as_str()), Duration::from_millis(1).into());
+                .insert(test_tp_key(&key), Duration::from_millis(1).into());
             selector.enqueue_task(create_task(&key, DemandType::Normal, 0));
         }
 
@@ -584,7 +606,7 @@ mod tests {
         let Some(selected) = selected else {
             bail!("Expected task but got None");
         };
-        assert_eq!(selected.key, Key::from("waiting_key"));
+        assert_eq!(selected.tp_key.key, Key::from("waiting_key"));
         Ok(())
     }
 
@@ -632,7 +654,7 @@ mod tests {
             let key = format!("old_{i}");
             selector
                 .key_times
-                .insert(Key::from(key.as_str()), Duration::from_millis(500).into());
+                .insert(test_tp_key(&key), Duration::from_millis(500).into());
             // Give them 60s wait time - provides (60/120)^2 * 200 = 50 points boost
             selector.enqueue_task(create_task(&key, DemandType::Normal, 60));
         }
@@ -647,7 +669,7 @@ mod tests {
 
         for _ in 0_i32..50_i32 {
             if let Some(task) = selector.get_next_task() {
-                let key_str = task.key.to_string();
+                let key_str = task.tp_key.key.to_string();
                 if key_str.starts_with("old_") {
                     old_keys_selected += 1_i32;
                 } else {
@@ -679,7 +701,7 @@ mod tests {
             let Some(selected) = selector.get_next_task() else {
                 bail!("Expected task but got None");
             };
-            assert_eq!(selected.key, Key::from("monopoly_key"));
+            assert_eq!(selected.tp_key.key, Key::from("monopoly_key"));
         }
         Ok(())
     }
@@ -691,16 +713,14 @@ mod tests {
         for i in 0_u64..10_u64 {
             let key = format!("key_{i}");
             let vt = Duration::from_millis(i * 100);
-            selector
-                .key_times
-                .insert(Key::from(key.as_str()), vt.into());
+            selector.key_times.insert(test_tp_key(&key), vt.into());
             selector.enqueue_task(create_task(&key, DemandType::Normal, 0));
         }
 
         let mut vts = Vec::new();
         for _ in 0_i32..10_i32 {
             if let Some(task) = selector.get_next_task()
-                && let Some(vt) = selector.key_times.get(&task.key)
+                && let Some(vt) = selector.key_times.get(&task.tp_key)
             {
                 vts.push(vt.at(Instant::now()).as_millis());
             }
@@ -773,7 +793,7 @@ mod tests {
                 DemandType::Failure => selector.failure_time += duration,
             }
             // Re-enqueue to simulate continuous load
-            selector.enqueue_task(create_task(task.key.as_ref(), task.demand_type, 0));
+            selector.enqueue_task(create_task(task.tp_key.key.as_ref(), task.demand_type, 0));
         }
 
         // Simulate burst: add many new failure keys
@@ -802,7 +822,7 @@ mod tests {
                 }
             }
             // Re-enqueue to keep continuous load
-            selector.enqueue_task(create_task(task.key.as_ref(), task.demand_type, 0));
+            selector.enqueue_task(create_task(task.tp_key.key.as_ref(), task.demand_type, 0));
         }
 
         // Both classes should still get service during burst
@@ -845,12 +865,12 @@ mod tests {
         for &key in &fast_keys {
             selector
                 .key_times
-                .insert(Key::from(key), Duration::ZERO.into());
+                .insert(test_tp_key(key), Duration::ZERO.into());
         }
         for &key in &slow_keys {
             selector
                 .key_times
-                .insert(Key::from(key), Duration::ZERO.into());
+                .insert(test_tp_key(key), Duration::ZERO.into());
         }
 
         // Track execution for each key type
@@ -872,7 +892,7 @@ mod tests {
                 bail!("Expected task in heterogeneous test");
             };
 
-            let key_str = task.key.to_string();
+            let key_str = task.tp_key.key.to_string();
             let duration = if fast_keys.contains(&key_str.as_str()) {
                 let d = Duration::from_millis(10);
                 fast_time += d;
@@ -884,7 +904,7 @@ mod tests {
             };
 
             // Update VT for the key
-            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+            if let Some(mut vt) = selector.key_times.get_mut(&task.tp_key) {
                 *vt += duration;
             }
         }
@@ -915,11 +935,11 @@ mod tests {
         // Initialize all at zero VT
         selector
             .key_times
-            .insert(Key::from(slow_key), Duration::ZERO.into());
+            .insert(test_tp_key(slow_key), Duration::ZERO.into());
         for &key in &fast_keys {
             selector
                 .key_times
-                .insert(Key::from(key), Duration::ZERO.into());
+                .insert(test_tp_key(key), Duration::ZERO.into());
         }
 
         let mut slow_count = 0_i32;
@@ -938,7 +958,7 @@ mod tests {
                 bail!("Expected task in long tail test");
             };
 
-            let duration = if task.key == Key::from(slow_key) {
+            let duration = if task.tp_key.key == Key::from(slow_key) {
                 slow_count += 1_i32;
                 Duration::from_millis(500) // 50x slower
             } else {
@@ -947,7 +967,7 @@ mod tests {
             };
 
             // Update VT
-            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+            if let Some(mut vt) = selector.key_times.get_mut(&task.tp_key) {
                 *vt += duration;
             }
         }
@@ -967,12 +987,12 @@ mod tests {
         // Check VT fairness: all keys should have similar VT (not execution count)
         let slow_vt = selector
             .key_times
-            .get(&Key::from(slow_key))
+            .get(&test_tp_key(slow_key))
             .map_or(Duration::ZERO, |vt| vt.at(Instant::now()));
 
         let max_fast_vt = fast_keys
             .iter()
-            .filter_map(|&key| selector.key_times.get(&Key::from(key)))
+            .filter_map(|&key| selector.key_times.get(&test_tp_key(key)))
             .map(|vt| vt.at(Instant::now()))
             .max()
             .unwrap_or(Duration::ZERO);
@@ -1004,13 +1024,13 @@ mod tests {
         // So new keys are selected first, but monopoly recovers once they accumulate VT
         selector
             .key_times
-            .insert(Key::from(monopoly_key), Duration::from_secs(150).into());
+            .insert(test_tp_key(monopoly_key), Duration::from_secs(150).into());
 
         // New keys start at zero VT
         for &key in &new_keys {
             selector
                 .key_times
-                .insert(Key::from(key), Duration::ZERO.into());
+                .insert(test_tp_key(key), Duration::ZERO.into());
         }
 
         let mut monopoly_count = 0_i32;
@@ -1036,9 +1056,9 @@ mod tests {
 
             // Simulate realistic task durations
             let duration = Duration::from_millis(100);
-            let key_str = task.key.clone();
+            let key_str = task.tp_key.key.clone();
 
-            if task.key == Key::from(monopoly_key) {
+            if task.tp_key.key == Key::from(monopoly_key) {
                 monopoly_count += 1_i32;
                 if first_monopoly_iter.is_none() {
                     first_monopoly_iter = Some(i);
@@ -1048,7 +1068,7 @@ mod tests {
             }
 
             // Update VT for the executed task
-            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+            if let Some(mut vt) = selector.key_times.get_mut(&task.tp_key) {
                 *vt += duration;
             }
 
@@ -1184,13 +1204,13 @@ mod tests {
                 }
             }
 
-            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+            if let Some(mut vt) = selector.key_times.get_mut(&task.tp_key) {
                 *vt += duration;
             }
 
             // Burst pattern: failure keys re-enqueue every time, normal only every 5th
             // iteration
-            let key_str = task.key.to_string();
+            let key_str = task.tp_key.key.to_string();
             if failure_keys.contains(&key_str) || i % 5_i32 == 0_i32 {
                 selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
             }
@@ -1222,13 +1242,13 @@ mod tests {
                 }
             }
 
-            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+            if let Some(mut vt) = selector.key_times.get_mut(&task.tp_key) {
                 *vt += duration;
             }
 
             // Burst pattern: normal keys re-enqueue every time, failure only every 5th
             // iteration
-            let key_str = task.key.to_string();
+            let key_str = task.tp_key.key.to_string();
             if normal_keys.contains(&key_str) || i % 5_i32 == 0_i32 {
                 selector.enqueue_task(create_task(&key_str, task.demand_type, 0));
             }
@@ -1269,9 +1289,7 @@ mod tests {
         for (i, key) in keys.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             let vt = Duration::from_millis((i as u64) * 100_u64);
-            selector
-                .key_times
-                .insert(Key::from(key.as_str()), vt.into());
+            selector.key_times.insert(test_tp_key(key), vt.into());
         }
 
         // Enqueue all keys
@@ -1288,15 +1306,15 @@ mod tests {
             };
 
             // Execute with small variance
-            let duration = Duration::from_millis(10_u64 + (task.key.len() as u64 % 5_u64));
+            let duration = Duration::from_millis(10_u64 + (task.tp_key.key.len() as u64 % 5_u64));
             selector.success_time += duration;
 
-            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+            if let Some(mut vt) = selector.key_times.get_mut(&task.tp_key) {
                 *vt += duration;
             }
 
             // Re-enqueue
-            selector.enqueue_task(create_task(task.key.as_ref(), task.demand_type, 0));
+            selector.enqueue_task(create_task(task.tp_key.key.as_ref(), task.demand_type, 0));
 
             // Check spread every 100 iterations
             if selector.tasks.len() == keys.len() {
@@ -1306,7 +1324,7 @@ mod tests {
                     .filter_map(|k| {
                         selector
                             .key_times
-                            .get(&Key::from(k.as_str()))
+                            .get(&test_tp_key(k))
                             .map(|vt| vt.at(now).as_micros())
                     })
                     .collect();
@@ -1372,12 +1390,12 @@ mod tests {
                 }
             }
 
-            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+            if let Some(mut vt) = selector.key_times.get_mut(&task.tp_key) {
                 *vt += duration;
             }
 
             // Re-enqueue
-            selector.enqueue_task(create_task(task.key.as_ref(), task.demand_type, 0));
+            selector.enqueue_task(create_task(task.tp_key.key.as_ref(), task.demand_type, 0));
         }
 
         // System should recover toward 70/30 split
@@ -1411,9 +1429,7 @@ mod tests {
         for (i, key) in existing_keys.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             let vt = Duration::from_millis((i as u64) * 50_u64);
-            selector
-                .key_times
-                .insert(Key::from(key.as_str()), vt.into());
+            selector.key_times.insert(test_tp_key(key), vt.into());
             selector.enqueue_task(create_task(key, DemandType::Normal, 0));
         }
 
@@ -1435,11 +1451,11 @@ mod tests {
             let duration = Duration::from_millis(10);
             selector.success_time += duration;
 
-            if let Some(mut vt) = selector.key_times.get_mut(&task.key) {
+            if let Some(mut vt) = selector.key_times.get_mut(&task.tp_key) {
                 *vt += duration;
             }
 
-            let key_str = task.key.to_string();
+            let key_str = task.tp_key.key.to_string();
             if existing_keys.contains(&key_str) {
                 old_selections += 1_i32;
             } else {
@@ -1447,7 +1463,7 @@ mod tests {
             }
 
             // Re-enqueue
-            selector.enqueue_task(create_task(task.key.as_ref(), task.demand_type, 0));
+            selector.enqueue_task(create_task(task.tp_key.key.as_ref(), task.demand_type, 0));
         }
 
         // New keys start at 0 VT (lower than existing 0-450ms), so should dominate
@@ -1473,7 +1489,7 @@ mod tests {
             .filter_map(|k| {
                 selector
                     .key_times
-                    .get(&Key::from(k.as_str()))
+                    .get(&test_tp_key(k))
                     .map(|vt| vt.at(now).as_micros())
             })
             .collect();
@@ -1493,14 +1509,15 @@ mod tests {
     fn telemetry_tracks_invocation_time() -> Result<()> {
         let mut selector = create_selector()?;
         let key = Key::from("test_key");
+        let tp_key = TopicPartitionKey::new(TEST_TOPIC.into(), TEST_PARTITION, key.clone());
         let now = Instant::now();
 
         let event = TelemetryEvent {
             timestamp: now,
-            topic: Topic::from("test"),
-            partition: Partition::from(0_i32),
+            topic: TEST_TOPIC.into(),
+            partition: TEST_PARTITION,
             data: Data::Key(KeyEvent {
-                key: key.clone(),
+                key,
                 demand_type: DemandType::Normal,
                 state: KeyState::HandlerInvoked,
             }),
@@ -1508,8 +1525,8 @@ mod tests {
 
         selector.process_telemetry(event);
 
-        assert!(selector.invocation_times.contains_key(&key));
-        assert_eq!(selector.invocation_times.get(&key), Some(&now));
+        assert!(selector.invocation_times.contains_key(&tp_key));
+        assert_eq!(selector.invocation_times.get(&tp_key), Some(&now));
         Ok(())
     }
 
@@ -1517,14 +1534,15 @@ mod tests {
     fn telemetry_updates_success_time_and_key_vt() -> Result<()> {
         let mut selector = create_selector()?;
         let key = Key::from("test_key");
+        let tp_key = test_tp_key("test_key");
         let invoke_time = Instant::now();
         let complete_time = invoke_time + Duration::from_millis(100);
 
         // First, record invocation
         selector.process_telemetry(TelemetryEvent {
             timestamp: invoke_time,
-            topic: Topic::from("test"),
-            partition: Partition::from(0_i32),
+            topic: TEST_TOPIC.into(),
+            partition: TEST_PARTITION,
             data: Data::Key(KeyEvent {
                 key: key.clone(),
                 demand_type: DemandType::Normal,
@@ -1537,10 +1555,10 @@ mod tests {
         // Then, record completion
         selector.process_telemetry(TelemetryEvent {
             timestamp: complete_time,
-            topic: Topic::from("test"),
-            partition: Partition::from(0_i32),
+            topic: TEST_TOPIC.into(),
+            partition: TEST_PARTITION,
             data: Data::Key(KeyEvent {
-                key: key.clone(),
+                key,
                 demand_type: DemandType::Normal,
                 state: KeyState::HandlerSucceeded,
             }),
@@ -1555,7 +1573,7 @@ mod tests {
 
         // Verify key VT was updated
         assert!(
-            selector.key_times.get(&key).is_some(),
+            selector.key_times.get(&tp_key).is_some(),
             "key_times should contain the key after completion"
         );
         Ok(())
@@ -1571,8 +1589,8 @@ mod tests {
         // Record invocation
         selector.process_telemetry(TelemetryEvent {
             timestamp: invoke_time,
-            topic: Topic::from("test"),
-            partition: Partition::from(0_i32),
+            topic: TEST_TOPIC.into(),
+            partition: TEST_PARTITION,
             data: Data::Key(KeyEvent {
                 key: key.clone(),
                 demand_type: DemandType::Failure,
@@ -1585,10 +1603,10 @@ mod tests {
         // Record failure
         selector.process_telemetry(TelemetryEvent {
             timestamp: complete_time,
-            topic: Topic::from("test"),
-            partition: Partition::from(0_i32),
+            topic: TEST_TOPIC.into(),
+            partition: TEST_PARTITION,
             data: Data::Key(KeyEvent {
-                key: key.clone(),
+                key,
                 demand_type: DemandType::Failure,
                 state: KeyState::HandlerFailed,
             }),
@@ -1614,8 +1632,8 @@ mod tests {
         // Simulate key1 executing and accumulating VT
         selector.process_telemetry(TelemetryEvent {
             timestamp: now,
-            topic: Topic::from("test"),
-            partition: Partition::from(0_i32),
+            topic: TEST_TOPIC.into(),
+            partition: TEST_PARTITION,
             data: Data::Key(KeyEvent {
                 key: key1.clone(),
                 demand_type: DemandType::Normal,
@@ -1625,10 +1643,10 @@ mod tests {
 
         selector.process_telemetry(TelemetryEvent {
             timestamp: now + Duration::from_secs(1),
-            topic: Topic::from("test"),
-            partition: Partition::from(0_i32),
+            topic: TEST_TOPIC.into(),
+            partition: TEST_PARTITION,
             data: Data::Key(KeyEvent {
-                key: key1.clone(),
+                key: key1,
                 demand_type: DemandType::Normal,
                 state: KeyState::HandlerSucceeded,
             }),
@@ -1645,7 +1663,7 @@ mod tests {
             bail!("Expected task");
         };
         assert_eq!(
-            selected.key, key2,
+            selected.tp_key.key, key2,
             "key2 should be selected due to lower VT"
         );
 
@@ -1661,10 +1679,10 @@ mod tests {
         let dispatcher = Dispatcher::new(&config, &telemetry);
 
         let permit1 = dispatcher
-            .get_permit(Key::from("key1"), DemandType::Normal)
+            .get_permit(test_tp_key("key1"), DemandType::Normal)
             .await;
         let permit2 = dispatcher
-            .get_permit(Key::from("key2"), DemandType::Normal)
+            .get_permit(test_tp_key("key2"), DemandType::Normal)
             .await;
 
         assert!(permit1.is_ok(), "Should get first permit");
@@ -1682,11 +1700,11 @@ mod tests {
 
         // Get first permit
         let _permit1 = dispatcher
-            .get_permit(Key::from("key1"), DemandType::Normal)
+            .get_permit(test_tp_key("key1"), DemandType::Normal)
             .await?;
 
         // Try to get second permit (should block since max_concurrency=1)
-        let permit2_future = dispatcher.get_permit(Key::from("key2"), DemandType::Normal);
+        let permit2_future = dispatcher.get_permit(test_tp_key("key2"), DemandType::Normal);
 
         // Use timeout to verify it blocks
         let result = timeout(Duration::from_millis(100), permit2_future).await;
@@ -1710,14 +1728,14 @@ mod tests {
         // Get and drop first permit
         {
             let _permit1 = dispatcher
-                .get_permit(Key::from("key1"), DemandType::Normal)
+                .get_permit(test_tp_key("key1"), DemandType::Normal)
                 .await?;
             // permit1 dropped here
         }
 
         // Should be able to get another permit now
         let permit2 = dispatcher
-            .get_permit(Key::from("key2"), DemandType::Normal)
+            .get_permit(test_tp_key("key2"), DemandType::Normal)
             .await;
 
         assert!(
@@ -1737,9 +1755,9 @@ mod tests {
         let dispatcher = Dispatcher::new(&config, &telemetry);
 
         // Enqueue tasks with different wait times (older = higher priority)
-        let old_task = dispatcher.get_permit(Key::from("old"), DemandType::Normal);
+        let old_task = dispatcher.get_permit(test_tp_key("old"), DemandType::Normal);
         sleep(Duration::from_millis(10)).await;
-        let new_task = dispatcher.get_permit(Key::from("new"), DemandType::Normal);
+        let new_task = dispatcher.get_permit(test_tp_key("new"), DemandType::Normal);
 
         // Both should complete, and old task should get priority
         let (result1, result2) = tokio::join!(old_task, new_task);

@@ -47,7 +47,7 @@ use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
 use crate::timers::Trigger;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
-use crate::{Key, Partition, Topic};
+use crate::{Key, Partition, Topic, TopicPartitionKey};
 
 /// Configuration for monopolization detection.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -102,7 +102,7 @@ pub struct MonopolizationMiddleware {
     monopolization_threshold: f64,
     window_duration: Duration,
     reference_instant: Instant,
-    key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
 }
 
 /// Provider that creates monopolization handlers for each partition.
@@ -112,7 +112,7 @@ pub struct MonopolizationProvider<T> {
     monopolization_threshold: f64,
     window_duration: Duration,
     reference_instant: Instant,
-    key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
 }
 
 /// Handler wrapper that checks for monopolization before delegating to inner
@@ -120,8 +120,10 @@ pub struct MonopolizationProvider<T> {
 #[derive(Clone)]
 pub struct MonopolizationHandler<T> {
     handler: T,
+    topic: Topic,
+    partition: Partition,
     reference_instant: Instant,
-    key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
     monopolization_threshold: f64,
     window_duration: Duration,
 }
@@ -216,6 +218,8 @@ where
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         MonopolizationHandler {
             handler: self.provider.handler_for_partition(topic, partition),
+            topic,
+            partition,
             reference_instant: self.reference_instant,
             key_intervals: Arc::clone(&self.key_intervals),
             monopolization_threshold: self.monopolization_threshold,
@@ -239,7 +243,8 @@ where
     where
         C: EventContext,
     {
-        if let Some(error) = self.check_monopolization(message.key(), Instant::now()) {
+        let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
+        if let Some(error) = self.check_monopolization(&tp_key, Instant::now()) {
             return Err(error);
         }
 
@@ -258,7 +263,8 @@ where
     where
         C: EventContext,
     {
-        if let Some(error) = self.check_monopolization(&trigger.key, Instant::now()) {
+        let tp_key = TopicPartitionKey::new(self.topic, self.partition, trigger.key.clone());
+        if let Some(error) = self.check_monopolization(&tp_key, Instant::now()) {
             return Err(error);
         }
 
@@ -284,11 +290,11 @@ where
     #[allow(clippy::cast_precision_loss)]
     fn check_monopolization(
         &self,
-        key: &Key,
+        tp_key: &TopicPartitionKey,
         now: Instant,
     ) -> Option<MonopolizationError<T::Error>> {
         // No intervals tracked for this key yet - fast path
-        let intervals = self.key_intervals.get(key)?;
+        let intervals = self.key_intervals.get(tp_key)?;
 
         let now_nanos = now
             .saturating_duration_since(self.reference_instant)
@@ -312,7 +318,9 @@ where
 
             // Only log when we're actually rejecting - this is the important event
             warn!(
-                %key,
+                topic = %tp_key.topic,
+                partition = tp_key.partition,
+                key = %tp_key.key,
                 usage = %format_args!("{percentage:.1}%"),
                 limit = %format_args!("{threshold_pct:.1}%"),
                 window = %format_duration(self.window_duration),
@@ -320,7 +328,9 @@ where
             );
 
             return Some(MonopolizationError::Monopolization {
-                key: key.clone(),
+                topic: tp_key.topic,
+                partition: tp_key.partition,
+                key: tp_key.key.clone(),
                 percentage,
                 threshold: threshold_pct,
                 window: self.window_duration,
@@ -333,7 +343,7 @@ where
 
 async fn run_event_loop(
     reference_instant: Instant,
-    key_intervals: Arc<Cache<Key, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
     window_duration: Duration,
     mut telemetry_rx: broadcast::Receiver<TelemetryEvent>,
 ) {
@@ -361,6 +371,8 @@ async fn run_event_loop(
             continue;
         };
 
+        let tp_key = TopicPartitionKey::new(event.topic, event.partition, key);
+
         let elapsed_nanos = event
             .timestamp
             .saturating_duration_since(reference_instant)
@@ -371,28 +383,46 @@ async fn run_event_loop(
                 const MAX_NANOS: u64 = u64::MAX - 1;
                 let open_interval_set = [(elapsed_nanos, MAX_NANOS)].to_interval_set();
 
-                if let Some(intervals) = key_intervals.get(&key) {
-                    key_intervals.insert(key.clone(), intervals.union(&open_interval_set));
-                    trace!(%key, "Handler invoked - extended execution interval");
+                if let Some(intervals) = key_intervals.get(&tp_key) {
+                    key_intervals.insert(tp_key.clone(), intervals.union(&open_interval_set));
+                    trace!(
+                        topic = %tp_key.topic,
+                        partition = tp_key.partition,
+                        key = %tp_key.key,
+                        "Handler invoked - extended execution interval"
+                    );
                 } else {
-                    key_intervals.insert(key.clone(), open_interval_set);
-                    trace!(%key, "Handler invoked - opened new execution interval");
+                    key_intervals.insert(tp_key.clone(), open_interval_set);
+                    trace!(
+                        topic = %tp_key.topic,
+                        partition = tp_key.partition,
+                        key = %tp_key.key,
+                        "Handler invoked - opened new execution interval"
+                    );
                 }
             }
             KeyState::HandlerSucceeded | KeyState::HandlerFailed => {
                 let window_start = elapsed_nanos.saturating_sub(window_nanos);
                 let window_interval_set = [(window_start, elapsed_nanos)].to_interval_set();
 
-                if let Some(intervals) = key_intervals.get(&key) {
+                if let Some(intervals) = key_intervals.get(&tp_key) {
                     let windowed = intervals.intersection(&window_interval_set);
-                    key_intervals.insert(key.clone(), windowed);
+                    key_intervals.insert(tp_key.clone(), windowed);
 
-                    trace!(%key, ?state, "Handler completed - closed execution interval");
+                    trace!(
+                        topic = %tp_key.topic,
+                        partition = tp_key.partition,
+                        key = %tp_key.key,
+                        ?state,
+                        "Handler completed - closed execution interval"
+                    );
                 } else {
                     // Handler completed without a corresponding invocation event
                     // (possibly due to telemetry lag or cache eviction)
                     debug!(
-                        %key,
+                        topic = %tp_key.topic,
+                        partition = tp_key.partition,
+                        key = %tp_key.key,
                         ?state,
                         "Handler completed but no open interval found"
                     );
@@ -414,11 +444,16 @@ pub enum MonopolizationError<E> {
 
     /// A key has monopolized execution time.
     #[error(
-        "Key '{key}' monopolized {percentage:.1}% of execution time over {} window \
-         (threshold: {threshold:.1}%), preventing other keys from being processed efficiently.",
+        "Key '{key}' in {topic}:{partition} monopolized {percentage:.1}% of execution time over \
+         {} window (threshold: {threshold:.1}%), preventing other keys from being processed \
+         efficiently.",
         format_duration(*.window)
     )]
     Monopolization {
+        /// The topic containing the monopolizing key.
+        topic: Topic,
+        /// The partition containing the monopolizing key.
+        partition: Partition,
         /// The key that monopolized execution.
         key: Key,
         /// The percentage of execution time monopolized.
@@ -536,6 +571,13 @@ mod tests {
         }
     }
 
+    const TEST_TOPIC: &str = "test-topic";
+    const TEST_PARTITION: Partition = 0;
+
+    fn test_tp_key(key: &str) -> TopicPartitionKey {
+        TopicPartitionKey::new(TEST_TOPIC.into(), TEST_PARTITION, key.into())
+    }
+
     fn create_key_event(
         topic: Topic,
         partition: Partition,
@@ -586,6 +628,8 @@ mod tests {
     #[test]
     fn test_monopolization_error_classification() {
         let error: MonopolizationError<MockError> = MonopolizationError::Monopolization {
+            topic: "test-topic".into(),
+            partition: 0,
             key: "test-key".into(),
             percentage: 95.0,
             threshold: 90.0,
@@ -602,6 +646,8 @@ mod tests {
     #[test]
     fn test_monopolization_error_message() {
         let error: MonopolizationError<MockError> = MonopolizationError::Monopolization {
+            topic: "orders".into(),
+            partition: 3,
             key: "user-12345".into(),
             percentage: 95.5,
             threshold: 90.0,
@@ -612,6 +658,10 @@ mod tests {
         assert!(
             message.contains("user-12345"),
             "Error should include the key"
+        );
+        assert!(
+            message.contains("orders:3"),
+            "Error should include topic:partition"
         );
         assert!(
             message.contains("95.5%"),
@@ -647,35 +697,35 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
-        let key: Key = "test-key".into();
+        let tp_key = test_tp_key("test-key");
         let reference_instant = handler.reference_instant;
 
         let start_time = reference_instant;
         let end_time = start_time + Duration::from_secs(10);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             start_time,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             end_time,
         ));
 
         sleep(Duration::from_millis(10)).await;
 
-        let result = handler.check_monopolization(&key, end_time);
+        let result = handler.check_monopolization(&tp_key, end_time);
         assert!(
             result.is_none(),
             "Key using 10s of 300s window should not monopolize"
@@ -703,35 +753,35 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
-        let key: Key = "monopolizer".into();
+        let tp_key = test_tp_key("monopolizer");
         let reference_instant = handler.reference_instant;
 
         let start_time = reference_instant;
         let end_time = start_time + Duration::from_secs(95);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             start_time,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             end_time,
         ));
 
         sleep(Duration::from_millis(10)).await;
 
-        let result = handler.check_monopolization(&key, end_time);
+        let result = handler.check_monopolization(&tp_key, end_time);
         assert!(
             result.is_some(),
             "Key using 95s of 100s window (95%) should monopolize"
@@ -766,29 +816,29 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
-        let key1: Key = "key-1".into();
-        let key2: Key = "key-2".into();
+        let tp_key1 = test_tp_key("key-1");
+        let tp_key2 = test_tp_key("key-2");
         let reference_instant = handler.reference_instant;
 
         let start1 = reference_instant;
         let end1 = start1 + Duration::from_secs(95);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key1.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key1.key.clone(),
             KeyState::HandlerInvoked,
             start1,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key1.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key1.key.clone(),
             KeyState::HandlerSucceeded,
             end1,
         ));
@@ -797,17 +847,17 @@ mod tests {
         let end2 = start2 + Duration::from_secs(2);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key2.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key2.key.clone(),
             KeyState::HandlerInvoked,
             start2,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key2.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key2.key.clone(),
             KeyState::HandlerSucceeded,
             end2,
         ));
@@ -815,14 +865,14 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
 
         // Check key1 at the time it finished (end1 = 95s)
-        let result1 = handler.check_monopolization(&key1, end1);
+        let result1 = handler.check_monopolization(&tp_key1, end1);
         assert!(
             result1.is_some(),
             "Key 1 should be monopolizing (95s of 100s)"
         );
 
         // Check key2 at the time it finished (end2 = 2.1s)
-        let result2 = handler.check_monopolization(&key2, end2);
+        let result2 = handler.check_monopolization(&tp_key2, end2);
         assert!(
             result2.is_none(),
             "Key 2 should not be monopolizing (2s of 100s)"
@@ -850,59 +900,59 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
-        let key: Key = "test-key".into();
+        let tp_key = test_tp_key("test-key");
         let reference_instant = handler.reference_instant;
 
         let start1 = reference_instant;
         let end1 = start1 + Duration::from_millis(9100); // 9.1 seconds to exceed 90% threshold
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             start1,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             end1,
         ));
 
         sleep(Duration::from_millis(50)).await;
 
-        let result = handler.check_monopolization(&key, end1);
+        let result = handler.check_monopolization(&tp_key, end1);
         assert!(result.is_some(), "Should monopolize right after execution");
 
         let start2 = end1 + Duration::from_secs(11);
         let end2 = start2 + Duration::from_millis(100);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             start2,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             end2,
         ));
 
         sleep(Duration::from_millis(10)).await;
 
-        if let Some(intervals) = handler.key_intervals.get(&key) {
+        if let Some(intervals) = handler.key_intervals.get(&tp_key) {
             let now_nanos = end2
                 .saturating_duration_since(handler.reference_instant)
                 .as_nanos() as u64;
@@ -943,26 +993,26 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
-        let key: Key = "test-key".into();
+        let tp_key = test_tp_key("test-key");
         let reference_instant = handler.reference_instant;
 
         let start = reference_instant;
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             start,
         ));
 
         sleep(Duration::from_millis(10)).await;
 
-        let intervals_before = handler.key_intervals.get(&key);
+        let intervals_before = handler.key_intervals.get(&tp_key);
         assert!(
             intervals_before.is_some(),
             "Should have open interval after invocation"
@@ -971,16 +1021,16 @@ mod tests {
         let end = start + Duration::from_secs(50);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             end,
         ));
 
         sleep(Duration::from_millis(10)).await;
 
-        let intervals_after = handler.key_intervals.get(&key);
+        let intervals_after = handler.key_intervals.get(&tp_key);
         assert!(
             intervals_after.is_some(),
             "Should have closed interval after completion"
@@ -1008,28 +1058,28 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
 
-        let key: Key = "key-before-window".into();
+        let tp_key = test_tp_key("key-before-window");
         let execution_start = reference_instant;
         let execution_end = execution_start + Duration::from_secs(50);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             execution_start,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             execution_end,
         ));
@@ -1038,7 +1088,7 @@ mod tests {
 
         // Check at time that puts execution_start before the window
         let check_time = reference_instant + Duration::from_secs(120);
-        let result = handler.check_monopolization(&key, check_time);
+        let result = handler.check_monopolization(&tp_key, check_time);
         assert!(
             result.is_none(),
             "Execution that started before window should only count time within window"
@@ -1066,35 +1116,35 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
 
-        let key: Key = "key-crosses-boundary".into();
+        let tp_key = test_tp_key("key-crosses-boundary");
         let execution_start = reference_instant + Duration::from_secs(10);
         let execution_end = execution_start + Duration::from_secs(95);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             execution_start,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             execution_end,
         ));
 
         sleep(Duration::from_millis(50)).await;
 
-        let result = handler.check_monopolization(&key, execution_end);
+        let result = handler.check_monopolization(&tp_key, execution_end);
         assert!(
             result.is_some(),
             "Key using 95s of 100s window should monopolize at window end"
@@ -1122,35 +1172,35 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
 
-        let key: Key = "key-exact-threshold".into();
+        let tp_key = test_tp_key("key-exact-threshold");
         let execution_start = reference_instant;
         let execution_end = execution_start + Duration::from_secs(90);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             execution_start,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             execution_end,
         ));
 
         sleep(Duration::from_millis(50)).await;
 
-        let result = handler.check_monopolization(&key, execution_end);
+        let result = handler.check_monopolization(&tp_key, execution_end);
         assert!(
             result.is_none(),
             "Key using exactly 90s of 100s window (90.0%) should not monopolize (threshold is \
@@ -1179,35 +1229,35 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
 
-        let key: Key = "key-above-threshold".into();
+        let tp_key = test_tp_key("key-above-threshold");
         let execution_start = reference_instant;
         let execution_end = execution_start + Duration::from_millis(90_100);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             execution_start,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             execution_end,
         ));
 
         sleep(Duration::from_millis(50)).await;
 
-        let result = handler.check_monopolization(&key, execution_end);
+        let result = handler.check_monopolization(&tp_key, execution_end);
         assert!(
             result.is_some(),
             "Key using 90.1s of 100s window (90.1%) should monopolize"
@@ -1235,29 +1285,29 @@ mod tests {
 
         let provider = middleware.with_provider(provider);
         let handler = provider
-            .handler_for_partition("test-topic".into(), 0)
+            .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
             .enabled()
             .ok_or_else(|| color_eyre::eyre::eyre!("expected enabled handler"))?;
 
         let reference_instant = handler.reference_instant;
-        let key: Key = "key-multiple-at-boundary".into();
+        let tp_key = test_tp_key("key-multiple-at-boundary");
 
         // First execution: 20s at start of window
         let first_start = reference_instant;
         let first_end = first_start + Duration::from_secs(20);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             first_start,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             first_end,
         ));
@@ -1267,17 +1317,17 @@ mod tests {
         let second_end = first_start + Duration::from_secs(100);
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerInvoked,
             second_start,
         ));
 
         telemetry.test_emit(create_key_event(
-            "test-topic".into(),
-            0,
-            key.clone(),
+            TEST_TOPIC.into(),
+            TEST_PARTITION,
+            tp_key.key.clone(),
             KeyState::HandlerSucceeded,
             second_end,
         ));
@@ -1287,7 +1337,7 @@ mod tests {
         // Check at end of window - should capture both executions (20s + 72s = 92s >
         // 90s)
         let check_time = first_start + Duration::from_secs(100);
-        let result = handler.check_monopolization(&key, check_time);
+        let result = handler.check_monopolization(&tp_key, check_time);
         assert!(
             result.is_some(),
             "Multiple executions totaling >90s in window should monopolize"
