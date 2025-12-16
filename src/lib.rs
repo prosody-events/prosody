@@ -325,6 +325,37 @@ pub type Payload = Value;
 /// An offset position within a Kafka partition.
 pub type Offset = i64;
 
+/// A key qualified by its topic-partition context.
+///
+/// Uniquely identifies a message key within Kafka's coordinate system. Two
+/// messages with the same `Key` from different topic-partitions are distinct
+/// `TopicPartitionKey`s. This prevents key collisions in cross-partition state
+/// like the scheduler's virtual time tracking.
+///
+/// The name mirrors Kafka's `TopicPartition` concept with the addition of the
+/// message key.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct TopicPartitionKey {
+    /// The topic this key belongs to.
+    pub topic: Topic,
+    /// The partition this key belongs to.
+    pub partition: Partition,
+    /// The message key.
+    pub key: Key,
+}
+
+impl TopicPartitionKey {
+    /// Creates a new topic-partition-qualified key.
+    #[must_use]
+    pub fn new(topic: Topic, partition: Partition, key: Key) -> Self {
+        Self {
+            topic,
+            partition,
+            key,
+        }
+    }
+}
+
 /// A compact string for storing event identifiers.
 ///
 /// Uses `Flexstr` to efficiently store event IDs up to UUID length without heap
