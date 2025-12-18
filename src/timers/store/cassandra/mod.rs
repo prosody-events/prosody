@@ -22,7 +22,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
-use tracing::{error, info_span, instrument};
+use tracing::{debug, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod queries;
@@ -426,7 +426,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger");
                 if let Err(error) = span.set_parent(context) {
-                    error!("failed to set parent span: {error:#}");
+                    debug!("failed to set parent span: {error:#}");
                 }
 
                 let timer_type = TimerType::try_from(timer_type_returned)?;
@@ -466,7 +466,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger_all_types");
                 if let Err(error) = span.set_parent(context) {
-                    error!("failed to set parent span: {error:#}");
+                    debug!("failed to set parent span: {error:#}");
                 }
 
                 let timer_type = TimerType::try_from(timer_type_returned)?;
@@ -606,7 +606,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_key_trigger");
                 if let Err(error) = span.set_parent(context) {
-                    error!("failed to set parent span: {error:#}");
+                    debug!("failed to set parent span: {error:#}");
                 }
 
                 let timer_type = TimerType::try_from(timer_type_returned)?;
@@ -642,7 +642,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_key_trigger_all_types");
                 if let Err(error) = span.set_parent(context) {
-                    error!("failed to set parent span: {error:#}");
+                    debug!("failed to set parent span: {error:#}");
                 }
 
                 let timer_type = TimerType::try_from(timer_type_returned)?;
