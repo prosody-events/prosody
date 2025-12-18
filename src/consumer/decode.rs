@@ -21,7 +21,7 @@ use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
 use tracing::field::Empty;
-use tracing::{Span, error, info_span};
+use tracing::{Span, debug, error, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(not(target_arch = "arm"))]
@@ -93,7 +93,7 @@ pub fn decode_message(
     );
 
     if let Err(error) = receive_span.set_parent(context) {
-        error!("failed to set parent span: {error:#}");
+        debug!("failed to set parent span: {error:#}");
     }
 
     let enter = receive_span.enter();

@@ -23,7 +23,7 @@ use opentelemetry::propagation::TextMapPropagator;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
-use tracing::{error, info_span, instrument};
+use tracing::{debug, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(test)]
@@ -211,7 +211,7 @@ impl V1Operations {
                 let context = store.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger_v1");
                 if let Err(error) = span.set_parent(context) {
-                    error!("failed to set parent span: {error:#}");
+                    debug!("failed to set parent span: {error:#}");
                 }
 
                 yield TriggerV1 {
@@ -355,7 +355,7 @@ impl V1Operations {
                 let context = store.propagator().extract(&span_map);
                 let span = info_span!("fetch_key_trigger_v1");
                 if let Err(error) = span.set_parent(context) {
-                    error!("failed to set parent span: {error:#}");
+                    debug!("failed to set parent span: {error:#}");
                 }
 
                 yield TriggerV1 {
