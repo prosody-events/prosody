@@ -15,14 +15,13 @@
 
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
+use opentelemetry::Context;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
-use tracing::field::Empty;
-use tracing::{Span, debug, error, info_span};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing::error;
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
@@ -33,31 +32,42 @@ use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessageValue;
 use crate::{Payload, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
-/// A decoded Kafka message without processing state.
+/// A decoded Kafka message without live span references.
 ///
-/// Contains the immutable message data and the receive span for tracing
-/// lineage, but no semaphore permit. This allows separating the decode
-/// lifecycle from caching and processing lifecycles.
+/// Contains the immutable message data and the parent trace context extracted
+/// from Kafka headers. The context contains only the upstream service's trace
+/// identifiers (`trace_id`, `span_id`, flags) and baggage - no active span
+/// reference. Callers construct their own spans using `context.clone()` and
+/// `span.set_parent()`.
+///
+/// This design ensures spans have independent lifecycles from cache entries:
+/// - Context is safely cached (contains only remote trace identifiers)
+/// - Each load site creates its own span from the cached context
+/// - Spans close when processing completes, not on cache eviction
 #[derive(Clone, Debug)]
 pub struct DecodedMessage {
     /// Shared immutable message data
     pub value: Arc<ConsumerMessageValue>,
 
-    /// Span for tracing lineage
-    pub span: Span,
+    /// Parent trace context extracted from original Kafka headers.
+    ///
+    /// This is a "remote" context with `inner: None` - it contains only the
+    /// upstream service's `SpanContext` (`trace_id`, `span_id`, flags) and
+    /// baggage, not a reference to any local span. Safe to cache and clone.
+    pub parent_context: Context,
 }
 
 /// Decodes and validates a Kafka message into a `DecodedMessage`.
 ///
 /// This function performs comprehensive message processing:
-/// 1. Creates a tracing span with message metadata for observability
-/// 2. Extracts distributed tracing context from message headers
-/// 3. Parses and validates the JSON payload
-/// 4. Extracts and validates the message key
-/// 5. Resolves the message timestamp from Kafka metadata
+/// 1. Extracts distributed tracing context from message headers
+/// 2. Parses and validates the JSON payload
+/// 3. Extracts and validates the message key
+/// 4. Resolves the message timestamp from Kafka metadata
 ///
-/// The decoded message contains immutable data and the receive span but no
-/// semaphore permit, allowing the caller to manage permit lifecycle separately.
+/// The decoded message contains immutable data and parent trace context.
+/// Callers create their own spans from the context, ensuring span lifecycles
+/// are independent of cache eviction.
 ///
 /// # Arguments
 ///
@@ -67,7 +77,7 @@ pub struct DecodedMessage {
 ///
 /// # Returns
 ///
-/// * `Some(DecodedMessage)` - A validated, parsed message with tracing context
+/// * `Some(DecodedMessage)` - A validated, parsed message with parent context
 /// * `None` - If the message is invalid or missing required fields
 pub fn decode_message(
     message: &BorrowedMessage,
@@ -79,34 +89,22 @@ pub fn decode_message(
     let partition = message.partition();
     let offset = message.offset();
 
-    // Create and configure tracing span with distributed context
-    let context = propagator.extract(&MessageExtractor::new(message));
-    let receive_span = info_span!(
-        "receive",
-        partition,
-        offset,
-        topic = topic.as_ref(),
-        key = Empty,
-        payload_size = Empty,
-        skipped = Empty,
-        event_type = Empty,
-    );
-
-    if let Err(error) = receive_span.set_parent(context) {
-        debug!("failed to set parent span: {error:#}");
-    }
-
-    let enter = receive_span.enter();
+    // Extract distributed tracing context from message headers (no local span)
+    let parent_context = propagator.extract(&MessageExtractor::new(message));
 
     // Extract source system header if present
     let source_system = extract_source_system(message);
 
     // Validate and parse payload
     let Some(payload_data) = message.payload() else {
-        error!("missing payload; discarding message");
+        error!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "missing payload; discarding message"
+        );
         return None;
     };
-    receive_span.record("payload_size", payload_data.len());
 
     let payload = parse_payload(
         payload_data,
@@ -116,17 +114,24 @@ pub fn decode_message(
 
     // Validate and extract key
     let Some(key_data) = message.key() else {
-        error!("missing key; discarding message");
+        error!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "missing key; discarding message"
+        );
         return None;
     };
 
     let key = match str::from_utf8(key_data) {
-        Ok(key_str) => {
-            receive_span.record("key", key_str);
-            key_str.into()
-        }
+        Ok(key_str) => key_str.into(),
         Err(error) => {
-            error!("invalid key encoding: {error:#}; discarding message");
+            error!(
+                topic = %topic,
+                partition = partition,
+                offset = offset,
+                "invalid key encoding: {error:#}; discarding message"
+            );
             return None;
         }
     };
@@ -134,7 +139,7 @@ pub fn decode_message(
     // Determine message timestamp based on available metadata
     let timestamp = resolve_timestamp(message);
 
-    // Create and return decoded message (without permit)
+    // Create and return decoded message with parent context (no span)
     let value = Arc::new(ConsumerMessageValue {
         source_system,
         topic,
@@ -145,12 +150,9 @@ pub fn decode_message(
         payload,
     });
 
-    // Exit the span context before moving the span into the result
-    drop(enter);
-
     Some(DecodedMessage {
         value,
-        span: receive_span,
+        parent_context,
     })
 }
 
