@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info_span, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::Topic;
 use crate::consumer::decode::decode_message;
@@ -171,8 +172,20 @@ where
 
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {
+            // Create receive span linked to parent trace context
+            let receive_span = info_span!(
+                "receive",
+                partition = decoded.value.partition,
+                offset = decoded.value.offset,
+                topic = %decoded.value.topic,
+                key = %decoded.value.key,
+            );
+            if let Err(error) = receive_span.set_parent(decoded.parent_context.clone()) {
+                debug!("failed to set parent span: {error:#}");
+            }
+
             let consumer_message =
-                ConsumerMessage::from_decoded(decoded.value, decoded.span, permit);
+                ConsumerMessage::from_decoded(decoded.value, receive_span, permit);
             dispatch_with_retry(consumer_message, poll_interval, managers);
         }
 

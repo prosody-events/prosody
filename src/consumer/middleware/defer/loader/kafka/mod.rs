@@ -62,7 +62,8 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tracing::field::Empty;
-use tracing::{Span, debug, error, instrument, warn};
+use tracing::{Span, debug, error, info_span, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use whoami::fallible::hostname;
 
 #[cfg(not(target_arch = "arm"))]
@@ -234,8 +235,9 @@ impl KafkaLoader {
     ///
     /// Checks the cache first for a fast path. Cache hits return immediately,
     /// while cache misses load from Kafka and populate the cache. In both
-    /// cases, returns a new message instance with a deferred span that has a
-    /// `follows_from` relationship to the original span.
+    /// cases, creates a new span linked to the parent trace context from the
+    /// original Kafka message headers, ensuring span lifecycles are independent
+    /// of cache eviction.
     ///
     /// # Arguments
     ///
@@ -258,7 +260,7 @@ impl KafkaLoader {
         partition: Partition,
         offset: Offset,
     ) -> Result<ConsumerMessage, KafkaLoaderError> {
-        let span = Span::current();
+        let instrument_span = Span::current();
 
         debug!(
             topic = %topic,
@@ -277,27 +279,29 @@ impl KafkaLoader {
 
         let cache_key = (topic, partition, offset);
 
-        // Get decoded message from cache or load from Kafka
-        let decoded_message = if let Some(cached) = self.cache.get(&cache_key) {
-            span.record("cached", true);
+        // Get decoded message from cache or load from Kafka, tracking cache status
+        let (decoded_message, cached) = if let Some(cached) = self.cache.get(&cache_key) {
+            instrument_span.record("cached", true);
             debug!(
                 topic = %topic,
                 partition = partition,
                 offset = offset,
                 "Loading deferred message from cache"
             );
-            cached
+            (cached, true)
         } else {
-            span.record("cached", false);
-            self.load_from_kafka(topic, partition, offset).await?
+            instrument_span.record("cached", false);
+            let decoded = self.load_from_kafka(topic, partition, offset).await?;
+            (decoded, false)
         };
 
-        span.follows_from(&decoded_message.span);
+        // Create span linked to parent context (independent of cache lifetime)
+        let load_span = create_load_span(&decoded_message, cached);
 
-        // Create consumer message from decoded message with load permit
+        // Create consumer message from decoded message with new load span
         Ok(ConsumerMessage::from_decoded(
             decoded_message.value,
-            decoded_message.span,
+            load_span,
             load_permit,
         ))
     }
@@ -873,6 +877,39 @@ fn unassign_partition(
         "Unassigned partition after fulfilling all deferred load requests"
     );
     Ok(())
+}
+
+/// Creates a tracing span for a loaded message with parent context linking.
+///
+/// Creates an `info_span!` named "load" with message metadata attributes and
+/// links it to the upstream trace using the parent context from the cached
+/// `DecodedMessage`. This ensures proper distributed tracing across services
+/// while keeping span lifecycles independent of cache eviction.
+///
+/// # Arguments
+///
+/// * `decoded` - The decoded message containing parent context and metadata
+/// * `cached` - Whether this message was loaded from cache (true) or Kafka
+///   (false)
+///
+/// # Returns
+///
+/// A tracing span linked to the parent context with message metadata recorded.
+fn create_load_span(decoded: &DecodedMessage, cached: bool) -> Span {
+    let span = info_span!(
+        "load",
+        partition = decoded.value.partition,
+        offset = decoded.value.offset,
+        topic = %decoded.value.topic,
+        key = %decoded.value.key,
+        cached = cached,
+    );
+
+    if let Err(error) = span.set_parent(decoded.parent_context.clone()) {
+        debug!("failed to set parent span: {error:#}");
+    }
+
+    span
 }
 
 /// Errors that can occur during Kafka message loading.
