@@ -52,6 +52,7 @@ where
     config: DeferConfiguration,
     provider: P,
     decider: D,
+    consumer_group: ConsumerGroup,
 }
 
 /// Creates [`TimerDeferHandler`]s for each partition.
@@ -65,6 +66,7 @@ where
     config: DeferConfiguration,
     store_provider: P,
     decider: D,
+    consumer_group: ConsumerGroup,
 }
 
 /// Per-partition handler wrapping an inner handler with timer defer logic.
@@ -88,6 +90,35 @@ where
     pub(crate) partition: Partition,
 }
 
+impl<P, D> TimerDeferMiddleware<P, D>
+where
+    P: TimerDeferStoreProvider,
+    D: DeferralDecider,
+{
+    /// Creates a new timer defer middleware.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Defer configuration (backoff, cache size, etc.)
+    /// * `provider` - Store provider for creating partition-specific stores
+    /// * `decider` - Decider for gating initial deferral decisions
+    /// * `consumer_group` - Consumer group ID for segment isolation
+    #[must_use]
+    pub fn new(
+        config: DeferConfiguration,
+        provider: P,
+        decider: D,
+        consumer_group: ConsumerGroup,
+    ) -> Self {
+        Self {
+            config,
+            provider,
+            decider,
+            consumer_group,
+        }
+    }
+}
+
 impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
 where
     P: TimerDeferStoreProvider,
@@ -104,6 +135,7 @@ where
             config: self.config.clone(),
             store_provider: self.provider.clone(),
             decider: self.decider.clone(),
+            consumer_group: self.consumer_group.clone(),
         }
     }
 }
@@ -144,12 +176,7 @@ where
     type Handler = TimerDeferHandler<T::Handler, TimerDeferLazyStore<P>, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        // Create segment for this partition - lives for partition lifetime
-        // Note: In full implementation, segment should be shared with message
-        // defer. This is a simplified version that creates its own.
-        // TODO: Share segment with MessageDeferMiddleware via unified
-        // DeferMiddleware
-        let segment = Segment::new(topic, partition, ConsumerGroup::from("placeholder-group"));
+        let segment = Segment::new(topic, partition, self.consumer_group.clone());
 
         let factory = TimerDeferStoreFactoryImpl {
             provider: self.store_provider.clone(),
