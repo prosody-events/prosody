@@ -196,14 +196,14 @@ where
 
         // Update cache based on result (store tells us exact new state)
         match &result {
-            TimerRetryCompletionResult::MoreTimers { next_time } => {
-                // More timers exist - need to fetch full entry for context
-                // We only have next_time, not the context, so invalidate
-                // to let next read populate cache properly
-                self.cache.remove(key.as_ref());
-                // Note: Could optimize by fetching from store here, but
-                // invalidation is simpler and the next read will populate
-                let _ = next_time; // Silence unused warning
+            TimerRetryCompletionResult::MoreTimers { next_time, context } => {
+                // More timers exist, retry_count reset to 0
+                let entry = CachedTimerEntry {
+                    time: *next_time,
+                    context: context.clone(),
+                    retry_count: 0,
+                };
+                self.cache.insert(Arc::clone(key), Some(entry));
             }
             TimerRetryCompletionResult::Completed => {
                 // Key deleted, no more timers
@@ -439,6 +439,42 @@ mod tests {
         // Cache should show None (key is not deferred)
         let cached = cached_store.get_next_deferred_timer(&trigger.key).await?;
         assert!(cached.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cache_update_on_complete_success() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let key = "test-key-1";
+
+        // Defer two timers
+        cached_store
+            .defer_first_timer(&test_trigger(key, 1000))
+            .await?;
+        cached_store
+            .defer_additional_timer(&test_trigger(key, 2000))
+            .await?;
+
+        // Complete first timer
+        let key_arc: Key = Arc::from(key);
+        let result = cached_store
+            .complete_retry_success(&key_arc, CompactDateTime::from(1000_u32))
+            .await?;
+
+        // Should return MoreTimers with next time
+        assert!(matches!(
+            result,
+            TimerRetryCompletionResult::MoreTimers { next_time, .. } if next_time == CompactDateTime::from(2000_u32)
+        ));
+
+        // Cache should be updated to point to next timer with retry_count=0
+        let cached = cached_store.get_next_deferred_timer(&key_arc).await?;
+        let (trigger, retry_count) =
+            cached.ok_or_else(|| color_eyre::eyre::eyre!("expected timer"))?;
+        assert_eq!(trigger.time, CompactDateTime::from(2000_u32));
+        assert_eq!(retry_count, 0);
 
         Ok(())
     }

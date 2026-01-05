@@ -427,10 +427,10 @@ mod tests {
             .complete_retry_success(&key_arc, CompactDateTime::from(1000_u32))
             .await?;
 
-        // Should return MoreTimers with next time
+        // Should return MoreTimers with next time and context
         assert!(matches!(
             result,
-            TimerRetryCompletionResult::MoreTimers { next_time } if next_time == CompactDateTime::from(2000_u32)
+            TimerRetryCompletionResult::MoreTimers { next_time, .. } if next_time == CompactDateTime::from(2000_u32)
         ));
 
         // Retry count should be reset to 0

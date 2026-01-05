@@ -20,6 +20,7 @@ use futures::Stream;
 use opentelemetry::Context;
 use std::error::Error;
 use std::future::Future;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use cached::CachedTimerDeferStore;
 pub use cassandra::{CassandraTimerDeferStore, CassandraTimerDeferStoreProvider};
@@ -28,12 +29,14 @@ pub use memory::{MemoryTimerDeferStore, MemoryTimerDeferStoreProvider};
 pub use provider::TimerDeferStoreProvider;
 
 /// Result of [`TimerDeferStore::complete_retry_success`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum TimerRetryCompletionResult {
     /// More timers remain; `retry_count` has been reset to 0.
     MoreTimers {
         /// The next timer's original fire time (for scheduling).
         next_time: CompactDateTime,
+        /// The next timer's parent trace context for span reconstruction.
+        context: Context,
     },
 
     /// No more timers; key has been deleted from storage.
@@ -114,8 +117,10 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
 
             if let Some((trigger, _)) = self.get_next_deferred_timer(key).await? {
                 self.set_retry_count(key, 0).await?;
+                let context = trigger.span().context();
                 Ok(TimerRetryCompletionResult::MoreTimers {
                     next_time: trigger.time,
+                    context,
                 })
             } else {
                 self.delete_key(key).await?;

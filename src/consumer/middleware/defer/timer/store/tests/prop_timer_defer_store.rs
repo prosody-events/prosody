@@ -439,7 +439,7 @@ fn verify_completion_result(
     op_idx: usize,
 ) -> color_eyre::Result<()> {
     match (expected_next, result) {
-        (Some((expected_time, _)), TimerRetryCompletionResult::MoreTimers { next_time }) => {
+        (Some((expected_time, _)), TimerRetryCompletionResult::MoreTimers { next_time, .. }) => {
             if expected_time != next_time {
                 return Err(color_eyre::eyre::eyre!(
                     "Op #{op_idx} CompleteRetrySuccess time mismatch for key={key}: expected \
@@ -456,7 +456,7 @@ fn verify_completion_result(
                  with time={expected_time}, got Completed"
             ));
         }
-        (None, TimerRetryCompletionResult::MoreTimers { next_time }) => {
+        (None, TimerRetryCompletionResult::MoreTimers { next_time, .. }) => {
             return Err(color_eyre::eyre::eyre!(
                 "Op #{op_idx} CompleteRetrySuccess mismatch for key={key}: expected Completed, \
                  got MoreTimers with time={next_time}"
