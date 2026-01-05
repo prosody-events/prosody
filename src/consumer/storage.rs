@@ -7,10 +7,10 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::consumer::middleware::defer::store::cassandra::{
+use crate::consumer::middleware::defer::message::store::cassandra::{
     CassandraDeferStoreError, CassandraDeferStoreProvider,
 };
-use crate::consumer::middleware::defer::store::memory::MemoryDeferStoreProvider;
+use crate::consumer::middleware::defer::message::store::memory::MemoryDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::cassandra::{
     CassandraTimerDeferStoreError, CassandraTimerDeferStoreProvider,
 };

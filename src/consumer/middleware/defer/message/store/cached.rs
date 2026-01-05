@@ -290,11 +290,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::segment::Segment;
-    use crate::consumer::middleware::defer::store::MessageDeferStoreProvider;
-    use crate::consumer::middleware::defer::store::memory::{
+    use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
+    use crate::consumer::middleware::defer::message::store::memory::{
         MemoryDeferStore, MemoryDeferStoreProvider,
     };
+    use crate::consumer::middleware::defer::segment::Segment;
     use crate::{ConsumerGroup, Key, Partition, Topic};
 
     async fn create_test_store() -> MemoryDeferStore {

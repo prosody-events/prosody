@@ -3,7 +3,9 @@
 //! Tests the `MessageDeferStore` trait using a simple reference model to verify
 //! correctness across both memory and Cassandra implementations.
 
-use crate::consumer::middleware::defer::store::{MessageDeferStore, MessageRetryCompletionResult};
+use crate::consumer::middleware::defer::message::store::{
+    MessageDeferStore, MessageRetryCompletionResult,
+};
 use crate::{Key, Offset};
 use ahash::{HashMap, HashSet};
 use color_eyre::eyre::Report;

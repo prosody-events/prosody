@@ -2,6 +2,25 @@
 //!
 //! Provides persistent storage for deferred timers using Apache Cassandra
 //! with automatic schema migration and optimized TTL management.
+//!
+//! # Year 2038 Limitation
+//!
+//! `original_time` is stored as Cassandra `int` (i32) but represents a u32
+//! Unix timestamp. Values ≥2^31 (2038-01-19 03:14:07 UTC) are stored as
+//! negative i32. Cassandra sorts negative before positive, so:
+//!
+//! - **Pre-2038 only**: Correct order (all positive i32, ascending)
+//! - **Post-2038 only**: Correct order (all negative i32, ascending within
+//!   negatives)
+//! - **Spanning 2038**: **Incorrect** - post-2038 timers (negative) sort before
+//!   pre-2038 (positive)
+//!
+//! **Why acceptable**: Timer defer handles retry delays (seconds to hours).
+//! A single key having deferred timers that span the 2038 boundary requires
+//! timers to remain deferred for 12+ years - not a realistic scenario.
+//!
+//! See [`get_slab_range`](crate::timers::store::cassandra) for the two-query
+//! wrap-around solution if this limitation ever needs addressing.
 
 use crate::Key;
 use crate::cassandra::CassandraStore;

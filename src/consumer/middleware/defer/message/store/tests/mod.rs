@@ -30,7 +30,7 @@ macro_rules! defer_store_tests {
         use quickcheck::{QuickCheck, TestResult};
         use tokio::runtime::Builder;
         use tracing::Instrument;
-        use $crate::consumer::middleware::defer::store::tests::prop_defer_store::*;
+        use $crate::consumer::middleware::defer::message::store::tests::prop_defer_store::*;
 
         #[test]
         fn test_defer_store_model_equivalence() {

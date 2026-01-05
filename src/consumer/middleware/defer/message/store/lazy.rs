@@ -102,11 +102,11 @@ impl<F: StoreFactory> MessageDeferStore for LazyStore<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::segment::Segment;
-    use crate::consumer::middleware::defer::store::MessageDeferStoreProvider;
-    use crate::consumer::middleware::defer::store::memory::{
+    use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
+    use crate::consumer::middleware::defer::message::store::memory::{
         MemoryDeferStore, MemoryDeferStoreProvider,
     };
+    use crate::consumer::middleware::defer::segment::Segment;
     use crate::{ConsumerGroup, Partition, Topic};
 
     /// Test factory that creates memory-backed stores.

@@ -3,8 +3,8 @@
 use super::queries::Queries;
 use super::{CassandraDeferStore, CassandraDeferStoreError};
 use crate::cassandra::CassandraStore;
+use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::segment::Segment;
-use crate::consumer::middleware::defer::store::MessageDeferStoreProvider;
 use std::sync::Arc;
 use tracing::instrument;
 

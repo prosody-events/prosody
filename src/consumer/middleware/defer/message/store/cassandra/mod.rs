@@ -5,9 +5,9 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::consumer::middleware::defer::message::store::MessageDeferStore;
+use crate::consumer::middleware::defer::message::store::cassandra::queries::Queries;
 use crate::consumer::middleware::defer::segment::SegmentId;
-use crate::consumer::middleware::defer::store::MessageDeferStore;
-use crate::consumer::middleware::defer::store::cassandra::queries::Queries;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::{Key, Offset};
 use scylla::client::session::Session;
@@ -196,8 +196,8 @@ impl ClassifyError for CassandraDeferStoreError {
 mod tests {
     use super::*;
     use crate::cassandra::{CassandraConfiguration, CassandraStore};
+    use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
     use crate::consumer::middleware::defer::segment::Segment;
-    use crate::consumer::middleware::defer::store::MessageDeferStoreProvider;
     use crate::defer_store_tests;
     use crate::{ConsumerGroup, Partition, Topic};
 

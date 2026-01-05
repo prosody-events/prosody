@@ -4,7 +4,9 @@
 //! based on trace specifications.
 
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::defer::loader::{MemoryLoader, MemoryLoaderError, MessageLoader};
+use crate::consumer::middleware::defer::message::loader::{
+    MemoryLoader, MemoryLoaderError, MessageLoader,
+};
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::{Key, Offset, Partition, Topic};
 use parking_lot::Mutex;

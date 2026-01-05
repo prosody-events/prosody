@@ -1,18 +1,21 @@
+//! Defer middleware for handling transient failures.
+//!
+//! This module provides deferral handling for both messages and timers,
+//! allowing keys to be unblocked between retry attempts while maintaining
+//! ordering guarantees.
+
 pub mod config;
 pub mod decider;
 pub mod error;
 pub mod failure_tracker;
-pub mod handler;
-pub mod loader;
+pub mod message;
 pub mod segment;
-pub mod store;
 pub mod timer;
 
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
 pub use decider::{AlwaysDefer, DeferralDecider, NeverDefer, TraceBasedDecider};
 pub use error::DeferInitError;
-pub use handler::MessageDeferMiddleware;
-pub use loader::MessageLoader;
+pub use message::{MessageDeferMiddleware, MessageLoader};
 
 /// State of a key in the defer system.
 ///

@@ -22,7 +22,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
-use prosody::consumer::middleware::defer::store::cassandra::CassandraDeferStoreProvider;
+use prosody::consumer::middleware::defer::message::store::cassandra::CassandraDeferStoreProvider;
 use prosody::consumer::middleware::defer::timer::store::cassandra::CassandraTimerDeferStoreProvider;
 use prosody::consumer::middleware::defer::{DeferConfiguration, MessageDeferMiddleware};
 use prosody::consumer::middleware::log::LogMiddleware;

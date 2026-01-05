@@ -251,7 +251,7 @@ impl FallibleHandler for OutcomeHandler {
 mod tests {
     use super::*;
     use crate::Key;
-    use crate::consumer::middleware::defer::handler::tests::{MockContext, TEST_RUNTIME};
+    use crate::consumer::middleware::defer::message::handler::tests::{MockContext, TEST_RUNTIME};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use crate::tracing::init_test_logging;

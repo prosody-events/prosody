@@ -14,20 +14,24 @@
 //!    deferred, transient errors always re-defer (config/decider only gate
 //!    initial deferral).
 
-use super::config::DeferConfiguration;
-use super::decider::DeferralDecider;
-use super::error::{DeferError, DeferInitError, DeferResult};
-use super::failure_tracker::FailureTracker;
 use super::loader::{KafkaLoader, MessageLoader};
-use super::segment::Segment;
 use super::store::{
     CachedDeferStore, LazyStore, MessageDeferStore, MessageDeferStoreProvider,
     MessageRetryCompletionResult, StoreFactory,
 };
-use super::timer::handler::{TimerDeferHandler, TimerDeferLazyStore, TimerDeferStoreFactoryImpl};
-use super::timer::store::{LazyTimerDeferStore, TimerDeferStoreProvider};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::defer::config::DeferConfiguration;
+use crate::consumer::middleware::defer::decider::DeferralDecider;
+use crate::consumer::middleware::defer::error::{DeferError, DeferInitError, DeferResult};
+use crate::consumer::middleware::defer::failure_tracker::FailureTracker;
+use crate::consumer::middleware::defer::segment::Segment;
+use crate::consumer::middleware::defer::timer::handler::{
+    TimerDeferHandler, TimerDeferLazyStore, TimerDeferStoreFactoryImpl,
+};
+use crate::consumer::middleware::defer::timer::store::{
+    LazyTimerDeferStore, TimerDeferStoreProvider,
+};
 use crate::consumer::middleware::scheduler::SchedulerConfiguration;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
