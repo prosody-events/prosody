@@ -279,6 +279,18 @@ fn schedule_when_deferred_appends_to_store() {
             "Timer should NOT be in active store when key is deferred"
         );
 
+        // CLIENT INVARIANT: Timer must appear in scheduled() regardless of internal
+        // storage
+        let scheduled: Vec<CompactDateTime> = context
+            .scheduled(TimerType::Application)
+            .try_collect()
+            .await
+            .ok()?;
+        assert!(
+            scheduled.contains(&time),
+            "Timer scheduled while deferred must appear in scheduled(); got: {scheduled:?}"
+        );
+
         Some(())
     });
 }
@@ -332,6 +344,25 @@ fn unschedule_removes_from_both_stores() {
         assert!(
             deferred.contains(&CompactDateTime::from(1500_u32)),
             "Timer at 1500 should still be in defer store"
+        );
+
+        // CLIENT INVARIANT: scheduled() must reflect unschedule operations
+        let scheduled: Vec<CompactDateTime> = context
+            .scheduled(TimerType::Application)
+            .try_collect()
+            .await
+            .ok()?;
+        assert!(
+            !scheduled.contains(&CompactDateTime::from(500_u32)),
+            "Unscheduled timer must not appear in scheduled()"
+        );
+        assert!(
+            !scheduled.contains(&CompactDateTime::from(1000_u32)),
+            "Unscheduled timer must not appear in scheduled()"
+        );
+        assert!(
+            scheduled.contains(&CompactDateTime::from(1500_u32)),
+            "Remaining timer must appear in scheduled()"
         );
 
         Some(())
@@ -522,6 +553,101 @@ fn clear_and_schedule_makes_key_not_deferred() {
         assert!(
             deferred_timers.is_empty(),
             "DeferredTimer should be cleared"
+        );
+
+        Some(())
+    });
+}
+
+/// Client invariant: schedule/unschedule while deferred behaves identically to
+/// not deferred.
+///
+/// This test verifies the key behavioral equivalence requirement: from the
+/// client's perspective, timer operations should work the same regardless of
+/// internal deferral state. The client should be able to:
+/// 1. Schedule a timer and see it in `scheduled()`
+/// 2. Unschedule that timer and no longer see it in `scheduled()`
+#[test]
+fn client_operations_work_identically_when_deferred() {
+    init_test_logging();
+
+    TEST_RUNTIME.block_on(async {
+        let harness = ContextTestHarness::new("test-key");
+
+        // Make key deferred by deferring an initial timer
+        harness.defer_timer(1000).await.ok()?;
+        assert!(harness.is_deferred().await.ok()?);
+
+        let context = harness.create_wrapped_context();
+
+        // STEP 1: Schedule a new timer while deferred
+        let client_timer = CompactDateTime::from(2000_u32);
+        context
+            .schedule(client_timer, TimerType::Application)
+            .await
+            .ok()?;
+
+        // CLIENT INVARIANT: Scheduled timer must be visible
+        let scheduled: Vec<CompactDateTime> = context
+            .scheduled(TimerType::Application)
+            .try_collect()
+            .await
+            .ok()?;
+        assert!(
+            scheduled.contains(&client_timer),
+            "schedule() while deferred: timer must appear in scheduled()"
+        );
+
+        // STEP 2: Unschedule the timer
+        context
+            .unschedule(client_timer, TimerType::Application)
+            .await
+            .ok()?;
+
+        // CLIENT INVARIANT: Unscheduled timer must be gone
+        let scheduled: Vec<CompactDateTime> = context
+            .scheduled(TimerType::Application)
+            .try_collect()
+            .await
+            .ok()?;
+        assert!(
+            !scheduled.contains(&client_timer),
+            "unschedule() while deferred: timer must not appear in scheduled()"
+        );
+
+        // Original deferred timer should still be there
+        assert!(
+            scheduled.contains(&CompactDateTime::from(1000_u32)),
+            "Original deferred timer should remain"
+        );
+
+        // STEP 3: Schedule again and use clear_and_schedule to replace
+        context
+            .schedule(client_timer, TimerType::Application)
+            .await
+            .ok()?;
+        let replacement = CompactDateTime::from(3000_u32);
+        context
+            .clear_and_schedule(replacement, TimerType::Application)
+            .await
+            .ok()?;
+
+        // CLIENT INVARIANT: Only the replacement timer should exist
+        let scheduled: Vec<CompactDateTime> = context
+            .scheduled(TimerType::Application)
+            .try_collect()
+            .await
+            .ok()?;
+        assert_eq!(
+            scheduled,
+            vec![replacement],
+            "clear_and_schedule() should leave only the new timer"
+        );
+
+        // Key should no longer be deferred (clear_and_schedule deletes the key)
+        assert!(
+            !harness.is_deferred().await.ok()?,
+            "clear_and_schedule should un-defer the key"
         );
 
         Some(())
