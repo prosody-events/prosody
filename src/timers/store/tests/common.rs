@@ -148,7 +148,7 @@ where
 }
 
 /// Helper function to get ALL triggers from a slab (both Application and
-/// `DeferRetry`)
+/// `DeferredMessage`)
 ///
 /// Uses the public API method `get_slab_triggers_all_types`.
 ///

@@ -644,7 +644,7 @@ mod tests {
         let retry = Trigger::new(
             key.clone(),
             time,
-            TimerType::DeferRetry,
+            TimerType::DeferredMessage,
             tracing::Span::current(),
         );
 
@@ -659,7 +659,7 @@ mod tests {
         );
         assert!(
             active_triggers
-                .contains(&key, time, TimerType::DeferRetry)
+                .contains(&key, time, TimerType::DeferredMessage)
                 .await
         );
 
@@ -676,7 +676,7 @@ mod tests {
         );
         assert!(
             active_triggers
-                .contains(&key, time, TimerType::DeferRetry)
+                .contains(&key, time, TimerType::DeferredMessage)
                 .await
         );
     }
@@ -697,7 +697,7 @@ mod tests {
         let retry = Trigger::new(
             key.clone(),
             time,
-            TimerType::DeferRetry,
+            TimerType::DeferredMessage,
             tracing::Span::current(),
         );
 
@@ -709,7 +709,7 @@ mod tests {
             .remove(&key, time, TimerType::Application)
             .await;
 
-        // DeferRetry should still exist
+        // DeferredMessage should still exist
         assert!(
             !active_triggers
                 .contains(&key, time, TimerType::Application)
@@ -717,13 +717,13 @@ mod tests {
         );
         assert!(
             active_triggers
-                .contains(&key, time, TimerType::DeferRetry)
+                .contains(&key, time, TimerType::DeferredMessage)
                 .await
         );
 
-        // Remove DeferRetry type
+        // Remove DeferredMessage type
         active_triggers
-            .remove(&key, time, TimerType::DeferRetry)
+            .remove(&key, time, TimerType::DeferredMessage)
             .await;
 
         // Both should be gone
@@ -734,7 +734,7 @@ mod tests {
         );
         assert!(
             !active_triggers
-                .contains(&key, time, TimerType::DeferRetry)
+                .contains(&key, time, TimerType::DeferredMessage)
                 .await
         );
     }
@@ -756,22 +756,22 @@ mod tests {
             ))
             .await;
 
-        // Insert DeferRetry at time1 (same time, different type)
+        // Insert DeferredMessage at time1 (same time, different type)
         active_triggers
             .insert(Trigger::new(
                 key.clone(),
                 time1,
-                TimerType::DeferRetry,
+                TimerType::DeferredMessage,
                 tracing::Span::current(),
             ))
             .await;
 
-        // Insert DeferRetry at time2
+        // Insert DeferredMessage at time2
         active_triggers
             .insert(Trigger::new(
                 key.clone(),
                 time2,
-                TimerType::DeferRetry,
+                TimerType::DeferredMessage,
                 tracing::Span::current(),
             ))
             .await;
@@ -789,8 +789,8 @@ mod tests {
 
         // Verify all combinations exist
         assert!(collected.contains(&(time1, TimerType::Application)));
-        assert!(collected.contains(&(time1, TimerType::DeferRetry)));
-        assert!(collected.contains(&(time2, TimerType::DeferRetry)));
+        assert!(collected.contains(&(time1, TimerType::DeferredMessage)));
+        assert!(collected.contains(&(time2, TimerType::DeferredMessage)));
     }
 
     #[test]

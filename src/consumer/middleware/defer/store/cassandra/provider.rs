@@ -1,18 +1,17 @@
 //! Provider for creating Cassandra defer stores with shared resources.
 
 use super::queries::Queries;
-use super::{CassandraDeferStore, CassandraDeferStoreError, compute_segment_id};
+use super::{CassandraDeferStore, CassandraDeferStoreError};
 use crate::cassandra::CassandraStore;
-use crate::cassandra::errors::CassandraStoreError;
-use crate::consumer::middleware::defer::store::DeferStoreProvider;
-use crate::{Partition, Topic};
+use crate::consumer::middleware::defer::segment::Segment;
+use crate::consumer::middleware::defer::store::MessageDeferStoreProvider;
 use std::sync::Arc;
 use tracing::instrument;
 
 /// Provider for creating [`CassandraDeferStore`] instances.
 ///
 /// Holds shared resources (Cassandra session, prepared queries) and creates
-/// store instances with the correct segment context for each partition.
+/// store instances for a given [`Segment`].
 ///
 /// # Usage
 ///
@@ -20,8 +19,8 @@ use tracing::instrument;
 /// // Create provider once at startup
 /// let provider = CassandraDeferStoreProvider::with_store(cassandra_store, keyspace).await?;
 ///
-/// // Create stores for each partition as needed
-/// let store = provider.create_store(topic, partition, &consumer_group).await?;
+/// // Create stores for each segment (segment already persisted via SegmentStore)
+/// let store = provider.create_store(&segment).await?;
 /// ```
 #[derive(Clone, Debug)]
 pub struct CassandraDeferStoreProvider {
@@ -53,33 +52,18 @@ impl CassandraDeferStoreProvider {
     }
 }
 
-impl DeferStoreProvider for CassandraDeferStoreProvider {
+impl MessageDeferStoreProvider for CassandraDeferStoreProvider {
     type Error = CassandraDeferStoreError;
     type Store = CassandraDeferStore;
 
     #[instrument(level = "debug", skip(self), err)]
-    async fn create_store(
-        &self,
-        topic: Topic,
-        partition: Partition,
-        consumer_group: &str,
-    ) -> Result<Self::Store, Self::Error> {
-        let segment_id = compute_segment_id(topic, partition, consumer_group);
-
-        // Insert segment metadata (idempotent)
-        self.store
-            .session()
-            .execute_unpaged(
-                &self.queries.insert_segment,
-                (&segment_id, topic.as_ref(), partition, consumer_group),
-            )
-            .await
-            .map_err(|e| CassandraDeferStoreError::from(CassandraStoreError::from(e)))?;
-
+    async fn create_store(&self, segment: &Segment) -> Result<Self::Store, Self::Error> {
+        // Segment metadata is already persisted via SegmentStore.
+        // We just use the segment ID for store operations.
         Ok(CassandraDeferStore {
             store: self.store.clone(),
             queries: Arc::clone(&self.queries),
-            segment_id,
+            segment_id: segment.id(),
         })
     }
 }

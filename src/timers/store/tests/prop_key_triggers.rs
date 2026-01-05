@@ -123,7 +123,7 @@ impl Arbitrary for KeyTriggerTestInput {
             let timer_type = if bool::arbitrary(g) {
                 TimerType::Application
             } else {
-                TimerType::DeferRetry
+                TimerType::DeferredMessage
             };
 
             let time = CompactDateTime::arbitrary(g);
@@ -602,7 +602,7 @@ where
 
     for (segment_id, key) in &all_keys {
         // Verify get_key_times and get_key_triggers for each timer type
-        for timer_type in [TimerType::Application, TimerType::DeferRetry] {
+        for timer_type in [TimerType::Application, TimerType::DeferredMessage] {
             verify_key_times(operations, &model, segment_id, timer_type, key).await?;
             verify_key_triggers(operations, &model, segment_id, timer_type, key).await?;
         }

@@ -18,11 +18,11 @@ pub use cached::CachedDeferStore;
 pub use cassandra::{CassandraDeferStore, CassandraDeferStoreProvider};
 pub use lazy::{LazyStore, StoreFactory};
 pub use memory::{MemoryDeferStore, MemoryDeferStoreProvider};
-pub use provider::DeferStoreProvider;
+pub use provider::MessageDeferStoreProvider;
 
-/// Result of [`DeferStore::complete_retry_success`].
+/// Result of [`MessageDeferStore::complete_retry_success`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetryCompletionResult {
+pub enum MessageRetryCompletionResult {
     /// More messages remain; `retry_count` has been reset to 0.
     MoreMessages {
         /// The next (oldest) offset to retry.
@@ -37,7 +37,7 @@ pub enum RetryCompletionResult {
 ///
 /// Manages a FIFO queue of offsets per key with a shared `retry_count`. The
 /// segment context (`topic/partition/consumer_group`) is established at
-/// construction via [`DeferStoreProvider`].
+/// construction via [`MessageDeferStoreProvider`].
 ///
 /// # Invariants
 ///
@@ -50,7 +50,7 @@ pub enum RetryCompletionResult {
 ///   to the head.
 /// - **Cleanup**: [`complete_retry_success`](Self::complete_retry_success)
 ///   handles queue progression and key deletion when empty.
-pub trait DeferStore: Clone + Send + Sync + 'static {
+pub trait MessageDeferStore: Clone + Send + Sync + 'static {
     /// Error type. Must implement [`ClassifyError`] for retry decisions.
     type Error: Error + ClassifyError + Send + Sync + 'static;
 
@@ -95,16 +95,16 @@ pub trait DeferStore: Clone + Send + Sync + 'static {
         &self,
         key: &Key,
         offset: Offset,
-    ) -> impl Future<Output = Result<RetryCompletionResult, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<MessageRetryCompletionResult, Self::Error>> + Send {
         async move {
             self.remove_deferred_message(key, offset).await?;
 
             if let Some((next_offset, _)) = self.get_next_deferred_message(key).await? {
                 self.set_retry_count(key, 0).await?;
-                Ok(RetryCompletionResult::MoreMessages { next_offset })
+                Ok(MessageRetryCompletionResult::MoreMessages { next_offset })
             } else {
                 self.delete_key(key).await?;
-                Ok(RetryCompletionResult::Completed)
+                Ok(MessageRetryCompletionResult::Completed)
             }
         }
     }

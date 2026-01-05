@@ -1,15 +1,15 @@
 //! Provider trait for creating partition-specific defer stores.
 
-use super::DeferStore;
+use super::MessageDeferStore;
 use crate::consumer::middleware::ClassifyError;
-use crate::{Partition, Topic};
+use crate::consumer::middleware::defer::segment::Segment;
 use std::error::Error;
 use std::future::Future;
 
-/// Factory for creating partition-specific [`DeferStore`] instances.
+/// Factory for creating partition-specific [`MessageDeferStore`] instances.
 ///
 /// The provider holds shared resources (Cassandra session, prepared queries)
-/// and creates store instances with the correct segment context.
+/// and creates store instances for a given [`Segment`].
 ///
 /// # Usage
 ///
@@ -17,21 +17,31 @@ use std::future::Future;
 /// // Create provider once at application startup
 /// let provider = CassandraDeferStoreProvider::new(session, keyspace).await?;
 ///
-/// // Create store for each partition as needed
-/// let store = provider.create_store(topic, partition, &consumer_group).await?;
+/// // Create store for a segment
+/// let store = provider.create_store(&segment).await?;
 /// ```
+///
+/// # Segment Lifecycle
+///
+/// The [`Segment`] must be created and persisted via [`SegmentStore`] before
+/// calling `create_store`. This ensures:
+/// 1. Segment metadata is in the database
+/// 2. Both message and timer defer share the same segment
+/// 3. No redundant segment ID computation
+///
+/// [`SegmentStore`]: crate::consumer::middleware::defer::segment::SegmentStore
 ///
 /// # Implementations
 ///
 /// - `CassandraDeferStoreProvider`: Creates `CassandraDeferStore` instances
 /// - `MemoryDeferStoreProvider`: Creates `MemoryDeferStore` instances (for
 ///   testing)
-pub trait DeferStoreProvider: Clone + Send + Sync + 'static {
+pub trait MessageDeferStoreProvider: Clone + Send + Sync + 'static {
     /// The store type created by this provider.
     ///
     /// The store's error type must match this provider's error type to allow
     /// unified error handling in the lazy store wrapper.
-    type Store: DeferStore<Error = Self::Error>;
+    type Store: MessageDeferStore<Error = Self::Error>;
 
     /// Error type for store creation and store operations.
     ///
@@ -39,29 +49,25 @@ pub trait DeferStoreProvider: Clone + Send + Sync + 'static {
     /// and errors from the created store instances.
     type Error: Error + ClassifyError + Send + Sync + 'static;
 
-    /// Creates a store for the specified partition.
+    /// Creates a store for the specified segment.
     ///
     /// # Arguments
     ///
-    /// * `topic` - Kafka topic
-    /// * `partition` - Kafka partition
-    /// * `consumer_group` - Consumer group ID
+    /// * `segment` - The segment (`topic/partition/consumer_group` context)
     ///
-    /// # Behavior
+    /// # Preconditions
     ///
-    /// 1. Computes segment ID as `UUIDv5` of
-    ///    `"{topic}/{partition}:{consumer_group}"`
-    /// 2. Inserts segment metadata row (idempotent)
-    /// 3. Returns store instance with segment context
+    /// The segment must already be persisted via
+    /// [`SegmentStore::get_or_create_segment`]. This method does NOT insert
+    /// segment metadata.
     ///
     /// # Errors
     ///
-    /// Returns error if segment metadata insertion fails (Cassandra) or other
-    /// initialization failure.
+    /// Returns error if store initialization fails.
+    ///
+    /// [`SegmentStore::get_or_create_segment`]: crate::consumer::middleware::defer::segment::SegmentStore::get_or_create_segment
     fn create_store(
         &self,
-        topic: Topic,
-        partition: Partition,
-        consumer_group: &str,
+        segment: &Segment,
     ) -> impl Future<Output = Result<Self::Store, Self::Error>> + Send;
 }

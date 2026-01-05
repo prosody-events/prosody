@@ -1,9 +1,9 @@
 //! Property-based tests for defer store operations.
 //!
-//! Tests the `DeferStore` trait using a simple reference model to verify
+//! Tests the `MessageDeferStore` trait using a simple reference model to verify
 //! correctness across both memory and Cassandra implementations.
 
-use crate::consumer::middleware::defer::store::{DeferStore, RetryCompletionResult};
+use crate::consumer::middleware::defer::store::{MessageDeferStore, MessageRetryCompletionResult};
 use crate::{Key, Offset};
 use ahash::{HashMap, HashSet};
 use color_eyre::eyre::Report;
@@ -372,7 +372,7 @@ async fn verify_final_state<S>(
     input: &DeferTestInput,
 ) -> color_eyre::Result<()>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     // Check ALL keys used in operations
@@ -422,12 +422,15 @@ where
 /// Verifies result of `complete_retry_success` matches model expectations.
 fn verify_completion_result(
     expected_next: Option<(Offset, u32)>,
-    result: RetryCompletionResult,
+    result: MessageRetryCompletionResult,
     key: &Key,
     op_idx: usize,
 ) -> color_eyre::Result<()> {
     match (expected_next, result) {
-        (Some((expected_offset, _)), RetryCompletionResult::MoreMessages { next_offset }) => {
+        (
+            Some((expected_offset, _)),
+            MessageRetryCompletionResult::MoreMessages { next_offset },
+        ) => {
             if expected_offset != next_offset {
                 return Err(color_eyre::eyre::eyre!(
                     "Op #{op_idx} CompleteRetrySuccess offset mismatch for key={key}: expected \
@@ -435,16 +438,16 @@ fn verify_completion_result(
                 ));
             }
         }
-        (None, RetryCompletionResult::Completed) => {
+        (None, MessageRetryCompletionResult::Completed) => {
             // Both agree no more messages - correct
         }
-        (Some((expected_offset, _)), RetryCompletionResult::Completed) => {
+        (Some((expected_offset, _)), MessageRetryCompletionResult::Completed) => {
             return Err(color_eyre::eyre::eyre!(
                 "Op #{op_idx} CompleteRetrySuccess mismatch for key={key}: expected MoreMessages \
                  with offset={expected_offset}, got Completed"
             ));
         }
-        (None, RetryCompletionResult::MoreMessages { next_offset }) => {
+        (None, MessageRetryCompletionResult::MoreMessages { next_offset }) => {
             return Err(color_eyre::eyre::eyre!(
                 "Op #{op_idx} CompleteRetrySuccess mismatch for key={key}: expected Completed, \
                  got MoreMessages with offset={next_offset}"
@@ -464,7 +467,7 @@ async fn apply_query_operation<S>(
     key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     match op {
@@ -519,7 +522,7 @@ async fn apply_complete_retry<S>(
     key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     let key = &key_components[key_index].key;
@@ -546,7 +549,7 @@ async fn apply_increment_retry<S>(
     key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     let key = &key_components[key_index].key;
@@ -575,7 +578,7 @@ struct MutationContext<'a, S> {
 
 impl<S> MutationContext<'_, S>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     fn key(&self, key_index: usize) -> &Key {
@@ -685,7 +688,7 @@ async fn apply_mutation_operation<S>(
     key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     let ctx = MutationContext {
@@ -757,7 +760,7 @@ async fn apply_operation<S>(
     key_components: &[TestKeyComponents],
 ) -> color_eyre::Result<()>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     match op {
@@ -788,7 +791,7 @@ pub async fn prop_defer_store_model_equivalence<S>(
     input: DeferTestInput,
 ) -> color_eyre::Result<()>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
     S::Error: Error + Send + Sync + 'static,
 {
     // Clean up keys from this trial to ensure isolation

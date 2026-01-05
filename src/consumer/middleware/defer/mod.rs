@@ -4,12 +4,14 @@ pub mod error;
 pub mod failure_tracker;
 pub mod handler;
 pub mod loader;
+pub mod segment;
 pub mod store;
+pub mod timer;
 
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
 pub use decider::{AlwaysDefer, DeferralDecider, NeverDefer, TraceBasedDecider};
 pub use error::DeferInitError;
-pub use handler::DeferMiddleware;
+pub use handler::MessageDeferMiddleware;
 pub use loader::MessageLoader;
 
 /// State of a key in the defer system.

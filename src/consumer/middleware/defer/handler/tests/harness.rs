@@ -1,7 +1,7 @@
 //! Test harness for trace-based property testing.
 //!
 //! Provides [`TestHarness`] that executes traces against the **real**
-//! `DeferHandler` and verification functions for checking invariants.
+//! `MessageDeferHandler` and verification functions for checking invariants.
 //!
 //! # Architecture
 //!
@@ -23,10 +23,10 @@ use crate::consumer::DemandType;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
-use crate::consumer::middleware::defer::handler::DeferHandler;
+use crate::consumer::middleware::defer::handler::MessageDeferHandler;
 use crate::consumer::middleware::defer::loader::{MemoryLoader, MessageLoader};
 use crate::consumer::middleware::defer::store::CachedDeferStore;
-use crate::consumer::middleware::defer::store::DeferStore;
+use crate::consumer::middleware::defer::store::MessageDeferStore;
 use crate::consumer::middleware::defer::store::memory::MemoryDeferStore;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
@@ -75,21 +75,22 @@ pub async fn verify_timer_coverage(
 }
 
 // ============================================================================
-// Test Harness using Real DeferHandler
+// Test Harness using Real MessageDeferHandler
 // ============================================================================
 
-/// Type alias for the `DeferHandler` used in tests.
-type TestDeferHandler = DeferHandler<
+/// Type alias for the `MessageDeferHandler` used in tests.
+type TestDeferHandler = MessageDeferHandler<
     OutcomeHandler,
     CachedDeferStore<MemoryDeferStore>,
     FailableLoader,
     TraceBasedDecider,
 >;
 
-/// Test harness for executing traces against the **real** `DeferHandler`.
+/// Test harness for executing traces against the **real**
+/// `MessageDeferHandler`.
 ///
 /// Unlike the previous simulation-based harness, this one constructs an actual
-/// `DeferHandler` and calls its `on_message()` and `on_timer()` methods.
+/// `MessageDeferHandler` and calls its `on_message()` and `on_timer()` methods.
 /// Test doubles control behavior:
 ///
 /// - `OutcomeHandler`: Returns outcomes specified by the trace
@@ -149,11 +150,12 @@ impl TestHarness {
             .build()
             .map_err(|e| eyre!("config error: {e}"))?;
 
-        // Create the DeferHandler directly (bypassing middleware/provider pattern)
-        // This is simpler for testing since we don't need the full middleware stack
+        // Create the MessageDeferHandler directly (bypassing middleware/provider
+        // pattern) This is simpler for testing since we don't need the full
+        // middleware stack
         let cached_store = CachedDeferStore::new(store.clone(), config.cache_size);
 
-        let handler = DeferHandler {
+        let handler = MessageDeferHandler {
             handler: inner_handler.clone(),
             loader: loader.clone(),
             store: cached_store,
@@ -216,7 +218,7 @@ impl TestHarness {
         KeyedCapturingContext::new(key.clone(), self.capture.clone())
     }
 
-    /// Executes a message event using the real `DeferHandler`.
+    /// Executes a message event using the real `MessageDeferHandler`.
     pub async fn execute_message(&mut self, event: &MessageEvent) -> color_eyre::Result<()> {
         let key = &self.keys[event.key_idx];
 
@@ -256,7 +258,7 @@ impl TestHarness {
             .await
             .map_err(|e| eyre!("loader error: {e}"))?;
 
-        // Call the real DeferHandler::on_message
+        // Call the real MessageDeferHandler::on_message
         let result = self
             .handler
             .on_message(key_context, message, DemandType::Normal)
@@ -288,7 +290,7 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Executes a timer event using the real `DeferHandler`.
+    /// Executes a timer event using the real `MessageDeferHandler`.
     pub async fn execute_timer(&mut self, event: &TimerEvent) -> color_eyre::Result<()> {
         let key = &self.keys[event.key_idx];
 
@@ -349,9 +351,9 @@ impl TestHarness {
         let key_context = self.context_for_key(key);
 
         // Create a trigger with the actual scheduled time
-        let trigger = Trigger::for_testing(key.clone(), trigger_time, TimerType::DeferRetry);
+        let trigger = Trigger::for_testing(key.clone(), trigger_time, TimerType::DeferredMessage);
 
-        // Call the real DeferHandler::on_timer
+        // Call the real MessageDeferHandler::on_timer
         let result = self
             .handler
             .on_timer(key_context, trigger, DemandType::Normal)
@@ -370,7 +372,7 @@ impl TestHarness {
             | TimerOutcome::Transient { .. }
             | TimerOutcome::LoaderPermanent
             | TimerOutcome::LoaderTransient { .. } => {
-                // These should succeed (errors handled internally by DeferHandler)
+                // These should succeed (errors handled internally by MessageDeferHandler)
                 if let Err(e) = result {
                     return Err(eyre!("Timer failed unexpectedly: {e}"));
                 }

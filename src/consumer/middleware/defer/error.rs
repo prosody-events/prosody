@@ -17,7 +17,7 @@ use validator::ValidationErrors;
 /// # Type Parameters
 ///
 /// * `T` - Success value type
-/// * `S` - Store error type (from `DeferStore::Error`)
+/// * `S` - Store error type (from `MessageDeferStore::Error`)
 /// * `H` - Handler error type (from inner `FallibleHandler::Error`)
 /// * `L` - Loader error type (from `MessageLoader::Error`)
 pub type DeferResult<T, S, H, L> = Result<T, DeferError<S, H, L>>;
@@ -29,7 +29,7 @@ pub type DeferResult<T, S, H, L> = Result<T, DeferError<S, H, L>>;
 ///
 /// # Type Parameters
 ///
-/// * `S` - Store error type (from `DeferStore::Error`)
+/// * `S` - Store error type (from `MessageDeferStore::Error`)
 /// * `H` - Handler error type (from inner `FallibleHandler::Error`)
 /// * `L` - Loader error type (from `MessageLoader::Error`)
 #[derive(Debug, Error)]

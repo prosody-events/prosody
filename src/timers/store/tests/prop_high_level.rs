@@ -112,7 +112,7 @@ fn random_timer_type(g: &mut Gen) -> TimerType {
     if bool::arbitrary(g) {
         TimerType::Application
     } else {
-        TimerType::DeferRetry
+        TimerType::DeferredMessage
     }
 }
 

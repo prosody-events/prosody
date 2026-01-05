@@ -1,22 +1,22 @@
 //! Lazy-initialized store wrapper for deferred message storage.
 
-use super::{DeferStore, RetryCompletionResult};
+use super::{MessageDeferStore, MessageRetryCompletionResult};
 use crate::{Key, Offset};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
-/// Factory for creating [`DeferStore`] instances.
+/// Factory for creating [`MessageDeferStore`] instances.
 ///
 /// Implementations provide the async initialization logic for [`LazyStore`].
 pub trait StoreFactory: Clone + Send + Sync + 'static {
     /// The store type this factory creates.
-    type Store: DeferStore;
+    type Store: MessageDeferStore;
 
     /// Creates the store asynchronously.
     fn create(
         self,
-    ) -> impl Future<Output = Result<Self::Store, <Self::Store as DeferStore>::Error>> + Send;
+    ) -> impl Future<Output = Result<Self::Store, <Self::Store as MessageDeferStore>::Error>> + Send;
 }
 
 /// Lazy-initialized store wrapper.
@@ -65,13 +65,13 @@ impl<F: StoreFactory> LazyStore<F> {
     /// # Errors
     ///
     /// Returns the factory's error if store creation fails.
-    async fn get_store(&self) -> Result<&F::Store, <F::Store as DeferStore>::Error> {
+    async fn get_store(&self) -> Result<&F::Store, <F::Store as MessageDeferStore>::Error> {
         let factory = self.factory.clone();
         self.cell.get_or_try_init(|| factory.create()).await
     }
 }
 
-/// Implements lazy delegation for [`DeferStore`] methods.
+/// Implements lazy delegation for [`MessageDeferStore`] methods.
 macro_rules! delegate_defer_store {
     ($($method:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
         $(
@@ -82,13 +82,13 @@ macro_rules! delegate_defer_store {
     };
 }
 
-impl<F: StoreFactory> DeferStore for LazyStore<F> {
-    type Error = <F::Store as DeferStore>::Error;
+impl<F: StoreFactory> MessageDeferStore for LazyStore<F> {
+    type Error = <F::Store as MessageDeferStore>::Error;
 
     delegate_defer_store! {
         defer_first_message(key: &Key, offset: Offset) -> Result<(), Self::Error>;
         defer_additional_message(key: &Key, offset: Offset) -> Result<(), Self::Error>;
-        complete_retry_success(key: &Key, offset: Offset) -> Result<RetryCompletionResult, Self::Error>;
+        complete_retry_success(key: &Key, offset: Offset) -> Result<MessageRetryCompletionResult, Self::Error>;
         increment_retry_count(key: &Key, current_retry_count: u32) -> Result<u32, Self::Error>;
         get_next_deferred_message(key: &Key) -> Result<Option<(Offset, u32)>, Self::Error>;
         is_deferred(key: &Key) -> Result<Option<u32>, Self::Error>;
@@ -102,37 +102,37 @@ impl<F: StoreFactory> DeferStore for LazyStore<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::store::DeferStoreProvider;
+    use crate::consumer::middleware::defer::segment::Segment;
+    use crate::consumer::middleware::defer::store::MessageDeferStoreProvider;
     use crate::consumer::middleware::defer::store::memory::{
         MemoryDeferStore, MemoryDeferStoreProvider,
     };
-    use crate::{Partition, Topic};
+    use crate::{ConsumerGroup, Partition, Topic};
 
     /// Test factory that creates memory-backed stores.
     #[derive(Clone)]
     struct TestFactory {
         provider: MemoryDeferStoreProvider,
-        topic: Topic,
-        partition: Partition,
-        group: &'static str,
+        segment: Segment,
     }
 
     impl StoreFactory for TestFactory {
         type Store = MemoryDeferStore;
 
-        async fn create(self) -> Result<Self::Store, <Self::Store as DeferStore>::Error> {
-            self.provider
-                .create_store(self.topic, self.partition, self.group)
-                .await
+        async fn create(self) -> Result<Self::Store, <Self::Store as MessageDeferStore>::Error> {
+            self.provider.create_store(&self.segment).await
         }
     }
 
     fn test_factory() -> TestFactory {
+        let segment = Segment::new(
+            Topic::from("test-topic"),
+            Partition::from(0_i32),
+            Arc::from("test-group") as ConsumerGroup,
+        );
         TestFactory {
             provider: MemoryDeferStoreProvider::new(),
-            topic: Topic::from("test-topic"),
-            partition: Partition::from(0_i32),
-            group: "test-group",
+            segment,
         }
     }
 

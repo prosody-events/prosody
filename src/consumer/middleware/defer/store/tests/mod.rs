@@ -1,18 +1,19 @@
-//! Tests for the `DeferStore` trait implementations.
+//! Tests for the `MessageDeferStore` trait implementations.
 //!
 //! This module contains property-based tests that verify the behavior
-//! of any implementation of the `DeferStore` trait using model-based testing.
+//! of any implementation of the `MessageDeferStore` trait using model-based
+//! testing.
 
 pub mod prop_defer_store;
 
 /// Alias for the result returned by defer store tests.
 pub type TestStoreResult = Result<(), String>;
 
-/// Generate comprehensive test suite for a `DeferStore` implementation.
+/// Generate comprehensive test suite for a `MessageDeferStore` implementation.
 ///
 /// This macro creates property-based tests using `QuickCheck` to verify
-/// that a `DeferStore` implementation correctly handles all operations by
-/// comparing against a simple reference model.
+/// that a `MessageDeferStore` implementation correctly handles all operations
+/// by comparing against a simple reference model.
 ///
 /// # Usage
 ///

@@ -1,0 +1,488 @@
+//! In-memory implementation of `TimerDeferStore` for testing.
+//!
+//! Provides [`MemoryTimerDeferStore`], a lock-free, concurrent implementation
+//! of the [`TimerDeferStore`] trait using [`scc::HashMap`].
+//!
+//! All data is held in memory and lost on process exit. Not suitable for
+//! production use where persistence across restarts is required.
+
+use super::{TimerDeferStore, TimerDeferStoreProvider};
+use crate::Key;
+use crate::consumer::middleware::defer::segment::Segment;
+use crate::timers::datetime::CompactDateTime;
+use crate::timers::{TimerType, Trigger};
+use ahash::RandomState;
+use futures::stream;
+use futures::{Stream, StreamExt};
+use opentelemetry::Context;
+use scc::HashMap;
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::sync::Arc;
+use tracing::info_span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// Stored timer entry with span context for reconstruction.
+#[derive(Clone, Debug)]
+struct StoredTimer {
+    /// The timer's key (copied for reconstruction).
+    key: Key,
+    /// Original fire time (used as ordering key).
+    time: CompactDateTime,
+    /// Parent trace context extracted from original span.
+    context: Context,
+}
+
+impl StoredTimer {
+    /// Creates a stored timer entry from a trigger.
+    fn from_trigger(trigger: &Trigger) -> Self {
+        // Extract the parent context from the trigger's span
+        let span = trigger.span();
+        let context = span.context();
+
+        Self {
+            key: trigger.key.clone(),
+            time: trigger.time,
+            context,
+        }
+    }
+
+    /// Reconstructs a trigger with a fresh span linked to the stored context.
+    fn to_trigger(&self) -> Trigger {
+        // Create a new span and link it to the stored context
+        let span = info_span!(
+            "timer_defer.load",
+            key = %self.key,
+            time = %self.time,
+        );
+        let _ = span.set_parent(self.context.clone());
+
+        Trigger::new(self.key.clone(), self.time, TimerType::Application, span)
+    }
+}
+
+/// In-memory implementation of [`TimerDeferStore`] for testing and
+/// development.
+///
+/// Uses [`scc::HashMap`] for lock-free concurrent access. Stores multiple
+/// timers per key (queue) with a shared retry counter. All data is
+/// volatile - deferred state is lost when the process exits.
+///
+/// # Thread Safety
+///
+/// Safe to clone and use from multiple threads. All operations are atomic
+/// per message key.
+///
+/// # Design
+///
+/// Each store instance is created for a specific segment
+/// (`topic/partition/consumer_group`). The internal `HashMap` keys by message
+/// key only, with segment isolation handled by having separate store instances
+/// per partition.
+#[derive(Clone, Debug)]
+pub struct MemoryTimerDeferStore {
+    inner: Arc<Inner>,
+}
+
+impl MemoryTimerDeferStore {
+    /// Creates a new empty in-memory timer defer store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Inner::default()),
+        }
+    }
+}
+
+impl Default for MemoryTimerDeferStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Internal state for [`MemoryTimerDeferStore`].
+///
+/// Maps each key to:
+/// - `BTreeMap<CompactDateTime, StoredTimer>`: Sorted timers (oldest first)
+/// - `u32`: Shared retry counter for this key
+#[derive(Debug)]
+struct Inner {
+    /// Storage: `key` -> (`timers by time`, `retry_count`)
+    deferred: HashMap<Key, (BTreeMap<CompactDateTime, StoredTimer>, u32), RandomState>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            deferred: HashMap::with_hasher(RandomState::new()),
+        }
+    }
+}
+
+impl TimerDeferStore for MemoryTimerDeferStore {
+    type Error = Infallible;
+
+    async fn get_next_deferred_timer(
+        &self,
+        key: &Key,
+    ) -> Result<Option<(Trigger, u32)>, Self::Error> {
+        let result = self
+            .inner
+            .deferred
+            .get_async(key.as_ref())
+            .await
+            .and_then(|entry| {
+                let (timers, retry_count) = entry.get();
+                timers
+                    .first_key_value()
+                    .map(|(_, stored)| (stored.to_trigger(), *retry_count))
+            });
+
+        Ok(result)
+    }
+
+    fn deferred_times(
+        &self,
+        key: &Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
+        // scc::HashMap guard can't span yields, so copy times (4 bytes each) out
+        let inner = Arc::clone(&self.inner);
+        let key = key.clone();
+
+        stream::once(async move {
+            inner
+                .deferred
+                .get_async(key.as_ref())
+                .await
+                .map(|entry| {
+                    let (timers, _) = entry.get();
+                    timers.keys().copied().collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .flat_map(|times| stream::iter(times).map(Ok))
+    }
+
+    async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+        let stored = StoredTimer::from_trigger(trigger);
+        let time = trigger.time;
+
+        self.inner
+            .deferred
+            .entry_async(trigger.key.clone())
+            .await
+            .and_modify(|(timers, retry_count)| {
+                timers.insert(time, stored.clone());
+                *retry_count = 0;
+            })
+            .or_insert_with(|| {
+                let mut timers = BTreeMap::new();
+                timers.insert(time, stored);
+                (timers, 0)
+            });
+
+        Ok(())
+    }
+
+    async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+        let stored = StoredTimer::from_trigger(trigger);
+        let time = trigger.time;
+
+        self.inner
+            .deferred
+            .entry_async(trigger.key.clone())
+            .await
+            .and_modify(|(timers, _)| {
+                timers.insert(time, stored.clone());
+            })
+            .or_insert_with(|| {
+                // Shouldn't happen (should use defer_first_timer first)
+                // but handle gracefully with retry_count=0
+                let mut timers = BTreeMap::new();
+                timers.insert(time, stored);
+                (timers, 0)
+            });
+
+        Ok(())
+    }
+
+    async fn remove_deferred_timer(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+    ) -> Result<(), Self::Error> {
+        let _ = self
+            .inner
+            .deferred
+            .entry_async(key.clone())
+            .await
+            .and_modify(|(timers, _)| {
+                timers.remove(&time);
+            });
+
+        Ok(())
+    }
+
+    async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
+        self.inner
+            .deferred
+            .entry_async(key.clone())
+            .await
+            .and_modify(|(_, current)| {
+                *current = retry_count;
+            })
+            .or_insert_with(|| (BTreeMap::new(), retry_count));
+
+        Ok(())
+    }
+
+    async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
+        self.inner.deferred.remove_async(key.as_ref()).await;
+        Ok(())
+    }
+}
+
+/// Provider for creating [`MemoryTimerDeferStore`] instances.
+///
+/// Simple provider that creates isolated in-memory stores for each partition.
+/// Each store instance has its own `HashMap`, ensuring partition isolation.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryTimerDeferStoreProvider {
+    /// Shared inner state (empty, just for consistency with pattern)
+    _inner: Arc<()>,
+}
+
+impl MemoryTimerDeferStoreProvider {
+    /// Creates a new memory timer defer store provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
+    type Error = Infallible;
+    type Store = MemoryTimerDeferStore;
+
+    async fn create_store(&self, _segment: &Segment) -> Result<Self::Store, Self::Error> {
+        Ok(MemoryTimerDeferStore {
+            inner: Arc::new(Inner::default()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ConsumerGroup, Partition, Topic};
+    use tracing::Span;
+
+    async fn create_test_store() -> MemoryTimerDeferStore {
+        let provider = MemoryTimerDeferStoreProvider::new();
+        let segment = Segment::new(
+            Topic::from("test-topic"),
+            Partition::from(0_i32),
+            Arc::from("test-group") as ConsumerGroup,
+        );
+        let Ok(store) = provider.create_store(&segment).await;
+        store
+    }
+
+    fn test_trigger(key: &str, time_secs: u32) -> Trigger {
+        let key: Key = Arc::from(key);
+        let time = CompactDateTime::from(time_secs);
+        Trigger::new(key, time, TimerType::Application, Span::current())
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_key() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let key: Key = Arc::from("test-key-1");
+
+        let result = store.get_next_deferred_timer(&key).await?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_defer_first_and_get() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let trigger = test_trigger("test-key-1", 1000);
+
+        store.defer_first_timer(&trigger).await?;
+
+        let result = store.get_next_deferred_timer(&trigger.key).await?;
+        assert!(result.is_some());
+        let (returned_trigger, retry_count) =
+            result.ok_or_else(|| color_eyre::eyre::eyre!("expected trigger"))?;
+        assert_eq!(returned_trigger.time, trigger.time);
+        assert_eq!(returned_trigger.key, trigger.key);
+        assert_eq!(retry_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multiple_timers_returns_oldest() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let key = "test-key-1";
+
+        // Defer first timer at time 1000
+        store.defer_first_timer(&test_trigger(key, 1000)).await?;
+        // Append timer at time 500 (earlier)
+        store.append_deferred_timer(&test_trigger(key, 500)).await?;
+        // Append timer at time 1500 (later)
+        store
+            .append_deferred_timer(&test_trigger(key, 1500))
+            .await?;
+
+        let key: Key = Arc::from(key);
+        let result = store.get_next_deferred_timer(&key).await?;
+        assert!(result.is_some());
+        let (trigger, retry_count) =
+            result.ok_or_else(|| color_eyre::eyre::eyre!("expected trigger"))?;
+        // Should return the oldest (time 500)
+        assert_eq!(trigger.time, CompactDateTime::from(500_u32));
+        assert_eq!(retry_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_timer() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let trigger = test_trigger("test-key-1", 1000);
+
+        store.defer_first_timer(&trigger).await?;
+        store
+            .remove_deferred_timer(&trigger.key, trigger.time)
+            .await?;
+
+        let result = store.get_next_deferred_timer(&trigger.key).await?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let key: Key = Arc::from("test-key-1");
+
+        // Should not error
+        store
+            .remove_deferred_timer(&key, CompactDateTime::from(42_u32))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_retry_count() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let trigger = test_trigger("test-key-1", 1000);
+
+        store.defer_first_timer(&trigger).await?;
+        store.set_retry_count(&trigger.key, 5).await?;
+
+        let result = store.get_next_deferred_timer(&trigger.key).await?;
+        assert!(result.is_some());
+        let (_, retry_count) = result.ok_or_else(|| color_eyre::eyre::eyre!("expected trigger"))?;
+        assert_eq!(retry_count, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_is_deferred() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let trigger = test_trigger("test-key-1", 1000);
+
+        // Not deferred initially
+        assert!(store.is_deferred(&trigger.key).await?.is_none());
+
+        // Defer and check
+        store.defer_first_timer(&trigger).await?;
+        assert_eq!(store.is_deferred(&trigger.key).await?, Some(0));
+
+        // Update retry count and check
+        store.set_retry_count(&trigger.key, 3).await?;
+        assert_eq!(store.is_deferred(&trigger.key).await?, Some(3));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_complete_retry_success_more_timers() -> color_eyre::Result<()> {
+        use super::super::TimerRetryCompletionResult;
+
+        let store = create_test_store().await;
+        let key = "test-key-1";
+
+        // Defer two timers
+        store.defer_first_timer(&test_trigger(key, 1000)).await?;
+        store
+            .defer_additional_timer(&test_trigger(key, 2000))
+            .await?;
+        store.set_retry_count(&Arc::from(key), 5).await?;
+
+        // Complete first timer
+        let key_arc: Key = Arc::from(key);
+        let result = store
+            .complete_retry_success(&key_arc, CompactDateTime::from(1000_u32))
+            .await?;
+
+        // Should return MoreTimers with next time
+        assert!(matches!(
+            result,
+            TimerRetryCompletionResult::MoreTimers { next_time } if next_time == CompactDateTime::from(2000_u32)
+        ));
+
+        // Retry count should be reset to 0
+        let (_, retry_count) = store
+            .get_next_deferred_timer(&key_arc)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected next timer"))?;
+        assert_eq!(retry_count, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_complete_retry_success_completed() -> color_eyre::Result<()> {
+        use super::super::TimerRetryCompletionResult;
+
+        let store = create_test_store().await;
+        let trigger = test_trigger("test-key-1", 1000);
+
+        store.defer_first_timer(&trigger).await?;
+
+        let result = store
+            .complete_retry_success(&trigger.key, trigger.time)
+            .await?;
+
+        assert!(matches!(result, TimerRetryCompletionResult::Completed));
+
+        // Key should no longer be deferred
+        assert!(store.is_deferred(&trigger.key).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_increment_retry_count() -> color_eyre::Result<()> {
+        let store = create_test_store().await;
+        let trigger = test_trigger("test-key-1", 1000);
+
+        store.defer_first_timer(&trigger).await?;
+
+        let new_count = store.increment_retry_count(&trigger.key, 0).await?;
+        assert_eq!(new_count, 1);
+
+        let new_count = store.increment_retry_count(&trigger.key, 1).await?;
+        assert_eq!(new_count, 2);
+
+        let (_, retry_count) = store
+            .get_next_deferred_timer(&trigger.key)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected trigger"))?;
+        assert_eq!(retry_count, 2);
+
+        Ok(())
+    }
+}

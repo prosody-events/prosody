@@ -88,7 +88,7 @@ impl Arbitrary for MigrationTestInput {
             let timer_type = if bool::arbitrary(g) {
                 TimerType::Application
             } else {
-                TimerType::DeferRetry
+                TimerType::DeferredMessage
             };
 
             triggers.push(MigrationTriggerData {
@@ -344,7 +344,7 @@ async fn verify_data_preservation(
         seen_keys.insert(key.clone());
 
         // Get triggers for both timer types
-        for timer_type in [TimerType::Application, TimerType::DeferRetry] {
+        for timer_type in [TimerType::Application, TimerType::DeferredMessage] {
             let triggers: Vec<Trigger> = store
                 .get_key_triggers(&model.segment.id, timer_type, key)
                 .try_collect()
@@ -467,7 +467,7 @@ async fn verify_dual_index_consistency(
         }
         seen_keys.insert(key.clone());
 
-        for timer_type in [TimerType::Application, TimerType::DeferRetry] {
+        for timer_type in [TimerType::Application, TimerType::DeferredMessage] {
             let triggers: Vec<Trigger> = store
                 .get_key_triggers(&model.segment.id, timer_type, key)
                 .try_collect()

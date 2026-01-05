@@ -1,21 +1,26 @@
-//! In-memory implementation of `DeferStore` for testing.
+//! In-memory implementation of `MessageDeferStore` for testing.
 //!
 //! Provides [`MemoryDeferStore`], a lock-free, concurrent implementation
-//! of the [`DeferStore`] trait using [`scc::HashMap`].
+//! of the [`MessageDeferStore`] trait using [`scc::HashMap`].
 //!
 //! # Usage
 //!
 //! ```rust,no_run
-//! use prosody::consumer::middleware::defer::store::DeferStoreProvider;
+//! use prosody::consumer::middleware::defer::segment::Segment;
+//! use prosody::consumer::middleware::defer::store::MessageDeferStoreProvider;
 //! use prosody::consumer::middleware::defer::store::memory::MemoryDeferStoreProvider;
-//! use prosody::{Partition, Topic};
+//! use prosody::{ConsumerGroup, Partition, Topic};
+//! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let provider = MemoryDeferStoreProvider::new();
-//! let store = provider
-//!     .create_store(Topic::from("test"), Partition::from(0), "consumer-group")
-//!     .await?;
-//! // Use store with DeferStore methods
+//! let segment = Segment::new(
+//!     Topic::from("test"),
+//!     Partition::from(0),
+//!     Arc::from("consumer-group") as ConsumerGroup,
+//! );
+//! let store = provider.create_store(&segment).await?;
+//! // Use store with MessageDeferStore methods
 //! # Ok(())
 //! # }
 //! ```
@@ -23,8 +28,9 @@
 //! All data is held in memory and lost on process exit. Not suitable for
 //! production use where persistence across restarts is required.
 
-use super::{DeferStore, DeferStoreProvider};
-use crate::{Key, Offset, Partition, Topic};
+use super::{MessageDeferStore, MessageDeferStoreProvider};
+use crate::consumer::middleware::defer::segment::Segment;
+use crate::{Key, Offset};
 
 #[cfg(test)]
 use crate::defer_store_tests;
@@ -34,7 +40,8 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-/// In-memory implementation of [`DeferStore`] for testing and development.
+/// In-memory implementation of [`MessageDeferStore`] for testing and
+/// development.
 ///
 /// Uses [`scc::HashMap`] for lock-free concurrent access. Stores multiple
 /// offsets per key (queue) with a shared retry counter. All data is
@@ -91,7 +98,7 @@ impl Default for Inner {
     }
 }
 
-impl DeferStore for MemoryDeferStore {
+impl MessageDeferStore for MemoryDeferStore {
     type Error = Infallible;
 
     async fn get_next_deferred_message(
@@ -198,16 +205,11 @@ impl MemoryDeferStoreProvider {
     }
 }
 
-impl DeferStoreProvider for MemoryDeferStoreProvider {
+impl MessageDeferStoreProvider for MemoryDeferStoreProvider {
     type Error = Infallible;
     type Store = MemoryDeferStore;
 
-    async fn create_store(
-        &self,
-        _topic: Topic,
-        _partition: Partition,
-        _consumer_group: &str,
-    ) -> Result<Self::Store, Self::Error> {
+    async fn create_store(&self, _segment: &Segment) -> Result<Self::Store, Self::Error> {
         Ok(MemoryDeferStore {
             inner: Arc::new(Inner::default()),
         })
@@ -217,18 +219,17 @@ impl DeferStoreProvider for MemoryDeferStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Key, Partition, Topic};
+    use crate::{ConsumerGroup, Key, Partition, Topic};
 
     async fn create_test_store() -> MemoryDeferStore {
         let provider = MemoryDeferStoreProvider::new();
-        provider
-            .create_store(
-                Topic::from("test-topic"),
-                Partition::from(0_i32),
-                "test-group",
-            )
-            .await
-            .expect("store creation is infallible")
+        let segment = Segment::new(
+            Topic::from("test-topic"),
+            Partition::from(0_i32),
+            Arc::from("test-group") as ConsumerGroup,
+        );
+        let Ok(store) = provider.create_store(&segment).await;
+        store
     }
 
     #[tokio::test]

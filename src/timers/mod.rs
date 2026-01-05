@@ -82,8 +82,10 @@ pub enum TimerType {
     /// User-scheduled application timers (default).
     #[default]
     Application = 0,
-    /// Defer middleware retry timers.
-    DeferRetry = 1,
+    /// Defer middleware message retry timers.
+    DeferredMessage = 1,
+    /// Defer middleware timer retry timers.
+    DeferredTimer = 2,
 }
 
 impl From<TimerType> for i8 {
@@ -98,7 +100,8 @@ impl TryFrom<i8> for TimerType {
     fn try_from(value: i8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Application),
-            1 => Ok(Self::DeferRetry),
+            1 => Ok(Self::DeferredMessage),
+            2 => Ok(Self::DeferredTimer),
             _ => Err(ParseError::UnknownTimerType(value)),
         }
     }

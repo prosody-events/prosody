@@ -1,8 +1,8 @@
 //! Integration tests for defer middleware using the test harness.
 //!
-//! These tests verify specific behavioral scenarios of the `DeferHandler`
-//! middleware using deterministic traces, complementing the property-based
-//! tests in `properties.rs`.
+//! These tests verify specific behavioral scenarios of the
+//! `MessageDeferHandler` middleware using deterministic traces, complementing
+//! the property-based tests in `properties.rs`.
 
 use super::TEST_RUNTIME;
 use super::harness::TestHarness;
@@ -11,7 +11,7 @@ use crate::Offset;
 use crate::consumer::DemandType;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::handler::tests::context::KeyedCapturingContext;
-use crate::consumer::middleware::defer::store::DeferStore;
+use crate::consumer::middleware::defer::store::MessageDeferStore;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
@@ -201,7 +201,7 @@ fn transient_errors_always_redeferred_ignoring_decider() {
         // Create context and trigger manually
         let trigger_time = harness.capture().get_timer_time(&key)?;
         let key_context = KeyedCapturingContext::new(key.clone(), harness.capture().clone());
-        let trigger = Trigger::for_testing(key.clone(), trigger_time, TimerType::DeferRetry);
+        let trigger = Trigger::for_testing(key.clone(), trigger_time, TimerType::DeferredMessage);
 
         // Transient failures are ALWAYS re-deferred (decider is ignored for retry path)
         let result = harness

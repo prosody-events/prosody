@@ -1,9 +1,9 @@
-//! Write-through cache adapter for `DeferStore` implementations.
+//! Write-through cache adapter for `MessageDeferStore` implementations.
 //!
 //! Provides [`CachedDeferStore`], a transparent caching layer that wraps any
-//! [`DeferStore`] implementation to reduce store queries.
+//! [`MessageDeferStore`] implementation to reduce store queries.
 
-use super::{DeferStore, RetryCompletionResult};
+use super::{MessageDeferStore, MessageRetryCompletionResult};
 use crate::{Key, Offset};
 use quick_cache::sync::Cache;
 use std::sync::Arc;
@@ -18,10 +18,10 @@ type DeferCache = Cache<Key, Option<(Offset, u32)>>;
 #[cfg(test)]
 use crate::defer_store_tests;
 
-/// Write-through cache adapter for `DeferStore` implementations.
+/// Write-through cache adapter for `MessageDeferStore` implementations.
 ///
 /// Caches the result of
-/// [`get_next_deferred_message`](DeferStore::get_next_deferred_message)
+/// [`get_next_deferred_message`](MessageDeferStore::get_next_deferred_message)
 /// to reduce store queries. All mutations write through to the underlying store
 /// and update/invalidate the cache appropriately.
 ///
@@ -46,18 +46,23 @@ use crate::defer_store_tests;
 /// # Usage
 ///
 /// ```rust,no_run
-/// use prosody::consumer::middleware::defer::store::DeferStoreProvider;
+/// use prosody::consumer::middleware::defer::segment::Segment;
+/// use prosody::consumer::middleware::defer::store::MessageDeferStoreProvider;
 /// use prosody::consumer::middleware::defer::store::cached::CachedDeferStore;
 /// use prosody::consumer::middleware::defer::store::memory::MemoryDeferStoreProvider;
-/// use prosody::{Partition, Topic};
+/// use prosody::{ConsumerGroup, Partition, Topic};
+/// use std::sync::Arc;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let provider = MemoryDeferStoreProvider::new();
-/// let store = provider
-///     .create_store(Topic::from("test"), Partition::from(0), "consumer-group")
-///     .await?;
+/// let segment = Segment::new(
+///     Topic::from("test"),
+///     Partition::from(0),
+///     Arc::from("consumer-group") as ConsumerGroup,
+/// );
+/// let store = provider.create_store(&segment).await?;
 /// let cached_store = CachedDeferStore::new(store, 10_000);
-/// // Use cached_store with DeferStore methods
+/// // Use cached_store with MessageDeferStore methods
 /// # Ok(())
 /// # }
 /// ```
@@ -69,7 +74,7 @@ pub struct CachedDeferStore<S> {
 
 impl<S> CachedDeferStore<S>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
 {
     /// Creates a new cached store wrapping the underlying store.
     ///
@@ -121,9 +126,9 @@ where
     }
 }
 
-impl<S> DeferStore for CachedDeferStore<S>
+impl<S> MessageDeferStore for CachedDeferStore<S>
 where
-    S: DeferStore,
+    S: MessageDeferStore,
 {
     type Error = S::Error;
 
@@ -161,17 +166,17 @@ where
         &self,
         key: &Key,
         offset: Offset,
-    ) -> Result<RetryCompletionResult, Self::Error> {
+    ) -> Result<MessageRetryCompletionResult, Self::Error> {
         // Write through to store first
         let result = self.store.complete_retry_success(key, offset).await?;
 
         // Update cache based on result (store tells us exact new state)
         match result {
-            RetryCompletionResult::MoreMessages { next_offset } => {
+            MessageRetryCompletionResult::MoreMessages { next_offset } => {
                 // More messages exist, retry_count reset to 0
                 self.cache.insert(Arc::clone(key), Some((next_offset, 0)));
             }
-            RetryCompletionResult::Completed => {
+            MessageRetryCompletionResult::Completed => {
                 // Key deleted, no more messages
                 self.cache.insert(Arc::clone(key), None);
             }
@@ -285,25 +290,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::store::DeferStoreProvider;
+    use crate::consumer::middleware::defer::segment::Segment;
+    use crate::consumer::middleware::defer::store::MessageDeferStoreProvider;
     use crate::consumer::middleware::defer::store::memory::{
         MemoryDeferStore, MemoryDeferStoreProvider,
     };
-    use crate::{Key, Partition, Topic};
+    use crate::{ConsumerGroup, Key, Partition, Topic};
 
     async fn create_test_store() -> MemoryDeferStore {
         let provider = MemoryDeferStoreProvider::new();
-        match provider
-            .create_store(
-                Topic::from("test-topic"),
-                Partition::from(0_i32),
-                "test-group",
-            )
-            .await
-        {
-            Ok(store) => store,
-            Err(infallible) => match infallible {},
-        }
+        let segment = Segment::new(
+            Topic::from("test-topic"),
+            Partition::from(0_i32),
+            Arc::from("test-group") as ConsumerGroup,
+        );
+        let Ok(store) = provider.create_store(&segment).await;
+        store
     }
 
     #[tokio::test]
@@ -378,7 +380,7 @@ mod tests {
         // Should return MoreMessages with next offset
         assert!(matches!(
             result,
-            RetryCompletionResult::MoreMessages { next_offset } if next_offset == Offset::from(200_i64)
+            MessageRetryCompletionResult::MoreMessages { next_offset } if next_offset == Offset::from(200_i64)
         ));
 
         // Cache should be updated to point to next message with retry_count=0
@@ -401,7 +403,7 @@ mod tests {
         // Complete it
         let result = cached_store.complete_retry_success(&key, offset).await?;
 
-        assert!(matches!(result, RetryCompletionResult::Completed));
+        assert!(matches!(result, MessageRetryCompletionResult::Completed));
 
         // Cache should show None (key is not deferred)
         let cached = cached_store.get_next_deferred_message(&key).await?;

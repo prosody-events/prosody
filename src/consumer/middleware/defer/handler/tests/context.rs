@@ -202,7 +202,7 @@ impl EventContext for KeyedCapturingContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if timer_type == TimerType::DeferRetry {
+        if timer_type == TimerType::DeferredMessage {
             self.capture.record_schedule(self.key.clone(), time);
         }
         future::ready(Ok(()))
@@ -213,7 +213,7 @@ impl EventContext for KeyedCapturingContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if timer_type == TimerType::DeferRetry {
+        if timer_type == TimerType::DeferredMessage {
             // Clear all timers for this key first, then schedule new one
             self.capture.record_clear_all(&self.key);
             self.capture.record_schedule(self.key.clone(), time);
@@ -226,7 +226,7 @@ impl EventContext for KeyedCapturingContext {
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if timer_type == TimerType::DeferRetry {
+        if timer_type == TimerType::DeferredMessage {
             // Remove specific timer by (key, time)
             self.capture.record_clear(&self.key, time);
         }
@@ -237,7 +237,7 @@ impl EventContext for KeyedCapturingContext {
         &self,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        if timer_type == TimerType::DeferRetry {
+        if timer_type == TimerType::DeferredMessage {
             // Remove all timers for this key
             self.capture.record_clear_all(&self.key);
         }
@@ -324,7 +324,7 @@ mod tests {
         let time = CompactDateTime::now().ok();
         if let Some(time) = time {
             TEST_RUNTIME.block_on(async {
-                let _ = ctx.schedule(time, TimerType::DeferRetry).await;
+                let _ = ctx.schedule(time, TimerType::DeferredMessage).await;
             });
 
             assert!(capture.has_active_timer(&test_key("k1")));
@@ -344,7 +344,9 @@ mod tests {
             capture.record_schedule(test_key("k1"), time);
 
             TEST_RUNTIME.block_on(async {
-                let _ = ctx.clear_and_schedule(time, TimerType::DeferRetry).await;
+                let _ = ctx
+                    .clear_and_schedule(time, TimerType::DeferredMessage)
+                    .await;
             });
 
             // Should have 3 events: initial schedule, clear, new schedule

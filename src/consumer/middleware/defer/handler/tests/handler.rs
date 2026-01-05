@@ -259,7 +259,7 @@ mod tests {
     fn make_test_trigger(key_name: &str) -> Trigger {
         let key: Key = Arc::from(key_name);
         let time = CompactDateTime::from(1000_u32);
-        Trigger::for_testing(key, time, TimerType::DeferRetry)
+        Trigger::for_testing(key, time, TimerType::DeferredMessage)
     }
 
     #[test]

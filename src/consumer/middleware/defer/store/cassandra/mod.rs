@@ -1,33 +1,26 @@
-//! Cassandra-based implementation of [`DeferStore`].
+//! Cassandra-based implementation of [`MessageDeferStore`].
 //!
 //! Provides persistent storage for deferred messages using Apache Cassandra
 //! with automatic schema migration and optimized TTL management.
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::consumer::middleware::defer::store::DeferStore;
+use crate::consumer::middleware::defer::segment::SegmentId;
+use crate::consumer::middleware::defer::store::MessageDeferStore;
 use crate::consumer::middleware::defer::store::cassandra::queries::Queries;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
-use crate::{Key, Offset, Partition, Topic};
+use crate::{Key, Offset};
 use scylla::client::session::Session;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::instrument;
-use uuid::Uuid;
 
 pub mod provider;
 mod queries;
 
 pub use provider::CassandraDeferStoreProvider;
 
-/// Deterministic `UUIDv5` from `"{topic}/{partition}:{consumer_group}"`.
-#[must_use]
-pub fn compute_segment_id(topic: Topic, partition: Partition, consumer_group: &str) -> Uuid {
-    let input = format!("{topic}/{partition}:{consumer_group}");
-    Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
-}
-
-/// Cassandra-based implementation of [`DeferStore`].
+/// Cassandra-based implementation of [`MessageDeferStore`].
 ///
 /// Provides persistent storage for deferred messages with automatic TTL
 /// management and retry count tracking via static columns.
@@ -38,7 +31,8 @@ pub fn compute_segment_id(topic: Topic, partition: Partition, consumer_group: &s
 ///   (data)
 /// - **Partition key**: `(segment_id, key)` in offsets table
 /// - **Segment ID**: `UUIDv5` hash of `{topic}/{partition}:{consumer_group}`
-///   (computed once at construction)
+///   (provided via
+///   [`Segment`](crate::consumer::middleware::defer::segment::Segment))
 /// - **Retry count**: Stored as static column (shared across all offsets for a
 ///   key)
 /// - **TTL management**: Uses fixed TTL from `CassandraStore::base_ttl()`
@@ -47,7 +41,7 @@ pub fn compute_segment_id(topic: Topic, partition: Partition, consumer_group: &s
 pub struct CassandraDeferStore {
     store: CassandraStore,
     queries: Arc<Queries>,
-    segment_id: Uuid,
+    segment_id: SegmentId,
 }
 
 impl CassandraDeferStore {
@@ -57,7 +51,7 @@ impl CassandraDeferStore {
     }
 }
 
-impl DeferStore for CassandraDeferStore {
+impl MessageDeferStore for CassandraDeferStore {
     type Error = CassandraDeferStoreError;
 
     #[instrument(level = "debug", skip(self), err)]
@@ -202,9 +196,10 @@ impl ClassifyError for CassandraDeferStoreError {
 mod tests {
     use super::*;
     use crate::cassandra::{CassandraConfiguration, CassandraStore};
-    use crate::consumer::middleware::defer::store::DeferStoreProvider;
+    use crate::consumer::middleware::defer::segment::Segment;
+    use crate::consumer::middleware::defer::store::MessageDeferStoreProvider;
     use crate::defer_store_tests;
-    use crate::{Partition, Topic};
+    use crate::{ConsumerGroup, Partition, Topic};
 
     // Property-based tests using model equivalence
     defer_store_tests!(async {
@@ -217,13 +212,12 @@ mod tests {
         let cassandra_store = CassandraStore::new(&config).await?;
         let provider =
             CassandraDeferStoreProvider::with_store(cassandra_store, "prosody_test").await?;
-        let defer_store = provider
-            .create_store(
-                Topic::from("test-topic"),
-                Partition::from(0_i32),
-                "test-consumer-group",
-            )
-            .await?;
+        let segment = Segment::new(
+            Topic::from("test-topic"),
+            Partition::from(0_i32),
+            Arc::from("test-consumer-group") as ConsumerGroup,
+        );
+        let defer_store = provider.create_store(&segment).await?;
         Ok::<_, color_eyre::Report>(defer_store)
     });
 }

@@ -10,7 +10,7 @@
 use super::TEST_RUNTIME;
 use super::harness::TestHarness;
 use super::types::{MessageOutcome, TimerOutcome, Trace, TraceEvent};
-use crate::consumer::middleware::defer::store::DeferStore;
+use crate::consumer::middleware::defer::store::MessageDeferStore;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::tracing::init_test_logging;

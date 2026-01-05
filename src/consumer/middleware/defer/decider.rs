@@ -27,11 +27,11 @@ use std::sync::Arc;
 ///
 /// ```ignore
 /// // Production usage - unchanged API
-/// let middleware = DeferMiddleware::new(config, consumer_config, ...)?;
+/// let middleware = MessageDeferMiddleware::new(config, consumer_config, ...)?;
 ///
 /// // Test usage - inject test double
 /// let decider = TraceBasedDecider::new();
-/// let middleware = DeferMiddleware::with_decider(config, ..., decider)?;
+/// let middleware = MessageDeferMiddleware::with_decider(config, ..., decider)?;
 /// ```
 pub trait DeferralDecider: Clone + Send + Sync + 'static {
     /// Returns `true` if messages should be deferred on transient failure.

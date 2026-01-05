@@ -23,7 +23,8 @@ use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
 use prosody::consumer::middleware::defer::store::cassandra::CassandraDeferStoreProvider;
-use prosody::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};
+use prosody::consumer::middleware::defer::timer::store::cassandra::CassandraTimerDeferStoreProvider;
+use prosody::consumer::middleware::defer::{DeferConfiguration, MessageDeferMiddleware};
 use prosody::consumer::middleware::log::LogMiddleware;
 use prosody::consumer::middleware::scheduler::SchedulerConfiguration;
 use prosody::consumer::middleware::{
@@ -261,16 +262,19 @@ impl DeferTestEnvironment {
             .build()?;
 
         let cassandra_store = CassandraStore::new(&cassandra_config).await?;
-        let defer_provider =
-            CassandraDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
+        let message_defer_provider =
+            CassandraDeferStoreProvider::with_store(cassandra_store.clone(), &keyspace).await?;
+        let timer_defer_provider =
+            CassandraTimerDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
 
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
-        let defer_middleware = DeferMiddleware::new(
+        let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
             &scheduler_config,
-            defer_provider,
+            message_defer_provider,
+            timer_defer_provider,
             &telemetry,
             &heartbeats,
         )?;
@@ -340,16 +344,19 @@ impl DeferTestEnvironment {
             .build()?;
 
         let cassandra_store = CassandraStore::new(&cassandra_config).await?;
-        let defer_provider =
-            CassandraDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
+        let message_defer_provider =
+            CassandraDeferStoreProvider::with_store(cassandra_store.clone(), &keyspace).await?;
+        let timer_defer_provider =
+            CassandraTimerDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
 
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
-        let defer_middleware = DeferMiddleware::new(
+        let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
             &scheduler_config,
-            defer_provider,
+            message_defer_provider,
+            timer_defer_provider,
             &telemetry,
             &heartbeats,
         )?;

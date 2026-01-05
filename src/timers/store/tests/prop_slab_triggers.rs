@@ -97,7 +97,7 @@ impl Arbitrary for SlabTriggerTestInput {
             let timer_type = if bool::arbitrary(g) {
                 TimerType::Application
             } else {
-                TimerType::DeferRetry
+                TimerType::DeferredMessage
             };
 
             let time = CompactDateTime::arbitrary(g);
@@ -393,7 +393,7 @@ where
         let slab = Slab::new(*segment_id, *slab_id, slab_size);
 
         // Verify get_slab_triggers for each timer type
-        for timer_type in [TimerType::Application, TimerType::DeferRetry] {
+        for timer_type in [TimerType::Application, TimerType::DeferredMessage] {
             verify_slab_triggers_by_type(operations, model, &slab, timer_type).await?;
         }
 

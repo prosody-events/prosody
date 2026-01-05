@@ -18,6 +18,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use axum_extra::routing::RouterExt;
 use educe::Educe;
 use futures::executor::block_on;
@@ -105,6 +106,13 @@ impl ProbeServer {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let listener = block_on(async { TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await })?;
         let address = listener.local_addr()?;
+
+        // Disable Nagle's algorithm for low-latency health check responses
+        let listener = listener.tap_io(|tcp_stream| {
+            if let Err(error) = tcp_stream.set_nodelay(true) {
+                error!("failed to set TCP_NODELAY on probe connection: {error:#}");
+            }
+        });
 
         // Spawn server in background task
         let handle = spawn(async move {
