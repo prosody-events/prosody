@@ -88,6 +88,15 @@ pub enum TimerType {
     DeferredTimer = 2,
 }
 
+impl TimerType {
+    /// All timer type variants.
+    pub const ALL: [Self; 3] = [
+        Self::Application,
+        Self::DeferredMessage,
+        Self::DeferredTimer,
+    ];
+}
+
 impl From<TimerType> for i8 {
     fn from(timer_type: TimerType) -> Self {
         timer_type as i8

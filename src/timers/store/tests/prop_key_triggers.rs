@@ -120,10 +120,10 @@ impl Arbitrary for KeyTriggerTestInput {
             let key_idx = usize::from(u8::arbitrary(g)) % key_pool.len();
             let key = Key::from(key_pool[key_idx]);
 
-            let timer_type = if bool::arbitrary(g) {
-                TimerType::Application
-            } else {
-                TimerType::DeferredMessage
+            let timer_type = match u8::arbitrary(g) % 3 {
+                0 => TimerType::Application,
+                1 => TimerType::DeferredMessage,
+                _ => TimerType::DeferredTimer,
             };
 
             let time = CompactDateTime::arbitrary(g);
@@ -602,7 +602,7 @@ where
 
     for (segment_id, key) in &all_keys {
         // Verify get_key_times and get_key_triggers for each timer type
-        for timer_type in [TimerType::Application, TimerType::DeferredMessage] {
+        for timer_type in TimerType::ALL {
             verify_key_times(operations, &model, segment_id, timer_type, key).await?;
             verify_key_triggers(operations, &model, segment_id, timer_type, key).await?;
         }
