@@ -21,6 +21,7 @@ use super::store::{
 };
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::{DeferError, DeferInitError, DeferResult};
@@ -40,11 +41,8 @@ use crate::consumer::{ConsumerConfiguration, DemandType, Keyed};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
-use rand::Rng;
-use std::cmp::min;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -290,41 +288,12 @@ where
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    /// Jittered exponential backoff: `random(1, min(base * 2^retry, max))`.
-    /// Returns 0 for `retry_count == 0`.
-    fn calculate_backoff(&self, retry_count: u32) -> CompactDuration {
-        // No delay for the initial attempt
-        if retry_count == 0 {
-            return CompactDuration::MIN;
-        }
-
-        let base_seconds = u32::try_from(self.config.base.as_secs()).unwrap_or(u32::MAX);
-        let max_delay_seconds = u32::try_from(self.config.max_delay.as_secs()).unwrap_or(u32::MAX);
-
-        // Calculate exponential backoff: base * 2^(retry_count - 1)
-        // Subtract 1 so first retry (count=1) uses base delay
-        // Using checked operations to avoid overflow
-        let multiplier = 2_u32.saturating_pow(retry_count - 1);
-        let delay_seconds = base_seconds.saturating_mul(multiplier);
-
-        // Cap at max_delay, with minimum of 1 second.
-        // Minimum 1 second ensures a meaningful delay when jitter would
-        // otherwise produce 0.
-        let capped_seconds = min(delay_seconds, max_delay_seconds).max(1);
-
-        // Apply full jitter: random(1, capped_seconds)
-        // This prevents thundering herd when many keys retry simultaneously.
-        let jittered_seconds = rand::rng().random_range(1..=capped_seconds);
-
-        CompactDuration::new(jittered_seconds)
-    }
-
     /// Returns `now + backoff(retry_count)`; used for scheduling timers.
     fn next_retry_time(
         &self,
         retry_count: u32,
     ) -> DeferResult<CompactDateTime, S::Error, T::Error, L::Error> {
-        let delay = self.calculate_backoff(retry_count);
+        let delay = calculate_backoff(&self.config, retry_count);
         let now = CompactDateTime::now()?;
         Ok(now.add_duration(delay)?)
     }
