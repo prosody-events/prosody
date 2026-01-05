@@ -201,13 +201,21 @@ impl ContextTestHarness {
     async fn is_deferred(&self) -> color_eyre::Result<bool> {
         Ok(self.store.is_deferred(self.key()).await?.is_some())
     }
+
+    /// Returns all deferred times for this key, sorted ascending.
+    async fn deferred_times(&self) -> color_eyre::Result<Vec<CompactDateTime>> {
+        use futures::TryStreamExt;
+        let times: Vec<CompactDateTime> =
+            self.store.deferred_times(self.key()).try_collect().await?;
+        Ok(times)
+    }
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
 
-/// T064: `schedule()` when NOT deferred delegates to inner context.
+/// `schedule()` when NOT deferred delegates to inner context.
 #[test]
 fn schedule_when_not_deferred_adds_to_active() {
     init_test_logging();
@@ -239,7 +247,7 @@ fn schedule_when_not_deferred_adds_to_active() {
     });
 }
 
-/// T065: `schedule()` when deferred appends to defer store.
+/// `schedule()` when deferred appends to defer store.
 #[test]
 fn schedule_when_deferred_appends_to_store() {
     init_test_logging();
@@ -257,15 +265,25 @@ fn schedule_when_deferred_appends_to_store() {
         let time = CompactDateTime::from(2000_u32);
         context.schedule(time, TimerType::Application).await.ok()?;
 
-        // Should be appended to defer store (we need to implement this behavior)
-        // For now, check that context handles this case
-        // The timer at time 2000 should go to defer store since key is deferred
+        // Timer should be appended to defer store (not inner context)
+        let deferred = harness.deferred_times().await.ok()?;
+        assert!(
+            deferred.contains(&time),
+            "Timer should be in defer store; got: {deferred:?}"
+        );
+
+        // Should NOT be in inner context's active timers
+        let active = harness.inner_context.active_application_timers();
+        assert!(
+            !active.contains(&time),
+            "Timer should NOT be in active store when key is deferred"
+        );
 
         Some(())
     });
 }
 
-/// T066: `unschedule()` removes from both stores when deferred.
+/// `unschedule()` removes from both stores when deferred.
 #[test]
 fn unschedule_removes_from_both_stores() {
     init_test_logging();
@@ -280,8 +298,9 @@ fn unschedule_removes_from_both_stores() {
             .await
             .ok()?;
 
-        // Defer a different timer to make key deferred
+        // Defer timers at 500 and 1500 to make key deferred
         harness.defer_timer(500).await.ok()?;
+        harness.defer_additional_timer(1500).await.ok()?;
 
         let context = harness.create_wrapped_context();
 
@@ -298,11 +317,28 @@ fn unschedule_removes_from_both_stores() {
             "Timer should be removed from active store"
         );
 
+        // Unschedule the timer at 500 (in defer store)
+        context
+            .unschedule(CompactDateTime::from(500_u32), TimerType::Application)
+            .await
+            .ok()?;
+
+        // Should be removed from defer store (only 1500 remains)
+        let deferred = harness.deferred_times().await.ok()?;
+        assert!(
+            !deferred.contains(&CompactDateTime::from(500_u32)),
+            "Timer at 500 should be removed from defer store"
+        );
+        assert!(
+            deferred.contains(&CompactDateTime::from(1500_u32)),
+            "Timer at 1500 should still be in defer store"
+        );
+
         Some(())
     });
 }
 
-/// T067: `clear_scheduled()` clears both stores and cancels `DeferredTimer`.
+/// `clear_scheduled()` clears both stores and cancels `DeferredTimer`.
 #[test]
 fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() {
     init_test_logging();
@@ -320,7 +356,7 @@ fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() {
         // Defer a timer
         harness.defer_timer(500).await.ok()?;
 
-        // Schedule a DeferredTimer
+        // Schedule a DeferredTimer (simulates the retry timer)
         harness
             .inner_context
             .schedule(CompactDateTime::from(600_u32), TimerType::DeferredTimer)
@@ -339,15 +375,31 @@ fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() {
             "Active Application timers should be cleared"
         );
 
-        // Key should no longer be deferred (defer store cleared via delete_key)
-        // This behavior needs to be implemented - clear_scheduled should also
-        // cancel the DeferredTimer
+        // Defer store should be cleared (key deleted)
+        let deferred = harness.deferred_times().await.ok()?;
+        assert!(
+            deferred.is_empty(),
+            "Defer store should be cleared; got: {deferred:?}"
+        );
+
+        // Key should no longer be deferred
+        assert!(
+            !harness.is_deferred().await.ok()?,
+            "Key should not be deferred after clear_scheduled"
+        );
+
+        // DeferredTimer should be cancelled
+        let deferred_timers = harness.inner_context.active_deferred_timers();
+        assert!(
+            deferred_timers.is_empty(),
+            "DeferredTimer should be cancelled; got: {deferred_timers:?}"
+        );
 
         Some(())
     });
 }
 
-/// T068: `scheduled()` merges both stores sorted and deduplicated.
+/// `scheduled()` merges both stores sorted and deduplicated.
 #[test]
 fn scheduled_merges_both_stores_sorted_deduplicated() {
     init_test_logging();
@@ -396,7 +448,7 @@ fn scheduled_merges_both_stores_sorted_deduplicated() {
     });
 }
 
-/// T068a: `scheduled()` deduplicates when same time exists in both stores.
+/// `scheduled()` deduplicates when same time exists in both stores.
 #[test]
 fn scheduled_deduplicates_when_same_time_in_both_stores() {
     init_test_logging();
@@ -431,7 +483,7 @@ fn scheduled_deduplicates_when_same_time_in_both_stores() {
     });
 }
 
-/// T068b: `clear_and_schedule()` makes key not deferred after completion.
+/// `clear_and_schedule()` makes key not deferred after completion.
 #[test]
 fn clear_and_schedule_makes_key_not_deferred() {
     init_test_logging();
@@ -476,7 +528,7 @@ fn clear_and_schedule_makes_key_not_deferred() {
     });
 }
 
-/// T069: Non-Application timer types pass through to inner context.
+/// Non-Application timer types pass through to inner context.
 #[test]
 fn non_application_timers_pass_through() {
     init_test_logging();
@@ -511,4 +563,365 @@ fn non_application_timers_pass_through() {
 
         Some(())
     });
+}
+
+// ============================================================================
+// Error Handling Tests
+// ============================================================================
+
+mod error_handling {
+    use super::*;
+    use crate::consumer::middleware::defer::timer::context::TimerDeferContextError;
+    use crate::consumer::middleware::defer::timer::store::TimerRetryCompletionResult;
+    use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+    use std::error::Error;
+    use std::fmt::{self, Display, Formatter};
+
+    /// Test error that can be classified as transient or permanent.
+    #[derive(Debug, Clone)]
+    struct TestStoreError {
+        category: ErrorCategory,
+    }
+
+    impl TestStoreError {
+        fn transient() -> Self {
+            Self {
+                category: ErrorCategory::Transient,
+            }
+        }
+    }
+
+    impl Display for TestStoreError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "test store error ({:?})", self.category)
+        }
+    }
+
+    impl Error for TestStoreError {}
+
+    impl ClassifyError for TestStoreError {
+        fn classify_error(&self) -> ErrorCategory {
+            self.category
+        }
+    }
+
+    /// Store wrapper that injects an error after yielding N items from
+    /// `deferred_times`.
+    #[derive(Clone)]
+    struct FailAfterNStore {
+        inner: CachedTimerDeferStore<MemoryTimerDeferStore>,
+        /// Error after this many items (0 = error immediately on first poll)
+        fail_after: usize,
+    }
+
+    impl TimerDeferStore for FailAfterNStore {
+        type Error = TestStoreError;
+
+        async fn get_next_deferred_timer(
+            &self,
+            key: &Key,
+        ) -> Result<Option<(Trigger, u32)>, Self::Error> {
+            self.inner
+                .get_next_deferred_timer(key)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        fn deferred_times(
+            &self,
+            key: &Key,
+        ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
+            let inner_stream = self.inner.deferred_times(key);
+            let fail_after = self.fail_after;
+
+            async_stream::try_stream! {
+                use futures::StreamExt;
+                futures::pin_mut!(inner_stream);
+
+                let mut yielded = 0;
+                while let Some(result) = inner_stream.next().await {
+                    if yielded >= fail_after {
+                        // Inject error before yielding this item
+                        Err(TestStoreError::transient())?;
+                    }
+                    yielded += 1;
+                    yield result.map_err(|_| TestStoreError::transient())?;
+                }
+            }
+        }
+
+        async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+            self.inner
+                .defer_first_timer(trigger)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn defer_additional_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+            self.inner
+                .defer_additional_timer(trigger)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn complete_retry_success(
+            &self,
+            key: &Key,
+            time: CompactDateTime,
+        ) -> Result<TimerRetryCompletionResult, Self::Error> {
+            self.inner
+                .complete_retry_success(key, time)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn increment_retry_count(&self, key: &Key, current: u32) -> Result<u32, Self::Error> {
+            self.inner
+                .increment_retry_count(key, current)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+            self.inner
+                .append_deferred_timer(trigger)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn remove_deferred_timer(
+            &self,
+            key: &Key,
+            time: CompactDateTime,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .remove_deferred_timer(key, time)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn set_retry_count(&self, key: &Key, count: u32) -> Result<(), Self::Error> {
+            self.inner
+                .set_retry_count(key, count)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
+            self.inner
+                .delete_key(key)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+    }
+
+    /// Helper to set up a failing store with N deferred timers.
+    async fn setup_failing_store(
+        timer_count: usize,
+        fail_after: usize,
+    ) -> color_eyre::Result<(KeyedMockContext, FailAfterNStore, Key)> {
+        let inner_store = CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100);
+        let inner_context = KeyedMockContext::new("test-key");
+        let key: Key = Arc::from("test-key");
+
+        // Defer N timers at times 1000, 2000, 3000, ...
+        for i in 0..timer_count {
+            let time_secs = ((i + 1) * 1000) as u32;
+            let trigger = Trigger::new(
+                key.clone(),
+                CompactDateTime::from(time_secs),
+                TimerType::Application,
+                tracing::Span::current(),
+            );
+            if i == 0 {
+                inner_store.defer_first_timer(&trigger).await?;
+            } else {
+                inner_store.defer_additional_timer(&trigger).await?;
+            }
+        }
+
+        let failing_store = FailAfterNStore {
+            inner: inner_store,
+            fail_after,
+        };
+
+        Ok((inner_context, failing_store, key))
+    }
+
+    /// Collects items from the scheduled stream until error or completion.
+    async fn collect_until_error<C, S>(
+        context: &TimerDeferContext<C, S>,
+    ) -> (
+        Vec<CompactDateTime>,
+        Option<TimerDeferContextError<C::Error, S::Error>>,
+    )
+    where
+        C: EventContext + Clone + Send + Sync,
+        S: TimerDeferStore + Clone + Send + Sync,
+    {
+        let mut collected = Vec::new();
+        let stream = context.scheduled(TimerType::Application);
+        futures::pin_mut!(stream);
+
+        loop {
+            match stream.try_next().await {
+                Ok(Some(time)) => collected.push(time),
+                Ok(None) => return (collected, None),
+                Err(e) => return (collected, Some(e)),
+            }
+        }
+    }
+
+    /// T070: `scheduled()` propagates store error on immediate failure.
+    ///
+    /// Tests that when the deferred store fails on the very first poll,
+    /// the error is correctly propagated as `TimerDeferContextError::Store`.
+    #[test]
+    fn scheduled_propagates_immediate_store_error() {
+        init_test_logging();
+
+        TEST_RUNTIME.block_on(async {
+            // Set up store with 3 timers that fails on first poll (fail_after=0)
+            let (inner_context, failing_store, key) = setup_failing_store(3, 0).await.ok()?;
+            let context = TimerDeferContext::new(inner_context, failing_store, key);
+
+            let (collected, error) = collect_until_error(&context).await;
+
+            // Should get error immediately with no items collected
+            assert!(error.is_some(), "Should have received a Store error");
+            assert!(
+                matches!(error, Some(TimerDeferContextError::Store(_))),
+                "Error should be Store variant"
+            );
+            assert!(
+                collected.is_empty(),
+                "Should not yield any items before immediate error; got: {collected:?}"
+            );
+
+            Some(())
+        });
+    }
+
+    /// T070b: `scheduled()` propagates store error after yielding some items.
+    ///
+    /// Tests that when the deferred store fails mid-iteration, previously
+    /// yielded items are preserved and the error is correctly wrapped.
+    #[test]
+    fn scheduled_propagates_mid_iteration_store_error() {
+        init_test_logging();
+
+        TEST_RUNTIME.block_on(async {
+            // Set up store with 5 timers that fails after yielding 2 (fail_after=2)
+            let (inner_context, failing_store, key) = setup_failing_store(5, 2).await.ok()?;
+            let context = TimerDeferContext::new(inner_context, failing_store, key);
+
+            let (collected, error) = collect_until_error(&context).await;
+
+            // Should get error after some items
+            assert!(error.is_some(), "Should have received a Store error");
+            assert!(
+                matches!(error, Some(TimerDeferContextError::Store(_))),
+                "Error should be Store variant"
+            );
+
+            // The merge algorithm looks ahead, so the number of items yielded
+            // depends on timing. But we should have at least 1 item (first was
+            // fetched successfully) and fewer than all 5.
+            assert!(
+                !collected.is_empty(),
+                "Should yield at least one item before error"
+            );
+            assert!(
+                collected.len() < 5,
+                "Should not yield all items; got {} items",
+                collected.len()
+            );
+
+            // Items should be in sorted order
+            for window in collected.windows(2) {
+                assert!(
+                    window[0] <= window[1],
+                    "Items should be sorted; got: {collected:?}"
+                );
+            }
+
+            Some(())
+        });
+    }
+
+    /// T070c: `scheduled()` returns all items when store succeeds.
+    ///
+    /// Control test to ensure normal operation works correctly.
+    #[test]
+    fn scheduled_returns_all_items_on_success() {
+        init_test_logging();
+
+        TEST_RUNTIME.block_on(async {
+            // Set up store with 4 timers that never fails (fail_after > count)
+            let (inner_context, failing_store, key) = setup_failing_store(4, 100).await.ok()?;
+            let context = TimerDeferContext::new(inner_context, failing_store, key);
+
+            let (collected, error) = collect_until_error(&context).await;
+
+            // Should complete without error
+            assert!(error.is_none(), "Should not have error; got: {error:?}");
+
+            // Should have all 4 items in sorted order
+            assert_eq!(
+                collected,
+                vec![
+                    CompactDateTime::from(1000_u32),
+                    CompactDateTime::from(2000_u32),
+                    CompactDateTime::from(3000_u32),
+                    CompactDateTime::from(4000_u32),
+                ],
+                "Should yield all items in order"
+            );
+
+            Some(())
+        });
+    }
+}
+
+/// `TimerDeferContextError` classifies errors correctly by delegation.
+#[test]
+fn context_error_classification_delegates_correctly() {
+    use crate::consumer::middleware::defer::timer::context::TimerDeferContextError;
+    use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+
+    init_test_logging();
+
+    // Create errors with known classifications
+    let transient_error = OutcomeError::transient();
+    let permanent_error = OutcomeError::permanent();
+
+    // Context errors should delegate to inner error classification
+    let context_transient: TimerDeferContextError<OutcomeError, Infallible> =
+        TimerDeferContextError::Context(transient_error);
+    assert!(
+        matches!(context_transient.classify_error(), ErrorCategory::Transient),
+        "Context(Transient) should classify as Transient"
+    );
+
+    let context_permanent: TimerDeferContextError<OutcomeError, Infallible> =
+        TimerDeferContextError::Context(permanent_error);
+    assert!(
+        matches!(context_permanent.classify_error(), ErrorCategory::Permanent),
+        "Context(Permanent) should classify as Permanent"
+    );
+
+    // Store errors should delegate to inner error classification
+    let store_transient: TimerDeferContextError<Infallible, OutcomeError> =
+        TimerDeferContextError::Store(OutcomeError::transient());
+    assert!(
+        matches!(store_transient.classify_error(), ErrorCategory::Transient),
+        "Store(Transient) should classify as Transient"
+    );
+
+    let store_permanent: TimerDeferContextError<Infallible, OutcomeError> =
+        TimerDeferContextError::Store(OutcomeError::permanent());
+    assert!(
+        matches!(store_permanent.classify_error(), ErrorCategory::Permanent),
+        "Store(Permanent) should classify as Permanent"
+    );
 }

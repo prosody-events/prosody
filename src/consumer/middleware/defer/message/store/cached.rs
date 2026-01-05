@@ -46,10 +46,10 @@ use crate::defer_store_tests;
 /// # Usage
 ///
 /// ```rust,no_run
-/// use prosody::consumer::middleware::defer::segment::Segment;
 /// use prosody::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 /// use prosody::consumer::middleware::defer::message::store::cached::CachedDeferStore;
 /// use prosody::consumer::middleware::defer::message::store::memory::MemoryDeferStoreProvider;
+/// use prosody::consumer::middleware::defer::segment::Segment;
 /// use prosody::{ConsumerGroup, Partition, Topic};
 /// use std::sync::Arc;
 ///
