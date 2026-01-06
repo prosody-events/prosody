@@ -11,16 +11,6 @@ use std::future::Future;
 /// The provider holds shared resources (Cassandra session, prepared queries)
 /// and creates store instances for a given [`Segment`].
 ///
-/// # Usage
-///
-/// ```text
-/// // Create provider once at application startup
-/// let provider = CassandraMessageDeferStoreProvider::new(session, keyspace).await?;
-///
-/// // Create store for a segment
-/// let store = provider.create_store(&segment).await?;
-/// ```
-///
 /// # Segment Lifecycle
 ///
 /// The [`Segment`] must be created and persisted via [`SegmentStore`] before

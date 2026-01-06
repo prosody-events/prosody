@@ -12,16 +12,6 @@ use tracing::instrument;
 ///
 /// Holds shared resources (Cassandra session, prepared queries) and creates
 /// store instances for a given [`Segment`].
-///
-/// # Usage
-///
-/// ```text
-/// // Create provider once at startup
-/// let provider = CassandraMessageDeferStoreProvider::with_store(cassandra_store, keyspace).await?;
-///
-/// // Create stores for each segment (segment already persisted via SegmentStore)
-/// let store = provider.create_store(&segment).await?;
-/// ```
 #[derive(Clone, Debug)]
 pub struct CassandraMessageDeferStoreProvider {
     store: CassandraStore,
