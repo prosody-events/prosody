@@ -15,7 +15,7 @@ use std::error::Error;
 use std::future::Future;
 
 pub use cached::CachedDeferStore;
-pub use cassandra::{CassandraDeferStore, CassandraDeferStoreProvider};
+pub use cassandra::{CassandraMessageDeferStore, CassandraMessageDeferStoreProvider};
 pub use lazy::{LazyStore, StoreFactory};
 pub use memory::{MemoryDeferStore, MemoryDeferStoreProvider};
 pub use provider::MessageDeferStoreProvider;

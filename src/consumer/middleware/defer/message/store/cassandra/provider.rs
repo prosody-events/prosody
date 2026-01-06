@@ -1,14 +1,14 @@
 //! Provider for creating Cassandra defer stores with shared resources.
 
 use super::queries::Queries;
-use super::{CassandraDeferStore, CassandraDeferStoreError};
+use super::{CassandraMessageDeferStore, CassandraMessageDeferStoreError};
 use crate::cassandra::CassandraStore;
 use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::segment::Segment;
 use std::sync::Arc;
 use tracing::instrument;
 
-/// Provider for creating [`CassandraDeferStore`] instances.
+/// Provider for creating [`CassandraMessageDeferStore`] instances.
 ///
 /// Holds shared resources (Cassandra session, prepared queries) and creates
 /// store instances for a given [`Segment`].
@@ -17,18 +17,18 @@ use tracing::instrument;
 ///
 /// ```text
 /// // Create provider once at startup
-/// let provider = CassandraDeferStoreProvider::with_store(cassandra_store, keyspace).await?;
+/// let provider = CassandraMessageDeferStoreProvider::with_store(cassandra_store, keyspace).await?;
 ///
 /// // Create stores for each segment (segment already persisted via SegmentStore)
 /// let store = provider.create_store(&segment).await?;
 /// ```
 #[derive(Clone, Debug)]
-pub struct CassandraDeferStoreProvider {
+pub struct CassandraMessageDeferStoreProvider {
     store: CassandraStore,
     queries: Arc<Queries>,
 }
 
-impl CassandraDeferStoreProvider {
+impl CassandraMessageDeferStoreProvider {
     /// Creates a new provider using an existing `CassandraStore`.
     ///
     /// This allows sharing a single Cassandra session across multiple
@@ -45,22 +45,22 @@ impl CassandraDeferStoreProvider {
     pub async fn with_store(
         store: CassandraStore,
         keyspace: &str,
-    ) -> Result<Self, CassandraDeferStoreError> {
+    ) -> Result<Self, CassandraMessageDeferStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
         Ok(Self { store, queries })
     }
 }
 
-impl MessageDeferStoreProvider for CassandraDeferStoreProvider {
-    type Error = CassandraDeferStoreError;
-    type Store = CassandraDeferStore;
+impl MessageDeferStoreProvider for CassandraMessageDeferStoreProvider {
+    type Error = CassandraMessageDeferStoreError;
+    type Store = CassandraMessageDeferStore;
 
     #[instrument(level = "debug", skip(self), err)]
     async fn create_store(&self, segment: &Segment) -> Result<Self::Store, Self::Error> {
         // Segment metadata is already persisted via SegmentStore.
         // We just use the segment ID for store operations.
-        Ok(CassandraDeferStore {
+        Ok(CassandraMessageDeferStore {
             store: self.store.clone(),
             queries: Arc::clone(&self.queries),
             segment_id: segment.id(),

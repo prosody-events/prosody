@@ -18,7 +18,7 @@ use tracing::instrument;
 pub mod provider;
 mod queries;
 
-pub use provider::CassandraDeferStoreProvider;
+pub use provider::CassandraMessageDeferStoreProvider;
 
 /// Cassandra-based implementation of [`MessageDeferStore`].
 ///
@@ -38,21 +38,21 @@ pub use provider::CassandraDeferStoreProvider;
 /// - **TTL management**: Uses fixed TTL from `CassandraStore::base_ttl()`
 /// - **Ordering**: Clustering by offset ASC ensures FIFO processing
 #[derive(Clone, Debug)]
-pub struct CassandraDeferStore {
+pub struct CassandraMessageDeferStore {
     store: CassandraStore,
     queries: Arc<Queries>,
     segment_id: SegmentId,
 }
 
-impl CassandraDeferStore {
+impl CassandraMessageDeferStore {
     /// Returns a reference to the Cassandra session.
     fn session(&self) -> &Session {
         self.store.session()
     }
 }
 
-impl MessageDeferStore for CassandraDeferStore {
-    type Error = CassandraDeferStoreError;
+impl MessageDeferStore for CassandraMessageDeferStore {
+    type Error = CassandraMessageDeferStoreError;
 
     #[instrument(level = "debug", skip(self), err)]
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
@@ -133,13 +133,12 @@ impl MessageDeferStore for CassandraDeferStore {
     #[instrument(level = "debug", skip(self), err)]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
         let ttl = self.store.base_ttl();
-        let retry_count_i32: i32 =
-            retry_count
-                .try_into()
-                .map_err(|_| CassandraDeferStoreError::InvalidRetryCount {
-                    retry_count,
-                    reason: "retry count exceeds i32::MAX",
-                })?;
+        let retry_count_i32: i32 = retry_count.try_into().map_err(|_| {
+            CassandraMessageDeferStoreError::InvalidRetryCount {
+                retry_count,
+                reason: "retry count exceeds i32::MAX",
+            }
+        })?;
 
         self.session()
             .execute_unpaged(
@@ -165,7 +164,7 @@ impl MessageDeferStore for CassandraDeferStore {
 
 /// Errors that can occur in Cassandra defer store operations.
 #[derive(Debug, Error)]
-pub enum CassandraDeferStoreError {
+pub enum CassandraMessageDeferStoreError {
     /// Error from Cassandra operations.
     #[error("cassandra error: {0:#}")]
     Cassandra(#[from] CassandraStoreError),
@@ -180,7 +179,7 @@ pub enum CassandraDeferStoreError {
     },
 }
 
-impl ClassifyError for CassandraDeferStoreError {
+impl ClassifyError for CassandraMessageDeferStoreError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             // Delegate Cassandra errors to their classification
@@ -211,7 +210,7 @@ mod tests {
 
         let cassandra_store = CassandraStore::new(&config).await?;
         let provider =
-            CassandraDeferStoreProvider::with_store(cassandra_store, "prosody_test").await?;
+            CassandraMessageDeferStoreProvider::with_store(cassandra_store, "prosody_test").await?;
         let segment = Segment::new(
             Topic::from("test-topic"),
             Partition::from(0_i32),

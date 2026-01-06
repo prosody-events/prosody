@@ -8,7 +8,7 @@
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::defer::message::store::cassandra::{
-    CassandraDeferStoreError, CassandraDeferStoreProvider,
+    CassandraMessageDeferStoreError, CassandraMessageDeferStoreProvider,
 };
 use crate::consumer::middleware::defer::message::store::memory::MemoryDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::cassandra::{
@@ -162,7 +162,7 @@ pub enum StorePair {
         /// Cassandra trigger store wrapped in `TableAdapter`.
         trigger: TableAdapter<CassandraTriggerStore>,
         /// Cassandra message defer store provider.
-        message_defer: CassandraDeferStoreProvider,
+        message_defer: CassandraMessageDeferStoreProvider,
         /// Cassandra timer defer store provider.
         timer_defer: CassandraTimerDeferStoreProvider,
     },
@@ -181,7 +181,7 @@ pub enum StoreCreationError {
 
     /// Message defer store initialization error (non-Cassandra).
     #[error("message defer store initialization error: {0:#}")]
-    MessageDeferStoreInit(Box<CassandraDeferStoreError>),
+    MessageDeferStoreInit(Box<CassandraMessageDeferStoreError>),
 
     /// Timer defer store initialization error (non-Cassandra).
     #[error("timer defer store initialization error: {0:#}")]
@@ -200,13 +200,13 @@ impl From<CassandraStoreError> for StoreCreationError {
     }
 }
 
-impl From<CassandraDeferStoreError> for StoreCreationError {
-    fn from(e: CassandraDeferStoreError) -> Self {
+impl From<CassandraMessageDeferStoreError> for StoreCreationError {
+    fn from(e: CassandraMessageDeferStoreError) -> Self {
         match e {
-            CassandraDeferStoreError::Cassandra(cassandra_err) => {
+            CassandraMessageDeferStoreError::Cassandra(cassandra_err) => {
                 Self::DeferStore(Box::new(cassandra_err))
             }
-            other @ CassandraDeferStoreError::InvalidRetryCount { .. } => {
+            other @ CassandraMessageDeferStoreError::InvalidRetryCount { .. } => {
                 Self::MessageDeferStoreInit(Box::new(other))
             }
         }
@@ -277,7 +277,7 @@ impl StorePair {
                     CassandraTriggerStore::with_store(store.clone(), keyspace, slab_size).await?;
 
                 let message_defer =
-                    CassandraDeferStoreProvider::with_store(store.clone(), keyspace).await?;
+                    CassandraMessageDeferStoreProvider::with_store(store.clone(), keyspace).await?;
 
                 let timer_defer =
                     CassandraTimerDeferStoreProvider::with_store(store.clone(), keyspace).await?;

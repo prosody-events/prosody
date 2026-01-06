@@ -15,7 +15,7 @@ use std::future::Future;
 ///
 /// ```text
 /// // Create provider once at application startup
-/// let provider = CassandraDeferStoreProvider::new(session, keyspace).await?;
+/// let provider = CassandraMessageDeferStoreProvider::new(session, keyspace).await?;
 ///
 /// // Create store for a segment
 /// let store = provider.create_store(&segment).await?;
@@ -33,7 +33,8 @@ use std::future::Future;
 ///
 /// # Implementations
 ///
-/// - `CassandraDeferStoreProvider`: Creates `CassandraDeferStore` instances
+/// - `CassandraMessageDeferStoreProvider`: Creates `CassandraMessageDeferStore`
+///   instances
 /// - `MemoryDeferStoreProvider`: Creates `MemoryDeferStore` instances (for
 ///   testing)
 pub trait MessageDeferStoreProvider: Clone + Send + Sync + 'static {

@@ -22,7 +22,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
-use prosody::consumer::middleware::defer::message::store::cassandra::CassandraDeferStoreProvider;
+use prosody::consumer::middleware::defer::message::store::cassandra::CassandraMessageDeferStoreProvider;
 use prosody::consumer::middleware::defer::timer::store::cassandra::CassandraTimerDeferStoreProvider;
 use prosody::consumer::middleware::defer::{DeferConfiguration, MessageDeferMiddleware};
 use prosody::consumer::middleware::log::LogMiddleware;
@@ -263,7 +263,8 @@ impl DeferTestEnvironment {
 
         let cassandra_store = CassandraStore::new(&cassandra_config).await?;
         let message_defer_provider =
-            CassandraDeferStoreProvider::with_store(cassandra_store.clone(), &keyspace).await?;
+            CassandraMessageDeferStoreProvider::with_store(cassandra_store.clone(), &keyspace)
+                .await?;
         let timer_defer_provider =
             CassandraTimerDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
 
@@ -345,7 +346,8 @@ impl DeferTestEnvironment {
 
         let cassandra_store = CassandraStore::new(&cassandra_config).await?;
         let message_defer_provider =
-            CassandraDeferStoreProvider::with_store(cassandra_store.clone(), &keyspace).await?;
+            CassandraMessageDeferStoreProvider::with_store(cassandra_store.clone(), &keyspace)
+                .await?;
         let timer_defer_provider =
             CassandraTimerDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
 
