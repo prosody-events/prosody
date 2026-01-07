@@ -19,3 +19,5 @@ pub mod loader;
 pub mod store;
 
 pub use handler::{MessageDeferHandler, MessageDeferMiddleware, MessageDeferProvider};
+pub use loader::{KafkaLoader, KafkaLoaderError, LoaderConfiguration, MessageLoader};
+pub use store::MessageDeferStore;

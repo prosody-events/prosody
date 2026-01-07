@@ -21,8 +21,8 @@ use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
+use crate::consumer::middleware::defer::decider::FailureTracker;
 use crate::consumer::middleware::defer::error::{DeferError, DeferInitError, DeferResult};
-use crate::consumer::middleware::defer::failure_tracker::FailureTracker;
 use crate::consumer::middleware::defer::provider::DeferStoreProvider;
 use crate::consumer::middleware::defer::segment::LazySegment;
 use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
@@ -185,19 +185,6 @@ where
     }
 }
 
-/// Composed handler type with timer defer inside message defer.
-///
-/// Structure: `MessageDeferHandler<TimerDeferHandler<Inner>>`
-/// - Message defer wraps timer defer
-/// - Timer defer sees the original context
-/// - Message defer sees the wrapped context from timer defer
-pub type ComposedDeferHandler<T, P, L, D> = MessageDeferHandler<
-    TimerDeferHandler<T, CachedTimerDeferStore<<P as DeferStoreProvider>::TimerStore>, D>,
-    CachedDeferStore<<P as DeferStoreProvider>::MessageStore>,
-    L,
-    D,
->;
-
 impl<T, P, L, D> FallibleHandlerProvider for MessageDeferProvider<T, P, L, D>
 where
     T: FallibleHandlerProvider,
@@ -206,7 +193,17 @@ where
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    type Handler = ComposedDeferHandler<T::Handler, P, L, D>;
+    /// Composed handler: `MessageDeferHandler<TimerDeferHandler<Inner>>`.
+    ///
+    /// - Message defer wraps timer defer
+    /// - Timer defer sees the original context
+    /// - Message defer sees the wrapped context from timer defer
+    type Handler = MessageDeferHandler<
+        TimerDeferHandler<T::Handler, CachedTimerDeferStore<P::TimerStore>, D>,
+        CachedDeferStore<P::MessageStore>,
+        L,
+        D,
+    >;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         // Create shared lazy segment - persists on first store access

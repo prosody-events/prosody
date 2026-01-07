@@ -24,3 +24,7 @@ pub mod store;
 
 #[cfg(test)]
 mod tests;
+
+pub use context::{StoredTimerEntry, TimerDeferContext, TimerDeferContextError};
+pub use handler::TimerDeferHandler;
+pub use store::TimerDeferStore;

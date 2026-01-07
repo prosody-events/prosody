@@ -11,14 +11,13 @@ use std::cmp::min;
 pub mod config;
 pub mod decider;
 pub mod error;
-pub mod failure_tracker;
 pub mod message;
 pub mod provider;
 pub mod segment;
 pub mod timer;
 
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
-pub use decider::{AlwaysDefer, DeferralDecider, NeverDefer, TraceBasedDecider};
+pub use decider::{AlwaysDefer, DeferralDecider, FailureTracker, NeverDefer, TraceBasedDecider};
 pub use error::{CassandraDeferStoreError, DeferInitError};
 pub use message::MessageDeferMiddleware;
 pub use provider::{CassandraDeferStoreProvider, DeferStoreProvider, MemoryDeferStoreProvider};
