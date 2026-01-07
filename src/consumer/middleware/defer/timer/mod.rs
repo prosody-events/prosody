@@ -24,5 +24,3 @@ pub mod store;
 
 #[cfg(test)]
 mod tests;
-
-pub use handler::TimerDeferHandler;

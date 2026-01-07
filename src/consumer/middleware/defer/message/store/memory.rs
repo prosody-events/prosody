@@ -1,35 +1,24 @@
 //! In-memory implementation of `MessageDeferStore` for testing.
 //!
-//! Provides [`MemoryDeferStore`], a lock-free, concurrent implementation
+//! Provides [`MemoryMessageDeferStore`], a lock-free, concurrent implementation
 //! of the [`MessageDeferStore`] trait using [`scc::HashMap`].
 //!
 //! # Usage
 //!
 //! ```rust,no_run
-//! use prosody::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
-//! use prosody::consumer::middleware::defer::message::store::memory::MemoryDeferStoreProvider;
-//! use prosody::consumer::middleware::defer::segment::Segment;
-//! use prosody::{ConsumerGroup, Partition, Topic};
-//! use std::sync::Arc;
+//! use prosody::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStoreProvider;
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let provider = MemoryDeferStoreProvider::new();
-//! let segment = Segment::new(
-//!     Topic::from("test"),
-//!     Partition::from(0),
-//!     Arc::from("consumer-group") as ConsumerGroup,
-//! );
-//! let store = provider.create_store(&segment).await?;
+//! let provider = MemoryMessageDeferStoreProvider::new();
+//! let store = provider.build();
 //! // Use store with MessageDeferStore methods
-//! # Ok(())
-//! # }
 //! ```
 //!
 //! All data is held in memory and lost on process exit. Not suitable for
 //! production use where persistence across restarts is required.
 
-use super::{MessageDeferStore, MessageDeferStoreProvider};
-use crate::consumer::middleware::defer::segment::Segment;
+use super::MessageDeferStore;
+use crate::consumer::middleware::defer::message::handler::MessageStoreProvider;
+use crate::consumer::middleware::defer::segment::{LazySegment, SegmentStore};
 use crate::{Key, Offset};
 
 #[cfg(test)]
@@ -59,11 +48,11 @@ use std::sync::Arc;
 /// key only, with segment isolation handled by having separate store instances
 /// per partition.
 #[derive(Clone, Debug)]
-pub struct MemoryDeferStore {
+pub struct MemoryMessageDeferStore {
     inner: Arc<Inner>,
 }
 
-impl MemoryDeferStore {
+impl MemoryMessageDeferStore {
     /// Creates a new empty in-memory defer store.
     #[must_use]
     pub fn new() -> Self {
@@ -73,13 +62,13 @@ impl MemoryDeferStore {
     }
 }
 
-impl Default for MemoryDeferStore {
+impl Default for MemoryMessageDeferStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Internal state for [`MemoryDeferStore`].
+/// Internal state for [`MemoryMessageDeferStore`].
 ///
 /// Maps each message key to:
 /// - `BTreeSet<Offset>`: Sorted offsets (oldest first)
@@ -98,7 +87,7 @@ impl Default for Inner {
     }
 }
 
-impl MessageDeferStore for MemoryDeferStore {
+impl MessageDeferStore for MemoryMessageDeferStore {
     type Error = Infallible;
 
     async fn get_next_deferred_message(
@@ -187,54 +176,54 @@ impl MessageDeferStore for MemoryDeferStore {
     }
 }
 
-/// Provider for creating [`MemoryDeferStore`] instances.
+/// Provider for creating [`MemoryMessageDeferStore`] instances.
 ///
 /// Simple provider that creates isolated in-memory stores for each partition.
 /// Each store instance has its own `HashMap`, ensuring partition isolation.
 #[derive(Clone, Debug, Default)]
-pub struct MemoryDeferStoreProvider {
+pub struct MemoryMessageDeferStoreProvider {
     /// Shared inner state (empty, just for consistency with pattern)
     _inner: Arc<()>,
 }
 
-impl MemoryDeferStoreProvider {
+impl MemoryMessageDeferStoreProvider {
     /// Creates a new memory defer store provider.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Creates a store.
+    ///
+    /// Memory stores don't need segment information, so this is
+    /// a convenience method that creates a store directly.
+    #[must_use]
+    pub fn build(&self) -> MemoryMessageDeferStore {
+        MemoryMessageDeferStore::new()
+    }
 }
 
-impl MessageDeferStoreProvider for MemoryDeferStoreProvider {
-    type Error = Infallible;
-    type Store = MemoryDeferStore;
+impl<S: SegmentStore> MessageStoreProvider<S> for MemoryMessageDeferStoreProvider {
+    type Store = MemoryMessageDeferStore;
 
-    async fn create_store(&self, _segment: &Segment) -> Result<Self::Store, Self::Error> {
-        Ok(MemoryDeferStore {
-            inner: Arc::new(Inner::default()),
-        })
+    fn create_store(&self, _segment: LazySegment<S>) -> Self::Store {
+        self.build()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConsumerGroup, Key, Partition, Topic};
+    use crate::Key;
 
-    async fn create_test_store() -> MemoryDeferStore {
-        let provider = MemoryDeferStoreProvider::new();
-        let segment = Segment::new(
-            Topic::from("test-topic"),
-            Partition::from(0_i32),
-            Arc::from("test-group") as ConsumerGroup,
-        );
-        let Ok(store) = provider.create_store(&segment).await;
-        store
+    fn create_test_store() -> MemoryMessageDeferStore {
+        let provider = MemoryMessageDeferStoreProvider::new();
+        provider.build()
     }
 
     #[tokio::test]
     async fn test_get_nonexistent_key() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key: Key = Arc::from("test-key-1");
 
         let result = store.get_next_deferred_message(&key).await?;
@@ -244,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_and_get() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
 
@@ -258,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_offsets_returns_oldest() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key: Key = Arc::from("test-key-1");
 
         // Defer first message
@@ -281,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_offset() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
 
@@ -295,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_nonexistent() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key: Key = Arc::from("test-key-1");
 
         // Should not error
@@ -307,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_retry_count() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
 
@@ -324,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_access() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
 
         let key1: Key = Arc::from("test-key-1");
         let key2: Key = Arc::from("test-key-2");
@@ -358,5 +347,7 @@ mod tests {
     }
 
     // Property-based tests using model equivalence
-    defer_store_tests!(async { Ok::<_, color_eyre::Report>(create_test_store().await) });
+    defer_store_tests!(async {
+        Ok::<_, color_eyre::Report>(MemoryMessageDeferStoreProvider::new().build())
+    });
 }

@@ -5,9 +5,7 @@
 
 pub mod cached;
 pub mod cassandra;
-pub mod lazy;
 pub mod memory;
-pub mod provider;
 
 #[cfg(test)]
 pub mod tests;
@@ -23,10 +21,7 @@ use std::future::Future;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use cached::CachedTimerDeferStore;
-pub use cassandra::{CassandraTimerDeferStore, CassandraTimerDeferStoreProvider};
-pub use lazy::{LazyTimerDeferStore, TimerDeferStoreFactory};
 pub use memory::{MemoryTimerDeferStore, MemoryTimerDeferStoreProvider};
-pub use provider::TimerDeferStoreProvider;
 
 /// Result of [`TimerDeferStore::complete_retry_success`].
 #[derive(Debug, Clone)]
@@ -47,7 +42,9 @@ pub enum TimerRetryCompletionResult {
 ///
 /// Manages a FIFO queue of timers per key with a shared `retry_count`. The
 /// segment context (`topic/partition/consumer_group`) is established at
-/// construction via [`TimerDeferStoreProvider`].
+/// construction via [`TimerStoreProvider`].
+///
+/// [`TimerStoreProvider`]: crate::consumer::middleware::defer::message::TimerStoreProvider
 ///
 /// # Invariants
 ///

@@ -6,9 +6,10 @@
 //! All data is held in memory and lost on process exit. Not suitable for
 //! production use where persistence across restarts is required.
 
-use super::{TimerDeferStore, TimerDeferStoreProvider};
+use super::TimerDeferStore;
 use crate::Key;
-use crate::consumer::middleware::defer::segment::Segment;
+use crate::consumer::middleware::defer::message::handler::TimerStoreProvider;
+use crate::consumer::middleware::defer::segment::{LazySegment, SegmentStore};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use ahash::RandomState;
@@ -258,34 +259,33 @@ impl MemoryTimerDeferStoreProvider {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Creates a store.
+    ///
+    /// Memory stores don't need segment information, so this is
+    /// a convenience method that creates a store directly.
+    #[must_use]
+    pub fn build(&self) -> MemoryTimerDeferStore {
+        MemoryTimerDeferStore::new()
+    }
 }
 
-impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
-    type Error = Infallible;
+impl<S: SegmentStore> TimerStoreProvider<S> for MemoryTimerDeferStoreProvider {
     type Store = MemoryTimerDeferStore;
 
-    async fn create_store(&self, _segment: &Segment) -> Result<Self::Store, Self::Error> {
-        Ok(MemoryTimerDeferStore {
-            inner: Arc::new(Inner::default()),
-        })
+    fn create_store(&self, _segment: LazySegment<S>) -> Self::Store {
+        self.build()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConsumerGroup, Partition, Topic};
     use tracing::Span;
 
-    async fn create_test_store() -> MemoryTimerDeferStore {
+    fn create_test_store() -> MemoryTimerDeferStore {
         let provider = MemoryTimerDeferStoreProvider::new();
-        let segment = Segment::new(
-            Topic::from("test-topic"),
-            Partition::from(0_i32),
-            Arc::from("test-group") as ConsumerGroup,
-        );
-        let Ok(store) = provider.create_store(&segment).await;
-        store
+        provider.build()
     }
 
     fn test_trigger(key: &str, time_secs: u32) -> Trigger {
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_nonexistent_key() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key: Key = Arc::from("test-key-1");
 
         let result = store.get_next_deferred_timer(&key).await?;
@@ -306,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_defer_first_and_get() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let trigger = test_trigger("test-key-1", 1000);
 
         store.defer_first_timer(&trigger).await?;
@@ -323,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_timers_returns_oldest() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key = "test-key-1";
 
         // Defer first timer at time 1000
@@ -348,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_timer() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let trigger = test_trigger("test-key-1", 1000);
 
         store.defer_first_timer(&trigger).await?;
@@ -363,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_nonexistent() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key: Key = Arc::from("test-key-1");
 
         // Should not error
@@ -375,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_retry_count() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let trigger = test_trigger("test-key-1", 1000);
 
         store.defer_first_timer(&trigger).await?;
@@ -390,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_deferred() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let trigger = test_trigger("test-key-1", 1000);
 
         // Not deferred initially
@@ -411,7 +411,7 @@ mod tests {
     async fn test_complete_retry_success_more_timers() -> color_eyre::Result<()> {
         use super::super::TimerRetryCompletionResult;
 
-        let store = create_test_store().await;
+        let store = create_test_store();
         let key = "test-key-1";
 
         // Defer two timers
@@ -447,7 +447,7 @@ mod tests {
     async fn test_complete_retry_success_completed() -> color_eyre::Result<()> {
         use super::super::TimerRetryCompletionResult;
 
-        let store = create_test_store().await;
+        let store = create_test_store();
         let trigger = test_trigger("test-key-1", 1000);
 
         store.defer_first_timer(&trigger).await?;
@@ -466,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_increment_retry_count() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let trigger = test_trigger("test-key-1", 1000);
 
         store.defer_first_timer(&trigger).await?;

@@ -92,6 +92,57 @@ pub enum DeferInitError {
     CassandraStore(#[from] CassandraStoreError),
 }
 
+/// Unified error type for Cassandra-backed defer stores.
+///
+/// Used by both [`CassandraMessageDeferStore`] and [`CassandraTimerDeferStore`]
+/// to provide a common error type when message and timer stores share the same
+/// segment store type.
+///
+/// [`CassandraMessageDeferStore`]: crate::consumer::middleware::defer::message::store::cassandra::CassandraMessageDeferStore
+/// [`CassandraTimerDeferStore`]: crate::consumer::middleware::defer::timer::store::cassandra::CassandraTimerDeferStore
+#[derive(Debug, Error)]
+pub enum CassandraDeferStoreError {
+    /// Error from Cassandra operations.
+    #[error("cassandra error: {0:#}")]
+    Cassandra(#[from] CassandraStoreError),
+
+    /// Invalid retry count value.
+    #[error("invalid retry count {retry_count}: {reason}")]
+    InvalidRetryCount {
+        /// The invalid retry count value.
+        retry_count: u32,
+        /// Why the value is invalid.
+        reason: &'static str,
+    },
+}
+
+impl ClassifyError for CassandraDeferStoreError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            // Delegate Cassandra errors to their classification
+            Self::Cassandra(error) => error.classify_error(),
+
+            // Invalid retry count is a programming error - terminal
+            Self::InvalidRetryCount { .. } => ErrorCategory::Terminal,
+        }
+    }
+}
+
+impl From<super::segment::CassandraSegmentStoreError> for CassandraDeferStoreError {
+    fn from(err: super::segment::CassandraSegmentStoreError) -> Self {
+        match err {
+            super::segment::CassandraSegmentStoreError::Cassandra(e) => Self::Cassandra(e),
+        }
+    }
+}
+
+impl From<super::segment::MemorySegmentStoreError> for CassandraDeferStoreError {
+    fn from(err: super::segment::MemorySegmentStoreError) -> Self {
+        // MemorySegmentStoreError is uninhabited (empty enum), so this is unreachable
+        match err {}
+    }
+}
+
 impl<S, H, L> ClassifyError for DeferError<S, H, L>
 where
     S: StdError + ClassifyError + Send + Sync + 'static,

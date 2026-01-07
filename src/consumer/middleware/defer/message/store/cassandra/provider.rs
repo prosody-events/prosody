@@ -1,17 +1,17 @@
 //! Provider for creating Cassandra defer stores with shared resources.
 
+use super::CassandraMessageDeferStore;
 use super::queries::Queries;
-use super::{CassandraMessageDeferStore, CassandraMessageDeferStoreError};
 use crate::cassandra::CassandraStore;
-use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
-use crate::consumer::middleware::defer::segment::Segment;
+use crate::consumer::middleware::defer::error::CassandraDeferStoreError;
+use crate::consumer::middleware::defer::message::handler::MessageStoreProvider;
+use crate::consumer::middleware::defer::segment::{LazySegment, SegmentStore};
 use std::sync::Arc;
-use tracing::instrument;
 
 /// Provider for creating [`CassandraMessageDeferStore`] instances.
 ///
 /// Holds shared resources (Cassandra session, prepared queries) and creates
-/// store instances for a given [`Segment`].
+/// store instances for a given [`LazySegment`].
 #[derive(Clone, Debug)]
 pub struct CassandraMessageDeferStoreProvider {
     store: CassandraStore,
@@ -35,25 +35,33 @@ impl CassandraMessageDeferStoreProvider {
     pub async fn with_store(
         store: CassandraStore,
         keyspace: &str,
-    ) -> Result<Self, CassandraMessageDeferStoreError> {
+    ) -> Result<Self, CassandraDeferStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
         Ok(Self { store, queries })
     }
-}
 
-impl MessageDeferStoreProvider for CassandraMessageDeferStoreProvider {
-    type Error = CassandraMessageDeferStoreError;
-    type Store = CassandraMessageDeferStore;
-
-    #[instrument(level = "debug", skip(self), err)]
-    async fn create_store(&self, segment: &Segment) -> Result<Self::Store, Self::Error> {
-        // Segment metadata is already persisted via SegmentStore.
-        // We just use the segment ID for store operations.
-        Ok(CassandraMessageDeferStore {
+    /// Creates a store for the specified segment.
+    ///
+    /// The store is created synchronously; segment initialization is deferred
+    /// until the first store operation.
+    #[must_use]
+    pub fn build<S: SegmentStore>(&self, segment: LazySegment<S>) -> CassandraMessageDeferStore<S> {
+        CassandraMessageDeferStore {
             store: self.store.clone(),
             queries: Arc::clone(&self.queries),
-            segment_id: segment.id(),
-        })
+            segment,
+        }
+    }
+}
+
+impl<S> MessageStoreProvider<S> for CassandraMessageDeferStoreProvider
+where
+    S: SegmentStore<Error: Into<CassandraDeferStoreError>>,
+{
+    type Store = CassandraMessageDeferStore<S>;
+
+    fn create_store(&self, segment: LazySegment<S>) -> Self::Store {
+        self.build(segment)
     }
 }

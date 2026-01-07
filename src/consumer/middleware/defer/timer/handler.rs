@@ -18,55 +18,25 @@
 //!    permanent skip
 
 use super::context::TimerDeferContext;
-use super::store::{
-    CachedTimerDeferStore, LazyTimerDeferStore, TimerDeferStore, TimerDeferStoreFactory,
-    TimerDeferStoreProvider, TimerRetryCompletionResult,
-};
+use super::store::{TimerDeferStore, TimerRetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
-use crate::consumer::middleware::defer::segment::Segment;
-use crate::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
-};
+use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
 use crate::consumer::{DemandType, Keyed};
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::{TimerType, Trigger};
-use crate::{ConsumerGroup, Partition, Topic};
+use crate::{Partition, Topic};
 use tracing::{debug, info, warn};
 
-/// Middleware that defers transiently-failed application timers for timer-based
-/// retry.
-#[derive(Clone)]
-pub struct TimerDeferMiddleware<P, D>
-where
-    P: TimerDeferStoreProvider,
-    D: DeferralDecider,
-{
-    config: DeferConfiguration,
-    provider: P,
-    decider: D,
-    consumer_group: ConsumerGroup,
-}
-
-/// Creates [`TimerDeferHandler`]s for each partition.
-#[derive(Clone)]
-pub struct TimerDeferProvider<T, P, D>
-where
-    P: TimerDeferStoreProvider,
-    D: DeferralDecider,
-{
-    provider: T,
-    config: DeferConfiguration,
-    store_provider: P,
-    decider: D,
-    consumer_group: ConsumerGroup,
-}
-
 /// Per-partition handler wrapping an inner handler with timer defer logic.
+///
+/// Created by
+/// [`MessageDeferProvider`](super::super::message::handler::MessageDeferProvider)
+/// as part of the composed defer handler stack.
 #[derive(Clone)]
 pub struct TimerDeferHandler<T, S, D>
 where
@@ -85,111 +55,6 @@ where
     pub(crate) topic: Topic,
     /// Partition this handler is processing.
     pub(crate) partition: Partition,
-}
-
-impl<P, D> TimerDeferMiddleware<P, D>
-where
-    P: TimerDeferStoreProvider,
-    D: DeferralDecider,
-{
-    /// Creates a new timer defer middleware.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Defer configuration (backoff, cache size, etc.)
-    /// * `provider` - Store provider for creating partition-specific stores
-    /// * `decider` - Decider for gating initial deferral decisions
-    /// * `consumer_group` - Consumer group ID for segment isolation
-    #[must_use]
-    pub fn new(
-        config: DeferConfiguration,
-        provider: P,
-        decider: D,
-        consumer_group: ConsumerGroup,
-    ) -> Self {
-        Self {
-            config,
-            provider,
-            decider,
-            consumer_group,
-        }
-    }
-}
-
-impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
-where
-    P: TimerDeferStoreProvider,
-    D: DeferralDecider,
-{
-    type Provider<T: FallibleHandlerProvider> = TimerDeferProvider<T, P, D>;
-
-    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
-    where
-        T: FallibleHandlerProvider,
-    {
-        TimerDeferProvider {
-            provider,
-            config: self.config.clone(),
-            store_provider: self.provider.clone(),
-            decider: self.decider.clone(),
-            consumer_group: self.consumer_group.clone(),
-        }
-    }
-}
-
-/// Factory for cached timer defer stores.
-///
-/// Holds a [`Segment`] which lives for the partition's lifetime and is used
-/// to create the underlying store on first access.
-#[derive(Clone)]
-pub struct TimerDeferStoreFactoryImpl<P: TimerDeferStoreProvider> {
-    /// The timer defer store provider.
-    pub provider: P,
-    /// The segment this store handles.
-    pub segment: Segment,
-    /// Maximum cache size.
-    pub cache_size: usize,
-}
-
-impl<P: TimerDeferStoreProvider> TimerDeferStoreFactory for TimerDeferStoreFactoryImpl<P> {
-    type Store = CachedTimerDeferStore<P::Store>;
-
-    async fn create(self) -> Result<Self::Store, <Self::Store as TimerDeferStore>::Error> {
-        let store = self.provider.create_store(&self.segment).await?;
-        Ok(CachedTimerDeferStore::new(store, self.cache_size))
-    }
-}
-
-/// Lazily-initialized cached store for [`TimerDeferHandler`].
-pub type TimerDeferLazyStore<P> = LazyTimerDeferStore<TimerDeferStoreFactoryImpl<P>>;
-
-impl<T, P, D> FallibleHandlerProvider for TimerDeferProvider<T, P, D>
-where
-    T: FallibleHandlerProvider,
-    T::Handler: FallibleHandler,
-    P: TimerDeferStoreProvider,
-    D: DeferralDecider,
-{
-    type Handler = TimerDeferHandler<T::Handler, TimerDeferLazyStore<P>, D>;
-
-    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        let segment = Segment::new(topic, partition, self.consumer_group.clone());
-
-        let factory = TimerDeferStoreFactoryImpl {
-            provider: self.store_provider.clone(),
-            segment,
-            cache_size: self.config.cache_size,
-        };
-
-        TimerDeferHandler {
-            handler: self.provider.handler_for_partition(topic, partition),
-            store: LazyTimerDeferStore::new(factory),
-            decider: self.decider.clone(),
-            config: self.config.clone(),
-            topic,
-            partition,
-        }
-    }
 }
 
 impl<T, S, D> TimerDeferHandler<T, S, D>

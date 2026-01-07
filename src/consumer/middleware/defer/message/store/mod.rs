@@ -2,9 +2,7 @@
 
 pub mod cached;
 pub mod cassandra;
-pub mod lazy;
 pub mod memory;
-pub mod provider;
 
 #[cfg(test)]
 pub mod tests;
@@ -15,10 +13,7 @@ use std::error::Error;
 use std::future::Future;
 
 pub use cached::CachedDeferStore;
-pub use cassandra::{CassandraMessageDeferStore, CassandraMessageDeferStoreProvider};
-pub use lazy::{LazyStore, StoreFactory};
-pub use memory::{MemoryDeferStore, MemoryDeferStoreProvider};
-pub use provider::MessageDeferStoreProvider;
+pub use memory::{MemoryMessageDeferStore, MemoryMessageDeferStoreProvider};
 
 /// Result of [`MessageDeferStore::complete_retry_success`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +32,9 @@ pub enum MessageRetryCompletionResult {
 ///
 /// Manages a FIFO queue of offsets per key with a shared `retry_count`. The
 /// segment context (`topic/partition/consumer_group`) is established at
-/// construction via [`MessageDeferStoreProvider`].
+/// construction via [`MessageStoreProvider`].
+///
+/// [`MessageStoreProvider`]: crate::consumer::middleware::defer::message::MessageStoreProvider
 ///
 /// # Invariants
 ///

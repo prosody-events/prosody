@@ -290,27 +290,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
+    use crate::Key;
     use crate::consumer::middleware::defer::message::store::memory::{
-        MemoryDeferStore, MemoryDeferStoreProvider,
+        MemoryMessageDeferStore, MemoryMessageDeferStoreProvider,
     };
-    use crate::consumer::middleware::defer::segment::Segment;
-    use crate::{ConsumerGroup, Key, Partition, Topic};
 
-    async fn create_test_store() -> MemoryDeferStore {
-        let provider = MemoryDeferStoreProvider::new();
-        let segment = Segment::new(
-            Topic::from("test-topic"),
-            Partition::from(0_i32),
-            Arc::from("test-group") as ConsumerGroup,
-        );
-        let Ok(store) = provider.create_store(&segment).await;
-        store
+    fn create_test_store() -> MemoryMessageDeferStore {
+        let provider = MemoryMessageDeferStoreProvider::new();
+        provider.build()
     }
 
     #[tokio::test]
     async fn test_cache_hit_on_repeated_get() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
@@ -331,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_update_on_increment() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
@@ -360,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_update_on_complete_success() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
 
@@ -392,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_cleared_on_complete_last_message() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
@@ -414,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_defer_additional_out_of_order() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
 
@@ -439,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_defer_additional_monotonic() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
 
@@ -471,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_negative_results() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
 
@@ -488,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_key_updates_cache() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
         let offset = Offset::from(42_i64);
@@ -509,6 +501,6 @@ mod tests {
 
     // Property-based tests using model equivalence with underlying memory store
     defer_store_tests!(async {
-        Ok::<_, color_eyre::Report>(CachedDeferStore::new(create_test_store().await, 1000))
+        Ok::<_, color_eyre::Report>(CachedDeferStore::new(create_test_store(), 1000))
     });
 }

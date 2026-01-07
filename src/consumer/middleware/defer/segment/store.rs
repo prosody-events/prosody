@@ -5,6 +5,7 @@
 
 use super::{Segment, SegmentId};
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
 use std::sync::Arc;
@@ -127,6 +128,12 @@ impl ClassifyError for MemorySegmentStoreError {
     }
 }
 
+impl From<MemorySegmentStoreError> for Infallible {
+    fn from(err: MemorySegmentStoreError) -> Self {
+        match err {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,7 +141,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_memory_get_or_create_new_segment() {
+    async fn test_memory_get_or_create_new_segment() -> color_eyre::Result<()> {
         let store = MemorySegmentStore::new();
         let segment = Segment::new(
             Topic::from("test-topic"),
@@ -143,16 +150,15 @@ mod tests {
         );
         let segment_id = segment.id();
 
-        let result = store.get_or_create_segment(segment.clone()).await;
+        let returned = store.get_or_create_segment(segment.clone()).await?;
 
-        assert!(result.is_ok());
-        let returned = result.unwrap();
         assert_eq!(returned.id(), segment_id);
         assert_eq!(returned, segment);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_memory_get_or_create_existing_segment() {
+    async fn test_memory_get_or_create_existing_segment() -> color_eyre::Result<()> {
         let store = MemorySegmentStore::new();
         let segment = Segment::new(
             Topic::from("test-topic"),
@@ -161,17 +167,17 @@ mod tests {
         );
 
         // Create first time
-        let _ = store.get_or_create_segment(segment.clone()).await;
+        store.get_or_create_segment(segment.clone()).await?;
 
         // Create again - should be idempotent
-        let result = store.get_or_create_segment(segment.clone()).await;
+        let returned = store.get_or_create_segment(segment.clone()).await?;
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), segment);
+        assert_eq!(returned, segment);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_memory_get_segment_existing() {
+    async fn test_memory_get_segment_existing() -> color_eyre::Result<()> {
         let store = MemorySegmentStore::new();
         let segment = Segment::new(
             Topic::from("test-topic"),
@@ -181,23 +187,23 @@ mod tests {
         let segment_id = segment.id();
 
         // Create segment
-        let _ = store.get_or_create_segment(segment.clone()).await;
+        store.get_or_create_segment(segment.clone()).await?;
 
         // Get by ID
-        let result = store.get_segment(&segment_id).await;
+        let result = store.get_segment(&segment_id).await?;
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(segment));
+        assert_eq!(result, Some(segment));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_memory_get_segment_nonexistent() {
+    async fn test_memory_get_segment_nonexistent() -> color_eyre::Result<()> {
         let store = MemorySegmentStore::new();
         let segment_id = uuid::Uuid::new_v4();
 
-        let result = store.get_segment(&segment_id).await;
+        let result = store.get_segment(&segment_id).await?;
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), None);
+        assert_eq!(result, None);
+        Ok(())
     }
 }

@@ -10,7 +10,7 @@
 //! - [`OutcomeHandler`]: Inner handler returning trace-specified outcomes
 //! - [`TraceBasedDecider`]: Deferral decisions from trace
 //! - [`FailableLoader`]: Wraps `MemoryLoader` with failure injection
-//! - [`MemoryDeferStore`]: Deferred message state
+//! - [`MemoryMessageDeferStore`]: Deferred message state
 //! - [`TimerCapture`]/[`KeyedCapturingContext`]: Timer operation capture
 //!
 //! All these components use `Arc` internally, so clones share state.
@@ -27,7 +27,7 @@ use crate::consumer::middleware::defer::message::handler::MessageDeferHandler;
 use crate::consumer::middleware::defer::message::loader::{MemoryLoader, MessageLoader};
 use crate::consumer::middleware::defer::message::store::CachedDeferStore;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
-use crate::consumer::middleware::defer::message::store::memory::MemoryDeferStore;
+use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
 use color_eyre::eyre::eyre;
@@ -43,7 +43,7 @@ use tracing::debug;
 /// Verifies timer coverage: every deferred key has an active timer.
 pub async fn verify_timer_coverage(
     capture: &TimerCapture,
-    store: &MemoryDeferStore,
+    store: &MemoryMessageDeferStore,
     keys: &[Key],
 ) -> color_eyre::Result<()> {
     for key in keys {
@@ -81,7 +81,7 @@ pub async fn verify_timer_coverage(
 /// Type alias for the `MessageDeferHandler` used in tests.
 type TestDeferHandler = MessageDeferHandler<
     OutcomeHandler,
-    CachedDeferStore<MemoryDeferStore>,
+    CachedDeferStore<MemoryMessageDeferStore>,
     FailableLoader,
     TraceBasedDecider,
 >;
@@ -107,7 +107,7 @@ pub struct TestHarness {
     loader: FailableLoader,
     /// Store for verification (shared via Arc, wrapped in `CachedDeferStore`
     /// inside handler).
-    store: MemoryDeferStore,
+    store: MemoryMessageDeferStore,
     /// Timer capture for verification.
     capture: TimerCapture,
     /// Topic for messages.
@@ -137,7 +137,7 @@ impl TestHarness {
         let decider = TraceBasedDecider::new();
         let memory_loader = MemoryLoader::new();
         let loader = FailableLoader::new(memory_loader);
-        let store = MemoryDeferStore::new();
+        let store = MemoryMessageDeferStore::new();
         let capture = TimerCapture::new();
 
         // Create config using shared test constants
@@ -186,7 +186,7 @@ impl TestHarness {
 
     /// Returns a reference to the store for verification.
     #[must_use]
-    pub fn store(&self) -> &MemoryDeferStore {
+    pub fn store(&self) -> &MemoryMessageDeferStore {
         &self.store
     }
 

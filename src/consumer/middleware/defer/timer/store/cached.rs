@@ -347,22 +347,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::segment::Segment;
-    use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
     use crate::consumer::middleware::defer::timer::store::memory::{
         MemoryTimerDeferStore, MemoryTimerDeferStoreProvider,
     };
-    use crate::{ConsumerGroup, Partition, Topic};
 
-    async fn create_test_store() -> MemoryTimerDeferStore {
+    fn create_test_store() -> MemoryTimerDeferStore {
         let provider = MemoryTimerDeferStoreProvider::new();
-        let segment = Segment::new(
-            Topic::from("test-topic"),
-            Partition::from(0_i32),
-            Arc::from("test-group") as ConsumerGroup,
-        );
-        let Ok(store) = provider.create_store(&segment).await;
-        store
+        provider.build()
     }
 
     fn test_trigger(key: &str, time_secs: u32) -> Trigger {
@@ -373,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_hit_on_repeated_get() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedTimerDeferStore::new(store, 100);
         let trigger = test_trigger("test-key-1", 1000);
 
@@ -400,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_update_on_increment() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedTimerDeferStore::new(store, 100);
         let trigger = test_trigger("test-key-1", 1000);
 
@@ -422,7 +413,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_cleared_on_complete_last_timer() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedTimerDeferStore::new(store, 100);
         let trigger = test_trigger("test-key-1", 1000);
 
@@ -445,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_update_on_complete_success() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedTimerDeferStore::new(store, 100);
         let key = "test-key-1";
 
@@ -481,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_defer_additional_out_of_order() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedTimerDeferStore::new(store, 100);
         let key = "test-key-1";
 
@@ -507,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_defer_additional_monotonic() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedTimerDeferStore::new(store, 100);
         let key = "test-key-1";
 
@@ -532,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_negative_results() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedTimerDeferStore::new(store, 100);
         let key: Key = Arc::from("test-key-1");
 
@@ -549,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_key_updates_cache() -> color_eyre::Result<()> {
-        let store = create_test_store().await;
+        let store = create_test_store();
         let cached_store = CachedTimerDeferStore::new(store, 100);
         let trigger = test_trigger("test-key-1", 1000);
 

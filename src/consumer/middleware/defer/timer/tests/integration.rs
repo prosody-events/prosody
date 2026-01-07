@@ -5,9 +5,9 @@
 
 use super::*;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::consumer::middleware::defer::CassandraDeferStoreError;
 use crate::consumer::middleware::defer::error::DeferError;
 use crate::consumer::middleware::defer::message::loader::KafkaLoaderError;
-use crate::consumer::middleware::defer::timer::store::cassandra::CassandraTimerDeferStoreError;
 use crate::tracing::init_test_logging;
 use scylla::errors::ExecutionError;
 
@@ -385,15 +385,15 @@ fn store_write_failure_retries_via_retry_middleware() {
         "EmptyPlan should classify as transient"
     );
 
-    // Wrap in CassandraTimerDeferStoreError
-    let timer_store_error = CassandraTimerDeferStoreError::Cassandra(cassandra_store_error);
+    // Wrap in CassandraDeferStoreError (unified error type)
+    let timer_store_error = CassandraDeferStoreError::Cassandra(cassandra_store_error);
     assert!(
         matches!(timer_store_error.classify_error(), ErrorCategory::Transient),
-        "CassandraTimerDeferStoreError should delegate to inner Cassandra classification"
+        "CassandraDeferStoreError should delegate to inner Cassandra classification"
     );
 
     // Wrap in DeferError::Store (as TimerDeferHandler does)
-    let defer_error: DeferError<CassandraTimerDeferStoreError, OutcomeError, KafkaLoaderError> =
+    let defer_error: DeferError<CassandraDeferStoreError, OutcomeError, KafkaLoaderError> =
         DeferError::Store(timer_store_error);
 
     // Final verification: DeferError::Store classifies as transient
@@ -404,7 +404,7 @@ fn store_write_failure_retries_via_retry_middleware() {
     );
 
     // Verify permanent handler errors still propagate correctly
-    let permanent_error: DeferError<CassandraTimerDeferStoreError, OutcomeError, KafkaLoaderError> =
+    let permanent_error: DeferError<CassandraDeferStoreError, OutcomeError, KafkaLoaderError> =
         DeferError::Handler(OutcomeError::permanent());
     assert!(
         matches!(permanent_error.classify_error(), ErrorCategory::Permanent),

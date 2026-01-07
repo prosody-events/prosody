@@ -826,20 +826,12 @@ where
 
 #[cfg(test)]
 mod memory_store_tests {
-    use crate::consumer::middleware::defer::segment::Segment;
-    use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
     use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStoreProvider;
-    use crate::{ConsumerGroup, Partition, Topic};
-    use std::sync::Arc;
+    use std::convert::Infallible;
 
     crate::timer_defer_store_tests!(async {
         let provider = MemoryTimerDeferStoreProvider::new();
-        let segment = Segment::new(
-            Topic::from("test-topic"),
-            Partition::from(0_i32),
-            Arc::from("test-group") as ConsumerGroup,
-        );
-        provider.create_store(&segment).await
+        Ok::<_, Infallible>(provider.build())
     });
 }
 
@@ -849,22 +841,13 @@ mod memory_store_tests {
 
 #[cfg(test)]
 mod cached_store_tests {
-    use crate::consumer::middleware::defer::segment::Segment;
     use crate::consumer::middleware::defer::timer::store::CachedTimerDeferStore;
-    use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
     use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStoreProvider;
-    use crate::{ConsumerGroup, Partition, Topic};
     use std::convert::Infallible;
-    use std::sync::Arc;
 
     crate::timer_defer_store_tests!(async {
         let provider = MemoryTimerDeferStoreProvider::new();
-        let segment = Segment::new(
-            Topic::from("test-topic"),
-            Partition::from(0_i32),
-            Arc::from("test-group") as ConsumerGroup,
-        );
-        let store = provider.create_store(&segment).await?;
+        let store = provider.build();
         Ok::<_, Infallible>(CachedTimerDeferStore::new(store, 100))
     });
 }

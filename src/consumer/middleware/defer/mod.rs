@@ -18,8 +18,10 @@ pub mod timer;
 
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
 pub use decider::{AlwaysDefer, DeferralDecider, NeverDefer, TraceBasedDecider};
-pub use error::DeferInitError;
-pub use message::{MessageDeferMiddleware, MessageLoader};
+pub use error::{CassandraDeferStoreError, DeferInitError};
+pub use message::{
+    DeferStoreProviders, MessageDeferMiddleware, MessageStoreProvider, TimerStoreProvider,
+};
 
 /// Jittered exponential backoff: `random(1, min(base * 2^retry, max))`.
 ///

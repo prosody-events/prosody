@@ -16,18 +16,21 @@
 //!
 //! # Lifecycle
 //!
-//! 1. `MessageDeferMiddleware` creates a `Segment` via
+//! 1. `MessageDeferMiddleware` creates a [`LazySegment`] for each partition
+//! 2. The `LazySegment` is shared between message and timer defer stores
+//! 3. On first store access, the segment is created and persisted via
 //!    [`SegmentStore::get_or_create_segment`]
-//! 2. The `Segment` is passed to both message and timer defer handlers
-//! 3. Both handlers use `segment.id()` for their storage operations
+//! 4. Both stores use `segment.id()` for their storage operations
 
 pub mod cassandra;
+pub mod lazy;
 pub mod store;
 
 use crate::{ConsumerGroup, Partition, Topic};
 use uuid::Uuid;
 
 pub use cassandra::{CassandraSegmentStore, CassandraSegmentStoreError};
+pub use lazy::LazySegment;
 pub use store::{MemorySegmentStore, MemorySegmentStoreError, SegmentStore};
 
 /// Unique identifier for a defer segment.
