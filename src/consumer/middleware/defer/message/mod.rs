@@ -18,6 +18,4 @@ pub mod handler;
 pub mod loader;
 pub mod store;
 
-pub use handler::{
-    DeferStoreProviders, MessageDeferMiddleware, MessageStoreProvider, TimerStoreProvider,
-};
+pub use handler::{MessageDeferHandler, MessageDeferMiddleware, MessageDeferProvider};

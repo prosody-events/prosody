@@ -13,15 +13,15 @@ pub mod decider;
 pub mod error;
 pub mod failure_tracker;
 pub mod message;
+pub mod provider;
 pub mod segment;
 pub mod timer;
 
 pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder};
 pub use decider::{AlwaysDefer, DeferralDecider, NeverDefer, TraceBasedDecider};
 pub use error::{CassandraDeferStoreError, DeferInitError};
-pub use message::{
-    DeferStoreProviders, MessageDeferMiddleware, MessageStoreProvider, TimerStoreProvider,
-};
+pub use message::MessageDeferMiddleware;
+pub use provider::{CassandraDeferStoreProvider, DeferStoreProvider, MemoryDeferStoreProvider};
 
 /// Jittered exponential backoff: `random(1, min(base * 2^retry, max))`.
 ///

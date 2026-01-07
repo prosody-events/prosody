@@ -23,9 +23,10 @@ use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::{DeferError, DeferInitError, DeferResult};
 use crate::consumer::middleware::defer::failure_tracker::FailureTracker;
-use crate::consumer::middleware::defer::segment::{LazySegment, SegmentStore};
+use crate::consumer::middleware::defer::provider::DeferStoreProvider;
+use crate::consumer::middleware::defer::segment::LazySegment;
 use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
-use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
+use crate::consumer::middleware::defer::timer::store::CachedTimerDeferStore;
 use crate::consumer::middleware::scheduler::SchedulerConfiguration;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
@@ -43,39 +44,6 @@ use tracing::{debug, info, warn};
 #[cfg(test)]
 pub mod tests;
 
-/// Bundled store providers for defer middleware.
-///
-/// Groups message, timer, and segment store providers for creating stores.
-/// Each provider must have a `create_store(LazySegment<S>)` method that
-/// returns a store holding the lazy segment.
-///
-/// # Type Parameters
-///
-/// * `P` - Message defer store provider (e.g.,
-///   `CassandraMessageDeferStoreProvider`)
-/// * `Q` - Timer defer store provider (e.g.,
-///   `CassandraTimerDeferStoreProvider`)
-/// * `S` - Segment store for persisting segment metadata
-///
-/// # Example
-///
-/// ```ignore
-/// let stores = DeferStoreProviders {
-///     message: CassandraMessageDeferStoreProvider::with_store(...).await?,
-///     timer: CassandraTimerDeferStoreProvider::with_store(...).await?,
-///     segment: CassandraSegmentStore::new(...).await?,
-/// };
-/// ```
-#[derive(Clone, Debug)]
-pub struct DeferStoreProviders<P, Q, S> {
-    /// Provider for creating message defer stores.
-    pub message: P,
-    /// Provider for creating timer defer stores.
-    pub timer: Q,
-    /// Store for segment metadata persistence.
-    pub segment: S,
-}
-
 /// Middleware that defers transiently-failed messages for timer-based retry.
 ///
 /// This unified middleware composes both message defer and timer defer
@@ -84,30 +52,30 @@ pub struct DeferStoreProviders<P, Q, S> {
 ///
 /// # Type Parameters
 ///
-/// * `P` - Message defer store provider
-/// * `Q` - Timer defer store provider
-/// * `S` - Segment store
+/// * `P` - Defer store provider (e.g., [`MemoryDeferStoreProvider`],
+///   [`CassandraDeferStoreProvider`])
 /// * `L` - Message loader (default: [`KafkaLoader`])
 /// * `D` - Deferral decider (default: [`FailureTracker`])
+///
+/// [`MemoryDeferStoreProvider`]: crate::consumer::middleware::defer::MemoryDeferStoreProvider
+/// [`CassandraDeferStoreProvider`]: crate::consumer::middleware::defer::CassandraDeferStoreProvider
 #[derive(Clone)]
-pub struct MessageDeferMiddleware<P, Q, S, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferMiddleware<P, L = KafkaLoader, D = FailureTracker>
 where
-    S: SegmentStore,
+    P: DeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     config: DeferConfiguration,
     loader: L,
-    stores: DeferStoreProviders<P, Q, S>,
+    provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
 }
 
-impl<P, Q, S> MessageDeferMiddleware<P, Q, S, KafkaLoader, FailureTracker>
+impl<P> MessageDeferMiddleware<P, KafkaLoader, FailureTracker>
 where
-    P: MessageStoreProvider<S>,
-    Q: TimerStoreProvider<S>,
-    S: SegmentStore,
+    P: DeferStoreProvider,
 {
     /// Creates middleware with default [`KafkaLoader`] and [`FailureTracker`].
     ///
@@ -118,7 +86,7 @@ where
         config: DeferConfiguration,
         consumer_config: &ConsumerConfiguration,
         scheduler_config: &SchedulerConfiguration,
-        stores: DeferStoreProviders<P, Q, S>,
+        provider: P,
         telemetry: &Telemetry,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, DeferInitError> {
@@ -152,7 +120,7 @@ where
         Ok(Self {
             config,
             loader,
-            stores,
+            provider,
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
         })
@@ -163,16 +131,16 @@ where
 ///
 /// Composes timer defer inside message defer, with shared segment and decider.
 #[derive(Clone)]
-pub struct MessageDeferProvider<T, P, Q, S, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferProvider<T, P, L = KafkaLoader, D = FailureTracker>
 where
-    S: SegmentStore,
+    P: DeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
-    provider: T,
+    inner_provider: T,
     config: DeferConfiguration,
     loader: L,
-    stores: DeferStoreProviders<P, Q, S>,
+    provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
 }
@@ -194,25 +162,23 @@ where
     pub(crate) partition: Partition,
 }
 
-impl<P, Q, S, L, D> HandlerMiddleware for MessageDeferMiddleware<P, Q, S, L, D>
+impl<P, L, D> HandlerMiddleware for MessageDeferMiddleware<P, L, D>
 where
-    P: MessageStoreProvider<S>,
-    Q: TimerStoreProvider<S>,
-    S: SegmentStore,
+    P: DeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    type Provider<T: FallibleHandlerProvider> = MessageDeferProvider<T, P, Q, S, L, D>;
+    type Provider<T: FallibleHandlerProvider> = MessageDeferProvider<T, P, L, D>;
 
-    fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
+    fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
     {
         MessageDeferProvider {
-            provider,
+            inner_provider,
             config: self.config.clone(),
             loader: self.loader.clone(),
-            stores: self.stores.clone(),
+            provider: self.provider.clone(),
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
         }
@@ -225,29 +191,27 @@ where
 /// - Message defer wraps timer defer
 /// - Timer defer sees the original context
 /// - Message defer sees the wrapped context from timer defer
-pub type ComposedDeferHandler<T, M, R, L, D> = MessageDeferHandler<
-    TimerDeferHandler<T, CachedTimerDeferStore<R>, D>,
-    CachedDeferStore<M>,
+pub type ComposedDeferHandler<T, P, L, D> = MessageDeferHandler<
+    TimerDeferHandler<T, CachedTimerDeferStore<<P as DeferStoreProvider>::TimerStore>, D>,
+    CachedDeferStore<<P as DeferStoreProvider>::MessageStore>,
     L,
     D,
 >;
 
-impl<T, P, Q, S, L, D> FallibleHandlerProvider for MessageDeferProvider<T, P, Q, S, L, D>
+impl<T, P, L, D> FallibleHandlerProvider for MessageDeferProvider<T, P, L, D>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
-    P: MessageStoreProvider<S>,
-    Q: TimerStoreProvider<S>,
-    S: SegmentStore,
+    P: DeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    type Handler = ComposedDeferHandler<T::Handler, P::Store, Q::Store, L, D>;
+    type Handler = ComposedDeferHandler<T::Handler, P, L, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         // Create shared lazy segment - persists on first store access
         let segment = LazySegment::new(
-            self.stores.segment.clone(),
+            self.provider.segment().clone(),
             topic,
             partition,
             self.consumer_group.clone(),
@@ -255,17 +219,17 @@ where
 
         // Create stores that share the lazy segment
         let message_store = CachedDeferStore::new(
-            self.stores.message.create_store(segment.clone()),
+            self.provider.create_message_store(segment.clone()),
             self.config.cache_size,
         );
 
         let timer_store = CachedTimerDeferStore::new(
-            self.stores.timer.create_store(segment),
+            self.provider.create_timer_store(segment),
             self.config.cache_size,
         );
 
         // Inner handler first
-        let inner_handler = self.provider.handler_for_partition(topic, partition);
+        let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
 
         // Timer defer wraps inner handler
         let timer_defer_handler = TimerDeferHandler {
@@ -288,28 +252,6 @@ where
             partition,
         }
     }
-}
-
-/// Provider trait for creating message defer stores.
-///
-/// Providers hold shared resources and create stores per partition.
-pub trait MessageStoreProvider<S: SegmentStore>: Clone + Send + Sync + 'static {
-    /// The store type created by this provider.
-    type Store: MessageDeferStore;
-
-    /// Creates a store for the given lazy segment.
-    fn create_store(&self, segment: LazySegment<S>) -> Self::Store;
-}
-
-/// Provider trait for creating timer defer stores.
-///
-/// Providers hold shared resources and create stores per partition.
-pub trait TimerStoreProvider<S: SegmentStore>: Clone + Send + Sync + 'static {
-    /// The store type created by this provider.
-    type Store: TimerDeferStore;
-
-    /// Creates a store for the given lazy segment.
-    fn create_store(&self, segment: LazySegment<S>) -> Self::Store;
 }
 
 impl<T, M, L, D> MessageDeferHandler<T, M, L, D>

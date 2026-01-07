@@ -5,11 +5,10 @@
 //!
 //! # Usage
 //!
-//! ```rust,no_run
-//! use prosody::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStoreProvider;
+//! ```rust
+//! use prosody::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
 //!
-//! let provider = MemoryMessageDeferStoreProvider::new();
-//! let store = provider.build();
+//! let store = MemoryMessageDeferStore::new();
 //! // Use store with MessageDeferStore methods
 //! ```
 //!
@@ -17,8 +16,6 @@
 //! production use where persistence across restarts is required.
 
 use super::MessageDeferStore;
-use crate::consumer::middleware::defer::message::handler::MessageStoreProvider;
-use crate::consumer::middleware::defer::segment::{LazySegment, SegmentStore};
 use crate::{Key, Offset};
 
 #[cfg(test)]
@@ -176,49 +173,13 @@ impl MessageDeferStore for MemoryMessageDeferStore {
     }
 }
 
-/// Provider for creating [`MemoryMessageDeferStore`] instances.
-///
-/// Simple provider that creates isolated in-memory stores for each partition.
-/// Each store instance has its own `HashMap`, ensuring partition isolation.
-#[derive(Clone, Debug, Default)]
-pub struct MemoryMessageDeferStoreProvider {
-    /// Shared inner state (empty, just for consistency with pattern)
-    _inner: Arc<()>,
-}
-
-impl MemoryMessageDeferStoreProvider {
-    /// Creates a new memory defer store provider.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Creates a store.
-    ///
-    /// Memory stores don't need segment information, so this is
-    /// a convenience method that creates a store directly.
-    #[must_use]
-    pub fn build(&self) -> MemoryMessageDeferStore {
-        MemoryMessageDeferStore::new()
-    }
-}
-
-impl<S: SegmentStore> MessageStoreProvider<S> for MemoryMessageDeferStoreProvider {
-    type Store = MemoryMessageDeferStore;
-
-    fn create_store(&self, _segment: LazySegment<S>) -> Self::Store {
-        self.build()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Key;
 
     fn create_test_store() -> MemoryMessageDeferStore {
-        let provider = MemoryMessageDeferStoreProvider::new();
-        provider.build()
+        MemoryMessageDeferStore::new()
     }
 
     #[tokio::test]
@@ -347,7 +308,5 @@ mod tests {
     }
 
     // Property-based tests using model equivalence
-    defer_store_tests!(async {
-        Ok::<_, color_eyre::Report>(MemoryMessageDeferStoreProvider::new().build())
-    });
+    defer_store_tests!(async { Ok::<_, color_eyre::Report>(MemoryMessageDeferStore::new()) });
 }

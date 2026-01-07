@@ -43,10 +43,9 @@ use tokio::task::coop::cooperative;
 use tracing::{debug, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-pub mod provider;
-mod queries;
+pub mod queries;
 
-pub use provider::CassandraTimerDeferStoreProvider;
+pub use queries::Queries as TimerQueries;
 
 /// Cassandra-based implementation of [`TimerDeferStore`].
 ///
@@ -80,6 +79,20 @@ pub struct CassandraTimerDeferStore<S: SegmentStore> {
 }
 
 impl<S: SegmentStore> CassandraTimerDeferStore<S> {
+    /// Creates a new Cassandra timer defer store.
+    ///
+    /// Used internally by [`CassandraDeferStoreProvider`].
+    ///
+    /// [`CassandraDeferStoreProvider`]: crate::consumer::middleware::defer::CassandraDeferStoreProvider
+    #[must_use]
+    pub fn new(store: CassandraStore, queries: Arc<Queries>, segment: LazySegment<S>) -> Self {
+        Self {
+            store,
+            queries,
+            segment,
+        }
+    }
+
     /// Returns a reference to the Cassandra session.
     fn session(&self) -> &Session {
         self.store.session()
@@ -379,15 +392,14 @@ mod tests {
             .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
 
         let cassandra_store = CassandraStore::new(&config).await?;
-        let provider =
-            CassandraTimerDeferStoreProvider::with_store(cassandra_store, "prosody_test").await?;
+        let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
         let segment = LazySegment::new(
             MemorySegmentStore::new(),
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from("test-consumer-group") as ConsumerGroup,
         );
-        let defer_store = provider.build(segment);
+        let defer_store = CassandraTimerDeferStore::new(cassandra_store, queries, segment);
 
         // Test basic operations
         let key: Key = Arc::from("test-key");

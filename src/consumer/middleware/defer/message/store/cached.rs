@@ -45,26 +45,13 @@ use crate::defer_store_tests;
 ///
 /// # Usage
 ///
-/// ```rust,no_run
-/// use prosody::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
+/// ```rust
 /// use prosody::consumer::middleware::defer::message::store::cached::CachedDeferStore;
-/// use prosody::consumer::middleware::defer::message::store::memory::MemoryDeferStoreProvider;
-/// use prosody::consumer::middleware::defer::segment::Segment;
-/// use prosody::{ConsumerGroup, Partition, Topic};
-/// use std::sync::Arc;
+/// use prosody::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
 ///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let provider = MemoryDeferStoreProvider::new();
-/// let segment = Segment::new(
-///     Topic::from("test"),
-///     Partition::from(0),
-///     Arc::from("consumer-group") as ConsumerGroup,
-/// );
-/// let store = provider.create_store(&segment).await?;
+/// let store = MemoryMessageDeferStore::new();
 /// let cached_store = CachedDeferStore::new(store, 10_000);
 /// // Use cached_store with MessageDeferStore methods
-/// # Ok(())
-/// # }
 /// ```
 #[derive(Clone)]
 pub struct CachedDeferStore<S> {
@@ -291,13 +278,10 @@ where
 mod tests {
     use super::*;
     use crate::Key;
-    use crate::consumer::middleware::defer::message::store::memory::{
-        MemoryMessageDeferStore, MemoryMessageDeferStoreProvider,
-    };
+    use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
 
     fn create_test_store() -> MemoryMessageDeferStore {
-        let provider = MemoryMessageDeferStoreProvider::new();
-        provider.build()
+        MemoryMessageDeferStore::new()
     }
 
     #[tokio::test]

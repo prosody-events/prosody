@@ -347,13 +347,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::defer::timer::store::memory::{
-        MemoryTimerDeferStore, MemoryTimerDeferStoreProvider,
-    };
+    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 
     fn create_test_store() -> MemoryTimerDeferStore {
-        let provider = MemoryTimerDeferStoreProvider::new();
-        provider.build()
+        MemoryTimerDeferStore::new()
     }
 
     fn test_trigger(key: &str, time_secs: u32) -> Trigger {

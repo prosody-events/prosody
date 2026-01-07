@@ -15,10 +15,9 @@ use std::fmt;
 use std::sync::Arc;
 use tracing::instrument;
 
-pub mod provider;
-mod queries;
+pub mod queries;
 
-pub use provider::CassandraMessageDeferStoreProvider;
+pub use queries::Queries as MessageQueries;
 
 /// Cassandra-based implementation of [`MessageDeferStore`].
 ///
@@ -51,6 +50,20 @@ pub struct CassandraMessageDeferStore<S: SegmentStore> {
 }
 
 impl<S: SegmentStore> CassandraMessageDeferStore<S> {
+    /// Creates a new Cassandra message defer store.
+    ///
+    /// Used internally by [`CassandraDeferStoreProvider`].
+    ///
+    /// [`CassandraDeferStoreProvider`]: crate::consumer::middleware::defer::CassandraDeferStoreProvider
+    #[must_use]
+    pub fn new(store: CassandraStore, queries: Arc<Queries>, segment: LazySegment<S>) -> Self {
+        Self {
+            store,
+            queries,
+            segment,
+        }
+    }
+
     /// Returns a reference to the Cassandra session.
     fn session(&self) -> &Session {
         self.store.session()
@@ -206,15 +219,14 @@ mod tests {
             .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
 
         let cassandra_store = CassandraStore::new(&config).await?;
-        let provider =
-            CassandraMessageDeferStoreProvider::with_store(cassandra_store, "prosody_test").await?;
+        let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
         let segment = LazySegment::new(
             MemorySegmentStore::new(),
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from("test-consumer-group") as ConsumerGroup,
         );
-        let defer_store = provider.build(segment);
+        let defer_store = CassandraMessageDeferStore::new(cassandra_store, queries, segment);
         Ok::<_, color_eyre::Report>(defer_store)
     });
 }

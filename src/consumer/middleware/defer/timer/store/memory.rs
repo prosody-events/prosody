@@ -8,8 +8,6 @@
 
 use super::TimerDeferStore;
 use crate::Key;
-use crate::consumer::middleware::defer::message::handler::TimerStoreProvider;
-use crate::consumer::middleware::defer::segment::{LazySegment, SegmentStore};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use ahash::RandomState;
@@ -243,49 +241,13 @@ impl TimerDeferStore for MemoryTimerDeferStore {
     }
 }
 
-/// Provider for creating [`MemoryTimerDeferStore`] instances.
-///
-/// Simple provider that creates isolated in-memory stores for each partition.
-/// Each store instance has its own `HashMap`, ensuring partition isolation.
-#[derive(Clone, Debug, Default)]
-pub struct MemoryTimerDeferStoreProvider {
-    /// Shared inner state (empty, just for consistency with pattern)
-    _inner: Arc<()>,
-}
-
-impl MemoryTimerDeferStoreProvider {
-    /// Creates a new memory timer defer store provider.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Creates a store.
-    ///
-    /// Memory stores don't need segment information, so this is
-    /// a convenience method that creates a store directly.
-    #[must_use]
-    pub fn build(&self) -> MemoryTimerDeferStore {
-        MemoryTimerDeferStore::new()
-    }
-}
-
-impl<S: SegmentStore> TimerStoreProvider<S> for MemoryTimerDeferStoreProvider {
-    type Store = MemoryTimerDeferStore;
-
-    fn create_store(&self, _segment: LazySegment<S>) -> Self::Store {
-        self.build()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tracing::Span;
 
     fn create_test_store() -> MemoryTimerDeferStore {
-        let provider = MemoryTimerDeferStoreProvider::new();
-        provider.build()
+        MemoryTimerDeferStore::new()
     }
 
     fn test_trigger(key: &str, time_secs: u32) -> Trigger {

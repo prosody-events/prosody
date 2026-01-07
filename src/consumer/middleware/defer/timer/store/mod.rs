@@ -21,7 +21,7 @@ use std::future::Future;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use cached::CachedTimerDeferStore;
-pub use memory::{MemoryTimerDeferStore, MemoryTimerDeferStoreProvider};
+pub use memory::MemoryTimerDeferStore;
 
 /// Result of [`TimerDeferStore::complete_retry_success`].
 #[derive(Debug, Clone)]
@@ -42,9 +42,9 @@ pub enum TimerRetryCompletionResult {
 ///
 /// Manages a FIFO queue of timers per key with a shared `retry_count`. The
 /// segment context (`topic/partition/consumer_group`) is established at
-/// construction via [`TimerStoreProvider`].
+/// construction via [`DeferStoreProvider`].
 ///
-/// [`TimerStoreProvider`]: crate::consumer::middleware::defer::message::TimerStoreProvider
+/// [`DeferStoreProvider`]: crate::consumer::middleware::defer::DeferStoreProvider
 ///
 /// # Invariants
 ///

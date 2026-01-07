@@ -826,13 +826,10 @@ where
 
 #[cfg(test)]
 mod memory_store_tests {
-    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStoreProvider;
+    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
     use std::convert::Infallible;
 
-    crate::timer_defer_store_tests!(async {
-        let provider = MemoryTimerDeferStoreProvider::new();
-        Ok::<_, Infallible>(provider.build())
-    });
+    crate::timer_defer_store_tests!(async { Ok::<_, Infallible>(MemoryTimerDeferStore::new()) });
 }
 
 // ============================================================================
@@ -842,12 +839,11 @@ mod memory_store_tests {
 #[cfg(test)]
 mod cached_store_tests {
     use crate::consumer::middleware::defer::timer::store::CachedTimerDeferStore;
-    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStoreProvider;
+    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
     use std::convert::Infallible;
 
     crate::timer_defer_store_tests!(async {
-        let provider = MemoryTimerDeferStoreProvider::new();
-        let store = provider.build();
+        let store = MemoryTimerDeferStore::new();
         Ok::<_, Infallible>(CachedTimerDeferStore::new(store, 100))
     });
 }

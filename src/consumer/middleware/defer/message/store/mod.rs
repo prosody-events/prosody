@@ -13,7 +13,7 @@ use std::error::Error;
 use std::future::Future;
 
 pub use cached::CachedDeferStore;
-pub use memory::{MemoryMessageDeferStore, MemoryMessageDeferStoreProvider};
+pub use memory::MemoryMessageDeferStore;
 
 /// Result of [`MessageDeferStore::complete_retry_success`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,9 +32,9 @@ pub enum MessageRetryCompletionResult {
 ///
 /// Manages a FIFO queue of offsets per key with a shared `retry_count`. The
 /// segment context (`topic/partition/consumer_group`) is established at
-/// construction via [`MessageStoreProvider`].
+/// construction via [`DeferStoreProvider`].
 ///
-/// [`MessageStoreProvider`]: crate::consumer::middleware::defer::message::MessageStoreProvider
+/// [`DeferStoreProvider`]: crate::consumer::middleware::defer::DeferStoreProvider
 ///
 /// # Invariants
 ///

@@ -153,9 +153,7 @@ use whoami::fallible::hostname;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
-use crate::consumer::middleware::defer::{
-    DeferConfiguration, DeferStoreProviders, MessageDeferMiddleware,
-};
+use crate::consumer::middleware::defer::{DeferConfiguration, MessageDeferMiddleware};
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::monopolization::{
     MonopolizationConfiguration, MonopolizationInitError, MonopolizationMiddleware,
@@ -925,19 +923,13 @@ impl ProsodyConsumer {
         match stores {
             StorePair::Memory {
                 trigger: trigger_store,
-                segment,
-                message_defer,
-                timer_defer,
+                defer,
             } => {
                 let defer_middleware = MessageDeferMiddleware::new(
                     defer_config,
                     consumer_config,
                     &common_config.scheduler,
-                    DeferStoreProviders {
-                        message: message_defer,
-                        timer: timer_defer,
-                        segment,
-                    },
+                    defer,
                     &telemetry,
                     &heartbeats,
                 )?;
@@ -964,19 +956,13 @@ impl ProsodyConsumer {
             }
             StorePair::Cassandra {
                 trigger: trigger_store,
-                segment,
-                message_defer,
-                timer_defer,
+                defer,
             } => {
                 let defer_middleware = MessageDeferMiddleware::new(
                     defer_config,
                     consumer_config,
                     &common_config.scheduler,
-                    DeferStoreProviders {
-                        message: message_defer,
-                        timer: timer_defer,
-                        segment,
-                    },
+                    defer,
                     &telemetry,
                     &heartbeats,
                 )?;
