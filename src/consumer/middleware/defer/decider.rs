@@ -200,27 +200,6 @@ impl FailureTracker {
         }
     }
 
-    /// Checks if deferral should be enabled based on current failure rate.
-    ///
-    /// Lock-free read from atomic. Returns `true` if the failure rate is
-    /// below the threshold (deferral should be enabled), `false` otherwise.
-    ///
-    /// # Returns
-    ///
-    /// - `true`: Failure rate is acceptable, deferral enabled
-    /// - `false`: Failure rate exceeds threshold, deferral disabled
-    ///
-    /// # Note
-    ///
-    /// This method also exists on [`DeferralDecider`] trait. Both are kept
-    /// for backward compatibility - existing code calls this inherent method,
-    /// while generic code uses the trait method.
-    #[must_use]
-    #[allow(clippy::same_name_method)]
-    pub fn should_defer(&self) -> bool {
-        self.failure_rate() < self.threshold
-    }
-
     /// Gets current failure rate for monitoring/metrics.
     ///
     /// Lock-free read from atomic.
@@ -245,9 +224,7 @@ impl Debug for FailureTracker {
 }
 
 impl DeferralDecider for FailureTracker {
-    #[allow(clippy::same_name_method)]
     fn should_defer(&self) -> bool {
-        // Delegate to the existing inherent method for backward compatibility
         self.failure_rate() < self.threshold
     }
 }
@@ -321,19 +298,20 @@ fn prune_events(
 }
 
 /// Calculates current failure rate and updates the atomic.
-#[allow(clippy::cast_precision_loss)]
 fn update_failure_rate(
     failure_rate: &Arc<AtomicF64>,
     successes: &VecDeque<Instant>,
     failures: &VecDeque<Instant>,
 ) {
-    let failure_count = failures.len();
-    let total = failure_count + successes.len();
+    // Window sizes are bounded and small, so len() fits in u32 without loss.
+    // Using u32 allows lossless f64::from() conversion.
+    let failure_count = failures.len() as u32;
+    let total = failure_count + successes.len() as u32;
 
     let rate = if total == 0 {
         0.0_f64
     } else {
-        failure_count as f64 / total as f64
+        f64::from(failure_count) / f64::from(total)
     };
 
     failure_rate.store(rate, Ordering::Relaxed);

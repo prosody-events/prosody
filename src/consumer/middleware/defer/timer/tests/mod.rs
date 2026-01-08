@@ -33,10 +33,14 @@ pub mod types;
 
 /// Shared multi-threaded runtime for all timer defer property tests.
 ///
-/// Uses the established codebase pattern for static runtime initialization
-/// in property tests. The `expect_used` lint is allowed here because
-/// `LazyLock` requires a non-fallible closure and this is test infrastructure.
-#[allow(clippy::expect_used)]
+/// # Rationale for `expect`
+///
+/// `LazyLock` requires a non-fallible closure. Runtime creation failure is
+/// unrecoverable in test infrastructure - tests cannot run without a runtime.
+#[allow(
+    clippy::expect_used,
+    reason = "LazyLock requires non-fallible closure; test infra"
+)]
 pub(crate) static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     Builder::new_multi_thread()
         .enable_time()

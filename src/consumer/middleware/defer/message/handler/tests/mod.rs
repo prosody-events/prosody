@@ -27,10 +27,14 @@ pub const TEST_MAX_BACKOFF_SECS: u32 = 3600;
 
 /// Shared multi-threaded runtime for all defer property tests.
 ///
-/// Using a static runtime avoids the overhead of creating a new runtime for
-/// each `QuickCheck` iteration. Multi-threaded to support concurrent test
-/// execution.
-#[allow(clippy::expect_used)]
+/// # Rationale for `expect`
+///
+/// `LazyLock` requires a non-fallible closure. Runtime creation failure is
+/// unrecoverable in test infrastructure - tests cannot run without a runtime.
+#[allow(
+    clippy::expect_used,
+    reason = "LazyLock requires non-fallible closure; test infra"
+)]
 pub(crate) static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     Builder::new_multi_thread()
         .enable_time()

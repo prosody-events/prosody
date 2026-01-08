@@ -8,8 +8,8 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::defer::error::CassandraDeferStoreError;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::cassandra::queries::Queries;
-use crate::consumer::middleware::defer::segment::{LazySegment, SegmentStore};
-use crate::{Key, Offset};
+use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, LazySegment};
+use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
 use scylla::client::session::Session;
 use std::fmt;
 use std::sync::Arc;
@@ -30,7 +30,6 @@ pub use queries::Queries as MessageQueries;
 ///   (data)
 /// - **Partition key**: `(segment_id, key)` in offsets table
 /// - **Segment ID**: `UUIDv5` hash of `{topic}/{partition}:{consumer_group}`
-///   (resolved lazily from [`LazySegment`])
 /// - **Retry count**: Stored as static column (shared across all offsets for a
 ///   key)
 /// - **TTL management**: Uses fixed TTL from `CassandraStore::base_ttl()`
@@ -38,25 +37,31 @@ pub use queries::Queries as MessageQueries;
 ///
 /// # Lazy Initialization
 ///
-/// The store holds a [`LazySegment`] which defers segment persistence until
-/// first use. This allows the store to be created in synchronous context
-/// (e.g., `handler_for_partition`) while deferring I/O to the first async
-/// operation.
+/// The store uses a [`LazySegment`] which defers segment persistence to
+/// Cassandra until first use. This allows the store to be created in
+/// synchronous context (e.g., `handler_for_partition`) while deferring I/O to
+/// the first async operation.
 #[derive(Clone)]
-pub struct CassandraMessageDeferStore<S: SegmentStore> {
+pub struct CassandraMessageDeferStore {
     store: CassandraStore,
     queries: Arc<Queries>,
-    segment: LazySegment<S>,
+    segment: LazySegment<CassandraSegmentStore>,
 }
 
-impl<S: SegmentStore> CassandraMessageDeferStore<S> {
-    /// Creates a new Cassandra message defer store.
+impl CassandraMessageDeferStore {
+    /// Creates a new Cassandra message defer store for the given partition.
     ///
-    /// Used internally by [`CassandraDeferStoreProvider`].
-    ///
-    /// [`CassandraDeferStoreProvider`]: crate::consumer::middleware::defer::CassandraDeferStoreProvider
+    /// The `segment_store` is used to persist segment metadata on first access.
     #[must_use]
-    pub fn new(store: CassandraStore, queries: Arc<Queries>, segment: LazySegment<S>) -> Self {
+    pub fn new(
+        store: CassandraStore,
+        queries: Arc<Queries>,
+        segment_store: CassandraSegmentStore,
+        topic: Topic,
+        partition: Partition,
+        consumer_group: ConsumerGroup,
+    ) -> Self {
+        let segment = LazySegment::new(segment_store, topic, partition, consumer_group);
         Self {
             store,
             queries,
@@ -68,9 +73,15 @@ impl<S: SegmentStore> CassandraMessageDeferStore<S> {
     fn session(&self) -> &Session {
         self.store.session()
     }
+
+    /// Gets the segment ID, lazily initializing and persisting if needed.
+    async fn segment_id(&self) -> Result<uuid::Uuid, CassandraDeferStoreError> {
+        let segment = self.segment.get().await?;
+        Ok(segment.id())
+    }
 }
 
-impl<S: SegmentStore> fmt::Debug for CassandraMessageDeferStore<S> {
+impl fmt::Debug for CassandraMessageDeferStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CassandraMessageDeferStore")
             .field("segment", &self.segment)
@@ -78,15 +89,12 @@ impl<S: SegmentStore> fmt::Debug for CassandraMessageDeferStore<S> {
     }
 }
 
-impl<S> MessageDeferStore for CassandraMessageDeferStore<S>
-where
-    S: SegmentStore<Error: Into<CassandraDeferStoreError>>,
-{
+impl MessageDeferStore for CassandraMessageDeferStore {
     type Error = CassandraDeferStoreError;
 
     #[instrument(level = "debug", skip(self), err)]
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
         let ttl = self.store.base_ttl();
 
         // INSERT with retry_count=0 for first failure
@@ -106,7 +114,7 @@ where
         &self,
         key: &Key,
     ) -> Result<Option<(Offset, u32)>, Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
 
         let result = self
             .session()
@@ -136,7 +144,7 @@ where
 
     #[instrument(level = "debug", skip(self), err)]
     async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
         let ttl = self.store.base_ttl();
 
         // Don't include retry_count in INSERT - leaves static column unchanged
@@ -153,7 +161,7 @@ where
 
     #[instrument(level = "debug", skip(self), err)]
     async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
 
         self.session()
             .execute_unpaged(
@@ -168,7 +176,7 @@ where
 
     #[instrument(level = "debug", skip(self), err)]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
         let ttl = self.store.base_ttl();
         let retry_count_i32: i32 =
             retry_count
@@ -191,7 +199,7 @@ where
 
     #[instrument(level = "debug", skip(self), err)]
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
 
         self.session()
             .execute_unpaged(&self.queries.delete_key, (&segment_id, key.as_ref()))
@@ -206,7 +214,6 @@ where
 mod tests {
     use super::*;
     use crate::cassandra::{CassandraConfiguration, CassandraStore};
-    use crate::consumer::middleware::defer::segment::{LazySegment, MemorySegmentStore};
     use crate::defer_store_tests;
     use crate::{ConsumerGroup, Partition, Topic};
 
@@ -219,14 +226,17 @@ mod tests {
             .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
 
         let cassandra_store = CassandraStore::new(&config).await?;
+        let segment_store =
+            CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
         let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
-        let segment = LazySegment::new(
-            MemorySegmentStore::new(),
+        let defer_store = CassandraMessageDeferStore::new(
+            cassandra_store,
+            queries,
+            segment_store,
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from("test-consumer-group") as ConsumerGroup,
         );
-        let defer_store = CassandraMessageDeferStore::new(cassandra_store, queries, segment);
         Ok::<_, color_eyre::Report>(defer_store)
     });
 }

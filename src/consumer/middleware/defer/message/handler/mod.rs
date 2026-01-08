@@ -15,69 +15,192 @@
 //!    initial deferral).
 
 use super::loader::{KafkaLoader, MessageLoader};
+use super::store::cassandra::{CassandraMessageDeferStore, MessageQueries};
+use super::store::memory::MemoryMessageDeferStore;
 use super::store::{CachedDeferStore, MessageDeferStore, MessageRetryCompletionResult};
+use crate::cassandra::CassandraStore;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
-use crate::consumer::middleware::defer::decider::DeferralDecider;
-use crate::consumer::middleware::defer::decider::FailureTracker;
-use crate::consumer::middleware::defer::error::{DeferError, DeferInitError, DeferResult};
-use crate::consumer::middleware::defer::provider::DeferStoreProvider;
-use crate::consumer::middleware::defer::segment::LazySegment;
-use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
-use crate::consumer::middleware::defer::timer::store::CachedTimerDeferStore;
+use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
+use crate::consumer::middleware::defer::error::{
+    CassandraDeferStoreError, DeferError, DeferInitError, DeferResult,
+};
+use crate::consumer::middleware::defer::segment::CassandraSegmentStore;
 use crate::consumer::middleware::scheduler::SchedulerConfiguration;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::consumer::{ConsumerConfiguration, DemandType, Keyed};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
+use std::convert::Infallible;
 use std::sync::Arc;
+use thiserror::Error;
 use tracing::{debug, info, warn};
 
 /// Property-based tests for defer handler invariants.
 #[cfg(test)]
 pub mod tests;
 
+/// Cassandra resources for creating message defer stores.
+#[derive(Clone, Debug)]
+pub struct CassandraResources {
+    /// Shared Cassandra store.
+    pub store: CassandraStore,
+    /// Prepared message queries.
+    pub queries: Arc<MessageQueries>,
+    /// Cassandra segment store for segment persistence.
+    pub segment_store: CassandraSegmentStore,
+}
+
+/// Message store variant - either memory or Cassandra.
+#[derive(Clone, Debug)]
+pub enum MessageStoreKind {
+    /// In-memory store for testing.
+    Memory,
+    /// Cassandra-backed store for production.
+    Cassandra(CassandraResources),
+}
+
+/// Enum wrapper for different message defer store implementations.
+#[derive(Clone)]
+pub enum MessageStoreWrapper {
+    /// In-memory store for testing.
+    Memory(CachedDeferStore<MemoryMessageDeferStore>),
+    /// Cassandra-backed store for production.
+    Cassandra(CachedDeferStore<CassandraMessageDeferStore>),
+}
+
+/// Unified error type for message store operations.
+#[derive(Debug, Error)]
+pub enum MessageStoreError {
+    /// Cassandra store error.
+    #[error(transparent)]
+    Cassandra(#[from] CassandraDeferStoreError),
+    /// Memory store error (never occurs).
+    #[error(transparent)]
+    Memory(#[from] Infallible),
+}
+
+impl ClassifyError for MessageStoreError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Cassandra(e) => e.classify_error(),
+            Self::Memory(e) => match *e {},
+        }
+    }
+}
+
+impl MessageDeferStore for MessageStoreWrapper {
+    type Error = MessageStoreError;
+
+    async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
+        match self {
+            Self::Memory(store) => store
+                .defer_first_message(key, offset)
+                .await
+                .map_err(Into::into),
+            Self::Cassandra(store) => store
+                .defer_first_message(key, offset)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn get_next_deferred_message(
+        &self,
+        key: &Key,
+    ) -> Result<Option<(Offset, u32)>, Self::Error> {
+        match self {
+            Self::Memory(store) => store
+                .get_next_deferred_message(key)
+                .await
+                .map_err(Into::into),
+            Self::Cassandra(store) => store
+                .get_next_deferred_message(key)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
+        match self {
+            Self::Memory(store) => store
+                .append_deferred_message(key, offset)
+                .await
+                .map_err(Into::into),
+            Self::Cassandra(store) => store
+                .append_deferred_message(key, offset)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
+        match self {
+            Self::Memory(store) => store
+                .remove_deferred_message(key, offset)
+                .await
+                .map_err(Into::into),
+            Self::Cassandra(store) => store
+                .remove_deferred_message(key, offset)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
+        match self {
+            Self::Memory(store) => store
+                .set_retry_count(key, retry_count)
+                .await
+                .map_err(Into::into),
+            Self::Cassandra(store) => store
+                .set_retry_count(key, retry_count)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
+        match self {
+            Self::Memory(store) => store.delete_key(key).await.map_err(Into::into),
+            Self::Cassandra(store) => store.delete_key(key).await.map_err(Into::into),
+        }
+    }
+}
+
 /// Middleware that defers transiently-failed messages for timer-based retry.
 ///
-/// This unified middleware composes both message defer and timer defer
-/// handling. Timer defer is inside message defer, so message defer sees unified
-/// timer state.
+/// This middleware handles message deferral independently of timer deferral.
+/// Both can be composed via `.layer()`.
 ///
 /// # Type Parameters
 ///
-/// * `P` - Defer store provider (e.g., [`MemoryDeferStoreProvider`],
-///   [`CassandraDeferStoreProvider`])
 /// * `L` - Message loader (default: [`KafkaLoader`])
 /// * `D` - Deferral decider (default: [`FailureTracker`])
-///
-/// [`MemoryDeferStoreProvider`]: crate::consumer::middleware::defer::MemoryDeferStoreProvider
-/// [`CassandraDeferStoreProvider`]: crate::consumer::middleware::defer::CassandraDeferStoreProvider
 #[derive(Clone)]
-pub struct MessageDeferMiddleware<P, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferMiddleware<L = KafkaLoader, D = FailureTracker>
 where
-    P: DeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     config: DeferConfiguration,
     loader: L,
-    provider: P,
+    store_kind: MessageStoreKind,
     decider: D,
     consumer_group: ConsumerGroup,
 }
 
-impl<P> MessageDeferMiddleware<P, KafkaLoader, FailureTracker>
+impl<D> MessageDeferMiddleware<KafkaLoader, D>
 where
-    P: DeferStoreProvider,
+    D: DeferralDecider,
 {
-    /// Creates middleware with default [`KafkaLoader`] and [`FailureTracker`].
+    /// Creates middleware with default [`KafkaLoader`].
     ///
     /// # Errors
     ///
@@ -86,8 +209,8 @@ where
         config: DeferConfiguration,
         consumer_config: &ConsumerConfiguration,
         scheduler_config: &SchedulerConfiguration,
-        provider: P,
-        telemetry: &Telemetry,
+        store_kind: MessageStoreKind,
+        decider: D,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, DeferInitError> {
         use super::loader::LoaderConfiguration;
@@ -110,17 +233,41 @@ where
         };
         let loader = KafkaLoader::new(loader_config, heartbeats)?;
 
-        let decider = FailureTracker::new(
-            config.failure_window,
-            config.failure_threshold,
-            telemetry,
-            heartbeats,
-        );
+        Ok(Self {
+            config,
+            loader,
+            store_kind,
+            decider,
+            consumer_group: Arc::from(consumer_config.group_id.as_str()),
+        })
+    }
+}
+
+impl<L, D> MessageDeferMiddleware<L, D>
+where
+    L: MessageLoader,
+    D: DeferralDecider,
+{
+    /// Creates middleware with custom loader and decider.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if config validation fails.
+    pub fn with_custom(
+        config: DeferConfiguration,
+        loader: L,
+        store_kind: MessageStoreKind,
+        decider: D,
+        consumer_config: &ConsumerConfiguration,
+    ) -> Result<Self, DeferInitError> {
+        use validator::Validate;
+
+        config.validate()?;
 
         Ok(Self {
             config,
             loader,
-            provider,
+            store_kind,
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
         })
@@ -128,19 +275,16 @@ where
 }
 
 /// Creates [`MessageDeferHandler`]s for each partition.
-///
-/// Composes timer defer inside message defer, with shared segment and decider.
 #[derive(Clone)]
-pub struct MessageDeferProvider<T, P, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferProvider<T, L = KafkaLoader, D = FailureTracker>
 where
-    P: DeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     inner_provider: T,
     config: DeferConfiguration,
     loader: L,
-    provider: P,
+    store_kind: MessageStoreKind,
     decider: D,
     consumer_group: ConsumerGroup,
 }
@@ -162,13 +306,12 @@ where
     pub(crate) partition: Partition,
 }
 
-impl<P, L, D> HandlerMiddleware for MessageDeferMiddleware<P, L, D>
+impl<L, D> HandlerMiddleware for MessageDeferMiddleware<L, D>
 where
-    P: DeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    type Provider<T: FallibleHandlerProvider> = MessageDeferProvider<T, P, L, D>;
+    type Provider<T: FallibleHandlerProvider> = MessageDeferProvider<T, L, D>;
 
     fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
     where
@@ -178,69 +321,48 @@ where
             inner_provider,
             config: self.config.clone(),
             loader: self.loader.clone(),
-            provider: self.provider.clone(),
+            store_kind: self.store_kind.clone(),
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
         }
     }
 }
 
-impl<T, P, L, D> FallibleHandlerProvider for MessageDeferProvider<T, P, L, D>
+impl<T, L, D> FallibleHandlerProvider for MessageDeferProvider<T, L, D>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
-    P: DeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    /// Composed handler: `MessageDeferHandler<TimerDeferHandler<Inner>>`.
-    ///
-    /// - Message defer wraps timer defer
-    /// - Timer defer sees the original context
-    /// - Message defer sees the wrapped context from timer defer
-    type Handler = MessageDeferHandler<
-        TimerDeferHandler<T::Handler, CachedTimerDeferStore<P::TimerStore>, D>,
-        CachedDeferStore<P::MessageStore>,
-        L,
-        D,
-    >;
+    type Handler = MessageDeferHandler<T::Handler, MessageStoreWrapper, L, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        // Create shared lazy segment - persists on first store access
-        let segment = LazySegment::new(
-            self.provider.segment().clone(),
-            topic,
-            partition,
-            self.consumer_group.clone(),
-        );
-
-        // Create stores that share the lazy segment
-        let message_store = CachedDeferStore::new(
-            self.provider.create_message_store(segment.clone()),
-            self.config.cache_size,
-        );
-
-        let timer_store = CachedTimerDeferStore::new(
-            self.provider.create_timer_store(segment),
-            self.config.cache_size,
-        );
-
-        // Inner handler first
-        let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
-
-        // Timer defer wraps inner handler
-        let timer_defer_handler = TimerDeferHandler {
-            handler: inner_handler,
-            store: timer_store,
-            decider: self.decider.clone(),
-            config: self.config.clone(),
-            topic,
-            partition,
+        // Create the appropriate store based on store_kind
+        let message_store = match &self.store_kind {
+            MessageStoreKind::Memory => {
+                let store = MemoryMessageDeferStore::new();
+                MessageStoreWrapper::Memory(CachedDeferStore::new(store, self.config.cache_size))
+            }
+            MessageStoreKind::Cassandra(resources) => {
+                let store = CassandraMessageDeferStore::new(
+                    resources.store.clone(),
+                    resources.queries.clone(),
+                    resources.segment_store.clone(),
+                    topic,
+                    partition,
+                    self.consumer_group.clone(),
+                );
+                MessageStoreWrapper::Cassandra(CachedDeferStore::new(store, self.config.cache_size))
+            }
         };
 
-        // Message defer wraps timer defer handler
+        // Inner handler
+        let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
+
+        // Message defer wraps inner handler
         MessageDeferHandler {
-            handler: timer_defer_handler,
+            handler: inner_handler,
             loader: self.loader.clone(),
             store: message_store,
             decider: self.decider.clone(),

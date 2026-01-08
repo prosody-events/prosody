@@ -20,6 +20,7 @@
 
 pub mod context;
 pub mod handler;
+pub mod middleware;
 pub mod store;
 
 #[cfg(test)]
@@ -27,4 +28,5 @@ mod tests;
 
 pub use context::{StoredTimerEntry, TimerDeferContext, TimerDeferContextError};
 pub use handler::TimerDeferHandler;
+pub use middleware::{TimerDeferMiddleware, TimerDeferProvider};
 pub use store::TimerDeferStore;

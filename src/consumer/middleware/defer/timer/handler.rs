@@ -34,9 +34,8 @@ use tracing::{debug, info, warn};
 
 /// Per-partition handler wrapping an inner handler with timer defer logic.
 ///
-/// Created by
-/// [`MessageDeferProvider`](super::super::message::handler::MessageDeferProvider)
-/// as part of the composed defer handler stack.
+/// Created by [`TimerDeferProvider`](super::middleware::TimerDeferProvider)
+/// as part of a defer handler stack.
 #[derive(Clone)]
 pub struct TimerDeferHandler<T, S, D>
 where

@@ -22,15 +22,15 @@
 //! See [`get_slab_range`](crate::timers::store::cassandra) for the two-query
 //! wrap-around solution if this limitation ever needs addressing.
 
-use crate::Key;
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::defer::error::CassandraDeferStoreError;
-use crate::consumer::middleware::defer::segment::{LazySegment, SegmentStore};
+use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, LazySegment};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::cassandra::queries::Queries;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
+use crate::{ConsumerGroup, Key, Partition, Topic};
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
@@ -59,7 +59,6 @@ pub use queries::Queries as TimerQueries;
 /// - **Partition key**: `(segment_id, key)` in timers table
 /// - **Clustering column**: `original_time ASC` ensures FIFO processing
 /// - **Segment ID**: `UUIDv5` hash of `{topic}/{partition}:{consumer_group}`
-///   (resolved lazily from [`LazySegment`])
 /// - **Retry count**: Stored as static column (shared across all timers for a
 ///   key)
 /// - **TTL management**: Uses `CassandraStore::calculate_ttl(original_time)`
@@ -67,25 +66,31 @@ pub use queries::Queries as TimerQueries;
 ///
 /// # Lazy Initialization
 ///
-/// The store holds a [`LazySegment`] which defers segment persistence until
-/// first use. This allows the store to be created in synchronous context
-/// (e.g., `handler_for_partition`) while deferring I/O to the first async
-/// operation.
+/// The store uses a [`LazySegment`] which defers segment persistence to
+/// Cassandra until first use. This allows the store to be created in
+/// synchronous context (e.g., `handler_for_partition`) while deferring I/O to
+/// the first async operation.
 #[derive(Clone)]
-pub struct CassandraTimerDeferStore<S: SegmentStore> {
+pub struct CassandraTimerDeferStore {
     store: CassandraStore,
     queries: Arc<Queries>,
-    segment: LazySegment<S>,
+    segment: LazySegment<CassandraSegmentStore>,
 }
 
-impl<S: SegmentStore> CassandraTimerDeferStore<S> {
-    /// Creates a new Cassandra timer defer store.
+impl CassandraTimerDeferStore {
+    /// Creates a new Cassandra timer defer store for the given partition.
     ///
-    /// Used internally by [`CassandraDeferStoreProvider`].
-    ///
-    /// [`CassandraDeferStoreProvider`]: crate::consumer::middleware::defer::CassandraDeferStoreProvider
+    /// The `segment_store` is used to persist segment metadata on first access.
     #[must_use]
-    pub fn new(store: CassandraStore, queries: Arc<Queries>, segment: LazySegment<S>) -> Self {
+    pub fn new(
+        store: CassandraStore,
+        queries: Arc<Queries>,
+        segment_store: CassandraSegmentStore,
+        topic: Topic,
+        partition: Partition,
+        consumer_group: ConsumerGroup,
+    ) -> Self {
+        let segment = LazySegment::new(segment_store, topic, partition, consumer_group);
         Self {
             store,
             queries,
@@ -101,6 +106,12 @@ impl<S: SegmentStore> CassandraTimerDeferStore<S> {
     /// Returns a reference to the OpenTelemetry propagator.
     fn propagator(&self) -> &TextMapCompositePropagator {
         self.store.propagator()
+    }
+
+    /// Gets the segment ID, lazily initializing and persisting if needed.
+    async fn segment_id(&self) -> Result<uuid::Uuid, CassandraDeferStoreError> {
+        let segment = self.segment.get().await?;
+        Ok(segment.id())
     }
 
     /// Injects span context into a map for storage.
@@ -130,7 +141,7 @@ impl<S: SegmentStore> CassandraTimerDeferStore<S> {
     }
 }
 
-impl<S: SegmentStore> fmt::Debug for CassandraTimerDeferStore<S> {
+impl fmt::Debug for CassandraTimerDeferStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CassandraTimerDeferStore")
             .field("segment", &self.segment)
@@ -138,15 +149,12 @@ impl<S: SegmentStore> fmt::Debug for CassandraTimerDeferStore<S> {
     }
 }
 
-impl<S> TimerDeferStore for CassandraTimerDeferStore<S>
-where
-    S: SegmentStore<Error: Into<CassandraDeferStoreError>>,
-{
+impl TimerDeferStore for CassandraTimerDeferStore {
     type Error = CassandraDeferStoreError;
 
     #[instrument(level = "debug", skip(self), err)]
     async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
         let ttl = self.store.calculate_ttl(trigger.time);
         let span_map = self.inject_span_context(trigger);
 
@@ -189,7 +197,7 @@ where
         &self,
         key: &Key,
     ) -> Result<Option<(Trigger, u32)>, Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
 
         let result = self
             .session()
@@ -229,7 +237,7 @@ where
 
     #[instrument(level = "debug", skip(self), err)]
     async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
         let ttl = self.store.calculate_ttl(trigger.time);
         let span_map = self.inject_span_context(trigger);
 
@@ -263,7 +271,7 @@ where
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
 
         self.session()
             .execute_unpaged(
@@ -284,7 +292,7 @@ where
 
     #[instrument(level = "debug", skip(self), err)]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
         let ttl = self.store.base_ttl();
         let retry_count_i32: i32 =
             retry_count
@@ -313,7 +321,7 @@ where
 
     #[instrument(level = "debug", skip(self), err)]
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
-        let segment_id = self.segment.get().await.map_err(Into::into)?.id();
+        let segment_id = self.segment_id().await?;
 
         self.session()
             .execute_unpaged(&self.queries.delete_key, (&segment_id, key.as_ref()))
@@ -342,17 +350,15 @@ where
 }
 
 /// Helper to create deferred times stream without capturing `&self`.
-fn deferred_times_stream<S>(
+fn deferred_times_stream(
     store: CassandraStore,
     query: PreparedStatement,
-    segment: LazySegment<S>,
+    segment: LazySegment<CassandraSegmentStore>,
     key: Key,
-) -> impl Stream<Item = Result<CompactDateTime, CassandraDeferStoreError>> + Send + 'static
-where
-    S: SegmentStore<Error: Into<CassandraDeferStoreError>>,
-{
+) -> impl Stream<Item = Result<CompactDateTime, CassandraDeferStoreError>> + Send + 'static {
     try_stream! {
-        let segment_id = segment.get().await.map_err(Into::into)?.id();
+        let seg = segment.get().await?;
+        let segment_id = seg.id();
 
         let stream = store.session()
             .execute_iter(query, (&segment_id, key.as_ref()))
@@ -377,8 +383,6 @@ where
 mod tests {
     use super::*;
     use crate::cassandra::{CassandraConfiguration, CassandraStore};
-    use crate::consumer::middleware::defer::segment::{LazySegment, MemorySegmentStore};
-    use crate::{ConsumerGroup, Partition, Topic};
 
     // Note: These tests require a running Cassandra instance
     // Run with: cargo test timer_defer_cassandra -- --ignored
@@ -392,14 +396,17 @@ mod tests {
             .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
 
         let cassandra_store = CassandraStore::new(&config).await?;
+        let segment_store =
+            CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
         let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
-        let segment = LazySegment::new(
-            MemorySegmentStore::new(),
+        let defer_store = CassandraTimerDeferStore::new(
+            cassandra_store,
+            queries,
+            segment_store,
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from("test-consumer-group") as ConsumerGroup,
         );
-        let defer_store = CassandraTimerDeferStore::new(cassandra_store, queries, segment);
 
         // Test basic operations
         let key: Key = Arc::from("test-key");

@@ -3,6 +3,33 @@
 //! This module provides deferral handling for both messages and timers,
 //! allowing keys to be unblocked between retry attempts while maintaining
 //! ordering guarantees.
+//!
+//! # Store Types
+//!
+//! Two store types are available:
+//! - `Memory`: In-memory storage for testing
+//! - `Cassandra`: Persistent Cassandra storage for production
+//!
+//! # Composability
+//!
+//! Message and timer defer middlewares can be composed independently via
+//! `.layer()`.
+//!
+//! ```rust,ignore
+//! let message_middleware = MessageDeferMiddleware::new(
+//!     config.clone(), consumer_config, &scheduler_config,
+//!     MessageStoreKind::Memory, failure_tracker.clone(), &heartbeats,
+//! )?;
+//! let timer_middleware = TimerDeferMiddleware::new(
+//!     config, TimerStoreKind::Memory, failure_tracker, consumer_config,
+//! );
+//!
+//! let provider = common_middleware
+//!     .layer(timer_middleware)
+//!     .layer(message_middleware)
+//!     .layer(retry_middleware)
+//!     .into_provider(handler);
+//! ```
 
 use crate::timers::duration::CompactDuration;
 use rand::Rng;
@@ -12,7 +39,6 @@ pub mod config;
 pub mod decider;
 pub mod error;
 pub mod message;
-pub mod provider;
 pub mod segment;
 pub mod timer;
 
@@ -20,7 +46,11 @@ pub use config::{DeferConfigError, DeferConfiguration, DeferConfigurationBuilder
 pub use decider::{AlwaysDefer, DeferralDecider, FailureTracker, NeverDefer, TraceBasedDecider};
 pub use error::{CassandraDeferStoreError, DeferInitError};
 pub use message::MessageDeferMiddleware;
-pub use provider::{CassandraDeferStoreProvider, DeferStoreProvider, MemoryDeferStoreProvider};
+pub use timer::{TimerDeferMiddleware, TimerDeferProvider};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
 
 /// Jittered exponential backoff: `random(1, min(base * 2^retry, max))`.
 ///

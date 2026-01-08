@@ -42,9 +42,7 @@ pub enum TimerRetryCompletionResult {
 ///
 /// Manages a FIFO queue of timers per key with a shared `retry_count`. The
 /// segment context (`topic/partition/consumer_group`) is established at
-/// construction via [`DeferStoreProvider`].
-///
-/// [`DeferStoreProvider`]: crate::consumer::middleware::defer::DeferStoreProvider
+/// store construction (internally for Cassandra stores).
 ///
 /// # Invariants
 ///

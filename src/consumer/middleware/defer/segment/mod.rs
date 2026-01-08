@@ -9,18 +9,16 @@
 //! Both message defer and timer defer share the same segment concept:
 //! - **Same segment ID**: Both compute identical `UUIDv5` from
 //!   `{topic}/{partition}:{consumer_group}`
-//! - **Same metadata table**: Both reference the shared `deferred_segments`
-//!   table
 //! - **Different data tables**: `deferred_offsets` for messages,
 //!   `deferred_timers` for timers
 //!
 //! # Lifecycle
 //!
-//! 1. `MessageDeferMiddleware` creates a [`LazySegment`] for each partition
-//! 2. The `LazySegment` is shared between message and timer defer stores
-//! 3. On first store access, the segment is created and persisted via
-//!    [`SegmentStore::get_or_create_segment`]
-//! 4. Both stores use `segment.id()` for their storage operations
+//! 1. [`CassandraSegmentStore`] is created once with prepared queries
+//! 2. Each Cassandra defer store receives a clone and wraps it in
+//!    [`LazySegment`]
+//! 3. On first store access, the segment is persisted to Cassandra
+//! 4. Stores use `segment.id()` for their storage operations
 
 pub mod cassandra;
 pub mod lazy;
@@ -31,7 +29,11 @@ use uuid::Uuid;
 
 pub use cassandra::{CassandraSegmentStore, CassandraSegmentStoreError};
 pub use lazy::LazySegment;
-pub use store::{MemorySegmentStore, MemorySegmentStoreError, SegmentStore};
+pub use store::SegmentStore;
+
+// Re-export MemorySegmentStore for testing only
+#[cfg(test)]
+pub use store::{MemorySegmentStore, MemorySegmentStoreError};
 
 /// Unique identifier for a defer segment.
 ///

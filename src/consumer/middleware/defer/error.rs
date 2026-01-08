@@ -136,13 +136,6 @@ impl From<super::segment::CassandraSegmentStoreError> for CassandraDeferStoreErr
     }
 }
 
-impl From<super::segment::MemorySegmentStoreError> for CassandraDeferStoreError {
-    fn from(err: super::segment::MemorySegmentStoreError) -> Self {
-        // MemorySegmentStoreError is uninhabited (empty enum), so this is unreachable
-        match err {}
-    }
-}
-
 impl<S, H, L> ClassifyError for DeferError<S, H, L>
 where
     S: StdError + ClassifyError + Send + Sync + 'static,

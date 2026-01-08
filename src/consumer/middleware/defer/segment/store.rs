@@ -12,22 +12,18 @@ use std::sync::Arc;
 
 /// Storage backend for defer segment metadata.
 ///
-/// Manages the `deferred_segments` table which stores metadata about each
-/// segment (topic, partition, `consumer_group`). This metadata is shared
-/// between message and timer defer stores.
-///
-/// # Lifecycle
-///
-/// 1. When `MessageDeferMiddleware` is created for a partition, call
-///    [`get_or_create_segment`](Self::get_or_create_segment)
-/// 2. The returned [`Segment`] is passed to both message and timer defer stores
-/// 3. Both stores use `segment.id()` as their partition key prefix
+/// Manages segment metadata (topic, partition, `consumer_group`). Each
+/// Cassandra defer store uses [`LazySegment<CassandraSegmentStore>`] to
+/// persist segment metadata to Cassandra on first access.
 ///
 /// # Implementations
 ///
-/// - [`CassandraSegmentStore`](super::CassandraSegmentStore): Production
-///   implementation using Cassandra
-/// - [`MemorySegmentStore`]: In-memory implementation for testing
+/// - [`CassandraSegmentStore`]: Persists segment metadata to the
+///   `deferred_segments` table
+/// - [`MemorySegmentStore`]: In-memory implementation for testing only
+///
+/// [`LazySegment<CassandraSegmentStore>`]: super::LazySegment
+/// [`CassandraSegmentStore`]: super::CassandraSegmentStore
 pub trait SegmentStore: Clone + Send + Sync + 'static {
     /// Error type for segment operations.
     type Error: Error + ClassifyError + Send + Sync + 'static;
