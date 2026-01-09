@@ -1,7 +1,4 @@
-//! Storage trait for defer segment metadata.
-//!
-//! Provides abstraction for persisting and retrieving segment metadata.
-//! The segment store is shared by both message and timer defer middlewares.
+//! Segment persistence trait and in-memory implementation.
 
 use super::{Segment, SegmentId};
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
@@ -10,77 +7,35 @@ use std::error::Error;
 use std::future::Future;
 use std::sync::Arc;
 
-/// Storage backend for defer segment metadata.
+/// Storage backend for segment metadata (topic, partition, consumer group).
 ///
-/// Manages segment metadata (topic, partition, `consumer_group`). Each
-/// Cassandra defer store uses [`LazySegment<CassandraSegmentStore>`] to
-/// persist segment metadata to Cassandra on first access.
-///
-/// # Implementations
-///
-/// - [`CassandraSegmentStore`]: Persists segment metadata to the
-///   `deferred_segments` table
-/// - [`MemorySegmentStore`]: In-memory implementation for testing only
-///
-/// [`LazySegment<CassandraSegmentStore>`]: super::LazySegment
-/// [`CassandraSegmentStore`]: super::CassandraSegmentStore
+/// Used via [`LazySegment`](super::LazySegment) to defer persistence until
+/// first access.
 pub trait SegmentStore: Clone + Send + Sync + 'static {
     /// Error type for segment operations.
     type Error: Error + ClassifyError + Send + Sync + 'static;
 
-    /// Gets or creates a segment for the given topic, partition, and consumer
-    /// group.
-    ///
-    /// This is the primary entry point for segment management. It:
-    /// 1. Computes the segment ID from the inputs
-    /// 2. Inserts segment metadata if not already present (idempotent)
-    /// 3. Returns the [`Segment`] with computed ID and metadata
-    ///
-    /// # Arguments
-    ///
-    /// * `segment` - Segment metadata to persist
-    ///
-    /// # Returns
-    ///
-    /// The segment with its computed ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if segment metadata insertion fails.
+    /// Persists segment metadata (idempotent).
     fn get_or_create_segment(
         &self,
         segment: Segment,
     ) -> impl Future<Output = Result<Segment, Self::Error>> + Send;
 
-    /// Retrieves segment metadata by ID.
-    ///
-    /// Used for diagnostics and observability. Returns `None` if the segment
-    /// doesn't exist.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - The segment ID to look up
-    ///
-    /// # Returns
-    ///
-    /// `Some(Segment)` if found, `None` otherwise.
+    /// Retrieves segment metadata by ID (for diagnostics).
     fn get_segment(
         &self,
         segment_id: &SegmentId,
     ) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
 }
 
-/// In-memory implementation of [`SegmentStore`] for testing.
-///
-/// Stores segments in a concurrent hash map. All data is volatile and lost
-/// on process exit.
+/// In-memory segment store for testing.
 #[derive(Clone, Debug, Default)]
 pub struct MemorySegmentStore {
     segments: Arc<scc::HashMap<SegmentId, Segment, ahash::RandomState>>,
 }
 
 impl MemorySegmentStore {
-    /// Creates a new empty memory segment store.
+    /// Creates an empty store.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -111,10 +66,7 @@ impl SegmentStore for MemorySegmentStore {
     }
 }
 
-/// Error type for [`MemorySegmentStore`] operations.
-///
-/// This store is infallible, so this enum has no variants and can never
-/// be constructed. It exists only to satisfy the `SegmentStore::Error` bound.
+/// Infallible error type (store never fails).
 #[derive(Debug, thiserror::Error)]
 pub enum MemorySegmentStoreError {}
 

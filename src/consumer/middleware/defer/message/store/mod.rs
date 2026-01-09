@@ -1,4 +1,15 @@
-//! Storage trait and implementations for defer middleware.
+//! Message defer storage backend.
+//!
+//! Manages per-key FIFO queues of deferred message offsets with shared retry
+//! counters. The [`MessageDeferStore`] trait abstracts over in-memory and
+//! Cassandra implementations.
+//!
+//! # Key Concepts
+//!
+//! - **Offset queue**: Each key maintains a FIFO queue of Kafka offsets
+//! - **Retry count**: Shared counter per key, reset on successful processing
+//! - **Segment isolation**: Stores are scoped to
+//!   `{topic}/{partition}:{consumer_group}`
 
 pub mod cached;
 pub mod cassandra;
@@ -18,65 +29,53 @@ pub use cassandra::{CassandraMessageDeferStore, CassandraMessageDeferStoreProvid
 pub use memory::{MemoryMessageDeferStore, MemoryMessageDeferStoreProvider};
 pub use provider::MessageDeferStoreProvider;
 
-/// Result of [`MessageDeferStore::complete_retry_success`].
+/// Outcome of completing a successful retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRetryCompletionResult {
-    /// More messages remain; `retry_count` has been reset to 0.
+    /// Queue has more messages; retry count reset to 0.
     MoreMessages {
-        /// The next (oldest) offset to retry.
+        /// Next offset to retry (oldest in queue).
         next_offset: Offset,
     },
 
-    /// No more messages; key has been deleted from storage.
+    /// Queue empty; key deleted from storage.
     Completed,
 }
 
 /// Storage backend for deferred message offsets.
 ///
-/// Manages a FIFO queue of offsets per key with a shared `retry_count`. The
-/// segment context (`topic/partition/consumer_group`) is established at
-/// store construction (internally for Cassandra stores).
+/// Each key maintains a FIFO queue of Kafka offsets with a shared retry
+/// counter. Segment context (`topic/partition/consumer_group`) is established
+/// at store construction.
 ///
 /// # Invariants
 ///
-/// - **First vs. additional**: Use
-///   [`defer_first_message`](Self::defer_first_message) for the first failure
-///   (initializes `retry_count`),
+/// - Use [`defer_first_message`](Self::defer_first_message) for first failure,
 ///   [`defer_additional_message`](Self::defer_additional_message) for
-///   subsequent messages. Mixing these corrupts state.
-/// - **FIFO ordering**: Messages retry in offset order; `retry_count` applies
-///   to the head.
-/// - **Cleanup**: [`complete_retry_success`](Self::complete_retry_success)
-///   handles queue progression and key deletion when empty.
+///   subsequent
+/// - Messages retry in offset order; retry count applies to queue head
+/// - [`complete_retry_success`](Self::complete_retry_success) advances queue or
+///   deletes key
 pub trait MessageDeferStore: Clone + Send + Sync + 'static {
     /// Error type. Must implement [`ClassifyError`] for retry decisions.
     type Error: Error + ClassifyError + Send + Sync + 'static;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Compound Operations
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Defers a message for the first time on this key.
-    ///
-    /// Appends the offset and initializes `retry_count = 0`.
+    /// Defers a message on a fresh key (initializes retry count to 0).
     ///
     /// # Precondition
     ///
-    /// Key must not already have deferred messages. See trait-level invariants.
+    /// Key must not already have deferred messages.
     fn defer_first_message(
         &self,
         key: &Key,
         offset: Offset,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Defers an additional message for an already-deferred key.
-    ///
-    /// Appends the offset without modifying `retry_count`. Queued messages
-    /// retry in FIFO order after the head succeeds.
+    /// Appends offset to an existing deferred key (preserves retry count).
     ///
     /// # Precondition
     ///
-    /// Key must already have deferred messages. See trait-level invariants.
+    /// Key must already have deferred messages.
     fn defer_additional_message(
         &self,
         key: &Key,
@@ -85,10 +84,8 @@ pub trait MessageDeferStore: Clone + Send + Sync + 'static {
         async move { self.append_deferred_message(key, offset).await }
     }
 
-    /// Completes a successful retry and advances or clears the queue.
-    ///
-    /// Removes `offset`, then either resets `retry_count = 0` for the next
-    /// message or deletes the key entirely if the queue is empty.
+    /// Removes offset after successful processing; resets retry count or
+    /// deletes key.
     fn complete_retry_success(
         &self,
         key: &Key,
@@ -107,9 +104,7 @@ pub trait MessageDeferStore: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Increments retry count after a failed retry attempt.
-    ///
-    /// Returns the new count for backoff calculation.
+    /// Increments retry count after failed attempt; returns new count.
     fn increment_retry_count(
         &self,
         key: &Key,
@@ -122,21 +117,14 @@ pub trait MessageDeferStore: Clone + Send + Sync + 'static {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Queries
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Returns the oldest deferred offset and current retry count, or `None`.
+    /// Returns oldest offset and retry count, or `None` if key not deferred.
     fn get_next_deferred_message(
         &self,
         key: &Key,
     ) -> impl Future<Output = Result<Option<(Offset, u32)>, Self::Error>> + Send;
 
-    /// Returns `retry_count` if key is deferred, `None` otherwise.
-    ///
-    /// Prefer over
-    /// [`get_next_deferred_message`](Self::get_next_deferred_message)
-    /// when you don't need the offset.
+    /// Returns retry count if deferred, `None` otherwise. Cheaper than
+    /// [`get_next_deferred_message`](Self::get_next_deferred_message).
     fn is_deferred(
         &self,
         key: &Key,
@@ -149,40 +137,27 @@ pub trait MessageDeferStore: Clone + Send + Sync + 'static {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Primitives (prefer compound operations above)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Appends an offset without modifying `retry_count`.
-    ///
-    /// Prefer [`defer_first_message`](Self::defer_first_message) or
-    /// [`defer_additional_message`](Self::defer_additional_message).
+    /// Low-level: appends offset without touching retry count.
     fn append_deferred_message(
         &self,
         key: &Key,
         offset: Offset,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Removes an offset without modifying `retry_count` or deleting the key.
-    ///
-    /// Prefer [`complete_retry_success`](Self::complete_retry_success).
+    /// Low-level: removes offset without cleanup.
     fn remove_deferred_message(
         &self,
         key: &Key,
         offset: Offset,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Internal (used by default implementations)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Sets `retry_count` directly. Used by default implementations.
+    /// Internal: sets retry count directly.
     fn set_retry_count(
         &self,
         key: &Key,
         retry_count: u32,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Deletes all data for a key. Used by default implementations.
+    /// Internal: deletes all data for a key.
     fn delete_key(&self, key: &Key) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

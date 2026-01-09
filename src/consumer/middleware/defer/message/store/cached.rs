@@ -1,58 +1,22 @@
-//! Write-through cache adapter for `MessageDeferStore` implementations.
-//!
-//! Provides [`CachedDeferStore`], a transparent caching layer that wraps any
-//! [`MessageDeferStore`] implementation to reduce store queries.
+//! Write-through cache for message defer stores.
 
 use super::{MessageDeferStore, MessageRetryCompletionResult};
 use crate::{Key, Offset};
 use quick_cache::sync::Cache;
 use std::sync::Arc;
 
-/// Type alias for the defer cache: maps message keys to their cached state.
-///
-/// The cached state is `Option<(Offset, u32)>`:
-/// - `None` means the key has no deferred messages
-/// - `Some((offset, retry_count))` is the first deferred message for the key
+/// Cache: `key` → `Option<(next_offset, retry_count)>`.
 type DeferCache = Cache<Key, Option<(Offset, u32)>>;
 
 #[cfg(test)]
 use crate::defer_store_tests;
 
-/// Write-through cache adapter for `MessageDeferStore` implementations.
+/// Write-through cache for any [`MessageDeferStore`].
 ///
-/// Caches the result of
-/// [`get_next_deferred_message`](MessageDeferStore::get_next_deferred_message)
-/// to reduce store queries. All mutations write through to the underlying store
-/// and update/invalidate the cache appropriately.
-///
-/// # Cache Strategy
-///
-/// - **Reads**: Check cache first, query store on miss, populate cache
-/// - **Writes**: Write to store first (for durability), then update/invalidate
-///   cache
-/// - **Consistency**: Conservative invalidation when new state is uncertain
-///
-/// # Cache Key
-///
-/// Uses the message key ([`Key`]) as the cache key.
-///
-/// # Cache Value
-///
-/// Stores `Option<(Offset, u32)>` - the result of `get_next_deferred_message`:
-/// - `Some((offset, retry_count))`: Key has deferred messages, next is at
-///   `offset`
-/// - `None`: Key has no deferred messages
-///
-/// # Usage
-///
-/// ```rust
-/// use prosody::consumer::middleware::defer::message::store::cached::CachedDeferStore;
-/// use prosody::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
-///
-/// let store = MemoryMessageDeferStore::new();
-/// let cached_store = CachedDeferStore::new(store, 10_000);
-/// // Use cached_store with MessageDeferStore methods
-/// ```
+/// Caches `get_next_deferred_message` results. Writes go to store first, then
+/// update or conservatively invalidate cache. Uses smart invalidation:
+/// monotonic appends preserve cache; out-of-order appends update to new
+/// minimum.
 #[derive(Clone)]
 pub struct CachedDeferStore<S> {
     store: S,
@@ -63,16 +27,7 @@ impl<S> CachedDeferStore<S>
 where
     S: MessageDeferStore,
 {
-    /// Creates a new cached store wrapping the underlying store.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - Underlying store implementation
-    /// * `capacity` - Maximum number of keys to cache
-    ///
-    /// # Returns
-    ///
-    /// A [`CachedDeferStore`] that transparently caches queries to `store`.
+    /// Wraps a store with a cache of the given capacity.
     #[must_use]
     pub fn new(store: S, capacity: usize) -> Self {
         Self {
@@ -81,34 +36,23 @@ where
         }
     }
 
-    /// Updates cache after appending an offset to the deferred queue.
-    ///
-    /// Uses smart invalidation: only updates/invalidates if the new offset
-    /// might change the cached minimum offset.
-    ///
-    /// # Strategy
-    ///
-    /// - If cached and `offset >= min_offset`: Preserve cache (monotonic
-    ///   append)
-    /// - If cached and `offset < min_offset`: Update cache with new minimum
-    /// - If not cached or was `None`: Invalidate (conservative)
+    /// Smart cache update: preserve if monotonic, update if new minimum,
+    /// invalidate if uncertain.
     fn update_cache_after_append(&self, key: &Key, offset: Offset) {
         if let Some(cached) = self.cache.get(key.as_ref())
             && let Some((min_offset, retry_count)) = cached
         {
             if offset >= min_offset {
-                // New offset doesn't change minimum (monotonic append case)
-                // Preserve cache - this is the common case for Kafka
+                // Monotonic append - cache stays valid
                 return;
             }
-            // New offset is smaller - update cache with new minimum
-            // Keep existing retry_count as it applies to the queue as a whole
+            // New minimum - update cache
             self.cache
                 .insert(Arc::clone(key), Some((offset, retry_count)));
             return;
         }
 
-        // No cached entry or was None - invalidate to be safe
+        // Unknown state - invalidate
         self.cache.remove(key.as_ref());
     }
 }
@@ -120,18 +64,12 @@ where
     type Error = S::Error;
 
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        // Write through to store first (for durability)
         self.store.defer_first_message(key, offset).await?;
 
-        // Pre-populate cache ONLY if we're confident this is truly the first message
+        // Populate cache only if we knew key was empty
         match self.cache.get(key.as_ref()) {
-            Some(None) => {
-                // Was cached as not-deferred - safe to update to deferred
-                self.cache.insert(Arc::clone(key), Some((offset, 0)));
-            }
+            Some(None) => self.cache.insert(Arc::clone(key), Some((offset, 0))),
             Some(Some(_)) | None => {
-                // Either already had deferred state (contract violation) or not cached
-                // Be conservative: invalidate so next read queries store for true minimum
                 self.cache.remove(key.as_ref());
             }
         }
@@ -140,12 +78,8 @@ where
     }
 
     async fn defer_additional_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        // Write through to store first
         self.store.defer_additional_message(key, offset).await?;
-
-        // Update cache using smart invalidation
         self.update_cache_after_append(key, offset);
-
         Ok(())
     }
 
@@ -154,17 +88,14 @@ where
         key: &Key,
         offset: Offset,
     ) -> Result<MessageRetryCompletionResult, Self::Error> {
-        // Write through to store first
         let result = self.store.complete_retry_success(key, offset).await?;
 
-        // Update cache based on result (store tells us exact new state)
+        // Result tells us exact new state
         match result {
             MessageRetryCompletionResult::MoreMessages { next_offset } => {
-                // More messages exist, retry_count reset to 0
                 self.cache.insert(Arc::clone(key), Some((next_offset, 0)));
             }
             MessageRetryCompletionResult::Completed => {
-                // Key deleted, no more messages
                 self.cache.insert(Arc::clone(key), None);
             }
         }
@@ -177,25 +108,21 @@ where
         key: &Key,
         current_retry_count: u32,
     ) -> Result<u32, Self::Error> {
-        // Write through to store first
         let new_count = self
             .store
             .increment_retry_count(key, current_retry_count)
             .await?;
 
-        // Update retry count in-place if we have a cached entry with offset.
-        // This is safe because retry_count changes don't affect offset ordering.
+        // Update in-place if cached (retry count is orthogonal to offset)
         if let Some(cached) = self.cache.get(key.as_ref())
-            && let Some((offset, _old_retry_count)) = cached
+            && let Some((offset, _)) = cached
         {
             self.cache
                 .insert(Arc::clone(key), Some((offset, new_count)));
             return Ok(new_count);
         }
 
-        // No cached entry or was None - invalidate so next read repopulates
         self.cache.remove(key.as_ref());
-
         Ok(new_count)
     }
 
@@ -203,73 +130,47 @@ where
         &self,
         key: &Key,
     ) -> Result<Option<(Offset, u32)>, Self::Error> {
-        // Check cache first
         if let Some(cached) = self.cache.get(key.as_ref()) {
             return Ok(cached);
         }
 
-        // Cache miss - query store
         let result = self.store.get_next_deferred_message(key).await?;
-
-        // Populate cache (including None for "not deferred")
         self.cache.insert(Arc::clone(key), result);
-
         Ok(result)
     }
 
     async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        // Write through to store first
         self.store.append_deferred_message(key, offset).await?;
-
-        // Update cache using smart invalidation
         self.update_cache_after_append(key, offset);
-
         Ok(())
     }
 
     async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        // Write through to store first
         self.store.remove_deferred_message(key, offset).await?;
-
-        // Invalidate: don't know if more messages exist.
-        // If this was the last offset, get_next_deferred_message would return None.
-        // If more offsets exist, we need to query to find the next one.
+        // Can't know next offset - invalidate
         self.cache.remove(key.as_ref());
-
         Ok(())
     }
 
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        // Write through to store first
         self.store.set_retry_count(key, retry_count).await?;
 
-        // Update retry count in-place if we have a cached entry with offset.
-        // This is safe because:
-        // 1. Retry count changes are orthogonal to offset ordering
-        // 2. If we have an offset cached, the key exists with offsets in store
-        // 3. set_retry_count doesn't remove offsets, so our cached offset remains valid
+        // Update in-place if cached (retry count is orthogonal to offset)
         if let Some(cached) = self.cache.get(key.as_ref())
-            && let Some((offset, _old_retry_count)) = cached
+            && let Some((offset, _)) = cached
         {
             self.cache
                 .insert(Arc::clone(key), Some((offset, retry_count)));
             return Ok(());
         }
 
-        // No cached entry or was None - invalidate to be safe
-        // (set_retry_count can create entry with empty offsets per trait semantics)
         self.cache.remove(key.as_ref());
-
         Ok(())
     }
 
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
-        // Write through to store first
         self.store.delete_key(key).await?;
-
-        // Update cache with known state: key is deleted
         self.cache.insert(Arc::clone(key), None);
-
         Ok(())
     }
 }

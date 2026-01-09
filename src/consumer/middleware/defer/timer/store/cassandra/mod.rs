@@ -1,26 +1,10 @@
-//! Cassandra-based implementation of [`TimerDeferStore`].
+//! Cassandra-backed timer defer store with TTL and span context preservation.
 //!
-//! Provides persistent storage for deferred timers using Apache Cassandra
-//! with automatic schema migration and optimized TTL management.
+//! # Year 2038 Note
 //!
-//! # Year 2038 Limitation
-//!
-//! `original_time` is stored as Cassandra `int` (i32) but represents a u32
-//! Unix timestamp. Values ≥2^31 (2038-01-19 03:14:07 UTC) are stored as
-//! negative i32. Cassandra sorts negative before positive, so:
-//!
-//! - **Pre-2038 only**: Correct order (all positive i32, ascending)
-//! - **Post-2038 only**: Correct order (all negative i32, ascending within
-//!   negatives)
-//! - **Spanning 2038**: **Incorrect** - post-2038 timers (negative) sort before
-//!   pre-2038 (positive)
-//!
-//! **Why acceptable**: Timer defer handles retry delays (seconds to hours).
-//! A single key having deferred timers that span the 2038 boundary requires
-//! timers to remain deferred for 12+ years - not a realistic scenario.
-//!
-//! See [`get_slab_range`](crate::timers::store::cassandra) for the two-query
-//! wrap-around solution if this limitation ever needs addressing.
+//! `original_time` (u32 Unix timestamp) is stored as Cassandra `int` (i32).
+//! Post-2038 values appear negative and sort before positive. This only affects
+//! keys with timers spanning the 2038 boundary - unrealistic for retry delays.
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
@@ -48,29 +32,18 @@ pub mod queries;
 
 pub use queries::Queries as TimerQueries;
 
-/// Cassandra-based implementation of [`TimerDeferStore`].
+/// Cassandra-backed timer defer store.
 ///
-/// Provides persistent storage for deferred timers with automatic TTL
-/// management and retry count tracking via static columns.
+/// # Storage Model
 ///
-/// # Design
+/// - **Partition key**: `(segment_id, key)` where segment = `UUIDv5` of
+///   `{topic}/{partition}:{consumer_group}`
+/// - **Clustering**: `original_time ASC` for FIFO ordering
+/// - **Retry count**: Static column (shared per key)
+/// - **Span context**: `frozen<map<text, text>>` (W3C trace format)
+/// - **TTL**: Time-based via [`CassandraStore::calculate_ttl()`]
 ///
-/// - **Two tables**: `deferred_segments` (metadata) and `deferred_timers`
-///   (data)
-/// - **Partition key**: `(segment_id, key)` in timers table
-/// - **Clustering column**: `original_time ASC` ensures FIFO processing
-/// - **Segment ID**: `UUIDv5` hash of `{topic}/{partition}:{consumer_group}`
-/// - **Retry count**: Stored as static column (shared across all timers for a
-///   key)
-/// - **TTL management**: Uses `CassandraStore::calculate_ttl(original_time)`
-/// - **Span storage**: `frozen<map<text, text>>` for OpenTelemetry W3C context
-///
-/// # Lazy Initialization
-///
-/// The store uses a [`LazySegment`] which defers segment persistence to
-/// Cassandra until first use. This allows the store to be created in
-/// synchronous context (e.g., `handler_for_partition`) while deferring I/O to
-/// the first async operation.
+/// Uses [`LazySegment`] to defer segment persistence until first access.
 #[derive(Clone)]
 pub struct CassandraTimerDeferStore {
     store: CassandraStore,
@@ -79,9 +52,7 @@ pub struct CassandraTimerDeferStore {
 }
 
 impl CassandraTimerDeferStore {
-    /// Creates a new Cassandra timer defer store for the given partition.
-    ///
-    /// The `segment_store` is used to persist segment metadata on first access.
+    /// Creates a store; segment persisted lazily on first access.
     #[must_use]
     pub fn new(
         store: CassandraStore,
@@ -99,23 +70,20 @@ impl CassandraTimerDeferStore {
         }
     }
 
-    /// Returns a reference to the Cassandra session.
     fn session(&self) -> &Session {
         self.store.session()
     }
 
-    /// Returns a reference to the OpenTelemetry propagator.
     fn propagator(&self) -> &TextMapCompositePropagator {
         self.store.propagator()
     }
 
-    /// Gets the segment ID, lazily initializing and persisting if needed.
     async fn segment_id(&self) -> Result<uuid::Uuid, CassandraDeferStoreError> {
         let segment = self.segment.get().await?;
         Ok(segment.id())
     }
 
-    /// Injects span context into a map for storage.
+    /// Serializes span context to W3C trace format for storage.
     fn inject_span_context(&self, trigger: &Trigger) -> HashMap<String, String> {
         let span = trigger.span();
         let context = span.context();
@@ -124,7 +92,7 @@ impl CassandraTimerDeferStore {
         span_map
     }
 
-    /// Extracts span context from stored map and creates a new linked span.
+    /// Deserializes span context and creates linked span.
     fn extract_and_create_span(
         &self,
         key: &Key,
@@ -132,11 +100,7 @@ impl CassandraTimerDeferStore {
         span_map: &HashMap<String, String>,
     ) -> tracing::Span {
         let context = self.propagator().extract(span_map);
-        let span = info_span!(
-            "timer_defer.load",
-            key = %key,
-            time = %time,
-        );
+        let span = info_span!("timer_defer.load", key = %key, time = %time);
         let _ = span.set_parent(context);
         span
     }
@@ -183,16 +147,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         Ok(())
     }
 
-    // Note: This query relies on Cassandra's ASC clustering order to return the
-    // oldest timer. CompactDateTime (u32) is stored as i32 in Cassandra, causing
-    // values >= 2^31 (year 2038+) to appear negative. Since Cassandra sorts
-    // negative values before positive, a key with timers spanning the 2038
-    // boundary would return post-2038 timers first (incorrect FIFO order).
-    //
-    // This is acceptable because timer defer handles retry delays (seconds to
-    // hours), not multi-year spans. A single key spanning 2038 is not a
-    // realistic scenario. If needed, see `get_slab_range` in the timer store
-    // for the two-query wrap-around solution.
+    // See module docs for year 2038 limitation discussion.
     #[instrument(level = "debug", skip(self), err)]
     async fn get_next_deferred_timer(
         &self,
@@ -219,8 +174,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             )>()
             .map_err(CassandraStoreError::from)?;
 
-        // Filter out rows where original_time is NULL (only static column set,
-        // no clustering rows)
+        // NULL time means static column exists but no clustering rows
         Ok(
             row_opt.and_then(|(time_opt, span_map_opt, retry_count_opt)| {
                 time_opt.map(|time| {
@@ -242,7 +196,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         let ttl = self.store.calculate_ttl(trigger.time);
         let span_map = self.inject_span_context(trigger);
 
-        // Don't include retry_count in INSERT - leaves static column unchanged
+        // Omitting retry_count preserves static column
         self.session()
             .execute_unpaged(
                 &self.queries.insert_deferred_timer_without_retry_count,
@@ -380,25 +334,10 @@ fn deferred_times_stream(
     }
 }
 
-/// Provider for creating [`CassandraTimerDeferStore`] instances.
+/// Factory for partition-scoped Cassandra timer defer stores.
 ///
-/// Holds shared resources (Cassandra session, prepared queries, segment store)
-/// and creates store instances with the correct segment context for each
-/// partition.
-///
-/// # Usage
-///
-/// ```text
-/// // Create provider once at startup
-/// let provider = CassandraTimerDeferStoreProvider::new(
-///     cassandra_store,
-///     queries,
-///     segment_store,
-/// );
-///
-/// // Create stores for each partition as needed
-/// let store = provider.create_store(topic, partition, &consumer_group);
-/// ```
+/// Holds shared Cassandra resources; creates stores with correct segment
+/// context per partition.
 #[derive(Clone, Debug)]
 pub struct CassandraTimerDeferStoreProvider {
     store: CassandraStore,
@@ -407,13 +346,7 @@ pub struct CassandraTimerDeferStoreProvider {
 }
 
 impl CassandraTimerDeferStoreProvider {
-    /// Creates a new provider with the given Cassandra resources.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - Shared Cassandra store
-    /// * `queries` - Pre-prepared timer defer queries
-    /// * `segment_store` - Segment store for persisting segment metadata
+    /// Creates a provider with shared Cassandra resources.
     #[must_use]
     pub fn new(
         store: CassandraStore,

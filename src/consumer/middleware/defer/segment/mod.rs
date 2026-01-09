@@ -1,24 +1,15 @@
-//! Segment infrastructure for defer middleware.
+//! Segment identity for defer stores.
 //!
-//! Provides shared segment identification and management for both message
-//! and timer defer stores. A segment represents the context of a specific
-//! `topic/partition/consumer_group` combination.
+//! A **segment** is a `UUIDv5` hash of `{topic}/{partition}:{consumer_group}`,
+//! serving as the partition key prefix in Cassandra. This provides:
 //!
-//! # Architecture
+//! - **Data locality**: All deferred items for a partition colocate
+//! - **Isolation**: Different consumer groups don't conflict
+//! - **Stability**: Deterministic IDs survive restarts
 //!
-//! Both message defer and timer defer share the same segment concept:
-//! - **Same segment ID**: Both compute identical `UUIDv5` from
-//!   `{topic}/{partition}:{consumer_group}`
-//! - **Different data tables**: `deferred_offsets` for messages,
-//!   `deferred_timers` for timers
-//!
-//! # Lifecycle
-//!
-//! 1. [`CassandraSegmentStore`] is created once with prepared queries
-//! 2. Each Cassandra defer store receives a clone and wraps it in
-//!    [`LazySegment`]
-//! 3. On first store access, the segment is persisted to Cassandra
-//! 4. Stores use `segment.id()` for their storage operations
+//! Message and timer stores share segment IDs but use separate tables.
+//! [`LazySegment`] defers persistence until first I/O, enabling synchronous
+//! store creation in `handler_for_partition`.
 
 pub mod cassandra;
 pub mod lazy;
@@ -35,50 +26,22 @@ pub use store::SegmentStore;
 #[cfg(test)]
 pub use store::{MemorySegmentStore, MemorySegmentStoreError};
 
-/// Unique identifier for a defer segment.
-///
-/// A segment represents the context of `{topic}/{partition}:{consumer_group}`.
-/// All deferred messages and timers for a given segment share the same
-/// partition key prefix in storage.
+/// `UUIDv5` identifier for a `{topic}/{partition}:{consumer_group}` context.
 pub type SegmentId = Uuid;
 
-/// Segment metadata for observability and reconstruction.
+/// Segment metadata: ID plus source context (topic, partition, consumer group).
 ///
-/// Stores the context needed to identify and manage a defer segment.
-/// The segment ID is computed deterministically from the topic, partition,
-/// and consumer group.
-///
-/// # Shared Ownership
-///
-/// `Segment` is designed to be cloned and shared between message and timer
-/// defer handlers. The internal types (`Topic`, `ConsumerGroup`) are cheap
-/// to clone (`Intern<str>`, `Arc<str>`).
+/// Cheap to clone; internal types use `Intern<str>` and `Arc<str>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
-    /// Unique segment identifier (`UUIDv5` hash).
     id: SegmentId,
-
-    /// Kafka topic.
     topic: Topic,
-
-    /// Kafka partition.
     partition: Partition,
-
-    /// Consumer group ID.
     consumer_group: ConsumerGroup,
 }
 
 impl Segment {
-    /// Creates a new segment with computed ID.
-    ///
-    /// The segment ID is computed deterministically from the topic, partition,
-    /// and consumer group using [`compute_segment_id`].
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - Kafka topic
-    /// * `partition` - Kafka partition
-    /// * `consumer_group` - Consumer group ID
+    /// Creates a segment with computed ID.
     #[must_use]
     pub fn new(topic: Topic, partition: Partition, consumer_group: ConsumerGroup) -> Self {
         let id = compute_segment_id(topic, partition, &consumer_group);
@@ -90,16 +53,7 @@ impl Segment {
         }
     }
 
-    /// Creates a segment from existing ID and metadata.
-    ///
-    /// Used when loading segment metadata from storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Pre-computed segment ID
-    /// * `topic` - Kafka topic
-    /// * `partition` - Kafka partition
-    /// * `consumer_group` - Consumer group ID
+    /// Creates a segment from existing ID (used when loading from storage).
     #[must_use]
     pub fn with_id(
         id: SegmentId,
@@ -115,46 +69,32 @@ impl Segment {
         }
     }
 
-    /// Returns the segment's unique identifier.
+    /// Segment ID (`UUIDv5`).
     #[must_use]
     pub fn id(&self) -> SegmentId {
         self.id
     }
 
-    /// Returns the Kafka topic.
+    /// Kafka topic.
     #[must_use]
     pub fn topic(&self) -> &Topic {
         &self.topic
     }
 
-    /// Returns the Kafka partition.
+    /// Kafka partition.
     #[must_use]
     pub fn partition(&self) -> Partition {
         self.partition
     }
 
-    /// Returns the consumer group ID.
+    /// Consumer group ID.
     #[must_use]
     pub fn consumer_group(&self) -> &ConsumerGroup {
         &self.consumer_group
     }
 }
 
-/// Computes a deterministic segment ID from topic, partition, and consumer
-/// group.
-///
-/// Uses `UUIDv5` with OID namespace to generate a reproducible identifier from
-/// the string `"{topic}/{partition}:{consumer_group}"`.
-///
-/// # Arguments
-///
-/// * `topic` - Kafka topic
-/// * `partition` - Kafka partition
-/// * `consumer_group` - Consumer group ID
-///
-/// # Returns
-///
-/// A deterministic [`SegmentId`] (UUID) for this segment.
+/// Computes `UUIDv5(OID, "{topic}/{partition}:{consumer_group}")`.
 #[must_use]
 pub fn compute_segment_id(topic: Topic, partition: Partition, consumer_group: &str) -> SegmentId {
     let input = format!("{topic}/{partition}:{consumer_group}");

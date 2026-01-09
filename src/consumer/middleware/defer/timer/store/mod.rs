@@ -1,7 +1,7 @@
-//! Storage trait and implementations for timer defer middleware.
+//! Timer defer storage backend.
 //!
-//! Provides [`TimerDeferStore`] trait for managing deferred timers with
-//! FIFO ordering per key and retry count tracking.
+//! Manages per-key FIFO queues of deferred timers with shared retry counters
+//! and OpenTelemetry span context preservation.
 
 pub mod cached;
 pub mod cassandra;
@@ -26,74 +26,55 @@ pub use cassandra::{CassandraTimerDeferStore, CassandraTimerDeferStoreProvider};
 pub use memory::{MemoryTimerDeferStore, MemoryTimerDeferStoreProvider};
 pub use provider::TimerDeferStoreProvider;
 
-/// Result of [`TimerDeferStore::complete_retry_success`].
+/// Outcome of completing a successful timer retry.
 #[derive(Debug, Clone)]
 pub enum TimerRetryCompletionResult {
-    /// More timers remain; `retry_count` has been reset to 0.
+    /// Queue has more timers; retry count reset to 0.
     MoreTimers {
-        /// The next timer's original fire time (for scheduling).
+        /// Next timer's fire time (for scheduling).
         next_time: CompactDateTime,
-        /// The next timer's parent trace context for span reconstruction.
+        /// Parent trace context for span reconstruction.
         context: Context,
     },
 
-    /// No more timers; key has been deleted from storage.
+    /// Queue empty; key deleted from storage.
     Completed,
 }
 
 /// Storage backend for deferred timer entries.
 ///
-/// Manages a FIFO queue of timers per key with a shared `retry_count`. The
-/// segment context (`topic/partition/consumer_group`) is established at
-/// store construction (internally for Cassandra stores).
-///
-/// # Invariants
-///
-/// - **First vs. additional**: Use
-///   [`defer_first_timer`](Self::defer_first_timer) for the first failure
-///   (initializes `retry_count`),
-///   [`defer_additional_timer`](Self::defer_additional_timer) for subsequent
-///   timers. Mixing these corrupts state.
-/// - **FIFO ordering**: Timers retry in `original_time` order; `retry_count`
-///   applies to the head.
-/// - **Cleanup**: [`complete_retry_success`](Self::complete_retry_success)
-///   handles queue progression and key deletion when empty.
+/// Each key maintains a FIFO queue of timers (indexed by `original_time`) with
+/// a shared retry counter. Segment context is established at construction.
 ///
 /// # Key Differences from `MessageDeferStore`
 ///
-/// - Methods accept `Trigger` for trace context (span serialized to storage)
-/// - `get_next_deferred_timer` returns `Option<(Trigger, u32)>` with restored
-///   span
-/// - Timers are indexed by `original_time` (not offset)
+/// - Stores `Trigger` with serialized span context (W3C trace format)
+/// - Reconstructs spans on read via `span.set_parent(context)`
+///
+/// # Invariants
+///
+/// - Use [`defer_first_timer`](Self::defer_first_timer) for first failure,
+///   [`defer_additional_timer`](Self::defer_additional_timer) for subsequent
+/// - Timers retry in time order; retry count applies to queue head
 pub trait TimerDeferStore: Clone + Send + Sync + 'static {
     /// Error type. Must implement [`ClassifyError`] for retry decisions.
     type Error: Error + ClassifyError + Send + Sync + 'static;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Compound Operations
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Defers a timer for the first time on this key.
-    ///
-    /// Stores the timer entry with its span context and initializes
-    /// `retry_count = 0`.
+    /// Defers a timer on a fresh key (initializes retry count to 0).
     ///
     /// # Precondition
     ///
-    /// Key must not already have deferred timers. See trait-level invariants.
+    /// Key must not already have deferred timers.
     fn defer_first_timer(
         &self,
         trigger: &Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Defers an additional timer for an already-deferred key.
-    ///
-    /// Appends the timer without modifying `retry_count`. Queued timers
-    /// retry in FIFO order after the head succeeds.
+    /// Appends timer to an existing deferred key (preserves retry count).
     ///
     /// # Precondition
     ///
-    /// Key must already have deferred timers. See trait-level invariants.
+    /// Key must already have deferred timers.
     fn defer_additional_timer(
         &self,
         trigger: &Trigger,
@@ -101,10 +82,8 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
         async move { self.append_deferred_timer(trigger).await }
     }
 
-    /// Completes a successful retry and advances or clears the queue.
-    ///
-    /// Removes the timer at `time`, then either resets `retry_count = 0` for
-    /// the next timer or deletes the key entirely if the queue is empty.
+    /// Removes timer after successful processing; resets retry count or
+    /// deletes key.
     fn complete_retry_success(
         &self,
         key: &Key,
@@ -127,9 +106,7 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Increments retry count after a failed retry attempt.
-    ///
-    /// Returns the new count for backoff calculation.
+    /// Increments retry count after failed attempt; returns new count.
     fn increment_retry_count(
         &self,
         key: &Key,
@@ -142,23 +119,14 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Queries
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Returns the oldest deferred timer and current retry count, or `None`.
-    ///
-    /// The returned `Trigger` contains a freshly-constructed span linked to
-    /// the stored parent context via `span.set_parent(context)`.
+    /// Returns oldest timer (with reconstructed span) and retry count.
     fn get_next_deferred_timer(
         &self,
         key: &Key,
     ) -> impl Future<Output = Result<Option<(Trigger, u32)>, Self::Error>> + Send;
 
-    /// Returns `retry_count` if key is deferred, `None` otherwise.
-    ///
-    /// Prefer over [`get_next_deferred_timer`](Self::get_next_deferred_timer)
-    /// when you don't need the timer data.
+    /// Returns retry count if deferred, `None` otherwise. Cheaper than
+    /// [`get_next_deferred_timer`](Self::get_next_deferred_timer).
     fn is_deferred(
         &self,
         key: &Key,
@@ -171,74 +139,47 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Returns a stream of all deferred timer times for a key, sorted
-    /// ascending.
-    ///
-    /// Used by `TimerDeferContext::scheduled()` to merge deferred times
-    /// with active timer times for a unified view. Times are streamed in
-    /// ascending order (Cassandra clustering order or `BTreeMap` key order).
+    /// Streams all deferred times for a key (ascending order).
     fn deferred_times(
         &self,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Primitives (prefer compound operations above)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Appends a timer without modifying `retry_count`.
-    ///
-    /// Prefer [`defer_first_timer`](Self::defer_first_timer) or
-    /// [`defer_additional_timer`](Self::defer_additional_timer).
+    /// Low-level: appends timer without touching retry count.
     fn append_deferred_timer(
         &self,
         trigger: &Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Removes a timer without modifying `retry_count` or deleting the key.
-    ///
-    /// Prefer [`complete_retry_success`](Self::complete_retry_success).
+    /// Low-level: removes timer without cleanup.
     fn remove_deferred_timer(
         &self,
         key: &Key,
         time: CompactDateTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Internal (used by default implementations)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Sets `retry_count` directly. Used by default implementations.
+    /// Internal: sets retry count directly.
     fn set_retry_count(
         &self,
         key: &Key,
         retry_count: u32,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Deletes all data for a key. Used by default implementations.
+    /// Internal: deletes all data for a key.
     fn delete_key(&self, key: &Key) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Cached entry for timer defer state.
+/// Cached timer state: time, trace context, and retry count.
 ///
-/// Stores the minimum timer's original time, parent trace context for span
-/// reconstruction, and current retry count.
-///
-/// # Why Cache `Context` Instead of `Trigger`
-///
-/// The timer system uses `Arc<ArcSwap<Span>>` - when processing completes,
-/// the span is replaced with `Span::none()`. Caching `Trigger` directly would
-/// cause subsequent cache reads to get dead spans.
-///
-/// Instead, we cache the extracted `Context` (containing only upstream trace
-/// identifiers) and create fresh spans at each access site using
+/// Caches `Context` rather than `Trigger` because spans get replaced with
+/// `Span::none()` after processing. Fresh spans are created at read time via
 /// `span.set_parent(context)`.
 #[derive(Clone, Debug)]
 pub struct CachedTimerEntry {
-    /// Earliest timer's original fire time.
+    /// Earliest timer's fire time.
     pub time: CompactDateTime,
-    /// Extracted parent trace context for span reconstruction.
+    /// Parent trace context for span reconstruction.
     pub context: Context,
-    /// Current retry count for backoff calculation.
+    /// Retry count for backoff calculation.
     pub retry_count: u32,
 }

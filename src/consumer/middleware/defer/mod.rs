@@ -1,35 +1,31 @@
-//! Defer middleware for handling transient failures.
+//! Defer middleware for transient failure recovery.
 //!
-//! This module provides deferral handling for both messages and timers,
-//! allowing keys to be unblocked between retry attempts while maintaining
-//! ordering guarantees.
+//! When a message or timer fails transiently (network error, timeout), it must
+//! be retried—but blocking the key during backoff would stall all subsequent
+//! items. The defer system solves this by:
 //!
-//! # Store Types
+//! 1. **Persisting** the failed item to a per-key FIFO queue
+//! 2. **Unblocking** the key so later items can process
+//! 3. **Rescheduling** a retry after exponential backoff
+//! 4. **Restoring** the key's blocked state when retry fires
 //!
-//! Two store types are available:
-//! - `Memory`: In-memory storage for testing
-//! - `Cassandra`: Persistent Cassandra storage for production
+//! This maintains per-key ordering (critical for Kafka semantics) while
+//! allowing cross-key parallelism during retry delays.
+//!
+//! # Modules
+//!
+//! - `segment`: Partition identity (`UUIDv5` of `topic/partition:group`)
+//! - `message`: Kafka offset queues with retry counts
+//! - `timer`: Timer queues with span context and retry counts
+//!
+//! # Store Backends
+//!
+//! - **Memory**: Volatile, for testing
+//! - **Cassandra**: Persistent, for production (with write-through cache)
 //!
 //! # Composability
 //!
-//! Message and timer defer middlewares can be composed independently via
-//! `.layer()`.
-//!
-//! ```rust,ignore
-//! let message_middleware = MessageDeferMiddleware::new(
-//!     config.clone(), consumer_config, &scheduler_config,
-//!     MessageStoreKind::Memory, failure_tracker.clone(), &heartbeats,
-//! )?;
-//! let timer_middleware = TimerDeferMiddleware::new(
-//!     config, TimerStoreKind::Memory, failure_tracker, consumer_config,
-//! );
-//!
-//! let provider = common_middleware
-//!     .layer(timer_middleware)
-//!     .layer(message_middleware)
-//!     .layer(retry_middleware)
-//!     .into_provider(handler);
-//! ```
+//! Message and timer defer middlewares compose independently via `.layer()`.
 
 use crate::timers::duration::CompactDuration;
 use rand::Rng;

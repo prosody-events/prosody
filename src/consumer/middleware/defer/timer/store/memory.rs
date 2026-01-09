@@ -1,10 +1,6 @@
-//! In-memory implementation of `TimerDeferStore` for testing.
+//! In-memory timer defer store for testing.
 //!
-//! Provides [`MemoryTimerDeferStore`], a lock-free, concurrent implementation
-//! of the [`TimerDeferStore`] trait using [`scc::HashMap`].
-//!
-//! All data is held in memory and lost on process exit. Not suitable for
-//! production use where persistence across restarts is required.
+//! Uses [`scc::HashMap`] for lock-free concurrent access. All data is volatile.
 
 use super::TimerDeferStore;
 use super::provider::TimerDeferStoreProvider;
@@ -22,70 +18,47 @@ use std::sync::Arc;
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// Stored timer entry with span context for reconstruction.
+/// Timer entry with span context for reconstruction.
 #[derive(Clone, Debug)]
 struct StoredTimer {
-    /// The timer's key (copied for reconstruction).
     key: Key,
-    /// Original fire time (used as ordering key).
     time: CompactDateTime,
-    /// Parent trace context extracted from original span.
     context: Context,
 }
 
 impl StoredTimer {
-    /// Creates a stored timer entry from a trigger.
     fn from_trigger(trigger: &Trigger) -> Self {
-        // Extract the parent context from the trigger's span
         let span = trigger.span();
-        let context = span.context();
-
         Self {
             key: trigger.key.clone(),
             time: trigger.time,
-            context,
+            context: span.context(),
         }
     }
 
-    /// Reconstructs a trigger with a fresh span linked to the stored context.
+    /// Reconstructs trigger with fresh span linked to stored context.
     fn to_trigger(&self) -> Trigger {
-        // Create a new span and link it to the stored context
-        let span = info_span!(
-            "timer_defer.load",
-            key = %self.key,
-            time = %self.time,
-        );
+        let span = info_span!("timer_defer.load", key = %self.key, time = %self.time);
         let _ = span.set_parent(self.context.clone());
-
         Trigger::new(self.key.clone(), self.time, TimerType::Application, span)
     }
 }
 
-/// In-memory implementation of [`TimerDeferStore`] for testing and
-/// development.
+/// In-memory timer defer store.
 ///
-/// Uses [`scc::HashMap`] for lock-free concurrent access. Stores multiple
-/// timers per key (queue) with a shared retry counter. All data is
-/// volatile - deferred state is lost when the process exits.
+/// Lock-free via [`scc::HashMap`]. Each key maps to a
+/// `BTreeMap<CompactDateTime, StoredTimer>` (sorted queue) plus a shared retry
+/// counter. Thread-safe and cheap to clone.
 ///
-/// # Thread Safety
-///
-/// Safe to clone and use from multiple threads. All operations are atomic
-/// per message key.
-///
-/// # Design
-///
-/// Each store instance is created for a specific segment
-/// (`topic/partition/consumer_group`). The internal `HashMap` keys by message
-/// key only, with segment isolation handled by having separate store instances
-/// per partition.
+/// Each store instance is scoped to a segment; partition isolation comes from
+/// creating separate instances per partition.
 #[derive(Clone, Debug)]
 pub struct MemoryTimerDeferStore {
     inner: Arc<Inner>,
 }
 
 impl MemoryTimerDeferStore {
-    /// Creates a new empty in-memory timer defer store.
+    /// Creates an empty store.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -100,14 +73,9 @@ impl Default for MemoryTimerDeferStore {
     }
 }
 
-/// Internal state for [`MemoryTimerDeferStore`].
-///
-/// Maps each key to:
-/// - `BTreeMap<CompactDateTime, StoredTimer>`: Sorted timers (oldest first)
-/// - `u32`: Shared retry counter for this key
+/// Storage: `key` → (`sorted timers`, `retry_count`).
 #[derive(Debug)]
 struct Inner {
-    /// Storage: `key` -> (`timers by time`, `retry_count`)
     deferred: HashMap<Key, (BTreeMap<CompactDateTime, StoredTimer>, u32), RandomState>,
 }
 
@@ -242,15 +210,12 @@ impl TimerDeferStore for MemoryTimerDeferStore {
     }
 }
 
-/// Provider for creating [`MemoryTimerDeferStore`] instances.
-///
-/// Simple provider that creates isolated in-memory stores for each partition.
-/// Each store instance has its own `HashMap`, ensuring partition isolation.
+/// Creates isolated in-memory stores per partition.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryTimerDeferStoreProvider;
 
 impl MemoryTimerDeferStoreProvider {
-    /// Creates a new memory timer defer store provider.
+    /// Creates a new provider.
     #[must_use]
     pub fn new() -> Self {
         Self

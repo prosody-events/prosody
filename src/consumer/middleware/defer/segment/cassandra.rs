@@ -1,6 +1,4 @@
-//! Cassandra-based implementation of [`SegmentStore`].
-//!
-//! Provides persistent storage for segment metadata using Apache Cassandra.
+//! Cassandra-backed segment persistence.
 
 use super::store::SegmentStore;
 use super::{Segment, SegmentId};
@@ -15,15 +13,14 @@ use thiserror::Error;
 use tracing::instrument;
 
 cassandra_queries! {
-    /// Prepared statements for segment metadata operations.
     struct SegmentQueries {
-        /// Inserts segment metadata (idempotent via INSERT without IF NOT EXISTS).
+        /// Upsert segment metadata.
         insert_segment: (
             "INSERT INTO $keyspace.{} (id, topic, partition, consumer_group) VALUES (?, ?, ?, ?)",
             TABLE_DEFERRED_SEGMENTS
         ),
 
-        /// Gets segment metadata by ID.
+        /// Get segment by ID.
         get_segment: (
             "SELECT topic, partition, consumer_group FROM $keyspace.{} WHERE id = ?",
             TABLE_DEFERRED_SEGMENTS
@@ -31,9 +28,7 @@ cassandra_queries! {
     }
 }
 
-/// Cassandra-based implementation of [`SegmentStore`].
-///
-/// Persists segment metadata to the `deferred_segments` table.
+/// Cassandra-backed segment store.
 #[derive(Clone, Debug)]
 pub struct CassandraSegmentStore {
     store: CassandraStore,
@@ -41,12 +36,7 @@ pub struct CassandraSegmentStore {
 }
 
 impl CassandraSegmentStore {
-    /// Creates a new Cassandra segment store.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - The Cassandra store (session holder)
-    /// * `keyspace` - Cassandra keyspace for query preparation
+    /// Creates a store; prepares queries against the given keyspace.
     ///
     /// # Errors
     ///
@@ -59,7 +49,6 @@ impl CassandraSegmentStore {
         Ok(Self { store, queries })
     }
 
-    /// Returns a reference to the Cassandra session.
     fn session(&self) -> &Session {
         self.store.session()
     }
@@ -70,8 +59,6 @@ impl SegmentStore for CassandraSegmentStore {
 
     #[instrument(level = "debug", skip(self), err)]
     async fn get_or_create_segment(&self, segment: Segment) -> Result<Segment, Self::Error> {
-        // Insert segment metadata (idempotent - INSERT without IF NOT EXISTS
-        // is a no-op if the row already exists with the same primary key)
         let topic: &str = segment.topic().as_ref();
         let consumer_group: &str = segment.consumer_group().as_ref();
 
@@ -111,7 +98,7 @@ impl SegmentStore for CassandraSegmentStore {
     }
 }
 
-/// Errors that can occur in Cassandra segment store operations.
+/// Cassandra segment store errors.
 #[derive(Debug, Error)]
 pub enum CassandraSegmentStoreError {
     /// Error from Cassandra operations.

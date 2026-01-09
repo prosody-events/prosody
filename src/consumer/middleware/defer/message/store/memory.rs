@@ -1,27 +1,6 @@
-//! In-memory implementation of `MessageDeferStore` for testing.
+//! In-memory message defer store for testing.
 //!
-//! Provides [`MemoryMessageDeferStore`], a lock-free, concurrent implementation
-//! of the [`MessageDeferStore`] trait using [`scc::HashMap`].
-//!
-//! # Usage
-//!
-//! ```rust
-//! use prosody::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStoreProvider;
-//! use prosody::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
-//! use prosody::{Partition, Topic};
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let provider = MemoryMessageDeferStoreProvider::new();
-//! let store = provider
-//!     .create_store(Topic::from("test"), Partition::from(0), "consumer-group")
-//!     .await?;
-//! // Use store with MessageDeferStore methods
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! All data is held in memory and lost on process exit. Not suitable for
-//! production use where persistence across restarts is required.
+//! Uses [`scc::HashMap`] for lock-free concurrent access. All data is volatile.
 
 use super::MessageDeferStore;
 use super::provider::MessageDeferStoreProvider;
@@ -35,31 +14,20 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-/// In-memory implementation of [`MessageDeferStore`] for testing and
-/// development.
+/// In-memory message defer store.
 ///
-/// Uses [`scc::HashMap`] for lock-free concurrent access. Stores multiple
-/// offsets per key (queue) with a shared retry counter. All data is
-/// volatile - deferred state is lost when the process exits.
+/// Lock-free via [`scc::HashMap`]. Each key maps to a `BTreeSet<Offset>`
+/// (sorted queue) plus a shared retry counter. Thread-safe and cheap to clone.
 ///
-/// # Thread Safety
-///
-/// Safe to clone and use from multiple threads. All operations are atomic
-/// per message key.
-///
-/// # Design
-///
-/// Each store instance is created for a specific segment
-/// (`topic/partition/consumer_group`). The internal `HashMap` keys by message
-/// key only, with segment isolation handled by having separate store instances
-/// per partition.
+/// Each store instance is scoped to a segment; partition isolation comes from
+/// creating separate instances per partition.
 #[derive(Clone, Debug)]
 pub struct MemoryMessageDeferStore {
     inner: Arc<Inner>,
 }
 
 impl MemoryMessageDeferStore {
-    /// Creates a new empty in-memory defer store.
+    /// Creates an empty store.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -74,14 +42,9 @@ impl Default for MemoryMessageDeferStore {
     }
 }
 
-/// Internal state for [`MemoryMessageDeferStore`].
-///
-/// Maps each message key to:
-/// - `BTreeSet<Offset>`: Sorted offsets (oldest first)
-/// - `u32`: Shared retry counter for this key
+/// Storage: `key` → (`sorted offsets`, `retry_count`).
 #[derive(Debug)]
 struct Inner {
-    /// Storage: `message_key` -> (`offsets`, `retry_count`)
     deferred: HashMap<Key, (BTreeSet<Offset>, u32), RandomState>,
 }
 
@@ -182,15 +145,12 @@ impl MessageDeferStore for MemoryMessageDeferStore {
     }
 }
 
-/// Provider for creating [`MemoryMessageDeferStore`] instances.
-///
-/// Simple provider that creates isolated in-memory stores for each partition.
-/// Each store instance has its own `HashMap`, ensuring partition isolation.
+/// Creates isolated in-memory stores per partition.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryMessageDeferStoreProvider;
 
 impl MemoryMessageDeferStoreProvider {
-    /// Creates a new memory message defer store provider.
+    /// Creates a new provider.
     #[must_use]
     pub fn new() -> Self {
         Self

@@ -1,8 +1,4 @@
-//! Lazy segment initialization with automatic persistence.
-//!
-//! [`LazySegment`] defers segment creation and persistence until first access,
-//! ensuring segments are always persisted before use while avoiding unnecessary
-//! work for partitions that are never accessed.
+//! Lazy segment initialization for deferred I/O.
 
 use super::{Segment, SegmentStore};
 use crate::{ConsumerGroup, Partition, Topic};
@@ -10,28 +6,10 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
-/// Lazily creates and persists a segment on first access.
+/// Defers segment creation/persistence until first access.
 ///
-/// `LazySegment` is a handle type that's cheap to clone (contains `Arc`
-/// internally). Multiple clones share the same underlying segment, and
-/// persistence happens exactly once regardless of which clone triggers it.
-///
-/// # Usage
-///
-/// Create a `LazySegment` in synchronous code, then call [`get`](Self::get)
-/// when you need the segment:
-///
-/// ```ignore
-/// let segment = LazySegment::new(store, topic, partition, consumer_group);
-///
-/// // Later, in async context:
-/// let seg = segment.get().await?;  // Persists on first call
-/// ```
-///
-/// # Thread Safety
-///
-/// Multiple tasks can call `get()` concurrently. Only one will perform the
-/// initialization; others wait for it to complete and receive the same result.
+/// Cheap to clone (`Arc` internally). Multiple clones share the segment;
+/// persistence happens exactly once. Thread-safe concurrent access.
 #[derive(Clone)]
 pub struct LazySegment<S> {
     inner: Arc<LazySegmentInner<S>>,
@@ -49,9 +27,7 @@ impl<S> LazySegment<S>
 where
     S: SegmentStore,
 {
-    /// Creates a new lazy segment.
-    ///
-    /// No I/O occurs until [`get`](Self::get) is called.
+    /// Creates a lazy segment (no I/O until [`get`](Self::get)).
     #[must_use]
     pub fn new(
         store: S,
@@ -70,19 +46,11 @@ where
         }
     }
 
-    /// Returns the segment, creating and persisting it if necessary.
-    ///
-    /// On first call, this:
-    /// 1. Creates a [`Segment`] from the stored parameters
-    /// 2. Persists it via [`SegmentStore::get_or_create_segment`]
-    /// 3. Caches and returns the result
-    ///
-    /// Subsequent calls return the cached segment immediately.
+    /// Returns the segment, persisting on first call. Errors are not cached.
     ///
     /// # Errors
     ///
-    /// Returns an error if segment persistence fails. The error is not cached;
-    /// subsequent calls will retry persistence.
+    /// Returns error if segment persistence fails.
     pub async fn get(&self) -> Result<&Segment, S::Error> {
         self.inner
             .cell
@@ -101,7 +69,7 @@ where
             .await
     }
 
-    /// Returns whether the segment has been initialized.
+    /// Whether the segment has been initialized.
     #[must_use]
     pub fn is_initialized(&self) -> bool {
         self.inner.cell.initialized()

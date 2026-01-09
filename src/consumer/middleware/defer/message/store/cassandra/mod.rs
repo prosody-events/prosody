@@ -1,7 +1,5 @@
-//! Cassandra-based implementation of [`MessageDeferStore`].
-//!
-//! Provides persistent storage for deferred messages using Apache Cassandra
-//! with automatic schema migration and optimized TTL management.
+//! Cassandra-backed message defer store with TTL and segment-based
+//! partitioning.
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
@@ -20,28 +18,18 @@ pub mod queries;
 
 pub use queries::Queries as MessageQueries;
 
-/// Cassandra-based implementation of [`MessageDeferStore`].
+/// Cassandra-backed message defer store.
 ///
-/// Provides persistent storage for deferred messages with automatic TTL
-/// management and retry count tracking via static columns.
+/// # Storage Model
 ///
-/// # Design
+/// - **Partition key**: `(segment_id, key)` where segment = `UUIDv5` of
+///   `{topic}/{partition}:{consumer_group}`
+/// - **Clustering**: `offset ASC` for FIFO ordering
+/// - **Retry count**: Static column (shared per key)
+/// - **TTL**: Fixed duration from [`CassandraStore::base_ttl()`]
 ///
-/// - **Two tables**: `deferred_segments` (metadata) and `deferred_offsets`
-///   (data)
-/// - **Partition key**: `(segment_id, key)` in offsets table
-/// - **Segment ID**: `UUIDv5` hash of `{topic}/{partition}:{consumer_group}`
-/// - **Retry count**: Stored as static column (shared across all offsets for a
-///   key)
-/// - **TTL management**: Uses fixed TTL from `CassandraStore::base_ttl()`
-/// - **Ordering**: Clustering by offset ASC ensures FIFO processing
-///
-/// # Lazy Initialization
-///
-/// The store uses a [`LazySegment`] which defers segment persistence to
-/// Cassandra until first use. This allows the store to be created in
-/// synchronous context (e.g., `handler_for_partition`) while deferring I/O to
-/// the first async operation.
+/// Uses [`LazySegment`] to defer segment persistence until first access,
+/// allowing synchronous store creation in `handler_for_partition`.
 #[derive(Clone)]
 pub struct CassandraMessageDeferStore {
     store: CassandraStore,
@@ -50,9 +38,7 @@ pub struct CassandraMessageDeferStore {
 }
 
 impl CassandraMessageDeferStore {
-    /// Creates a new Cassandra message defer store for the given partition.
-    ///
-    /// The `segment_store` is used to persist segment metadata on first access.
+    /// Creates a store; segment persisted lazily on first access.
     #[must_use]
     pub fn new(
         store: CassandraStore,
@@ -70,12 +56,10 @@ impl CassandraMessageDeferStore {
         }
     }
 
-    /// Returns a reference to the Cassandra session.
     fn session(&self) -> &Session {
         self.store.session()
     }
 
-    /// Gets the segment ID, lazily initializing and persisting if needed.
     async fn segment_id(&self) -> Result<uuid::Uuid, CassandraDeferStoreError> {
         let segment = self.segment.get().await?;
         Ok(segment.id())
@@ -98,7 +82,6 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         let segment_id = self.segment_id().await?;
         let ttl = self.store.base_ttl();
 
-        // INSERT with retry_count=0 for first failure
         self.session()
             .execute_unpaged(
                 &self.queries.insert_deferred_message_with_retry_count,
@@ -132,8 +115,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
             .maybe_first_row::<(Option<i64>, Option<i32>)>()
             .map_err(CassandraStoreError::from)?;
 
-        // Filter out rows where offset is NULL (only static column set, no clustering
-        // rows)
+        // NULL offset means static column exists but no clustering rows
         Ok(row_opt.and_then(|(offset_opt, retry_count_opt)| {
             offset_opt.map(|offset_raw| {
                 let offset = Offset::from(offset_raw);
@@ -148,7 +130,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         let segment_id = self.segment_id().await?;
         let ttl = self.store.base_ttl();
 
-        // Don't include retry_count in INSERT - leaves static column unchanged
+        // Omitting retry_count preserves static column
         self.session()
             .execute_unpaged(
                 &self.queries.insert_deferred_message_without_retry_count,
@@ -211,25 +193,10 @@ impl MessageDeferStore for CassandraMessageDeferStore {
     }
 }
 
-/// Provider for creating [`CassandraMessageDeferStore`] instances.
+/// Factory for partition-scoped Cassandra message defer stores.
 ///
-/// Holds shared resources (Cassandra session, prepared queries, segment store)
-/// and creates store instances with the correct segment context for each
-/// partition.
-///
-/// # Usage
-///
-/// ```text
-/// // Create provider once at startup
-/// let provider = CassandraMessageDeferStoreProvider::new(
-///     cassandra_store,
-///     queries,
-///     segment_store,
-/// );
-///
-/// // Create stores for each partition as needed
-/// let store = provider.create_store(topic, partition, &consumer_group).await?;
-/// ```
+/// Holds shared Cassandra resources; creates stores with correct segment
+/// context per partition.
 #[derive(Clone, Debug)]
 pub struct CassandraMessageDeferStoreProvider {
     store: CassandraStore,
@@ -238,13 +205,7 @@ pub struct CassandraMessageDeferStoreProvider {
 }
 
 impl CassandraMessageDeferStoreProvider {
-    /// Creates a new provider with the given Cassandra resources.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - Shared Cassandra store
-    /// * `queries` - Pre-prepared message defer queries
-    /// * `segment_store` - Segment store for persisting segment metadata
+    /// Creates a provider with shared Cassandra resources.
     #[must_use]
     pub fn new(
         store: CassandraStore,

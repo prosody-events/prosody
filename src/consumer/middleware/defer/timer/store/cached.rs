@@ -1,7 +1,4 @@
-//! Write-through cache adapter for `TimerDeferStore` implementations.
-//!
-//! Provides [`CachedTimerDeferStore`], a transparent caching layer that wraps
-//! any [`TimerDeferStore`] implementation to reduce store queries.
+//! Write-through cache for timer defer stores.
 
 use super::{CachedTimerEntry, TimerDeferStore, TimerRetryCompletionResult};
 use crate::Key;
@@ -15,49 +12,18 @@ use std::sync::Arc;
 use tracing::{Span, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// Type alias for the timer defer cache: maps keys to their cached state.
-///
-/// The cached state is `Option<CachedTimerEntry>`:
-/// - `None` means the key has no deferred timers
-/// - `Some(entry)` contains the first deferred timer's time, context, and retry
-///   count
+/// Cache: `key` → `Option<CachedTimerEntry>`.
 type TimerDeferCache = Cache<Key, Option<CachedTimerEntry>>;
 
-/// Write-through cache adapter for `TimerDeferStore` implementations.
+/// Write-through cache for any [`TimerDeferStore`].
 ///
-/// Caches the result of
-/// [`get_next_deferred_timer`](TimerDeferStore::get_next_deferred_timer)
-/// to reduce store queries. All mutations write through to the underlying store
-/// and update/invalidate the cache appropriately.
+/// Caches `get_next_deferred_timer` results. Writes go to store first, then
+/// update or conservatively invalidate cache. Uses smart invalidation:
+/// monotonic appends preserve cache; out-of-order appends update to new
+/// minimum.
 ///
-/// # Cache Strategy
-///
-/// - **Reads**: Check cache first, query store on miss, populate cache
-/// - **Writes**: Write to store first (for durability), then update/invalidate
-///   cache
-/// - **Consistency**: Conservative invalidation when new state is uncertain
-///
-/// # Cache Key
-///
-/// Uses the message key ([`Key`]) as the cache key.
-///
-/// # Cache Value
-///
-/// Stores `Option<CachedTimerEntry>` - the essential data for reconstructing
-/// `get_next_deferred_timer` results:
-/// - `Some(entry)`: Key has deferred timers, entry contains time, context,
-///   `retry_count`
-/// - `None`: Key has no deferred timers
-///
-/// # Why Cache `Context` Instead of `Trigger`
-///
-/// The timer system uses `Arc<ArcSwap<Span>>` - when processing completes,
-/// the span is replaced with `Span::none()`. Caching `Trigger` directly would
-/// cause subsequent cache reads to get dead spans.
-///
-/// Instead, we cache the extracted `Context` (containing only upstream trace
-/// identifiers) and create fresh spans at each read using
-/// `span.set_parent(context)`.
+/// Caches `Context` rather than `Trigger` because spans get replaced with
+/// `Span::none()` after processing.
 #[derive(Clone)]
 pub struct CachedTimerDeferStore<S> {
     store: S,
@@ -68,17 +34,7 @@ impl<S> CachedTimerDeferStore<S>
 where
     S: TimerDeferStore,
 {
-    /// Creates a new cached store wrapping the underlying store.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - Underlying store implementation
-    /// * `capacity` - Maximum number of keys to cache
-    ///
-    /// # Returns
-    ///
-    /// A [`CachedTimerDeferStore`] that transparently caches queries to
-    /// `store`.
+    /// Wraps a store with a cache of the given capacity.
     #[must_use]
     pub fn new(store: S, capacity: usize) -> Self {
         Self {
@@ -87,18 +43,12 @@ where
         }
     }
 
-    /// Creates a fresh span linked to the cached context.
     fn create_span_from_context(key: &Key, time: CompactDateTime, context: &Context) -> Span {
-        let span = info_span!(
-            "timer_defer.cache_hit",
-            key = %key,
-            time = %time,
-        );
+        let span = info_span!("timer_defer.cache_hit", key = %key, time = %time);
         let _ = span.set_parent(context.clone());
         span
     }
 
-    /// Extracts a cache entry from a trigger.
     fn extract_cache_entry(trigger: &Trigger, retry_count: u32) -> CachedTimerEntry {
         let span = trigger.span();
         let context = span.context();
@@ -109,16 +59,8 @@ where
         }
     }
 
-    /// Updates cache after appending a timer to the deferred queue.
-    ///
-    /// Uses smart invalidation: only updates/invalidates if the new timer
-    /// might change the cached minimum time.
-    ///
-    /// # Strategy
-    ///
-    /// - If cached and `time >= min_time`: Preserve cache (monotonic append)
-    /// - If cached and `time < min_time`: Update cache with new minimum
-    /// - If not cached or was `None`: Invalidate (conservative)
+    /// Smart cache update: preserve if monotonic, update if new minimum,
+    /// invalidate if uncertain.
     fn update_cache_after_append(&self, trigger: &Trigger) {
         let key = &trigger.key;
         let time = trigger.time;
