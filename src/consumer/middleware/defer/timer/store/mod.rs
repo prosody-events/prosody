@@ -6,6 +6,7 @@
 pub mod cached;
 pub mod cassandra;
 pub mod memory;
+pub mod provider;
 
 #[cfg(test)]
 pub mod tests;
@@ -21,7 +22,9 @@ use std::future::Future;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use cached::CachedTimerDeferStore;
-pub use memory::MemoryTimerDeferStore;
+pub use cassandra::{CassandraTimerDeferStore, CassandraTimerDeferStoreProvider};
+pub use memory::{MemoryTimerDeferStore, MemoryTimerDeferStoreProvider};
+pub use provider::TimerDeferStoreProvider;
 
 /// Result of [`TimerDeferStore::complete_retry_success`].
 #[derive(Debug, Clone)]

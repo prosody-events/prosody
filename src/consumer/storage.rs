@@ -7,17 +7,17 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::consumer::middleware::defer::message::handler::{
-    CassandraResources as MessageCassandraResources, MessageStoreKind,
-};
 use crate::consumer::middleware::defer::message::store::cassandra::MessageQueries;
+use crate::consumer::middleware::defer::message::store::{
+    CassandraMessageDeferStoreProvider, MemoryMessageDeferStoreProvider,
+};
 use crate::consumer::middleware::defer::segment::{
     CassandraSegmentStore, CassandraSegmentStoreError,
 };
-use crate::consumer::middleware::defer::timer::middleware::{
-    CassandraResources as TimerCassandraResources, TimerStoreKind,
-};
 use crate::consumer::middleware::defer::timer::store::cassandra::queries::Queries as TimerQueries;
+use crate::consumer::middleware::defer::timer::store::{
+    CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
+};
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::adapter::TableAdapter;
@@ -114,7 +114,7 @@ impl StorageBackend {
     }
 }
 
-/// Atomically-created set of trigger and defer stores.
+/// Atomically-created set of trigger and defer store providers.
 ///
 /// This enum ensures that trigger and defer stores always use matching
 /// storage types, making mismatched stores unrepresentable in the type system.
@@ -134,15 +134,15 @@ impl StorageBackend {
 /// match stores {
 ///     StorePair::Memory {
 ///         trigger,
-///         message_store_kind,
-///         timer_store_kind,
+///         message_provider,
+///         timer_provider,
 ///     } => {
 ///         // All are in-memory
 ///     }
 ///     StorePair::Cassandra {
 ///         trigger,
-///         message_store_kind,
-///         timer_store_kind,
+///         message_provider,
+///         timer_provider,
 ///     } => {
 ///         // All are Cassandra
 ///     }
@@ -156,19 +156,19 @@ pub enum StorePair {
     Memory {
         /// In-memory trigger store wrapped in `TableAdapter`.
         trigger: TableAdapter<InMemoryTriggerStore>,
-        /// Message defer store kind (Memory).
-        message_store_kind: MessageStoreKind,
-        /// Timer defer store kind (Memory).
-        timer_store_kind: TimerStoreKind,
+        /// Message defer store provider (Memory).
+        message_provider: MemoryMessageDeferStoreProvider,
+        /// Timer defer store provider (Memory).
+        timer_provider: MemoryTimerDeferStoreProvider,
     },
     /// All stores use Cassandra storage with a shared session.
     Cassandra {
         /// Cassandra trigger store wrapped in `TableAdapter`.
         trigger: TableAdapter<CassandraTriggerStore>,
-        /// Message defer store kind (Cassandra with resources).
-        message_store_kind: MessageStoreKind,
-        /// Timer defer store kind (Cassandra with resources).
-        timer_store_kind: TimerStoreKind,
+        /// Message defer store provider (Cassandra with resources).
+        message_provider: CassandraMessageDeferStoreProvider,
+        /// Timer defer store provider (Cassandra with resources).
+        timer_provider: CassandraTimerDeferStoreProvider,
     },
 }
 
@@ -207,55 +207,7 @@ impl From<CassandraSegmentStoreError> for StoreCreationError {
 }
 
 impl StorePair {
-    /// Creates both trigger and defer stores atomically.
-    ///
-    /// This is an atomic operation - both stores are created or the operation
-    /// fails. The stores are guaranteed to use the same underlying storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Trigger store configuration (`InMemory` or `Cassandra`)
-    /// * `slab_size` - Slab size for trigger store time partitioning
-    /// * `mock` - If true, uses in-memory storage regardless of config
-    ///
-    /// # Errors
-    ///
-    /// Returns error if store initialization fails.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use prosody::consumer::storage::StorePair;
-    /// # use prosody::high_level::config::TriggerStoreConfiguration;
-    /// # use prosody::timers::duration::CompactDuration;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let stores = StorePair::new(
-    ///     &TriggerStoreConfiguration::InMemory,
-    ///     CompactDuration::new(3600),
-    ///     false,
-    /// )
-    /// .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    /// Returns the message and timer store kinds.
-    #[must_use]
-    pub fn store_kinds(&self) -> (MessageStoreKind, TimerStoreKind) {
-        match self {
-            Self::Memory {
-                message_store_kind,
-                timer_store_kind,
-                ..
-            }
-            | Self::Cassandra {
-                message_store_kind,
-                timer_store_kind,
-                ..
-            } => (message_store_kind.clone(), timer_store_kind.clone()),
-        }
-    }
-
-    /// Creates both trigger and defer stores atomically.
+    /// Creates both trigger and defer store providers atomically.
     ///
     /// This is an atomic operation - both stores are created or the operation
     /// fails. The stores are guaranteed to use the same underlying storage.
@@ -295,8 +247,8 @@ impl StorePair {
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
                 trigger: memory_store(),
-                message_store_kind: MessageStoreKind::Memory,
-                timer_store_kind: TimerStoreKind::Memory,
+                message_provider: MemoryMessageDeferStoreProvider::new(),
+                timer_provider: MemoryTimerDeferStoreProvider::new(),
             }),
 
             StorageBackend::Cassandra { store, keyspace } => {
@@ -314,22 +266,22 @@ impl StorePair {
                 // Prepare queries for timer defer stores
                 let timer_queries = Arc::new(TimerQueries::new(store.session(), keyspace).await?);
 
-                let message_store_kind = MessageStoreKind::Cassandra(MessageCassandraResources {
-                    store: store.clone(),
-                    queries: message_queries,
-                    segment_store: segment_store.clone(),
-                });
+                let message_provider = CassandraMessageDeferStoreProvider::new(
+                    store.clone(),
+                    message_queries,
+                    segment_store.clone(),
+                );
 
-                let timer_store_kind = TimerStoreKind::Cassandra(TimerCassandraResources {
-                    store: store.clone(),
-                    queries: timer_queries,
+                let timer_provider = CassandraTimerDeferStoreProvider::new(
+                    store.clone(),
+                    timer_queries,
                     segment_store,
-                });
+                );
 
                 Ok(Self::Cassandra {
                     trigger: TableAdapter::new(trigger),
-                    message_store_kind,
-                    timer_store_kind,
+                    message_provider,
+                    timer_provider,
                 })
             }
         }

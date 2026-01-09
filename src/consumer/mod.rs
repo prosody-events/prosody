@@ -912,16 +912,12 @@ impl ProsodyConsumer {
         let stores = StorePair::new(trigger_store_config, slab_size, consumer_config.mock).await?;
 
         let telemetry = Telemetry::new();
-        let retry_middleware = RetryMiddleware::new(retry_config)?;
         let monopolization_middleware =
             MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
         let heartbeats = HeartbeatRegistry::new(
             consumer_config.group_id.clone(),
             consumer_config.stall_threshold,
         );
-
-        // Extract store kinds (same enum type regardless of StorePair variant)
-        let (message_store_kind, timer_store_kind) = stores.store_kinds();
 
         // Build middleware stack (shared logic)
         let failure_tracker = FailureTracker::new(
@@ -931,48 +927,84 @@ impl ProsodyConsumer {
             &heartbeats,
         );
 
-        let message_defer_middleware = MessageDeferMiddleware::new(
-            defer_config.clone(),
-            consumer_config,
-            &common_config.scheduler,
-            message_store_kind,
-            failure_tracker.clone(),
-            &heartbeats,
-        )?;
-
-        let timer_defer_middleware = TimerDeferMiddleware::new(
-            defer_config,
-            timer_store_kind,
-            failure_tracker,
-            consumer_config,
-        );
-
         let common_middleware =
             build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
 
-        let provider = common_middleware
-            .layer(monopolization_middleware)
-            .layer(timer_defer_middleware)
-            .layer(message_defer_middleware)
-            .layer(retry_middleware)
-            .into_provider(handler);
-
-        // Initialize with appropriate trigger store type
+        // Build middleware stack with concrete provider types (determined by StorePair
+        // variant)
         match stores {
-            StorePair::Memory { trigger, .. } => initialize_consumer_with_store(
-                consumer_config,
-                provider,
+            StorePair::Memory {
                 trigger,
-                &telemetry,
-                heartbeats,
-            ),
-            StorePair::Cassandra { trigger, .. } => initialize_consumer_with_store(
-                consumer_config,
-                provider,
+                message_provider,
+                timer_provider,
+            } => {
+                let message_defer_middleware = MessageDeferMiddleware::new(
+                    defer_config.clone(),
+                    consumer_config,
+                    &common_config.scheduler,
+                    message_provider,
+                    failure_tracker.clone(),
+                    &heartbeats,
+                )?;
+
+                let timer_defer_middleware = TimerDeferMiddleware::new(
+                    defer_config,
+                    timer_provider,
+                    failure_tracker,
+                    consumer_config,
+                );
+
+                let provider = common_middleware
+                    .layer(monopolization_middleware)
+                    .layer(timer_defer_middleware)
+                    .layer(message_defer_middleware)
+                    .layer(RetryMiddleware::new(retry_config)?)
+                    .into_provider(handler);
+
+                initialize_consumer_with_store(
+                    consumer_config,
+                    provider,
+                    trigger,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
+            StorePair::Cassandra {
                 trigger,
-                &telemetry,
-                heartbeats,
-            ),
+                message_provider,
+                timer_provider,
+            } => {
+                let message_defer_middleware = MessageDeferMiddleware::new(
+                    defer_config.clone(),
+                    consumer_config,
+                    &common_config.scheduler,
+                    message_provider,
+                    failure_tracker.clone(),
+                    &heartbeats,
+                )?;
+
+                let timer_defer_middleware = TimerDeferMiddleware::new(
+                    defer_config,
+                    timer_provider,
+                    failure_tracker,
+                    consumer_config,
+                );
+
+                let provider = common_middleware
+                    .layer(monopolization_middleware)
+                    .layer(timer_defer_middleware)
+                    .layer(message_defer_middleware)
+                    .layer(RetryMiddleware::new(retry_config)?)
+                    .into_provider(handler);
+
+                initialize_consumer_with_store(
+                    consumer_config,
+                    provider,
+                    trigger,
+                    &telemetry,
+                    heartbeats,
+                )
+            }
         }
     }
 

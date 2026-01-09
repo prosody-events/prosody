@@ -6,17 +6,26 @@
 //! # Usage
 //!
 //! ```rust
-//! use prosody::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
+//! use prosody::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStoreProvider;
+//! use prosody::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
+//! use prosody::{Partition, Topic};
 //!
-//! let store = MemoryMessageDeferStore::new();
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let provider = MemoryMessageDeferStoreProvider::new();
+//! let store = provider
+//!     .create_store(Topic::from("test"), Partition::from(0), "consumer-group")
+//!     .await?;
 //! // Use store with MessageDeferStore methods
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! All data is held in memory and lost on process exit. Not suitable for
 //! production use where persistence across restarts is required.
 
 use super::MessageDeferStore;
-use crate::{Key, Offset};
+use super::provider::MessageDeferStoreProvider;
+use crate::{Key, Offset, Partition, Topic};
 
 #[cfg(test)]
 use crate::defer_store_tests;
@@ -170,6 +179,34 @@ impl MessageDeferStore for MemoryMessageDeferStore {
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
         self.inner.deferred.remove_async(key.as_ref()).await;
         Ok(())
+    }
+}
+
+/// Provider for creating [`MemoryMessageDeferStore`] instances.
+///
+/// Simple provider that creates isolated in-memory stores for each partition.
+/// Each store instance has its own `HashMap`, ensuring partition isolation.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryMessageDeferStoreProvider;
+
+impl MemoryMessageDeferStoreProvider {
+    /// Creates a new memory message defer store provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl MessageDeferStoreProvider for MemoryMessageDeferStoreProvider {
+    type Store = MemoryMessageDeferStore;
+
+    fn create_store(
+        &self,
+        _topic: Topic,
+        _partition: Partition,
+        _consumer_group: &str,
+    ) -> Self::Store {
+        MemoryMessageDeferStore::new()
     }
 }
 

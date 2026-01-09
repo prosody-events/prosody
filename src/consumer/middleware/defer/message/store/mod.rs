@@ -3,6 +3,7 @@
 pub mod cached;
 pub mod cassandra;
 pub mod memory;
+pub mod provider;
 
 #[cfg(test)]
 pub mod tests;
@@ -13,7 +14,9 @@ use std::error::Error;
 use std::future::Future;
 
 pub use cached::CachedDeferStore;
-pub use memory::MemoryMessageDeferStore;
+pub use cassandra::{CassandraMessageDeferStore, CassandraMessageDeferStoreProvider};
+pub use memory::{MemoryMessageDeferStore, MemoryMessageDeferStoreProvider};
+pub use provider::MessageDeferStoreProvider;
 
 /// Result of [`MessageDeferStore::complete_retry_success`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

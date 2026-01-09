@@ -8,6 +8,7 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::defer::error::CassandraDeferStoreError;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::cassandra::queries::Queries;
+use crate::consumer::middleware::defer::message::store::provider::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, LazySegment};
 use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
 use scylla::client::session::Session;
@@ -207,6 +208,74 @@ impl MessageDeferStore for CassandraMessageDeferStore {
             .map_err(CassandraStoreError::from)?;
 
         Ok(())
+    }
+}
+
+/// Provider for creating [`CassandraMessageDeferStore`] instances.
+///
+/// Holds shared resources (Cassandra session, prepared queries, segment store)
+/// and creates store instances with the correct segment context for each
+/// partition.
+///
+/// # Usage
+///
+/// ```text
+/// // Create provider once at startup
+/// let provider = CassandraMessageDeferStoreProvider::new(
+///     cassandra_store,
+///     queries,
+///     segment_store,
+/// );
+///
+/// // Create stores for each partition as needed
+/// let store = provider.create_store(topic, partition, &consumer_group).await?;
+/// ```
+#[derive(Clone, Debug)]
+pub struct CassandraMessageDeferStoreProvider {
+    store: CassandraStore,
+    queries: Arc<Queries>,
+    segment_store: CassandraSegmentStore,
+}
+
+impl CassandraMessageDeferStoreProvider {
+    /// Creates a new provider with the given Cassandra resources.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Shared Cassandra store
+    /// * `queries` - Pre-prepared message defer queries
+    /// * `segment_store` - Segment store for persisting segment metadata
+    #[must_use]
+    pub fn new(
+        store: CassandraStore,
+        queries: Arc<Queries>,
+        segment_store: CassandraSegmentStore,
+    ) -> Self {
+        Self {
+            store,
+            queries,
+            segment_store,
+        }
+    }
+}
+
+impl MessageDeferStoreProvider for CassandraMessageDeferStoreProvider {
+    type Store = CassandraMessageDeferStore;
+
+    fn create_store(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        consumer_group: &str,
+    ) -> Self::Store {
+        CassandraMessageDeferStore::new(
+            self.store.clone(),
+            self.queries.clone(),
+            self.segment_store.clone(),
+            topic,
+            partition,
+            Arc::from(consumer_group),
+        )
     }
 }
 

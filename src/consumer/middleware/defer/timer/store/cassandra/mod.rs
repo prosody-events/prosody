@@ -28,6 +28,7 @@ use crate::consumer::middleware::defer::error::CassandraDeferStoreError;
 use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, LazySegment};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::cassandra::queries::Queries;
+use crate::consumer::middleware::defer::timer::store::provider::TimerDeferStoreProvider;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Partition, Topic};
@@ -376,6 +377,74 @@ fn deferred_times_stream(
                 yield time;
             }
         }
+    }
+}
+
+/// Provider for creating [`CassandraTimerDeferStore`] instances.
+///
+/// Holds shared resources (Cassandra session, prepared queries, segment store)
+/// and creates store instances with the correct segment context for each
+/// partition.
+///
+/// # Usage
+///
+/// ```text
+/// // Create provider once at startup
+/// let provider = CassandraTimerDeferStoreProvider::new(
+///     cassandra_store,
+///     queries,
+///     segment_store,
+/// );
+///
+/// // Create stores for each partition as needed
+/// let store = provider.create_store(topic, partition, &consumer_group);
+/// ```
+#[derive(Clone, Debug)]
+pub struct CassandraTimerDeferStoreProvider {
+    store: CassandraStore,
+    queries: Arc<Queries>,
+    segment_store: CassandraSegmentStore,
+}
+
+impl CassandraTimerDeferStoreProvider {
+    /// Creates a new provider with the given Cassandra resources.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Shared Cassandra store
+    /// * `queries` - Pre-prepared timer defer queries
+    /// * `segment_store` - Segment store for persisting segment metadata
+    #[must_use]
+    pub fn new(
+        store: CassandraStore,
+        queries: Arc<Queries>,
+        segment_store: CassandraSegmentStore,
+    ) -> Self {
+        Self {
+            store,
+            queries,
+            segment_store,
+        }
+    }
+}
+
+impl TimerDeferStoreProvider for CassandraTimerDeferStoreProvider {
+    type Store = CassandraTimerDeferStore;
+
+    fn create_store(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        consumer_group: &str,
+    ) -> Self::Store {
+        CassandraTimerDeferStore::new(
+            self.store.clone(),
+            self.queries.clone(),
+            self.segment_store.clone(),
+            topic,
+            partition,
+            Arc::from(consumer_group),
+        )
     }
 }
 

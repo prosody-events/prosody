@@ -15,19 +15,15 @@
 //!    initial deferral).
 
 use super::loader::{KafkaLoader, MessageLoader};
-use super::store::cassandra::{CassandraMessageDeferStore, MessageQueries};
-use super::store::memory::MemoryMessageDeferStore;
-use super::store::{CachedDeferStore, MessageDeferStore, MessageRetryCompletionResult};
-use crate::cassandra::CassandraStore;
+use super::store::{
+    CachedDeferStore, MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult,
+};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
-use crate::consumer::middleware::defer::error::{
-    CassandraDeferStoreError, DeferError, DeferInitError, DeferResult,
-};
-use crate::consumer::middleware::defer::segment::CassandraSegmentStore;
+use crate::consumer::middleware::defer::error::{DeferError, DeferInitError, DeferResult};
 use crate::consumer::middleware::scheduler::SchedulerConfiguration;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
@@ -37,142 +33,12 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
-use std::convert::Infallible;
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::{debug, info, warn};
 
 /// Property-based tests for defer handler invariants.
 #[cfg(test)]
 pub mod tests;
-
-/// Cassandra resources for creating message defer stores.
-#[derive(Clone, Debug)]
-pub struct CassandraResources {
-    /// Shared Cassandra store.
-    pub store: CassandraStore,
-    /// Prepared message queries.
-    pub queries: Arc<MessageQueries>,
-    /// Cassandra segment store for segment persistence.
-    pub segment_store: CassandraSegmentStore,
-}
-
-/// Message store variant - either memory or Cassandra.
-#[derive(Clone, Debug)]
-pub enum MessageStoreKind {
-    /// In-memory store for testing.
-    Memory,
-    /// Cassandra-backed store for production.
-    Cassandra(CassandraResources),
-}
-
-/// Enum wrapper for different message defer store implementations.
-#[derive(Clone)]
-pub enum MessageStoreWrapper {
-    /// In-memory store for testing (no cache needed - already O(1) lookups).
-    Memory(MemoryMessageDeferStore),
-    /// Cassandra-backed store for production (cached to reduce network calls).
-    Cassandra(CachedDeferStore<CassandraMessageDeferStore>),
-}
-
-/// Unified error type for message store operations.
-#[derive(Debug, Error)]
-pub enum MessageStoreError {
-    /// Cassandra store error.
-    #[error(transparent)]
-    Cassandra(#[from] CassandraDeferStoreError),
-    /// Memory store error (never occurs).
-    #[error(transparent)]
-    Memory(#[from] Infallible),
-}
-
-impl ClassifyError for MessageStoreError {
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Cassandra(e) => e.classify_error(),
-            Self::Memory(e) => match *e {},
-        }
-    }
-}
-
-impl MessageDeferStore for MessageStoreWrapper {
-    type Error = MessageStoreError;
-
-    async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(store) => store
-                .defer_first_message(key, offset)
-                .await
-                .map_err(Into::into),
-            Self::Cassandra(store) => store
-                .defer_first_message(key, offset)
-                .await
-                .map_err(Into::into),
-        }
-    }
-
-    async fn get_next_deferred_message(
-        &self,
-        key: &Key,
-    ) -> Result<Option<(Offset, u32)>, Self::Error> {
-        match self {
-            Self::Memory(store) => store
-                .get_next_deferred_message(key)
-                .await
-                .map_err(Into::into),
-            Self::Cassandra(store) => store
-                .get_next_deferred_message(key)
-                .await
-                .map_err(Into::into),
-        }
-    }
-
-    async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(store) => store
-                .append_deferred_message(key, offset)
-                .await
-                .map_err(Into::into),
-            Self::Cassandra(store) => store
-                .append_deferred_message(key, offset)
-                .await
-                .map_err(Into::into),
-        }
-    }
-
-    async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(store) => store
-                .remove_deferred_message(key, offset)
-                .await
-                .map_err(Into::into),
-            Self::Cassandra(store) => store
-                .remove_deferred_message(key, offset)
-                .await
-                .map_err(Into::into),
-        }
-    }
-
-    async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(store) => store
-                .set_retry_count(key, retry_count)
-                .await
-                .map_err(Into::into),
-            Self::Cassandra(store) => store
-                .set_retry_count(key, retry_count)
-                .await
-                .map_err(Into::into),
-        }
-    }
-
-    async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
-        match self {
-            Self::Memory(store) => store.delete_key(key).await.map_err(Into::into),
-            Self::Cassandra(store) => store.delete_key(key).await.map_err(Into::into),
-        }
-    }
-}
 
 /// Middleware that defers transiently-failed messages for timer-based retry.
 ///
@@ -181,26 +47,29 @@ impl MessageDeferStore for MessageStoreWrapper {
 ///
 /// # Type Parameters
 ///
+/// * `P` - Message defer store provider
 /// * `L` - Message loader (default: [`KafkaLoader`])
 /// * `D` - Deferral decider (default: [`FailureTracker`])
 #[derive(Clone)]
-pub struct MessageDeferMiddleware<L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferMiddleware<P, L = KafkaLoader, D = FailureTracker>
 where
+    P: MessageDeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     config: DeferConfiguration,
     loader: L,
-    store_kind: MessageStoreKind,
+    provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
 }
 
-impl<D> MessageDeferMiddleware<KafkaLoader, D>
+impl<P> MessageDeferMiddleware<P, KafkaLoader, FailureTracker>
 where
-    D: DeferralDecider,
+    P: MessageDeferStoreProvider,
 {
-    /// Creates middleware with default [`KafkaLoader`].
+    /// Creates middleware with default [`KafkaLoader`] and provided
+    /// [`FailureTracker`].
     ///
     /// # Errors
     ///
@@ -209,8 +78,8 @@ where
         config: DeferConfiguration,
         consumer_config: &ConsumerConfiguration,
         scheduler_config: &SchedulerConfiguration,
-        store_kind: MessageStoreKind,
-        decider: D,
+        provider: P,
+        decider: FailureTracker,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, DeferInitError> {
         use super::loader::LoaderConfiguration;
@@ -236,15 +105,16 @@ where
         Ok(Self {
             config,
             loader,
-            store_kind,
+            provider,
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
         })
     }
 }
 
-impl<L, D> MessageDeferMiddleware<L, D>
+impl<P, L, D> MessageDeferMiddleware<P, L, D>
 where
+    P: MessageDeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
@@ -256,7 +126,7 @@ where
     pub fn with_custom(
         config: DeferConfiguration,
         loader: L,
-        store_kind: MessageStoreKind,
+        provider: P,
         decider: D,
         consumer_config: &ConsumerConfiguration,
     ) -> Result<Self, DeferInitError> {
@@ -267,7 +137,7 @@ where
         Ok(Self {
             config,
             loader,
-            store_kind,
+            provider,
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
         })
@@ -276,15 +146,16 @@ where
 
 /// Creates [`MessageDeferHandler`]s for each partition.
 #[derive(Clone)]
-pub struct MessageDeferProvider<T, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferProvider<T, P, L = KafkaLoader, D = FailureTracker>
 where
+    P: MessageDeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     inner_provider: T,
     config: DeferConfiguration,
     loader: L,
-    store_kind: MessageStoreKind,
+    store_provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
 }
@@ -306,12 +177,13 @@ where
     pub(crate) partition: Partition,
 }
 
-impl<L, D> HandlerMiddleware for MessageDeferMiddleware<L, D>
+impl<P, L, D> HandlerMiddleware for MessageDeferMiddleware<P, L, D>
 where
+    P: MessageDeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    type Provider<T: FallibleHandlerProvider> = MessageDeferProvider<T, L, D>;
+    type Provider<T: FallibleHandlerProvider> = MessageDeferProvider<T, P, L, D>;
 
     fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
     where
@@ -321,38 +193,30 @@ where
             inner_provider,
             config: self.config.clone(),
             loader: self.loader.clone(),
-            store_kind: self.store_kind.clone(),
+            store_provider: self.provider.clone(),
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
         }
     }
 }
 
-impl<T, L, D> FallibleHandlerProvider for MessageDeferProvider<T, L, D>
+impl<T, P, L, D> FallibleHandlerProvider for MessageDeferProvider<T, P, L, D>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
+    P: MessageDeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    type Handler = MessageDeferHandler<T::Handler, MessageStoreWrapper, L, D>;
+    type Handler = MessageDeferHandler<T::Handler, CachedDeferStore<P::Store>, L, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        // Create the appropriate store based on store_kind
-        let message_store = match &self.store_kind {
-            MessageStoreKind::Memory => MessageStoreWrapper::Memory(MemoryMessageDeferStore::new()),
-            MessageStoreKind::Cassandra(resources) => {
-                let store = CassandraMessageDeferStore::new(
-                    resources.store.clone(),
-                    resources.queries.clone(),
-                    resources.segment_store.clone(),
-                    topic,
-                    partition,
-                    self.consumer_group.clone(),
-                );
-                MessageStoreWrapper::Cassandra(CachedDeferStore::new(store, self.config.cache_size))
-            }
-        };
+        // Create store synchronously - LazySegment handles async initialization
+        // internally
+        let store = self
+            .store_provider
+            .create_store(topic, partition, &self.consumer_group);
+        let cached_store = CachedDeferStore::new(store, self.config.cache_size);
 
         // Inner handler
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
@@ -361,7 +225,7 @@ where
         MessageDeferHandler {
             handler: inner_handler,
             loader: self.loader.clone(),
-            store: message_store,
+            store: cached_store,
             decider: self.decider.clone(),
             config: self.config.clone(),
             topic,

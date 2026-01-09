@@ -7,9 +7,10 @@
 //! production use where persistence across restarts is required.
 
 use super::TimerDeferStore;
-use crate::Key;
+use super::provider::TimerDeferStoreProvider;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
+use crate::{Key, Partition, Topic};
 use ahash::RandomState;
 use futures::stream;
 use futures::{Stream, StreamExt};
@@ -238,6 +239,34 @@ impl TimerDeferStore for MemoryTimerDeferStore {
     async fn delete_key(&self, key: &Key) -> Result<(), Self::Error> {
         self.inner.deferred.remove_async(key.as_ref()).await;
         Ok(())
+    }
+}
+
+/// Provider for creating [`MemoryTimerDeferStore`] instances.
+///
+/// Simple provider that creates isolated in-memory stores for each partition.
+/// Each store instance has its own `HashMap`, ensuring partition isolation.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryTimerDeferStoreProvider;
+
+impl MemoryTimerDeferStoreProvider {
+    /// Creates a new memory timer defer store provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
+    type Store = MemoryTimerDeferStore;
+
+    fn create_store(
+        &self,
+        _topic: Topic,
+        _partition: Partition,
+        _consumer_group: &str,
+    ) -> Self::Store {
+        MemoryTimerDeferStore::new()
     }
 }
 

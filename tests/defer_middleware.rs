@@ -22,9 +22,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
-use prosody::consumer::middleware::defer::message::handler::{
-    CassandraResources, MessageStoreKind,
-};
+use prosody::consumer::middleware::defer::message::store::CassandraMessageDeferStoreProvider;
 use prosody::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use prosody::consumer::middleware::defer::segment::CassandraSegmentStore;
 use prosody::consumer::middleware::defer::{
@@ -270,11 +268,11 @@ impl DeferTestEnvironment {
         let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), &keyspace).await?;
         let message_queries =
             Arc::new(MessageQueries::new(cassandra_store.session(), &keyspace).await?);
-        let message_store_kind = MessageStoreKind::Cassandra(CassandraResources {
-            store: cassandra_store.clone(),
-            queries: message_queries,
+        let message_provider = CassandraMessageDeferStoreProvider::new(
+            cassandra_store.clone(),
+            message_queries,
             segment_store,
-        });
+        );
 
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
@@ -288,7 +286,7 @@ impl DeferTestEnvironment {
             defer_config,
             &consumer_config,
             &scheduler_config,
-            message_store_kind,
+            message_provider,
             failure_tracker,
             &heartbeats,
         )?;
@@ -361,11 +359,11 @@ impl DeferTestEnvironment {
         let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), &keyspace).await?;
         let message_queries =
             Arc::new(MessageQueries::new(cassandra_store.session(), &keyspace).await?);
-        let message_store_kind = MessageStoreKind::Cassandra(CassandraResources {
-            store: cassandra_store.clone(),
-            queries: message_queries,
+        let message_provider = CassandraMessageDeferStoreProvider::new(
+            cassandra_store.clone(),
+            message_queries,
             segment_store,
-        });
+        );
 
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
@@ -379,7 +377,7 @@ impl DeferTestEnvironment {
             defer_config,
             &consumer_config,
             &scheduler_config,
-            message_store_kind,
+            message_provider,
             failure_tracker,
             &heartbeats,
         )?;
