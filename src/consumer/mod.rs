@@ -151,6 +151,7 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::event_context::EventContext;
+pub use crate::consumer::event_context::CancellationSignals;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};

@@ -21,7 +21,17 @@
 //! - **Exponential growth**: Each retry doubles the delay (with jitter)
 //! - **Maximum delay**: Capped at configured maximum
 //! - **Jitter**: Adds randomness to prevent thundering herd
-//! - **Cancellation**: Respects shutdown signals during retry delays
+//!
+//! # Cancellation Handling
+//!
+//! The retry middleware distinguishes between two types of cancellation signals:
+//!
+//! - **Shutdown** (partition revoked, consumer stopping): Aborts immediately.
+//!   The partition must be released promptly to allow rebalancing.
+//!
+//! - **Message cancellation** (timeout fired): Treated as a transient condition.
+//!   The retry loop continues, skipping any remaining sleep delay. This ensures
+//!   that timeouts don't cause message loss when retries could still succeed.
 //!
 //! # Usage
 //!
@@ -303,7 +313,9 @@ where
                 return Ok(());
             };
 
-            if context.should_cancel() {
+            // Only abort on shutdown (partition revoked). Message cancellation (timeout)
+            // is treated as transient - we continue retrying.
+            if context.is_shutdown() {
                 return Err(error);
             }
 
@@ -336,10 +348,14 @@ where
                         format_duration(sleep_time)
                     );
 
+                    // Shutdown aborts immediately; cancellation skips sleep and continues retrying
                     select! {
                         () = sleep(sleep_time) => {}
-                        () = context.on_cancel() => {
+                        () = context.on_shutdown() => {
                             return Err(error);
+                        }
+                        () = context.on_message_cancelled() => {
+                            // Timeout fired - skip sleep and continue retrying
                         }
                     }
                 }
@@ -398,8 +414,9 @@ where
             else {
                 return Ok(());
             };
-            // If shutdown was requested, stop retrying
-            if context.should_cancel() {
+            // Only abort on shutdown (partition revoked). Message cancellation (timeout)
+            // is treated as transient - we continue retrying.
+            if context.is_shutdown() {
                 return Err(error);
             }
             match error.classify_error() {
@@ -413,9 +430,13 @@ where
                         "failed to handle timer: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
+                    // Shutdown aborts immediately; cancellation skips sleep and continues retrying
                     select! {
                         () = sleep(sleep_time) => {},
-                        () = context.on_cancel() => return Err(error),
+                        () = context.on_shutdown() => return Err(error),
+                        () = context.on_message_cancelled() => {
+                            // Timeout fired - skip sleep and continue retrying
+                        }
                     }
                 }
                 ErrorCategory::Permanent => {
@@ -482,7 +503,9 @@ where
                 break;
             };
 
-            if context.should_cancel() {
+            // Only abort on shutdown (partition revoked). Message cancellation (timeout)
+            // is treated as transient - we continue retrying.
+            if context.is_shutdown() {
                 uncommitted_offset.abort();
                 break;
             }
@@ -501,11 +524,15 @@ where
                         format_duration(sleep_time)
                     );
 
+                    // Shutdown aborts immediately; cancellation skips sleep and continues retrying
                     select! {
                         () = sleep(sleep_time) => {}
-                        () = context.on_cancel() => {
+                        () = context.on_shutdown() => {
                             uncommitted_offset.abort();
                             break;
+                        }
+                        () = context.on_message_cancelled() => {
+                            // Timeout fired - skip sleep and continue retrying
                         }
                     }
                 }
@@ -564,8 +591,9 @@ where
                 uncommitted.commit().await;
                 break;
             };
-            // If shutdown was requested, abort and stop retrying
-            if context.should_cancel() {
+            // Only abort on shutdown (partition revoked). Message cancellation (timeout)
+            // is treated as transient - we continue retrying.
+            if context.is_shutdown() {
                 uncommitted.abort().await;
                 break;
             }
@@ -576,11 +604,15 @@ where
                         "failed to handle timer: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
+                    // Shutdown aborts immediately; cancellation skips sleep and continues retrying
                     select! {
                         () = sleep(sleep_time) => {},
-                        () = context.on_cancel() => {
+                        () = context.on_shutdown() => {
                             uncommitted.abort().await;
                             break;
+                        }
+                        () = context.on_message_cancelled() => {
+                            // Timeout fired - skip sleep and continue retrying
                         }
                     }
                 }
@@ -617,6 +649,7 @@ mod tests {
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
+    use crate::consumer::CancellationSignals;
     use futures::stream;
     use parking_lot::Mutex;
     use serde_json::json;
@@ -649,11 +682,19 @@ mod tests {
         }
     }
 
-    /// Mock context with configurable shutdown state.
+    /// Mock context with configurable shutdown and cancellation state.
+    ///
+    /// Supports two separate signals:
+    /// - **Shutdown**: Partition revoked or consumer stopping (should abort)
+    /// - **Message cancellation**: Timeout fired (should treat as transient)
     #[derive(Clone)]
     struct MockContext {
+        /// Partition/consumer shutdown signal
         shutdown_requested: Arc<AtomicBool>,
         shutdown_notify: Arc<Notify>,
+        /// Message-level cancellation signal (e.g., timeout)
+        message_cancelled: Arc<AtomicBool>,
+        message_cancel_notify: Arc<Notify>,
     }
 
     impl MockContext {
@@ -661,12 +702,21 @@ mod tests {
             Self {
                 shutdown_requested: Arc::new(AtomicBool::new(false)),
                 shutdown_notify: Arc::new(Notify::new()),
+                message_cancelled: Arc::new(AtomicBool::new(false)),
+                message_cancel_notify: Arc::new(Notify::new()),
             }
         }
 
+        /// Trigger partition/consumer shutdown signal.
         fn request_shutdown(&self) {
-            self.shutdown_requested.store(true, Ordering::SeqCst);
+            self.shutdown_requested.store(true, Ordering::Relaxed);
             self.shutdown_notify.notify_waiters();
+        }
+
+        /// Trigger message-level cancellation signal (e.g., timeout).
+        fn request_cancellation(&self) {
+            self.message_cancelled.store(true, Ordering::Relaxed);
+            self.message_cancel_notify.notify_waiters();
         }
     }
 
@@ -674,13 +724,18 @@ mod tests {
         type Error = Infallible;
 
         fn should_cancel(&self) -> bool {
-            self.shutdown_requested.load(Ordering::SeqCst)
+            self.shutdown_requested.load(Ordering::Relaxed)
+                || self.message_cancelled.load(Ordering::Relaxed)
         }
 
         fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
-            let notify = Arc::clone(&self.shutdown_notify);
+            let shutdown_notify = Arc::clone(&self.shutdown_notify);
+            let cancel_notify = Arc::clone(&self.message_cancel_notify);
             async move {
-                notify.notified().await;
+                tokio::select! {
+                    () = shutdown_notify.notified() => {}
+                    () = cancel_notify.notified() => {}
+                }
             }
         }
 
@@ -728,6 +783,30 @@ mod tests {
         }
     }
 
+    impl CancellationSignals for MockContext {
+        fn is_shutdown(&self) -> bool {
+            self.shutdown_requested.load(Ordering::Relaxed)
+        }
+
+        fn is_message_cancelled(&self) -> bool {
+            self.message_cancelled.load(Ordering::Relaxed)
+        }
+
+        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+            let notify = Arc::clone(&self.shutdown_notify);
+            async move {
+                notify.notified().await;
+            }
+        }
+
+        fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+            let notify = Arc::clone(&self.message_cancel_notify);
+            async move {
+                notify.notified().await;
+            }
+        }
+    }
+
     /// Mock handler that tracks calls and can be configured to fail.
     #[derive(Clone)]
     struct MockHandler {
@@ -766,7 +845,7 @@ mod tests {
         }
 
         fn call_count(&self) -> usize {
-            self.call_count.load(Ordering::SeqCst)
+            self.call_count.load(Ordering::Relaxed)
         }
 
         fn recorded_demand_types(&self) -> Vec<DemandType> {
@@ -786,7 +865,7 @@ mod tests {
         where
             C: EventContext,
         {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.call_count.fetch_add(1, Ordering::Relaxed);
             self.demand_types.lock().push(demand_type);
 
             let mut seq = self.failure_sequence.lock();
@@ -807,7 +886,7 @@ mod tests {
         where
             C: EventContext,
         {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.call_count.fetch_add(1, Ordering::Relaxed);
             self.demand_types.lock().push(demand_type);
 
             let mut seq = self.failure_sequence.lock();
@@ -1127,5 +1206,282 @@ mod tests {
             let sleep = retry_handler.sleep_time(10).as_millis() as u64;
             assert!(sleep < 500, "Sleep time should be capped at max_delay");
         }
+    }
+
+    // =========================================================================
+    // Shutdown vs Cancellation Tests
+    // =========================================================================
+    //
+    // These tests verify correct behavior for two distinct signals:
+    // - **Shutdown**: Partition revoked or consumer stopping → should abort
+    // - **Cancellation**: Message timeout fired → should treat as transient, retry
+    //
+    // Test matrix (2×2×2 = 8 tests):
+    // - Handler type: FallibleHandler vs EventHandler
+    // - Method: on_message vs on_timer
+    // - Signal: shutdown vs cancellation
+
+    use crate::consumer::partition::offsets::OffsetTracker;
+    use crate::consumer::{Keyed, Uncommitted};
+    use crate::timers::UncommittedTimer;
+    use color_eyre::eyre::{Result, bail};
+    use crossbeam_utils::CachePadded;
+
+    /// Mock commit guard for tracking commit/abort calls.
+    struct MockCommitGuard {
+        committed: Arc<AtomicBool>,
+        aborted: Arc<AtomicBool>,
+    }
+
+    impl Uncommitted for MockCommitGuard {
+        async fn commit(self) {
+            self.committed.store(true, Ordering::Relaxed);
+        }
+
+        async fn abort(self) {
+            self.aborted.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Mock uncommitted timer for testing `EventHandler::on_timer`.
+    struct MockUncommittedTimer {
+        trigger: Trigger,
+        committed: Arc<AtomicBool>,
+        aborted: Arc<AtomicBool>,
+    }
+
+    impl MockUncommittedTimer {
+        fn new(committed: Arc<AtomicBool>, aborted: Arc<AtomicBool>) -> Self {
+            Self {
+                trigger: create_test_trigger(),
+                committed,
+                aborted,
+            }
+        }
+    }
+
+    impl Keyed for MockUncommittedTimer {
+        type Key = crate::Key;
+
+        fn key(&self) -> &Self::Key {
+            &self.trigger.key
+        }
+    }
+
+    impl Uncommitted for MockUncommittedTimer {
+        async fn commit(self) {
+            self.committed.store(true, Ordering::Relaxed);
+        }
+
+        async fn abort(self) {
+            self.aborted.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl UncommittedTimer for MockUncommittedTimer {
+        type CommitGuard = MockCommitGuard;
+
+        fn time(&self) -> CompactDateTime {
+            self.trigger.time
+        }
+
+        fn timer_type(&self) -> TimerType {
+            self.trigger.timer_type
+        }
+
+        fn span(&self) -> Span {
+            Span::none()
+        }
+
+        fn into_inner(self) -> (Trigger, Self::CommitGuard) {
+            (
+                self.trigger,
+                MockCommitGuard {
+                    committed: self.committed,
+                    aborted: self.aborted,
+                },
+            )
+        }
+    }
+
+    fn create_offset_tracker() -> OffsetTracker {
+        let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+        OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(300), version)
+    }
+
+    // === Shutdown Tests (should pass - abort is correct behavior) ===
+
+    /// `FallibleHandler::on_message` should abort on shutdown signal.
+    #[tokio::test]
+    async fn fallible_on_message_shutdown_aborts() -> Result<()> {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        let retry_handler = create_retry_handler(handler.clone(), 10);
+        let context = MockContext::new();
+        context.request_shutdown();
+
+        let Some(message) = create_test_message() else {
+            bail!("failed to create test message");
+        };
+        let result =
+            FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 1);
+        Ok(())
+    }
+
+    /// `FallibleHandler::on_timer` should abort on shutdown signal.
+    #[tokio::test]
+    async fn fallible_on_timer_shutdown_aborts() -> Result<()> {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        let retry_handler = create_retry_handler(handler.clone(), 10);
+        let context = MockContext::new();
+        context.request_shutdown();
+
+        let result = FallibleHandler::on_timer(
+            &retry_handler,
+            context,
+            create_test_trigger(),
+            DemandType::Normal,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 1);
+        Ok(())
+    }
+
+    /// `EventHandler::on_message` should abort offset on shutdown signal.
+    #[tokio::test]
+    async fn event_on_message_shutdown_aborts() -> Result<()> {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        let retry_handler = create_retry_handler(handler.clone(), 10);
+        let context = MockContext::new();
+        context.request_shutdown();
+
+        let tracker = create_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let Some(message) = create_test_message() else {
+            bail!("failed to create test message");
+        };
+        let uncommitted_message = message.into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&retry_handler, context, uncommitted_message, DemandType::Normal)
+            .await;
+
+        assert_eq!(handler.call_count(), 1);
+        assert_eq!(tracker.shutdown().await, None, "offset should be aborted");
+        Ok(())
+    }
+
+    /// `EventHandler::on_timer` should abort on shutdown signal.
+    #[tokio::test]
+    async fn event_on_timer_shutdown_aborts() -> Result<()> {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        let retry_handler = create_retry_handler(handler.clone(), 10);
+        let context = MockContext::new();
+        context.request_shutdown();
+
+        let committed = Arc::new(AtomicBool::new(false));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let timer = MockUncommittedTimer::new(Arc::clone(&committed), Arc::clone(&aborted));
+
+        EventHandler::on_timer(&retry_handler, context, timer, DemandType::Normal).await;
+
+        assert_eq!(handler.call_count(), 1);
+        assert!(aborted.load(Ordering::Relaxed));
+        assert!(!committed.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    // === Cancellation Tests (should fail - current code incorrectly aborts) ===
+
+    /// `FallibleHandler::on_message` should continue retrying on cancellation.
+    #[tokio::test]
+    async fn fallible_on_message_cancellation_retries() -> Result<()> {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        context.request_cancellation();
+
+        let Some(message) = create_test_message() else {
+            bail!("failed to create test message");
+        };
+        let result =
+            FallibleHandler::on_message(&retry_handler, context, message, DemandType::Normal).await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 4); // 1 initial + 3 retries
+        Ok(())
+    }
+
+    /// `FallibleHandler::on_timer` should continue retrying on cancellation.
+    #[tokio::test]
+    async fn fallible_on_timer_cancellation_retries() -> Result<()> {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        let retry_handler = create_retry_handler(handler.clone(), 3);
+        let context = MockContext::new();
+        context.request_cancellation();
+
+        let result = FallibleHandler::on_timer(
+            &retry_handler,
+            context,
+            create_test_trigger(),
+            DemandType::Normal,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(handler.call_count(), 4); // 1 initial + 3 retries
+        Ok(())
+    }
+
+    /// `EventHandler::on_message` should continue retrying on cancellation.
+    #[tokio::test]
+    async fn event_on_message_cancellation_retries() -> Result<()> {
+        let handler = MockHandler::failing_then_success(vec![
+            ErrorCategory::Transient,
+            ErrorCategory::Transient,
+        ]);
+        let retry_handler = create_retry_handler(handler.clone(), 10);
+        let context = MockContext::new();
+        context.request_cancellation();
+
+        let tracker = create_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let Some(message) = create_test_message() else {
+            bail!("failed to create test message");
+        };
+        let uncommitted_message = message.into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&retry_handler, context, uncommitted_message, DemandType::Normal)
+            .await;
+
+        assert_eq!(handler.call_count(), 3); // 2 failures + 1 success
+        assert_eq!(tracker.shutdown().await, Some(0), "offset should be committed");
+        Ok(())
+    }
+
+    /// `EventHandler::on_timer` should continue retrying on cancellation.
+    #[tokio::test]
+    async fn event_on_timer_cancellation_retries() -> Result<()> {
+        let handler = MockHandler::failing_then_success(vec![
+            ErrorCategory::Transient,
+            ErrorCategory::Transient,
+        ]);
+        let retry_handler = create_retry_handler(handler.clone(), 10);
+        let context = MockContext::new();
+        context.request_cancellation();
+
+        let committed = Arc::new(AtomicBool::new(false));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let timer = MockUncommittedTimer::new(Arc::clone(&committed), Arc::clone(&aborted));
+
+        EventHandler::on_timer(&retry_handler, context, timer, DemandType::Normal).await;
+
+        assert_eq!(handler.call_count(), 3); // 2 failures + 1 success
+        assert!(committed.load(Ordering::Relaxed));
+        assert!(!aborted.load(Ordering::Relaxed));
+        Ok(())
     }
 }

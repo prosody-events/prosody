@@ -249,6 +249,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::CancellationSignals;
     use crate::consumer::message::ConsumerMessage;
     use crate::consumer::middleware::{ClassifyError, ErrorCategory};
     use crate::timers::TimerType;
@@ -259,7 +260,7 @@ mod tests {
     use std::convert::Infallible;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
-    use std::future::{self, Future};
+    use std::future::{self, Future, ready};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -297,6 +298,24 @@ mod tests {
             Self {
                 cancelled: Arc::new(AtomicBool::new(false)),
             }
+        }
+    }
+
+    impl CancellationSignals for MockContext {
+        fn is_shutdown(&self) -> bool {
+            false
+        }
+
+        fn is_message_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Relaxed)
+        }
+
+        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+            ready(())
+        }
+
+        fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+            ready(())
         }
     }
 

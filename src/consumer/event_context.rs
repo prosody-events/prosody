@@ -4,6 +4,8 @@
 //! managing timer scheduling within message handlers. It provides:
 //! - `EventContext`: Trait for handler contexts to schedule, unschedule, clear,
 //!   and list timers, as well as detect shutdown.
+//! - `CancellationSignals`: Internal trait for distinguishing shutdown from
+//!   message-level cancellation (used by retry middleware).
 //! - `TimerContext<T>`: Concrete `EventContext` implementation backed by a
 //!   `TimerManager<T>` using a `TriggerStore` backend.
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
@@ -49,7 +51,7 @@ impl<T> EventContextError for T where T: StdError + ClassifyError + Send + Sync 
 /// - Clear any scheduled timers and reschedule a fresh one.
 /// - Inspect all scheduled timer execution times for the key.
 /// - Check synchronously if cancellation has been requested.
-pub trait EventContext: Clone + Send + Sync + 'static {
+pub trait EventContext: CancellationSignals + Clone + Send + Sync + 'static {
     /// Error type returned by timer-related operations.
     type Error: EventContextError;
 
@@ -181,6 +183,46 @@ pub trait EventContext: Clone + Send + Sync + 'static {
     fn boxed(self) -> BoxEventContext {
         Box::new(self)
     }
+}
+
+/// Distinguishes shutdown signals from message-level cancellation.
+///
+/// This trait is used internally by the retry middleware to determine whether
+/// to abort immediately (shutdown) or treat cancellation as a transient error
+/// and continue retrying (message cancellation/timeout).
+///
+/// - **Shutdown**: Partition revoked or consumer stopping. Processing must stop
+///   immediately to release the partition.
+/// - **Message cancellation**: Timeout fired or similar. Should be treated as a
+///   transient error; retry logic should continue.
+///
+/// # Note
+///
+/// This trait is a supertrait of [`EventContext`] and must be public, but it is
+/// considered an implementation detail. External users should not rely on these
+/// methods directly.
+pub trait CancellationSignals {
+    /// Returns `true` if shutdown has been requested.
+    ///
+    /// Shutdown means the partition is being revoked or the consumer is
+    /// stopping. Processing must abort immediately.
+    fn is_shutdown(&self) -> bool;
+
+    /// Returns `true` if message-level cancellation has been requested.
+    ///
+    /// Message cancellation (e.g., timeout) should be treated as a transient
+    /// error by retry logic, not as a signal to abort.
+    fn is_message_cancelled(&self) -> bool;
+
+    /// Returns a future that resolves when shutdown is requested.
+    ///
+    /// Use this in `select!` to abort retry sleep on shutdown while ignoring
+    /// message-level cancellation.
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static;
+
+    /// Returns a future that resolves when message-level cancellation is
+    /// requested.
+    fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static;
 }
 
 /// Concrete implementation of `EventContext` that uses a `TimerManager<T>`.
@@ -459,6 +501,53 @@ where
             }
         }
         .right_stream()
+    }
+}
+
+impl<T> CancellationSignals for TimerContext<T>
+where
+    T: TriggerStore,
+{
+    fn is_shutdown(&self) -> bool {
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return true;
+        };
+        *inner.shutdown_rx.borrow()
+    }
+
+    fn is_message_cancelled(&self) -> bool {
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return true;
+        };
+        *inner.message_cancel_rx.borrow()
+    }
+
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return ready(()).left_future();
+        };
+
+        let mut shutdown_rx = inner.shutdown_rx.clone();
+        async move {
+            let _ = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await;
+        }
+        .right_future()
+    }
+
+    fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        let inner = self.inner.load();
+        let Some(inner) = inner.as_ref() else {
+            return ready(()).left_future();
+        };
+
+        let mut cancel_rx = inner.message_cancel_rx.clone();
+        async move {
+            let _ = cancel_rx.wait_for(|is_cancelled| *is_cancelled).await;
+        }
+        .right_future()
     }
 }
 

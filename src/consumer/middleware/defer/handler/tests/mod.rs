@@ -1,10 +1,11 @@
+use crate::consumer::CancellationSignals;
 use crate::consumer::event_context::EventContext;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use futures::{Stream, stream};
 use parking_lot::Mutex;
 use std::convert::Infallible;
-use std::future;
+use std::future::{self, Future, ready};
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::{Builder, Runtime};
 
@@ -112,6 +113,24 @@ impl MockContext {
     /// Clear all recorded operations.
     pub fn clear_operations(&self) {
         self.operations.lock().clear();
+    }
+}
+
+impl CancellationSignals for MockContext {
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+
+    fn is_message_cancelled(&self) -> bool {
+        false
+    }
+
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+        ready(())
+    }
+
+    fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        ready(())
     }
 }
 
