@@ -47,9 +47,9 @@ pub enum TimerStoreKind {
 /// Enum wrapper for different timer defer store implementations.
 #[derive(Clone)]
 pub enum TimerStoreWrapper {
-    /// In-memory store for testing.
-    Memory(CachedTimerDeferStore<MemoryTimerDeferStore>),
-    /// Cassandra-backed store for production.
+    /// In-memory store for testing (no cache needed - already O(1) lookups).
+    Memory(MemoryTimerDeferStore),
+    /// Cassandra-backed store for production (cached to reduce network calls).
     Cassandra(CachedTimerDeferStore<CassandraTimerDeferStore>),
 }
 
@@ -266,10 +266,7 @@ where
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         // Create the appropriate store based on store_kind
         let timer_store = match &self.store_kind {
-            TimerStoreKind::Memory => {
-                let store = MemoryTimerDeferStore::new();
-                TimerStoreWrapper::Memory(CachedTimerDeferStore::new(store, self.config.cache_size))
-            }
+            TimerStoreKind::Memory => TimerStoreWrapper::Memory(MemoryTimerDeferStore::new()),
             TimerStoreKind::Cassandra(resources) => {
                 let store = CassandraTimerDeferStore::new(
                     resources.store.clone(),

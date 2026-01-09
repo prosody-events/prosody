@@ -69,9 +69,9 @@ pub enum MessageStoreKind {
 /// Enum wrapper for different message defer store implementations.
 #[derive(Clone)]
 pub enum MessageStoreWrapper {
-    /// In-memory store for testing.
-    Memory(CachedDeferStore<MemoryMessageDeferStore>),
-    /// Cassandra-backed store for production.
+    /// In-memory store for testing (no cache needed - already O(1) lookups).
+    Memory(MemoryMessageDeferStore),
+    /// Cassandra-backed store for production (cached to reduce network calls).
     Cassandra(CachedDeferStore<CassandraMessageDeferStore>),
 }
 
@@ -340,10 +340,7 @@ where
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         // Create the appropriate store based on store_kind
         let message_store = match &self.store_kind {
-            MessageStoreKind::Memory => {
-                let store = MemoryMessageDeferStore::new();
-                MessageStoreWrapper::Memory(CachedDeferStore::new(store, self.config.cache_size))
-            }
+            MessageStoreKind::Memory => MessageStoreWrapper::Memory(MemoryMessageDeferStore::new()),
             MessageStoreKind::Cassandra(resources) => {
                 let store = CassandraMessageDeferStore::new(
                     resources.store.clone(),
