@@ -647,22 +647,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::CancellationSignals;
     use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::middleware::test_support::MockEventContext;
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
-    use futures::stream;
     use parking_lot::Mutex;
     use serde_json::json;
-    use std::convert::Infallible;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
-    use std::future::{self, Future};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::Semaphore;
     use tokio::time::{sleep as tokio_sleep, timeout};
     use tracing::Span;
 
@@ -681,131 +678,6 @@ mod tests {
     impl ClassifyError for TestError {
         fn classify_error(&self) -> ErrorCategory {
             self.0
-        }
-    }
-
-    /// Mock context with configurable shutdown and cancellation state.
-    ///
-    /// Supports two separate signals:
-    /// - **Shutdown**: Partition revoked or consumer stopping (should abort)
-    /// - **Message cancellation**: Timeout fired (should treat as transient)
-    #[derive(Clone)]
-    struct MockContext {
-        /// Partition/consumer shutdown signal
-        shutdown_requested: Arc<AtomicBool>,
-        shutdown_notify: Arc<Notify>,
-        /// Message-level cancellation signal (e.g., timeout)
-        message_cancelled: Arc<AtomicBool>,
-        message_cancel_notify: Arc<Notify>,
-    }
-
-    impl MockContext {
-        fn new() -> Self {
-            Self {
-                shutdown_requested: Arc::new(AtomicBool::new(false)),
-                shutdown_notify: Arc::new(Notify::new()),
-                message_cancelled: Arc::new(AtomicBool::new(false)),
-                message_cancel_notify: Arc::new(Notify::new()),
-            }
-        }
-
-        /// Trigger partition/consumer shutdown signal.
-        fn request_shutdown(&self) {
-            self.shutdown_requested.store(true, Ordering::Relaxed);
-            self.shutdown_notify.notify_waiters();
-        }
-
-        /// Trigger message-level cancellation signal (e.g., timeout).
-        fn request_cancellation(&self) {
-            self.message_cancelled.store(true, Ordering::Relaxed);
-            self.message_cancel_notify.notify_waiters();
-        }
-    }
-
-    impl EventContext for MockContext {
-        type Error = Infallible;
-
-        fn should_cancel(&self) -> bool {
-            self.shutdown_requested.load(Ordering::Relaxed)
-                || self.message_cancelled.load(Ordering::Relaxed)
-        }
-
-        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
-            let shutdown_notify = Arc::clone(&self.shutdown_notify);
-            let cancel_notify = Arc::clone(&self.message_cancel_notify);
-            async move {
-                tokio::select! {
-                    () = shutdown_notify.notified() => {}
-                    () = cancel_notify.notified() => {}
-                }
-            }
-        }
-
-        fn schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_and_schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn unschedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn cancel(&self) {}
-
-        fn invalidate(self) {}
-
-        fn scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl futures::Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static
-        {
-            stream::empty()
-        }
-    }
-
-    impl CancellationSignals for MockContext {
-        fn is_shutdown(&self) -> bool {
-            self.shutdown_requested.load(Ordering::Relaxed)
-        }
-
-        fn is_message_cancelled(&self) -> bool {
-            self.message_cancelled.load(Ordering::Relaxed)
-        }
-
-        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-            let notify = Arc::clone(&self.shutdown_notify);
-            async move {
-                notify.notified().await;
-            }
-        }
-
-        fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
-            let notify = Arc::clone(&self.message_cancel_notify);
-            async move {
-                notify.notified().await;
-            }
         }
     }
 
@@ -942,7 +814,7 @@ mod tests {
     async fn success_on_first_attempt_returns_ok_immediately() {
         let handler = MockHandler::success();
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -964,7 +836,7 @@ mod tests {
             ErrorCategory::Transient,
         ]);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -980,7 +852,7 @@ mod tests {
     async fn transient_error_fails_after_max_retries() {
         let handler = MockHandler::always_failing(ErrorCategory::Transient);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -1003,7 +875,7 @@ mod tests {
     async fn permanent_error_fails_immediately_no_retry() {
         let handler = MockHandler::always_failing(ErrorCategory::Permanent);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -1021,7 +893,7 @@ mod tests {
     async fn terminal_error_fails_immediately_no_retry() {
         let handler = MockHandler::always_failing(ErrorCategory::Terminal);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -1040,7 +912,7 @@ mod tests {
         // Fail once with transient, then succeed
         let handler = MockHandler::failing_then_success(vec![ErrorCategory::Transient]);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -1075,7 +947,7 @@ mod tests {
             max_retries: 10,
             handler: handler.clone(),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -1111,7 +983,7 @@ mod tests {
     async fn timer_success_on_first_attempt() {
         let handler = MockHandler::success();
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result =
@@ -1125,7 +997,7 @@ mod tests {
     async fn timer_transient_error_retries_then_succeeds() {
         let handler = MockHandler::failing_then_success(vec![ErrorCategory::Transient]);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result =
@@ -1139,7 +1011,7 @@ mod tests {
     async fn timer_permanent_error_no_retry() {
         let handler = MockHandler::always_failing(ErrorCategory::Permanent);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result =
@@ -1324,7 +1196,7 @@ mod tests {
     async fn fallible_on_message_shutdown_aborts() -> Result<()> {
         let handler = MockHandler::always_failing(ErrorCategory::Transient);
         let retry_handler = create_retry_handler(handler.clone(), 10);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         context.request_shutdown();
 
         let Some(message) = create_test_message() else {
@@ -1343,7 +1215,7 @@ mod tests {
     async fn fallible_on_timer_shutdown_aborts() -> Result<()> {
         let handler = MockHandler::always_failing(ErrorCategory::Transient);
         let retry_handler = create_retry_handler(handler.clone(), 10);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         context.request_shutdown();
 
         let result = FallibleHandler::on_timer(
@@ -1364,7 +1236,7 @@ mod tests {
     async fn event_on_message_shutdown_aborts() -> Result<()> {
         let handler = MockHandler::always_failing(ErrorCategory::Transient);
         let retry_handler = create_retry_handler(handler.clone(), 10);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         context.request_shutdown();
 
         let tracker = create_offset_tracker();
@@ -1392,7 +1264,7 @@ mod tests {
     async fn event_on_timer_shutdown_aborts() -> Result<()> {
         let handler = MockHandler::always_failing(ErrorCategory::Transient);
         let retry_handler = create_retry_handler(handler.clone(), 10);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         context.request_shutdown();
 
         let committed = Arc::new(AtomicBool::new(false));
@@ -1414,7 +1286,7 @@ mod tests {
     async fn fallible_on_message_cancellation_retries() -> Result<()> {
         let handler = MockHandler::always_failing(ErrorCategory::Transient);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         context.request_cancellation();
 
         let Some(message) = create_test_message() else {
@@ -1433,7 +1305,7 @@ mod tests {
     async fn fallible_on_timer_cancellation_retries() -> Result<()> {
         let handler = MockHandler::always_failing(ErrorCategory::Transient);
         let retry_handler = create_retry_handler(handler.clone(), 3);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         context.request_cancellation();
 
         let result = FallibleHandler::on_timer(
@@ -1457,7 +1329,7 @@ mod tests {
             ErrorCategory::Transient,
         ]);
         let retry_handler = create_retry_handler(handler.clone(), 10);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         context.request_cancellation();
 
         let tracker = create_offset_tracker();
@@ -1492,7 +1364,7 @@ mod tests {
             ErrorCategory::Transient,
         ]);
         let retry_handler = create_retry_handler(handler.clone(), 10);
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         context.request_cancellation();
 
         let committed = Arc::new(AtomicBool::new(false));

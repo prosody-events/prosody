@@ -234,19 +234,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::CancellationSignals;
     use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::middleware::test_support::MockEventContext;
     use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleCloneProvider};
     use crate::telemetry::event::{Data, KeyState};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
-    use futures::stream;
     use serde_json::json;
-    use std::convert::Infallible;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
-    use std::future::{self, Future, ready};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -269,83 +266,6 @@ mod tests {
     impl ClassifyError for TestError {
         fn classify_error(&self) -> ErrorCategory {
             self.0
-        }
-    }
-
-    /// Mock context that satisfies [`EventContext`].
-    #[derive(Clone)]
-    struct MockContext;
-
-    impl CancellationSignals for MockContext {
-        fn is_shutdown(&self) -> bool {
-            false
-        }
-
-        fn is_message_cancelled(&self) -> bool {
-            false
-        }
-
-        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-            ready(())
-        }
-
-        fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
-            ready(())
-        }
-    }
-
-    impl EventContext for MockContext {
-        type Error = Infallible;
-
-        fn should_cancel(&self) -> bool {
-            false
-        }
-
-        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
-            future::pending::<()>()
-        }
-
-        fn schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_and_schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn unschedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn cancel(&self) {}
-
-        fn invalidate(self) {}
-
-        fn scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl futures::Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static
-        {
-            stream::empty()
         }
     }
 
@@ -442,7 +362,7 @@ mod tests {
             handler: handler.clone(),
             sender: telemetry.partition_sender("test-topic".into(), 0),
         };
-        let context = MockContext;
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -463,7 +383,7 @@ mod tests {
             handler: handler.clone(),
             sender: telemetry.partition_sender("test-topic".into(), 0),
         };
-        let context = MockContext;
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -484,7 +404,7 @@ mod tests {
             handler: handler.clone(),
             sender: telemetry.partition_sender("test-topic".into(), 0),
         };
-        let context = MockContext;
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = telemetry_handler
@@ -503,7 +423,7 @@ mod tests {
             handler: handler.clone(),
             sender: telemetry.partition_sender("test-topic".into(), 0),
         };
-        let context = MockContext;
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = telemetry_handler
@@ -525,7 +445,7 @@ mod tests {
             handler,
             sender: telemetry.partition_sender("test-topic".into(), 0),
         };
-        let context = MockContext;
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -564,7 +484,7 @@ mod tests {
             handler,
             sender: telemetry.partition_sender("test-topic".into(), 0),
         };
-        let context = MockContext;
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -603,7 +523,7 @@ mod tests {
             handler,
             sender: telemetry.partition_sender("test-topic".into(), 0),
         };
-        let context = MockContext;
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let _ = telemetry_handler

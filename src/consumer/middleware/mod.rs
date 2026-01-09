@@ -168,6 +168,8 @@ pub mod retry;
 pub mod scheduler;
 pub mod shutdown;
 pub mod telemetry;
+#[cfg(test)]
+pub mod test_support;
 pub mod timeout;
 pub mod topic;
 

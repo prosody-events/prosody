@@ -249,20 +249,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::CancellationSignals;
     use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::middleware::test_support::MockEventContext;
     use crate::consumer::middleware::{ClassifyError, ErrorCategory};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
-    use futures::stream;
     use serde_json::json;
-    use std::convert::Infallible;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
-    use std::future::{self, Future, ready};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Semaphore;
     use tokio::task::yield_now;
@@ -284,97 +281,6 @@ mod tests {
     impl ClassifyError for TestError {
         fn classify_error(&self) -> ErrorCategory {
             ErrorCategory::Transient
-        }
-    }
-
-    /// Mock context that satisfies [`EventContext`] and tracks cancellation.
-    #[derive(Clone)]
-    struct MockContext {
-        cancelled: Arc<AtomicBool>,
-    }
-
-    impl MockContext {
-        fn new() -> Self {
-            Self {
-                cancelled: Arc::new(AtomicBool::new(false)),
-            }
-        }
-    }
-
-    impl CancellationSignals for MockContext {
-        fn is_shutdown(&self) -> bool {
-            false
-        }
-
-        fn is_message_cancelled(&self) -> bool {
-            self.cancelled.load(Ordering::Relaxed)
-        }
-
-        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-            ready(())
-        }
-
-        fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
-            ready(())
-        }
-    }
-
-    impl EventContext for MockContext {
-        type Error = Infallible;
-
-        fn should_cancel(&self) -> bool {
-            self.cancelled.load(Ordering::Relaxed)
-        }
-
-        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
-            future::pending::<()>()
-        }
-
-        fn cancel(&self) {
-            self.cancelled.store(true, Ordering::Relaxed);
-        }
-
-        fn schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_and_schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn unschedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn invalidate(self) {
-            self.cancel();
-        }
-
-        fn scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl futures::Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static
-        {
-            stream::empty()
         }
     }
 
@@ -501,7 +407,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -521,7 +427,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -543,7 +449,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_millis(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -567,7 +473,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler
@@ -586,7 +492,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_millis(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler
@@ -606,7 +512,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler

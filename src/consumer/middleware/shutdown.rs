@@ -219,16 +219,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::CancellationSignals;
+    use crate::consumer::middleware::test_support::MockEventContext;
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
-    use futures::stream;
     use serde_json::json;
-    use std::convert::Infallible;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
-    use std::future::{self, Future, ready};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
@@ -249,91 +246,6 @@ mod tests {
     impl ClassifyError for TestError {
         fn classify_error(&self) -> ErrorCategory {
             self.0
-        }
-    }
-
-    /// Mock context with configurable shutdown state.
-    #[derive(Clone)]
-    struct MockContext {
-        shutdown: bool,
-    }
-
-    impl MockContext {
-        fn new(shutdown: bool) -> Self {
-            Self { shutdown }
-        }
-    }
-
-    impl CancellationSignals for MockContext {
-        fn is_shutdown(&self) -> bool {
-            self.shutdown
-        }
-
-        fn is_message_cancelled(&self) -> bool {
-            false
-        }
-
-        fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-            ready(())
-        }
-
-        fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
-            ready(())
-        }
-    }
-
-    impl EventContext for MockContext {
-        type Error = Infallible;
-
-        fn should_cancel(&self) -> bool {
-            self.shutdown
-        }
-
-        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
-            future::pending::<()>()
-        }
-
-        fn schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_and_schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn unschedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn cancel(&self) {}
-
-        fn invalidate(self) {}
-
-        fn scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl futures::Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static
-        {
-            stream::empty()
         }
     }
 
@@ -446,7 +358,7 @@ mod tests {
         let shutdown_handler = ShutdownHandler {
             handler: handler.clone(),
         };
-        let context = MockContext::new(true); // shutdown = true
+        let context = MockEventContext::new().with_shutdown();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -465,7 +377,7 @@ mod tests {
         let shutdown_handler = ShutdownHandler {
             handler: handler.clone(),
         };
-        let context = MockContext::new(false); // shutdown = false
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -484,7 +396,7 @@ mod tests {
         let shutdown_handler = ShutdownHandler {
             handler: handler.clone(),
         };
-        let context = MockContext::new(false);
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -503,7 +415,7 @@ mod tests {
         let shutdown_handler = ShutdownHandler {
             handler: handler.clone(),
         };
-        let context = MockContext::new(true);
+        let context = MockEventContext::new().with_shutdown();
         let trigger = create_test_trigger();
 
         let result = shutdown_handler
@@ -520,7 +432,7 @@ mod tests {
         let shutdown_handler = ShutdownHandler {
             handler: handler.clone(),
         };
-        let context = MockContext::new(false);
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = shutdown_handler
