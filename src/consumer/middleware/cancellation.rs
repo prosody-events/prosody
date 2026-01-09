@@ -1,38 +1,43 @@
-//! Graceful shutdown middleware for partition revocation.
+//! Cancellation guard middleware for preventing unnecessary work.
 //!
-//! Monitors partition revocation signals and immediately stops processing new
-//! messages when a partition is being revoked. Returns terminal errors to abort
-//! processing gracefully.
+//! Checks if the context is already cancelled before passing control to inner
+//! middleware. This prevents starting new work when the message has already
+//! been cancelled (shutdown or timeout).
 //!
 //! # Execution Order
 //!
 //! **Request Path:**
-//! 1. **Check shutdown signal** - Return terminal error if partition being
-//!    revoked
-//! 2. Pass control to inner middleware layers (if not shutting down)
+//! 1. **Check cancellation signals** - Return appropriate error if cancelled
+//! 2. Pass control to inner middleware layers (if not cancelled)
 //!
 //! **Response Path:**
 //! 1. Receive result from inner layers
 //! 2. Pass result through unchanged
 //!
-//! # Shutdown Behavior
+//! # Cancellation Behavior
 //!
-//! - **Signal Detection**: Monitors [`EventContext::is_shutdown_requested`]
-//! - **Immediate Stop**: Returns [`ShutdownError`] when revocation detected
-//! - **Terminal Classification**: Error classified as
-//!   [`ErrorCategory::Terminal`]
-//! - **Graceful Abort**: Allows in-flight operations to complete
+//! The middleware distinguishes between two types of cancellation:
+//!
+//! - **Shutdown** (partition revoked): Returns
+//!   [`CancellationGuardError::Shutdown`] classified as
+//!   [`ErrorCategory::Terminal`]. Processing must stop immediately to release
+//!   the partition.
+//!
+//! - **Message cancellation**: Returns
+//!   [`CancellationGuardError::MessageCancelled`] classified as
+//!   [`ErrorCategory::Transient`]. The retry middleware will continue retrying
+//!   rather than aborting the message.
 //!
 //! # Usage
 //!
-//! Position early in middleware stack to prevent unnecessary processing during
-//! shutdown:
+//! Position early in middleware stack to prevent unnecessary processing when
+//! already cancelled:
 //!
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::retry::*;
 //! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::shutdown::*;
+//! # use prosody::consumer::middleware::cancellation_guard::*;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
 //! # use prosody::consumer::message::ConsumerMessage;
@@ -53,12 +58,12 @@
 //! # let handler = MyHandler;
 //!
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(ShutdownMiddleware) // Check shutdown early
+//!     .layer(CancellationGuardMiddleware) // Check cancellation early
 //!     .layer(RetryMiddleware::new(retry_config).unwrap())
 //!     .into_provider(handler);
 //! ```
 //!
-//! [`EventContext::is_shutdown_requested`]: crate::consumer::event_context::EventContext
+//! [`EventContext::should_cancel`]: crate::consumer::event_context::EventContext::should_cancel
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 
 use thiserror::Error;
@@ -73,58 +78,59 @@ use crate::consumer::middleware::{
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
 
-/// Middleware that checks if the partition is shutting down before running the
-/// handler, preventing other middleware from delaying the shutdown.
+/// Middleware that checks if processing is already cancelled before running the
+/// handler, preventing unnecessary work when shutdown or cancellation has
+/// occurred.
 #[derive(Clone, Copy, Debug)]
-pub struct ShutdownMiddleware;
+pub struct CancellationGuardMiddleware;
 
-/// A provider that wraps handlers with shutdown functionality.
+/// A provider that wraps handlers with cancellation guard functionality.
 #[derive(Clone, Debug)]
-pub struct ShutdownProvider<T> {
+pub struct CancellationGuardProvider<T> {
     provider: T,
 }
 
-/// Wraps a handler with shutdown functionality.
+/// Wraps a handler with cancellation guard functionality.
 ///
-/// This struct adds shutdown checks to the wrapped handler's message
-/// processing, ensuring that no new messages are processed when a
-/// partition is being revoked.
+/// This struct adds cancellation checks to the wrapped handler's message
+/// processing, ensuring that no new messages are processed when the context
+/// is already cancelled.
 #[derive(Clone, Debug)]
-pub struct ShutdownHandler<T> {
+pub struct CancellationGuardHandler<T> {
     handler: T,
 }
 
-impl HandlerMiddleware for ShutdownMiddleware {
-    type Provider<T: FallibleHandlerProvider> = ShutdownProvider<T>;
+impl HandlerMiddleware for CancellationGuardMiddleware {
+    type Provider<T: FallibleHandlerProvider> = CancellationGuardProvider<T>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
     {
-        ShutdownProvider { provider }
+        CancellationGuardProvider { provider }
     }
 }
 
-impl<T> FallibleHandlerProvider for ShutdownProvider<T>
+impl<T> FallibleHandlerProvider for CancellationGuardProvider<T>
 where
     T: FallibleHandlerProvider,
 {
-    type Handler = ShutdownHandler<T::Handler>;
+    type Handler = CancellationGuardHandler<T::Handler>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        ShutdownHandler {
+        CancellationGuardHandler {
             handler: self.provider.handler_for_partition(topic, partition),
         }
     }
 }
 
-impl<T> FallibleHandler for ShutdownHandler<T>
+impl<T> FallibleHandler for CancellationGuardHandler<T>
 where
     T: FallibleHandler,
 {
-    type Error = ShutdownError<T::Error>;
+    type Error = CancellationGuardError<T::Error>;
 
-    /// Processes a message, checking for shutdown conditions.
+    /// Processes a message, checking for cancellation conditions.
     ///
     /// # Arguments
     ///
@@ -133,12 +139,15 @@ where
     ///
     /// # Returns
     ///
-    /// A `Result` indicating success or a `ShutdownError`.
+    /// A `Result` indicating success or a `CancellationGuardError`.
     ///
     /// # Errors
     ///
-    /// Returns a `ShutdownError::Shutdown` if the partition is being revoked,
-    /// or a `ShutdownError::Handler` containing the wrapped handler's error.
+    /// - `CancellationGuardError::Shutdown` (Terminal) if partition is revoked
+    /// - `CancellationGuardError::MessageCancelled` (Transient) if message was
+    ///   cancelled
+    /// - `CancellationGuardError::Handler` containing the wrapped handler's
+    ///   error
     async fn on_message<C>(
         &self,
         context: C,
@@ -148,14 +157,19 @@ where
     where
         C: EventContext,
     {
-        if context.should_cancel() {
-            return Err(ShutdownError::Shutdown);
+        // Check shutdown first (Terminal) - must release partition immediately
+        if context.is_shutdown() {
+            return Err(CancellationGuardError::Shutdown);
+        }
+        // Check message cancellation (Transient) - retry will continue
+        if context.is_message_cancelled() {
+            return Err(CancellationGuardError::MessageCancelled);
         }
 
         self.handler
             .on_message(context, message, demand_type)
             .await
-            .map_err(ShutdownError::Handler)
+            .map_err(CancellationGuardError::Handler)
     }
 
     async fn on_timer<C>(
@@ -167,51 +181,71 @@ where
     where
         C: EventContext,
     {
-        if context.should_cancel() {
-            return Err(ShutdownError::Shutdown);
+        // Check shutdown first (Terminal) - must release partition immediately
+        if context.is_shutdown() {
+            return Err(CancellationGuardError::Shutdown);
         }
+        // Check message cancellation (Transient) - retry will continue
+        if context.is_message_cancelled() {
+            return Err(CancellationGuardError::MessageCancelled);
+        }
+
         self.handler
             .on_timer(context, timer, demand_type)
             .await
-            .map_err(ShutdownError::Handler)
+            .map_err(CancellationGuardError::Handler)
     }
 
     async fn shutdown(self) {
-        debug!("shutting down shutdown middleware handler");
+        debug!("shutting down cancellation guard handler");
 
-        // No shutdown-specific state to clean up (signals are external)
+        // No guard-specific state to clean up (signals are external)
         // Cascade shutdown to the inner handler
         self.handler.shutdown().await;
     }
 }
 
-/// Represents errors that can occur during shutdown handling.
+/// Represents errors that can occur during cancellation guard handling.
 #[derive(Debug, Error)]
-pub enum ShutdownError<T> {
-    /// Indicates that the partition is being revoked.
+pub enum CancellationGuardError<T> {
+    /// Indicates shutdown was requested (partition revoked).
+    ///
+    /// Classified as [`ErrorCategory::Terminal`] - processing must stop
+    /// immediately to release the partition.
     #[error("partition is being revoked")]
     Shutdown,
+
+    /// Indicates message processing was cancelled.
+    ///
+    /// Classified as [`ErrorCategory::Transient`] - retry middleware will
+    /// continue retrying rather than aborting the message.
+    #[error("message processing was cancelled")]
+    MessageCancelled,
 
     /// Wraps an error from the underlying handler.
     #[error("handler error: {0:#}")]
     Handler(T),
 }
 
-impl<T> ClassifyError for ShutdownError<T>
+impl<T> ClassifyError for CancellationGuardError<T>
 where
     T: ClassifyError,
 {
-    /// Classifies the shutdown error.
+    /// Classifies the cancellation guard error.
     ///
     /// # Returns
     ///
     /// An `ErrorCategory` indicating the nature of the error:
-    /// - `ErrorCategory::Terminal` for `ShutdownError::Shutdown`
-    /// - The classification of the wrapped error for `ShutdownError::Handler`
+    /// - `ErrorCategory::Terminal` for `CancellationGuardError::Shutdown`
+    /// - `ErrorCategory::Transient` for
+    ///   `CancellationGuardError::MessageCancelled`
+    /// - The classification of the wrapped error for
+    ///   `CancellationGuardError::Handler`
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            ShutdownError::Shutdown => ErrorCategory::Terminal,
-            ShutdownError::Handler(error) => error.classify_error(),
+            CancellationGuardError::Shutdown => ErrorCategory::Terminal,
+            CancellationGuardError::MessageCancelled => ErrorCategory::Transient,
+            CancellationGuardError::Handler(error) => error.classify_error(),
         }
     }
 }
@@ -334,28 +368,34 @@ mod tests {
 
     #[test]
     fn shutdown_error_classifies_as_terminal() {
-        let error: ShutdownError<TestError> = ShutdownError::Shutdown;
+        let error: CancellationGuardError<TestError> = CancellationGuardError::Shutdown;
         assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
     }
 
     #[test]
+    fn message_cancelled_error_classifies_as_transient() {
+        let error: CancellationGuardError<TestError> = CancellationGuardError::MessageCancelled;
+        assert!(matches!(error.classify_error(), ErrorCategory::Transient));
+    }
+
+    #[test]
     fn handler_error_delegates_classification_transient() {
-        let error: ShutdownError<TestError> =
-            ShutdownError::Handler(TestError(ErrorCategory::Transient));
+        let error: CancellationGuardError<TestError> =
+            CancellationGuardError::Handler(TestError(ErrorCategory::Transient));
         assert!(matches!(error.classify_error(), ErrorCategory::Transient));
     }
 
     #[test]
     fn handler_error_delegates_classification_permanent() {
-        let error: ShutdownError<TestError> =
-            ShutdownError::Handler(TestError(ErrorCategory::Permanent));
+        let error: CancellationGuardError<TestError> =
+            CancellationGuardError::Handler(TestError(ErrorCategory::Permanent));
         assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
     }
 
     #[tokio::test]
-    async fn shutdown_signal_returns_shutdown_error() {
+    async fn shutdown_returns_terminal_error() {
         let handler = MockHandler::success();
-        let shutdown_handler = ShutdownHandler {
+        let guard_handler = CancellationGuardHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new().with_shutdown();
@@ -363,18 +403,49 @@ mod tests {
             return;
         };
 
-        let result = shutdown_handler
+        let result = guard_handler
             .on_message(context, message, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(ShutdownError::Shutdown)));
+        assert!(matches!(result, Err(CancellationGuardError::Shutdown)));
+        assert!(matches!(
+            result.as_ref().err().map(ClassifyError::classify_error),
+            Some(ErrorCategory::Terminal)
+        ));
         assert_eq!(handler.call_count(), 0, "handler should not be called");
     }
 
     #[tokio::test]
-    async fn no_shutdown_passes_through_to_handler() {
+    async fn message_cancelled_returns_transient_error() {
         let handler = MockHandler::success();
-        let shutdown_handler = ShutdownHandler {
+        let guard_handler = CancellationGuardHandler {
+            handler: handler.clone(),
+        };
+        let context = MockEventContext::new();
+        context.request_cancellation();
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result = guard_handler
+            .on_message(context, message, DemandType::Normal)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CancellationGuardError::MessageCancelled)
+        ));
+        assert!(matches!(
+            result.as_ref().err().map(ClassifyError::classify_error),
+            Some(ErrorCategory::Transient)
+        ));
+        assert_eq!(handler.call_count(), 0, "handler should not be called");
+    }
+
+    #[tokio::test]
+    async fn not_cancelled_passes_through_to_handler() {
+        let handler = MockHandler::success();
+        let guard_handler = CancellationGuardHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new();
@@ -382,7 +453,7 @@ mod tests {
             return;
         };
 
-        let result = shutdown_handler
+        let result = guard_handler
             .on_message(context, message, DemandType::Normal)
             .await;
 
@@ -391,9 +462,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handler_error_wrapped_in_shutdown_error() {
+    async fn handler_error_wrapped_in_guard_error() {
         let handler = MockHandler::failing(ErrorCategory::Transient);
-        let shutdown_handler = ShutdownHandler {
+        let guard_handler = CancellationGuardHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new();
@@ -401,41 +472,62 @@ mod tests {
             return;
         };
 
-        let result = shutdown_handler
+        let result = guard_handler
             .on_message(context, message, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(ShutdownError::Handler(_))));
+        assert!(matches!(result, Err(CancellationGuardError::Handler(_))));
         assert_eq!(handler.call_count(), 1);
     }
 
     #[tokio::test]
-    async fn timer_shutdown_signal_returns_shutdown_error() {
+    async fn timer_shutdown_returns_terminal_error() {
         let handler = MockHandler::success();
-        let shutdown_handler = ShutdownHandler {
+        let guard_handler = CancellationGuardHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new().with_shutdown();
         let trigger = create_test_trigger();
 
-        let result = shutdown_handler
+        let result = guard_handler
             .on_timer(context, trigger, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(ShutdownError::Shutdown)));
+        assert!(matches!(result, Err(CancellationGuardError::Shutdown)));
         assert_eq!(handler.call_count(), 0);
     }
 
     #[tokio::test]
-    async fn timer_no_shutdown_passes_through() {
+    async fn timer_message_cancelled_returns_transient_error() {
         let handler = MockHandler::success();
-        let shutdown_handler = ShutdownHandler {
+        let guard_handler = CancellationGuardHandler {
+            handler: handler.clone(),
+        };
+        let context = MockEventContext::new();
+        context.request_cancellation();
+        let trigger = create_test_trigger();
+
+        let result = guard_handler
+            .on_timer(context, trigger, DemandType::Normal)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CancellationGuardError::MessageCancelled)
+        ));
+        assert_eq!(handler.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn timer_not_cancelled_passes_through() {
+        let handler = MockHandler::success();
+        let guard_handler = CancellationGuardHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
-        let result = shutdown_handler
+        let result = guard_handler
             .on_timer(context, trigger, DemandType::Normal)
             .await;
 

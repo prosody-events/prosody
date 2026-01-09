@@ -31,7 +31,7 @@
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::retry::*;
 //! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::shutdown::*;
+//! # use prosody::consumer::middleware::cancellation_guard::CancellationGuardMiddleware;
 //! # use prosody::consumer::middleware::telemetry::*;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
@@ -54,7 +54,7 @@
 //!
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
 //!     .layer(TelemetryMiddleware::new(telemetry)) // Monitor entire pipeline
-//!     .layer(ShutdownMiddleware)
+//!     .layer(CancellationGuardMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config).unwrap())
 //!     .into_provider(handler);
 //! ```

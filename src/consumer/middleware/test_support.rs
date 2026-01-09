@@ -13,7 +13,7 @@ use futures::stream::{self, Stream};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::consumer::event_context::{CancellationSignals, EventContext};
+use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 
@@ -176,7 +176,7 @@ impl MockEventContext {
     }
 }
 
-impl CancellationSignals for MockEventContext {
+impl TerminationSignals for MockEventContext {
     fn is_shutdown(&self) -> bool {
         self.shutdown_requested.load(Ordering::Relaxed)
     }
@@ -231,6 +231,10 @@ impl EventContext for MockEventContext {
     fn cancel(&self) {
         self.message_cancelled.store(true, Ordering::Relaxed);
         self.message_cancel_notify.notify_waiters();
+    }
+
+    fn uncancel(&self) {
+        self.message_cancelled.store(false, Ordering::Relaxed);
     }
 
     fn schedule(

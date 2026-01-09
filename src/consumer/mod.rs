@@ -150,10 +150,11 @@ use tracing::error;
 use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
-pub use crate::consumer::event_context::CancellationSignals;
 use crate::consumer::event_context::EventContext;
+pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
+use crate::consumer::middleware::cancellation::CancellationGuardMiddleware;
 use crate::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::monopolization::{
@@ -163,7 +164,6 @@ use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::scheduler::{
     SchedulerConfiguration, SchedulerInitError, SchedulerMiddleware,
 };
-use crate::consumer::middleware::shutdown::ShutdownMiddleware;
 use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::{
     TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
@@ -716,7 +716,7 @@ fn build_common_middleware(
     Ok(telemetry_middleware
         .layer(timeout_middleware)
         .layer(scheduler_middleware)
-        .layer(ShutdownMiddleware))
+        .layer(CancellationGuardMiddleware))
 }
 
 /// Helper function to initialize a consumer with a pre-built trigger store.

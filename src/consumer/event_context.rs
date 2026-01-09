@@ -4,7 +4,7 @@
 //! managing timer scheduling within message handlers. It provides:
 //! - `EventContext`: Trait for handler contexts to schedule, unschedule, clear,
 //!   and list timers, as well as detect shutdown.
-//! - `CancellationSignals`: Internal trait for distinguishing shutdown from
+//! - `TerminationSignals`: Internal trait for distinguishing shutdown from
 //!   message-level cancellation (used by retry middleware).
 //! - `TimerContext<T>`: Concrete `EventContext` implementation backed by a
 //!   `TimerManager<T>` using a `TriggerStore` backend.
@@ -51,7 +51,7 @@ impl<T> EventContextError for T where T: StdError + ClassifyError + Send + Sync 
 /// - Clear any scheduled timers and reschedule a fresh one.
 /// - Inspect all scheduled timer execution times for the key.
 /// - Check synchronously if cancellation has been requested.
-pub trait EventContext: CancellationSignals + Clone + Send + Sync + 'static {
+pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// Error type returned by timer-related operations.
     type Error: EventContextError;
 
@@ -80,6 +80,13 @@ pub trait EventContext: CancellationSignals + Clone + Send + Sync + 'static {
     /// continuing to wait for the handler to finish cleanup. Calling multiple
     /// times is idempotent.
     fn cancel(&self);
+
+    /// Resets the message-level cancellation flag.
+    ///
+    /// Called by the canceller after the inner operation completes, so
+    /// subsequent retry attempts start with a clean state. This is the
+    /// counterpart to [`cancel`](Self::cancel).
+    fn uncancel(&self);
 
     /// Schedule a new timer at the given execution time for this key.
     ///
@@ -201,7 +208,7 @@ pub trait EventContext: CancellationSignals + Clone + Send + Sync + 'static {
 /// This trait is a supertrait of [`EventContext`] and must be public, but it is
 /// considered an implementation detail. External users should not rely on these
 /// methods directly.
-pub trait CancellationSignals {
+pub trait TerminationSignals {
     /// Returns `true` if shutdown has been requested.
     ///
     /// Shutdown means the partition is being revoked or the consumer is
@@ -374,6 +381,12 @@ where
         }
     }
 
+    fn uncancel(&self) {
+        if let Some(inner) = self.inner.load().as_ref() {
+            inner.message_cancel_tx.send_replace(false);
+        }
+    }
+
     async fn schedule(
         &self,
         time: CompactDateTime,
@@ -504,7 +517,7 @@ where
     }
 }
 
-impl<T> CancellationSignals for TimerContext<T>
+impl<T> TerminationSignals for TimerContext<T>
 where
     T: TriggerStore,
 {

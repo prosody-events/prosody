@@ -43,7 +43,7 @@
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::retry::*;
 //! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::shutdown::*;
+//! # use prosody::consumer::middleware::cancellation_guard::CancellationGuardMiddleware;
 //! # use prosody::consumer::middleware::topic::*;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
@@ -69,7 +69,7 @@
 //! # let handler = MyHandler;
 //!
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(ShutdownMiddleware)
+//!     .layer(CancellationGuardMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap()) // Retry handler failures
 //!     .layer(FailureTopicMiddleware::new(topic_config, "consumer-group".to_string(), producer).unwrap())
 //!     .layer(RetryMiddleware::new(retry_config).unwrap()) // Retry DLQ writes
@@ -98,6 +98,58 @@ use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommit
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Partition, Topic};
+
+// ============================================================================
+// Retry Sleep Helper
+// ============================================================================
+
+/// Result of waiting during retry backoff.
+///
+/// Used by the retry loop to determine the next action after a sleep period.
+/// This centralizes the cancellation handling logic to ensure consistent
+/// behavior across all retry implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryWaitResult {
+    /// Sleep completed normally, continue with retry.
+    Completed,
+    /// Shutdown requested (partition revoked), abort immediately.
+    Shutdown,
+    /// Message cancelled (timeout), skip remaining sleep and continue retry.
+    Cancelled,
+}
+
+/// Waits for the specified duration with cancellation support.
+///
+/// This helper encapsulates the critical shutdown vs cancellation distinction:
+/// - **Shutdown**: Partition revoked or consumer stopping. Returns
+///   `RetryWaitResult::Shutdown`.
+/// - **Cancellation**: Message timeout fired. Returns
+///   `RetryWaitResult::Cancelled`.
+/// - **Completed**: Sleep finished normally. Returns
+///   `RetryWaitResult::Completed`.
+///
+/// # Arguments
+///
+/// * `context` - The event context providing termination signals.
+/// * `duration` - How long to sleep before retrying.
+///
+/// # Returns
+///
+/// A `RetryWaitResult` indicating why the wait ended.
+async fn wait_with_cancellation<C: EventContext>(
+    context: &C,
+    duration: Duration,
+) -> RetryWaitResult {
+    select! {
+        () = sleep(duration) => RetryWaitResult::Completed,
+        () = context.on_shutdown() => RetryWaitResult::Shutdown,
+        () = context.on_message_cancelled() => RetryWaitResult::Cancelled,
+    }
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
 
 /// Configuration for retry middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -350,15 +402,10 @@ where
                         format_duration(sleep_time)
                     );
 
-                    // Shutdown aborts immediately; cancellation skips sleep and continues retrying
-                    select! {
-                        () = sleep(sleep_time) => {}
-                        () = context.on_shutdown() => {
-                            return Err(error);
-                        }
-                        () = context.on_message_cancelled() => {
-                            // Timeout fired - skip sleep and continue retrying
-                        }
+                    if wait_with_cancellation(&context, sleep_time).await
+                        == RetryWaitResult::Shutdown
+                    {
+                        return Err(error);
                     }
                 }
                 ErrorCategory::Permanent => {
@@ -432,13 +479,10 @@ where
                         "failed to handle timer: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
-                    // Shutdown aborts immediately; cancellation skips sleep and continues retrying
-                    select! {
-                        () = sleep(sleep_time) => {},
-                        () = context.on_shutdown() => return Err(error),
-                        () = context.on_message_cancelled() => {
-                            // Timeout fired - skip sleep and continue retrying
-                        }
+                    if wait_with_cancellation(&context, sleep_time).await
+                        == RetryWaitResult::Shutdown
+                    {
+                        return Err(error);
                     }
                 }
                 ErrorCategory::Permanent => {
@@ -526,16 +570,11 @@ where
                         format_duration(sleep_time)
                     );
 
-                    // Shutdown aborts immediately; cancellation skips sleep and continues retrying
-                    select! {
-                        () = sleep(sleep_time) => {}
-                        () = context.on_shutdown() => {
-                            uncommitted_offset.abort();
-                            break;
-                        }
-                        () = context.on_message_cancelled() => {
-                            // Timeout fired - skip sleep and continue retrying
-                        }
+                    if wait_with_cancellation(&context, sleep_time).await
+                        == RetryWaitResult::Shutdown
+                    {
+                        uncommitted_offset.abort();
+                        break;
                     }
                 }
                 ErrorCategory::Permanent => {
@@ -606,16 +645,11 @@ where
                         "failed to handle timer: {error:#}; retrying after {}",
                         format_duration(sleep_time)
                     );
-                    // Shutdown aborts immediately; cancellation skips sleep and continues retrying
-                    select! {
-                        () = sleep(sleep_time) => {},
-                        () = context.on_shutdown() => {
-                            uncommitted.abort().await;
-                            break;
-                        }
-                        () = context.on_message_cancelled() => {
-                            // Timeout fired - skip sleep and continue retrying
-                        }
+                    if wait_with_cancellation(&context, sleep_time).await
+                        == RetryWaitResult::Shutdown
+                    {
+                        uncommitted.abort().await;
+                        break;
                     }
                 }
                 ErrorCategory::Permanent => {

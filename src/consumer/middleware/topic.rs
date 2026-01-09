@@ -36,7 +36,7 @@
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::retry::*;
 //! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::shutdown::*;
+//! # use prosody::consumer::middleware::cancellation_guard::CancellationGuardMiddleware;
 //! # use prosody::consumer::middleware::topic::*;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
@@ -62,7 +62,7 @@
 //! # let handler = MyHandler;
 //!
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(ShutdownMiddleware)
+//!     .layer(CancellationGuardMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap()) // Retry handler failures
 //!     .layer(FailureTopicMiddleware::new(topic_config, "consumer-group".to_string(), producer).unwrap()) // Route to DLQ
 //!     .layer(RetryMiddleware::new(retry_config).unwrap()) // Retry DLQ writes

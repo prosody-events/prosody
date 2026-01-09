@@ -6,7 +6,7 @@
 
 use super::types::OutputEvent;
 use crate::Key;
-use crate::consumer::CancellationSignals;
+use crate::consumer::TerminationSignals;
 use crate::consumer::event_context::EventContext;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
@@ -187,7 +187,7 @@ impl KeyedCapturingContext {
     }
 }
 
-impl CancellationSignals for KeyedCapturingContext {
+impl TerminationSignals for KeyedCapturingContext {
     fn is_shutdown(&self) -> bool {
         false
     }
@@ -264,6 +264,10 @@ impl EventContext for KeyedCapturingContext {
     }
 
     fn cancel(&self) {
+        // No-op for tests
+    }
+
+    fn uncancel(&self) {
         // No-op for tests
     }
 
