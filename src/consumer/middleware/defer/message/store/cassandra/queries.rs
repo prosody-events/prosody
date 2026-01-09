@@ -7,7 +7,7 @@
 
 #![allow(dead_code, reason = "fields used in implementation")]
 
-use crate::cassandra::{TABLE_DEFERRED_OFFSETS, TABLE_DEFERRED_SEGMENTS};
+use crate::cassandra::TABLE_DEFERRED_OFFSETS;
 use crate::cassandra_queries;
 
 cassandra_queries! {
@@ -18,24 +18,14 @@ cassandra_queries! {
     /// performance and security compared to ad-hoc query strings.
     ///
     /// The struct contains prepared statements for:
-    /// - Inserting and querying segment metadata
     /// - Getting the next deferred message for a key
     /// - Appending new deferred messages with TTL
     /// - Updating retry counts
     /// - Removing processed messages
+    ///
+    /// Segment metadata is managed separately via
+    /// [`CassandraSegmentStore`](crate::consumer::middleware::defer::segment::CassandraSegmentStore).
     pub struct Queries {
-        /// Inserts segment metadata (idempotent)
-        insert_segment: (
-            "INSERT INTO $keyspace.{} (id, topic, partition, consumer_group) VALUES (?, ?, ?, ?)",
-            TABLE_DEFERRED_SEGMENTS
-        ),
-
-        /// Gets segment metadata by ID
-        get_segment: (
-            "SELECT topic, partition, consumer_group FROM $keyspace.{} WHERE id = ?",
-            TABLE_DEFERRED_SEGMENTS
-        ),
-
         /// Gets the next deferred message (oldest offset) and retry count for a key
         get_next_deferred_message: (
             "SELECT offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
