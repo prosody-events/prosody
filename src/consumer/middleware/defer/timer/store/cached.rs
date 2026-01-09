@@ -15,6 +15,13 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 /// Cache: `key` → `Option<CachedTimerEntry>`.
 type TimerDeferCache = Cache<Key, Option<CachedTimerEntry>>;
 
+/// Creates a span for a cached timer load, linked to the stored parent context.
+fn create_span_from_context(key: &Key, time: CompactDateTime, context: &Context) -> Span {
+    let span = info_span!("timer_defer.load", key = %key, time = %time, cached = true);
+    let _ = span.set_parent(context.clone());
+    span
+}
+
 /// Write-through cache for any [`TimerDeferStore`].
 ///
 /// Caches `get_next_deferred_timer` results. Writes go to store first, then
@@ -41,12 +48,6 @@ where
             store,
             cache: Arc::new(Cache::new(capacity)),
         }
-    }
-
-    fn create_span_from_context(key: &Key, time: CompactDateTime, context: &Context) -> Span {
-        let span = info_span!("timer_defer.cache_hit", key = %key, time = %time);
-        let _ = span.set_parent(context.clone());
-        span
     }
 
     fn extract_cache_entry(trigger: &Trigger, retry_count: u32) -> CachedTimerEntry {
@@ -194,7 +195,7 @@ where
         // Check cache first
         if let Some(cached) = self.cache.get(key.as_ref()) {
             return Ok(cached.map(|entry| {
-                let span = Self::create_span_from_context(key, entry.time, &entry.context);
+                let span = create_span_from_context(key, entry.time, &entry.context);
                 let trigger = Trigger::new(key.clone(), entry.time, TimerType::Application, span);
                 (trigger, entry.retry_count)
             }));

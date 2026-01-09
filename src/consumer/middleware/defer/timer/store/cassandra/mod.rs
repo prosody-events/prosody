@@ -100,7 +100,7 @@ impl CassandraTimerDeferStore {
         span_map: &HashMap<String, String>,
     ) -> tracing::Span {
         let context = self.propagator().extract(span_map);
-        let span = info_span!("timer_defer.load", key = %key, time = %time);
+        let span = info_span!("timer_defer.load", key = %key, time = %time, cached = false);
         let _ = span.set_parent(context);
         span
     }

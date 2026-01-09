@@ -38,7 +38,8 @@ impl StoredTimer {
 
     /// Reconstructs trigger with fresh span linked to stored context.
     fn to_trigger(&self) -> Trigger {
-        let span = info_span!("timer_defer.load", key = %self.key, time = %self.time);
+        let span =
+            info_span!("timer_defer.load", key = %self.key, time = %self.time, cached = false);
         let _ = span.set_parent(self.context.clone());
         Trigger::new(self.key.clone(), self.time, TimerType::Application, span)
     }
