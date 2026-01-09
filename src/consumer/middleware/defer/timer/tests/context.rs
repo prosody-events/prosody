@@ -81,6 +81,10 @@ impl EventContext for KeyedMockContext {
         self.inner.on_cancel()
     }
 
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+
     fn schedule(
         &self,
         time: CompactDateTime,
@@ -118,10 +122,6 @@ impl EventContext for KeyedMockContext {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.active_timers.lock().retain(|(_, t)| *t != timer_type);
         self.inner.clear_scheduled(timer_type)
-    }
-
-    fn cancel(&self) {
-        self.inner.cancel();
     }
 
     fn invalidate(self) {
@@ -743,6 +743,38 @@ mod error_handling {
     impl TimerDeferStore for FailAfterNStore {
         type Error = TestStoreError;
 
+        async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+            self.inner
+                .defer_first_timer(trigger)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn defer_additional_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+            self.inner
+                .defer_additional_timer(trigger)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn complete_retry_success(
+            &self,
+            key: &Key,
+            time: CompactDateTime,
+        ) -> Result<TimerRetryCompletionResult, Self::Error> {
+            self.inner
+                .complete_retry_success(key, time)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
+        async fn increment_retry_count(&self, key: &Key, current: u32) -> Result<u32, Self::Error> {
+            self.inner
+                .increment_retry_count(key, current)
+                .await
+                .map_err(|_| TestStoreError::transient())
+        }
+
         async fn get_next_deferred_timer(
             &self,
             key: &Key,
@@ -774,38 +806,6 @@ mod error_handling {
                     yield result.map_err(|_| TestStoreError::transient())?;
                 }
             }
-        }
-
-        async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
-            self.inner
-                .defer_first_timer(trigger)
-                .await
-                .map_err(|_| TestStoreError::transient())
-        }
-
-        async fn defer_additional_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
-            self.inner
-                .defer_additional_timer(trigger)
-                .await
-                .map_err(|_| TestStoreError::transient())
-        }
-
-        async fn complete_retry_success(
-            &self,
-            key: &Key,
-            time: CompactDateTime,
-        ) -> Result<TimerRetryCompletionResult, Self::Error> {
-            self.inner
-                .complete_retry_success(key, time)
-                .await
-                .map_err(|_| TestStoreError::transient())
-        }
-
-        async fn increment_retry_count(&self, key: &Key, current: u32) -> Result<u32, Self::Error> {
-            self.inner
-                .increment_retry_count(key, current)
-                .await
-                .map_err(|_| TestStoreError::transient())
         }
 
         async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {

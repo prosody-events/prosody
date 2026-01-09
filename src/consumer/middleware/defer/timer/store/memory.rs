@@ -90,6 +90,27 @@ impl Default for Inner {
 impl TimerDeferStore for MemoryTimerDeferStore {
     type Error = Infallible;
 
+    async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+        let stored = StoredTimer::from_trigger(trigger);
+        let time = trigger.time;
+
+        self.inner
+            .deferred
+            .entry_async(trigger.key.clone())
+            .await
+            .and_modify(|(timers, retry_count)| {
+                timers.insert(time, stored.clone());
+                *retry_count = 0;
+            })
+            .or_insert_with(|| {
+                let mut timers = BTreeMap::new();
+                timers.insert(time, stored);
+                (timers, 0)
+            });
+
+        Ok(())
+    }
+
     async fn get_next_deferred_timer(
         &self,
         key: &Key,
@@ -129,27 +150,6 @@ impl TimerDeferStore for MemoryTimerDeferStore {
                 .unwrap_or_default()
         })
         .flat_map(|times| stream::iter(times).map(Ok))
-    }
-
-    async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
-        let stored = StoredTimer::from_trigger(trigger);
-        let time = trigger.time;
-
-        self.inner
-            .deferred
-            .entry_async(trigger.key.clone())
-            .await
-            .and_modify(|(timers, retry_count)| {
-                timers.insert(time, stored.clone());
-                *retry_count = 0;
-            })
-            .or_insert_with(|| {
-                let mut timers = BTreeMap::new();
-                timers.insert(time, stored);
-                (timers, 0)
-            });
-
-        Ok(())
     }
 
     async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {

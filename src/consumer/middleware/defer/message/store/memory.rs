@@ -59,23 +59,6 @@ impl Default for Inner {
 impl MessageDeferStore for MemoryMessageDeferStore {
     type Error = Infallible;
 
-    async fn get_next_deferred_message(
-        &self,
-        key: &Key,
-    ) -> Result<Option<(Offset, u32)>, Self::Error> {
-        let result = self
-            .inner
-            .deferred
-            .get_async(key.as_ref())
-            .await
-            .and_then(|entry| {
-                let (offsets, retry_count) = entry.get();
-                offsets.first().map(|&offset| (offset, *retry_count))
-            });
-
-        Ok(result)
-    }
-
     async fn defer_first_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
         self.inner
             .deferred
@@ -92,6 +75,23 @@ impl MessageDeferStore for MemoryMessageDeferStore {
             });
 
         Ok(())
+    }
+
+    async fn get_next_deferred_message(
+        &self,
+        key: &Key,
+    ) -> Result<Option<(Offset, u32)>, Self::Error> {
+        let result = self
+            .inner
+            .deferred
+            .get_async(key.as_ref())
+            .await
+            .and_then(|entry| {
+                let (offsets, retry_count) = entry.get();
+                offsets.first().map(|&offset| (offset, *retry_count))
+            });
+
+        Ok(result)
     }
 
     async fn append_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {

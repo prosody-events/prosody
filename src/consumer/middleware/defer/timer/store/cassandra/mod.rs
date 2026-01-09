@@ -190,6 +190,18 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         )
     }
 
+    fn deferred_times(
+        &self,
+        key: &Key,
+    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
+        deferred_times_stream(
+            self.store.clone(),
+            self.queries.get_deferred_times.clone(),
+            self.segment.clone(),
+            key.clone(),
+        )
+    }
+
     #[instrument(level = "debug", skip(self), err)]
     async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
         let segment_id = self.segment_id().await?;
@@ -289,18 +301,6 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         );
 
         Ok(())
-    }
-
-    fn deferred_times(
-        &self,
-        key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        deferred_times_stream(
-            self.store.clone(),
-            self.queries.get_deferred_times.clone(),
-            self.segment.clone(),
-            key.clone(),
-        )
     }
 }
 
