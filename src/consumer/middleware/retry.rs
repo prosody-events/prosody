@@ -24,14 +24,16 @@
 //!
 //! # Cancellation Handling
 //!
-//! The retry middleware distinguishes between two types of cancellation signals:
+//! The retry middleware distinguishes between two types of cancellation
+//! signals:
 //!
 //! - **Shutdown** (partition revoked, consumer stopping): Aborts immediately.
 //!   The partition must be released promptly to allow rebalancing.
 //!
-//! - **Message cancellation** (timeout fired): Treated as a transient condition.
-//!   The retry loop continues, skipping any remaining sleep delay. This ensures
-//!   that timeouts don't cause message loss when retries could still succeed.
+//! - **Message cancellation** (timeout fired): Treated as a transient
+//!   condition. The retry loop continues, skipping any remaining sleep delay.
+//!   This ensures that timeouts don't cause message loss when retries could
+//!   still succeed.
 //!
 //! # Usage
 //!
@@ -645,11 +647,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::CancellationSignals;
     use crate::consumer::message::ConsumerMessage;
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
-    use crate::consumer::CancellationSignals;
     use futures::stream;
     use parking_lot::Mutex;
     use serde_json::json;
@@ -1306,7 +1308,13 @@ mod tests {
 
     fn create_offset_tracker() -> OffsetTracker {
         let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
-        OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(300), version)
+        OffsetTracker::new(
+            "test-topic".into(),
+            0,
+            10,
+            Duration::from_secs(300),
+            version,
+        )
     }
 
     // === Shutdown Tests (should pass - abort is correct behavior) ===
@@ -1366,8 +1374,13 @@ mod tests {
         };
         let uncommitted_message = message.into_uncommitted(uncommitted_offset);
 
-        EventHandler::on_message(&retry_handler, context, uncommitted_message, DemandType::Normal)
-            .await;
+        EventHandler::on_message(
+            &retry_handler,
+            context,
+            uncommitted_message,
+            DemandType::Normal,
+        )
+        .await;
 
         assert_eq!(handler.call_count(), 1);
         assert_eq!(tracker.shutdown().await, None, "offset should be aborted");
@@ -1454,11 +1467,20 @@ mod tests {
         };
         let uncommitted_message = message.into_uncommitted(uncommitted_offset);
 
-        EventHandler::on_message(&retry_handler, context, uncommitted_message, DemandType::Normal)
-            .await;
+        EventHandler::on_message(
+            &retry_handler,
+            context,
+            uncommitted_message,
+            DemandType::Normal,
+        )
+        .await;
 
         assert_eq!(handler.call_count(), 3); // 2 failures + 1 success
-        assert_eq!(tracker.shutdown().await, Some(0), "offset should be committed");
+        assert_eq!(
+            tracker.shutdown().await,
+            Some(0),
+            "offset should be committed"
+        );
         Ok(())
     }
 
