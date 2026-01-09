@@ -898,7 +898,7 @@ mod error_handling {
         }
     }
 
-    /// T070: `scheduled()` propagates store error on immediate failure.
+    /// `scheduled()` propagates store error on immediate failure.
     ///
     /// Tests that when the deferred store fails on the very first poll,
     /// the error is correctly propagated as `TimerDeferContextError::Store`.
@@ -928,7 +928,7 @@ mod error_handling {
         });
     }
 
-    /// T070b: `scheduled()` propagates store error after yielding some items.
+    /// `scheduled()` propagates store error after yielding some items.
     ///
     /// Tests that when the deferred store fails mid-iteration, previously
     /// yielded items are preserved and the error is correctly wrapped.
@@ -975,7 +975,7 @@ mod error_handling {
         });
     }
 
-    /// T070c: `scheduled()` returns all items when store succeeds.
+    /// `scheduled()` returns all items when store succeeds.
     ///
     /// Control test to ensure normal operation works correctly.
     #[test]

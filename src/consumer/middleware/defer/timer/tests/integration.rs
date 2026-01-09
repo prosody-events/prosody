@@ -412,19 +412,13 @@ fn store_write_failure_retries_via_retry_middleware() {
     );
 }
 
-// ============================================================================
-// Phase 8: Permanent Error Handling Tests (Scenario 6)
-// ============================================================================
-
 #[test]
 fn permanent_error_schedules_timer_for_next() {
-    // T089: Verifies that when a permanent error occurs during deferred timer
-    // retry, the queue advances and a DeferredTimer is scheduled for the NEXT
-    // timer.
+    // When a permanent error occurs during deferred timer retry, the queue
+    // advances and a DeferredTimer is scheduled for the NEXT timer.
     //
-    // Per design doc: "Permanent error propagation: When a permanent error occurs,
-    // the queue advances (timer removed, next timer scheduled if any), then the
-    // error is wrapped in TimerDeferError::Handler(error) and propagated."
+    // The queue advances (timer removed, next timer scheduled if any), then the
+    // error is wrapped in DeferError::Handler and propagated.
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -512,14 +506,12 @@ fn permanent_error_schedules_timer_for_next() {
 
 #[test]
 fn permanent_error_propagates_wrapped() {
-    // T090: Verifies that permanent errors are properly wrapped in
-    // DeferError::Handler and propagated up the middleware stack for
-    // observability.
+    // Permanent errors are properly wrapped in DeferError::Handler and propagated
+    // up the middleware stack for observability.
     //
-    // Per design doc: "The error is wrapped in TimerDeferError::Handler(error) and
-    // propagated up the middleware stack. The CommittingHandler at the top of the
-    // stack calls on_timer_error() for observability (logging, metrics) and commits
-    // the timer (marking it as processed)."
+    // The CommittingHandler at the top of the stack calls on_timer_error() for
+    // observability (logging, metrics) and commits the timer (marking it as
+    // processed).
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -572,22 +564,11 @@ fn permanent_error_propagates_wrapped() {
     });
 }
 
-// ============================================================================
-// Phase 7: Backoff Behavior Tests
-// ============================================================================
-
-// ============================================================================
-// Phase 9: Span Context Preservation Tests (Scenario 7)
-// ============================================================================
-
 #[test]
 fn span_restored_on_retry() {
-    // T095: Verifies that when a timer is deferred and later retried, the span
-    // context is properly restored. The inner handler should receive a trigger
-    // with a span that links back to the original trace.
-    //
-    // Per design doc: "Span continuity: Deferred timers restore their original
-    // span when retrying, maintaining distributed trace linkage."
+    // When a timer is deferred and later retried, the span context is properly
+    // restored. The inner handler should receive a trigger with a span that
+    // links back to the original trace, maintaining distributed trace linkage.
     //
     // This tests the round-trip:
     // 1. Application timer fires with a span (from Span::current())
@@ -666,14 +647,13 @@ fn span_restored_on_retry() {
 
 #[test]
 fn span_extraction_failure_fallback() {
-    // T096: Verifies that when span extraction fails (e.g., corrupt or empty
-    // span data), the system gracefully falls back to using Span::current()
-    // rather than failing.
+    // When span extraction fails (e.g., corrupt or empty span data), the system
+    // gracefully falls back to using Span::current() rather than failing.
     //
-    // Per design doc: "Span extraction failure handling: If span extraction from
-    // the database fails (invalid/corrupt data), log at debug level (matching
-    // existing timer store pattern) and use Span::current() as fallback. This
-    // ensures timer processing continues even with degraded tracing."
+    // If span extraction from the database fails (invalid/corrupt data), log at
+    // debug level (matching existing timer store pattern) and use Span::current()
+    // as fallback. This ensures timer processing continues even with degraded
+    // tracing.
     //
     // The MemoryTimerDeferStore stores the Context directly, so we can't easily
     // simulate corrupt data. However, we can verify that when a timer is stored
@@ -738,14 +718,12 @@ fn span_extraction_failure_fallback() {
 
 #[test]
 fn first_deferral_schedules_at_original_time() {
-    // This test verifies that when a timer is deferred for the first time
-    // (retry_count=0), the DeferredTimer is scheduled at the original fire time,
-    // NOT using backoff. This preserves the semantic meaning of the timer's
-    // intended fire time.
+    // When a timer is deferred for the first time (retry_count=0), the
+    // DeferredTimer is scheduled at the original fire time, NOT using backoff.
+    // This preserves the semantic meaning of the timer's intended fire time.
     //
-    // Per design doc: "First deferral (retry_count=0): Schedule DeferredTimer at
-    // original_time. Application timers carry semantic meaning—a timer scheduled
-    // for midnight should fire at midnight, not immediately when deferral occurs."
+    // Application timers carry semantic meaning - a timer scheduled for midnight
+    // should fire at midnight, not immediately when deferral occurs.
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -802,12 +780,8 @@ fn first_deferral_schedules_at_original_time() {
 
 #[test]
 fn subsequent_retry_uses_backoff() {
-    // This test verifies that after a deferred timer retry fails (retry_count > 0),
-    // the next DeferredTimer is scheduled using exponential backoff with jitter.
-    //
-    // Per design doc: "Subsequent retries (retry_count>0): Schedule DeferredTimer
-    // at now + backoff(retry_count). After the first attempt fails, exponential
-    // backoff applies."
+    // After a deferred timer retry fails (retry_count > 0), the next DeferredTimer
+    // is scheduled using exponential backoff with jitter.
     //
     // Backoff formula: backoff(n) = random(1, min(base × 2^(n-1), max_delay))
     init_test_logging();
@@ -930,18 +904,13 @@ fn subsequent_retry_uses_backoff() {
     });
 }
 
-// ============================================================================
-// Phase 10: Configuration and Feature Toggle Tests (Scenario 8)
-// ============================================================================
-
 #[test]
 fn disabled_config_propagates_errors_no_deferral() {
-    // T102: Verifies that when `enabled: false`, transient errors propagate
-    // to the caller instead of being absorbed by deferral. No deferral occurs.
+    // When `enabled: false`, transient errors propagate to the caller instead of
+    // being absorbed by deferral. No deferral occurs.
     //
-    // Per design doc: "When `enabled: false`:
-    // - New failures: Propagate error to retry middleware (no deferral for either
-    //   messages or timers)"
+    // New failures propagate to retry middleware (no deferral for either messages
+    // or timers).
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -1002,12 +971,9 @@ fn disabled_config_propagates_errors_no_deferral() {
 
 #[test]
 fn disabled_config_still_queues_existing_deferred_keys() {
-    // T103: Verifies that when `enabled: false` but a key is ALREADY deferred,
-    // new timers for that key still queue behind the existing deferred timers.
-    // This maintains ordering guarantees for already-deferred keys.
-    //
-    // Per design doc: "Existing deferred keys: Still queue new events to maintain
-    // ordering invariants"
+    // When `enabled: false` but a key is ALREADY deferred, new timers for that
+    // key still queue behind the existing deferred timers. This maintains
+    // ordering guarantees for already-deferred keys.
     //
     // The check order is critical:
     // 1. First: Check is_deferred(key) - if already deferred, queue new event
@@ -1097,14 +1063,13 @@ fn disabled_config_still_queues_existing_deferred_keys() {
 
 #[test]
 fn is_deferred_check_precedes_enabled_check() {
-    // T105: Explicitly verifies the order of checks: is_deferred BEFORE enabled.
+    // Explicitly verifies the order of checks: is_deferred BEFORE enabled.
     //
-    // Per design doc: "Following the existing message defer pattern, the check
-    // order is critical:
+    // Following the existing message defer pattern, the check order is critical:
     // 1. First: Check is_deferred(key) - if already deferred, queue new event
     // 2. Then: If not deferred and handler fails with transient error, check
     //    config.enabled
-    // 3. If disabled: Propagate error to retry middleware (no new deferral)"
+    // 3. If disabled: Propagate error to retry middleware (no new deferral)
     //
     // This test verifies that when:
     // - config.enabled = false
