@@ -261,18 +261,12 @@ impl TimerDeferStore for CassandraTimerDeferStore {
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
         let segment_id = self.segment_id().await?;
         let ttl = self.store.base_ttl();
-        let retry_count_i32: i32 =
-            retry_count
-                .try_into()
-                .map_err(|_| CassandraDeferStoreError::InvalidRetryCount {
-                    retry_count,
-                    reason: "retry count exceeds i32::MAX",
-                })?;
+        let retry_count: i32 = retry_count.try_into().unwrap_or(i32::MAX);
 
         self.session()
             .execute_unpaged(
                 &self.queries.update_retry_count,
-                (ttl, retry_count_i32, &segment_id, key.as_ref()),
+                (ttl, retry_count, &segment_id, key.as_ref()),
             )
             .await
             .map_err(CassandraStoreError::from)?;

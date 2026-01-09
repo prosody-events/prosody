@@ -105,15 +105,6 @@ pub enum CassandraDeferStoreError {
     /// Error from Cassandra operations.
     #[error("cassandra error: {0:#}")]
     Cassandra(#[from] CassandraStoreError),
-
-    /// Invalid retry count value.
-    #[error("invalid retry count {retry_count}: {reason}")]
-    InvalidRetryCount {
-        /// The invalid retry count value.
-        retry_count: u32,
-        /// Why the value is invalid.
-        reason: &'static str,
-    },
 }
 
 impl ClassifyError for CassandraDeferStoreError {
@@ -121,9 +112,6 @@ impl ClassifyError for CassandraDeferStoreError {
         match self {
             // Delegate Cassandra errors to their classification
             Self::Cassandra(error) => error.classify_error(),
-
-            // Invalid retry count is a programming error - terminal
-            Self::InvalidRetryCount { .. } => ErrorCategory::Terminal,
         }
     }
 }
