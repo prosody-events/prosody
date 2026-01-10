@@ -1,8 +1,7 @@
-//! Cancellation guard middleware for preventing unnecessary work.
+//! Cancellation middleware for early exit when already cancelled.
 //!
-//! Checks if the context is already cancelled before passing control to inner
-//! middleware. This prevents starting new work when the message has already
-//! been cancelled (shutdown or timeout).
+//! Checks cancellation state before invoking inner middleware. Prevents
+//! starting new work when shutdown or timeout has already been signaled.
 //!
 //! # Execution Order
 //!
@@ -18,15 +17,13 @@
 //!
 //! The middleware distinguishes between two types of cancellation:
 //!
-//! - **Shutdown** (partition revoked): Returns
-//!   [`CancellationGuardError::Shutdown`] classified as
-//!   [`ErrorCategory::Terminal`]. Processing must stop immediately to release
-//!   the partition.
+//! - **Shutdown** (partition revoked): Returns [`CancellationError::Shutdown`]
+//!   classified as [`ErrorCategory::Terminal`]. Processing must stop
+//!   immediately to release the partition.
 //!
-//! - **Message cancellation**: Returns
-//!   [`CancellationGuardError::MessageCancelled`] classified as
-//!   [`ErrorCategory::Transient`]. The retry middleware will continue retrying
-//!   rather than aborting the message.
+//! - **Message cancellation**: Returns [`CancellationError::MessageCancelled`]
+//!   classified as [`ErrorCategory::Transient`]. The retry middleware will
+//!   continue retrying rather than aborting the message.
 //!
 //! # Usage
 //!
@@ -58,7 +55,7 @@
 //! # let handler = MyHandler;
 //!
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(CancellationGuardMiddleware) // Check cancellation early
+//!     .layer(CancellationMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config).unwrap())
 //!     .into_provider(handler);
 //! ```
@@ -78,76 +75,53 @@ use crate::consumer::middleware::{
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
 
-/// Middleware that checks if processing is already cancelled before running the
-/// handler, preventing unnecessary work when shutdown or cancellation has
-/// occurred.
+/// Middleware that checks cancellation state before invoking the handler.
 #[derive(Clone, Copy, Debug)]
-pub struct CancellationGuardMiddleware;
+pub struct CancellationMiddleware;
 
-/// A provider that wraps handlers with cancellation guard functionality.
+/// Provider that wraps handlers with cancellation checks.
 #[derive(Clone, Debug)]
-pub struct CancellationGuardProvider<T> {
+pub struct CancellationProvider<T> {
     provider: T,
 }
 
-/// Wraps a handler with cancellation guard functionality.
-///
-/// This struct adds cancellation checks to the wrapped handler's message
-/// processing, ensuring that no new messages are processed when the context
-/// is already cancelled.
+/// Handler wrapper that checks cancellation before delegating.
 #[derive(Clone, Debug)]
-pub struct CancellationGuardHandler<T> {
+pub struct CancellationHandler<T> {
     handler: T,
 }
 
-impl HandlerMiddleware for CancellationGuardMiddleware {
-    type Provider<T: FallibleHandlerProvider> = CancellationGuardProvider<T>;
+impl HandlerMiddleware for CancellationMiddleware {
+    type Provider<T: FallibleHandlerProvider> = CancellationProvider<T>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
     {
-        CancellationGuardProvider { provider }
+        CancellationProvider { provider }
     }
 }
 
-impl<T> FallibleHandlerProvider for CancellationGuardProvider<T>
+impl<T> FallibleHandlerProvider for CancellationProvider<T>
 where
     T: FallibleHandlerProvider,
 {
-    type Handler = CancellationGuardHandler<T::Handler>;
+    type Handler = CancellationHandler<T::Handler>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        CancellationGuardHandler {
+        CancellationHandler {
             handler: self.provider.handler_for_partition(topic, partition),
         }
     }
 }
 
-impl<T> FallibleHandler for CancellationGuardHandler<T>
+impl<T> FallibleHandler for CancellationHandler<T>
 where
     T: FallibleHandler,
 {
-    type Error = CancellationGuardError<T::Error>;
+    type Error = CancellationError<T::Error>;
 
-    /// Processes a message, checking for cancellation conditions.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The context of the message being processed.
-    /// * `message` - The message to be processed.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or a `CancellationGuardError`.
-    ///
-    /// # Errors
-    ///
-    /// - `CancellationGuardError::Shutdown` (Terminal) if partition is revoked
-    /// - `CancellationGuardError::MessageCancelled` (Transient) if message was
-    ///   cancelled
-    /// - `CancellationGuardError::Handler` containing the wrapped handler's
-    ///   error
+    /// Checks cancellation state, then delegates to inner handler if clear.
     async fn on_message<C>(
         &self,
         context: C,
@@ -159,17 +133,17 @@ where
     {
         // Check shutdown first (Terminal) - must release partition immediately
         if context.is_shutdown() {
-            return Err(CancellationGuardError::Shutdown);
+            return Err(CancellationError::Shutdown);
         }
         // Check message cancellation (Transient) - retry will continue
         if context.is_message_cancelled() {
-            return Err(CancellationGuardError::MessageCancelled);
+            return Err(CancellationError::MessageCancelled);
         }
 
         self.handler
             .on_message(context, message, demand_type)
             .await
-            .map_err(CancellationGuardError::Handler)
+            .map_err(CancellationError::Handler)
     }
 
     async fn on_timer<C>(
@@ -183,31 +157,28 @@ where
     {
         // Check shutdown first (Terminal) - must release partition immediately
         if context.is_shutdown() {
-            return Err(CancellationGuardError::Shutdown);
+            return Err(CancellationError::Shutdown);
         }
         // Check message cancellation (Transient) - retry will continue
         if context.is_message_cancelled() {
-            return Err(CancellationGuardError::MessageCancelled);
+            return Err(CancellationError::MessageCancelled);
         }
 
         self.handler
             .on_timer(context, timer, demand_type)
             .await
-            .map_err(CancellationGuardError::Handler)
+            .map_err(CancellationError::Handler)
     }
 
     async fn shutdown(self) {
-        debug!("shutting down cancellation guard handler");
-
-        // No guard-specific state to clean up (signals are external)
-        // Cascade shutdown to the inner handler
+        debug!("shutting down cancellation handler");
         self.handler.shutdown().await;
     }
 }
 
-/// Represents errors that can occur during cancellation guard handling.
+/// Errors from the cancellation middleware.
 #[derive(Debug, Error)]
-pub enum CancellationGuardError<T> {
+pub enum CancellationError<T> {
     /// Indicates shutdown was requested (partition revoked).
     ///
     /// Classified as [`ErrorCategory::Terminal`] - processing must stop
@@ -227,25 +198,15 @@ pub enum CancellationGuardError<T> {
     Handler(T),
 }
 
-impl<T> ClassifyError for CancellationGuardError<T>
+impl<T> ClassifyError for CancellationError<T>
 where
     T: ClassifyError,
 {
-    /// Classifies the cancellation guard error.
-    ///
-    /// # Returns
-    ///
-    /// An `ErrorCategory` indicating the nature of the error:
-    /// - `ErrorCategory::Terminal` for `CancellationGuardError::Shutdown`
-    /// - `ErrorCategory::Transient` for
-    ///   `CancellationGuardError::MessageCancelled`
-    /// - The classification of the wrapped error for
-    ///   `CancellationGuardError::Handler`
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            CancellationGuardError::Shutdown => ErrorCategory::Terminal,
-            CancellationGuardError::MessageCancelled => ErrorCategory::Transient,
-            CancellationGuardError::Handler(error) => error.classify_error(),
+            CancellationError::Shutdown => ErrorCategory::Terminal,
+            CancellationError::MessageCancelled => ErrorCategory::Transient,
+            CancellationError::Handler(error) => error.classify_error(),
         }
     }
 }
@@ -368,34 +329,34 @@ mod tests {
 
     #[test]
     fn shutdown_error_classifies_as_terminal() {
-        let error: CancellationGuardError<TestError> = CancellationGuardError::Shutdown;
+        let error: CancellationError<TestError> = CancellationError::Shutdown;
         assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
     }
 
     #[test]
     fn message_cancelled_error_classifies_as_transient() {
-        let error: CancellationGuardError<TestError> = CancellationGuardError::MessageCancelled;
+        let error: CancellationError<TestError> = CancellationError::MessageCancelled;
         assert!(matches!(error.classify_error(), ErrorCategory::Transient));
     }
 
     #[test]
     fn handler_error_delegates_classification_transient() {
-        let error: CancellationGuardError<TestError> =
-            CancellationGuardError::Handler(TestError(ErrorCategory::Transient));
+        let error: CancellationError<TestError> =
+            CancellationError::Handler(TestError(ErrorCategory::Transient));
         assert!(matches!(error.classify_error(), ErrorCategory::Transient));
     }
 
     #[test]
     fn handler_error_delegates_classification_permanent() {
-        let error: CancellationGuardError<TestError> =
-            CancellationGuardError::Handler(TestError(ErrorCategory::Permanent));
+        let error: CancellationError<TestError> =
+            CancellationError::Handler(TestError(ErrorCategory::Permanent));
         assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
     }
 
     #[tokio::test]
     async fn shutdown_returns_terminal_error() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationGuardHandler {
+        let guard_handler = CancellationHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new().with_shutdown();
@@ -407,7 +368,7 @@ mod tests {
             .on_message(context, message, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(CancellationGuardError::Shutdown)));
+        assert!(matches!(result, Err(CancellationError::Shutdown)));
         assert!(matches!(
             result.as_ref().err().map(ClassifyError::classify_error),
             Some(ErrorCategory::Terminal)
@@ -418,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn message_cancelled_returns_transient_error() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationGuardHandler {
+        let guard_handler = CancellationHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new();
@@ -431,10 +392,7 @@ mod tests {
             .on_message(context, message, DemandType::Normal)
             .await;
 
-        assert!(matches!(
-            result,
-            Err(CancellationGuardError::MessageCancelled)
-        ));
+        assert!(matches!(result, Err(CancellationError::MessageCancelled)));
         assert!(matches!(
             result.as_ref().err().map(ClassifyError::classify_error),
             Some(ErrorCategory::Transient)
@@ -445,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn not_cancelled_passes_through_to_handler() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationGuardHandler {
+        let guard_handler = CancellationHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new();
@@ -464,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn handler_error_wrapped_in_guard_error() {
         let handler = MockHandler::failing(ErrorCategory::Transient);
-        let guard_handler = CancellationGuardHandler {
+        let guard_handler = CancellationHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new();
@@ -476,14 +434,14 @@ mod tests {
             .on_message(context, message, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(CancellationGuardError::Handler(_))));
+        assert!(matches!(result, Err(CancellationError::Handler(_))));
         assert_eq!(handler.call_count(), 1);
     }
 
     #[tokio::test]
     async fn timer_shutdown_returns_terminal_error() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationGuardHandler {
+        let guard_handler = CancellationHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new().with_shutdown();
@@ -493,14 +451,14 @@ mod tests {
             .on_timer(context, trigger, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(CancellationGuardError::Shutdown)));
+        assert!(matches!(result, Err(CancellationError::Shutdown)));
         assert_eq!(handler.call_count(), 0);
     }
 
     #[tokio::test]
     async fn timer_message_cancelled_returns_transient_error() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationGuardHandler {
+        let guard_handler = CancellationHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new();
@@ -511,17 +469,14 @@ mod tests {
             .on_timer(context, trigger, DemandType::Normal)
             .await;
 
-        assert!(matches!(
-            result,
-            Err(CancellationGuardError::MessageCancelled)
-        ));
+        assert!(matches!(result, Err(CancellationError::MessageCancelled)));
         assert_eq!(handler.call_count(), 0);
     }
 
     #[tokio::test]
     async fn timer_not_cancelled_passes_through() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationGuardHandler {
+        let guard_handler = CancellationHandler {
             handler: handler.clone(),
         };
         let context = MockEventContext::new();

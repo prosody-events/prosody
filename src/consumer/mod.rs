@@ -154,7 +154,7 @@ use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
-use crate::consumer::middleware::cancellation::CancellationGuardMiddleware;
+use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::monopolization::{
@@ -716,7 +716,7 @@ fn build_common_middleware(
     Ok(telemetry_middleware
         .layer(timeout_middleware)
         .layer(scheduler_middleware)
-        .layer(CancellationGuardMiddleware))
+        .layer(CancellationMiddleware))
 }
 
 /// Helper function to initialize a consumer with a pre-built trigger store.

@@ -58,7 +58,7 @@
 //! ```rust,no_run
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
-//! # use prosody::consumer::middleware::cancellation::CancellationGuardMiddleware;
+//! # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
 //! # use prosody::consumer::message::ConsumerMessage;
@@ -74,8 +74,8 @@
 //! # }
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
-//! # let middle_middleware = CancellationGuardMiddleware;
-//! # let outer_middleware = CancellationGuardMiddleware;
+//! # let middle_middleware = CancellationMiddleware;
+//! # let outer_middleware = CancellationMiddleware;
 //! # let my_handler = MyHandler;
 //!
 //! // Basic composition pattern
@@ -92,7 +92,7 @@
 //! # use prosody::consumer::middleware::retry::*;
 //! # use prosody::consumer::middleware::scheduler::*;
 //! # use prosody::consumer::middleware::topic::*;
-//! # use prosody::consumer::middleware::cancellation::CancellationGuardMiddleware;
+//! # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
 //! # use prosody::producer::{ProsodyProducer, ProducerConfiguration};
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
@@ -118,7 +118,7 @@
 //!
 //! // Low-latency consumer with full error handling
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(CancellationGuardMiddleware)
+//!     .layer(CancellationMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config.clone()).unwrap())
 //!     .layer(FailureTopicMiddleware::new(topic_config, "consumer-group".to_string(), producer).unwrap())
 //!     .layer(RetryMiddleware::new(retry_config).unwrap())
@@ -335,11 +335,11 @@ pub trait HandlerMiddleware {
     /// ```rust,no_run
     /// # use prosody::consumer::middleware::*;
     /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
-    /// # use prosody::consumer::middleware::cancellation::CancellationGuardMiddleware;
+    /// # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
     /// # let retry_config = RetryConfiguration::builder().build().unwrap();
     /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
-    /// # let middle_middleware = CancellationGuardMiddleware;
-    /// # let outer_middleware = CancellationGuardMiddleware;
+    /// # let middle_middleware = CancellationMiddleware;
+    /// # let outer_middleware = CancellationMiddleware;
     /// // Builds from inner to outer: inner -> middle -> outer
     /// let middleware = inner_middleware
     ///     .layer(middle_middleware) // middle wraps inner

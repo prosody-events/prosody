@@ -28,7 +28,7 @@
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::log::*;
 //! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::cancellation::CancellationGuardMiddleware;
+//! # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
 //! # use prosody::consumer::message::ConsumerMessage;
@@ -48,7 +48,7 @@
 //! # let handler = MyHandler;
 //!
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(CancellationGuardMiddleware)
+//!     .layer(CancellationMiddleware)
 //!     .layer(LogMiddleware) // Logs all errors from inner layers
 //!     .into_provider(handler);
 //! ```
