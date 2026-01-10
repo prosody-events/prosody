@@ -7,18 +7,17 @@
 use std::convert::Infallible;
 use std::future::{self, Future};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::stream::{self, Stream};
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 
 /// Records timer operations for verification in tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerOperation {
     /// Timer scheduled at given time with given type.
     Schedule(CompactDateTime, TimerType),
@@ -32,10 +31,8 @@ pub enum TimerOperation {
 
 /// Unified mock context for middleware tests.
 ///
-/// Supports:
-/// - Separate shutdown and cancellation signals with async notification
-/// - Optional timer operation tracking
-/// - Builder pattern for test-specific configuration
+/// Uses `tokio::sync::watch` channels (matching production `TimerContext`)
+/// to avoid race conditions between flag checks and async notifications.
 ///
 /// # Examples
 ///
@@ -53,13 +50,15 @@ pub enum TimerOperation {
 /// ```
 #[derive(Clone)]
 pub struct MockEventContext {
-    /// Partition/consumer shutdown signal.
-    shutdown_requested: Arc<AtomicBool>,
-    shutdown_notify: Arc<Notify>,
+    /// Partition/consumer shutdown signal (sender for mutations).
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    /// Partition/consumer shutdown signal (receiver for queries).
+    shutdown_rx: watch::Receiver<bool>,
 
-    /// Message-level cancellation signal (e.g., timeout).
-    message_cancelled: Arc<AtomicBool>,
-    message_cancel_notify: Arc<Notify>,
+    /// Message-level cancellation signal (sender for mutations).
+    cancel_tx: Arc<watch::Sender<bool>>,
+    /// Message-level cancellation signal (receiver for queries).
+    cancel_rx: watch::Receiver<bool>,
 
     /// Timer operation tracking (None = disabled).
     timer_operations: Option<Arc<Mutex<Vec<TimerOperation>>>>,
@@ -75,11 +74,13 @@ impl MockEventContext {
     /// Create a new mock context with default state (no signals active).
     #[must_use]
     pub fn new() -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         Self {
-            shutdown_requested: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(Notify::new()),
-            message_cancelled: Arc::new(AtomicBool::new(false)),
-            message_cancel_notify: Arc::new(Notify::new()),
+            shutdown_tx: Arc::new(shutdown_tx),
+            shutdown_rx,
+            cancel_tx: Arc::new(cancel_tx),
+            cancel_rx,
             timer_operations: None,
         }
     }
@@ -89,8 +90,7 @@ impl MockEventContext {
     /// Used for testing early-exit behavior in middleware.
     #[must_use]
     pub fn with_shutdown(self) -> Self {
-        self.shutdown_requested.store(true, Ordering::Relaxed);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_tx.send_replace(true);
         self
     }
 
@@ -107,14 +107,12 @@ impl MockEventContext {
 
     /// Trigger partition/consumer shutdown signal.
     pub fn request_shutdown(&self) {
-        self.shutdown_requested.store(true, Ordering::Relaxed);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_tx.send_replace(true);
     }
 
     /// Trigger message-level cancellation signal (e.g., timeout).
     pub fn request_cancellation(&self) {
-        self.message_cancelled.store(true, Ordering::Relaxed);
-        self.message_cancel_notify.notify_waiters();
+        self.cancel_tx.send_replace(true);
     }
 
     /// Get all recorded timer operations.
@@ -178,30 +176,24 @@ impl MockEventContext {
 
 impl TerminationSignals for MockEventContext {
     fn is_shutdown(&self) -> bool {
-        self.shutdown_requested.load(Ordering::Relaxed)
+        *self.shutdown_rx.borrow()
     }
 
     fn is_message_cancelled(&self) -> bool {
-        self.message_cancelled.load(Ordering::Relaxed)
+        *self.cancel_rx.borrow()
     }
 
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
-        let notify = Arc::clone(&self.shutdown_notify);
-        let already_shutdown = self.shutdown_requested.load(Ordering::Relaxed);
+        let mut rx = self.shutdown_rx.clone();
         async move {
-            if !already_shutdown {
-                notify.notified().await;
-            }
+            let _ = rx.wait_for(|&v| v).await;
         }
     }
 
     fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
-        let notify = Arc::clone(&self.message_cancel_notify);
-        let already_cancelled = self.message_cancelled.load(Ordering::Relaxed);
+        let mut rx = self.cancel_rx.clone();
         async move {
-            if !already_cancelled {
-                notify.notified().await;
-            }
+            let _ = rx.wait_for(|&v| v).await;
         }
     }
 }
@@ -210,31 +202,26 @@ impl EventContext for MockEventContext {
     type Error = Infallible;
 
     fn should_cancel(&self) -> bool {
-        self.shutdown_requested.load(Ordering::Relaxed)
-            || self.message_cancelled.load(Ordering::Relaxed)
+        *self.shutdown_rx.borrow() || *self.cancel_rx.borrow()
     }
 
     fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
-        let shutdown_notify = Arc::clone(&self.shutdown_notify);
-        let cancel_notify = Arc::clone(&self.message_cancel_notify);
-        let already_cancelled = self.should_cancel();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let mut cancel_rx = self.cancel_rx.clone();
         async move {
-            if !already_cancelled {
-                tokio::select! {
-                    () = shutdown_notify.notified() => {}
-                    () = cancel_notify.notified() => {}
-                }
+            tokio::select! {
+                _ = shutdown_rx.wait_for(|&v| v) => {}
+                _ = cancel_rx.wait_for(|&v| v) => {}
             }
         }
     }
 
     fn cancel(&self) {
-        self.message_cancelled.store(true, Ordering::Relaxed);
-        self.message_cancel_notify.notify_waiters();
+        self.cancel_tx.send_replace(true);
     }
 
     fn uncancel(&self) {
-        self.message_cancelled.store(false, Ordering::Relaxed);
+        self.cancel_tx.send_replace(false);
     }
 
     fn schedule(
