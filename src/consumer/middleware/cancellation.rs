@@ -1,7 +1,7 @@
 //! Cancellation middleware for early exit when already cancelled.
 //!
 //! Checks cancellation state before invoking inner middleware. Prevents
-//! starting new work when shutdown or timeout has already been signaled.
+//! starting new work when shutdown or cancellation has already been signaled.
 //!
 //! # Execution Order
 //!

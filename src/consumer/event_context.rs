@@ -196,12 +196,12 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
 ///
 /// This trait is used internally by the retry middleware to determine whether
 /// to abort immediately (shutdown) or treat cancellation as a transient error
-/// and continue retrying (message cancellation/timeout).
+/// and continue retrying (message cancellation).
 ///
 /// - **Shutdown**: Partition revoked or consumer stopping. Processing must stop
 ///   immediately to release the partition.
-/// - **Message cancellation**: Timeout fired or similar. Should be treated as a
-///   transient error; retry logic should continue.
+/// - **Message cancellation**: Requested by middleware (e.g., timeout). Should
+///   be treated as a transient error; retry logic should continue.
 ///
 /// # Note
 ///
@@ -217,8 +217,8 @@ pub trait TerminationSignals {
 
     /// Returns `true` if message-level cancellation has been requested.
     ///
-    /// Message cancellation (e.g., timeout) should be treated as a transient
-    /// error by retry logic, not as a signal to abort.
+    /// Message cancellation should be treated as a transient error by retry
+    /// logic, not as a signal to abort.
     fn is_message_cancelled(&self) -> bool;
 
     /// Returns a future that resolves when shutdown is requested.

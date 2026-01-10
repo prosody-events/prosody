@@ -110,7 +110,7 @@ impl MockEventContext {
         self.shutdown_tx.send_replace(true);
     }
 
-    /// Trigger message-level cancellation signal (e.g., timeout).
+    /// Trigger message-level cancellation signal.
     pub fn request_cancellation(&self) {
         self.cancel_tx.send_replace(true);
     }

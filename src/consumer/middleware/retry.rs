@@ -30,10 +30,9 @@
 //! - **Shutdown** (partition revoked, consumer stopping): Aborts immediately.
 //!   The partition must be released promptly to allow rebalancing.
 //!
-//! - **Message cancellation** (timeout fired): Treated as a transient
-//!   condition. The retry loop continues, skipping any remaining sleep delay.
-//!   This ensures that timeouts don't cause message loss when retries could
-//!   still succeed.
+//! - **Message cancellation**: Treated as a transient condition. The retry loop
+//!   continues, skipping any remaining sleep delay. This ensures that
+//!   cancellation doesn't cause message loss when retries could still succeed.
 //!
 //! # Usage
 //!
@@ -114,7 +113,7 @@ enum RetryWaitResult {
     Completed,
     /// Shutdown requested (partition revoked), abort immediately.
     Shutdown,
-    /// Message cancelled (timeout), skip remaining sleep and continue retry.
+    /// Message cancelled, skip remaining sleep and continue retry.
     Cancelled,
 }
 
@@ -123,7 +122,7 @@ enum RetryWaitResult {
 /// This helper encapsulates the critical shutdown vs cancellation distinction:
 /// - **Shutdown**: Partition revoked or consumer stopping. Returns
 ///   `RetryWaitResult::Shutdown`.
-/// - **Cancellation**: Message timeout fired. Returns
+/// - **Cancellation**: Message-level cancellation requested. Returns
 ///   `RetryWaitResult::Cancelled`.
 /// - **Completed**: Sleep finished normally. Returns
 ///   `RetryWaitResult::Completed`.
@@ -367,8 +366,8 @@ where
                 return Ok(());
             };
 
-            // Only abort on shutdown (partition revoked). Message cancellation (timeout)
-            // is treated as transient - we continue retrying.
+            // Only abort on shutdown (partition revoked). Message cancellation is
+            // treated as transient - we continue retrying.
             if context.is_shutdown() {
                 return Err(error);
             }
@@ -463,8 +462,8 @@ where
             else {
                 return Ok(());
             };
-            // Only abort on shutdown (partition revoked). Message cancellation (timeout)
-            // is treated as transient - we continue retrying.
+            // Only abort on shutdown (partition revoked). Message cancellation is
+            // treated as transient - we continue retrying.
             if context.is_shutdown() {
                 return Err(error);
             }
@@ -549,8 +548,8 @@ where
                 break;
             };
 
-            // Only abort on shutdown (partition revoked). Message cancellation (timeout)
-            // is treated as transient - we continue retrying.
+            // Only abort on shutdown (partition revoked). Message cancellation is
+            // treated as transient - we continue retrying.
             if context.is_shutdown() {
                 uncommitted_offset.abort();
                 break;
@@ -632,8 +631,8 @@ where
                 uncommitted.commit().await;
                 break;
             };
-            // Only abort on shutdown (partition revoked). Message cancellation (timeout)
-            // is treated as transient - we continue retrying.
+            // Only abort on shutdown (partition revoked). Message cancellation is
+            // treated as transient - we continue retrying.
             if context.is_shutdown() {
                 uncommitted.abort().await;
                 break;
@@ -1122,7 +1121,8 @@ mod tests {
     //
     // These tests verify correct behavior for two distinct signals:
     // - **Shutdown**: Partition revoked or consumer stopping → should abort
-    // - **Cancellation**: Message timeout fired → should treat as transient, retry
+    // - **Cancellation**: Message-level cancellation → should treat as transient,
+    //   retry
     //
     // Test matrix (2×2×2 = 8 tests):
     // - Handler type: FallibleHandler vs EventHandler
