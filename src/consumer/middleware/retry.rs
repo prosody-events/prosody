@@ -43,7 +43,7 @@
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::retry::*;
 //! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::cancellation_guard::CancellationGuardMiddleware;
+//! # use prosody::consumer::middleware::cancellation::CancellationGuardMiddleware;
 //! # use prosody::consumer::middleware::topic::*;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
@@ -1313,7 +1313,7 @@ mod tests {
         Ok(())
     }
 
-    // === Cancellation Tests (should fail - current code incorrectly aborts) ===
+    // === Cancellation Tests (treats message cancellation as transient) ===
 
     /// `FallibleHandler::on_message` should continue retrying on cancellation.
     #[tokio::test]

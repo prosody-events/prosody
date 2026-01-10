@@ -37,7 +37,7 @@
 //! # use prosody::consumer::middleware::*;
 //! # use prosody::consumer::middleware::retry::*;
 //! # use prosody::consumer::middleware::scheduler::*;
-//! # use prosody::consumer::middleware::cancellation_guard::*;
+//! # use prosody::consumer::middleware::cancellation::*;
 //! # use prosody::consumer::DemandType;
 //! # use prosody::consumer::event_context::EventContext;
 //! # use prosody::consumer::message::ConsumerMessage;
@@ -63,8 +63,8 @@
 //!     .into_provider(handler);
 //! ```
 //!
-//! [`EventContext::should_cancel`]: crate::consumer::event_context::EventContext::should_cancel
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
+//! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 
 use thiserror::Error;
 use tracing::debug;

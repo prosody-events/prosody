@@ -335,7 +335,7 @@ pub trait HandlerMiddleware {
     /// ```rust,no_run
     /// # use prosody::consumer::middleware::*;
     /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
-    /// # use prosody::consumer::middleware::shutdown::CancellationGuardMiddleware;
+    /// # use prosody::consumer::middleware::cancellation::CancellationGuardMiddleware;
     /// # let retry_config = RetryConfiguration::builder().build().unwrap();
     /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
     /// # let middle_middleware = CancellationGuardMiddleware;
