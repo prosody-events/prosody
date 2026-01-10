@@ -251,7 +251,7 @@ impl FallibleHandler for OutcomeHandler {
 mod tests {
     use super::*;
     use crate::Key;
-    use crate::consumer::middleware::defer::handler::tests::{MockContext, TEST_RUNTIME};
+    use crate::consumer::middleware::defer::handler::tests::{MockEventContext, TEST_RUNTIME};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use crate::tracing::init_test_logging;
@@ -284,7 +284,7 @@ mod tests {
 
         TEST_RUNTIME.block_on(async {
             let handler = OutcomeHandler::new();
-            let context = MockContext::new();
+            let context = MockEventContext::new();
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Success);
@@ -299,7 +299,7 @@ mod tests {
 
         TEST_RUNTIME.block_on(async {
             let handler = OutcomeHandler::new();
-            let context = MockContext::new();
+            let context = MockEventContext::new();
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Permanent);
@@ -317,7 +317,7 @@ mod tests {
 
         TEST_RUNTIME.block_on(async {
             let handler = OutcomeHandler::new();
-            let context = MockContext::new();
+            let context = MockEventContext::new();
             let trigger = make_test_trigger("test-key");
 
             handler.set_outcome(HandlerOutcome::Transient);

@@ -119,6 +119,9 @@ impl<T> TimeoutHandler<T> {
                     "Handler completed after cancellation signal"
                 );
 
+                // Reset cancellation flag so retry can continue with clean state
+                context.uncancel();
+
                 result
             }
         }
@@ -250,22 +253,18 @@ where
 mod tests {
     use super::*;
     use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::middleware::test_support::MockEventContext;
     use crate::consumer::middleware::{ClassifyError, ErrorCategory};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
-    use futures::stream;
     use serde_json::json;
-    use std::convert::Infallible;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
-    use std::future::{self, Future};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Semaphore;
-    use tokio::task::yield_now;
-    use tokio::time::Instant;
     use tracing::Span;
 
     /// Test error type.
@@ -286,85 +285,14 @@ mod tests {
         }
     }
 
-    /// Mock context that satisfies [`EventContext`] and tracks cancellation.
-    #[derive(Clone)]
-    struct MockContext {
-        cancelled: Arc<AtomicBool>,
-    }
-
-    impl MockContext {
-        fn new() -> Self {
-            Self {
-                cancelled: Arc::new(AtomicBool::new(false)),
-            }
-        }
-    }
-
-    impl EventContext for MockContext {
-        type Error = Infallible;
-
-        fn should_cancel(&self) -> bool {
-            self.cancelled.load(Ordering::Relaxed)
-        }
-
-        fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
-            future::pending::<()>()
-        }
-
-        fn cancel(&self) {
-            self.cancelled.store(true, Ordering::Relaxed);
-        }
-
-        fn schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_and_schedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn unschedule(
-            &self,
-            _time: CompactDateTime,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn clear_scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn invalidate(self) {
-            self.cancel();
-        }
-
-        fn scheduled(
-            &self,
-            _timer_type: TimerType,
-        ) -> impl futures::Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static
-        {
-            stream::empty()
-        }
-    }
-
     /// Mock handler with configurable behavior including delay.
     #[derive(Clone)]
     struct MockHandler {
         call_count: Arc<AtomicUsize>,
         delay: Option<Duration>,
         result: Result<(), TestError>,
+        /// Records whether the handler observed cancellation during execution.
+        observed_cancellation: Arc<AtomicBool>,
     }
 
     impl MockHandler {
@@ -373,6 +301,7 @@ mod tests {
                 call_count: Arc::new(AtomicUsize::new(0)),
                 delay: None,
                 result: Ok(()),
+                observed_cancellation: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -381,6 +310,7 @@ mod tests {
                 call_count: Arc::new(AtomicUsize::new(0)),
                 delay: Some(delay),
                 result: Ok(()),
+                observed_cancellation: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -389,11 +319,16 @@ mod tests {
                 call_count: Arc::new(AtomicUsize::new(0)),
                 delay: None,
                 result: Err(TestError("handler failed")),
+                observed_cancellation: Arc::new(AtomicBool::new(false)),
             }
         }
 
         fn call_count(&self) -> usize {
             self.call_count.load(Ordering::Relaxed)
+        }
+
+        fn observed_cancellation(&self) -> bool {
+            self.observed_cancellation.load(Ordering::Relaxed)
         }
     }
 
@@ -411,14 +346,13 @@ mod tests {
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             if let Some(delay) = self.delay {
-                // Poll for cancellation during delay to support cooperative cancellation.
-                let deadline = Instant::now() + delay;
-                while Instant::now() < deadline {
-                    if context.should_cancel() {
+                // Wait for delay or cancellation, whichever comes first.
+                select! {
+                    () = sleep(delay) => {}
+                    () = context.on_cancel() => {
+                        self.observed_cancellation.store(true, Ordering::Relaxed);
                         return Err(TestError("cancelled"));
                     }
-                    // Yield to allow other tasks (like timeout) to run
-                    yield_now().await;
                 }
             }
             self.result.clone()
@@ -435,14 +369,13 @@ mod tests {
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             if let Some(delay) = self.delay {
-                // Poll for cancellation during delay to support cooperative cancellation.
-                let deadline = Instant::now() + delay;
-                while Instant::now() < deadline {
-                    if context.should_cancel() {
+                // Wait for delay or cancellation, whichever comes first.
+                select! {
+                    () = sleep(delay) => {}
+                    () = context.on_cancel() => {
+                        self.observed_cancellation.store(true, Ordering::Relaxed);
                         return Err(TestError("cancelled"));
                     }
-                    // Yield to allow other tasks (like timeout) to run
-                    yield_now().await;
                 }
             }
             self.result.clone()
@@ -482,7 +415,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -502,7 +435,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -516,7 +449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handler_exceeds_timeout_signals_cancellation_and_waits() {
+    async fn handler_exceeds_timeout_signals_cancellation_and_then_uncancels() {
         // Handler takes 100ms but timeout is 10ms
         // After timeout, cancellation is signaled and we wait for handler
         let handler = MockHandler::with_delay(Duration::from_millis(100));
@@ -524,7 +457,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_millis(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
         };
@@ -537,8 +470,10 @@ mod tests {
         assert!(result.is_err());
         // Handler was invoked and responded to cancellation
         assert_eq!(handler.call_count(), 1);
-        // Context should be marked as cancelled
-        assert!(context.should_cancel());
+        // Handler observed the cancellation signal during execution
+        assert!(handler.observed_cancellation());
+        // Cancellation flag should be reset after operation completes
+        assert!(!context.should_cancel());
     }
 
     #[tokio::test]
@@ -548,7 +483,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler
@@ -560,14 +495,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timer_handler_exceeds_timeout_signals_cancellation_and_waits() {
+    async fn timer_handler_exceeds_timeout_signals_cancellation_and_then_uncancels() {
         // Timer handler takes 100ms but timeout is 10ms
         let handler = MockHandler::with_delay(Duration::from_millis(100));
         let timeout_handler = TimeoutHandler {
             handler: handler.clone(),
             timeout: Duration::from_millis(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler
@@ -577,7 +512,10 @@ mod tests {
         // Handler should return error after seeing cancellation
         assert!(result.is_err());
         assert_eq!(handler.call_count(), 1);
-        assert!(context.should_cancel());
+        // Handler observed the cancellation signal during execution
+        assert!(handler.observed_cancellation());
+        // Cancellation flag should be reset after operation completes
+        assert!(!context.should_cancel());
     }
 
     #[tokio::test]
@@ -587,7 +525,7 @@ mod tests {
             handler: handler.clone(),
             timeout: Duration::from_secs(10),
         };
-        let context = MockContext::new();
+        let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
         let result = timeout_handler

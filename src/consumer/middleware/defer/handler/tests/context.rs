@@ -6,6 +6,7 @@
 
 use super::types::OutputEvent;
 use crate::Key;
+use crate::consumer::TerminationSignals;
 use crate::consumer::event_context::EventContext;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
@@ -13,7 +14,7 @@ use ahash::RandomState;
 use futures::stream::{self, Stream};
 use std::collections::BTreeSet;
 use std::convert::Infallible;
-use std::future::{self, Future};
+use std::future::{self, Future, ready};
 use std::sync::Arc;
 
 // ============================================================================
@@ -186,6 +187,24 @@ impl KeyedCapturingContext {
     }
 }
 
+impl TerminationSignals for KeyedCapturingContext {
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+
+    fn is_message_cancelled(&self) -> bool {
+        false
+    }
+
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+        ready(())
+    }
+
+    fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        ready(())
+    }
+}
+
 impl EventContext for KeyedCapturingContext {
     type Error = Infallible;
 
@@ -245,6 +264,10 @@ impl EventContext for KeyedCapturingContext {
     }
 
     fn cancel(&self) {
+        // No-op for tests
+    }
+
+    fn uncancel(&self) {
         // No-op for tests
     }
 
