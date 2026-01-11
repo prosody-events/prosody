@@ -151,8 +151,10 @@ use validator::{Validate, ValidationErrors};
 use whoami::fallible::hostname;
 
 use crate::consumer::event_context::EventContext;
+pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
+use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::defer::{
     DeferConfiguration, FailureTracker, MessageDeferMiddleware, TimerDeferMiddleware,
 };
@@ -164,7 +166,6 @@ use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::scheduler::{
     SchedulerConfiguration, SchedulerInitError, SchedulerMiddleware,
 };
-use crate::consumer::middleware::shutdown::ShutdownMiddleware;
 use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::{
     TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
@@ -686,7 +687,7 @@ pub struct ProsodyConsumer {
 /// 2. Timeout middleware - enforces handler execution timeout
 /// 3. Scheduler middleware - fair work-conserving dispatch with concurrency
 ///    limits
-/// 4. Shutdown middleware - stops processing during partition shutdown
+/// 4. Cancellation middleware - checks shutdown/cancellation before handler
 ///
 /// # Arguments
 ///
@@ -717,7 +718,7 @@ fn build_common_middleware(
     Ok(telemetry_middleware
         .layer(timeout_middleware)
         .layer(scheduler_middleware)
-        .layer(ShutdownMiddleware))
+        .layer(CancellationMiddleware))
 }
 
 /// Helper function to initialize a consumer with a pre-built trigger store.

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::consumer::Keyed;
+use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
@@ -70,6 +71,24 @@ impl Keyed for KeyedMockContext {
     }
 }
 
+impl TerminationSignals for KeyedMockContext {
+    fn is_shutdown(&self) -> bool {
+        self.inner.is_shutdown()
+    }
+
+    fn is_message_cancelled(&self) -> bool {
+        self.inner.is_message_cancelled()
+    }
+
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.inner.on_shutdown()
+    }
+
+    fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.inner.on_message_cancelled()
+    }
+}
+
 impl EventContext for KeyedMockContext {
     type Error = Infallible;
 
@@ -83,6 +102,10 @@ impl EventContext for KeyedMockContext {
 
     fn cancel(&self) {
         self.inner.cancel();
+    }
+
+    fn uncancel(&self) {
+        self.inner.uncancel();
     }
 
     fn schedule(

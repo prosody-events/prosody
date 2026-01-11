@@ -17,7 +17,7 @@
 
 use crate::Key;
 use crate::consumer::Keyed;
-use crate::consumer::event_context::EventContext;
+use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory};
 use crate::timers::TimerType;
@@ -127,6 +127,28 @@ where
     }
 }
 
+impl<C, S> TerminationSignals for TimerDeferContext<C, S>
+where
+    C: EventContext + Clone + Send + Sync,
+    S: TimerDeferStore + Clone + Send + Sync,
+{
+    fn is_shutdown(&self) -> bool {
+        self.inner.is_shutdown()
+    }
+
+    fn is_message_cancelled(&self) -> bool {
+        self.inner.is_message_cancelled()
+    }
+
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.inner.on_shutdown()
+    }
+
+    fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.inner.on_message_cancelled()
+    }
+}
+
 impl<C, S> EventContext for TimerDeferContext<C, S>
 where
     C: EventContext + Clone + Send + Sync,
@@ -144,6 +166,10 @@ where
 
     fn cancel(&self) {
         self.inner.cancel();
+    }
+
+    fn uncancel(&self) {
+        self.inner.uncancel();
     }
 
     fn invalidate(self) {

@@ -4,7 +4,7 @@
 //! verifying [`TimerDeferHandler`](super::TimerDeferHandler) behavior.
 
 use crate::consumer::DemandType;
-use crate::consumer::event_context::EventContext;
+use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
@@ -101,6 +101,24 @@ impl MockContext {
     }
 }
 
+impl TerminationSignals for MockContext {
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+
+    fn is_message_cancelled(&self) -> bool {
+        false
+    }
+
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+        pending::<()>()
+    }
+
+    fn on_message_cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        pending::<()>()
+    }
+}
+
 impl EventContext for MockContext {
     type Error = Infallible;
 
@@ -156,6 +174,10 @@ impl EventContext for MockContext {
     }
 
     fn cancel(&self) {
+        // No-op for testing
+    }
+
+    fn uncancel(&self) {
         // No-op for testing
     }
 
