@@ -16,7 +16,7 @@ use aho_corasick::AhoCorasick;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rdkafka::ClientContext;
-use rdkafka::consumer::{BaseConsumer, ConsumerContext, Rebalance};
+use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
 use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
@@ -226,7 +226,15 @@ where
     ///
     /// * `consumer` - The Kafka consumer instance
     /// * `rebalance` - The completed rebalance event details
-    fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, _rebalance: &Rebalance) {
+    fn post_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
+        if let Rebalance::Assign(partitions) = rebalance {
+            debug!("resuming assigned partitions: {partitions:#?}");
+
+            if let Err(error) = consumer.resume(partitions) {
+                error!("error while resuming assigned partitions: {error:#}");
+            }
+        }
+
         debug!("rebalance completed");
     }
 }
