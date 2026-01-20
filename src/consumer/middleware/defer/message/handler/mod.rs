@@ -112,38 +112,6 @@ where
     }
 }
 
-impl<P, L, D> MessageDeferMiddleware<P, L, D>
-where
-    P: MessageDeferStoreProvider,
-    L: MessageLoader,
-    D: DeferralDecider,
-{
-    /// Creates middleware with custom loader and decider.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if config validation fails.
-    pub fn with_custom(
-        config: DeferConfiguration,
-        loader: L,
-        provider: P,
-        decider: D,
-        consumer_config: &ConsumerConfiguration,
-    ) -> Result<Self, DeferInitError> {
-        use validator::Validate;
-
-        config.validate()?;
-
-        Ok(Self {
-            config,
-            loader,
-            provider,
-            decider,
-            consumer_group: Arc::from(consumer_config.group_id.as_str()),
-        })
-    }
-}
-
 /// Creates [`MessageDeferHandler`]s for each partition.
 #[derive(Clone)]
 pub struct MessageDeferProvider<T, P, L = KafkaLoader, D = FailureTracker>

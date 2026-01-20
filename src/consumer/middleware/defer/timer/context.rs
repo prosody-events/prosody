@@ -64,12 +64,6 @@ where
         Self { inner, store, key }
     }
 
-    /// Returns a reference to the inner context.
-    #[must_use]
-    pub fn inner(&self) -> &C {
-        &self.inner
-    }
-
     /// Schedules a retry timer at the specified time.
     ///
     /// Clears any existing `DeferredTimer` and schedules a new one.
@@ -469,16 +463,4 @@ pub struct StoredTimerEntry {
     pub trigger: Trigger,
     /// Current retry count.
     pub retry_count: u32,
-}
-
-impl StoredTimerEntry {
-    /// Creates a new stored timer entry.
-    #[must_use]
-    pub fn new(trigger: Trigger, retry_count: u32) -> Self {
-        Self {
-            original_time: trigger.time,
-            trigger,
-            retry_count,
-        }
-    }
 }
