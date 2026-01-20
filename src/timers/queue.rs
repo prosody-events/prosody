@@ -123,7 +123,7 @@ impl TriggerQueue {
     /// # Arguments
     ///
     /// * `trigger` - The timer event to add to the queue.
-    pub fn insert_queue_only(&mut self, trigger: Trigger) {
+    pub(crate) fn insert_queue_only(&mut self, trigger: Trigger) {
         // Skip if the trigger is already in the queue.
         let Entry::Vacant(vacant) = self.queue_keys.entry(trigger.clone()) else {
             return;
@@ -147,7 +147,7 @@ impl TriggerQueue {
     /// # Arguments
     ///
     /// * `trigger` - The trigger to remove from the queue.
-    pub fn remove_queue_only(&mut self, trigger: &Trigger) {
+    pub(crate) fn remove_queue_only(&mut self, trigger: &Trigger) {
         // Look up and remove the trigger's delay queue key.
         let Some(queue_key) = self.queue_keys.remove(trigger) else {
             return;

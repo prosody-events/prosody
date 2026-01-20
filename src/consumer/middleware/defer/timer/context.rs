@@ -81,20 +81,6 @@ where
             .map_err(TimerDeferContextError::Context)
     }
 
-    /// Clears the retry timer for this key.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the context operation fails.
-    pub async fn clear_retry_timer(
-        &self,
-    ) -> Result<(), TimerDeferContextError<C::Error, S::Error>> {
-        self.inner
-            .clear_scheduled(TimerType::DeferredTimer)
-            .await
-            .map_err(TimerDeferContextError::Context)
-    }
-
     /// Returns whether the key is currently deferred.
     ///
     /// # Errors
@@ -448,19 +434,4 @@ where
             Self::Store(e) => e.classify_error(),
         }
     }
-}
-
-/// Stored timer entry for queue management.
-///
-/// Contains all data needed to reconstruct a `Trigger` without accessing
-/// Kafka. Unlike message defer which stores only offsets, timer defer stores
-/// the complete timer data including span context.
-#[derive(Clone, Debug)]
-pub struct StoredTimerEntry {
-    /// The timer's original fire time.
-    pub original_time: CompactDateTime,
-    /// The reconstructed trigger (with restored span).
-    pub trigger: Trigger,
-    /// Current retry count.
-    pub retry_count: u32,
 }

@@ -35,7 +35,7 @@ impl<'a> MigrationExecutor<'a> {
     /// # Errors
     ///
     /// Returns an error if statement execution or migration recording fails.
-    pub async fn apply_migration(
+    pub(crate) async fn apply_migration(
         &self,
         migration: &Migration,
         keyspace: &str,

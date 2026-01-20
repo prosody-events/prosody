@@ -118,7 +118,7 @@ impl ProducerConfigurationBuilder {
     ///
     /// An option containing the source system if configured
     #[must_use]
-    pub fn configured_source_system(&self) -> Option<String> {
+    pub(crate) fn configured_source_system(&self) -> Option<String> {
         self.source_system
             .clone()
             .or_else(|| var(PROSODY_SOURCE_SYSTEM).ok())
@@ -269,7 +269,9 @@ impl ProsodyProducer {
     /// # Errors
     ///
     /// Returns a `ProducerError` if the producer creation fails.
-    pub fn low_latency_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+    pub(crate) fn low_latency_producer(
+        mut config: ProducerConfiguration,
+    ) -> Result<Self, ProducerError> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
@@ -293,7 +295,9 @@ impl ProsodyProducer {
     /// # Errors
     ///
     /// Returns a `ProducerError` if the producer creation fails.
-    pub fn best_effort_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+    pub(crate) fn best_effort_producer(
+        mut config: ProducerConfiguration,
+    ) -> Result<Self, ProducerError> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }

@@ -47,30 +47,6 @@ where
     Ok(())
 }
 
-/// Helper function to verify a segment exists and matches expected values
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn verify_segment<S>(store: &S, segment: &Segment) -> TestStoreResult
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    match store.get_segment(&segment.id).await {
-        Ok(Some(retrieved))
-            if retrieved.id == segment.id
-                && retrieved.name == segment.name
-                && retrieved.slab_size == segment.slab_size =>
-        {
-            Ok(())
-        }
-        Ok(Some(_)) => Err("Retrieved segment doesn't match original".to_owned()),
-        Ok(None) => Err("Failed to retrieve segment".to_owned()),
-        Err(e) => Err(format!("Error retrieving segment: {e:?}")),
-    }
-}
-
 /// Helper function to delete a slab
 ///
 /// # Errors

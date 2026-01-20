@@ -363,12 +363,6 @@ impl TimerDeferModel {
     pub fn is_deferred(&self, key: &Key) -> Option<u32> {
         self.get_next(key).map(|(_, retry_count)| retry_count)
     }
-
-    /// Returns all keys in the model.
-    #[must_use]
-    pub fn all_defer_keys(&self) -> Vec<Key> {
-        self.keys.keys().map(Arc::clone).collect()
-    }
 }
 
 /// Creates a test trigger with the given key and time.

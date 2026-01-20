@@ -98,7 +98,7 @@ use tracing::{debug, info, instrument, warn};
 ///
 /// Returns an error if any migration phase fails.
 #[instrument(level = "debug", skip(store), err)]
-pub async fn migrate_segment_if_needed(
+pub(crate) async fn migrate_segment_if_needed(
     store: &CassandraTriggerStore,
     mut segment: Segment,
     desired_slab_size: CompactDuration,
@@ -126,7 +126,7 @@ pub async fn migrate_segment_if_needed(
 ///
 /// `true` if the segment is v1 and needs migration, `false` otherwise.
 #[must_use]
-pub fn needs_migration(segment: &Segment) -> bool {
+pub(crate) fn needs_migration(segment: &Segment) -> bool {
     matches!(segment.version, SegmentVersion::V1)
 }
 
@@ -152,7 +152,7 @@ pub fn needs_migration(segment: &Segment) -> bool {
 /// - Updating segment version fails
 /// - Cleaning up v1 data fails
 #[instrument(level = "info", skip(store), err)]
-pub async fn migrate_segment_version(
+pub(crate) async fn migrate_segment_version(
     store: &CassandraTriggerStore,
     mut segment: Segment,
 ) -> Result<Segment, CassandraTriggerStoreError> {
@@ -316,7 +316,10 @@ async fn cleanup_v1_data(
 /// `true` if the segment's `slab_size` differs from `desired_slab_size`,
 /// `false` otherwise.
 #[must_use]
-pub fn needs_slab_size_migration(segment: &Segment, desired_slab_size: CompactDuration) -> bool {
+pub(crate) fn needs_slab_size_migration(
+    segment: &Segment,
+    desired_slab_size: CompactDuration,
+) -> bool {
     segment.slab_size != desired_slab_size
 }
 
@@ -510,7 +513,7 @@ async fn cleanup_old_slabs_with_overlap_protection(
 /// - Updating segment `slab_size` fails
 /// - Cleaning up old slabs fails
 #[instrument(level = "info", skip(store), err)]
-pub async fn migrate_slab_size(
+pub(crate) async fn migrate_slab_size(
     store: &CassandraTriggerStore,
     mut segment: Segment,
     desired_slab_size: CompactDuration,

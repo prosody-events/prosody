@@ -629,7 +629,7 @@ impl ConsumerConfigurationBuilder {
     ///
     /// An option containing the consumer group if configured.
     #[must_use]
-    pub fn configured_consumer_group(&self) -> Option<String> {
+    pub(crate) fn configured_consumer_group(&self) -> Option<String> {
         self.group_id.clone().or_else(|| var(PROSODY_GROUP_ID).ok())
     }
 }
@@ -1085,7 +1085,7 @@ impl ProsodyConsumer {
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn best_effort_consumer<T>(
+    pub(crate) async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         common_config: &CommonMiddlewareConfiguration,

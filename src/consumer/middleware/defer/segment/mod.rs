@@ -55,7 +55,7 @@ impl Segment {
 
     /// Creates a segment from existing ID (used when loading from storage).
     #[must_use]
-    pub fn with_id(
+    pub(crate) fn with_id(
         id: SegmentId,
         topic: Topic,
         partition: Partition,

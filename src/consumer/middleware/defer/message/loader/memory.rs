@@ -93,6 +93,7 @@ impl MemoryLoader {
     ///
     /// Used to simulate message deletion or compaction. Subsequent load
     /// attempts will return [`MemoryLoaderError::NotFound`].
+    #[cfg(test)]
     pub fn remove_message(&self, topic: Topic, partition: Partition, offset: Offset) {
         self.messages.write().remove(&(topic, partition, offset));
     }

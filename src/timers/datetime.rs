@@ -80,7 +80,7 @@ impl CompactDateTime {
     ///
     /// Returns [`CompactDateTimeError::PastDateTime`] if `other` is later
     /// than `self`.
-    pub fn compact_duration_since(
+    pub(crate) fn compact_duration_since(
         self,
         other: Self,
     ) -> Result<CompactDuration, CompactDateTimeError> {

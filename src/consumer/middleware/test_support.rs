@@ -159,13 +159,6 @@ impl MockEventContext {
         })
     }
 
-    /// Clear all recorded timer operations.
-    pub fn clear_timer_operations(&self) {
-        if let Some(ops) = &self.timer_operations {
-            ops.lock().clear();
-        }
-    }
-
     /// Record a timer operation (internal helper).
     fn record(&self, op: TimerOperation) {
         if let Some(ops) = &self.timer_operations {

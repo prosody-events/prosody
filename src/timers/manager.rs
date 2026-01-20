@@ -196,7 +196,7 @@ where
     ///
     /// Returns [`TimerManagerError::Store`] if the underlying storage query
     /// fails.
-    pub async fn scheduled_triggers(
+    pub(crate) async fn scheduled_triggers(
         &self,
         key: &Key,
         timer_type: TimerType,

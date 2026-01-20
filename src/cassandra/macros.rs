@@ -27,7 +27,7 @@ use scylla::statement::prepared::PreparedStatement;
 ///
 /// Returns an error if statement preparation fails.
 #[doc(hidden)]
-pub async fn prepare_statement(
+pub(crate) async fn prepare_statement(
     session: &Session,
     statement: &str,
 ) -> Result<PreparedStatement, CassandraStoreError> {
@@ -44,7 +44,7 @@ pub async fn prepare_statement(
 /// placeholders with the provided string arguments.
 #[doc(hidden)]
 #[must_use]
-pub fn format_sql(template: &str, keyspace: &str, args: &[&str]) -> String {
+pub(crate) fn format_sql(template: &str, keyspace: &str, args: &[&str]) -> String {
     let with_keyspace = template.replace("$keyspace", keyspace);
 
     if args.is_empty() {
