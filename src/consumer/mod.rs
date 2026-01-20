@@ -122,34 +122,6 @@
 //! - `heartbeat`: Monitoring for stalled processes
 //! - `probes`: HTTP endpoints for health and readiness checking
 
-use crate::consumer::poll::PollConfig;
-use crate::consumer::probes::ProbeServer;
-use crate::high_level::config::TriggerStoreConfiguration;
-use std::env::var;
-use std::fmt::Debug;
-use std::future::Future;
-use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
-
-use ahash::HashMap;
-use aho_corasick::{AhoCorasick, StartKind};
-use crossbeam_utils::CachePadded;
-use derive_builder::Builder;
-use educe::Educe;
-use futures::executor::block_on;
-use parking_lot::{Mutex, RwLock};
-use rdkafka::ClientConfig;
-use rdkafka::config::RDKafkaLogLevel;
-use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::error::KafkaError;
-use thiserror::Error;
-use tokio::task::{JoinHandle, spawn_blocking};
-use tracing::error;
-use validator::{Validate, ValidationErrors};
-use whoami::fallible::hostname;
-
 use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::Context;
@@ -173,9 +145,12 @@ use crate::consumer::middleware::timeout::{
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
+use crate::consumer::poll::PollConfig;
 use crate::consumer::poll::poll;
+use crate::consumer::probes::ProbeServer;
 use crate::consumer::storage::StorePair;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::high_level::config::TriggerStoreConfiguration;
 use crate::producer::ProsodyProducer;
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
@@ -190,6 +165,29 @@ use crate::util::{
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
 use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
+use ahash::HashMap;
+use aho_corasick::{AhoCorasick, StartKind};
+use crossbeam_utils::CachePadded;
+use derive_builder::Builder;
+use educe::Educe;
+use futures::executor::block_on;
+use parking_lot::{Mutex, RwLock};
+use rdkafka::ClientConfig;
+use rdkafka::config::RDKafkaLogLevel;
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::error::KafkaError;
+use std::env::var;
+use std::fmt::Debug;
+use std::future::Future;
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+use thiserror::Error;
+use tokio::task::{JoinHandle, spawn_blocking};
+use tracing::error;
+use validator::{Validate, ValidationErrors};
+use whoami::hostname;
 
 pub mod decode;
 pub mod event_context;
@@ -1374,6 +1372,10 @@ pub enum ConsumerError {
     /// Indicates an IO failure.
     #[error("IO error: {0:#}")]
     Io(#[from] io::Error),
+
+    /// Indicates a failure to retrieve the hostname.
+    #[error("failed to get hostname: {0:#}")]
+    Hostname(#[from] whoami::Error),
 
     /// Indicates a Kafka operation failure.
     #[error("Kafka operation failed: {0:#}")]

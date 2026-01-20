@@ -52,7 +52,6 @@ use rdkafka::{Message, TopicPartitionList};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io;
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,11 +63,11 @@ use tokio::task::spawn_blocking;
 use tracing::field::Empty;
 use tracing::{Span, debug, error, info_span, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use whoami::fallible::hostname;
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
 use tokio::select;
+use whoami::hostname;
 
 #[cfg(test)]
 mod tests;
@@ -943,7 +942,7 @@ pub enum KafkaLoaderError {
 
     /// Failed to retrieve the hostname for the consumer client ID.
     #[error("failed to get hostname: {0:#}")]
-    Hostname(Arc<io::Error>),
+    Hostname(Arc<whoami::Error>),
 }
 
 impl ClassifyError for KafkaLoaderError {

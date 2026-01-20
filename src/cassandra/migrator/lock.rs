@@ -14,7 +14,7 @@ use std::process;
 use std::time::Duration;
 use tracing::{debug, error};
 use uuid::Uuid;
-use whoami::fallible::hostname;
+use whoami::hostname;
 
 /// Distributed lock manager for migration coordination.
 pub struct LockManager<'a> {

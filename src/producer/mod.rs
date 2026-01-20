@@ -19,7 +19,6 @@ use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use std::env::var;
-use std::io;
 use std::mem::take;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -28,7 +27,6 @@ use thiserror::Error;
 use tracing::{Span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
-use whoami::fallible::hostname;
 
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
@@ -46,6 +44,7 @@ use serde_json as json;
 use simd_json as json;
 use tracing::field::debug;
 use tracing::log::info;
+use whoami::hostname;
 
 mod injector;
 
@@ -446,7 +445,7 @@ pub enum ProducerError {
 
     /// Indicates a failure to retrieve the hostname.
     #[error("failed to get hostname: {0:#}")]
-    Hostname(#[from] io::Error),
+    Hostname(#[from] whoami::Error),
 
     /// Indicates a Kafka operation failure.
     #[error("Kafka error: {0:#}")]
