@@ -6,12 +6,13 @@
 use crate::consumer::DemandType;
 use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
-use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};

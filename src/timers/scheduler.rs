@@ -9,7 +9,7 @@
 //! on a spawned Tokio task.
 
 use crate::Key;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};

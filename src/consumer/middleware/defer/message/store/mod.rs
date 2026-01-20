@@ -19,7 +19,7 @@ pub mod provider;
 #[cfg(test)]
 pub mod tests;
 
-use crate::consumer::middleware::ClassifyError;
+use crate::error::ClassifyError;
 use crate::{Key, Offset};
 use std::error::Error;
 use std::future::Future;

@@ -254,7 +254,7 @@ mod tests {
     use super::*;
     use crate::consumer::message::ConsumerMessage;
     use crate::consumer::middleware::test_support::MockEventContext;
-    use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+    use crate::error::{ClassifyError, ErrorCategory};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;

@@ -30,10 +30,9 @@ use prosody::consumer::middleware::defer::{
 };
 use prosody::consumer::middleware::log::LogMiddleware;
 use prosody::consumer::middleware::scheduler::SchedulerConfiguration;
-use prosody::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleHandler, HandlerMiddleware,
-};
+use prosody::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use prosody::consumer::{ConsumerConfiguration, DemandType, Keyed, ProsodyConsumer};
+use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::heartbeat::HeartbeatRegistry;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;

@@ -20,7 +20,7 @@
 //! implement the same trait to provide durability.
 
 use crate::Key;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};

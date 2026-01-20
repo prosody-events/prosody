@@ -5,7 +5,7 @@ use super::{Segment, SegmentId};
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_DEFERRED_SEGMENTS};
 use crate::cassandra_queries;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::{ConsumerGroup, Partition, Topic};
 use scylla::client::session::Session;
 use std::sync::Arc;

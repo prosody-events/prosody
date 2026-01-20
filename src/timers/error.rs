@@ -4,7 +4,7 @@
 //! [`super::manager::TimerManager`]: storage failures, scheduling failures,
 //! invalid datetime values, and timer lifecycle errors.
 
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTimeError;
 use crate::timers::scheduler::TimerSchedulerError;
 use chrono::OutOfRangeError;

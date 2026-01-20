@@ -390,7 +390,7 @@ where
     fn classify_error(&self) -> ErrorCategory {
         match self {
             FailureTopicError::Handler(error) => error.classify_error(),
-            FailureTopicError::Producer(_) => ErrorCategory::Transient,
+            FailureTopicError::Producer(error) => error.classify_error(),
         }
     }
 }
@@ -398,10 +398,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::middleware::ErrorCategory;
+    use crate::error::ErrorCategory;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
-    use std::io;
 
     /// Test error type with configurable classification.
     #[derive(Debug, Clone)]
@@ -445,15 +444,15 @@ mod tests {
     }
 
     #[test]
-    fn producer_error_classifies_as_transient() {
-        // Create a ProducerError for testing using io::Error which is easy to construct
-        // Producer errors should always be transient since they may succeed on retry
-        let io_error = io::Error::new(io::ErrorKind::ConnectionRefused, "test error");
+    fn producer_error_delegates_classification() {
+        // Kafka errors with transient error codes should be classified as transient
+        use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+        let kafka_error = KafkaError::MessageProduction(RDKafkaErrorCode::BrokerNotAvailable);
         let error: FailureTopicError<TestError> =
-            FailureTopicError::Producer(ProducerError::Hostname(io_error));
+            FailureTopicError::Producer(ProducerError::Kafka(kafka_error));
         assert!(
             matches!(error.classify_error(), ErrorCategory::Transient),
-            "Producer errors should be transient to allow outer retry middleware to retry"
+            "BrokerNotAvailable Kafka errors should be transient"
         );
     }
 

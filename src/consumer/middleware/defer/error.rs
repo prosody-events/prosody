@@ -3,7 +3,7 @@
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::event_context::BoxEventContextError;
 use crate::consumer::middleware::defer::message::loader::KafkaLoaderError;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTimeError;
 use std::error::Error as StdError;
 use std::fmt::Debug;

@@ -12,7 +12,7 @@
 //!   on retry. Retry with backoff recommended.
 
 use crate::cassandra::migrator::MigrationError;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDurationError;
 use scylla::_macro_internal::TypeCheckError;
 use scylla::client::pager::NextPageError;

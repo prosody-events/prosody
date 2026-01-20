@@ -12,7 +12,7 @@ pub mod provider;
 pub mod tests;
 
 use crate::Key;
-use crate::consumer::middleware::ClassifyError;
+use crate::error::ClassifyError;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use futures::Stream;

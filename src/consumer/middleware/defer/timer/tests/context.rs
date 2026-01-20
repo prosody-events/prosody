@@ -722,7 +722,7 @@ mod error_handling {
     use super::*;
     use crate::consumer::middleware::defer::timer::context::TimerDeferContextError;
     use crate::consumer::middleware::defer::timer::store::TimerRetryCompletionResult;
-    use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+    use crate::error::{ClassifyError, ErrorCategory};
     use std::error::Error;
     use std::fmt::{self, Display, Formatter};
 
@@ -1036,7 +1036,7 @@ mod error_handling {
 #[test]
 fn context_error_classification_delegates_correctly() {
     use crate::consumer::middleware::defer::timer::context::TimerDeferContextError;
-    use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+    use crate::error::{ClassifyError, ErrorCategory};
 
     init_test_logging();
 

@@ -4,7 +4,7 @@
 //! seconds, reducing memory usage for timer systems that process large volumes
 //! of events. Supports the range 1970-2106 with second-level precision.
 
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use chrono::{DateTime, Utc};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};

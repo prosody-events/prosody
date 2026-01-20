@@ -61,7 +61,7 @@ mod validator;
 mod tests;
 
 use crate::cassandra::{CassandraStoreError, TABLE_SCHEMA_MIGRATIONS};
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use executor::MigrationExecutor;
 use futures::{TryStreamExt, pin_mut};
 use humantime::format_duration;

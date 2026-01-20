@@ -4,7 +4,7 @@
 //! seconds. Reduces memory usage and enables fast arithmetic for timer systems
 //! requiring only second-level precision.
 
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::ops::{Add, Sub};
 use std::time::Duration;

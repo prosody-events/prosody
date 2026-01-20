@@ -8,7 +8,7 @@ use super::SchedulerConfiguration;
 use super::decay::DecayingDuration;
 use crate::TopicPartitionKey;
 use crate::consumer::DemandType;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
 use ahash::RandomState;

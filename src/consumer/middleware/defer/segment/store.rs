@@ -1,7 +1,7 @@
 //! Segment persistence trait and in-memory implementation.
 
 use super::{Segment, SegmentId};
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;

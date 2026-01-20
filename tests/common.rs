@@ -23,8 +23,9 @@ use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration}
 use prosody::cassandra::config::CassandraConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
-use prosody::consumer::middleware::{ClassifyError, CloneProvider, ErrorCategory, FallibleHandler};
+use prosody::consumer::middleware::{CloneProvider, FallibleHandler};
 use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
+use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;

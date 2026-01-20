@@ -6,7 +6,7 @@
 
 use super::MessageLoader;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::{Key, Offset, Partition, Topic};
 use ahash::HashMap;
 use chrono::Utc;

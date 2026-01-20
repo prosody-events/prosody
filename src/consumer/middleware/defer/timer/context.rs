@@ -19,7 +19,7 @@ use crate::Key;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;

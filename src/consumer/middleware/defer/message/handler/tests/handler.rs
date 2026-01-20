@@ -7,7 +7,8 @@
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
+use crate::consumer::middleware::FallibleHandler;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::Trigger;
 use crate::{Key, Offset};
 use parking_lot::Mutex;

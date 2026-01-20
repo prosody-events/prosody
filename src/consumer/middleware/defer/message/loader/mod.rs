@@ -23,7 +23,7 @@
 //! logic.
 
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::ClassifyError;
+use crate::error::ClassifyError;
 use crate::{Offset, Partition, Topic};
 use std::error::Error as StdError;
 use std::future::Future;

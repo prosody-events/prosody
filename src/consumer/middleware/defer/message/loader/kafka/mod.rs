@@ -36,7 +36,7 @@
 use super::MessageLoader;
 use crate::consumer::decode::{DecodedMessage, decode_message};
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::propagator::new_propagator;
 use crate::{Offset, Partition, Topic};
@@ -45,7 +45,7 @@ use opentelemetry::propagation::TextMapCompositePropagator;
 use quick_cache::sync::Cache;
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::error::{KafkaError, KafkaResult, RDKafkaErrorCode};
+use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::BorrowedMessage;
 use rdkafka::util::Timeout;
 use rdkafka::{Message, TopicPartitionList};
@@ -953,87 +953,11 @@ impl ClassifyError for KafkaLoaderError {
                 ErrorCategory::Terminal
             }
 
-            // Classify Kafka operation errors as transient or permanent
-            Self::Kafka(kafka_error) => classify_kafka_error(kafka_error),
+            // Classify Kafka operation errors using shared implementation
+            Self::Kafka(kafka_error) => kafka_error.classify_error(),
 
             // Permanent errors - data issues that won't resolve
             Self::DecodeError(..) | Self::OffsetDeleted(..) => ErrorCategory::Permanent,
         }
-    }
-}
-
-/// Classifies a [`KafkaError`] as transient or permanent.
-///
-/// Transient errors (network failures, timeouts) may succeed on retry.
-/// Permanent errors will never succeed - accept data loss and continue.
-///
-/// Note: [`KafkaError`] is marked `#[non_exhaustive]`, so a wildcard is
-/// required. New error variants added by rdkafka will be treated as transient
-/// by default, since the loader is reloading messages that previously existed.
-fn classify_kafka_error(error: &KafkaError) -> ErrorCategory {
-    match error {
-        // Classify based on error code for errors that contain RDKafkaErrorCode
-        KafkaError::MessageProduction(code)
-        | KafkaError::MessageConsumption(code)
-        | KafkaError::MetadataFetch(code)
-        | KafkaError::Global(code)
-        | KafkaError::ConsumerCommit(code)
-        | KafkaError::OffsetFetch(code)
-        | KafkaError::AdminOp(code)
-        | KafkaError::StoreOffset(code)
-        | KafkaError::SetPartitionOffset(code) => classify_kafka_error_code(*code),
-
-        // Client creation and configuration errors are terminal - loader cannot operate
-        KafkaError::ClientCreation(_) | KafkaError::ClientConfig(..) => ErrorCategory::Terminal,
-
-        // All other errors treated as transient (unknown variants, string errors, RDKafkaError
-        // types) In the loader context, we're reloading messages that existed before,
-        // so unknown errors are more likely to be transient issues
-        _ => ErrorCategory::Transient,
-    }
-}
-
-/// Classifies an [`RDKafkaErrorCode`] as transient or permanent.
-///
-/// Note: [`RDKafkaErrorCode`] is marked `#[non_exhaustive]`, so a wildcard is
-/// required. New error codes added by rdkafka will be treated as transient by
-/// default, since the loader is reloading messages that previously existed.
-///
-/// # Classification Rubric
-///
-/// - **Permanent**: The message itself is corrupt, malformed, or invalid. No
-///   configuration change can salvage it. Data loss is unavoidable.
-/// - **Transient**: The error is due to authorization, configuration, network,
-///   or availability issues. These can potentially be resolved by changing
-///   broker/client configuration, fixing ACLs, or waiting for recovery.
-///
-/// We bias heavily toward transient to avoid data loss. Only message-level
-/// corruption errors that cannot be fixed by any configuration change are
-/// marked permanent.
-fn classify_kafka_error_code(code: RDKafkaErrorCode) -> ErrorCategory {
-    match code {
-        // Permanent: Message content is fundamentally broken
-        // These indicate the message data itself is corrupt or malformed.
-        // No configuration change can fix the message - data loss is unavoidable.
-        //
-        // - BadMessage (-199): librdkafka client detected received message is incorrect
-        // - InvalidMessage (2): Kafka CORRUPT_MESSAGE - CRC failure, invalid size, null key on
-        //   compacted topic, or other corruption
-        // - InvalidRecord (87): Broker failed to validate record content
-        RDKafkaErrorCode::BadMessage
-        | RDKafkaErrorCode::InvalidMessage
-        | RDKafkaErrorCode::InvalidRecord => ErrorCategory::Permanent,
-
-        // All other errors are transient - they can potentially be resolved by:
-        // - Fixing ACLs (authorization errors)
-        // - Adjusting broker/client config (size limits, timeouts, etc.)
-        // - Creating topics or waiting for metadata refresh
-        // - Upgrading brokers or refreshing tokens
-        // - Network recovery or rebalancing
-        //
-        // Note: InvalidMessageSize (4) is Kafka's INVALID_FETCH_SIZE - about fetch
-        // request parameters, not message content. MessageSizeTooLarge (10) can be
-        // fixed by increasing broker's max.message.bytes.
-        _ => ErrorCategory::Transient,
     }
 }

@@ -32,7 +32,8 @@
 //! use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 //! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
-//! use prosody::consumer::middleware::{FallibleHandler, ClassifyError};
+//! use prosody::consumer::middleware::FallibleHandler;
+//! use prosody::error::ClassifyError;
 //! use prosody::consumer::DemandType;
 //! use prosody::consumer::message::ConsumerMessage;
 //! use prosody::consumer::event_context::EventContext;
@@ -251,6 +252,7 @@ use std::sync::{Arc, LazyLock};
 pub mod admin;
 pub mod cassandra;
 pub mod consumer;
+pub mod error;
 pub mod heartbeat;
 pub mod high_level;
 pub mod producer;
