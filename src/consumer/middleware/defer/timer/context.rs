@@ -25,6 +25,7 @@ use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
+use std::cmp::Ordering;
 use std::future::Future;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
@@ -152,10 +153,6 @@ where
         self.inner.uncancel();
     }
 
-    fn invalidate(self) {
-        self.inner.invalidate();
-    }
-
     fn schedule(
         &self,
         time: CompactDateTime,
@@ -196,6 +193,44 @@ where
                     .await
                     .map_err(TimerDeferContextError::Context)
             }
+        }
+    }
+
+    fn clear_and_schedule(
+        &self,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let inner = self.inner.clone();
+        let store = self.store.clone();
+        let key = self.key().clone();
+
+        async move {
+            // Non-Application timers pass through
+            if timer_type != TimerType::Application {
+                return inner
+                    .clear_and_schedule(time, timer_type)
+                    .await
+                    .map_err(TimerDeferContextError::Context);
+            }
+
+            // Delete key from defer store
+            store
+                .delete_key(&key)
+                .await
+                .map_err(TimerDeferContextError::Store)?;
+
+            // Clear DeferredTimer
+            inner
+                .clear_scheduled(TimerType::DeferredTimer)
+                .await
+                .map_err(TimerDeferContextError::Context)?;
+
+            // Delegate clear_and_schedule to inner (new timer goes to active store)
+            inner
+                .clear_and_schedule(time, timer_type)
+                .await
+                .map_err(TimerDeferContextError::Context)
         }
     }
 
@@ -268,49 +303,15 @@ where
         }
     }
 
-    fn clear_and_schedule(
-        &self,
-        time: CompactDateTime,
-        timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let inner = self.inner.clone();
-        let store = self.store.clone();
-        let key = self.key().clone();
-
-        async move {
-            // Non-Application timers pass through
-            if timer_type != TimerType::Application {
-                return inner
-                    .clear_and_schedule(time, timer_type)
-                    .await
-                    .map_err(TimerDeferContextError::Context);
-            }
-
-            // Delete key from defer store
-            store
-                .delete_key(&key)
-                .await
-                .map_err(TimerDeferContextError::Store)?;
-
-            // Clear DeferredTimer
-            inner
-                .clear_scheduled(TimerType::DeferredTimer)
-                .await
-                .map_err(TimerDeferContextError::Context)?;
-
-            // Delegate clear_and_schedule to inner (new timer goes to active store)
-            inner
-                .clear_and_schedule(time, timer_type)
-                .await
-                .map_err(TimerDeferContextError::Context)
-        }
+    fn invalidate(self) {
+        self.inner.invalidate();
     }
 
     fn scheduled(
         &self,
         timer_type: TimerType,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        scheduled_impl(
+        merge_scheduled_streams(
             self.inner.clone(),
             self.store.clone(),
             self.key().clone(),
@@ -321,7 +322,7 @@ where
 
 /// Implementation of `scheduled()` that handles both Application and
 /// non-Application types.
-fn scheduled_impl<C, S>(
+fn merge_scheduled_streams<C, S>(
     inner: C,
     store: S,
     key: Key,
@@ -339,76 +340,68 @@ where
 
         // Non-Application timers: just pass through from inner context
         if timer_type != TimerType::Application {
-            while let Some(time) = cooperative(active_stream.try_next())
-                .await
-                .map_err(TimerDeferContextError::Context)?
-            {
+            while let Some(time) = advance_active(&mut active_stream).await? {
                 yield time;
             }
             return;
         }
 
-        // Application timers: merge active and deferred streams with deduplication
+        // Application timers: merge active and deferred streams
         let deferred_stream = store.deferred_times(&key);
         pin_mut!(deferred_stream);
 
-        // Get first item from each stream
-        let mut active_next = cooperative(active_stream.try_next())
-            .await
-            .map_err(TimerDeferContextError::Context)?;
-        let mut deferred_next = cooperative(deferred_stream.try_next())
-            .await
-            .map_err(TimerDeferContextError::Store)?;
+        let mut active_next = advance_active(&mut active_stream).await?;
+        let mut deferred_next = advance_deferred(&mut deferred_stream).await?;
 
-        let mut last_yielded: Option<CompactDateTime> = None;
-
-        // Merge sorted streams with deduplication
-        loop {
-            let next = match (active_next, deferred_next) {
-                (Some(a), Some(d)) => {
-                    if a <= d {
-                        active_next = cooperative(active_stream.try_next())
-                            .await
-                            .map_err(TimerDeferContextError::Context)?;
-                        if a == d {
-                            // Same time in both - advance both, yield once
-                            deferred_next = cooperative(deferred_stream.try_next())
-                                .await
-                                .map_err(TimerDeferContextError::Store)?;
-                        }
-                        Some(a)
-                    } else {
-                        deferred_next = cooperative(deferred_stream.try_next())
-                            .await
-                            .map_err(TimerDeferContextError::Store)?;
-                        Some(d)
-                    }
+        // Merge while both streams have items
+        while let (Some(a), Some(d)) = (active_next, deferred_next) {
+            match a.cmp(&d) {
+                Ordering::Less => {
+                    yield a;
+                    active_next = advance_active(&mut active_stream).await?;
                 }
-                (Some(a), None) => {
-                    active_next = cooperative(active_stream.try_next())
-                        .await
-                        .map_err(TimerDeferContextError::Context)?;
-                    Some(a)
+                Ordering::Greater => {
+                    yield d;
+                    deferred_next = advance_deferred(&mut deferred_stream).await?;
                 }
-                (None, Some(d)) => {
-                    deferred_next = cooperative(deferred_stream.try_next())
-                        .await
-                        .map_err(TimerDeferContextError::Store)?;
-                    Some(d)
+                Ordering::Equal => {
+                    yield a;
+                    active_next = advance_active(&mut active_stream).await?;
+                    deferred_next = advance_deferred(&mut deferred_stream).await?;
                 }
-                (None, None) => None,
-            };
-
-            match next {
-                Some(time) if last_yielded != Some(time) => {
-                    last_yielded = Some(time);
-                    yield time;
-                }
-                Some(_) => {} // Duplicate, skip
-                None => break,
             }
         }
+
+        // Drain remaining from active
+        while let Some(a) = active_next {
+            yield a;
+            active_next = advance_active(&mut active_stream).await?;
+        }
+
+        // Drain remaining from deferred
+        while let Some(d) = deferred_next {
+            yield d;
+            deferred_next = advance_deferred(&mut deferred_stream).await?;
+        }
     }
+}
+
+/// Advances a stream, wrapping errors in `TimerDeferContextError::Context`.
+async fn advance_active<CE, SE>(
+    stream: &mut (impl Stream<Item = Result<CompactDateTime, CE>> + Unpin),
+) -> Result<Option<CompactDateTime>, TimerDeferContextError<CE, SE>> {
+    cooperative(stream.try_next())
+        .await
+        .map_err(TimerDeferContextError::Context)
+}
+
+/// Advances a stream, wrapping errors in `TimerDeferContextError::Store`.
+async fn advance_deferred<CE, SE>(
+    stream: &mut (impl Stream<Item = Result<CompactDateTime, SE>> + Unpin),
+) -> Result<Option<CompactDateTime>, TimerDeferContextError<CE, SE>> {
+    cooperative(stream.try_next())
+        .await
+        .map_err(TimerDeferContextError::Store)
 }
 
 /// Errors from timer defer context operations.
