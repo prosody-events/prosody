@@ -1,16 +1,15 @@
 //! Unit tests for the `PartitionManager` in the consumer partition module.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, reason = "Test module uses expect for test setup")]
 
 use super::*;
 use crate::Key;
-use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::timers::UncommittedTimer;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
 use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
-use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use serde_json::json;
 use std::future::Future;
@@ -313,13 +312,12 @@ async fn test_partition_manager_event_type_filtering() {
 
     // 1) a disallowed event ("type": "disallowed")
     let disallowed = ConsumerMessage::new(
-        None,
-        "test-topic".into(),
-        0,
-        Offset::from(0u8),
-        "key".into(),
-        Utc::now(),
-        json!({ "type": "disallowed" }),
+        ConsumerMessageValue {
+            offset: Offset::from(0u8),
+            key: "key".into(),
+            payload: json!({ "type": "disallowed" }),
+            ..Default::default()
+        },
         Span::current(),
         test_semaphore
             .clone()
@@ -330,13 +328,12 @@ async fn test_partition_manager_event_type_filtering() {
 
     // 2) an allowed event ("type": "allowed")
     let allowed = ConsumerMessage::new(
-        None,
-        "test-topic".into(),
-        0,
-        Offset::from(1u8),
-        "key".into(),
-        Utc::now(),
-        json!({ "type": "allowed" }),
+        ConsumerMessageValue {
+            offset: Offset::from(1u8),
+            key: "key".into(),
+            payload: json!({ "type": "allowed" }),
+            ..Default::default()
+        },
         Span::current(),
         test_semaphore
             .clone()
@@ -529,13 +526,11 @@ impl EventHandler for TestHandler {
 fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
     let semaphore = Arc::new(Semaphore::new(10));
     ConsumerMessage::new(
-        None,
-        "test-topic".into(),
-        0,
-        offset,
-        key.into(),
-        Utc::now(),
-        serde_json::json!({}),
+        ConsumerMessageValue {
+            offset,
+            key: key.into(),
+            ..Default::default()
+        },
         Span::current(),
         semaphore
             .try_acquire_owned()
@@ -548,20 +543,18 @@ fn create_test_message_with_event_id(
     key: &str,
     event_id: Option<&str>,
 ) -> ConsumerMessage {
-    let payload = if let Some(id) = event_id {
-        serde_json::json!({ "id": id })
-    } else {
-        serde_json::json!({})
-    };
+    let payload = event_id.map_or_else(
+        || serde_json::json!({}),
+        |id| serde_json::json!({ "id": id }),
+    );
     let semaphore = Arc::new(Semaphore::new(10));
     ConsumerMessage::new(
-        None,
-        "test-topic".into(),
-        0,
-        offset,
-        key.into(),
-        Utc::now(),
-        payload,
+        ConsumerMessageValue {
+            offset,
+            key: key.into(),
+            payload,
+            ..Default::default()
+        },
         Span::current(),
         semaphore
             .try_acquire_owned()

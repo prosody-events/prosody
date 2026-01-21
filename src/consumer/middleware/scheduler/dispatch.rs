@@ -276,16 +276,12 @@ impl Selector {
                 .iter()
                 .enumerate()
                 .fold((None, None), |(n_best, f_best), (index, task)| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let key_vt_micros = task
-                        .key_time
-                        .map_or(0.0_f64, |vt| vt.at(now).as_micros() as f64);
+                    let key_vt_secs = task.key_time.map_or(0.0_f64, |vt| vt.at(now).as_secs_f64());
 
                     let wait_time = (now - task.timestamp).as_secs_f64();
                     let wait_ratio = (wait_time / self.max_wait).min(1.0);
-                    let wait_urgency_micros =
-                        self.wait_weight * wait_ratio.powi(2) * 1_000_000.0_f64;
-                    let priority = key_vt_micros - wait_urgency_micros;
+                    let wait_urgency_secs = self.wait_weight * wait_ratio.powi(2);
+                    let priority = key_vt_secs - wait_urgency_secs;
 
                     match task.demand_type {
                         DemandType::Normal => (
@@ -1287,7 +1283,6 @@ mod tests {
 
         // Initialize with varying VT
         for (i, key) in keys.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
             let vt = Duration::from_millis((i as u64) * 100_u64);
             selector.key_times.insert(test_tp_key(key), vt.into());
         }
@@ -1427,7 +1422,6 @@ mod tests {
         // Create 10 existing keys with varying VT (simulating ongoing work)
         let existing_keys: Vec<String> = (0_i32..10_i32).map(|i| format!("old{i}")).collect();
         for (i, key) in existing_keys.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
             let vt = Duration::from_millis((i as u64) * 50_u64);
             selector.key_times.insert(test_tp_key(key), vt.into());
             selector.enqueue_task(create_task(key, DemandType::Normal, 0));

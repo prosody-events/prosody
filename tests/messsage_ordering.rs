@@ -3,25 +3,14 @@
 //! received in the order they were produced per key, utilizing integration
 //! tests with Kafka, via the Prosody library.
 
-use quickcheck::{QuickCheck, TestResult};
 use std::collections::BTreeSet;
 use std::env;
-use std::sync::LazyLock;
-use tokio::runtime::{Builder, Runtime};
+
+use prosody::tracing::init_test_logging;
+use quickcheck::{QuickCheck, TestResult};
 
 mod common;
-use common::{TestInput, run_test};
-use prosody::tracing::init_test_logging;
-
-/// Shared runtime for integration tests.
-#[allow(clippy::expect_used)]
-static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build()
-        .expect("Failed to create tokio runtime")
-});
+use common::{TEST_RUNTIME, TestInput, run_test};
 
 /// Tests that messages are received in the order they were produced for each
 /// key. This function leverages property-based testing using `QuickCheck`,
@@ -47,7 +36,7 @@ fn receives_all_in_key_order() {
 
 /// Property function for `QuickCheck` to verify message ordering.
 ///
-/// Uses a shared Tokio runtime to asynchronously run the `run_test` function
+/// Uses the shared Tokio runtime to asynchronously run the `run_test` function
 /// with generated test input to ensure the correct ordering of messages.
 ///
 /// # Arguments
@@ -66,7 +55,7 @@ fn prop(input: TestInput) -> TestResult {
         return TestResult::discard();
     }
 
-    // Run the test within the shared Tokio runtime and return the outcome.
+    // Run the test within the shared runtime and return the outcome.
     match TEST_RUNTIME.block_on(run_test(input)) {
         Ok(()) => TestResult::passed(),
         Err(e) => TestResult::error(e.to_string()),

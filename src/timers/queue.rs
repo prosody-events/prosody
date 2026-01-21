@@ -159,29 +159,25 @@ impl TriggerQueue {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::Key;
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
-    use crate::timers::scheduler::TimerSchedulerError;
     use crate::timers::{TimerType, Trigger};
+    use color_eyre::eyre::{Result, bail};
     use tokio::task::coop::cooperative;
     use tokio::time::{Duration, advance, pause};
     use tracing::Span;
 
     #[tokio::test]
-    async fn test_insert_and_next() -> Result<(), TimerSchedulerError> {
+    async fn test_insert_and_next() -> Result<()> {
         pause();
 
         let mut triggers = TriggerQueue::new();
 
         let key = Key::from("test-key");
-        let time = CompactDateTime::now()
-            .map_err(TimerSchedulerError::DateTime)?
-            .add_duration(CompactDuration::new(1))
-            .map_err(TimerSchedulerError::DateTime)?; // 1 second in the future
+        let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?; // 1 second in the future
         let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger
@@ -191,25 +187,22 @@ mod tests {
         advance(Duration::from_secs(1)).await;
 
         // Retrieve the next expired trigger
-        let expired_trigger = cooperative(triggers.next())
-            .await
-            .expect("No expired trigger found");
+        let Some(expired_trigger) = cooperative(triggers.next()).await else {
+            bail!("No expired trigger found");
+        };
         assert_eq!(expired_trigger, trigger);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_remove_trigger() -> Result<(), TimerSchedulerError> {
+    async fn test_remove_trigger() -> Result<()> {
         pause();
 
         let mut triggers = TriggerQueue::new();
 
         let key = Key::from("test-key");
-        let time = CompactDateTime::now()
-            .map_err(TimerSchedulerError::DateTime)?
-            .add_duration(CompactDuration::new(5))
-            .map_err(TimerSchedulerError::DateTime)?; // 5 seconds in the future
+        let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?; // 5 seconds in the future
         let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger
@@ -236,16 +229,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_triggers() -> Result<(), TimerSchedulerError> {
+    async fn test_multiple_triggers() -> Result<()> {
         pause();
 
         let mut triggers = TriggerQueue::new();
 
         let key_first = Key::from("key1");
-        let time_first = CompactDateTime::now()
-            .map_err(TimerSchedulerError::DateTime)?
-            .add_duration(CompactDuration::new(1))
-            .map_err(TimerSchedulerError::DateTime)?; // 1 second in the future
+        let time_first = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?; // 1 second in the future
         let trigger_first = Trigger::new(
             key_first.clone(),
             time_first,
@@ -254,10 +244,7 @@ mod tests {
         );
 
         let key_second = Key::from("key2");
-        let time_second = CompactDateTime::now()
-            .map_err(TimerSchedulerError::DateTime)?
-            .add_duration(CompactDuration::new(2))
-            .map_err(TimerSchedulerError::DateTime)?; // 2 seconds in the future
+        let time_second = CompactDateTime::now()?.add_duration(CompactDuration::new(2))?; // 2 seconds in the future
         let trigger_second = Trigger::new(
             key_second.clone(),
             time_second,
@@ -273,30 +260,33 @@ mod tests {
         advance(Duration::from_secs(1)).await;
 
         // Retrieve the next expired trigger
-        let expired_trigger = triggers.next().await.expect("No expired trigger found");
+        let expired_trigger = triggers
+            .next()
+            .await
+            .ok_or_else(|| color_eyre::eyre::eyre!("No expired trigger found"))?;
         assert_eq!(expired_trigger, trigger_first);
 
         // Advance time by another 1 second to simulate the second trigger expiring
         advance(Duration::from_secs(1)).await;
 
         // Retrieve the next expired trigger
-        let expired_trigger = triggers.next().await.expect("No expired trigger found");
+        let expired_trigger = triggers
+            .next()
+            .await
+            .ok_or_else(|| color_eyre::eyre::eyre!("No expired trigger found"))?;
         assert_eq!(expired_trigger, trigger_second);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_active_triggers() -> Result<(), TimerSchedulerError> {
+    async fn test_active_triggers() -> Result<()> {
         pause();
 
         let mut triggers = TriggerQueue::new();
 
         let key = Key::from("active-key");
-        let time = CompactDateTime::now()
-            .map_err(TimerSchedulerError::DateTime)?
-            .add_duration(CompactDuration::new(5))
-            .map_err(TimerSchedulerError::DateTime)?; // 5 seconds in the future
+        let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?; // 5 seconds in the future
         let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
         // Insert the trigger

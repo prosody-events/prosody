@@ -6,30 +6,21 @@
 //! and complete message processing.
 
 use std::cmp::max;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::consumer::Keyed;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::heartbeat::Heartbeat;
+use crate::test_util::TEST_RUNTIME;
 use ahash::HashMapExt;
 use futures::stream::iter;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use scc::{HashMap, HashSet};
-use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 use tokio::time::sleep;
-
-/// Shared runtime for property tests.
-#[allow(clippy::expect_used)]
-static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    Builder::new_multi_thread()
-        .enable_time()
-        .build()
-        .expect("Failed to create tokio runtime")
-});
 
 /// A sequence of messages with keys and values for testing.
 #[derive(Clone, Debug)]

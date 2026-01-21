@@ -4,38 +4,34 @@
 //! functioning of the `OffsetTracker`, focusing on watermark tracking and
 //! committing.
 
-use crate::Offset;
-use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation, UncommittedOffset};
+use std::collections::BTreeMap;
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
+
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use crossbeam_utils::CachePadded;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
-use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tokio::task;
 use tokio::time::{Instant, advance};
 
-/// Shared runtime for property tests that use real time.
-#[allow(clippy::expect_used)]
-static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    Builder::new_multi_thread()
-        .enable_time()
-        .build()
-        .expect("Failed to create tokio runtime")
-});
+use crate::Offset;
+use crate::consumer::partition::offsets::{Action, OffsetTracker, Operation, UncommittedOffset};
+use crate::test_util::TEST_RUNTIME;
 
-/// Shared runtime for property tests that use paused/mock time.
-#[allow(clippy::expect_used)]
-static PAUSED_TIME_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+/// Creates a current-thread runtime with paused time for stall detection tests.
+///
+/// This cannot use the shared `TEST_RUNTIME` because paused time is a
+/// per-runtime configuration that affects all tasks on that runtime.
+fn create_paused_time_runtime() -> Result<Runtime, io::Error> {
     Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
         .build()
-        .expect("Failed to create paused tokio runtime")
-});
+}
 
 /// A wrapper for a vector of Actions used in `QuickCheck` tests.
 #[derive(Clone, Debug)]
@@ -159,7 +155,11 @@ struct StallTestCase {
 
 #[quickcheck]
 fn detects_stalls(test_case: StallTestCase) -> TestResult {
-    PAUSED_TIME_RUNTIME.block_on(async {
+    let runtime = match create_paused_time_runtime() {
+        Ok(rt) => rt,
+        Err(e) => return TestResult::error(format!("Failed to create runtime: {e}")),
+    };
+    runtime.block_on(async {
         let StallTestCase {
             actions,
             stall_threshold,

@@ -20,15 +20,19 @@
 //! - **Cross-backend compatibility**: Working with any `TriggerStore`
 //!   implementation
 
+use std::collections::{HashMap, HashSet as StdHashSet};
+use std::fmt::Debug;
+use std::hash::BuildHasher;
+
+use ahash::HashSet;
+use futures::StreamExt;
+
 use super::TestStoreResult;
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
-use ahash::{HashMap, HashSet};
-use futures::StreamExt;
-use std::fmt::Debug;
 
 /// Helper function to insert a segment.
 ///
@@ -230,15 +234,16 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-#[allow(clippy::implicit_hasher)]
-pub async fn verify_store_state<S>(
+pub async fn verify_store_state<S, H1, H2>(
     store: &S,
     segment: &Segment,
-    expected_state: &HashMap<Key, HashSet<CompactDateTime>>,
+    expected_state: &HashMap<Key, StdHashSet<CompactDateTime, H2>, H1>,
 ) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
+    H1: BuildHasher,
+    H2: BuildHasher,
 {
     // Check all keys in our expected state
     for (key, expected_times) in expected_state {
@@ -249,8 +254,10 @@ where
         // Get actual times for this key from the store
         let actual_times = get_key_triggers(store, &segment.id, key).await?;
 
-        // Verify each key's times match what we expect
-        if &actual_times != expected_times {
+        // Verify each key's times match what we expect (compare across hasher types)
+        let times_match = actual_times.len() == expected_times.len()
+            && actual_times.iter().all(|t| expected_times.contains(t));
+        if !times_match {
             return Err(format!(
                 "Key times mismatch for key {key:?}. Expected: {expected_times:?}, Got: \
                  {actual_times:?}"

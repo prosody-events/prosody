@@ -1,8 +1,6 @@
-use std::sync::LazyLock;
-use tokio::runtime::{Builder, Runtime};
-
 // Re-export from the shared test support module.
 pub use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
+pub use crate::test_util::TEST_RUNTIME;
 
 mod context;
 mod generator;
@@ -20,20 +18,3 @@ pub const TEST_BASE_BACKOFF_SECS: u32 = 1;
 
 /// Maximum backoff delay in seconds for test handler config.
 pub const TEST_MAX_BACKOFF_SECS: u32 = 3600;
-
-/// Shared multi-threaded runtime for all defer property tests.
-///
-/// # Rationale for `expect`
-///
-/// `LazyLock` requires a non-fallible closure. Runtime creation failure is
-/// unrecoverable in test infrastructure - tests cannot run without a runtime.
-#[allow(
-    clippy::expect_used,
-    reason = "LazyLock requires non-fallible closure; test infra"
-)]
-pub(crate) static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    Builder::new_multi_thread()
-        .enable_time()
-        .build()
-        .expect("Failed to create tokio runtime")
-});

@@ -13,6 +13,7 @@ use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::test_util::TEST_RUNTIME;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
@@ -23,31 +24,13 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
 use std::future::{Future, pending, ready};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::{Builder, Runtime};
 
 mod context;
 mod integration;
 mod properties;
 pub mod types;
-
-/// Shared multi-threaded runtime for all timer defer property tests.
-///
-/// # Rationale for `expect`
-///
-/// `LazyLock` requires a non-fallible closure. Runtime creation failure is
-/// unrecoverable in test infrastructure - tests cannot run without a runtime.
-#[allow(
-    clippy::expect_used,
-    reason = "LazyLock requires non-fallible closure; test infra"
-)]
-pub(crate) static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    Builder::new_multi_thread()
-        .enable_time()
-        .build()
-        .expect("Failed to create tokio runtime")
-});
 
 // ============================================================================
 // MockContext - Minimal context for tests

@@ -622,7 +622,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::reversed_empty_ranges)]
     async fn test_load_slabs_empty_range() -> Result<()> {
         let store = memory_store();
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
@@ -630,8 +629,8 @@ mod tests {
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
-        // Load empty range
-        let loaded = load_slabs(&slab_lock, &segment, 1..=0).await?;
+        // Load empty range (start > end makes it empty)
+        let loaded = load_slabs(&slab_lock, &segment, RangeInclusive::new(1, 0)).await?;
         assert!(loaded.is_empty());
         Ok(())
     }

@@ -287,7 +287,11 @@ impl<T> MonopolizationHandler<T>
 where
     T: FallibleHandler,
 {
-    #[allow(clippy::cast_precision_loss)]
+    /// Checks if a key is monopolizing execution time.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "nanosecond values for practical windows (< 104 days) stay below 2^53"
+    )]
     fn check_monopolization(
         &self,
         tp_key: &TopicPartitionKey,

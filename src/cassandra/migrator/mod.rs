@@ -49,7 +49,10 @@
 //! (`YYYYMMDD_description.cql`). They support template substitution for table
 //! names and keyspace references.
 
-#![allow(clippy::same_name_method)]
+#![allow(
+    clippy::same_name_method,
+    reason = "RustEmbed derive macro generates get/iter methods that shadow trait methods"
+)]
 
 mod executor;
 mod loader;

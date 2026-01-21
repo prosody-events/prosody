@@ -45,26 +45,16 @@ use prosody::{
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::{Value, json};
 use std::env;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
 use tracing::info;
 use uuid::Uuid;
 
-/// Shared runtime for integration tests.
-#[allow(clippy::expect_used)]
-static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build()
-        .expect("Failed to create tokio runtime")
-});
-
 mod common;
+use common::TEST_RUNTIME;
 
 /// Get the number of times to run each integration test from environment
 /// variable.
