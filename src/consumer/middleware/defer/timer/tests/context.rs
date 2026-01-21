@@ -259,10 +259,7 @@ fn schedule_when_not_deferred_adds_to_active() -> color_eyre::Result<()> {
         assert!(active.contains(&time), "Timer should be in active store");
 
         // Should NOT be in defer store
-        let deferred = harness
-            .store
-            .get_next_deferred_timer(harness.key())
-            .await?;
+        let deferred = harness.store.get_next_deferred_timer(harness.key()).await?;
         assert!(deferred.is_none(), "Timer should not be in defer store");
 
         Ok(())
@@ -672,9 +669,7 @@ fn non_application_timers_pass_through() -> color_eyre::Result<()> {
 
         // Schedule a DeferredMessage timer (internal type)
         let time = CompactDateTime::from(2000_u32);
-        context
-            .schedule(time, TimerType::DeferredMessage)
-            .await?;
+        context.schedule(time, TimerType::DeferredMessage).await?;
 
         // Should go directly to inner context, not defer store
         let has_deferred_msg = harness
