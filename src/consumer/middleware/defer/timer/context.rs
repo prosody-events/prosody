@@ -64,36 +64,6 @@ where
     pub fn new(inner: C, store: S, key: Key) -> Self {
         Self { inner, store, key }
     }
-
-    /// Schedules a retry timer at the specified time.
-    ///
-    /// Clears any existing `DeferredTimer` and schedules a new one.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the context operation fails.
-    pub async fn schedule_retry_timer(
-        &self,
-        fire_time: CompactDateTime,
-    ) -> Result<(), TimerDeferContextError<C::Error, S::Error>> {
-        self.inner
-            .clear_and_schedule(fire_time, TimerType::DeferredTimer)
-            .await
-            .map_err(TimerDeferContextError::Context)
-    }
-
-    /// Returns whether the key is currently deferred.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store operation fails.
-    pub async fn is_deferred(&self) -> Result<bool, TimerDeferContextError<C::Error, S::Error>> {
-        self.store
-            .is_deferred(&self.key)
-            .await
-            .map(|opt| opt.is_some())
-            .map_err(TimerDeferContextError::Store)
-    }
 }
 
 /// Checks if a key is deferred (has pending timers in the defer store).
