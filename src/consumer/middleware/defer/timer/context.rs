@@ -96,6 +96,21 @@ where
     }
 }
 
+/// Checks if a key is deferred (has pending timers in the defer store).
+async fn is_deferred<C, S>(
+    store: &S,
+    key: &Key,
+) -> Result<bool, TimerDeferContextError<C, S::Error>>
+where
+    S: TimerDeferStore,
+{
+    store
+        .is_deferred(key)
+        .await
+        .map(|opt| opt.is_some())
+        .map_err(TimerDeferContextError::Store)
+}
+
 impl<C, S> Keyed for TimerDeferContext<C, S>
 where
     C: EventContext,
@@ -171,14 +186,7 @@ where
                     .map_err(TimerDeferContextError::Context);
             }
 
-            // Check if key is deferred
-            let is_deferred = store
-                .is_deferred(&key)
-                .await
-                .map_err(TimerDeferContextError::Store)?
-                .is_some();
-
-            if is_deferred {
+            if is_deferred(&store, &key).await? {
                 // Append to defer store
                 let trigger =
                     Trigger::new(key, time, TimerType::Application, tracing::Span::current());
@@ -214,23 +222,23 @@ where
                     .map_err(TimerDeferContextError::Context);
             }
 
-            // Delete key from defer store
-            store
-                .delete_key(&key)
-                .await
-                .map_err(TimerDeferContextError::Store)?;
-
-            // Clear DeferredTimer
-            inner
-                .clear_scheduled(TimerType::DeferredTimer)
-                .await
-                .map_err(TimerDeferContextError::Context)?;
-
-            // Delegate clear_and_schedule to inner (new timer goes to active store)
-            inner
-                .clear_and_schedule(time, timer_type)
-                .await
-                .map_err(TimerDeferContextError::Context)
+            if is_deferred(&store, &key).await? {
+                // Clear defer store, DeferredTimer, and schedule new timer concurrently
+                let (store_result, deferred_result, schedule_result) = tokio::join!(
+                    store.delete_key(&key),
+                    inner.clear_scheduled(TimerType::DeferredTimer),
+                    inner.clear_and_schedule(time, TimerType::Application),
+                );
+                store_result.map_err(TimerDeferContextError::Store)?;
+                deferred_result.map_err(TimerDeferContextError::Context)?;
+                schedule_result.map_err(TimerDeferContextError::Context)
+            } else {
+                // Not deferred - only need to clear and schedule in inner context
+                inner
+                    .clear_and_schedule(time, TimerType::Application)
+                    .await
+                    .map_err(TimerDeferContextError::Context)
+            }
         }
     }
 
@@ -252,17 +260,22 @@ where
                     .map_err(TimerDeferContextError::Context);
             }
 
-            // Remove from defer store (idempotent)
-            store
-                .remove_deferred_timer(&key, time)
-                .await
-                .map_err(TimerDeferContextError::Store)?;
-
-            // Remove from inner context (idempotent)
-            inner
-                .unschedule(time, timer_type)
-                .await
-                .map_err(TimerDeferContextError::Context)
+            if is_deferred(&store, &key).await? {
+                // Timer could be in either store - remove from both concurrently
+                let (store_result, context_result) = tokio::join!(
+                    store.remove_deferred_timer(&key, time),
+                    inner.unschedule(time, TimerType::Application),
+                );
+                store_result.map_err(TimerDeferContextError::Store)?;
+                context_result.map_err(TimerDeferContextError::Context)?;
+                Ok(())
+            } else {
+                // Not deferred - timer can only be in inner context
+                inner
+                    .unschedule(time, TimerType::Application)
+                    .await
+                    .map_err(TimerDeferContextError::Context)
+            }
         }
     }
 
@@ -283,23 +296,24 @@ where
                     .map_err(TimerDeferContextError::Context);
             }
 
-            // Delete key from defer store (clears all deferred timers + retry count)
-            store
-                .delete_key(&key)
-                .await
-                .map_err(TimerDeferContextError::Store)?;
-
-            // Clear DeferredTimer (internal retry timer)
-            inner
-                .clear_scheduled(TimerType::DeferredTimer)
-                .await
-                .map_err(TimerDeferContextError::Context)?;
-
-            // Clear from inner context
-            inner
-                .clear_scheduled(timer_type)
-                .await
-                .map_err(TimerDeferContextError::Context)
+            if is_deferred(&store, &key).await? {
+                // Clear all three sources concurrently
+                let (store_result, deferred_result, application_result) = tokio::join!(
+                    store.delete_key(&key),
+                    inner.clear_scheduled(TimerType::DeferredTimer),
+                    inner.clear_scheduled(TimerType::Application),
+                );
+                store_result.map_err(TimerDeferContextError::Store)?;
+                deferred_result.map_err(TimerDeferContextError::Context)?;
+                application_result.map_err(TimerDeferContextError::Context)?;
+                Ok(())
+            } else {
+                // Not deferred - only clear Application timers from inner context
+                inner
+                    .clear_scheduled(TimerType::Application)
+                    .await
+                    .map_err(TimerDeferContextError::Context)
+            }
         }
     }
 
