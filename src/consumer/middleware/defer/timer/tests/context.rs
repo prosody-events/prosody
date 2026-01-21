@@ -240,7 +240,7 @@ impl ContextTestHarness {
 
 /// `schedule()` when NOT deferred delegates to inner context.
 #[test]
-fn schedule_when_not_deferred_adds_to_active() {
+fn schedule_when_not_deferred_adds_to_active() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -248,11 +248,11 @@ fn schedule_when_not_deferred_adds_to_active() {
         let context = harness.create_wrapped_context();
 
         // Key is not deferred
-        assert!(!harness.is_deferred().await.ok()?);
+        assert!(!harness.is_deferred().await?);
 
         // Schedule via wrapped context
         let time = CompactDateTime::from(1000_u32);
-        context.schedule(time, TimerType::Application).await.ok()?;
+        context.schedule(time, TimerType::Application).await?;
 
         // Should have been added to inner context's active timers
         let active = harness.inner_context.active_application_timers();
@@ -262,34 +262,33 @@ fn schedule_when_not_deferred_adds_to_active() {
         let deferred = harness
             .store
             .get_next_deferred_timer(harness.key())
-            .await
-            .ok()?;
+            .await?;
         assert!(deferred.is_none(), "Timer should not be in defer store");
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 /// `schedule()` when deferred appends to defer store.
 #[test]
-fn schedule_when_deferred_appends_to_store() {
+fn schedule_when_deferred_appends_to_store() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
         let harness = ContextTestHarness::new("test-key");
 
         // First, defer a timer to make the key deferred
-        harness.defer_timer(1000).await.ok()?;
-        assert!(harness.is_deferred().await.ok()?);
+        harness.defer_timer(1000).await?;
+        assert!(harness.is_deferred().await?);
 
         let context = harness.create_wrapped_context();
 
         // Schedule a NEW timer via wrapped context
         let time = CompactDateTime::from(2000_u32);
-        context.schedule(time, TimerType::Application).await.ok()?;
+        context.schedule(time, TimerType::Application).await?;
 
         // Timer should be appended to defer store (not inner context)
-        let deferred = harness.deferred_times().await.ok()?;
+        let deferred = harness.deferred_times().await?;
         assert!(
             deferred.contains(&time),
             "Timer should be in defer store; got: {deferred:?}"
@@ -307,20 +306,19 @@ fn schedule_when_deferred_appends_to_store() {
         let scheduled: Vec<CompactDateTime> = context
             .scheduled(TimerType::Application)
             .try_collect()
-            .await
-            .ok()?;
+            .await?;
         assert!(
             scheduled.contains(&time),
             "Timer scheduled while deferred must appear in scheduled(); got: {scheduled:?}"
         );
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 /// `unschedule()` removes from both stores when deferred.
 #[test]
-fn unschedule_removes_from_both_stores() {
+fn unschedule_removes_from_both_stores() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -330,20 +328,18 @@ fn unschedule_removes_from_both_stores() {
         harness
             .inner_context
             .schedule(CompactDateTime::from(1000_u32), TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // Defer timers at 500 and 1500 to make key deferred
-        harness.defer_timer(500).await.ok()?;
-        harness.defer_additional_timer(1500).await.ok()?;
+        harness.defer_timer(500).await?;
+        harness.defer_additional_timer(1500).await?;
 
         let context = harness.create_wrapped_context();
 
         // Unschedule the timer at 1000 (in active store)
         context
             .unschedule(CompactDateTime::from(1000_u32), TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // Should be removed from active store
         let active = harness.inner_context.active_application_timers();
@@ -355,11 +351,10 @@ fn unschedule_removes_from_both_stores() {
         // Unschedule the timer at 500 (in defer store)
         context
             .unschedule(CompactDateTime::from(500_u32), TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // Should be removed from defer store (only 1500 remains)
-        let deferred = harness.deferred_times().await.ok()?;
+        let deferred = harness.deferred_times().await?;
         assert!(
             !deferred.contains(&CompactDateTime::from(500_u32)),
             "Timer at 500 should be removed from defer store"
@@ -373,8 +368,7 @@ fn unschedule_removes_from_both_stores() {
         let scheduled: Vec<CompactDateTime> = context
             .scheduled(TimerType::Application)
             .try_collect()
-            .await
-            .ok()?;
+            .await?;
         assert!(
             !scheduled.contains(&CompactDateTime::from(500_u32)),
             "Unscheduled timer must not appear in scheduled()"
@@ -388,13 +382,13 @@ fn unschedule_removes_from_both_stores() {
             "Remaining timer must appear in scheduled()"
         );
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 /// `clear_scheduled()` clears both stores and cancels `DeferredTimer`.
 #[test]
-fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() {
+fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -404,23 +398,21 @@ fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() {
         harness
             .inner_context
             .schedule(CompactDateTime::from(1000_u32), TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // Defer a timer
-        harness.defer_timer(500).await.ok()?;
+        harness.defer_timer(500).await?;
 
         // Schedule a DeferredTimer (simulates the retry timer)
         harness
             .inner_context
             .schedule(CompactDateTime::from(600_u32), TimerType::DeferredTimer)
-            .await
-            .ok()?;
+            .await?;
 
         let context = harness.create_wrapped_context();
 
         // Clear all Application timers
-        context.clear_scheduled(TimerType::Application).await.ok()?;
+        context.clear_scheduled(TimerType::Application).await?;
 
         // Active store should have no Application timers
         let active = harness.inner_context.active_application_timers();
@@ -430,7 +422,7 @@ fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() {
         );
 
         // Defer store should be cleared (key deleted)
-        let deferred = harness.deferred_times().await.ok()?;
+        let deferred = harness.deferred_times().await?;
         assert!(
             deferred.is_empty(),
             "Defer store should be cleared; got: {deferred:?}"
@@ -438,7 +430,7 @@ fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() {
 
         // Key should no longer be deferred
         assert!(
-            !harness.is_deferred().await.ok()?,
+            !harness.is_deferred().await?,
             "Key should not be deferred after clear_scheduled"
         );
 
@@ -449,13 +441,13 @@ fn clear_scheduled_clears_both_stores_and_cancels_deferred_timer() {
             "DeferredTimer should be cancelled; got: {deferred_timers:?}"
         );
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 /// `scheduled()` merges both stores sorted and deduplicated.
 #[test]
-fn scheduled_merges_both_stores_sorted_deduplicated() {
+fn scheduled_merges_both_stores_sorted_deduplicated() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -465,17 +457,15 @@ fn scheduled_merges_both_stores_sorted_deduplicated() {
         harness
             .inner_context
             .schedule(CompactDateTime::from(1000_u32), TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
         harness
             .inner_context
             .schedule(CompactDateTime::from(3000_u32), TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // Defer timers at 500, 2000
-        harness.defer_timer(500).await.ok()?;
-        harness.defer_additional_timer(2000).await.ok()?;
+        harness.defer_timer(500).await?;
+        harness.defer_additional_timer(2000).await?;
 
         let context = harness.create_wrapped_context();
 
@@ -483,8 +473,7 @@ fn scheduled_merges_both_stores_sorted_deduplicated() {
         let times: Vec<CompactDateTime> = context
             .scheduled(TimerType::Application)
             .try_collect()
-            .await
-            .ok()?;
+            .await?;
 
         // Should be sorted: 500, 1000, 2000, 3000
         assert_eq!(
@@ -498,13 +487,13 @@ fn scheduled_merges_both_stores_sorted_deduplicated() {
             "Times should be merged and sorted"
         );
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 /// `scheduled()` deduplicates when same time exists in both stores.
 #[test]
-fn scheduled_deduplicates_when_same_time_in_both_stores() {
+fn scheduled_deduplicates_when_same_time_in_both_stores() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
@@ -514,11 +503,10 @@ fn scheduled_deduplicates_when_same_time_in_both_stores() {
         harness
             .inner_context
             .schedule(CompactDateTime::from(1000_u32), TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // Defer timer at the SAME time 1000
-        harness.defer_timer(1000).await.ok()?;
+        harness.defer_timer(1000).await?;
 
         let context = harness.create_wrapped_context();
 
@@ -526,28 +514,27 @@ fn scheduled_deduplicates_when_same_time_in_both_stores() {
         let times: Vec<CompactDateTime> = context
             .scheduled(TimerType::Application)
             .try_collect()
-            .await
-            .ok()?;
+            .await?;
 
         // Should have only ONE entry at 1000
         assert_eq!(times.len(), 1, "Duplicate time should appear only once");
         assert_eq!(times[0], CompactDateTime::from(1000_u32));
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 /// `clear_and_schedule()` makes key not deferred after completion.
 #[test]
-fn clear_and_schedule_makes_key_not_deferred() {
+fn clear_and_schedule_makes_key_not_deferred() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
         let harness = ContextTestHarness::new("test-key");
 
         // Defer a timer
-        harness.defer_timer(1000).await.ok()?;
-        assert!(harness.is_deferred().await.ok()?, "Key should be deferred");
+        harness.defer_timer(1000).await?;
+        assert!(harness.is_deferred().await?, "Key should be deferred");
 
         let context = harness.create_wrapped_context();
 
@@ -555,12 +542,11 @@ fn clear_and_schedule_makes_key_not_deferred() {
         let new_time = CompactDateTime::from(2000_u32);
         context
             .clear_and_schedule(new_time, TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // Key should no longer be deferred
         assert!(
-            !harness.is_deferred().await.ok()?,
+            !harness.is_deferred().await?,
             "Key should not be deferred after clear_and_schedule"
         );
 
@@ -578,8 +564,8 @@ fn clear_and_schedule_makes_key_not_deferred() {
             "DeferredTimer should be cleared"
         );
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 /// Client invariant: schedule/unschedule while deferred behaves identically to
@@ -591,15 +577,15 @@ fn clear_and_schedule_makes_key_not_deferred() {
 /// 1. Schedule a timer and see it in `scheduled()`
 /// 2. Unschedule that timer and no longer see it in `scheduled()`
 #[test]
-fn client_operations_work_identically_when_deferred() {
+fn client_operations_work_identically_when_deferred() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
         let harness = ContextTestHarness::new("test-key");
 
         // Make key deferred by deferring an initial timer
-        harness.defer_timer(1000).await.ok()?;
-        assert!(harness.is_deferred().await.ok()?);
+        harness.defer_timer(1000).await?;
+        assert!(harness.is_deferred().await?);
 
         let context = harness.create_wrapped_context();
 
@@ -607,15 +593,13 @@ fn client_operations_work_identically_when_deferred() {
         let client_timer = CompactDateTime::from(2000_u32);
         context
             .schedule(client_timer, TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // CLIENT INVARIANT: Scheduled timer must be visible
         let scheduled: Vec<CompactDateTime> = context
             .scheduled(TimerType::Application)
             .try_collect()
-            .await
-            .ok()?;
+            .await?;
         assert!(
             scheduled.contains(&client_timer),
             "schedule() while deferred: timer must appear in scheduled()"
@@ -624,15 +608,13 @@ fn client_operations_work_identically_when_deferred() {
         // STEP 2: Unschedule the timer
         context
             .unschedule(client_timer, TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // CLIENT INVARIANT: Unscheduled timer must be gone
         let scheduled: Vec<CompactDateTime> = context
             .scheduled(TimerType::Application)
             .try_collect()
-            .await
-            .ok()?;
+            .await?;
         assert!(
             !scheduled.contains(&client_timer),
             "unschedule() while deferred: timer must not appear in scheduled()"
@@ -647,20 +629,17 @@ fn client_operations_work_identically_when_deferred() {
         // STEP 3: Schedule again and use clear_and_schedule to replace
         context
             .schedule(client_timer, TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
         let replacement = CompactDateTime::from(3000_u32);
         context
             .clear_and_schedule(replacement, TimerType::Application)
-            .await
-            .ok()?;
+            .await?;
 
         // CLIENT INVARIANT: Only the replacement timer should exist
         let scheduled: Vec<CompactDateTime> = context
             .scheduled(TimerType::Application)
             .try_collect()
-            .await
-            .ok()?;
+            .await?;
         assert_eq!(
             scheduled,
             vec![replacement],
@@ -669,25 +648,25 @@ fn client_operations_work_identically_when_deferred() {
 
         // Key should no longer be deferred (clear_and_schedule deletes the key)
         assert!(
-            !harness.is_deferred().await.ok()?,
+            !harness.is_deferred().await?,
             "clear_and_schedule should un-defer the key"
         );
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 /// Non-Application timer types pass through to inner context.
 #[test]
-fn non_application_timers_pass_through() {
+fn non_application_timers_pass_through() -> color_eyre::Result<()> {
     init_test_logging();
 
     TEST_RUNTIME.block_on(async {
         let harness = ContextTestHarness::new("test-key");
 
         // Defer a timer to make key deferred
-        harness.defer_timer(1000).await.ok()?;
-        assert!(harness.is_deferred().await.ok()?);
+        harness.defer_timer(1000).await?;
+        assert!(harness.is_deferred().await?);
 
         let context = harness.create_wrapped_context();
 
@@ -695,8 +674,7 @@ fn non_application_timers_pass_through() {
         let time = CompactDateTime::from(2000_u32);
         context
             .schedule(time, TimerType::DeferredMessage)
-            .await
-            .ok()?;
+            .await?;
 
         // Should go directly to inner context, not defer store
         let has_deferred_msg = harness
@@ -710,8 +688,8 @@ fn non_application_timers_pass_through() {
             "DeferredMessage should pass through to inner context"
         );
 
-        Some(())
-    });
+        Ok(())
+    })
 }
 
 // ============================================================================
@@ -926,12 +904,12 @@ mod error_handling {
     /// Tests that when the deferred store fails on the very first poll,
     /// the error is correctly propagated as `TimerDeferContextError::Store`.
     #[test]
-    fn scheduled_propagates_immediate_store_error() {
+    fn scheduled_propagates_immediate_store_error() -> color_eyre::Result<()> {
         init_test_logging();
 
         TEST_RUNTIME.block_on(async {
             // Set up store with 3 timers that fails on first poll (fail_after=0)
-            let (inner_context, failing_store, key) = setup_failing_store(3, 0).await.ok()?;
+            let (inner_context, failing_store, key) = setup_failing_store(3, 0).await?;
             let context = TimerDeferContext::new(inner_context, failing_store, key);
 
             let (collected, error) = collect_until_error(&context).await;
@@ -947,8 +925,8 @@ mod error_handling {
                 "Should not yield any items before immediate error; got: {collected:?}"
             );
 
-            Some(())
-        });
+            Ok(())
+        })
     }
 
     /// `scheduled()` propagates store error after yielding some items.
@@ -956,12 +934,12 @@ mod error_handling {
     /// Tests that when the deferred store fails mid-iteration, previously
     /// yielded items are preserved and the error is correctly wrapped.
     #[test]
-    fn scheduled_propagates_mid_iteration_store_error() {
+    fn scheduled_propagates_mid_iteration_store_error() -> color_eyre::Result<()> {
         init_test_logging();
 
         TEST_RUNTIME.block_on(async {
             // Set up store with 5 timers that fails after yielding 2 (fail_after=2)
-            let (inner_context, failing_store, key) = setup_failing_store(5, 2).await.ok()?;
+            let (inner_context, failing_store, key) = setup_failing_store(5, 2).await?;
             let context = TimerDeferContext::new(inner_context, failing_store, key);
 
             let (collected, error) = collect_until_error(&context).await;
@@ -994,20 +972,20 @@ mod error_handling {
                 );
             }
 
-            Some(())
-        });
+            Ok(())
+        })
     }
 
     /// `scheduled()` returns all items when store succeeds.
     ///
     /// Control test to ensure normal operation works correctly.
     #[test]
-    fn scheduled_returns_all_items_on_success() {
+    fn scheduled_returns_all_items_on_success() -> color_eyre::Result<()> {
         init_test_logging();
 
         TEST_RUNTIME.block_on(async {
             // Set up store with 4 timers that never fails (fail_after > count)
-            let (inner_context, failing_store, key) = setup_failing_store(4, 100).await.ok()?;
+            let (inner_context, failing_store, key) = setup_failing_store(4, 100).await?;
             let context = TimerDeferContext::new(inner_context, failing_store, key);
 
             let (collected, error) = collect_until_error(&context).await;
@@ -1027,8 +1005,8 @@ mod error_handling {
                 "Should yield all items in order"
             );
 
-            Some(())
-        });
+            Ok(())
+        })
     }
 }
 
