@@ -1,7 +1,7 @@
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::error::ParseError;

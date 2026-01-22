@@ -154,6 +154,7 @@ use std::io::Error as IoError;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
 use crate::consumer::{DemandType, EventHandler, Uncommitted};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::{Partition, Topic};
 
@@ -175,37 +176,6 @@ pub mod topic;
 
 // Re-export providers for backwards compatibility and convenience
 pub use providers::{CloneProvider, FallibleCloneProvider};
-
-/// Categorizes errors in message processing.
-#[derive(Copy, Clone, Debug)]
-pub enum ErrorCategory {
-    /// Error is temporary and recovery is possible
-    Transient,
-    /// Error is permanent and irrecoverable
-    Permanent,
-    /// Error is due to partition shutdown
-    Terminal,
-}
-
-/// Defines methods for classifying errors.
-pub trait ClassifyError {
-    /// Classifies the error into a specific `ErrorCategory`.
-    ///
-    /// # Returns
-    ///
-    /// An `ErrorCategory` indicating the nature of the error.
-    fn classify_error(&self) -> ErrorCategory;
-
-    /// Determines if the error is recoverable.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the error is classified as `ErrorCategory::Transient`, `false`
-    /// otherwise.
-    fn is_recoverable(&self) -> bool {
-        matches!(self.classify_error(), ErrorCategory::Transient)
-    }
-}
 
 /// Provides fallible handlers for processing messages from specific partitions.
 ///

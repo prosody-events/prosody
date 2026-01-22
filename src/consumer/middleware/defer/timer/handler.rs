@@ -1,0 +1,433 @@
+//! Timer defer handler for processing deferred timer retries.
+//!
+//! This module provides the [`TimerDeferHandler`] which wraps an inner handler
+//! and intercepts `DeferredTimer` timer events to retry previously-failed
+//! application timers.
+//!
+//! # Handler Flow
+//!
+//! 1. **Application Timer Fails**: Transient error on `on_timer` for
+//!    `Application` type
+//! 2. **Timer Deferred**: Store trigger in `deferred_timers`, schedule
+//!    `DeferredTimer`
+//! 3. **New Timers Queue**: Subsequent timers for same key queue behind failed
+//!    one
+//! 4. **Retry Fires**: `DeferredTimer` fires, load from store, retry inner
+//!    handler
+//! 5. **Success/Failure**: On success advance queue, on transient re-defer, on
+//!    permanent skip
+
+use super::context::TimerDeferContext;
+use super::store::{TimerDeferStore, TimerRetryCompletionResult};
+use crate::consumer::event_context::EventContext;
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::defer::calculate_backoff;
+use crate::consumer::middleware::defer::config::DeferConfiguration;
+use crate::consumer::middleware::defer::decider::DeferralDecider;
+use crate::consumer::middleware::defer::error::DeferError;
+use crate::consumer::{DemandType, Keyed};
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
+use crate::timers::{TimerType, Trigger};
+use crate::{Partition, Topic};
+use tracing::{debug, info, warn};
+
+/// Per-partition handler wrapping an inner handler with timer defer logic.
+///
+/// Created by [`TimerDeferProvider`](super::middleware::TimerDeferProvider)
+/// as part of a defer handler stack.
+#[derive(Clone)]
+pub struct TimerDeferHandler<T, S, D>
+where
+    S: TimerDeferStore,
+    D: DeferralDecider,
+{
+    /// Inner handler to call for processing.
+    pub(crate) handler: T,
+    /// Store for deferred timers.
+    pub(crate) store: S,
+    /// Decider for deferral decisions.
+    pub(crate) decider: D,
+    /// Configuration for backoff and deferral behavior.
+    pub(crate) config: DeferConfiguration,
+    /// Topic this handler is processing.
+    pub(crate) topic: Topic,
+    /// Partition this handler is processing.
+    pub(crate) partition: Partition,
+}
+
+impl<T, S, D> FallibleHandler for TimerDeferHandler<T, S, D>
+where
+    T: FallibleHandler,
+    S: TimerDeferStore,
+    D: DeferralDecider,
+{
+    type Error = DeferError<S::Error, T::Error>;
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        // Wrap context so inner handlers see unified timer state
+        let wrapped_context =
+            TimerDeferContext::new(context, self.store.clone(), message.key().clone());
+
+        self.handler
+            .on_message(wrapped_context, message, demand_type)
+            .await
+            .map_err(DeferError::Handler)
+    }
+
+    async fn on_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+        demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        // Wrap context so inner handlers see unified timer state
+        let wrapped_context =
+            TimerDeferContext::new(context, self.store.clone(), trigger.key.clone());
+
+        match trigger.timer_type {
+            TimerType::DeferredTimer => self.handle_deferred_timer(wrapped_context, trigger).await,
+            TimerType::Application => {
+                self.handle_application_timer(wrapped_context, trigger, demand_type)
+                    .await
+            }
+            TimerType::DeferredMessage => self
+                .handler
+                .on_timer(wrapped_context, trigger, demand_type)
+                .await
+                .map_err(DeferError::Handler),
+        }
+    }
+
+    async fn shutdown(self) {
+        self.handler.shutdown().await;
+    }
+}
+
+impl<T, S, D> TimerDeferHandler<T, S, D>
+where
+    T: FallibleHandler,
+    S: TimerDeferStore,
+    D: DeferralDecider,
+{
+    /// Handles an `Application` timer, deferring on transient failure if
+    /// enabled.
+    async fn handle_application_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+        demand_type: DemandType,
+    ) -> Result<(), DeferError<S::Error, T::Error>>
+    where
+        C: EventContext,
+    {
+        // Check if key is already deferred - queue behind existing entry
+        if self
+            .store
+            .is_deferred(&trigger.key)
+            .await
+            .map_err(DeferError::Store)?
+            .is_some()
+        {
+            return self.append_to_deferred_queue(&trigger).await;
+        }
+
+        // Try handler, defer on transient failure if enabled
+        let Err(error) = self
+            .handler
+            .on_timer(context.clone(), trigger.clone(), demand_type)
+            .await
+        else {
+            return Ok(());
+        };
+
+        if !matches!(error.classify_error(), ErrorCategory::Transient) {
+            return Err(DeferError::Handler(error));
+        }
+
+        // Check deferral eligibility
+        let enabled = self.config.enabled;
+        let should_defer = self.decider.should_defer();
+
+        if enabled && should_defer {
+            return self.defer_first_timer(context, &trigger).await;
+        }
+
+        debug!(
+            key = ?trigger.key,
+            time = %trigger.time,
+            topic = %self.topic,
+            partition = self.partition,
+            enabled,
+            should_defer,
+            "Deferral skipped"
+        );
+        Err(DeferError::Handler(error))
+    }
+
+    /// Handles a `DeferredTimer` retry event.
+    async fn handle_deferred_timer<C>(
+        &self,
+        context: C,
+        trigger: Trigger,
+    ) -> Result<(), DeferError<S::Error, T::Error>>
+    where
+        C: EventContext,
+    {
+        let key = &trigger.key;
+
+        debug!(
+            key = ?key,
+            scheduled_time = %trigger.time,
+            topic = %self.topic,
+            partition = self.partition,
+            "Defer retry timer fired"
+        );
+
+        // Get next deferred timer
+        let Some((stored_trigger, retry_count)) = self
+            .store
+            .get_next_deferred_timer(key)
+            .await
+            .map_err(DeferError::Store)?
+        else {
+            // Queue empty - clear orphaned timer
+            debug!(
+                key = ?key,
+                topic = %self.topic,
+                partition = self.partition,
+                "Clearing orphaned defer timer: queue empty"
+            );
+
+            self.store
+                .delete_key(key)
+                .await
+                .map_err(DeferError::Store)?;
+
+            return Ok(());
+        };
+
+        debug!(
+            key = ?key,
+            original_time = %stored_trigger.time,
+            retry_count = retry_count,
+            topic = %self.topic,
+            partition = self.partition,
+            "Loaded deferred timer - attempting retry"
+        );
+
+        // Retry inner handler with stored Application timer
+        if let Err(error) = self
+            .handler
+            .on_timer(context.clone(), stored_trigger.clone(), DemandType::Failure)
+            .await
+        {
+            return self
+                .handle_retry_failure(&context, &stored_trigger, retry_count, error)
+                .await;
+        }
+
+        self.complete_and_advance(&context, &stored_trigger).await?;
+
+        info!(
+            key = ?key,
+            original_time = %stored_trigger.time,
+            retry_count = retry_count,
+            topic = %self.topic,
+            partition = self.partition,
+            "Deferred timer retry succeeded"
+        );
+
+        Ok(())
+    }
+
+    /// Defers a timer for the first time. Schedules retry timer before storing
+    /// to ensure timer coverage on partial failure.
+    async fn defer_first_timer<C>(
+        &self,
+        context: C,
+        trigger: &Trigger,
+    ) -> Result<(), DeferError<S::Error, T::Error>>
+    where
+        C: EventContext,
+    {
+        // Timer first, then store: ensures timer coverage on partial failure
+        self.schedule_retry_timer(&context, 0).await?;
+
+        self.store
+            .defer_first_timer(trigger)
+            .await
+            .map_err(DeferError::Store)?;
+
+        info!(
+            key = ?trigger.key,
+            time = %trigger.time,
+            topic = %self.topic,
+            partition = self.partition,
+            "Deferred timer for timer-based retry"
+        );
+
+        Ok(())
+    }
+
+    /// Appends timer to an already-deferred key's queue (maintains ordering).
+    async fn append_to_deferred_queue(
+        &self,
+        trigger: &Trigger,
+    ) -> Result<(), DeferError<S::Error, T::Error>> {
+        self.store
+            .defer_additional_timer(trigger)
+            .await
+            .map_err(DeferError::Store)?;
+
+        debug!(
+            key = ?trigger.key,
+            time = %trigger.time,
+            topic = %self.topic,
+            partition = self.partition,
+            "Queued timer behind already-deferred key"
+        );
+
+        Ok(())
+    }
+
+    /// Handles retry failures by error category.
+    async fn handle_retry_failure<C>(
+        &self,
+        context: &C,
+        trigger: &Trigger,
+        retry_count: u32,
+        error: T::Error,
+    ) -> Result<(), DeferError<S::Error, T::Error>>
+    where
+        C: EventContext,
+    {
+        match error.classify_error() {
+            ErrorCategory::Transient => {
+                // Always re-defer: timer is committed to queue
+                let new_retry_count = self
+                    .store
+                    .increment_retry_count(&trigger.key, retry_count)
+                    .await
+                    .map_err(DeferError::Store)?;
+
+                self.schedule_retry_timer(context, new_retry_count).await?;
+
+                info!(
+                    key = ?trigger.key,
+                    time = %trigger.time,
+                    retry_count = new_retry_count,
+                    topic = %self.topic,
+                    partition = self.partition,
+                    "Re-deferred timer after transient failure"
+                );
+
+                Ok(())
+            }
+            ErrorCategory::Permanent => {
+                warn!(
+                    key = ?trigger.key,
+                    time = %trigger.time,
+                    retry_count = retry_count,
+                    topic = %self.topic,
+                    partition = self.partition,
+                    "Permanent handler error during retry - removing from queue: {error:#}"
+                );
+
+                self.complete_and_advance(context, trigger).await?;
+
+                Err(DeferError::Handler(error))
+            }
+            ErrorCategory::Terminal => Err(DeferError::Handler(error)),
+        }
+    }
+
+    /// Removes timer from queue and schedules next (or clears).
+    /// Used after success, permanent failure, or skipping corrupted entries.
+    async fn complete_and_advance<C>(
+        &self,
+        context: &C,
+        trigger: &Trigger,
+    ) -> Result<(), DeferError<S::Error, T::Error>>
+    where
+        C: EventContext,
+    {
+        let result = self
+            .store
+            .complete_retry_success(&trigger.key, trigger.time)
+            .await
+            .map_err(DeferError::Store)?;
+
+        self.schedule_next_or_clear(context, result).await
+    }
+
+    /// Schedules a `DeferredTimer` timer with backoff based on retry count.
+    async fn schedule_retry_timer<C>(
+        &self,
+        context: &C,
+        retry_count: u32,
+    ) -> Result<(), DeferError<S::Error, T::Error>>
+    where
+        C: EventContext,
+    {
+        let fire_time = self.next_retry_time(retry_count)?;
+
+        context
+            .clear_and_schedule(fire_time, TimerType::DeferredTimer)
+            .await
+            .map_err(|e| DeferError::Timer(Box::new(e)))?;
+
+        debug!(
+            fire_time = %fire_time,
+            retry_count = retry_count,
+            topic = %self.topic,
+            partition = self.partition,
+            "Scheduled defer retry timer"
+        );
+
+        Ok(())
+    }
+
+    /// Schedules timer for next entry or clears if queue empty.
+    async fn schedule_next_or_clear<C>(
+        &self,
+        context: &C,
+        result: TimerRetryCompletionResult,
+    ) -> Result<(), DeferError<S::Error, T::Error>>
+    where
+        C: EventContext,
+    {
+        match result {
+            TimerRetryCompletionResult::MoreTimers { .. } => {
+                // More timers in queue - schedule retry (retry_count reset to 0)
+                self.schedule_retry_timer(context, 0).await
+            }
+            TimerRetryCompletionResult::Completed => {
+                // No more timers - clear the retry timer
+                context
+                    .clear_scheduled(TimerType::DeferredTimer)
+                    .await
+                    .map_err(|e| DeferError::Timer(Box::new(e)))
+            }
+        }
+    }
+
+    /// Returns `now + backoff(retry_count)`; used for scheduling retry timers.
+    fn next_retry_time(&self, retry_count: u32) -> Result<CompactDateTime, CompactDateTimeError> {
+        let delay = calculate_backoff(&self.config, retry_count);
+        let now = CompactDateTime::now()?;
+        now.add_duration(delay)
+    }
+}

@@ -13,7 +13,7 @@ license = "UNLICENSED"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/cincpro/prosody"
-version = "0.11.0"
+version = "0.12.0"
 
 [dependencies]
 ahash = "0.8"
@@ -66,7 +66,7 @@ tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.17", features = ["v5"] }
 validator = { version = "0.20", features = ["derive"] }
-whoami = "1.6"
+whoami = "2.0"
 
 [features]
 cmake-build = ["rdkafka/cmake-build"]
@@ -86,7 +86,7 @@ derive-quickcheck-arbitrary = "0.1"
 itertools = "0.14"
 quickcheck = "1.0"
 quickcheck_macros = "1.1"
-reqwest = "0.12"
+reqwest = "0.13"
 tokio = { version = "1.44", features = ["rt-multi-thread", "test-util"] }
 uuid = { version = "1.16", features = ["v4"] }
 

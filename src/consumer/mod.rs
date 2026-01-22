@@ -122,40 +122,14 @@
 //! - `heartbeat`: Monitoring for stalled processes
 //! - `probes`: HTTP endpoints for health and readiness checking
 
-use crate::consumer::poll::PollConfig;
-use crate::consumer::probes::ProbeServer;
-use crate::high_level::config::TriggerStoreConfiguration;
-use std::env::var;
-use std::fmt::Debug;
-use std::future::Future;
-use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
-
-use ahash::HashMap;
-use aho_corasick::{AhoCorasick, StartKind};
-use crossbeam_utils::CachePadded;
-use derive_builder::Builder;
-use educe::Educe;
-use futures::executor::block_on;
-use parking_lot::{Mutex, RwLock};
-use rdkafka::ClientConfig;
-use rdkafka::config::RDKafkaLogLevel;
-use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::error::KafkaError;
-use thiserror::Error;
-use tokio::task::{JoinHandle, spawn_blocking};
-use tracing::error;
-use validator::{Validate, ValidationErrors};
-use whoami::fallible::hostname;
-
 use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
-use crate::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};
+use crate::consumer::middleware::defer::{
+    DeferConfiguration, FailureTracker, MessageDeferMiddleware, TimerDeferMiddleware,
+};
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::monopolization::{
     MonopolizationConfiguration, MonopolizationInitError, MonopolizationMiddleware,
@@ -171,9 +145,12 @@ use crate::consumer::middleware::timeout::{
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
+use crate::consumer::poll::PollConfig;
 use crate::consumer::poll::poll;
+use crate::consumer::probes::ProbeServer;
 use crate::consumer::storage::StorePair;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::high_level::config::TriggerStoreConfiguration;
 use crate::producer::ProsodyProducer;
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
@@ -188,6 +165,29 @@ use crate::util::{
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
 use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
+use ahash::HashMap;
+use aho_corasick::{AhoCorasick, StartKind};
+use crossbeam_utils::CachePadded;
+use derive_builder::Builder;
+use educe::Educe;
+use futures::executor::block_on;
+use parking_lot::{Mutex, RwLock};
+use rdkafka::ClientConfig;
+use rdkafka::config::RDKafkaLogLevel;
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::error::KafkaError;
+use std::env::var;
+use std::fmt::Debug;
+use std::future::Future;
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+use thiserror::Error;
+use tokio::task::{JoinHandle, spawn_blocking};
+use tracing::error;
+use validator::{Validate, ValidationErrors};
+use whoami::hostname;
 
 pub mod decode;
 pub mod event_context;
@@ -629,7 +629,7 @@ impl ConsumerConfigurationBuilder {
     ///
     /// An option containing the consumer group if configured.
     #[must_use]
-    pub fn configured_consumer_group(&self) -> Option<String> {
+    pub(crate) fn configured_consumer_group(&self) -> Option<String> {
         self.group_id.clone().or_else(|| var(PROSODY_GROUP_ID).ok())
     }
 }
@@ -685,7 +685,7 @@ pub struct ProsodyConsumer {
 /// 2. Timeout middleware - enforces handler execution timeout
 /// 3. Scheduler middleware - fair work-conserving dispatch with concurrency
 ///    limits
-/// 4. Shutdown middleware - stops processing during partition shutdown
+/// 4. Cancellation middleware - checks shutdown/cancellation before handler
 ///
 /// # Arguments
 ///
@@ -911,7 +911,6 @@ impl ProsodyConsumer {
         let stores = StorePair::new(trigger_store_config, slab_size, consumer_config.mock).await?;
 
         let telemetry = Telemetry::new();
-        let retry_middleware = RetryMiddleware::new(retry_config)?;
         let monopolization_middleware =
             MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
         let heartbeats = HeartbeatRegistry::new(
@@ -919,71 +918,88 @@ impl ProsodyConsumer {
             consumer_config.stall_threshold,
         );
 
-        // Build the complete middleware stack and consumer
-        // StorePair enum guarantees stores match - no unreachable!() needed
+        // Build middleware stack (shared logic)
+        let failure_tracker = FailureTracker::new(
+            defer_config.failure_window,
+            defer_config.failure_threshold,
+            &telemetry,
+            &heartbeats,
+        );
+
+        let common_middleware =
+            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
+
+        // Build middleware stack with concrete provider types (determined by StorePair
+        // variant)
         match stores {
             StorePair::Memory {
-                trigger: trigger_store,
-                defer: defer_store,
+                trigger,
+                message_provider,
+                timer_provider,
             } => {
-                let defer_middleware = DeferMiddleware::new(
-                    defer_config,
+                let message_defer_middleware = MessageDeferMiddleware::new(
+                    defer_config.clone(),
                     consumer_config,
                     &common_config.scheduler,
-                    defer_store,
-                    &telemetry,
+                    message_provider,
+                    failure_tracker.clone(),
                     &heartbeats,
                 )?;
 
-                let common_middleware = build_common_middleware(
-                    common_config,
-                    consumer_config.stall_threshold,
-                    &telemetry,
-                )?;
+                let timer_defer_middleware = TimerDeferMiddleware::new(
+                    defer_config,
+                    timer_provider,
+                    failure_tracker,
+                    consumer_config,
+                );
 
                 let provider = common_middleware
                     .layer(monopolization_middleware)
-                    .layer(defer_middleware)
-                    .layer(retry_middleware)
+                    .layer(timer_defer_middleware)
+                    .layer(message_defer_middleware)
+                    .layer(RetryMiddleware::new(retry_config)?)
                     .into_provider(handler);
 
                 initialize_consumer_with_store(
                     consumer_config,
                     provider,
-                    trigger_store,
+                    trigger,
                     &telemetry,
                     heartbeats,
                 )
             }
             StorePair::Cassandra {
-                trigger: trigger_store,
-                defer: defer_store,
+                trigger,
+                message_provider,
+                timer_provider,
             } => {
-                let defer_middleware = DeferMiddleware::new(
-                    defer_config,
+                let message_defer_middleware = MessageDeferMiddleware::new(
+                    defer_config.clone(),
                     consumer_config,
                     &common_config.scheduler,
-                    defer_store,
-                    &telemetry,
+                    message_provider,
+                    failure_tracker.clone(),
                     &heartbeats,
                 )?;
 
-                let common_middleware = build_common_middleware(
-                    common_config,
-                    consumer_config.stall_threshold,
-                    &telemetry,
-                )?;
+                let timer_defer_middleware = TimerDeferMiddleware::new(
+                    defer_config,
+                    timer_provider,
+                    failure_tracker,
+                    consumer_config,
+                );
 
                 let provider = common_middleware
                     .layer(monopolization_middleware)
-                    .layer(defer_middleware)
-                    .layer(retry_middleware)
+                    .layer(timer_defer_middleware)
+                    .layer(message_defer_middleware)
+                    .layer(RetryMiddleware::new(retry_config)?)
                     .into_provider(handler);
 
                 initialize_consumer_with_store(
                     consumer_config,
                     provider,
-                    trigger_store,
+                    trigger,
                     &telemetry,
                     heartbeats,
                 )
@@ -1069,7 +1085,7 @@ impl ProsodyConsumer {
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn best_effort_consumer<T>(
+    pub(crate) async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         common_config: &CommonMiddlewareConfiguration,
@@ -1356,6 +1372,10 @@ pub enum ConsumerError {
     /// Indicates an IO failure.
     #[error("IO error: {0:#}")]
     Io(#[from] io::Error),
+
+    /// Indicates a failure to retrieve the hostname.
+    #[error("failed to get hostname: {0:#}")]
+    Hostname(#[from] whoami::Error),
 
     /// Indicates a Kafka operation failure.
     #[error("Kafka operation failed: {0:#}")]

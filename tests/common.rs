@@ -6,12 +6,18 @@
 //! consumer tasks, and verifying message integrity and order in property-based
 //! tests.
 
-#![allow(dead_code, clippy::implicit_hasher)]
+#![allow(
+    dead_code,
+    clippy::implicit_hasher,
+    reason = "Shared test utilities: not all helpers used by every test binary; HashMap uses \
+              ahash for crate consistency"
+)]
 
 use std::cmp::max;
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::sync::LazyLock;
 use std::time::Duration as StdDuration;
 
 use ahash::{HashMap, HashMapExt};
@@ -23,20 +29,40 @@ use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration}
 use prosody::cassandra::config::CassandraConfiguration;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
-use prosody::consumer::middleware::{ClassifyError, CloneProvider, ErrorCategory, FallibleHandler};
+use prosody::consumer::middleware::{CloneProvider, FallibleHandler};
 use prosody::consumer::{ConsumerConfiguration, DemandType, EventHandler, Keyed, ProsodyConsumer};
+use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::timers::{Trigger, UncommittedTimer};
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tracing::{error, info, instrument};
 use uuid::Uuid;
+
+/// Shared multi-threaded runtime for all integration tests.
+///
+/// # Rationale for `expect`
+///
+/// `LazyLock` requires a non-fallible closure. Runtime creation failure is
+/// unrecoverable in test infrastructure - tests cannot run without a runtime.
+#[expect(
+    clippy::expect_used,
+    reason = "LazyLock requires non-fallible closure; test infra"
+)]
+pub static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+        .expect("Failed to create tokio runtime")
+});
 
 /// A small, non-zero count used in tests.
 ///
@@ -464,16 +490,12 @@ pub struct SlowTestHandler {
 }
 
 impl EventHandler for SlowTestHandler {
-    #[allow(clippy::used_underscore_binding)]
-    #[instrument(skip(self, _context))]
-    async fn on_message<C>(
-        &self,
-        _context: C,
-        message: UncommittedMessage,
-        _demand_type: DemandType,
-    ) where
+    #[instrument(skip(self, context, demand_type))]
+    async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
+    where
         C: EventContext,
     {
+        let _ = (context, demand_type);
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
         let payload: Value = msg.payload().clone();

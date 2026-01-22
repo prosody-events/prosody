@@ -11,7 +11,7 @@
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
 use crate::Key;
-use crate::consumer::middleware::ClassifyError;
+use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;

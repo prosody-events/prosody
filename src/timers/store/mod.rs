@@ -20,7 +20,7 @@
 //! implement the same trait to provide durability.
 
 use crate::Key;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -59,7 +59,8 @@ pub mod tests;
 ///
 /// Determines which Cassandra table schema is used for storing triggers.
 /// - V1: Legacy schema without `timer_type` field
-/// - V2: Current schema with `timer_type` field for Application vs `DeferRetry`
+/// - V2: Current schema with `timer_type` field for Application vs
+///   `DeferredMessage`
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SegmentVersion {

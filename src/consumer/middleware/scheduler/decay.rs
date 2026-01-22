@@ -3,7 +3,10 @@
 //! Prevents starvation by allowing older execution times to gradually lose
 //! influence in scheduling decisions through exponential decay.
 
-#![allow(clippy::cast_precision_loss)]
+#![allow(
+    clippy::cast_precision_loss,
+    reason = "Nanosecond values stay well below f64's exact integer range (2^53)"
+)]
 
 use quanta::Instant;
 use std::cmp::Ordering;
@@ -159,7 +162,15 @@ impl<const HALF_LIFE_SECS: u64> Default for DecayingDuration<HALF_LIFE_SECS> {
 impl<const HALF_LIFE_SECS: u64> Add<Duration> for DecayingDuration<HALF_LIFE_SECS> {
     type Output = Self;
 
-    #[allow(clippy::suspicious_arithmetic_impl)]
+    /// Adds a duration to the decayed value at the current instant.
+    ///
+    /// Decay is applied to `self` before adding `rhs`, modeling exponential
+    /// decay where accumulated time naturally decreases and new time is added
+    /// at full value.
+    #[expect(
+        clippy::suspicious_arithmetic_impl,
+        reason = "Intentional: decay applied before add for exponential decay semantics"
+    )]
     fn add(self, rhs: Duration) -> Self {
         let now = Instant::now();
         let decayed_nanos = (self.value_nanos as f64 * self.decay_factor_at(now)) as u64;
@@ -173,7 +184,15 @@ impl<const HALF_LIFE_SECS: u64> Add<Duration> for DecayingDuration<HALF_LIFE_SEC
 impl<const HALF_LIFE_SECS: u64> Sub<Duration> for DecayingDuration<HALF_LIFE_SECS> {
     type Output = Self;
 
-    #[allow(clippy::suspicious_arithmetic_impl)]
+    /// Subtracts a duration from the decayed value at the current instant.
+    ///
+    /// Decay is applied to `self` before subtracting `rhs`, modeling
+    /// exponential decay where accumulated time naturally decreases and
+    /// subtraction happens against the current decayed value.
+    #[expect(
+        clippy::suspicious_arithmetic_impl,
+        reason = "Intentional: decay applied before sub for exponential decay semantics"
+    )]
     fn sub(self, rhs: Duration) -> Self {
         let now = Instant::now();
         let decayed_nanos = (self.value_nanos as f64 * self.decay_factor_at(now)) as u64;

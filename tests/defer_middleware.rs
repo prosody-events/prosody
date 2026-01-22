@@ -22,14 +22,17 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
-use prosody::consumer::middleware::defer::store::cassandra::CassandraDeferStoreProvider;
-use prosody::consumer::middleware::defer::{DeferConfiguration, DeferMiddleware};
+use prosody::consumer::middleware::defer::message::store::CassandraMessageDeferStoreProvider;
+use prosody::consumer::middleware::defer::message::store::cassandra::MessageQueries;
+use prosody::consumer::middleware::defer::segment::CassandraSegmentStore;
+use prosody::consumer::middleware::defer::{
+    DeferConfiguration, FailureTracker, MessageDeferMiddleware,
+};
 use prosody::consumer::middleware::log::LogMiddleware;
 use prosody::consumer::middleware::scheduler::SchedulerConfiguration;
-use prosody::consumer::middleware::{
-    ClassifyError, ErrorCategory, FallibleHandler, HandlerMiddleware,
-};
+use prosody::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use prosody::consumer::{ConsumerConfiguration, DemandType, Keyed, ProsodyConsumer};
+use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::heartbeat::HeartbeatRegistry;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
@@ -42,26 +45,16 @@ use prosody::{
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::{Value, json};
 use std::env;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
 use tracing::info;
 use uuid::Uuid;
 
-/// Shared runtime for integration tests.
-#[allow(clippy::expect_used)]
-static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    Builder::new_multi_thread()
-        .enable_time()
-        .enable_io()
-        .build()
-        .expect("Failed to create tokio runtime")
-});
-
 mod common;
+use common::TEST_RUNTIME;
 
 /// Get the number of times to run each integration test from environment
 /// variable.
@@ -261,17 +254,29 @@ impl DeferTestEnvironment {
             .build()?;
 
         let cassandra_store = CassandraStore::new(&cassandra_config).await?;
-        let defer_provider =
-            CassandraDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
+        let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), &keyspace).await?;
+        let message_queries =
+            Arc::new(MessageQueries::new(cassandra_store.session(), &keyspace).await?);
+        let message_provider = CassandraMessageDeferStoreProvider::new(
+            cassandra_store.clone(),
+            message_queries,
+            segment_store,
+        );
 
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
-        let defer_middleware = DeferMiddleware::new(
+        let failure_tracker = FailureTracker::new(
+            defer_config.failure_window,
+            defer_config.failure_threshold,
+            &telemetry,
+            &heartbeats,
+        );
+        let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
             &scheduler_config,
-            defer_provider,
-            &telemetry,
+            message_provider,
+            failure_tracker,
             &heartbeats,
         )?;
 
@@ -340,17 +345,29 @@ impl DeferTestEnvironment {
             .build()?;
 
         let cassandra_store = CassandraStore::new(&cassandra_config).await?;
-        let defer_provider =
-            CassandraDeferStoreProvider::with_store(cassandra_store, &keyspace).await?;
+        let segment_store = CassandraSegmentStore::new(cassandra_store.clone(), &keyspace).await?;
+        let message_queries =
+            Arc::new(MessageQueries::new(cassandra_store.session(), &keyspace).await?);
+        let message_provider = CassandraMessageDeferStoreProvider::new(
+            cassandra_store.clone(),
+            message_queries,
+            segment_store,
+        );
 
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
-        let defer_middleware = DeferMiddleware::new(
+        let failure_tracker = FailureTracker::new(
+            defer_config.failure_window,
+            defer_config.failure_threshold,
+            &telemetry,
+            &heartbeats,
+        );
+        let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
             &scheduler_config,
-            defer_provider,
-            &telemetry,
+            message_provider,
+            failure_tracker,
             &heartbeats,
         )?;
 

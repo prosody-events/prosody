@@ -7,7 +7,7 @@
 //! **Not part of the public API.** Use `TriggerStore` instead.
 
 use crate::Key;
-use crate::consumer::middleware::ClassifyError;
+use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};

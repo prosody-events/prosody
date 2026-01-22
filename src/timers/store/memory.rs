@@ -281,7 +281,8 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// # Arguments
     ///
     /// * `slab` - The slab specification to query.
-    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
+    /// * `timer_type` - The timer type to query (Application or
+    ///   `DeferredMessage`).
     ///
     /// # Returns
     ///
@@ -370,7 +371,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// # Arguments
     ///
     /// * `slab` - Slab to modify.
-    /// * `timer_type` - The timer type (Application or `DeferRetry`).
+    /// * `timer_type` - The timer type (Application or `DeferredMessage`).
     /// * `key` - Trigger's key.
     /// * `time` - Trigger's scheduled time.
     ///
@@ -401,7 +402,7 @@ impl TriggerOperations for InMemoryTriggerStore {
 
     /// Remove all triggers from a slab's time index across ALL timer types.
     ///
-    /// This clears both Application and `DeferRetry` timers. Used for
+    /// This clears both Application and `DeferredMessage` timers. Used for
     /// `slab_size` migration and cleanup operations.
     ///
     /// # Arguments
@@ -425,7 +426,8 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// # Arguments
     ///
     /// * `segment_id` - Segment to query.
-    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
+    /// * `timer_type` - The timer type to query (Application or
+    ///   `DeferredMessage`).
     /// * `key` - Entity key.
     ///
     /// # Returns
@@ -446,7 +448,8 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// # Arguments
     ///
     /// * `segment_id` - Segment to query.
-    /// * `timer_type` - The timer type to query (Application or `DeferRetry`).
+    /// * `timer_type` - The timer type to query (Application or
+    ///   `DeferredMessage`).
     /// * `key` - Entity key.
     ///
     /// # Returns
@@ -535,7 +538,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// # Arguments
     ///
     /// * `segment_id` - Segment for the key.
-    /// * `timer_type` - The timer type (Application or `DeferRetry`).
+    /// * `timer_type` - The timer type (Application or `DeferredMessage`).
     /// * `key` - Trigger's key.
     /// * `time` - Trigger's scheduled time.
     ///
@@ -569,7 +572,8 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// # Arguments
     ///
     /// * `segment` - Segment ID.
-    /// * `timer_type` - The timer type to clear (Application or `DeferRetry`).
+    /// * `timer_type` - The timer type to clear (Application or
+    ///   `DeferredMessage`).
     /// * `key` - Entity key.
     ///
     /// # Errors

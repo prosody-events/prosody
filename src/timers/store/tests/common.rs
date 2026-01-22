@@ -20,15 +20,19 @@
 //! - **Cross-backend compatibility**: Working with any `TriggerStore`
 //!   implementation
 
+use std::collections::{HashMap, HashSet as StdHashSet};
+use std::fmt::Debug;
+use std::hash::BuildHasher;
+
+use ahash::HashSet;
+use futures::StreamExt;
+
 use super::TestStoreResult;
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
-use ahash::{HashMap, HashSet};
-use futures::StreamExt;
-use std::fmt::Debug;
 
 /// Helper function to insert a segment.
 ///
@@ -45,30 +49,6 @@ where
         .await
         .map_err(|e| format!("Failed to insert segment: {e:?}"))?;
     Ok(())
-}
-
-/// Helper function to verify a segment exists and matches expected values
-///
-/// # Errors
-///
-/// Returns an error if the store operation fails.
-pub async fn verify_segment<S>(store: &S, segment: &Segment) -> TestStoreResult
-where
-    S: TriggerStore + Send + Sync,
-    S::Error: Debug,
-{
-    match store.get_segment(&segment.id).await {
-        Ok(Some(retrieved))
-            if retrieved.id == segment.id
-                && retrieved.name == segment.name
-                && retrieved.slab_size == segment.slab_size =>
-        {
-            Ok(())
-        }
-        Ok(Some(_)) => Err("Retrieved segment doesn't match original".to_owned()),
-        Ok(None) => Err("Failed to retrieve segment".to_owned()),
-        Err(e) => Err(format!("Error retrieving segment: {e:?}")),
-    }
 }
 
 /// Helper function to delete a slab
@@ -148,7 +128,7 @@ where
 }
 
 /// Helper function to get ALL triggers from a slab (both Application and
-/// `DeferRetry`)
+/// `DeferredMessage`)
 ///
 /// Uses the public API method `get_slab_triggers_all_types`.
 ///
@@ -254,15 +234,16 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-#[allow(clippy::implicit_hasher)]
-pub async fn verify_store_state<S>(
+pub async fn verify_store_state<S, H1, H2>(
     store: &S,
     segment: &Segment,
-    expected_state: &HashMap<Key, HashSet<CompactDateTime>>,
+    expected_state: &HashMap<Key, StdHashSet<CompactDateTime, H2>, H1>,
 ) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
+    H1: BuildHasher,
+    H2: BuildHasher,
 {
     // Check all keys in our expected state
     for (key, expected_times) in expected_state {
@@ -273,8 +254,10 @@ where
         // Get actual times for this key from the store
         let actual_times = get_key_triggers(store, &segment.id, key).await?;
 
-        // Verify each key's times match what we expect
-        if &actual_times != expected_times {
+        // Verify each key's times match what we expect (compare across hasher types)
+        let times_match = actual_times.len() == expected_times.len()
+            && actual_times.iter().all(|t| expected_times.contains(t));
+        if !times_match {
             return Err(format!(
                 "Key times mismatch for key {key:?}. Expected: {expected_times:?}, Got: \
                  {actual_times:?}"

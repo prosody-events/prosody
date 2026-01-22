@@ -7,16 +7,24 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::consumer::middleware::defer::store::cassandra::{
-    CassandraDeferStoreError, CassandraDeferStoreProvider,
+use crate::consumer::middleware::defer::message::store::cassandra::MessageQueries;
+use crate::consumer::middleware::defer::message::store::{
+    CassandraMessageDeferStoreProvider, MemoryMessageDeferStoreProvider,
 };
-use crate::consumer::middleware::defer::store::memory::MemoryDeferStoreProvider;
+use crate::consumer::middleware::defer::segment::{
+    CassandraSegmentStore, CassandraSegmentStoreError,
+};
+use crate::consumer::middleware::defer::timer::store::cassandra::queries::Queries as TimerQueries;
+use crate::consumer::middleware::defer::timer::store::{
+    CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
+};
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::{CassandraTriggerStore, CassandraTriggerStoreError};
 use crate::timers::store::memory::InMemoryTriggerStore;
 use crate::timers::store::memory::memory_store;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Unified storage backend that ensures trigger and defer stores use the same
@@ -106,10 +114,10 @@ impl StorageBackend {
     }
 }
 
-/// Atomically-created pair of trigger and defer store providers.
+/// Atomically-created set of trigger and defer store providers.
 ///
-/// This enum ensures that trigger and defer store providers always use matching
-/// backends, making mismatched stores unrepresentable in the type system.
+/// This enum ensures that trigger and defer stores always use matching
+/// storage types, making mismatched stores unrepresentable in the type system.
 ///
 /// # Examples
 ///
@@ -122,13 +130,21 @@ impl StorageBackend {
 /// let slab_size = CompactDuration::new(3600);
 /// let stores = StorePair::new(&config, slab_size, false).await?;
 ///
-/// // Pattern match to get both providers - they're guaranteed to match
+/// // Pattern match to get all stores - they're guaranteed to match storage types
 /// match stores {
-///     StorePair::Memory { trigger, defer } => {
-///         // Both are in-memory store providers
+///     StorePair::Memory {
+///         trigger,
+///         message_provider,
+///         timer_provider,
+///     } => {
+///         // All are in-memory
 ///     }
-///     StorePair::Cassandra { trigger, defer } => {
-///         // Both are Cassandra store providers
+///     StorePair::Cassandra {
+///         trigger,
+///         message_provider,
+///         timer_provider,
+///     } => {
+///         // All are Cassandra
 ///     }
 /// }
 /// # Ok(())
@@ -136,19 +152,23 @@ impl StorageBackend {
 /// ```
 #[derive(Clone)]
 pub enum StorePair {
-    /// Both stores use in-memory storage.
+    /// All stores use in-memory storage.
     Memory {
         /// In-memory trigger store wrapped in `TableAdapter`.
         trigger: TableAdapter<InMemoryTriggerStore>,
-        /// In-memory defer store provider.
-        defer: MemoryDeferStoreProvider,
+        /// Message defer store provider (Memory).
+        message_provider: MemoryMessageDeferStoreProvider,
+        /// Timer defer store provider (Memory).
+        timer_provider: MemoryTimerDeferStoreProvider,
     },
-    /// Both stores use Cassandra storage with a shared session.
+    /// All stores use Cassandra storage with a shared session.
     Cassandra {
         /// Cassandra trigger store wrapped in `TableAdapter`.
         trigger: TableAdapter<CassandraTriggerStore>,
-        /// Cassandra defer store provider.
-        defer: CassandraDeferStoreProvider,
+        /// Message defer store provider (Cassandra with resources).
+        message_provider: CassandraMessageDeferStoreProvider,
+        /// Timer defer store provider (Cassandra with resources).
+        timer_provider: CassandraTimerDeferStoreProvider,
     },
 }
 
@@ -159,13 +179,13 @@ pub enum StoreCreationError {
     #[error("failed to create trigger store: {0:#}")]
     TriggerStore(Box<CassandraTriggerStoreError>),
 
-    /// Failed to create defer store.
-    #[error("failed to create defer store: {0:#}")]
+    /// Failed to create defer store queries.
+    #[error("failed to create defer store queries: {0:#}")]
     DeferStore(Box<CassandraStoreError>),
 
-    /// Defer store initialization error (non-Cassandra).
-    #[error("defer store initialization error: {0:#}")]
-    DeferStoreInit(Box<CassandraDeferStoreError>),
+    /// Failed to create segment store.
+    #[error("failed to create segment store: {0:#}")]
+    SegmentStore(Box<CassandraSegmentStoreError>),
 }
 
 impl From<CassandraTriggerStoreError> for StoreCreationError {
@@ -180,21 +200,14 @@ impl From<CassandraStoreError> for StoreCreationError {
     }
 }
 
-impl From<CassandraDeferStoreError> for StoreCreationError {
-    fn from(e: CassandraDeferStoreError) -> Self {
-        match e {
-            CassandraDeferStoreError::Cassandra(cassandra_err) => {
-                Self::DeferStore(Box::new(cassandra_err))
-            }
-            other @ CassandraDeferStoreError::InvalidRetryCount { .. } => {
-                Self::DeferStoreInit(Box::new(other))
-            }
-        }
+impl From<CassandraSegmentStoreError> for StoreCreationError {
+    fn from(e: CassandraSegmentStoreError) -> Self {
+        Self::SegmentStore(Box::new(e))
     }
 }
 
 impl StorePair {
-    /// Creates both trigger and defer stores atomically.
+    /// Creates both trigger and defer store providers atomically.
     ///
     /// This is an atomic operation - both stores are created or the operation
     /// fails. The stores are guaranteed to use the same underlying storage.
@@ -234,20 +247,41 @@ impl StorePair {
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
                 trigger: memory_store(),
-                defer: MemoryDeferStoreProvider::new(),
+                message_provider: MemoryMessageDeferStoreProvider::new(),
+                timer_provider: MemoryTimerDeferStoreProvider::new(),
             }),
 
             StorageBackend::Cassandra { store, keyspace } => {
-                // Both stores share the same CassandraStore via clone (cheap Arc clone)
+                // All stores share the same CassandraStore via clone (cheap Arc clone)
                 let trigger =
                     CassandraTriggerStore::with_store(store.clone(), keyspace, slab_size).await?;
 
-                let defer =
-                    CassandraDeferStoreProvider::with_store(store.clone(), keyspace).await?;
+                // Create segment store for defer stores (shared across message and timer)
+                let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;
+
+                // Prepare queries for message defer stores
+                let message_queries =
+                    Arc::new(MessageQueries::new(store.session(), keyspace).await?);
+
+                // Prepare queries for timer defer stores
+                let timer_queries = Arc::new(TimerQueries::new(store.session(), keyspace).await?);
+
+                let message_provider = CassandraMessageDeferStoreProvider::new(
+                    store.clone(),
+                    message_queries,
+                    segment_store.clone(),
+                );
+
+                let timer_provider = CassandraTimerDeferStoreProvider::new(
+                    store.clone(),
+                    timer_queries,
+                    segment_store,
+                );
 
                 Ok(Self::Cassandra {
                     trigger: TableAdapter::new(trigger),
-                    defer,
+                    message_provider,
+                    timer_provider,
                 })
             }
         }

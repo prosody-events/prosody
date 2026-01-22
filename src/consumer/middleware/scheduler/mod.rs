@@ -101,8 +101,8 @@ pub struct SchedulerConfiguration {
     /// seconds of negative virtual time, making it more likely to be selected.
     ///
     /// The priority formula is: `priority = key_vt - urgency_boost` where
-    /// `urgency_boost = wait_weight * (wait_time / max_wait)² * 1e6 μs`.
-    /// Lower priority values are selected first.
+    /// `urgency_boost = wait_weight * (wait_time / max_wait)²`.
+    /// Both terms are in seconds. Lower priority values are selected first.
     ///
     /// **Higher values** increase the importance of wait time relative to
     /// virtual time fairness. Tasks will be selected sooner based on how long

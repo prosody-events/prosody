@@ -234,14 +234,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
+    use crate::consumer::middleware::FallibleCloneProvider;
     use crate::consumer::middleware::test_support::MockEventContext;
-    use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleCloneProvider};
+    use crate::error::{ClassifyError, ErrorCategory};
     use crate::telemetry::event::{Data, KeyState};
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
-    use chrono::Utc;
-    use serde_json::json;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
     use std::sync::Arc;
@@ -332,13 +331,7 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(10));
         let permit = semaphore.try_acquire_owned().ok()?;
         Some(ConsumerMessage::new(
-            None,
-            "test-topic".into(),
-            0,
-            0,
-            "test-key".into(),
-            Utc::now(),
-            json!({}),
+            ConsumerMessageValue::default(),
             Span::current(),
             permit,
         ))

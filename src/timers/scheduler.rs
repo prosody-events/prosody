@@ -9,7 +9,7 @@
 //! on a spawned Tokio task.
 
 use crate::Key;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::timers::active::ActiveTriggers;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
@@ -237,7 +237,7 @@ impl TriggerScheduler {
     ///
     /// Returns [`TimerSchedulerError::Shutdown`] if the scheduler task has
     /// shut down or the command channel is closed.
-    pub async fn add_to_queue(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
+    pub(crate) async fn add_to_queue(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
         let (result_tx, result_rx) = oneshot::channel();
         let operation = CommandOperation::AddToQueue;
 
@@ -268,7 +268,10 @@ impl TriggerScheduler {
     ///
     /// Returns [`TimerSchedulerError::Shutdown`] if the scheduler task has
     /// shut down or the command channel is closed.
-    pub async fn remove_from_queue(&self, trigger: Trigger) -> Result<(), TimerSchedulerError> {
+    pub(crate) async fn remove_from_queue(
+        &self,
+        trigger: Trigger,
+    ) -> Result<(), TimerSchedulerError> {
         let (result_tx, result_rx) = oneshot::channel();
         let operation = CommandOperation::RemoveFromQueue;
 

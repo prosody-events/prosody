@@ -182,7 +182,7 @@ impl ModeConfiguration {
     ///
     /// A vector of `Topic`s configured for the current mode.
     #[must_use]
-    pub fn configured_topics(&self) -> Vec<Topic> {
+    pub(crate) fn configured_topics(&self) -> Vec<Topic> {
         match self {
             Self::Pipeline { consumer, .. } | Self::BestEffort { consumer, .. } => {
                 subscription(consumer).collect()

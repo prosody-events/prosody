@@ -196,7 +196,7 @@ where
     ///
     /// Returns [`TimerManagerError::Store`] if the underlying storage query
     /// fails.
-    pub async fn scheduled_triggers(
+    pub(crate) async fn scheduled_triggers(
         &self,
         key: &Key,
         timer_type: TimerType,
@@ -949,7 +949,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unwrap_used)]
     async fn test_concurrent_operations() -> Result<()> {
         time::pause();
 
@@ -963,10 +962,13 @@ mod tests {
         for i in 0..10 {
             let manager_clone = manager.clone();
             let handle = spawn(async move {
-                let trigger =
-                    create_test_trigger(&format!("concurrent-{i}"), 60 + i, TimerType::Application)
-                        .unwrap();
-                manager_clone.schedule(trigger).await
+                let trigger = create_test_trigger(
+                    &format!("concurrent-{i}"),
+                    60 + i,
+                    TimerType::Application,
+                )?;
+                manager_clone.schedule(trigger).await?;
+                Ok::<_, color_eyre::Report>(())
             });
             handles.push(handle);
         }
@@ -1121,7 +1123,12 @@ mod tests {
 
         // Schedule BOTH types at same (key, time)
         let app = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
-        let retry = Trigger::new(key.clone(), time, TimerType::DeferRetry, Span::current());
+        let retry = Trigger::new(
+            key.clone(),
+            time,
+            TimerType::DeferredMessage,
+            Span::current(),
+        );
         manager.schedule(app).await?;
         manager.schedule(retry).await?;
 
@@ -1133,7 +1140,7 @@ mod tests {
             1
         );
         assert_eq!(
-            count_scheduled(&manager, &key, TimerType::DeferRetry).await?,
+            count_scheduled(&manager, &key, TimerType::DeferredMessage).await?,
             1
         );
 
@@ -1152,8 +1159,8 @@ mod tests {
             "Application should fire"
         );
         assert!(
-            types.contains(&TimerType::DeferRetry),
-            "DeferRetry should fire"
+            types.contains(&TimerType::DeferredMessage),
+            "DeferredMessage should fire"
         );
         assert_eq!((t1.key.clone(), t1.time), (key.clone(), time));
         assert_eq!((t2.key.clone(), t2.time), (key.clone(), time));
@@ -1167,23 +1174,23 @@ mod tests {
         app_guard.commit().await;
 
         // Verify isolation: Application is removed from DB
-        // Note: DeferRetry is still in Firing state, so it's excluded from
+        // Note: DeferredMessage is still in Firing state, so it's excluded from
         // scheduled_times() (Firing state is excluded by design).
         // The important isolation property is that committing Application
-        // doesn't affect DeferRetry's ability to commit separately.
+        // doesn't affect DeferredMessage's ability to commit separately.
         assert_eq!(
             count_scheduled(&manager, &key, TimerType::Application).await?,
             0,
             "Application should be removed after commit"
         );
-        // DeferRetry in Firing state - excluded from scheduled_times by design
+        // DeferredMessage in Firing state - excluded from scheduled_times by design
         assert_eq!(
-            count_scheduled(&manager, &key, TimerType::DeferRetry).await?,
+            count_scheduled(&manager, &key, TimerType::DeferredMessage).await?,
             0,
-            "DeferRetry in Firing state is excluded from scheduled_times"
+            "DeferredMessage in Firing state is excluded from scheduled_times"
         );
 
-        // Commit DeferRetry and verify both gone from DB
+        // Commit DeferredMessage and verify both gone from DB
         retry_guard.commit().await;
         assert_eq!(
             count_scheduled(&manager, &key, TimerType::Application).await?,
@@ -1191,9 +1198,9 @@ mod tests {
             "Application should remain removed"
         );
         assert_eq!(
-            count_scheduled(&manager, &key, TimerType::DeferRetry).await?,
+            count_scheduled(&manager, &key, TimerType::DeferredMessage).await?,
             0,
-            "DeferRetry should be removed after commit"
+            "DeferredMessage should be removed after commit"
         );
 
         Ok(())
@@ -1209,7 +1216,12 @@ mod tests {
 
         // Schedule BOTH types at same (key, time)
         let app = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
-        let retry = Trigger::new(key.clone(), time, TimerType::DeferRetry, Span::current());
+        let retry = Trigger::new(
+            key.clone(),
+            time,
+            TimerType::DeferredMessage,
+            Span::current(),
+        );
         manager.schedule(app).await?;
         manager.schedule(retry).await?;
 
@@ -1221,7 +1233,7 @@ mod tests {
             1
         );
         assert_eq!(
-            count_scheduled(&manager, &key, TimerType::DeferRetry).await?,
+            count_scheduled(&manager, &key, TimerType::DeferredMessage).await?,
             1
         );
 
@@ -1235,18 +1247,18 @@ mod tests {
             0
         );
         assert_eq!(
-            count_scheduled(&manager, &key, TimerType::DeferRetry).await?,
+            count_scheduled(&manager, &key, TimerType::DeferredMessage).await?,
             1
         );
 
-        // Advance time - only DeferRetry should fire
+        // Advance time - only DeferredMessage should fire
         advance(Duration::from_secs(2)).await;
         task::yield_now().await;
-        let (fired, guard) = wait_and_fire(&mut stream, "DeferRetry timer").await?;
+        let (fired, guard) = wait_and_fire(&mut stream, "DeferredMessage timer").await?;
         assert_eq!(
             fired.timer_type,
-            TimerType::DeferRetry,
-            "Only DeferRetry fires"
+            TimerType::DeferredMessage,
+            "Only DeferredMessage fires"
         );
         assert_eq!((fired.key, fired.time), (key.clone(), time));
 

@@ -13,22 +13,18 @@ use quick_cache::sync::Cache;
 use rdkafka::ClientConfig;
 use rdkafka::client::{Client, DefaultClientContext};
 use rdkafka::config::RDKafkaLogLevel;
-use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use std::env::var;
-use std::io;
 use std::mem::take;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
-use thiserror::Error;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{Span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use validator::{Validate, ValidationErrors};
-use whoami::fallible::hostname;
+use validator::Validate;
 
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
@@ -46,8 +42,12 @@ use serde_json as json;
 use simd_json as json;
 use tracing::field::debug;
 use tracing::log::info;
+use whoami::hostname;
 
+mod error;
 mod injector;
+
+pub use error::ProducerError;
 
 /// Environment variable name for the source system identifier.
 const PROSODY_SOURCE_SYSTEM: &str = "PROSODY_SOURCE_SYSTEM";
@@ -118,7 +118,7 @@ impl ProducerConfigurationBuilder {
     ///
     /// An option containing the source system if configured
     #[must_use]
-    pub fn configured_source_system(&self) -> Option<String> {
+    pub(crate) fn configured_source_system(&self) -> Option<String> {
         self.source_system
             .clone()
             .or_else(|| var(PROSODY_SOURCE_SYSTEM).ok())
@@ -269,7 +269,9 @@ impl ProsodyProducer {
     /// # Errors
     ///
     /// Returns a `ProducerError` if the producer creation fails.
-    pub fn low_latency_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+    pub(crate) fn low_latency_producer(
+        mut config: ProducerConfiguration,
+    ) -> Result<Self, ProducerError> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
@@ -293,7 +295,9 @@ impl ProsodyProducer {
     /// # Errors
     ///
     /// Returns a `ProducerError` if the producer creation fails.
-    pub fn best_effort_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+    pub(crate) fn best_effort_producer(
+        mut config: ProducerConfiguration,
+    ) -> Result<Self, ProducerError> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
@@ -427,28 +431,4 @@ impl ProsodyProducer {
     pub(crate) fn kafka_client(&self) -> &Client<FutureProducerContext<DefaultClientContext>> {
         self.producer.client()
     }
-}
-
-/// Errors that can occur during producer operations.
-#[derive(Debug, Error)]
-pub enum ProducerError {
-    /// Indicates invalid producer configuration.
-    #[error("invalid producer configuration: {0:#}")]
-    Configuration(#[from] ValidationErrors),
-
-    /// Indicates a failure to serialize the payload.
-    #[error("failed to serialize payload: {0:#}")]
-    Serialization(#[from] json::Error),
-
-    /// Indicates a failure to set the message timestamp.
-    #[error("failed to set timestamp: {0:#}")]
-    SystemTime(#[from] SystemTimeError),
-
-    /// Indicates a failure to retrieve the hostname.
-    #[error("failed to get hostname: {0:#}")]
-    Hostname(#[from] io::Error),
-
-    /// Indicates a Kafka operation failure.
-    #[error("Kafka error: {0:#}")]
-    Kafka(#[from] KafkaError),
 }

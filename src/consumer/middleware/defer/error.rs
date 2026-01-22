@@ -2,8 +2,8 @@
 
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::event_context::BoxEventContextError;
-use crate::consumer::middleware::defer::loader::KafkaLoaderError;
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::consumer::middleware::defer::message::loader::KafkaLoaderError;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTimeError;
 use std::error::Error as StdError;
 use std::fmt::Debug;
@@ -17,7 +17,7 @@ use validator::ValidationErrors;
 /// # Type Parameters
 ///
 /// * `T` - Success value type
-/// * `S` - Store error type (from `DeferStore::Error`)
+/// * `S` - Store error type (from `MessageDeferStore::Error`)
 /// * `H` - Handler error type (from inner `FallibleHandler::Error`)
 /// * `L` - Loader error type (from `MessageLoader::Error`)
 pub type DeferResult<T, S, H, L> = Result<T, DeferError<S, H, L>>;
@@ -29,7 +29,7 @@ pub type DeferResult<T, S, H, L> = Result<T, DeferError<S, H, L>>;
 ///
 /// # Type Parameters
 ///
-/// * `S` - Store error type (from `DeferStore::Error`)
+/// * `S` - Store error type (from `MessageDeferStore::Error`)
 /// * `H` - Handler error type (from inner `FallibleHandler::Error`)
 /// * `L` - Loader error type (from `MessageLoader::Error`)
 #[derive(Debug, Error)]
@@ -90,6 +90,38 @@ pub enum DeferInitError {
     /// Cassandra store initialization failed.
     #[error("failed to initialize cassandra store: {0:#}")]
     CassandraStore(#[from] CassandraStoreError),
+}
+
+/// Unified error type for Cassandra-backed defer stores.
+///
+/// Used by both [`CassandraMessageDeferStore`] and [`CassandraTimerDeferStore`]
+/// to provide a common error type when message and timer stores share the same
+/// segment store type.
+///
+/// [`CassandraMessageDeferStore`]: crate::consumer::middleware::defer::message::store::cassandra::CassandraMessageDeferStore
+/// [`CassandraTimerDeferStore`]: crate::consumer::middleware::defer::timer::store::cassandra::CassandraTimerDeferStore
+#[derive(Debug, Error)]
+pub enum CassandraDeferStoreError {
+    /// Error from Cassandra operations.
+    #[error("cassandra error: {0:#}")]
+    Cassandra(#[from] CassandraStoreError),
+}
+
+impl ClassifyError for CassandraDeferStoreError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            // Delegate Cassandra errors to their classification
+            Self::Cassandra(error) => error.classify_error(),
+        }
+    }
+}
+
+impl From<super::segment::CassandraSegmentStoreError> for CassandraDeferStoreError {
+    fn from(err: super::segment::CassandraSegmentStoreError) -> Self {
+        match err {
+            super::segment::CassandraSegmentStoreError::Cassandra(e) => Self::Cassandra(e),
+        }
+    }
 }
 
 impl<S, H, L> ClassifyError for DeferError<S, H, L>

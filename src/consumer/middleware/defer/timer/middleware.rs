@@ -1,0 +1,123 @@
+//! Timer defer middleware for handling transient timer failures.
+//!
+//! This module provides [`TimerDeferMiddleware`] which wraps handlers with
+//! timer deferral capability independently of message deferral.
+
+use super::handler::TimerDeferHandler;
+use super::store::{CachedTimerDeferStore, TimerDeferStoreProvider};
+use crate::consumer::ConsumerConfiguration;
+use crate::consumer::middleware::defer::config::DeferConfiguration;
+use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
+use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
+use crate::{ConsumerGroup, Partition, Topic};
+use std::sync::Arc;
+
+/// Middleware that defers transiently-failed timers for timer-based retry.
+///
+/// This middleware handles timer deferral independently of message deferral.
+/// Both can be composed via `.layer()`.
+///
+/// # Type Parameters
+///
+/// * `P` - Timer defer store provider
+/// * `D` - Deferral decider (default: [`FailureTracker`])
+#[derive(Clone)]
+pub struct TimerDeferMiddleware<P, D = FailureTracker>
+where
+    P: TimerDeferStoreProvider,
+    D: DeferralDecider,
+{
+    config: DeferConfiguration,
+    provider: P,
+    decider: D,
+    consumer_group: ConsumerGroup,
+}
+
+impl<P, D> TimerDeferMiddleware<P, D>
+where
+    P: TimerDeferStoreProvider,
+    D: DeferralDecider,
+{
+    /// Creates middleware with configuration and store provider.
+    #[must_use]
+    pub fn new(
+        config: DeferConfiguration,
+        provider: P,
+        decider: D,
+        consumer_config: &ConsumerConfiguration,
+    ) -> Self {
+        Self {
+            config,
+            provider,
+            decider,
+            consumer_group: Arc::from(consumer_config.group_id.as_str()),
+        }
+    }
+}
+
+/// Creates [`TimerDeferHandler`]s for each partition.
+#[derive(Clone)]
+pub struct TimerDeferProvider<T, P, D = FailureTracker>
+where
+    P: TimerDeferStoreProvider,
+    D: DeferralDecider,
+{
+    inner_provider: T,
+    config: DeferConfiguration,
+    store_provider: P,
+    decider: D,
+    consumer_group: ConsumerGroup,
+}
+
+impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
+where
+    P: TimerDeferStoreProvider,
+    D: DeferralDecider,
+{
+    type Provider<T: FallibleHandlerProvider> = TimerDeferProvider<T, P, D>;
+
+    fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
+    where
+        T: FallibleHandlerProvider,
+    {
+        TimerDeferProvider {
+            inner_provider,
+            config: self.config.clone(),
+            store_provider: self.provider.clone(),
+            decider: self.decider.clone(),
+            consumer_group: self.consumer_group.clone(),
+        }
+    }
+}
+
+impl<T, P, D> FallibleHandlerProvider for TimerDeferProvider<T, P, D>
+where
+    T: FallibleHandlerProvider,
+    T::Handler: FallibleHandler,
+    P: TimerDeferStoreProvider,
+    D: DeferralDecider,
+{
+    type Handler = TimerDeferHandler<T::Handler, CachedTimerDeferStore<P::Store>, D>;
+
+    fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
+        // Create store synchronously - LazySegment handles async initialization
+        // internally
+        let store = self
+            .store_provider
+            .create_store(topic, partition, &self.consumer_group);
+        let cached_store = CachedTimerDeferStore::new(store, self.config.cache_size);
+
+        // Inner handler first
+        let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
+
+        // Timer defer wraps inner handler
+        TimerDeferHandler {
+            handler: inner_handler,
+            store: cached_store,
+            decider: self.decider.clone(),
+            config: self.config.clone(),
+            topic,
+            partition,
+        }
+    }
+}

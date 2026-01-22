@@ -109,10 +109,10 @@ fn random_key(g: &mut Gen) -> Key {
 
 /// Generates a random timer type.
 fn random_timer_type(g: &mut Gen) -> TimerType {
-    if bool::arbitrary(g) {
-        TimerType::Application
-    } else {
-        TimerType::DeferRetry
+    match u8::arbitrary(g) % 3 {
+        0 => TimerType::Application,
+        1 => TimerType::DeferredMessage,
+        _ => TimerType::DeferredTimer,
     }
 }
 

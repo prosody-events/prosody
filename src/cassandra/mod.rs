@@ -61,6 +61,9 @@ pub const TABLE_DEFERRED_SEGMENTS: &str = "deferred_segments";
 /// Table name for storing deferred offsets awaiting retry.
 pub const TABLE_DEFERRED_OFFSETS: &str = "deferred_offsets";
 
+/// Table name for storing deferred timers awaiting retry.
+pub const TABLE_DEFERRED_TIMERS: &str = "deferred_timers";
+
 /// Unified Cassandra store providing session and infrastructure for all
 /// components.
 ///

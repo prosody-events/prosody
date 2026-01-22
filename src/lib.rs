@@ -32,7 +32,8 @@
 //! use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 //! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 //! use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
-//! use prosody::consumer::middleware::{FallibleHandler, ClassifyError};
+//! use prosody::consumer::middleware::FallibleHandler;
+//! use prosody::error::ClassifyError;
 //! use prosody::consumer::DemandType;
 //! use prosody::consumer::message::ConsumerMessage;
 //! use prosody::consumer::event_context::EventContext;
@@ -237,7 +238,10 @@
 //! unit testing and continuous integration environments where setting up a real
 //! Kafka cluster might be impractical.
 
-#![allow(clippy::multiple_crate_versions)]
+#![allow(
+    clippy::multiple_crate_versions,
+    reason = "Transitive dependencies have version conflicts outside our control"
+)]
 
 use ::tracing::info;
 use fixedstr::Flexstr;
@@ -251,6 +255,7 @@ use std::sync::{Arc, LazyLock};
 pub mod admin;
 pub mod cassandra;
 pub mod consumer;
+pub mod error;
 pub mod heartbeat;
 pub mod high_level;
 pub mod producer;
@@ -266,9 +271,12 @@ mod util;
 /// `PROSODY_SUBSCRIBED_TOPICS` environment variable to facilitate testing
 /// without requiring a real Kafka cluster. The cluster is initialized the first
 /// time it's accessed and persists for the duration of the program.
-#[allow(clippy::unwrap_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "LazyLock requires non-fallible closure; test infra cannot recover from failure"
+)]
 static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
-    let cluster = MockCluster::new(3).unwrap();
+    let cluster = MockCluster::new(3).expect("Failed to create mock Kafka cluster");
     let bootstrap = cluster.bootstrap_servers();
 
     // Create topics from environment variable if set
@@ -276,7 +284,9 @@ static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
         for topic in topics_str.split(',') {
             let topic = topic.trim();
             if !topic.is_empty() {
-                cluster.create_topic(topic, 3, 3).unwrap();
+                cluster
+                    .create_topic(topic, 3, 3)
+                    .expect("Failed to create mock topic");
             }
         }
     }
@@ -428,4 +438,23 @@ pub trait ProcessScope {
 
     /// Creates a guard that releases resources when processing completes.
     fn process_scope(&self) -> Self::Guard;
+}
+
+/// Test utilities available only during test compilation.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use std::sync::LazyLock;
+    use tokio::runtime::{Builder, Runtime};
+
+    /// Shared multi-threaded runtime for all unit tests in the crate.
+    #[expect(
+        clippy::expect_used,
+        reason = "LazyLock requires non-fallible closure; test infra cannot recover from failure"
+    )]
+    pub static TEST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+        Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+    });
 }

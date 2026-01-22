@@ -64,6 +64,21 @@ struct PartitionInfo {
     partition: Partition,
 }
 
+/// Runtime context for partition message processing.
+///
+/// Groups the channels and trackers needed for partition processing,
+/// separating runtime state from static configuration.
+struct PartitionContext {
+    /// Tracks offset commits and processing progress.
+    offsets: OffsetTracker,
+    /// Channel receiving messages to process.
+    message_rx: Receiver<ConsumerMessage>,
+    /// Registry for monitoring processing and timer heartbeats.
+    heartbeats: HeartbeatRegistry,
+    /// Channel receiving shutdown signal.
+    shutdown_rx: watch::Receiver<bool>,
+}
+
 /// Configuration settings for a partition manager.
 ///
 /// Contains all the parameters needed to configure message processing
@@ -180,15 +195,13 @@ impl PartitionManager {
 
         // Spawn the background task for message handling
         let partition_info = PartitionInfo { topic, partition };
-        let handle = spawn(handle_messages(
-            config,
-            partition_info,
-            handler,
-            offsets.clone(),
+        let context = PartitionContext {
+            offsets: offsets.clone(),
             message_rx,
-            heartbeats.clone(),
+            heartbeats: heartbeats.clone(),
             shutdown_rx,
-        ));
+        };
+        let handle = spawn(handle_messages(config, partition_info, handler, context));
 
         Self {
             partition,
@@ -326,23 +339,23 @@ impl PartitionManager {
 /// * `config` - The partition configuration
 /// * `partition_info` - Information about the partition being processed
 /// * `handler` - Handler that processes messages
-/// * `offsets` - Tracks offset commits and processing progress
-/// * `message_rx` - Channel receiving messages to process
-/// * `heartbeats` - Registry for monitoring processing and timer heartbeats
-/// * `shutdown_rx` - Channel receiving shutdown signal
-#[allow(clippy::too_many_arguments)]
+/// * `context` - Runtime context containing channels and trackers
 async fn handle_messages<T, S>(
     config: PartitionConfiguration<S>,
     partition_info: PartitionInfo,
     handler: T,
-    offsets: OffsetTracker,
-    message_rx: Receiver<ConsumerMessage>,
-    heartbeats: HeartbeatRegistry,
-    shutdown_rx: watch::Receiver<bool>,
+    context: PartitionContext,
 ) where
     T: EventHandler,
     S: TriggerStore,
 {
+    let PartitionContext {
+        offsets,
+        message_rx,
+        heartbeats,
+        shutdown_rx,
+    } = context;
+
     let mut highest_offset_seen = -1;
 
     // Initialize idempotence cache if configured

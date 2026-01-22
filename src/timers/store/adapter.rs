@@ -12,7 +12,6 @@ use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
-use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::try_join;
@@ -139,42 +138,36 @@ where
     // consistency
     // ===================================================================
 
-    fn add_trigger(
+    async fn add_trigger(
         &self,
         segment: &Segment,
         slab: Slab,
         trigger: Trigger,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let ops = Arc::clone(&self.operations);
-        let segment_id = segment.id; // Extract segment ID
-        async move {
-            // Coordinate: slab metadata + slab trigger + key trigger
-            try_join!(
-                ops.insert_slab(&segment_id, slab.clone()),
-                ops.insert_slab_trigger(slab, trigger.clone()),
-                ops.insert_key_trigger(&segment_id, trigger),
-            )?;
-            Ok(())
-        }
+    ) -> Result<(), Self::Error> {
+        // Coordinate: slab metadata + slab trigger + key trigger
+        try_join!(
+            self.operations.insert_slab(&segment.id, slab.clone()),
+            self.operations.insert_slab_trigger(slab, trigger.clone()),
+            self.operations.insert_key_trigger(&segment.id, trigger),
+        )?;
+        Ok(())
     }
 
-    fn remove_trigger(
+    async fn remove_trigger(
         &self,
         segment: &Segment,
         slab: &Slab,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let ops = Arc::clone(&self.operations);
-        let segment_id = segment.id; // Extract segment ID
-        async move {
-            // Coordinate: delete from both tables
-            try_join!(
-                ops.delete_slab_trigger(slab, timer_type, key, time),
-                ops.delete_key_trigger(&segment_id, timer_type, key, time),
-            )?;
-            Ok(())
-        }
+    ) -> Result<(), Self::Error> {
+        // Coordinate: delete from both tables
+        try_join!(
+            self.operations
+                .delete_slab_trigger(slab, timer_type, key, time),
+            self.operations
+                .delete_key_trigger(&segment.id, timer_type, key, time),
+        )?;
+        Ok(())
     }
 }

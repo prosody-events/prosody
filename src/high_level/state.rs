@@ -9,7 +9,6 @@ use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams}
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
-use thiserror::Error;
 use tokio::sync::MutexGuard;
 use tracing::info;
 
@@ -67,24 +66,6 @@ impl<T> ConsumerState<T> {
             }
         }
     }
-
-    /// Retrieves a reference to the `ModeConfiguration` if available.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the `ModeConfiguration` if the consumer is in the
-    /// `Configured` or `Running` state.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConsumerStateError::UnconfiguredConsumer` if the consumer is in
-    /// the `Unconfigured` state.
-    pub fn mode_configuration(&self) -> Result<&ModeConfiguration, ConsumerStateError> {
-        match self {
-            ConsumerState::Unconfigured => Err(ConsumerStateError::UnconfiguredConsumer),
-            ConsumerState::Configured(config) | ConsumerState::Running { config, .. } => Ok(config),
-        }
-    }
 }
 
 impl<T> Display for ConsumerState<T> {
@@ -97,12 +78,4 @@ impl<T> Display for ConsumerState<T> {
 
         f.write_str(state)
     }
-}
-
-/// Errors that can occur during consumer state operations.
-#[derive(Debug, Error)]
-pub enum ConsumerStateError {
-    /// Attempted to use an unconfigured consumer.
-    #[error("unconfigured consumer; client does not have a valid consumer configuration")]
-    UnconfiguredConsumer,
 }

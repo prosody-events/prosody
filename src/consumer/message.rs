@@ -271,43 +271,34 @@ pub struct ConsumerMessageValue {
     pub payload: Payload,
 }
 
+#[cfg(test)]
+impl Default for ConsumerMessageValue {
+    fn default() -> Self {
+        Self {
+            source_system: None,
+            topic: "test-topic".into(),
+            partition: 0,
+            offset: 0,
+            key: "test-key".into(),
+            timestamp: chrono::Utc::now(),
+            payload: serde_json::json!({}),
+        }
+    }
+}
+
 impl ConsumerMessage {
-    /// Create a new `ConsumerMessage` from raw components.
+    /// Create a new `ConsumerMessage` from a message value and processing state
+    /// components.
     ///
     /// # Arguments
     ///
-    /// * `source_system` – Optional source system identifier.
-    /// * `topic` – Kafka topic name.
-    /// * `partition` – Partition index.
-    /// * `offset` – Offset within the partition.
-    /// * `key` – Message key.
-    /// * `timestamp` – Broker timestamp.
-    /// * `payload` – Message payload as JSON.
+    /// * `value` – The message data (topic, partition, offset, key, timestamp,
+    ///   payload, etc.).
     /// * `span` – Tracing span for distributed context.
     /// * `permit` – Semaphore permit for backpressure management.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn new(
-        source_system: Option<SourceSystem>,
-        topic: Topic,
-        partition: Partition,
-        offset: Offset,
-        key: Key,
-        timestamp: DateTime<Utc>,
-        payload: Payload,
-        span: Span,
-        permit: OwnedSemaphorePermit,
-    ) -> Self {
-        let value = Arc::new(ConsumerMessageValue {
-            source_system,
-            topic,
-            partition,
-            offset,
-            key,
-            timestamp,
-            payload,
-        });
-
+    pub fn new(value: ConsumerMessageValue, span: Span, permit: OwnedSemaphorePermit) -> Self {
+        let value = Arc::new(value);
         let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
 
         Self {
@@ -413,37 +404,40 @@ impl ConsumerMessage {
     /// * `key` - Message key
     /// * `payload` - JSON payload
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if semaphore permit acquisition fails (should never happen).
+    /// Returns an error if semaphore permit acquisition fails (should never
+    /// happen since the semaphore is created with 10 permits and we acquire
+    /// 1).
     #[cfg(test)]
-    #[must_use]
-    #[allow(clippy::panic)]
     pub fn for_testing(
         topic: Topic,
         partition: Partition,
         offset: Offset,
         key: Key,
         payload: Payload,
-    ) -> Self {
+    ) -> color_eyre::Result<Self> {
+        use color_eyre::eyre::eyre;
         use tokio::sync::Semaphore;
-        let semaphore = Arc::new(Semaphore::new(10));
-        let Ok(permit) = semaphore.try_acquire_owned() else {
-            // Semaphore with 10 permits, acquiring 1 - cannot fail
-            panic!("Semaphore should always have capacity")
-        };
 
-        Self::new(
-            None,
-            topic,
-            partition,
-            offset,
-            key,
-            chrono::Utc::now(),
-            payload,
+        let semaphore = Arc::new(Semaphore::new(10));
+        let permit = semaphore
+            .try_acquire_owned()
+            .map_err(|e| eyre!("Semaphore should always have capacity: {e}"))?;
+
+        Ok(Self::new(
+            ConsumerMessageValue {
+                source_system: None,
+                topic,
+                partition,
+                offset,
+                key,
+                timestamp: chrono::Utc::now(),
+                payload,
+            },
             tracing::Span::current(),
             permit,
-        )
+        ))
     }
 }
 

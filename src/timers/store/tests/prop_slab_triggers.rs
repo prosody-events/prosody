@@ -94,10 +94,10 @@ impl Arbitrary for SlabTriggerTestInput {
             let key_idx = usize::from(u8::arbitrary(g)) % key_pool.len();
             let key = Key::from(key_pool[key_idx]);
 
-            let timer_type = if bool::arbitrary(g) {
-                TimerType::Application
-            } else {
-                TimerType::DeferRetry
+            let timer_type = match u8::arbitrary(g) % 3 {
+                0 => TimerType::Application,
+                1 => TimerType::DeferredMessage,
+                _ => TimerType::DeferredTimer,
             };
 
             let time = CompactDateTime::arbitrary(g);
@@ -393,7 +393,7 @@ where
         let slab = Slab::new(*segment_id, *slab_id, slab_size);
 
         // Verify get_slab_triggers for each timer type
-        for timer_type in [TimerType::Application, TimerType::DeferRetry] {
+        for timer_type in TimerType::ALL {
             verify_slab_triggers_by_type(operations, model, &slab, timer_type).await?;
         }
 

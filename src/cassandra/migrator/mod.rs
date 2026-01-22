@@ -49,7 +49,10 @@
 //! (`YYYYMMDD_description.cql`). They support template substitution for table
 //! names and keyspace references.
 
-#![allow(clippy::same_name_method)]
+#![allow(
+    clippy::same_name_method,
+    reason = "RustEmbed derive macro generates get/iter methods that shadow trait methods"
+)]
 
 mod executor;
 mod loader;
@@ -61,7 +64,7 @@ mod validator;
 mod tests;
 
 use crate::cassandra::{CassandraStoreError, TABLE_SCHEMA_MIGRATIONS};
-use crate::consumer::middleware::{ClassifyError, ErrorCategory};
+use crate::error::{ClassifyError, ErrorCategory};
 use executor::MigrationExecutor;
 use futures::{TryStreamExt, pin_mut};
 use humantime::format_duration;
