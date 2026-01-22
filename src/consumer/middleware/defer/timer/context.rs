@@ -26,7 +26,6 @@ use crate::timers::datetime::CompactDateTime;
 use async_stream::try_stream;
 use futures::{Stream, TryStreamExt, pin_mut};
 use std::cmp::Ordering;
-use std::future::Future;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
 
@@ -138,152 +137,133 @@ where
         self.inner.uncancel();
     }
 
-    fn schedule(
+    async fn schedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let inner = self.inner.clone();
-        let store = self.store.clone();
-        let key = self.key().clone();
+    ) -> Result<(), Self::Error> {
+        // Non-Application timers pass through
+        if timer_type != TimerType::Application {
+            return self
+                .inner
+                .schedule(time, timer_type)
+                .await
+                .map_err(TimerDeferContextError::Context);
+        }
 
-        async move {
-            // Non-Application timers pass through
-            if timer_type != TimerType::Application {
-                return inner
-                    .schedule(time, timer_type)
-                    .await
-                    .map_err(TimerDeferContextError::Context);
-            }
-
-            if is_deferred(&store, &key).await? {
-                // Append to defer store
-                let trigger =
-                    Trigger::new(key, time, TimerType::Application, tracing::Span::current());
-                store
-                    .append_deferred_timer(&trigger)
-                    .await
-                    .map_err(TimerDeferContextError::Store)
-            } else {
-                // Delegate to inner context
-                inner
-                    .schedule(time, timer_type)
-                    .await
-                    .map_err(TimerDeferContextError::Context)
-            }
+        if is_deferred(&self.store, &self.key).await? {
+            // Append to defer store
+            let trigger = Trigger::new(
+                self.key.clone(),
+                time,
+                TimerType::Application,
+                tracing::Span::current(),
+            );
+            self.store
+                .append_deferred_timer(&trigger)
+                .await
+                .map_err(TimerDeferContextError::Store)
+        } else {
+            // Delegate to inner context
+            self.inner
+                .schedule(time, timer_type)
+                .await
+                .map_err(TimerDeferContextError::Context)
         }
     }
 
-    fn clear_and_schedule(
+    async fn clear_and_schedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let inner = self.inner.clone();
-        let store = self.store.clone();
-        let key = self.key().clone();
+    ) -> Result<(), Self::Error> {
+        // Non-Application timers pass through
+        if timer_type != TimerType::Application {
+            return self
+                .inner
+                .clear_and_schedule(time, timer_type)
+                .await
+                .map_err(TimerDeferContextError::Context);
+        }
 
-        async move {
-            // Non-Application timers pass through
-            if timer_type != TimerType::Application {
-                return inner
-                    .clear_and_schedule(time, timer_type)
-                    .await
-                    .map_err(TimerDeferContextError::Context);
-            }
-
-            if is_deferred(&store, &key).await? {
-                // Clear defer store, DeferredTimer, and schedule new timer concurrently
-                let (store_result, deferred_result, schedule_result) = tokio::join!(
-                    store.delete_key(&key),
-                    inner.clear_scheduled(TimerType::DeferredTimer),
-                    inner.clear_and_schedule(time, TimerType::Application),
-                );
-                store_result.map_err(TimerDeferContextError::Store)?;
-                deferred_result.map_err(TimerDeferContextError::Context)?;
-                schedule_result.map_err(TimerDeferContextError::Context)
-            } else {
-                // Not deferred - only need to clear and schedule in inner context
-                inner
-                    .clear_and_schedule(time, TimerType::Application)
-                    .await
-                    .map_err(TimerDeferContextError::Context)
-            }
+        if is_deferred(&self.store, &self.key).await? {
+            // Clear defer store, DeferredTimer, and schedule new timer concurrently
+            let (store_result, deferred_result, schedule_result) = tokio::join!(
+                self.store.delete_key(&self.key),
+                self.inner.clear_scheduled(TimerType::DeferredTimer),
+                self.inner.clear_and_schedule(time, TimerType::Application),
+            );
+            store_result.map_err(TimerDeferContextError::Store)?;
+            deferred_result.map_err(TimerDeferContextError::Context)?;
+            schedule_result.map_err(TimerDeferContextError::Context)
+        } else {
+            // Not deferred - only need to clear and schedule in inner context
+            self.inner
+                .clear_and_schedule(time, TimerType::Application)
+                .await
+                .map_err(TimerDeferContextError::Context)
         }
     }
 
-    fn unschedule(
+    async fn unschedule(
         &self,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let inner = self.inner.clone();
-        let store = self.store.clone();
-        let key = self.key().clone();
+    ) -> Result<(), Self::Error> {
+        // Non-Application timers pass through
+        if timer_type != TimerType::Application {
+            return self
+                .inner
+                .unschedule(time, timer_type)
+                .await
+                .map_err(TimerDeferContextError::Context);
+        }
 
-        async move {
-            // Non-Application timers pass through
-            if timer_type != TimerType::Application {
-                return inner
-                    .unschedule(time, timer_type)
-                    .await
-                    .map_err(TimerDeferContextError::Context);
-            }
-
-            if is_deferred(&store, &key).await? {
-                // Timer could be in either store - remove from both concurrently
-                let (store_result, context_result) = tokio::join!(
-                    store.remove_deferred_timer(&key, time),
-                    inner.unschedule(time, TimerType::Application),
-                );
-                store_result.map_err(TimerDeferContextError::Store)?;
-                context_result.map_err(TimerDeferContextError::Context)?;
-                Ok(())
-            } else {
-                // Not deferred - timer can only be in inner context
-                inner
-                    .unschedule(time, TimerType::Application)
-                    .await
-                    .map_err(TimerDeferContextError::Context)
-            }
+        if is_deferred(&self.store, &self.key).await? {
+            // Timer could be in either store - remove from both concurrently
+            let (store_result, context_result) = tokio::join!(
+                self.store.remove_deferred_timer(&self.key, time),
+                self.inner.unschedule(time, TimerType::Application),
+            );
+            store_result.map_err(TimerDeferContextError::Store)?;
+            context_result.map_err(TimerDeferContextError::Context)?;
+            Ok(())
+        } else {
+            // Not deferred - timer can only be in inner context
+            self.inner
+                .unschedule(time, TimerType::Application)
+                .await
+                .map_err(TimerDeferContextError::Context)
         }
     }
 
-    fn clear_scheduled(
-        &self,
-        timer_type: TimerType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let inner = self.inner.clone();
-        let store = self.store.clone();
-        let key = self.key().clone();
+    async fn clear_scheduled(&self, timer_type: TimerType) -> Result<(), Self::Error> {
+        // Non-Application timers pass through
+        if timer_type != TimerType::Application {
+            return self
+                .inner
+                .clear_scheduled(timer_type)
+                .await
+                .map_err(TimerDeferContextError::Context);
+        }
 
-        async move {
-            // Non-Application timers pass through
-            if timer_type != TimerType::Application {
-                return inner
-                    .clear_scheduled(timer_type)
-                    .await
-                    .map_err(TimerDeferContextError::Context);
-            }
-
-            if is_deferred(&store, &key).await? {
-                // Clear all three sources concurrently
-                let (store_result, deferred_result, application_result) = tokio::join!(
-                    store.delete_key(&key),
-                    inner.clear_scheduled(TimerType::DeferredTimer),
-                    inner.clear_scheduled(TimerType::Application),
-                );
-                store_result.map_err(TimerDeferContextError::Store)?;
-                deferred_result.map_err(TimerDeferContextError::Context)?;
-                application_result.map_err(TimerDeferContextError::Context)?;
-                Ok(())
-            } else {
-                // Not deferred - only clear Application timers from inner context
-                inner
-                    .clear_scheduled(TimerType::Application)
-                    .await
-                    .map_err(TimerDeferContextError::Context)
-            }
+        if is_deferred(&self.store, &self.key).await? {
+            // Clear all three sources concurrently
+            let (store_result, deferred_result, application_result) = tokio::join!(
+                self.store.delete_key(&self.key),
+                self.inner.clear_scheduled(TimerType::DeferredTimer),
+                self.inner.clear_scheduled(TimerType::Application),
+            );
+            store_result.map_err(TimerDeferContextError::Store)?;
+            deferred_result.map_err(TimerDeferContextError::Context)?;
+            application_result.map_err(TimerDeferContextError::Context)?;
+            Ok(())
+        } else {
+            // Not deferred - only clear Application timers from inner context
+            self.inner
+                .clear_scheduled(TimerType::Application)
+                .await
+                .map_err(TimerDeferContextError::Context)
         }
     }
 
