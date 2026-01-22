@@ -323,37 +323,41 @@ where
         let deferred_stream = store.deferred_times(&key);
         pin_mut!(deferred_stream);
 
-        let mut active_next = advance_active(&mut active_stream).await?;
-        let mut deferred_next = advance_deferred(&mut deferred_stream).await?;
+        let (mut active_next, mut deferred_next) = tokio::try_join!(
+            advance_active(&mut active_stream),
+            advance_deferred(&mut deferred_stream),
+        )?;
 
         // Merge while both streams have items
-        while let (Some(a), Some(d)) = (active_next, deferred_next) {
-            match a.cmp(&d) {
+        while let (Some(active), Some(deferred)) = (active_next, deferred_next) {
+            match active.cmp(&deferred) {
                 Ordering::Less => {
-                    yield a;
+                    yield active;
                     active_next = advance_active(&mut active_stream).await?;
                 }
                 Ordering::Greater => {
-                    yield d;
+                    yield deferred;
                     deferred_next = advance_deferred(&mut deferred_stream).await?;
                 }
                 Ordering::Equal => {
-                    yield a;
-                    active_next = advance_active(&mut active_stream).await?;
-                    deferred_next = advance_deferred(&mut deferred_stream).await?;
+                    yield active;
+                    (active_next, deferred_next) = tokio::try_join!(
+                        advance_active(&mut active_stream),
+                        advance_deferred(&mut deferred_stream),
+                    )?;
                 }
             }
         }
 
         // Drain remaining from active
-        while let Some(a) = active_next {
-            yield a;
+        while let Some(active) = active_next {
+            yield active;
             active_next = advance_active(&mut active_stream).await?;
         }
 
         // Drain remaining from deferred
-        while let Some(d) = deferred_next {
-            yield d;
+        while let Some(deferred) = deferred_next {
+            yield deferred;
             deferred_next = advance_deferred(&mut deferred_stream).await?;
         }
     }
