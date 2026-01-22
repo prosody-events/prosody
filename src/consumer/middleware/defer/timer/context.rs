@@ -24,7 +24,7 @@ use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use async_stream::try_stream;
-use futures::{Stream, TryStreamExt, pin_mut};
+use futures::{Stream, TryFutureExt, TryStreamExt, pin_mut};
 use std::cmp::Ordering;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
@@ -188,14 +188,18 @@ where
 
         if is_deferred(&self.store, &self.key).await? {
             // Clear defer store, DeferredTimer, and schedule new timer concurrently
-            let (store_result, deferred_result, schedule_result) = tokio::join!(
-                self.store.delete_key(&self.key),
-                self.inner.clear_scheduled(TimerType::DeferredTimer),
-                self.inner.clear_and_schedule(time, TimerType::Application),
-            );
-            store_result.map_err(TimerDeferContextError::Store)?;
-            deferred_result.map_err(TimerDeferContextError::Context)?;
-            schedule_result.map_err(TimerDeferContextError::Context)
+            tokio::try_join!(
+                self.store
+                    .delete_key(&self.key)
+                    .map_err(TimerDeferContextError::Store),
+                self.inner
+                    .clear_scheduled(TimerType::DeferredTimer)
+                    .map_err(TimerDeferContextError::Context),
+                self.inner
+                    .clear_and_schedule(time, TimerType::Application)
+                    .map_err(TimerDeferContextError::Context),
+            )?;
+            Ok(())
         } else {
             // Not deferred - only need to clear and schedule in inner context
             self.inner
@@ -221,12 +225,14 @@ where
 
         if is_deferred(&self.store, &self.key).await? {
             // Timer could be in either store - remove from both concurrently
-            let (store_result, context_result) = tokio::join!(
-                self.store.remove_deferred_timer(&self.key, time),
-                self.inner.unschedule(time, TimerType::Application),
-            );
-            store_result.map_err(TimerDeferContextError::Store)?;
-            context_result.map_err(TimerDeferContextError::Context)?;
+            tokio::try_join!(
+                self.store
+                    .remove_deferred_timer(&self.key, time)
+                    .map_err(TimerDeferContextError::Store),
+                self.inner
+                    .unschedule(time, TimerType::Application)
+                    .map_err(TimerDeferContextError::Context),
+            )?;
             Ok(())
         } else {
             // Not deferred - timer can only be in inner context
@@ -249,14 +255,17 @@ where
 
         if is_deferred(&self.store, &self.key).await? {
             // Clear all three sources concurrently
-            let (store_result, deferred_result, application_result) = tokio::join!(
-                self.store.delete_key(&self.key),
-                self.inner.clear_scheduled(TimerType::DeferredTimer),
-                self.inner.clear_scheduled(TimerType::Application),
-            );
-            store_result.map_err(TimerDeferContextError::Store)?;
-            deferred_result.map_err(TimerDeferContextError::Context)?;
-            application_result.map_err(TimerDeferContextError::Context)?;
+            tokio::try_join!(
+                self.store
+                    .delete_key(&self.key)
+                    .map_err(TimerDeferContextError::Store),
+                self.inner
+                    .clear_scheduled(TimerType::DeferredTimer)
+                    .map_err(TimerDeferContextError::Context),
+                self.inner
+                    .clear_scheduled(TimerType::Application)
+                    .map_err(TimerDeferContextError::Context),
+            )?;
             Ok(())
         } else {
             // Not deferred - only clear Application timers from inner context
