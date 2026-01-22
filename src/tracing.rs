@@ -5,10 +5,19 @@
 //! graceful - if exporter configuration fails, the system continues with a
 //! no-op tracer. This provides functionality to create a customizable tracing
 //! setup with optional additional layers.
+//!
+//! ## Sentry Integration
+//!
+//! If `SENTRY_DSN` is set, Sentry error tracking is automatically enabled.
+//! The [`initialize_tracing`] function returns an optional [`SentryGuard`] that
+//! must be kept alive for the duration of the application to ensure events are
+//! flushed on shutdown.
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{ExporterBuildError, Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer};
+use sentry::ClientInitGuard;
+use sentry::integrations::tracing::layer as sentry_tracing_layer;
 use std::env;
 use thiserror::Error;
 use tracing::level_filters::LevelFilter;
@@ -21,6 +30,12 @@ use tracing_subscriber::{EnvFilter, Layer, Registry, fmt};
 
 /// A layer that does nothing
 pub type Identity = TracingIdentity;
+
+/// Guard that keeps Sentry active until dropped.
+///
+/// When dropped, this guard flushes any pending events to Sentry with
+/// a timeout. Keep this alive for the duration of your application.
+pub type SentryGuard = ClientInitGuard;
 
 /// Initializes the tracing system with optional OpenTelemetry and OTLP
 /// exporter.
@@ -35,6 +50,12 @@ pub type Identity = TracingIdentity;
 ///
 /// An optional additional layer can be added to the tracing subscriber.
 ///
+/// # Sentry Integration
+///
+/// If `SENTRY_DSN` is set, Sentry error tracking is automatically enabled.
+/// Returns an optional [`SentryGuard`] that must be kept alive for the duration
+/// of the application to ensure events are flushed on shutdown.
+///
 /// # Arguments
 ///
 /// * `layer` - An optional additional layer to be added to the tracing
@@ -42,8 +63,8 @@ pub type Identity = TracingIdentity;
 ///
 /// # Returns
 ///
-/// Returns `Ok(())` if the tracing system is successfully initialized,
-/// or a `TracingError` if an error occurs during the process.
+/// Returns `Ok(Option<SentryGuard>)` if the tracing system is successfully
+/// initialized. The guard is `Some` if Sentry was enabled, `None` otherwise.
 ///
 /// # Errors
 ///
@@ -53,10 +74,13 @@ pub type Identity = TracingIdentity;
 ///
 /// Note: OTLP exporter errors (missing endpoint, unknown protocol, exporter
 /// build failures) are logged to stderr but do not cause the function to fail.
-pub fn initialize_tracing<T>(layer: Option<T>) -> Result<(), TracingError>
+pub fn initialize_tracing<T>(layer: Option<T>) -> Result<Option<SentryGuard>, TracingError>
 where
     T: Layer<Layered<OpenTelemetryLayer<Registry, Tracer>, Registry>> + Send + Sync,
 {
+    // Initialize Sentry if SENTRY_DSN is set
+    let sentry_guard = init_sentry();
+
     // Filter traces using an environment variable directive
     let env_filter = EnvFilter::builder()
         .with_env_var("PROSODY_LOG")
@@ -80,15 +104,47 @@ where
 
     let telemetry = tracing_opentelemetry::layer().with_tracer(trace_provider);
 
+    // Add Sentry tracing layer if Sentry is enabled
+    let sentry_layer = sentry_guard.as_ref().map(|_| sentry_tracing_layer());
+
     let subscriber = Registry::default()
         .with(telemetry)
         .with(layer)
+        .with(sentry_layer)
         .with(env_filter);
 
     // Set the subscriber as the global default
     set_global_default(subscriber)?;
 
-    Ok(())
+    Ok(sentry_guard)
+}
+
+/// Initializes Sentry if `SENTRY_DSN` environment variable is set.
+///
+/// # Configuration
+///
+/// * `in_app_include` is set to `["prosody"]` so Sentry marks frames from this
+///   crate as "in-app" code, making them stand out in stack traces.
+/// * `server_name` is set to the hostname for identifying which instance
+///   reported the error.
+///
+/// Returns `Some(SentryGuard)` if Sentry was successfully initialized,
+/// `None` if `SENTRY_DSN` is not set or is empty.
+fn init_sentry() -> Option<SentryGuard> {
+    let dsn = env::var("SENTRY_DSN").ok().filter(|s| !s.is_empty())?;
+
+    let guard = sentry::init((
+        dsn,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            server_name: whoami::hostname().ok().map(Into::into),
+            in_app_include: vec!["prosody"],
+            ..sentry::ClientOptions::default()
+        },
+    ));
+
+    // Only return the guard if Sentry is actually enabled (DSN was valid)
+    guard.is_enabled().then_some(guard)
 }
 
 /// Builds the OTLP span exporter for OpenTelemetry.

@@ -52,6 +52,7 @@ rdkafka = { version = "0.38", features = ["tracing"] }
 rust-embed = { version = "8.7", features = ["include-exclude"] }
 scc = "3.0"
 scylla = { version = "1.2", features = ["chrono-04"] }
+sentry = { version = "0.46", features = ["tracing"] }
 serde = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
