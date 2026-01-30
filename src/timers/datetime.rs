@@ -8,14 +8,22 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use chrono::{DateTime, Utc};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
+
+/// Nanosecond threshold for rounding up to the next second (500ms).
+const ROUND_UP_NANOS: u32 = 500_000_000;
 
 /// 32-bit datetime stored as epoch seconds.
 ///
 /// Stores time as seconds since Unix epoch (1970-01-01 UTC). Uses 4 bytes
 /// instead of 8+ bytes for standard datetime types. Supports range 1970-2106
-/// with second precision. Sub-second values are rounded to nearest second.
+/// with second precision.
+///
+/// # Rounding Behavior
+///
+/// Conversions from higher-precision types round to the nearest second:
+/// sub-second values ≥500ms round up, <500ms round down.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct CompactDateTime {
     epoch_seconds: u32,
@@ -205,20 +213,46 @@ impl CompactDateTime {
     }
 }
 
+/// Converts signed epoch seconds and nanoseconds to `CompactDateTime`, rounding
+/// to nearest second.
+fn from_seconds_nanos_i64(
+    seconds: i64,
+    nanos: u32,
+) -> Result<CompactDateTime, CompactDateTimeError> {
+    let seconds = if nanos >= ROUND_UP_NANOS {
+        seconds
+            .checked_add(1)
+            .ok_or(CompactDateTimeError::OutOfRange)?
+    } else {
+        seconds
+    };
+    let epoch_seconds = u32::try_from(seconds).map_err(|_| CompactDateTimeError::OutOfRange)?;
+    Ok(CompactDateTime { epoch_seconds })
+}
+
+/// Converts unsigned epoch seconds and nanoseconds to `CompactDateTime`,
+/// rounding to nearest second.
+fn from_seconds_nanos_u64(
+    seconds: u64,
+    nanos: u32,
+) -> Result<CompactDateTime, CompactDateTimeError> {
+    let seconds = if nanos >= ROUND_UP_NANOS {
+        seconds
+            .checked_add(1)
+            .ok_or(CompactDateTimeError::OutOfRange)?
+    } else {
+        seconds
+    };
+    let epoch_seconds = u32::try_from(seconds).map_err(|_| CompactDateTimeError::OutOfRange)?;
+    Ok(CompactDateTime { epoch_seconds })
+}
+
 impl TryFrom<DateTime<Utc>> for CompactDateTime {
     type Error = CompactDateTimeError;
 
-    /// Converts a [`DateTime<Utc>`] to a [`CompactDateTime`], rounding
-    /// sub-second precision to the nearest second.
+    /// Converts a [`DateTime<Utc>`] to a [`CompactDateTime`].
     ///
-    /// # Arguments
-    ///
-    /// * `value` - The `DateTime<Utc>` to convert.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(CompactDateTime)` if the timestamp fits in `u32`, otherwise an
-    /// error.
+    /// Rounds sub-second precision to the nearest second (≥500ms rounds up).
     ///
     /// # Errors
     ///
@@ -227,18 +261,51 @@ impl TryFrom<DateTime<Utc>> for CompactDateTime {
     fn try_from(value: DateTime<Utc>) -> Result<Self, Self::Error> {
         let seconds = value.timestamp();
         let nanos = value.timestamp_subsec_nanos();
+        from_seconds_nanos_i64(seconds, nanos)
+    }
+}
 
-        let seconds = if nanos >= 500_000_000 {
-            seconds
-                .checked_add(1)
-                .ok_or(CompactDateTimeError::OutOfRange)?
-        } else {
-            seconds
-        };
+impl TryFrom<SystemTime> for CompactDateTime {
+    type Error = CompactDateTimeError;
 
-        let epoch_seconds = u32::try_from(seconds).map_err(|_| CompactDateTimeError::OutOfRange)?;
+    /// Converts a [`SystemTime`] to a [`CompactDateTime`].
+    ///
+    /// Rounds sub-second precision to the nearest second (≥500ms rounds up).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactDateTimeError::OutOfRange`] if the time is before
+    /// 1970-01-01 or after 2106-02-07.
+    fn try_from(value: SystemTime) -> Result<Self, Self::Error> {
+        let duration = value
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| CompactDateTimeError::OutOfRange)?;
+        from_seconds_nanos_u64(duration.as_secs(), duration.subsec_nanos())
+    }
+}
 
-        Ok(CompactDateTime { epoch_seconds })
+impl From<CompactDateTime> for SystemTime {
+    /// Converts a [`CompactDateTime`] to a [`SystemTime`].
+    ///
+    /// # Returns
+    ///
+    /// A `SystemTime` corresponding to the same epoch second.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use prosody::timers::datetime::CompactDateTime;
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let compact_dt = CompactDateTime::from(12345_u32);
+    /// let system_time: SystemTime = compact_dt.into();
+    /// assert_eq!(
+    ///     system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+    ///     Duration::from_secs(12345)
+    /// );
+    /// ```
+    fn from(value: CompactDateTime) -> Self {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(value.epoch_seconds))
     }
 }
 
@@ -473,6 +540,84 @@ mod tests {
         let compact_dt = compact_datetime_from_epoch(12345_u32);
         let datetime: DateTime<Utc> = compact_dt.into();
         assert_eq!(datetime.timestamp(), 12345);
+    }
+
+    #[test]
+    fn test_try_from_system_time() {
+        let system_time = SystemTime::UNIX_EPOCH + Duration::from_secs(12345);
+        let compact_dt = CompactDateTime::try_from(system_time);
+        assert!(compact_dt.is_ok(), "Failed to convert from SystemTime");
+
+        if let Ok(compact_dt) = compact_dt {
+            assert_eq!(compact_dt.epoch_seconds(), 12345_u32);
+        }
+
+        // Test with sub-second rounding down
+        let system_time_round_down =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(12345) + Duration::from_nanos(499_999_999);
+        let compact_dt = CompactDateTime::try_from(system_time_round_down);
+        assert!(compact_dt.is_ok());
+        if let Ok(compact_dt) = compact_dt {
+            assert_eq!(compact_dt.epoch_seconds(), 12345_u32);
+        }
+
+        // Test with sub-second rounding up
+        let system_time_round_up =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(12345) + Duration::from_nanos(500_000_000);
+        let compact_dt = CompactDateTime::try_from(system_time_round_up);
+        assert!(compact_dt.is_ok());
+        if let Ok(compact_dt) = compact_dt {
+            assert_eq!(compact_dt.epoch_seconds(), 12346_u32);
+        }
+    }
+
+    #[test]
+    fn test_try_from_system_time_error_cases() {
+        // Test timestamp beyond u32::MAX
+        let large_system_time =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX) + 1);
+        let result = CompactDateTime::try_from(large_system_time);
+        assert!(matches!(result, Err(CompactDateTimeError::OutOfRange)));
+
+        // Test rounding at maximum value should fail
+        let max_with_rounding = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(u64::from(u32::MAX))
+            + Duration::from_nanos(500_000_000);
+        let result = CompactDateTime::try_from(max_with_rounding);
+        assert!(matches!(result, Err(CompactDateTimeError::OutOfRange)));
+    }
+
+    #[test]
+    fn test_from_compact_datetime_to_system_time() {
+        let compact_dt = compact_datetime_from_epoch(12345_u32);
+        let system_time: SystemTime = compact_dt.into();
+        let duration = system_time.duration_since(SystemTime::UNIX_EPOCH);
+        assert!(duration.is_ok());
+        if let Ok(duration) = duration {
+            assert_eq!(duration.as_secs(), 12345);
+        }
+    }
+
+    #[test]
+    fn test_system_time_roundtrip() {
+        let original = SystemTime::UNIX_EPOCH + Duration::from_secs(12345);
+        let compact_dt = CompactDateTime::try_from(original);
+        assert!(compact_dt.is_ok());
+        if let Ok(compact_dt) = compact_dt {
+            let roundtrip: SystemTime = compact_dt.into();
+            assert_eq!(roundtrip, original);
+        }
+
+        // Test MIN boundary
+        let min_compact = CompactDateTime::MIN;
+        let min_system_time: SystemTime = min_compact.into();
+        assert_eq!(min_system_time, SystemTime::UNIX_EPOCH);
+
+        // Test MAX boundary
+        let max_compact = CompactDateTime::MAX;
+        let max_system_time: SystemTime = max_compact.into();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX));
+        assert_eq!(max_system_time, expected);
     }
 
     #[test]
