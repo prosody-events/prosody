@@ -570,6 +570,8 @@ pub type BoxEventContext = Box<dyn DynEventContext>;
 /// Boxed error type for object-safe contexts.
 pub type BoxEventContextError = Box<dyn EventContextError>;
 
+impl Error for BoxEventContextError {}
+
 /// Object-safe version of `EventContext` with boxed futures and errors.
 ///
 /// Allows using `EventContext` trait objects where return types must be named.
