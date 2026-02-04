@@ -48,7 +48,7 @@ portable-atomic = { version = "1.0", features = ["float"] }
 quanta = "0.12"
 quick_cache = "0.6"
 rand = "0.9"
-rdkafka = { version = "0.38", features = ["tracing"] }
+rdkafka = { version = "0.39", features = ["curl-static", "tracing"] }
 rust-embed = { version = "8.7", features = ["include-exclude"] }
 scc = "3.0"
 scylla = { version = "1.2", features = ["chrono-04"] }

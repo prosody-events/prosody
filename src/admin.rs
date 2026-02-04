@@ -10,7 +10,8 @@ use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::error::KafkaError;
 use thiserror::Error;
-use validator::{Validate, ValidationErrors};
+use validator::Validate;
+pub use validator::ValidationErrors;
 
 use crate::util::{from_env, from_option_duration_env, from_option_env, from_vec_env};
 use crate::{Offset, Partition, Topic};
@@ -310,10 +311,10 @@ impl ProsodyAdminClient {
 #[derive(Debug, Error)]
 pub enum ProsodyAdminClientError {
     /// Indicates a Kafka operation failure.
-    #[error("Kafka error: {0:#}")]
+    #[error("kafka error: {0:#}")]
     Kafka(#[from] KafkaError),
 
     /// Configuration validation error.
-    #[error("Configuration validation error: {0:#}")]
+    #[error("configuration validation error: {0:#}")]
     Validation(#[from] ValidationErrors),
 }
