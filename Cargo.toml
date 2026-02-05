@@ -69,7 +69,7 @@ validator = { version = "0.20", features = ["derive"] }
 whoami = "2.0"
 
 [features]
-default = ["cmake-build", "curl-static", "ssl-vendored"]
+default = ["cmake-build"]
 
 # Build system
 cmake-build = ["rdkafka/cmake-build"]
@@ -83,19 +83,19 @@ ssl = ["rdkafka/ssl"]
 ssl-vendored = ["rdkafka/ssl-vendored"]
 
 # SASL/GSSAPI authentication
-sasl = ["rdkafka/sasl"]
 gssapi = ["rdkafka/gssapi"]
 gssapi-vendored = ["rdkafka/gssapi-vendored"]
+sasl = ["rdkafka/sasl"]
 
 # HTTP client (for schema registry, etc.)
 curl = ["rdkafka/curl"]
 curl-static = ["rdkafka/curl-static"]
 
 # Compression
+external-lz4 = ["rdkafka/external-lz4"]
 libz-static = ["rdkafka/libz-static"]
 zstd = ["rdkafka/zstd"]
 zstd-pkg-config = ["rdkafka/zstd-pkg-config"]
-external-lz4 = ["rdkafka/external-lz4"]
 
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
 simd-json = { version = "0.17", features = ["serde_impl"] }
