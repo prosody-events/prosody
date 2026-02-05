@@ -51,7 +51,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: cmake libssl-dev libcurl4-openssl-dev libsasl2-dev librdkafka-dev
+          packages: cmake libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
@@ -85,7 +85,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: cmake libssl-dev libcurl4-openssl-dev libsasl2-dev librdkafka-dev
+          packages: cmake libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install udeps from crates.io
@@ -104,7 +104,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: cmake libssl-dev libcurl4-openssl-dev libsasl2-dev librdkafka-dev
+          packages: cmake libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check documentation
