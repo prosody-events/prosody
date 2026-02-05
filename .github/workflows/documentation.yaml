@@ -24,7 +24,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: cmake libssl-dev libcurl4-openssl-dev libsasl2-dev
+          packages: cmake libssl-dev libcurl4-openssl-dev libsasl2-dev librdkafka-dev
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Configure cache

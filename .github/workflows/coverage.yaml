@@ -48,7 +48,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: cmake libssl-dev libcurl4-openssl-dev libsasl2-dev
+          packages: cmake libssl-dev libcurl4-openssl-dev libsasl2-dev librdkafka-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Install tarpaulin
         uses: baptiste0928/cargo-install@v3
