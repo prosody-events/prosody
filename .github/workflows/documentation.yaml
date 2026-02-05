@@ -21,6 +21,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: cmake libcurl4-openssl-dev
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Configure cache

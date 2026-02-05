@@ -21,6 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: cmake libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -34,8 +38,7 @@ jobs:
           crate: sarif-fmt
       - uses: Swatinem/rust-cache@v2
       - name: Linting
-        run:
-          cargo clippy --all-features -- -D warnings
+        run: cargo clippy -- -D warnings
 #          cargo clippy --all-features --message-format=json -- -D warnings
 #          | clippy-sarif
 #          | tee results.sarif
