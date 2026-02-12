@@ -3,7 +3,7 @@
 //! Provides helper functions for retry logic and table management.
 
 use crate::cassandra::{TABLE_LOCKS, TABLE_SCHEMA_MIGRATIONS};
-use rand::Rng;
+use rand::RngExt;
 use scylla::client::session::Session;
 use std::cmp::min;
 use std::time::Duration;

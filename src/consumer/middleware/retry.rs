@@ -82,7 +82,7 @@ use std::time::Duration;
 
 use derive_builder::Builder;
 use humantime::format_duration;
-use rand::Rng;
+use rand::RngExt;
 use tokio::select;
 use tokio::time::sleep;
 use tracing::{debug, error, info};

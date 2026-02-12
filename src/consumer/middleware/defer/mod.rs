@@ -28,7 +28,7 @@
 //! Message and timer defer middlewares compose independently via `.layer()`.
 
 use crate::timers::duration::CompactDuration;
-use rand::Rng;
+use rand::RngExt;
 use std::cmp::min;
 
 pub mod config;

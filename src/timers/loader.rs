@@ -17,7 +17,7 @@ use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
 use futures::{StreamExt, TryStreamExt};
-use rand::Rng;
+use rand::RngExt;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 use tokio::select;
