@@ -94,6 +94,14 @@ pub enum KeyTriggerOperation {
         /// The key.
         key: Key,
     },
+    /// Atomically clear all triggers for a key/type and schedule a new one
+    /// (`clear_and_schedule_key`).
+    ClearAndSchedule {
+        /// The segment ID.
+        segment_id: SegmentId,
+        /// The replacement trigger.
+        trigger: Trigger,
+    },
 }
 
 impl Arbitrary for KeyTriggerTestInput {
@@ -128,7 +136,7 @@ impl Arbitrary for KeyTriggerTestInput {
 
             let time = CompactDateTime::arbitrary(g);
 
-            let op = match u8::arbitrary(g) % 7 {
+            let op = match u8::arbitrary(g) % 8 {
                 0 => {
                     // Insert operation
                     let trigger = Trigger::new(key, time, timer_type, Span::current());
@@ -159,6 +167,13 @@ impl Arbitrary for KeyTriggerTestInput {
                     timer_type,
                     key,
                 },
+                6 => {
+                    let trigger = Trigger::new(key, time, timer_type, Span::current());
+                    KeyTriggerOperation::ClearAndSchedule {
+                        segment_id,
+                        trigger,
+                    }
+                }
                 _ => KeyTriggerOperation::ClearAllTypes { segment_id, key },
             };
             operations.push(op);
@@ -235,6 +250,18 @@ impl KeyTriggerModel {
             }
             KeyTriggerOperation::ClearAllTypes { segment_id, key } => {
                 self.triggers.remove(&(*segment_id, key.clone()));
+            }
+            KeyTriggerOperation::ClearAndSchedule {
+                segment_id,
+                trigger,
+            } => {
+                // Clear all triggers for this key/type, then insert the new one
+                let entry = self
+                    .triggers
+                    .entry((*segment_id, trigger.key.clone()))
+                    .or_default();
+                entry.retain(|(tt, _)| *tt != trigger.timer_type);
+                entry.insert((trigger.timer_type, trigger.time));
             }
         }
     }
@@ -466,6 +493,105 @@ where
     Ok(())
 }
 
+/// Applies a single operation to both the store and the reference model.
+async fn apply_operation<T>(
+    operations: &T,
+    model: &mut KeyTriggerModel,
+    op: &KeyTriggerOperation,
+    op_idx: usize,
+) -> color_eyre::Result<()>
+where
+    T: TriggerOperations + Send + Sync,
+    T::Error: Error + Send + Sync + 'static,
+{
+    match op {
+        KeyTriggerOperation::Insert {
+            segment_id,
+            trigger,
+        } => {
+            model.apply(op);
+            operations
+                .insert_key_trigger(segment_id, trigger.clone())
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!("Op #{op_idx} Insert trigger failed: {e:?}")
+                })?;
+        }
+        KeyTriggerOperation::GetTimes {
+            segment_id,
+            timer_type,
+            key,
+        } => {
+            verify_key_times(operations, model, segment_id, *timer_type, key)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetTimes: {e}"))?;
+        }
+        KeyTriggerOperation::GetTriggers {
+            segment_id,
+            timer_type,
+            key,
+        } => {
+            verify_key_triggers(operations, model, segment_id, *timer_type, key)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetTriggers: {e}"))?;
+        }
+        KeyTriggerOperation::GetAllTypes { segment_id, key } => {
+            verify_all_types(operations, model, segment_id, key)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetAllTypes: {e}"))?;
+        }
+        KeyTriggerOperation::Delete {
+            segment_id,
+            timer_type,
+            key,
+            time,
+        } => {
+            model.apply(op);
+            operations
+                .delete_key_trigger(segment_id, *timer_type, key, *time)
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!("Op #{op_idx} Delete trigger failed: {e:?}")
+                })?;
+        }
+        KeyTriggerOperation::ClearByType {
+            segment_id,
+            timer_type,
+            key,
+        } => {
+            model.apply(op);
+            operations
+                .clear_key_triggers(segment_id, *timer_type, key)
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!("Op #{op_idx} Clear triggers by type failed: {e:?}")
+                })?;
+        }
+        KeyTriggerOperation::ClearAllTypes { segment_id, key } => {
+            model.apply(op);
+            operations
+                .clear_key_triggers_all_types(segment_id, key)
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!("Op #{op_idx} Clear all triggers for key failed: {e:?}")
+                })?;
+        }
+        KeyTriggerOperation::ClearAndSchedule {
+            segment_id,
+            trigger,
+        } => {
+            model.apply(op);
+            operations
+                .clear_and_schedule_key(segment_id, trigger.clone())
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!("Op #{op_idx} ClearAndSchedule key failed: {e:?}")
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// Verifies that key trigger operations match the reference model behavior.
 ///
 /// # Test Strategy
@@ -514,100 +640,17 @@ where
 
     let mut model = KeyTriggerModel::new();
 
-    // Apply all operations to both store and model, verifying queries inline
     for (op_idx, op) in input.operations.iter().enumerate() {
-        match op {
-            KeyTriggerOperation::Insert {
-                segment_id,
-                trigger,
-            } => {
-                model.apply(op);
-                operations
-                    .insert_key_trigger(segment_id, trigger.clone())
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} Insert trigger failed: {e:?}")
-                    })?;
-            }
-            KeyTriggerOperation::GetTimes {
-                segment_id,
-                timer_type,
-                key,
-            } => {
-                // Verify query immediately against model
-                verify_key_times(operations, &model, segment_id, *timer_type, key)
-                    .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetTimes: {e}"))?;
-            }
-            KeyTriggerOperation::GetTriggers {
-                segment_id,
-                timer_type,
-                key,
-            } => {
-                // Verify query immediately against model
-                verify_key_triggers(operations, &model, segment_id, *timer_type, key)
-                    .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetTriggers: {e}"))?;
-            }
-            KeyTriggerOperation::GetAllTypes { segment_id, key } => {
-                // Verify query immediately against model
-                verify_all_types(operations, &model, segment_id, key)
-                    .await
-                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetAllTypes: {e}"))?;
-            }
-            KeyTriggerOperation::Delete {
-                segment_id,
-                timer_type,
-                key,
-                time,
-            } => {
-                model.apply(op);
-                operations
-                    .delete_key_trigger(segment_id, *timer_type, key, *time)
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} Delete trigger failed: {e:?}")
-                    })?;
-            }
-            KeyTriggerOperation::ClearByType {
-                segment_id,
-                timer_type,
-                key,
-            } => {
-                model.apply(op);
-                operations
-                    .clear_key_triggers(segment_id, *timer_type, key)
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} Clear triggers by type failed: {e:?}")
-                    })?;
-            }
-            KeyTriggerOperation::ClearAllTypes { segment_id, key } => {
-                model.apply(op);
-                operations
-                    .clear_key_triggers_all_types(segment_id, key)
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!(
-                            "Op #{op_idx} Clear all triggers for key failed: {e:?}"
-                        )
-                    })?;
-            }
-        }
+        apply_operation(operations, &mut model, op, op_idx).await?;
     }
 
     // Final sanity check: verify model-store equivalence for all keys
     // (queries were already verified inline, this catches any missed state)
-    let all_keys = model.all_keys();
-
-    for (segment_id, key) in &all_keys {
-        // Verify get_key_times and get_key_triggers for each timer type
+    for (segment_id, key) in &model.all_keys() {
         for timer_type in TimerType::ALL {
             verify_key_times(operations, &model, segment_id, timer_type, key).await?;
             verify_key_triggers(operations, &model, segment_id, timer_type, key).await?;
         }
-
-        // Verify get_key_triggers_all_types
         verify_all_types(operations, &model, segment_id, key).await?;
     }
 

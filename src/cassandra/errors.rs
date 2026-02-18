@@ -41,6 +41,10 @@ pub enum CassandraStoreError {
     #[error("expected integer type")]
     IntExpected,
 
+    /// Expected tinyint type but got something else.
+    #[error("expected tinyint type")]
+    TinyIntExpected,
+
     /// Invalid duration
     #[error("Invalid duration: {0:#}")]
     Duration(#[from] CompactDurationError),
@@ -154,7 +158,7 @@ impl ClassifyError for CassandraStoreError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             // Schema mismatch: code expects integer but database has different type
-            Self::IntExpected => ErrorCategory::Terminal,
+            Self::IntExpected | Self::TinyIntExpected => ErrorCategory::Terminal,
 
             Self::Duration(e) => e.classify_error(),
             Self::Session(e) => e.classify_error(),

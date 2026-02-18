@@ -184,11 +184,44 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 - Efficient strings: `Flexstr` (stack), `Intern` (interning)
 - Dependencies: `ahash`, `parking_lot`, `simd-json` (non-ARM)
 
+## Tracing / OpenTelemetry
+
+**Never cache `Span` - cache `Context` instead:**
+
+Spans have a lifecycle - they must be finished to flush to the collector. Caching spans causes problems:
+- Spans get replaced with `Span::none()` after processing completes
+- Cloning a span creates another reference to the same underlying span - finishing one finishes all
+- Holding spans in cache prevents proper flushing
+
+Instead, cache `opentelemetry::Context` and recreate spans on read:
+
+```rust
+use opentelemetry::Context;
+use tracing::{Span, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+// On cache write: extract context from span
+fn extract_context(span: &Span) -> Context {
+    span.context()
+}
+
+// On cache read: create fresh span linked to cached context
+fn create_span_from_context(context: &Context) -> Span {
+    let span = info_span!("operation.cached_load", cached = true);
+    span.set_parent(context.clone());
+    span
+}
+```
+
+See `CachedTimerDeferStore` for the reference implementation.
+
 ## Research
 
 - Automatically use context7 for code generation and library documentation.
 
 ## Active Technologies
+- Rust Edition 2024 (stable) + scylla 1.2 (Cassandra driver), tokio 1.45, parking_lot, scc, quick_cache 0.6, tracing, tracing-opentelemetry 0.32, opentelemetry 0.31 (001-reduce-timer-tombstones)
+- Apache Cassandra (via scylla-rust-driver) - `timer_typed_keys` and `timer_typed_slabs` tables (001-reduce-timer-tombstones)
 
 - Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer
   middleware (001-simplified-prop-tests)

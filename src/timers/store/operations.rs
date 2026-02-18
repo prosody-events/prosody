@@ -185,6 +185,25 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
         key: &Key,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Atomically clears existing timers and schedules a new one in the key
+    /// index.
+    ///
+    /// This is the key-index-only primitive for tombstone-free singleton
+    /// overwrites. For Cassandra, this uses a BATCH to atomically DELETE
+    /// clustering rows and UPDATE the static singleton slot. For in-memory
+    /// stores, this clears and inserts.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment containing this timer
+    /// * `trigger` - The new trigger to schedule (replaces all existing for
+    ///   key/type)
+    fn clear_and_schedule_key(
+        &self,
+        segment_id: &SegmentId,
+        trigger: Trigger,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Clears all triggers from the key index for a given key, across ALL timer
     /// types.
     fn clear_key_triggers_all_types(

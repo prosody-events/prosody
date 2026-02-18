@@ -15,13 +15,13 @@ use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
-use crate::timers::{DELETE_CONCURRENCY, TimerManager, TimerType, Trigger};
+use crate::timers::{TimerManager, TimerType, Trigger};
 use arc_swap::ArcSwapOption;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 use educe::Educe;
-use futures::stream::{iter, once};
+use futures::stream::once;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, pin_mut};
 use serde::de::StdError;
 use std::error::Error;
@@ -405,43 +405,8 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         self.run_cancellable(async |inner| {
-            let span = Span::current();
-
-            // Get scheduled triggers of this type
-            let mut triggers_to_delete = inner
-                .timers
-                .scheduled_triggers(&inner.key, timer_type)
-                .await?;
-            triggers_to_delete.retain(|trigger| trigger.time != time);
-
-            // Schedule exactly one new trigger.
-            inner
-                .timers
-                .schedule(Trigger::new(
-                    inner.key.clone(),
-                    time,
-                    timer_type,
-                    span.clone(),
-                ))
-                .await?;
-
-            // Unschedule all existing triggers in parallel, linking spans.
-            iter(triggers_to_delete)
-                .map(|trigger| {
-                    let span_clone = span.clone();
-                    let inner = Arc::clone(&inner);
-                    async move {
-                        // Link new span with the original trigger's span.
-                        span_clone.follows_from(trigger.span());
-                        inner
-                            .timers
-                            .unschedule(&trigger.key, trigger.time, trigger.timer_type)
-                            .await
-                    }
-                })
-                .buffer_unordered(DELETE_CONCURRENCY)
-                .try_collect::<()>()
-                .await
+            let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
+            inner.timers.clear_and_schedule(trigger).await
         })
         .await
     }

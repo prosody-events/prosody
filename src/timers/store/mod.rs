@@ -27,7 +27,9 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{TimerType, Trigger};
 use educe::Educe;
 use futures::Stream;
+use scylla::{DeserializeValue, SerializeValue};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -50,6 +52,9 @@ pub mod operations;
 /// This module is public to allow returning concrete `TableAdapter<T>` types
 /// from factory functions, but it's not re-exported at the crate root.
 pub mod adapter;
+
+/// Write-through cache wrapper for [`TriggerStore`] implementations.
+pub mod cached;
 
 #[cfg(test)]
 /// Comprehensive test suite for [`TriggerStore`] implementations.
@@ -143,6 +148,51 @@ impl Ord for TriggerV1 {
         // Compare by (key, time) tuple, ignoring span
         (&self.key, &self.time).cmp(&(&other.key, &other.time))
     }
+}
+
+/// Singleton timer data stored in the static map column.
+///
+/// Maps to the Cassandra UDT `timer_slot`:
+/// ```cql
+/// CREATE TYPE IF NOT EXISTS timer_slot (
+///     time int,
+///     span frozen<map<text, text>>
+/// );
+/// ```
+///
+/// Used for tombstone-free singleton timer storage in the `singleton_timers`
+/// static column of `timer_typed_keys`.
+#[derive(Clone, Debug, PartialEq, Eq, DeserializeValue, SerializeValue)]
+pub struct TimerSlot {
+    /// Timer trigger time.
+    ///
+    /// Stored as i32 in Cassandra but serialized/deserialized via
+    /// `CompactDateTime`'s scylla trait implementations.
+    pub time: CompactDateTime,
+    /// OpenTelemetry span context for trace continuity.
+    pub span: HashMap<String, String>,
+}
+
+/// State of a timer type's singleton slot.
+///
+/// Determined by querying the `singleton_timers` static map column:
+/// - Map entry absent → `Absent` (legacy data or never written)
+/// - Map entry present with value → `Singleton` (use static slot data)
+/// - Map entry present with NULL → `Overflow` (scan clustering columns)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    /// No map entry for this timer type.
+    ///
+    /// Legacy data or empty partition. Fall back to clustering column reads.
+    Absent,
+    /// Valid singleton timer in static slot.
+    ///
+    /// Contains the timer data; no clustering column scan needed.
+    Singleton(TimerSlot),
+    /// Map entry was deleted (NULL value).
+    ///
+    /// Multiple timers exist; scan clustering columns only.
+    Overflow,
 }
 
 /// Unique identifier for a timer segment.
@@ -271,7 +321,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     // ===================================================================
-    // Coordinated Write Operations (2 methods) - Used by TimerManager
+    // Coordinated Write Operations (3 methods) - Used by TimerManager
     // ===================================================================
 
     /// Adds a trigger to both slab and key tables.
@@ -293,5 +343,35 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Atomically clears existing timers and schedules a new one.
+    ///
+    /// This is the core primitive for tombstone-free singleton timer
+    /// overwrites. It performs the following operations atomically:
+    ///
+    /// 1. Writes the new timer to the slab index
+    /// 2. Writes the new timer to the singleton slot (static column)
+    /// 3. Deletes any existing clustering rows for this key/type
+    /// 4. Cleans up old slab index entries
+    ///
+    /// # Write Ordering
+    ///
+    /// New timer is written FIRST, then old entries are deleted. This ensures
+    /// at-least-once delivery: if a crash occurs, both timers may exist
+    /// temporarily, but the timer will never be lost.
+    ///
+    /// # Parameters
+    ///
+    /// * `segment` - The segment containing this timer
+    /// * `new_slab` - The slab for the new timer
+    /// * `new_trigger` - The new timer to schedule
+    /// * `old_slabs` - Slabs containing old timers to remove from slab index
+    fn clear_and_schedule(
+        &self,
+        segment: &Segment,
+        new_slab: Slab,
+        new_trigger: Trigger,
+        old_slabs: Vec<Slab>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

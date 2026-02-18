@@ -602,6 +602,46 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(())
     }
 
+    /// Atomically clears existing timers and schedules a new one in the key
+    /// index.
+    ///
+    /// For in-memory store, this simply clears and inserts.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Segment ID.
+    /// * `trigger` - The new trigger to schedule.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error.
+    async fn clear_and_schedule_key(
+        &self,
+        segment_id: &SegmentId,
+        trigger: Trigger,
+    ) -> Result<(), Self::Error> {
+        let partition_key = (*segment_id, trigger.key.clone());
+        let clustering_key = (trigger.timer_type, trigger.time);
+
+        // Get or create the partition entry
+        let mut entry = self
+            .0
+            .key_triggers
+            .entry_async(partition_key)
+            .await
+            .or_default();
+
+        // Clear all existing triggers for this timer_type
+        entry
+            .get_mut()
+            .retain(|(t_type, _time), _| *t_type != trigger.timer_type);
+
+        // Insert the new trigger
+        entry.get_mut().insert(clustering_key, trigger);
+
+        Ok(())
+    }
+
     /// Remove all triggers for a key across ALL timer types from the key index.
     ///
     /// This is a low-level primitive that clears the entire partition

@@ -22,6 +22,7 @@ use crate::timers::loader::{State, get_or_create_segment, slab_loader};
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
+use crate::timers::store::cached::CachedTriggerStore;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerType, Trigger};
 use async_stream::try_stream;
@@ -31,7 +32,7 @@ use std::sync::Arc;
 use tokio::spawn;
 use tokio::task::coop::cooperative;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{Instrument, Span};
+use tracing::{Instrument, Span, debug};
 
 /// Manages timer scheduling, storage, and delivery for a specific segment.
 ///
@@ -119,6 +120,47 @@ where
         Ok((stream, manager))
     }
 
+    /// Creates a timer manager with a write-through cache wrapping the store.
+    ///
+    /// Wraps the provided store in a [`CachedTriggerStore`] to accelerate
+    /// key-level reads for recently written timers.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - Unique identifier for the timer segment.
+    /// * `slab_size` - Duration of each time-based slab.
+    /// * `name` - Human-readable name for the segment.
+    /// * `store` - Persistent [`TriggerStore`] implementation.
+    /// * `heartbeats` - Heartbeat registry for background tasks.
+    /// * `cache_capacity` - Maximum entries in the trigger cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerManagerError`] if initialization fails.
+    pub async fn with_cache(
+        segment_id: SegmentId,
+        slab_size: CompactDuration,
+        name: &str,
+        store: T,
+        heartbeats: HeartbeatRegistry,
+        cache_capacity: usize,
+    ) -> Result<
+        (
+            impl Stream<Item = PendingTimer<CachedTriggerStore<T>>>,
+            TimerManager<CachedTriggerStore<T>>,
+        ),
+        TimerManagerError<T::Error>,
+    > {
+        TimerManager::new(
+            segment_id,
+            slab_size,
+            name,
+            CachedTriggerStore::new(store, cache_capacity),
+            heartbeats,
+        )
+        .await
+    }
+
     /// Retrieves all scheduled execution times for a given key.
     ///
     /// **State-aware filtering:**
@@ -186,32 +228,6 @@ where
         }
     }
 
-    /// Retrieves all scheduled triggers for a given key.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The entity key whose full [`Trigger`] records to list.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TimerManagerError::Store`] if the underlying storage query
-    /// fails.
-    pub(crate) async fn scheduled_triggers(
-        &self,
-        key: &Key,
-        timer_type: TimerType,
-    ) -> Result<Vec<Trigger>, TimerManagerError<T::Error>> {
-        self.0
-            .state
-            .trigger_lock()
-            .await
-            .store
-            .get_key_triggers(&self.0.segment.id, timer_type, key)
-            .map_err(TimerManagerError::Store)
-            .try_collect()
-            .await
-    }
-
     /// Schedules a new timer for future execution.
     ///
     /// Inserts the timer into persistent storage and, if its slab is currently
@@ -223,6 +239,13 @@ where
     /// - If the timer is in `FiringRescheduled` state, this is idempotent
     ///   (no-op).
     /// - Otherwise, performs normal scheduling with DB write.
+    ///
+    /// **Singleton vs Overflow routing:**
+    /// - First timer for a key/type → written to singleton slot (via store
+    ///   layer)
+    /// - Second+ timer → promotes to overflow (clustering columns)
+    /// - Use [`clear_and_schedule`](Self::clear_and_schedule) for
+    ///   tombstone-free singleton overwrites
     ///
     /// # Arguments
     ///
@@ -273,7 +296,17 @@ where
 
             // SCHEDULED or UNSCHEDULED: normal scheduling path
             _ => {
+                // Singleton detection: Check if this key/type already has timers.
+                // If no existing timers, this is a singleton case and the store
+                // layer will write to the static slot. If existing timers, this
+                // triggers singleton→overflow promotion in the store layer.
+                //
+                // NOTE: The actual singleton vs overflow routing is handled by
+                // the store's add_trigger implementation which checks slot state.
+                // This comment documents the expected behavior for clarity.
+
                 // Persist the trigger in both slab and key indices.
+                // The store layer handles singleton/overflow routing internally.
                 state
                     .store
                     .add_trigger(&self.0.segment, slab, trigger.clone())
@@ -399,6 +432,144 @@ where
             .try_buffer_unordered(DELETE_CONCURRENCY)
             .try_collect::<()>()
             .await
+    }
+
+    /// Atomically clears existing timers and schedules a new one.
+    ///
+    /// This is the optimized path for singleton timer overwrites. It:
+    /// 1. Reads existing triggers to determine which slabs need cleanup
+    /// 2. Updates the in-memory scheduler state (unschedule old, schedule new)
+    /// 3. Calls the store's `clear_and_schedule` for atomic persistence
+    ///
+    /// # State-aware behavior
+    ///
+    /// For each existing timer at a different time:
+    /// - `Firing` → no-op (timer is being processed)
+    /// - `FiringRescheduled` → transitions to `Firing` (cancels reschedule)
+    /// - `Scheduled` → unscheduled from `DelayQueue`
+    ///
+    /// For the new timer:
+    /// - If same time as existing `Firing` → transitions to `FiringRescheduled`
+    /// - Otherwise → schedules in `DelayQueue`
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The new timer to schedule (replaces all existing)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerManagerError`] if:
+    /// - Storage operations fail
+    /// - Scheduler operations fail
+    pub async fn clear_and_schedule(
+        &self,
+        trigger: Trigger,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let new_slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, trigger.time);
+        let new_slab_id = new_slab.id();
+        let state = self.0.state.trigger_lock().await;
+
+        // Get all existing triggers for this key/type
+        let existing_triggers: Vec<Trigger> = state
+            .store
+            .get_key_triggers(&self.0.segment.id, trigger.timer_type, &trigger.key)
+            .map_err(TimerManagerError::Store)
+            .try_collect()
+            .await?;
+
+        // Collect slabs that contain old triggers (for cleanup)
+        let old_slabs: Vec<Slab> = existing_triggers
+            .iter()
+            .filter(|t| t.time != trigger.time)
+            .map(|t| Slab::from_time(self.0.segment.id, self.0.segment.slab_size, t.time))
+            .collect();
+
+        debug!(
+            key = %trigger.key,
+            timer_type = ?trigger.timer_type,
+            new_time = ?trigger.time,
+            existing_count = existing_triggers.len(),
+            old_slab_count = old_slabs.len(),
+            "clear_and_schedule: read existing triggers, preparing state transitions"
+        );
+
+        // Step 1: Handle scheduler state for the new timer.
+        // STATE MACHINE PRESERVATION: Reuses the same Firing/FiringRescheduled/
+        // Scheduled transitions as schedule() and unschedule(). No new states
+        // are introduced; clear_and_schedule composes existing transitions.
+        let new_timer_state = state
+            .scheduler
+            .active_triggers()
+            .get_state(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+
+        match new_timer_state {
+            Some(TimerState::Firing) => {
+                // Reuses schedule()'s Firing → FiringRescheduled transition
+                debug!(
+                    key = %trigger.key,
+                    timer_type = ?trigger.timer_type,
+                    time = ?trigger.time,
+                    "clear_and_schedule: new timer is Firing, transitioning to FiringRescheduled"
+                );
+                state
+                    .scheduler
+                    .active_triggers()
+                    .set_state(
+                        &trigger.key,
+                        trigger.time,
+                        trigger.timer_type,
+                        TimerState::FiringRescheduled,
+                    )
+                    .await;
+                // Add to DelayQueue for re-firing
+                state.scheduler.add_to_queue(trigger.clone()).await?;
+            }
+            Some(TimerState::FiringRescheduled) => {
+                // Reuses schedule()'s idempotent FiringRescheduled no-op
+                debug!(
+                    key = %trigger.key,
+                    timer_type = ?trigger.timer_type,
+                    time = ?trigger.time,
+                    "clear_and_schedule: new timer already FiringRescheduled, no-op"
+                );
+            }
+            _ => {
+                // Reuses schedule()'s normal scheduling path
+                if state.is_owned(new_slab_id) {
+                    debug!(
+                        key = %trigger.key,
+                        timer_type = ?trigger.timer_type,
+                        time = ?trigger.time,
+                        state = ?new_timer_state,
+                        "clear_and_schedule: scheduling new timer in DelayQueue"
+                    );
+                    state.scheduler.schedule(trigger.clone()).await?;
+                }
+            }
+        }
+
+        // Step 2: Unschedule old timers from in-memory scheduler.
+        // STATE MACHINE PRESERVATION: Reuses the same state-aware transitions
+        // as unschedule(). Each old timer is handled according to its current
+        // state without introducing new transition paths.
+        unschedule_replaced_timers(&state, &self.0.segment, &trigger, &existing_triggers).await?;
+
+        // Step 3: Persist via store's clear_and_schedule
+        debug!(
+            key = %trigger.key,
+            timer_type = ?trigger.timer_type,
+            new_time = ?trigger.time,
+            old_slab_count = old_slabs.len(),
+            "clear_and_schedule: persisting to store"
+        );
+        state
+            .store
+            .clear_and_schedule(&self.0.segment, new_slab, trigger, old_slabs)
+            .await
+            .map_err(TimerManagerError::Store)?;
+
+        Ok(())
     }
 
     /// Transitions a timer from `Scheduled` to `Firing` state.
@@ -539,6 +710,82 @@ where
             }
         }
     }
+}
+
+/// Unschedules old timers from the in-memory scheduler during a
+/// `clear_and_schedule` operation.
+///
+/// STATE MACHINE PRESERVATION: Reuses the same state-aware transitions as
+/// `TimerManager::unschedule()`. Each old timer is handled according to its
+/// current state without introducing new transition paths:
+/// - `Firing` → no-op (being processed)
+/// - `FiringRescheduled` → `Firing` (cancels reschedule)
+/// - `Scheduled`/absent → removed from `DelayQueue`
+async fn unschedule_replaced_timers<T: TriggerStore>(
+    state: &State<T>,
+    segment: &Segment,
+    new_trigger: &Trigger,
+    existing_triggers: &[Trigger],
+) -> Result<(), TimerManagerError<T::Error>> {
+    for old_trigger in existing_triggers {
+        if old_trigger.time == new_trigger.time {
+            continue; // Same time as new - already handled by caller
+        }
+
+        let old_slab_id = Slab::from_time(segment.id, segment.slab_size, old_trigger.time).id();
+
+        let old_state = state
+            .scheduler
+            .active_triggers()
+            .get_state(&old_trigger.key, old_trigger.time, old_trigger.timer_type)
+            .await;
+
+        match old_state {
+            Some(TimerState::Firing) => {
+                debug!(
+                    key = %old_trigger.key,
+                    timer_type = ?old_trigger.timer_type,
+                    old_time = ?old_trigger.time,
+                    "clear_and_schedule: old timer is Firing, skipping (no-op)"
+                );
+            }
+            Some(TimerState::FiringRescheduled) => {
+                debug!(
+                    key = %old_trigger.key,
+                    timer_type = ?old_trigger.timer_type,
+                    old_time = ?old_trigger.time,
+                    "clear_and_schedule: old timer FiringRescheduled, cancelling reschedule"
+                );
+                state
+                    .scheduler
+                    .active_triggers()
+                    .set_state(
+                        &old_trigger.key,
+                        old_trigger.time,
+                        old_trigger.timer_type,
+                        TimerState::Firing,
+                    )
+                    .await;
+                state
+                    .scheduler
+                    .remove_from_queue(old_trigger.clone())
+                    .await?;
+            }
+            _ => {
+                if state.is_owned(old_slab_id) {
+                    debug!(
+                        key = %old_trigger.key,
+                        timer_type = ?old_trigger.timer_type,
+                        old_time = ?old_trigger.time,
+                        state = ?old_state,
+                        "clear_and_schedule: unscheduling old timer from DelayQueue"
+                    );
+                    state.scheduler.unschedule(old_trigger.clone()).await?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
