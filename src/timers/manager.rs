@@ -2263,4 +2263,85 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
+        // Issue #7: clear_and_schedule with Firing state at same time as new timer.
+        // Schedule T at time X → fire → clear_and_schedule at same time X →
+        // verify FiringRescheduled → commit → verify timer fires again.
+        time::pause();
+
+        let (mut stream, manager) = setup_timer_manager().await?;
+        let trigger = create_test_trigger("cas-firing-key", 1, TimerType::Application)?;
+
+        // Step 1: Schedule timer T at time X
+        manager.schedule(trigger.clone()).await?;
+        time::advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        // Step 2: Timer fires, enters Firing state
+        let pending = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("Expected pending timer"))?;
+        let firing = pending
+            .fire()
+            .await
+            .ok_or_else(|| eyre!("Expected active timer"))?;
+
+        // Step 3: clear_and_schedule with a new timer at the SAME time X.
+        // This exercises the Firing → FiringRescheduled path in clear_and_schedule
+        // (manager.rs line 507) and the skip in unschedule_replaced_timers (line 731).
+        manager.clear_and_schedule(trigger.clone()).await?;
+
+        // Step 4: Verify transition to FiringRescheduled
+        let is_scheduled = manager
+            .0
+            .state
+            .trigger_lock()
+            .await
+            .scheduler
+            .active_triggers()
+            .is_scheduled(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+        assert!(
+            is_scheduled,
+            "Timer should be scheduled (FiringRescheduled) after clear_and_schedule"
+        );
+
+        // Step 5: Commit the first firing. FiringRescheduled → re-queued.
+        let (_, guard) = firing.into_inner();
+        guard.commit().await;
+
+        // The timer should still be scheduled after commit
+        let times = manager
+            .scheduled_times(&trigger.key, TimerType::Application)
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(
+            times.len(),
+            1,
+            "Timer should be scheduled for re-firing after commit"
+        );
+        assert!(times.contains(&trigger.time));
+
+        // Advance time again and verify the timer fires a second time
+        time::advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        let pending2 = timeout(Duration::from_secs(5), stream.next())
+            .await?
+            .ok_or_else(|| eyre!("Expected timer to fire again after FiringRescheduled commit"))?;
+        let firing2 = pending2
+            .fire()
+            .await
+            .ok_or_else(|| eyre!("Second firing not active"))?;
+
+        let (refired_trigger, guard2) = firing2.into_inner();
+        assert_eq!(refired_trigger.key, trigger.key);
+        assert_eq!(refired_trigger.time, trigger.time);
+        guard2.commit().await;
+
+        Ok(())
+    }
 }

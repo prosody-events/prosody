@@ -9,50 +9,16 @@ use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentId, SlotState, TimerSlot, TriggerStore};
+use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
 use futures::future::try_join_all;
 use std::collections::HashMap;
 use std::future::{Future, ready};
-use std::hash::BuildHasher;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::try_join;
 use tracing::{debug, instrument};
-
-/// Determines the slot state for a timer type from a singleton map column
-/// value.
-///
-/// Interprets the `singleton_timers` CQL map column into the three possible
-/// slot states:
-///
-/// - **Absent**: Column is NULL, or map has no entry for this type (legacy data
-///   or empty).
-/// - **Singleton**: Map entry has a value (timer stored in static slot).
-/// - **Overflow**: Map entry is NULL (multiple timers, scan clustering
-///   columns).
-///
-/// # Arguments
-///
-/// * `singleton_map` - The deserialized `singleton_timers` static column.
-///   `None` if the column itself is NULL (legacy partition without the column).
-/// * `timer_type` - The timer type to look up in the map.
-#[must_use]
-pub fn determine_slot_state<S: BuildHasher>(
-    singleton_map: Option<&HashMap<i8, Option<TimerSlot>, S>>,
-    timer_type: TimerType,
-) -> SlotState {
-    let Some(map) = singleton_map else {
-        return SlotState::Absent;
-    };
-
-    match map.get(&i8::from(timer_type)) {
-        None => SlotState::Absent,
-        Some(None) => SlotState::Overflow,
-        Some(Some(slot)) => SlotState::Singleton(slot.clone()),
-    }
-}
 
 /// Adapts `TriggerOperations` to implement `TriggerStore`.
 ///

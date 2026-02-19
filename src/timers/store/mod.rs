@@ -27,9 +27,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{TimerType, Trigger};
 use educe::Educe;
 use futures::Stream;
-use scylla::{DeserializeValue, SerializeValue};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -148,51 +146,6 @@ impl Ord for TriggerV1 {
         // Compare by (key, time) tuple, ignoring span
         (&self.key, &self.time).cmp(&(&other.key, &other.time))
     }
-}
-
-/// Singleton timer data stored in the static map column.
-///
-/// Maps to the Cassandra UDT `timer_slot`:
-/// ```cql
-/// CREATE TYPE IF NOT EXISTS timer_slot (
-///     time int,
-///     span frozen<map<text, text>>
-/// );
-/// ```
-///
-/// Used for tombstone-free singleton timer storage in the `singleton_timers`
-/// static column of `timer_typed_keys`.
-#[derive(Clone, Debug, PartialEq, Eq, DeserializeValue, SerializeValue)]
-pub struct TimerSlot {
-    /// Timer trigger time.
-    ///
-    /// Stored as i32 in Cassandra but serialized/deserialized via
-    /// `CompactDateTime`'s scylla trait implementations.
-    pub time: CompactDateTime,
-    /// OpenTelemetry span context for trace continuity.
-    pub span: HashMap<String, String>,
-}
-
-/// State of a timer type's singleton slot.
-///
-/// Determined by querying the `singleton_timers` static map column:
-/// - Map entry absent → `Absent` (legacy data or never written)
-/// - Map entry present with value → `Singleton` (use static slot data)
-/// - Map entry present with NULL → `Overflow` (scan clustering columns)
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SlotState {
-    /// No map entry for this timer type.
-    ///
-    /// Legacy data or empty partition. Fall back to clustering column reads.
-    Absent,
-    /// Valid singleton timer in static slot.
-    ///
-    /// Contains the timer data; no clustering column scan needed.
-    Singleton(TimerSlot),
-    /// Map entry was deleted (NULL value).
-    ///
-    /// Multiple timers exist; scan clustering columns only.
-    Overflow,
 }
 
 /// Unique identifier for a timer segment.

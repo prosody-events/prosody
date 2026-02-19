@@ -9,9 +9,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::cassandra::queries::Queries;
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{
-    InvalidSegmentVersionError, Segment, SegmentId, SegmentVersion, SlotState, TimerSlot,
-};
+use crate::timers::store::{InvalidSegmentVersionError, Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use educe::Educe;
@@ -21,6 +19,7 @@ use quick_cache::sync::Cache;
 use scylla::client::session::Session;
 use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
+use scylla::{DeserializeValue, SerializeValue};
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -48,6 +47,51 @@ type SingletonCacheKey = (SegmentId, Key, TimerType);
 /// Sized to cover the active working set of keys. Cache misses simply
 /// fall back to a DB read, so undersizing only costs an extra query.
 const SINGLETON_CACHE_CAPACITY: usize = 8_192;
+
+/// Singleton timer data stored in the static map column.
+///
+/// Maps to the Cassandra UDT `timer_slot`:
+/// ```cql
+/// CREATE TYPE IF NOT EXISTS timer_slot (
+///     time int,
+///     span frozen<map<text, text>>
+/// );
+/// ```
+///
+/// Used for tombstone-free singleton timer storage in the `singleton_timers`
+/// static column of `timer_typed_keys`.
+#[derive(Clone, Debug, PartialEq, Eq, DeserializeValue, SerializeValue)]
+pub struct TimerSlot {
+    /// Timer trigger time.
+    ///
+    /// Stored as i32 in Cassandra but serialized/deserialized via
+    /// `CompactDateTime`'s scylla trait implementations.
+    pub time: CompactDateTime,
+    /// OpenTelemetry span context for trace continuity.
+    pub span: HashMap<String, String>,
+}
+
+/// State of a timer type's singleton slot.
+///
+/// Determined by querying the `singleton_timers` static map column:
+/// - Map entry absent → `Absent` (legacy data or never written)
+/// - Map entry present with value → `Singleton` (use static slot data)
+/// - Map entry present with NULL → `Overflow` (scan clustering columns)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    /// No map entry for this timer type.
+    ///
+    /// Legacy data or empty partition. Fall back to clustering column reads.
+    Absent,
+    /// Valid singleton timer in static slot.
+    ///
+    /// Contains the timer data; no clustering column scan needed.
+    Singleton(TimerSlot),
+    /// Map entry was deleted (NULL value).
+    ///
+    /// Multiple timers exist; scan clustering columns only.
+    Overflow,
+}
 
 /// Cassandra-based implementation of [`TriggerStore`](super::TriggerStore).
 ///
@@ -1328,11 +1372,16 @@ impl ClassifyError for CassandraTriggerStoreError {
 #[cfg(test)]
 mod test {
     use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
+    use crate::Key;
     use crate::cassandra::CassandraStore;
+    use crate::timers::TimerType;
+    use crate::timers::Trigger;
+    use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
     use crate::timers::slab::{Slab, SlabId};
     use crate::timers::store::operations::TriggerOperations;
     use crate::timers::store::{Segment, SegmentId, SegmentVersion};
+    use super::SlotState;
     use crate::tracing::init_test_logging;
     use crate::trigger_store_tests;
     use color_eyre::Result;
@@ -1534,6 +1583,137 @@ mod test {
         assert_eq!(results, expected, "Wrap-around range query failed");
 
         // Cleanup
+        store.delete_segment(&segment_id).await?;
+
+        Ok(())
+    }
+
+    /// Verifies the singleton slot state machine lifecycle:
+    /// Absent → Singleton → Singleton (replacement) → Absent (after promotion)
+    /// → Singleton
+    ///
+    /// This confirms the tombstone-free optimization actually transitions
+    /// through the expected states, and that type isolation holds between
+    /// timer types.
+    #[tokio::test]
+    async fn test_singleton_slot_round_trip() -> Result<()> {
+        init_test_logging();
+
+        let slab_size = CompactDuration::new(60);
+        let config = test_cassandra_config("prosody_test");
+        let cassandra_store = CassandraStore::new(&config).await?;
+        let store =
+            CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
+
+        // Unique segment + key per test run to avoid cross-test interference.
+        let segment_id = SegmentId::from(Uuid::new_v4());
+        let segment = Segment {
+            id: segment_id,
+            name: "slot_round_trip".to_owned(),
+            slab_size,
+            version: SegmentVersion::V1,
+        };
+        store.insert_segment(segment).await?;
+
+        let key: Key = format!("slot-test-{}", Uuid::new_v4()).into();
+        let t1 = CompactDateTime::from(1_000_000u32);
+        let t2 = CompactDateTime::from(2_000_000u32);
+        let t3 = CompactDateTime::from(3_000_000u32);
+        let t4 = CompactDateTime::from(4_000_000u32);
+
+        // Phase 1: Initial state — no data, slot is Absent.
+        let state = store
+            .get_singleton_slot(&segment_id, &key, TimerType::Application)
+            .await?;
+        assert_eq!(state, SlotState::Absent, "phase 1: expected Absent");
+
+        // Phase 2: clear_and_schedule_key(t1) → Singleton(t1)
+        let trigger1 = Trigger::for_testing(key.clone(), t1, TimerType::Application);
+        store.clear_and_schedule_key(&segment_id, trigger1).await?;
+
+        let state = store
+            .get_singleton_slot(&segment_id, &key, TimerType::Application)
+            .await?;
+        assert!(
+            matches!(&state, SlotState::Singleton(slot) if slot.time == t1),
+            "phase 2: expected Singleton(t1), got {state:?}"
+        );
+
+        // Phase 3: clear_and_schedule_key(t2) → Singleton(t2) (singleton→singleton, no
+        // tombstone)
+        let trigger2 = Trigger::for_testing(key.clone(), t2, TimerType::Application);
+        store.clear_and_schedule_key(&segment_id, trigger2).await?;
+
+        let state = store
+            .get_singleton_slot(&segment_id, &key, TimerType::Application)
+            .await?;
+        assert!(
+            matches!(&state, SlotState::Singleton(slot) if slot.time == t2),
+            "phase 3: expected Singleton(t2), got {state:?}"
+        );
+
+        // Phase 4: insert_key_trigger(t3) promotes singleton to clustering → slot
+        // becomes Absent
+        let trigger3 = Trigger::for_testing(key.clone(), t3, TimerType::Application);
+        store.insert_key_trigger(&segment_id, trigger3).await?;
+
+        let state = store
+            .get_singleton_slot(&segment_id, &key, TimerType::Application)
+            .await?;
+        assert_eq!(
+            state,
+            SlotState::Absent,
+            "phase 4: expected Absent after promotion"
+        );
+
+        // Phase 5: clear_and_schedule_key(t4) on an overflow key → back to
+        // Singleton(t4)
+        let trigger4 = Trigger::for_testing(key.clone(), t4, TimerType::Application);
+        store.clear_and_schedule_key(&segment_id, trigger4).await?;
+
+        let state = store
+            .get_singleton_slot(&segment_id, &key, TimerType::Application)
+            .await?;
+        assert!(
+            matches!(&state, SlotState::Singleton(slot) if slot.time == t4),
+            "phase 5: expected Singleton(t4), got {state:?}"
+        );
+
+        // Phase 6: Verify get_key_times returns exactly [t4].
+        let times: Vec<CompactDateTime> = store
+            .get_key_times(&segment_id, TimerType::Application, &key)
+            .try_collect()
+            .await?;
+        assert_eq!(
+            times,
+            vec![t4],
+            "phase 6: get_key_times should return exactly [t4]"
+        );
+
+        // Phase 7: Type isolation — DeferredMessage slot is still Absent.
+        let state = store
+            .get_singleton_slot(&segment_id, &key, TimerType::DeferredMessage)
+            .await?;
+        assert_eq!(
+            state,
+            SlotState::Absent,
+            "phase 7: DeferredMessage slot should be Absent"
+        );
+
+        // Phase 8: Cleanup — clear_key_triggers_all_types resets everything.
+        store
+            .clear_key_triggers_all_types(&segment_id, &key)
+            .await?;
+
+        let state = store
+            .get_singleton_slot(&segment_id, &key, TimerType::Application)
+            .await?;
+        assert_eq!(
+            state,
+            SlotState::Absent,
+            "phase 8: expected Absent after cleanup"
+        );
+
         store.delete_segment(&segment_id).await?;
 
         Ok(())
