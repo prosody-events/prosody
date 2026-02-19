@@ -231,17 +231,14 @@ impl CassandraTriggerStore {
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(String, CompactDuration, Option<i8>)>()
+            .maybe_first_row::<(String, CompactDuration, Option<SegmentVersion>)>()
             .map_err(CassandraStoreError::from)?;
 
         let Some((name, slab_size, version)) = row else {
             return Ok(None);
         };
 
-        let version = version
-            .map(SegmentVersion::try_from)
-            .transpose()?
-            .unwrap_or(SegmentVersion::V1);
+        let version = version.unwrap_or(SegmentVersion::V1);
 
         Ok(Some(Segment {
             id: *segment_id,
@@ -255,12 +252,12 @@ impl CassandraTriggerStore {
     // Singleton Slot Operations (Cassandra-specific, not part of TriggerOperations)
     // =========================================================================
 
-    /// Fetches the raw `singleton_timers` map from the database.
+    /// Fetches the `singleton_timers` map from the database.
     async fn fetch_singleton_map(
         &self,
         segment_id: &SegmentId,
         key: &Key,
-    ) -> Result<Option<HashMap<i8, Option<TimerSlot>>>, CassandraTriggerStoreError> {
+    ) -> Result<Option<HashMap<TimerType, Option<TimerSlot>>>, CassandraTriggerStoreError> {
         let row = self
             .session()
             .execute_unpaged(
@@ -271,7 +268,7 @@ impl CassandraTriggerStore {
             .map_err(CassandraStoreError::from)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(Option<HashMap<i8, Option<TimerSlot>>>,)>()
+            .maybe_first_row::<(Option<HashMap<TimerType, Option<TimerSlot>>>,)>()
             .map_err(CassandraStoreError::from)?;
 
         Ok(row.and_then(|(map,)| map))
@@ -298,8 +295,7 @@ impl CassandraTriggerStore {
             return Ok(SlotState::Absent);
         };
 
-        let timer_type_key = i8::from(timer_type);
-        match map.get(&timer_type_key) {
+        match map.get(&timer_type) {
             None => Ok(SlotState::Absent),
             Some(None) => Ok(SlotState::Overflow),
             Some(Some(slot)) => Ok(SlotState::Singleton(slot.clone())),
@@ -320,7 +316,7 @@ impl CassandraTriggerStore {
         &self,
         segment_id: &SegmentId,
         key: &Key,
-    ) -> Result<Option<HashMap<i8, Option<TimerSlot>>>, CassandraTriggerStoreError> {
+    ) -> Result<Option<HashMap<TimerType, Option<TimerSlot>>>, CassandraTriggerStoreError> {
         self.fetch_singleton_map(segment_id, key).await
     }
 
@@ -343,8 +339,6 @@ impl CassandraTriggerStore {
         timer_type: TimerType,
         slot: TimerSlot,
     ) -> Result<(), CassandraTriggerStoreError> {
-        let timer_type_i8 = i8::from(timer_type);
-
         self.execute_with_optional_ttl(
             slot.time,
             &self.queries().batch_clear_and_set_singleton,
@@ -353,9 +347,9 @@ impl CassandraTriggerStore {
                 (
                     segment_id,
                     key.as_ref(),
-                    timer_type_i8,
+                    timer_type,
                     ttl,
-                    timer_type_i8,
+                    timer_type,
                     &slot,
                     segment_id,
                     key.as_ref(),
@@ -365,8 +359,8 @@ impl CassandraTriggerStore {
                 (
                     segment_id,
                     key.as_ref(),
-                    timer_type_i8,
-                    timer_type_i8,
+                    timer_type,
+                    timer_type,
                     &slot,
                     segment_id,
                     key.as_ref(),
@@ -395,14 +389,12 @@ impl CassandraTriggerStore {
         timer_type: TimerType,
         slot: TimerSlot,
     ) -> Result<(), CassandraTriggerStoreError> {
-        let timer_type_i8 = i8::from(timer_type);
-
         self.execute_with_optional_ttl(
             slot.time,
             &self.queries().set_singleton_slot,
             &self.queries().set_singleton_slot_no_ttl,
-            |ttl| (ttl, timer_type_i8, &slot, segment_id, key.as_ref()),
-            || (timer_type_i8, &slot, segment_id, key.as_ref()),
+            |ttl| (ttl, timer_type, &slot, segment_id, key.as_ref()),
+            || (timer_type, &slot, segment_id, key.as_ref()),
         )
         .await
     }
@@ -422,7 +414,7 @@ impl CassandraTriggerStore {
         self.session()
             .execute_unpaged(
                 &self.queries().remove_singleton_entry,
-                (i8::from(timer_type), segment_id, key.as_ref()),
+                (timer_type, segment_id, key.as_ref()),
             )
             .await
             .map_err(CassandraStoreError::from)?;
@@ -450,7 +442,7 @@ impl CassandraTriggerStore {
 
         let key = trigger.key.as_ref();
         let time = trigger.time;
-        let timer_type = i8::from(trigger.timer_type);
+        let timer_type = trigger.timer_type;
 
         self.execute_with_optional_ttl(
             trigger.time,
@@ -480,12 +472,7 @@ impl TriggerOperations for CassandraTriggerStore {
         self.session()
             .execute_unpaged(
                 &self.queries().insert_segment,
-                (
-                    segment.id,
-                    segment.name,
-                    segment.slab_size,
-                    i8::from(segment.version),
-                ),
+                (segment.id, segment.name, segment.slab_size, segment.version),
             )
             .await
             .map_err(CassandraStoreError::from)?;
@@ -700,20 +687,19 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = slab.segment_id();
         let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
-        let timer_type_i8 = i8::from(timer_type);
 
         try_stream! {
             let stream = self
                 .session()
                 .execute_iter(
                     self.queries().get_slab_triggers.clone(),
-                    (segment_id, slab_size, slab_id, timer_type_i8),
+                    (segment_id, slab_size, slab_id, timer_type),
                 )
                 .await.map_err(CassandraStoreError::from)?
-                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>().map_err(CassandraStoreError::from)?;
+                .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>)>().map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((key, time, timer_type_returned, span_map)) =
+            while let Some((key, time, timer_type, span_map)) =
                 cooperative(stream.try_next()).await.map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
@@ -721,8 +707,6 @@ impl TriggerOperations for CassandraTriggerStore {
                 if let Err(error) = span.set_parent(context) {
                     debug!("failed to set parent span: {error:#}");
                 }
-
-                let timer_type = TimerType::try_from(timer_type_returned)?;
 
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
@@ -747,11 +731,11 @@ impl TriggerOperations for CassandraTriggerStore {
                 )
                 .await
                 .map_err(CassandraStoreError::from)?
-                .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
+                .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>)>()
                 .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((key, time, timer_type_returned, span_map)) =
+            while let Some((key, time, timer_type, span_map)) =
                 cooperative(stream.try_next())
                     .await
                     .map_err(CassandraStoreError::from)?
@@ -762,7 +746,6 @@ impl TriggerOperations for CassandraTriggerStore {
                     debug!("failed to set parent span: {error:#}");
                 }
 
-                let timer_type = TimerType::try_from(timer_type_returned)?;
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
         }
@@ -779,7 +762,7 @@ impl TriggerOperations for CassandraTriggerStore {
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
         let key = trigger.key.as_ref();
         let time = trigger.time;
-        let timer_type = i8::from(trigger.timer_type);
+        let timer_type = trigger.timer_type;
 
         self.execute_with_optional_ttl(
             slab.range().end,
@@ -814,7 +797,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     slab.segment_id(),
                     slab.size().seconds() as i32,
                     i32::from_le_bytes(slab.id().to_le_bytes()),
-                    i8::from(timer_type),
+                    timer_type,
                     key.as_ref(),
                     time,
                 ),
@@ -849,8 +832,6 @@ impl TriggerOperations for CassandraTriggerStore {
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
-        let timer_type_i8 = i8::from(timer_type);
-
         try_stream! {
             // Read singleton slot first (partition-level query, no clustering filter).
             // This avoids the Cassandra behavior where a clustering filter (timer_type = ?)
@@ -868,7 +849,7 @@ impl TriggerOperations for CassandraTriggerStore {
                         .session()
                         .execute_iter(
                             self.queries().get_key_times.clone(),
-                            (segment_id, key.as_ref(), timer_type_i8),
+                            (segment_id, key.as_ref(), timer_type),
                         )
                         .await
                         .map_err(CassandraStoreError::from)?
@@ -895,7 +876,6 @@ impl TriggerOperations for CassandraTriggerStore {
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        let timer_type_i8 = i8::from(timer_type);
         let key_clone = key.clone();
 
         try_stream! {
@@ -917,15 +897,15 @@ impl TriggerOperations for CassandraTriggerStore {
                         .session()
                         .execute_iter(
                             self.queries().get_key_triggers.clone(),
-                            (segment_id, key_clone.as_ref(), timer_type_i8),
+                            (segment_id, key_clone.as_ref(), timer_type),
                         )
                         .await
                         .map_err(CassandraStoreError::from)?
-                        .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
+                        .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>)>()
                         .map_err(CassandraStoreError::from)?;
 
                     pin_mut!(stream);
-                    while let Some((_key_str, time, _type_i8, span_map)) =
+                    while let Some((_key_str, time, _timer_type, span_map)) =
                         cooperative(stream.try_next())
                             .await
                             .map_err(CassandraStoreError::from)?
@@ -956,7 +936,9 @@ impl TriggerOperations for CassandraTriggerStore {
             // reading clustering rows. This avoids the race where a concurrent
             // insert_key_trigger promotes a singleton to clustering between the
             // two reads.
-            let singleton_map = self.get_singleton_slot_map(segment_id, &key_clone).await?;
+            let empty = HashMap::new();
+            let singletons = self.get_singleton_slot_map(segment_id, &key_clone).await?;
+            let singletons = singletons.as_ref().unwrap_or(&empty);
 
             let clustering_stream = self.session()
                 .execute_iter(
@@ -965,64 +947,48 @@ impl TriggerOperations for CassandraTriggerStore {
                 )
                 .await
                 .map_err(CassandraStoreError::from)?
-                .rows_stream::<(Option<String>, Option<CompactDateTime>, Option<i8>, Option<HashMap<String, String>>)>()
+                .rows_stream()
                 .map_err(CassandraStoreError::from)?;
 
-            // Collect all triggers, then yield in order.
-            // Singleton entries + clustering entries (skipping types in Singleton state).
-            let mut triggers: Vec<Trigger> = Vec::new();
-
-            // Add singleton triggers
-            if let Some(ref map) = singleton_map {
-                for (&type_i8, slot_opt) in map {
-                    if let Some(slot) = slot_opt {
-                        let timer_type = TimerType::try_from(type_i8)?;
-                        let context = self.propagator().extract(&slot.span);
-                        let span = info_span!("fetch_key_trigger_all_types_singleton");
-                        if let Err(error) = span.set_parent(context) {
-                            debug!("failed to set parent span: {error:#}");
-                        }
-                        triggers.push(Trigger::new(key_clone.clone(), slot.time, timer_type, span));
-                    }
-                }
-            }
-
-            // Add clustering triggers (skip types in Singleton state)
             pin_mut!(clustering_stream);
-            while let Some((_key_opt, time_opt, type_opt, span_opt)) =
-                cooperative(clustering_stream.try_next())
-                    .await
-                    .map_err(CassandraStoreError::from)?
-            {
-                // Skip static-only rows (NULL clustering columns)
-                let (Some(time), Some(type_i8), Some(span_map)) = (time_opt, type_opt, span_opt) else {
-                    continue;
-                };
 
-                let is_singleton = singleton_map
-                    .as_ref()
-                    .and_then(|m| m.get(&type_i8))
-                    .is_some_and(Option::is_some);
+            // Merge two sorted sources by (timer_type, time):
+            //
+            //   Singletons — TimerType::VARIANTS (i8-ascending), at most
+            //   one trigger per type.
+            //
+            //   Clustering — Cassandra stream in (timer_type, time) order,
+            //   skipping NULL static-only rows.
 
-                if !is_singleton {
-                    let timer_type = TimerType::try_from(type_i8)?;
-                    let context = self.propagator().extract(&span_map);
-                    let span = info_span!("fetch_key_trigger_all_types");
-                    if let Err(error) = span.set_parent(context) {
-                        debug!("failed to set parent span: {error:#}");
+            let mut variants_iter = TimerType::VARIANTS.iter();
+            let mut singleton_next = advance_singleton(
+                &key_clone, singletons, &mut variants_iter, self.propagator(),
+            );
+
+            // For each clustering row, flush any singletons that sort before it.
+            while let Some(clustering) = advance_clustering(
+                &key_clone, &mut clustering_stream, self.propagator(),
+            ).await? {
+                while let Some(s) = singleton_next.take() {
+                    if (s.timer_type, s.time) <= (clustering.timer_type, clustering.time) {
+                        yield s;
+                        singleton_next = advance_singleton(
+                            &key_clone, singletons, &mut variants_iter, self.propagator(),
+                        );
+                    } else {
+                        singleton_next = Some(s);
+                        break;
                     }
-                    triggers.push(Trigger::new(key_clone.clone(), time, timer_type, span));
                 }
+                yield clustering;
             }
 
-            // Sort by (timer_type, time) to match clustering order contract
-            triggers.sort_by(|a, b| {
-                i8::from(a.timer_type).cmp(&i8::from(b.timer_type))
-                    .then(a.time.cmp(&b.time))
-            });
-
-            for trigger in triggers {
+            // Drain remaining singletons.
+            while let Some(trigger) = singleton_next {
                 yield trigger;
+                singleton_next = advance_singleton(
+                    &key_clone, singletons, &mut variants_iter, self.propagator(),
+                );
             }
         }
     }
@@ -1093,7 +1059,7 @@ impl TriggerOperations for CassandraTriggerStore {
             self.get_singleton_slot(segment_id, key, timer_type),
             self.execute_unpaged_discard(
                 &self.queries().delete_key_trigger,
-                (segment_id, key.as_ref(), i8::from(timer_type), time),
+                (segment_id, key.as_ref(), timer_type, time),
             )
         )?;
 
@@ -1127,7 +1093,7 @@ impl TriggerOperations for CassandraTriggerStore {
             self.remove_singleton_entry(segment_id, key, timer_type),
             self.execute_unpaged_discard(
                 &self.queries().clear_key_triggers,
-                (segment_id, key.as_ref(), i8::from(timer_type)),
+                (segment_id, key.as_ref(), timer_type),
             )
         )?;
 
@@ -1238,11 +1204,7 @@ impl TriggerOperations for CassandraTriggerStore {
         self.session()
             .execute_unpaged(
                 &self.queries().update_segment_version,
-                (
-                    i8::from(new_version),
-                    new_slab_size.seconds() as i32,
-                    segment_id,
-                ),
+                (new_version, new_slab_size.seconds() as i32, segment_id),
             )
             .await
             .map_err(CassandraStoreError::from)?;
@@ -1283,6 +1245,61 @@ pub async fn cassandra_store(
     let store = CassandraStore::new(config).await?;
     let cassandra = CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await?;
     Ok(TableAdapter::new(cassandra))
+}
+
+/// Returns the next singleton trigger in type order, or `None` when exhausted.
+fn advance_singleton<'a>(
+    key: &Key,
+    singletons: &HashMap<TimerType, Option<TimerSlot>>,
+    variants_iter: &mut impl Iterator<Item = &'a TimerType>,
+    propagator: &TextMapCompositePropagator,
+) -> Option<Trigger> {
+    let (&timer_type, slot) = variants_iter
+        .find_map(|tt| singletons.get(tt).and_then(|s| s.as_ref()).map(|s| (tt, s)))?;
+
+    let context = propagator.extract(&slot.span);
+    let span = info_span!("fetch_key_trigger_all_types_singleton");
+    if let Err(error) = span.set_parent(context) {
+        debug!("failed to set parent span: {error:#}");
+    }
+    Some(Trigger::new(key.clone(), slot.time, timer_type, span))
+}
+
+/// Returns the next clustering trigger, skipping NULL static-only rows.
+async fn advance_clustering(
+    key: &Key,
+    stream: &mut (
+             impl Stream<
+        Item = Result<
+            (
+                Option<String>,
+                Option<CompactDateTime>,
+                Option<TimerType>,
+                Option<HashMap<String, String>>,
+            ),
+            impl Into<CassandraStoreError>,
+        >,
+    > + Unpin
+         ),
+    propagator: &TextMapCompositePropagator,
+) -> Result<Option<Trigger>, CassandraTriggerStoreError> {
+    while let Some((_key, time_opt, type_opt, span_opt)) =
+        cooperative(stream.try_next()).await.map_err(Into::into)?
+    {
+        // Skip static-only rows (NULL clustering columns).
+        let (Some(time), Some(timer_type), Some(span_map)) = (time_opt, type_opt, span_opt) else {
+            continue;
+        };
+
+        let context = propagator.extract(&span_map);
+        let span = info_span!("fetch_key_trigger_all_types");
+        if let Err(error) = span.set_parent(context) {
+            debug!("failed to set parent span: {error:#}");
+        }
+
+        return Ok(Some(Trigger::new(key.clone(), time, timer_type, span)));
+    }
+    Ok(None)
 }
 
 /// Errors that can occur during Cassandra trigger store operations.
