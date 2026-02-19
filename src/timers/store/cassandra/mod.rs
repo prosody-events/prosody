@@ -191,6 +191,22 @@ impl CassandraTriggerStore {
         Ok(())
     }
 
+    /// Executes an unpaged query and discards the result.
+    ///
+    /// Convenience wrapper for fire-and-forget mutations that only need
+    /// error propagation.
+    async fn execute_unpaged_discard(
+        &self,
+        query: &PreparedStatement,
+        params: impl SerializeRow,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        self.session()
+            .execute_unpaged(query, params)
+            .await
+            .map_err(CassandraStoreError::from)?;
+        Ok(())
+    }
+
     /// Creates V1 operations on-demand for migration support.
     ///
     /// This method constructs a `V1Operations` instance that provides access
@@ -239,6 +255,28 @@ impl CassandraTriggerStore {
     // Singleton Slot Operations (Cassandra-specific, not part of TriggerOperations)
     // =========================================================================
 
+    /// Fetches the raw `singleton_timers` map from the database.
+    async fn fetch_singleton_map(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> Result<Option<HashMap<i8, Option<TimerSlot>>>, CassandraTriggerStoreError> {
+        let row = self
+            .session()
+            .execute_unpaged(
+                &self.queries().get_singleton_slot,
+                (segment_id, key.as_ref()),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<(Option<HashMap<i8, Option<TimerSlot>>>,)>()
+            .map_err(CassandraStoreError::from)?;
+
+        Ok(row.and_then(|(map,)| map))
+    }
+
     /// Reads the singleton slot state for a key and timer type.
     ///
     /// Returns the slot state which determines the read strategy:
@@ -256,26 +294,7 @@ impl CassandraTriggerStore {
         key: &Key,
         timer_type: TimerType,
     ) -> Result<SlotState, CassandraTriggerStoreError> {
-        let row = self
-            .session()
-            .execute_unpaged(
-                &self.queries().get_singleton_slot,
-                (segment_id, key.as_ref()),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(Option<HashMap<i8, Option<TimerSlot>>>,)>()
-            .map_err(CassandraStoreError::from)?;
-
-        let Some((singleton_map,)) = row else {
-            // No row at all - partition doesn't exist
-            return Ok(SlotState::Absent);
-        };
-
-        let Some(map) = singleton_map else {
-            // Row exists but singleton_timers column is NULL (legacy data)
+        let Some(map) = self.fetch_singleton_map(segment_id, key).await? else {
             return Ok(SlotState::Absent);
         };
 
@@ -302,20 +321,7 @@ impl CassandraTriggerStore {
         segment_id: &SegmentId,
         key: &Key,
     ) -> Result<Option<HashMap<i8, Option<TimerSlot>>>, CassandraTriggerStoreError> {
-        let row = self
-            .session()
-            .execute_unpaged(
-                &self.queries().get_singleton_slot,
-                (segment_id, key.as_ref()),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(Option<HashMap<i8, Option<TimerSlot>>>,)>()
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(row.and_then(|(map,)| map))
+        self.fetch_singleton_map(segment_id, key).await
     }
 
     /// Atomically clears clustering rows and sets the singleton slot.
@@ -339,42 +345,35 @@ impl CassandraTriggerStore {
     ) -> Result<(), CassandraTriggerStoreError> {
         let timer_type_i8 = i8::from(timer_type);
 
-        if let Some(ttl) = self.calculate_ttl(slot.time) {
-            self.session()
-                .execute_unpaged(
-                    &self.queries().batch_clear_and_set_singleton,
-                    (
-                        segment_id,
-                        key.as_ref(),
-                        timer_type_i8,
-                        ttl,
-                        timer_type_i8,
-                        &slot,
-                        segment_id,
-                        key.as_ref(),
-                    ),
+        self.execute_with_optional_ttl(
+            slot.time,
+            &self.queries().batch_clear_and_set_singleton,
+            &self.queries().batch_clear_and_set_singleton_no_ttl,
+            |ttl| {
+                (
+                    segment_id,
+                    key.as_ref(),
+                    timer_type_i8,
+                    ttl,
+                    timer_type_i8,
+                    &slot,
+                    segment_id,
+                    key.as_ref(),
                 )
-                .await
-                .map_err(CassandraStoreError::from)?;
-        } else {
-            self.session()
-                .execute_unpaged(
-                    &self.queries().batch_clear_and_set_singleton_no_ttl,
-                    (
-                        segment_id,
-                        key.as_ref(),
-                        timer_type_i8,
-                        timer_type_i8,
-                        &slot,
-                        segment_id,
-                        key.as_ref(),
-                    ),
+            },
+            || {
+                (
+                    segment_id,
+                    key.as_ref(),
+                    timer_type_i8,
+                    timer_type_i8,
+                    &slot,
+                    segment_id,
+                    key.as_ref(),
                 )
-                .await
-                .map_err(CassandraStoreError::from)?;
-        }
-
-        Ok(())
+            },
+        )
+        .await
     }
 
     /// Updates the singleton slot (static column only) without touching
@@ -1092,16 +1091,10 @@ impl TriggerOperations for CassandraTriggerStore {
         // Concurrent: read singleton state AND delete clustering row
         let (slot_state, ()) = tokio::try_join!(
             self.get_singleton_slot(segment_id, key, timer_type),
-            async {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().delete_key_trigger,
-                        (segment_id, key.as_ref(), i8::from(timer_type), time),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-                Ok::<_, CassandraTriggerStoreError>(())
-            }
+            self.execute_unpaged_discard(
+                &self.queries().delete_key_trigger,
+                (segment_id, key.as_ref(), i8::from(timer_type), time),
+            )
         )?;
 
         // If singleton slot has this exact time, remove the entry
@@ -1132,55 +1125,10 @@ impl TriggerOperations for CassandraTriggerStore {
         // Concurrent: remove singleton entry AND clear clustering rows
         tokio::try_join!(
             self.remove_singleton_entry(segment_id, key, timer_type),
-            async {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().clear_key_triggers,
-                        (segment_id, key.as_ref(), i8::from(timer_type)),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-                Ok::<_, CassandraTriggerStoreError>(())
-            }
-        )?;
-
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip(self), err)]
-    async fn clear_key_triggers_all_types(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-    ) -> Result<(), Self::Error> {
-        // Evict every variant from the local singleton cache.
-        for &timer_type in TimerType::VARIANTS {
-            self.singleton_keys
-                .remove(&(*segment_id, key.clone(), timer_type));
-        }
-
-        // Concurrent: clear clustering rows AND the singleton_timers static column.
-        tokio::try_join!(
-            async {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().clear_key_triggers_all_types,
-                        (segment_id, key.as_ref()),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-                Ok::<_, CassandraTriggerStoreError>(())
-            },
-            async {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().clear_singleton_slots,
-                        (segment_id, key.as_ref()),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-                Ok::<_, CassandraTriggerStoreError>(())
-            }
+            self.execute_unpaged_discard(
+                &self.queries().clear_key_triggers,
+                (segment_id, key.as_ref(), i8::from(timer_type)),
+            )
         )?;
 
         Ok(())
@@ -1247,6 +1195,33 @@ impl TriggerOperations for CassandraTriggerStore {
 
         // After success, this key is known to be in singleton state.
         self.singleton_keys.insert(cache_key, ());
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn clear_key_triggers_all_types(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+    ) -> Result<(), Self::Error> {
+        // Evict every variant from the local singleton cache.
+        for &timer_type in TimerType::VARIANTS {
+            self.singleton_keys
+                .remove(&(*segment_id, key.clone(), timer_type));
+        }
+
+        // Concurrent: clear clustering rows AND the singleton_timers static column.
+        tokio::try_join!(
+            self.execute_unpaged_discard(
+                &self.queries().clear_key_triggers_all_types,
+                (segment_id, key.as_ref()),
+            ),
+            self.execute_unpaged_discard(
+                &self.queries().clear_singleton_slots,
+                (segment_id, key.as_ref()),
+            )
+        )?;
+
         Ok(())
     }
 
@@ -1371,6 +1346,7 @@ impl ClassifyError for CassandraTriggerStoreError {
 
 #[cfg(test)]
 mod test {
+    use super::SlotState;
     use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
     use crate::Key;
     use crate::cassandra::CassandraStore;
@@ -1381,7 +1357,6 @@ mod test {
     use crate::timers::slab::{Slab, SlabId};
     use crate::timers::store::operations::TriggerOperations;
     use crate::timers::store::{Segment, SegmentId, SegmentVersion};
-    use super::SlotState;
     use crate::tracing::init_test_logging;
     use crate::trigger_store_tests;
     use color_eyre::Result;
