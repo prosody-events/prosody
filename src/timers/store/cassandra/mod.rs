@@ -962,8 +962,7 @@ impl TriggerOperations for CassandraTriggerStore {
             if let Err(error) = span.set_parent(context) {
                 debug!("failed to set parent span: {error:#}");
             }
-            let promoted =
-                Trigger::new(key.clone(), slot.time, timer_type, span);
+            let promoted = Trigger::new(key.clone(), slot.time, timer_type, span);
             tokio::try_join!(
                 self.add_key_trigger_clustering(segment_id, promoted),
                 self.remove_singleton_entry(segment_id, &key, timer_type),

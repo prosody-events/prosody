@@ -252,39 +252,8 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
-        /// Gets both singleton slot AND clustering rows for a key/type in one query.
-        /// The `singleton_timers` static column is returned with every row.
-        /// First row gives the slot state; remaining rows are clustering data.
-        get_key_with_singleton: (
-            "SELECT singleton_timers, time, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
-            TABLE_TYPED_KEYS
-        ),
 
-        /// Gets both singleton slot AND all clustering rows for a key (all types) in one query.
-        get_key_all_types_with_singleton: (
-            "SELECT singleton_timers, timer_type, time, span FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
-            TABLE_TYPED_KEYS
-        ),
-
-        /// Updates a single entry in the `singleton_timers` static map (tombstone-free overwrite)
-        set_singleton_slot: (
-            "UPDATE $keyspace.{} USING TTL ? SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?",
-            TABLE_TYPED_KEYS
-        ),
-
-        /// Updates `singleton_timers` without TTL
-        set_singleton_slot_no_ttl: (
-            "UPDATE $keyspace.{} SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?",
-            TABLE_TYPED_KEYS
-        ),
-
-        /// Deletes (NULLs out) a single entry in the `singleton_timers` static map (marks overflow)
-        delete_singleton_slot: (
-            "UPDATE $keyspace.{} SET singleton_timers[?] = null WHERE segment_id = ? AND key = ?",
-            TABLE_TYPED_KEYS
-        ),
-
-        /// Inserts a trigger into clustering columns only (for overflow case)
+        /// Inserts a trigger into clustering columns
         insert_key_trigger_clustering: (
             "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?",
             TABLE_TYPED_KEYS
@@ -301,10 +270,6 @@ cassandra_queries! {
             "DELETE singleton_timers[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
             TABLE_TYPED_KEYS
         ),
-
-        // =========================================================================
-        // Singleton Promotion Batch Operations
-        // =========================================================================
 
         /// BATCH: Clear and set singleton slot with TTL (atomic delete clustering + update static)
         batch_clear_and_set_singleton: (
@@ -324,24 +289,5 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
-        /// BATCH: Promote singleton to overflow with TTL (NULL slot + 2 inserts)
-        batch_promote_singleton_to_overflow: (
-            "BEGIN UNLOGGED BATCH \
-             UPDATE $keyspace.{} SET singleton_timers[?] = null WHERE segment_id = ? AND key = ?; \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?; \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?; \
-             APPLY BATCH",
-            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
-        ),
-
-        /// BATCH: Promote singleton to overflow without TTL
-        batch_promote_singleton_to_overflow_no_ttl: (
-            "BEGIN UNLOGGED BATCH \
-             UPDATE $keyspace.{} SET singleton_timers[?] = null WHERE segment_id = ? AND key = ?; \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
-             APPLY BATCH",
-            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
-        ),
     }
 }
