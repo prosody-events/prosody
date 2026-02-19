@@ -1109,19 +1109,35 @@ impl TriggerOperations for CassandraTriggerStore {
         segment_id: &SegmentId,
         key: &Key,
     ) -> Result<(), Self::Error> {
-        // Cleared all types — evict every variant from cache.
-        for timer_type in TimerType::VARIANTS {
+        // Evict every variant from the local singleton cache.
+        for &timer_type in TimerType::VARIANTS {
             self.singleton_keys
-                .remove(&(*segment_id, key.clone(), *timer_type));
+                .remove(&(*segment_id, key.clone(), timer_type));
         }
 
-        self.session()
-            .execute_unpaged(
-                &self.queries().clear_key_triggers_all_types,
-                (segment_id, key.as_ref()),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
+        // Concurrent: clear clustering rows AND the singleton_timers static column.
+        tokio::try_join!(
+            async {
+                self.session()
+                    .execute_unpaged(
+                        &self.queries().clear_key_triggers_all_types,
+                        (segment_id, key.as_ref()),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)?;
+                Ok::<_, CassandraTriggerStoreError>(())
+            },
+            async {
+                self.session()
+                    .execute_unpaged(
+                        &self.queries().clear_singleton_slots,
+                        (segment_id, key.as_ref()),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)?;
+                Ok::<_, CassandraTriggerStoreError>(())
+            }
+        )?;
 
         Ok(())
     }

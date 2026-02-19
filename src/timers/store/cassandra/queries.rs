@@ -271,6 +271,12 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
+        /// Clears the entire `singleton_timers` static column (all timer types at once)
+        clear_singleton_slots: (
+            "DELETE singleton_timers FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
         /// Updates the singleton slot (static column only) with TTL — no DELETE, no BATCH
         set_singleton_slot: (
             "UPDATE $keyspace.{} USING TTL ? SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?",
