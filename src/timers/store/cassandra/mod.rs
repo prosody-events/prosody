@@ -313,78 +313,7 @@ impl CassandraTriggerStore {
         Ok(())
     }
 
-    /// Deletes (NULLs out) the singleton slot, marking it as overflow.
-    ///
-    /// Called when a second timer is added for a key/type that was previously
-    /// a singleton. The NULL value indicates that timers should be read from
-    /// clustering columns instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database update fails.
-    #[instrument(level = "debug", skip(self), err)]
-    pub async fn delete_singleton_slot(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-    ) -> Result<(), CassandraTriggerStoreError> {
-        self.session()
-            .execute_unpaged(
-                &self.queries().delete_singleton_slot,
-                (i8::from(timer_type), segment_id, key.as_ref()),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(())
-    }
-
-    /// Sets the singleton slot to a timer value.
-    ///
-    /// Used when writing the first timer for a key/type (Absent → Singleton).
-    ///
-    /// # Errors
-    ///
-    /// Returns error if the database update fails.
-    #[instrument(level = "debug", skip(self), err)]
-    async fn set_singleton_slot(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-        slot: TimerSlot,
-    ) -> Result<(), CassandraTriggerStoreError> {
-        let timer_type_i8 = i8::from(timer_type);
-
-        match self.calculate_ttl(slot.time) {
-            Some(ttl) => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().set_singleton_slot,
-                        (ttl, timer_type_i8, &slot, segment_id, key.as_ref()),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-            }
-            None => {
-                self.session()
-                    .execute_unpaged(
-                        &self.queries().set_singleton_slot_no_ttl,
-                        (timer_type_i8, &slot, segment_id, key.as_ref()),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Removes a singleton slot entry entirely, returning to Absent state.
-    ///
-    /// Unlike `delete_singleton_slot` which NULLs the entry (Overflow marker),
-    /// this removes the map entry entirely (Absent state).
     ///
     /// # Errors
     ///
@@ -407,75 +336,7 @@ impl CassandraTriggerStore {
         Ok(())
     }
 
-    /// Promotes from singleton to overflow state by moving existing singleton
-    /// data to clustering columns and adding the new trigger.
-    ///
-    /// Uses a BATCH for atomicity: NULL singleton slot + insert existing +
-    /// insert new.
-    #[instrument(level = "debug", skip(self, existing_slot, new_span_map), err)]
-    async fn promote_singleton_to_overflow(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-        timer_type: TimerType,
-        existing_slot: TimerSlot,
-        new_time: CompactDateTime,
-        new_span_map: &HashMap<String, String>,
-    ) -> Result<(), CassandraTriggerStoreError> {
-        let timer_type_i8 = i8::from(timer_type);
-
-        if let Some(ttl) = self.calculate_ttl(new_time) {
-            self.session()
-                .execute_unpaged(
-                    &self.queries().batch_promote_singleton_to_overflow,
-                    (
-                        timer_type_i8,
-                        segment_id,
-                        key.as_ref(),
-                        segment_id,
-                        key.as_ref(),
-                        timer_type_i8,
-                        existing_slot.time,
-                        &existing_slot.span,
-                        ttl,
-                        segment_id,
-                        key.as_ref(),
-                        timer_type_i8,
-                        new_time,
-                        new_span_map,
-                        ttl,
-                    ),
-                )
-                .await
-                .map_err(CassandraStoreError::from)?;
-        } else {
-            self.session()
-                .execute_unpaged(
-                    &self.queries().batch_promote_singleton_to_overflow_no_ttl,
-                    (
-                        timer_type_i8,
-                        segment_id,
-                        key.as_ref(),
-                        segment_id,
-                        key.as_ref(),
-                        timer_type_i8,
-                        existing_slot.time,
-                        &existing_slot.span,
-                        segment_id,
-                        key.as_ref(),
-                        timer_type_i8,
-                        new_time,
-                        new_span_map,
-                    ),
-                )
-                .await
-                .map_err(CassandraStoreError::from)?;
-        }
-
-        Ok(())
-    }
-
-    /// Inserts a trigger into clustering columns only (for overflow case).
+    /// Inserts a trigger into clustering columns only.
     ///
     /// Used when multiple timers exist for a key/type. Does not touch the
     /// singleton slot.
@@ -996,25 +857,22 @@ impl TriggerOperations for CassandraTriggerStore {
         let key_clone = key.clone();
 
         try_stream! {
-            // Read singleton slot (partition-level, no clustering filter) and all
-            // clustering rows concurrently.
-            let (singleton_slot_result, clustering_stream_result) = tokio::join!(
-                self.get_singleton_slot_map(segment_id, &key_clone),
-                async {
-                    self.session()
-                        .execute_iter(
-                            self.queries().get_key_triggers_all_types.clone(),
-                            (segment_id, key_clone.as_ref()),
-                        )
-                        .await
-                        .map_err(CassandraStoreError::from)?
-                        .rows_stream::<(String, CompactDateTime, i8, HashMap<String, String>)>()
-                        .map_err(CassandraStoreError::from)
-                }
-            );
+            // Read singleton map FIRST (sequential, not concurrent) to get a
+            // consistent snapshot of which types are in singleton state before
+            // reading clustering rows. This avoids the race where a concurrent
+            // insert_key_trigger promotes a singleton to clustering between the
+            // two reads.
+            let singleton_map = self.get_singleton_slot_map(segment_id, &key_clone).await?;
 
-            let singleton_map = singleton_slot_result?;
-            let clustering_stream = clustering_stream_result?;
+            let clustering_stream = self.session()
+                .execute_iter(
+                    self.queries().get_key_triggers_all_types.clone(),
+                    (segment_id, key_clone.as_ref()),
+                )
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(Option<String>, Option<CompactDateTime>, Option<i8>, Option<HashMap<String, String>>)>()
+                .map_err(CassandraStoreError::from)?;
 
             // Collect all triggers, then yield in order.
             // Singleton entries + clustering entries (skipping types in Singleton state).
@@ -1037,11 +895,16 @@ impl TriggerOperations for CassandraTriggerStore {
 
             // Add clustering triggers (skip types in Singleton state)
             pin_mut!(clustering_stream);
-            while let Some((_key_str, time, type_i8, span_map)) =
+            while let Some((_key_opt, time_opt, type_opt, span_opt)) =
                 cooperative(clustering_stream.try_next())
                     .await
                     .map_err(CassandraStoreError::from)?
             {
+                // Skip static-only rows (NULL clustering columns)
+                let (Some(time), Some(type_i8), Some(span_map)) = (time_opt, type_opt, span_opt) else {
+                    continue;
+                };
+
                 let is_singleton = singleton_map
                     .as_ref()
                     .and_then(|m| m.get(&type_i8))
@@ -1070,80 +933,42 @@ impl TriggerOperations for CassandraTriggerStore {
         }
     }
 
-    /// Inserts a trigger into the key index with singleton slot awareness.
+    /// Inserts a trigger into the key index using clustering columns.
     ///
-    /// Logic:
-    /// - If this is the first timer (Absent + no clustering rows) → write to
-    ///   singleton slot
-    /// - If a singleton exists → promote to overflow (NULL slot, move to
-    ///   clustering, add new)
-    /// - If already overflow → add to clustering only
+    /// If a singleton slot exists for this key/type (from a prior
+    /// `clear_and_schedule_key`), promotes the singleton data to a clustering
+    /// row before removing the slot entry. This prevents data loss when
+    /// transitioning from singleton to multi-trigger state.
     #[instrument(level = "debug", skip(self), err)]
     async fn insert_key_trigger(
         &self,
         segment_id: &SegmentId,
         trigger: Trigger,
     ) -> Result<(), Self::Error> {
-        let timer_type_i8 = i8::from(trigger.timer_type);
+        let timer_type = trigger.timer_type;
+        let key = trigger.key.clone();
 
-        // Step 1: Read singleton slot (partition-level, no clustering filter) and
-        // clustering rows concurrently.
-        let (slot_state, clustering_rows) = tokio::try_join!(
-            self.get_singleton_slot(segment_id, &trigger.key, trigger.timer_type),
-            async {
-                let rows: Vec<(CompactDateTime,)> = self
-                    .session()
-                    .execute_iter(
-                        self.queries().get_key_times.clone(),
-                        (segment_id, trigger.key.as_ref(), timer_type_i8),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?
-                    .rows_stream::<(CompactDateTime,)>()
-                    .map_err(CassandraStoreError::from)?
-                    .try_collect()
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-                Ok::<_, CassandraTriggerStoreError>(rows)
-            }
+        // Read singleton slot concurrently with writing the new clustering row.
+        let (slot_state, ()) = tokio::try_join!(
+            self.get_singleton_slot(segment_id, &key, timer_type),
+            self.add_key_trigger_clustering(segment_id, trigger),
         )?;
 
-        let clustering_row_count = clustering_rows.len();
-
-        // Extract span context for storage
-        let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
-        let context = trigger.span.load().context();
-        self.propagator().inject_context(&context, &mut span_map);
-
-        // Step 2: Write based on state
-        match slot_state {
-            SlotState::Absent if clustering_row_count == 0 => {
-                // First timer for this key/type → write to singleton slot
-                let slot = TimerSlot {
-                    time: trigger.time,
-                    span: span_map,
-                };
-                self.set_singleton_slot(segment_id, &trigger.key, trigger.timer_type, slot)
-                    .await?;
+        // If a singleton exists, promote its data to clustering then remove
+        // the slot entry. Skipped when Absent/Overflow (no data to promote).
+        if let SlotState::Singleton(slot) = slot_state {
+            let context = self.propagator().extract(&slot.span);
+            let span = info_span!("promote_singleton_to_clustering");
+            if let Err(error) = span.set_parent(context) {
+                debug!("failed to set parent span: {error:#}");
             }
-            SlotState::Singleton(existing_slot) => {
-                // Promotion to overflow using helper method
-                self.promote_singleton_to_overflow(
-                    segment_id,
-                    &trigger.key,
-                    trigger.timer_type,
-                    existing_slot,
-                    trigger.time,
-                    &span_map,
-                )
-                .await?;
-            }
-            SlotState::Overflow | SlotState::Absent => {
-                // Overflow or Absent with existing clustering rows → add to clustering
-                self.add_key_trigger_clustering(segment_id, trigger).await?;
-            }
+            let promoted =
+                Trigger::new(key.clone(), slot.time, timer_type, span);
+            tokio::try_join!(
+                self.add_key_trigger_clustering(segment_id, promoted),
+                self.remove_singleton_entry(segment_id, &key, timer_type),
+            )?;
         }
-
         Ok(())
     }
 
