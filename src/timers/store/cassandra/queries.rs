@@ -271,6 +271,18 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
+        /// Updates the singleton slot (static column only) with TTL — no DELETE, no BATCH
+        set_singleton_slot: (
+            "UPDATE $keyspace.{} USING TTL ? SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Updates the singleton slot (static column only) without TTL — no DELETE, no BATCH
+        set_singleton_slot_no_ttl: (
+            "UPDATE $keyspace.{} SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
         /// BATCH: Clear and set singleton slot with TTL (atomic delete clustering + update static)
         batch_clear_and_set_singleton: (
             "BEGIN UNLOGGED BATCH \

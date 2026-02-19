@@ -17,6 +17,7 @@ use crate::timers::{TimerType, Trigger};
 use ahash::{HashMap, HashSet};
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
+use strum::VariantArray;
 use tracing::Span;
 use uuid::Uuid;
 
@@ -344,7 +345,7 @@ async fn verify_data_preservation(
         seen_keys.insert(key.clone());
 
         // Get triggers for all timer types
-        for timer_type in TimerType::ALL {
+        for &timer_type in TimerType::VARIANTS {
             let triggers: Vec<Trigger> = store
                 .get_key_triggers(&model.segment.id, timer_type, key)
                 .try_collect()
@@ -467,7 +468,7 @@ async fn verify_dual_index_consistency(
         }
         seen_keys.insert(key.clone());
 
-        for timer_type in TimerType::ALL {
+        for &timer_type in TimerType::VARIANTS {
             let triggers: Vec<Trigger> = store
                 .get_key_triggers(&model.segment.id, timer_type, key)
                 .try_collect()

@@ -16,6 +16,7 @@ use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
+use strum::VariantArray;
 use tracing::Span;
 use uuid::Uuid;
 
@@ -393,7 +394,7 @@ where
         let slab = Slab::new(*segment_id, *slab_id, slab_size);
 
         // Verify get_slab_triggers for each timer type
-        for timer_type in TimerType::ALL {
+        for &timer_type in TimerType::VARIANTS {
             verify_slab_triggers_by_type(operations, model, &slab, timer_type).await?;
         }
 

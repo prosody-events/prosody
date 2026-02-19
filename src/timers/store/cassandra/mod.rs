@@ -14,17 +14,21 @@ use crate::timers::store::{
 };
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
+use educe::Educe;
 use futures::{Stream, TryStreamExt, pin_mut};
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
+use quick_cache::sync::Cache;
 use scylla::client::session::Session;
 use scylla::serialize::row::SerializeRow;
 use scylla::statement::prepared::PreparedStatement;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use strum::VariantArray;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
-use tracing::{debug, info_span, instrument};
+use tracing::field::Empty;
+use tracing::{Span, debug, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod queries;
@@ -36,15 +40,30 @@ pub(crate) mod v1;
 /// Cassandra-only).
 pub(crate) mod migration;
 
+/// Cache key for the singleton slot state cache.
+type SingletonCacheKey = (SegmentId, Key, TimerType);
+
+/// Capacity for the singleton slot cache.
+///
+/// Sized to cover the active working set of keys. Cache misses simply
+/// fall back to a DB read, so undersizing only costs an extra query.
+const SINGLETON_CACHE_CAPACITY: usize = 8_192;
+
 /// Cassandra-based implementation of [`TriggerStore`](super::TriggerStore).
 ///
 /// Provides persistent storage for timer triggers using Apache Cassandra
 /// with automatic schema migration and optimized TTL management.
-#[derive(Clone, Debug)]
+#[derive(Clone, Educe)]
+#[educe(Debug)]
 pub struct CassandraTriggerStore {
     store: CassandraStore,
     queries: Arc<Queries>,
     slab_size: CompactDuration,
+    /// Tracks keys known to be in singleton state. Presence means the key's
+    /// slot is `Singleton` (no clustering rows); absence means unknown (fall
+    /// back to DB read). Evicted on any write that may leave clustering rows.
+    #[educe(Debug(ignore))]
+    singleton_keys: Arc<Cache<SingletonCacheKey, ()>>,
 }
 
 impl CassandraTriggerStore {
@@ -75,6 +94,7 @@ impl CassandraTriggerStore {
             store,
             queries,
             slab_size,
+            singleton_keys: Arc::new(Cache::new(SINGLETON_CACHE_CAPACITY)),
         })
     }
 
@@ -311,6 +331,37 @@ impl CassandraTriggerStore {
         }
 
         Ok(())
+    }
+
+    /// Updates the singleton slot (static column only) without touching
+    /// clustering rows.
+    ///
+    /// This is the fast path for singleton→singleton replacement: no BATCH,
+    /// no DELETE, no range tombstone. Safe because the caller
+    /// (`clear_and_schedule_key`) has already verified the slot is in
+    /// `Singleton` state, meaning no clustering rows exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the database update fails.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn set_singleton_slot(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+        slot: TimerSlot,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        let timer_type_i8 = i8::from(timer_type);
+
+        self.execute_with_optional_ttl(
+            slot.time,
+            &self.queries().set_singleton_slot,
+            &self.queries().set_singleton_slot_no_ttl,
+            |ttl| (ttl, timer_type_i8, &slot, segment_id, key.as_ref()),
+            || (timer_type_i8, &slot, segment_id, key.as_ref()),
+        )
+        .await
     }
 
     /// Removes a singleton slot entry entirely, returning to Absent state.
@@ -948,6 +999,10 @@ impl TriggerOperations for CassandraTriggerStore {
         let timer_type = trigger.timer_type;
         let key = trigger.key.clone();
 
+        // No longer singleton — evict from cache.
+        self.singleton_keys
+            .remove(&(*segment_id, key.clone(), timer_type));
+
         // Read singleton slot concurrently with writing the new clustering row.
         let (slot_state, ()) = tokio::try_join!(
             self.get_singleton_slot(segment_id, &key, timer_type),
@@ -986,6 +1041,10 @@ impl TriggerOperations for CassandraTriggerStore {
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
+        // State is ambiguous after delete — evict from cache.
+        self.singleton_keys
+            .remove(&(*segment_id, key.clone(), timer_type));
+
         // Concurrent: read singleton state AND delete clustering row
         let (slot_state, ()) = tokio::try_join!(
             self.get_singleton_slot(segment_id, key, timer_type),
@@ -1022,6 +1081,10 @@ impl TriggerOperations for CassandraTriggerStore {
         timer_type: TimerType,
         key: &Key,
     ) -> Result<(), Self::Error> {
+        // Cleared — evict from cache.
+        self.singleton_keys
+            .remove(&(*segment_id, key.clone(), timer_type));
+
         // Concurrent: remove singleton entry AND clear clustering rows
         tokio::try_join!(
             self.remove_singleton_entry(segment_id, key, timer_type),
@@ -1046,6 +1109,12 @@ impl TriggerOperations for CassandraTriggerStore {
         segment_id: &SegmentId,
         key: &Key,
     ) -> Result<(), Self::Error> {
+        // Cleared all types — evict every variant from cache.
+        for timer_type in TimerType::VARIANTS {
+            self.singleton_keys
+                .remove(&(*segment_id, key.clone(), *timer_type));
+        }
+
         self.session()
             .execute_unpaged(
                 &self.queries().clear_key_triggers_all_types,
@@ -1060,12 +1129,15 @@ impl TriggerOperations for CassandraTriggerStore {
     /// Atomically clears existing timers and schedules a new one in the key
     /// index.
     ///
-    /// Uses singleton slot optimization: executes a BATCH that atomically
-    /// DELETEs all clustering rows for this key/type and UPDATEs the static
-    /// singleton slot with the new timer data. For singleton→singleton
-    /// replacement, the DELETE is a no-op (no clustering rows exist),
-    /// avoiding tombstone creation.
-    #[instrument(level = "debug", skip(self), err)]
+    /// Uses singleton slot optimization to avoid unnecessary tombstones:
+    /// - **Singleton state**: executes a plain UPDATE on the static column (no
+    ///   BATCH, no DELETE, no range tombstone).
+    /// - **Absent / Overflow state**: executes a BATCH that atomically DELETEs
+    ///   all clustering rows and UPDATEs the static singleton slot.
+    ///
+    /// Per-key serialization (`KeyManager`) guarantees the slot state is
+    /// stable between the read and the write.
+    #[instrument(level = "debug", skip(self), fields(singleton_cached = Empty), err)]
     async fn clear_and_schedule_key(
         &self,
         segment_id: &SegmentId,
@@ -1081,11 +1153,41 @@ impl TriggerOperations for CassandraTriggerStore {
             span: span_map,
         };
 
-        // Use the singleton slot BATCH operation which atomically:
-        // 1. DELETEs all clustering rows for this key/type
-        // 2. UPDATEs the static singleton slot with the new timer
-        self.clear_and_set_singleton_slot(segment_id, &trigger.key, trigger.timer_type, slot)
-            .await
+        let cache_key = (*segment_id, trigger.key.clone(), trigger.timer_type);
+        let is_known_singleton = self.singleton_keys.get(&cache_key).is_some();
+        Span::current().record("singleton_cached", is_known_singleton);
+
+        if is_known_singleton {
+            // Fast path: cache confirms singleton state — plain UPDATE,
+            // no BATCH, no range tombstone.
+            self.set_singleton_slot(segment_id, &trigger.key, trigger.timer_type, slot)
+                .await?;
+        } else {
+            // Cache miss: read from DB to determine state.
+            let slot_state = self
+                .get_singleton_slot(segment_id, &trigger.key, trigger.timer_type)
+                .await?;
+
+            match slot_state {
+                SlotState::Singleton(_) => {
+                    self.set_singleton_slot(segment_id, &trigger.key, trigger.timer_type, slot)
+                        .await?;
+                }
+                SlotState::Absent | SlotState::Overflow => {
+                    self.clear_and_set_singleton_slot(
+                        segment_id,
+                        &trigger.key,
+                        trigger.timer_type,
+                        slot,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        // After success, this key is known to be in singleton state.
+        self.singleton_keys.insert(cache_key, ());
+        Ok(())
     }
 
     // -- V1 migration methods --

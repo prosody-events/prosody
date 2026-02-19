@@ -15,6 +15,7 @@ use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
+use strum::VariantArray;
 use tracing::Span;
 use uuid::Uuid;
 
@@ -647,7 +648,7 @@ where
     // Final sanity check: verify model-store equivalence for all keys
     // (queries were already verified inline, this catches any missed state)
     for (segment_id, key) in &model.all_keys() {
-        for timer_type in TimerType::ALL {
+        for &timer_type in TimerType::VARIANTS {
             verify_key_times(operations, &model, segment_id, timer_type, key).await?;
             verify_key_triggers(operations, &model, segment_id, timer_type, key).await?;
         }

@@ -76,7 +76,9 @@ pub mod uncommitted;
 ///
 /// Timers can have different types that determine their purpose and routing.
 /// This is an internal classification not exposed to applications.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(
+    Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd, strum::VariantArray,
+)]
 #[repr(i8)]
 pub enum TimerType {
     /// User-scheduled application timers (default).
@@ -86,15 +88,6 @@ pub enum TimerType {
     DeferredMessage = 1,
     /// Defer middleware timer retry timers.
     DeferredTimer = 2,
-}
-
-impl TimerType {
-    /// All timer type variants.
-    pub const ALL: [Self; 3] = [
-        Self::Application,
-        Self::DeferredMessage,
-        Self::DeferredTimer,
-    ];
 }
 
 impl From<TimerType> for i8 {
