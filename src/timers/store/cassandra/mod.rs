@@ -1373,6 +1373,7 @@ mod test {
     use crate::timers::duration::CompactDuration;
     use crate::timers::slab::{Slab, SlabId};
     use crate::timers::store::operations::TriggerOperations;
+    use crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput;
     use crate::timers::store::{Segment, SegmentId, SegmentVersion};
     use crate::tracing::init_test_logging;
     use crate::trigger_store_tests;
@@ -1384,6 +1385,7 @@ mod test {
     use std::env;
     use std::ops::RangeInclusive;
     use std::time::Duration;
+    use strum::VariantArray;
     use uuid::Uuid;
 
     /// Creates a test configuration for Cassandra integration tests.
@@ -1580,6 +1582,477 @@ mod test {
         Ok(())
     }
 
+    /// Collects sorted times from `get_key_times`.
+    async fn collect_key_times(
+        store: &CassandraTriggerStore,
+        segment_id: &SegmentId,
+        timer_type: TimerType,
+        key: &Key,
+    ) -> Result<Vec<CompactDateTime>> {
+        let mut times: Vec<CompactDateTime> = store
+            .get_key_times(segment_id, timer_type, key)
+            .try_collect()
+            .await?;
+        times.sort();
+        Ok(times)
+    }
+
+    /// Collects sorted times from `get_key_triggers`.
+    async fn collect_trigger_times(
+        store: &CassandraTriggerStore,
+        segment_id: &SegmentId,
+        timer_type: TimerType,
+        key: &Key,
+    ) -> Result<Vec<CompactDateTime>> {
+        let mut times: Vec<CompactDateTime> = store
+            .get_key_triggers(segment_id, timer_type, key)
+            .map_ok(|t| t.time)
+            .try_collect()
+            .await?;
+        times.sort();
+        Ok(times)
+    }
+
+    /// Collects sorted times for a specific type from
+    /// `get_key_triggers_all_types`.
+    async fn collect_all_types_times(
+        store: &CassandraTriggerStore,
+        segment_id: &SegmentId,
+        timer_type: TimerType,
+        key: &Key,
+    ) -> Result<Vec<CompactDateTime>> {
+        let mut times: Vec<CompactDateTime> = store
+            .get_key_triggers_all_types(segment_id, key)
+            .try_filter_map(|t| async move {
+                if t.timer_type == timer_type {
+                    Ok(Some(t.time))
+                } else {
+                    Ok(None)
+                }
+            })
+            .try_collect()
+            .await?;
+        times.sort();
+        Ok(times)
+    }
+
+    /// Asserts that all three read paths return the expected sorted times for
+    /// a `(segment_id, key, timer_type)`.
+    async fn assert_key_reads(
+        store: &CassandraTriggerStore,
+        segment_id: &SegmentId,
+        timer_type: TimerType,
+        key: &Key,
+        expected: &[CompactDateTime],
+        phase: &str,
+    ) -> Result<()> {
+        assert_eq!(
+            collect_key_times(store, segment_id, timer_type, key).await?,
+            expected,
+            "{phase}: get_key_times"
+        );
+        assert_eq!(
+            collect_trigger_times(store, segment_id, timer_type, key).await?,
+            expected,
+            "{phase}: get_key_triggers"
+        );
+        assert_eq!(
+            collect_all_types_times(store, segment_id, timer_type, key).await?,
+            expected,
+            "{phase}: get_key_triggers_all_types"
+        );
+        Ok(())
+    }
+
+    /// Verifies that all operations on the key index are correct at each
+    /// state: 0 timers (Absent), 1 timer (Inline), and 2 timers (Overflow).
+    ///
+    /// Walks through every state transition:
+    ///
+    /// ```text
+    /// Absent → (clear_and_schedule) → Inline → (insert) → Overflow
+    ///   ↑                               ↑         ↓
+    ///   └── (delete) ───────────────────┘    (delete) → 1 in clustering
+    ///   ↑                                                   ↓
+    ///   └──────────────── (delete) ────────────────────────┘
+    ///
+    /// Overflow → (clear_and_schedule) → Inline
+    /// Inline → (clear_key_triggers) → Absent
+    /// Overflow → (clear_key_triggers) → Absent
+    /// ```
+    ///
+    /// At each state, verifies:
+    /// 1. `get_singleton_slot` returns the expected `SlotState`
+    /// 2. All three read paths return correct data
+    #[tokio::test]
+    async fn test_state_transitions_one_and_two_timers() -> Result<()> {
+        init_test_logging();
+
+        let slab_size = CompactDuration::new(60);
+        let config = test_cassandra_config("prosody_test");
+        let cassandra_store = CassandraStore::new(&config).await?;
+        let store =
+            CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
+
+        let segment_id = SegmentId::from(Uuid::new_v4());
+        let segment = Segment {
+            id: segment_id,
+            name: "state_transitions".to_owned(),
+            slab_size,
+            version: SegmentVersion::V2,
+        };
+        store.insert_segment(segment).await?;
+
+        let key: Key = format!("state-test-{}", Uuid::new_v4()).into();
+        let tt = TimerType::Application;
+        let t1 = CompactDateTime::from(1_000_000u32);
+        let t2 = CompactDateTime::from(2_000_000u32);
+        let t3 = CompactDateTime::from(3_000_000u32);
+
+        // Phase 1: Absent (0 timers)
+        let state = store.get_singleton_slot(&segment_id, &key, tt).await?;
+        assert_eq!(state, SlotState::Absent, "phase 1: expected Absent");
+        assert_key_reads(&store, &segment_id, tt, &key, &[], "phase 1").await?;
+
+        // Phase 1b: 1 timer in clustering, state column Absent.
+        // This is the backward-compatibility case: insert_key_trigger on a
+        // fresh key writes a clustering row but does not set the state column.
+        // Reads must still find the timer via clustering scan.
+        store
+            .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key, tt).await?;
+        assert_eq!(
+            state,
+            SlotState::Absent,
+            "phase 1b: state should remain Absent"
+        );
+        assert_key_reads(&store, &segment_id, tt, &key, &[t1], "phase 1b").await?;
+
+        // Clean up for phase 2.
+        store.clear_key_triggers(&segment_id, tt, &key).await?;
+
+        // Phase 2: Absent → Inline via clear_and_schedule_key
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key, tt).await?;
+        assert!(
+            matches!(&state, SlotState::Singleton(slot) if slot.time == t1),
+            "phase 2: expected Singleton(t1), got {state:?}"
+        );
+        assert_key_reads(&store, &segment_id, tt, &key, &[t1], "phase 2").await?;
+
+        // Phase 3: Inline → Overflow via insert_key_trigger
+        store
+            .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t2, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key, tt).await?;
+        assert_eq!(
+            state,
+            SlotState::Absent,
+            "phase 3: expected Absent (promoted)"
+        );
+        assert_key_reads(&store, &segment_id, tt, &key, &[t1, t2], "phase 3").await?;
+
+        // Phase 4: Overflow → 1 remaining via delete_key_trigger (2→1)
+        store.delete_key_trigger(&segment_id, tt, &key, t1).await?;
+        assert_key_reads(&store, &segment_id, tt, &key, &[t2], "phase 4").await?;
+
+        // Phase 5: 1 remaining → Absent via delete_key_trigger (1→0)
+        store.delete_key_trigger(&segment_id, tt, &key, t2).await?;
+        assert_key_reads(&store, &segment_id, tt, &key, &[], "phase 5").await?;
+
+        // Phase 6: Overflow → Inline via clear_and_schedule_key
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+            .await?;
+        store
+            .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t2, tt))
+            .await?;
+        assert_key_reads(&store, &segment_id, tt, &key, &[t1, t2], "phase 6 setup").await?;
+
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t3, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key, tt).await?;
+        assert!(
+            matches!(&state, SlotState::Singleton(slot) if slot.time == t3),
+            "phase 6: expected Singleton(t3), got {state:?}"
+        );
+        assert_key_reads(&store, &segment_id, tt, &key, &[t3], "phase 6").await?;
+
+        // Phase 7: Inline → Absent via clear_key_triggers
+        store.clear_key_triggers(&segment_id, tt, &key).await?;
+        let state = store.get_singleton_slot(&segment_id, &key, tt).await?;
+        assert_eq!(state, SlotState::Absent, "phase 7: expected Absent");
+        assert_key_reads(&store, &segment_id, tt, &key, &[], "phase 7").await?;
+
+        // Phase 8: Overflow → Absent via clear_key_triggers
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+            .await?;
+        store
+            .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t2, tt))
+            .await?;
+        store.clear_key_triggers(&segment_id, tt, &key).await?;
+        let state = store.get_singleton_slot(&segment_id, &key, tt).await?;
+        assert_eq!(state, SlotState::Absent, "phase 8: expected Absent");
+        assert_key_reads(&store, &segment_id, tt, &key, &[], "phase 8").await?;
+
+        // Phase 9: clear_key_triggers_all_types — tested separately below.
+
+        // Phase 10: Inline → Inline via clear_and_schedule_key (no tombstone)
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+            .await?;
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t2, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key, tt).await?;
+        assert!(
+            matches!(&state, SlotState::Singleton(slot) if slot.time == t2),
+            "phase 10: expected Singleton(t2), got {state:?}"
+        );
+        assert_key_reads(&store, &segment_id, tt, &key, &[t2], "phase 10").await?;
+
+        store.delete_segment(&segment_id).await?;
+        Ok(())
+    }
+
+    /// Creates a test store and segment, returning `(store, segment_id)`.
+    async fn setup_test_store(name: &str) -> Result<(CassandraTriggerStore, SegmentId)> {
+        let slab_size = CompactDuration::new(60);
+        let config = test_cassandra_config("prosody_test");
+        let cassandra_store = CassandraStore::new(&config).await?;
+        let store =
+            CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
+
+        let segment_id = SegmentId::from(Uuid::new_v4());
+        let segment = Segment {
+            id: segment_id,
+            name: name.to_owned(),
+            slab_size,
+            version: SegmentVersion::V2,
+        };
+        store.insert_segment(segment).await?;
+        Ok((store, segment_id))
+    }
+
+    /// Simulates pre-migration production data: timers written directly to
+    /// clustering columns with no `state` MAP entry (as old code would have).
+    /// Verifies reads and `clear_and_schedule_key` migration.
+    ///
+    /// Uses `add_key_trigger_clustering` to write clustering rows without
+    /// touching the state column.
+    #[tokio::test]
+    async fn test_pre_migration_reads_and_migration() -> Result<()> {
+        init_test_logging();
+        let (store, segment_id) = setup_test_store("pre_mig_reads").await?;
+
+        let tt = TimerType::Application;
+        let t1 = CompactDateTime::from(1_000_000u32);
+        let t2 = CompactDateTime::from(2_000_000u32);
+        let t3 = CompactDateTime::from(3_000_000u32);
+
+        // Scenario A: 1 pre-migration clustering timer — reads find it.
+        let key_a: Key = format!("pre-mig-a-{}", Uuid::new_v4()).into();
+        store
+            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_a.clone(), t1, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key_a, tt).await?;
+        assert_eq!(state, SlotState::Absent, "A: state should be Absent");
+        assert_key_reads(&store, &segment_id, tt, &key_a, &[t1], "A read").await?;
+
+        // clear_and_schedule_key migrates to inline.
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_a.clone(), t2, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key_a, tt).await?;
+        assert!(
+            matches!(&state, SlotState::Singleton(slot) if slot.time == t2),
+            "A migrated: expected Singleton(t2), got {state:?}"
+        );
+        assert_key_reads(&store, &segment_id, tt, &key_a, &[t2], "A migrated").await?;
+
+        // Scenario B: 2 pre-migration clustering timers — reads find both.
+        let key_b: Key = format!("pre-mig-b-{}", Uuid::new_v4()).into();
+        store
+            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_b.clone(), t1, tt))
+            .await?;
+        store
+            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_b.clone(), t2, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key_b, tt).await?;
+        assert_eq!(state, SlotState::Absent, "B: state should be Absent");
+        assert_key_reads(&store, &segment_id, tt, &key_b, &[t1, t2], "B read").await?;
+
+        // clear_and_schedule_key replaces both with inline singleton.
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_b.clone(), t3, tt))
+            .await?;
+        let state = store.get_singleton_slot(&segment_id, &key_b, tt).await?;
+        assert!(
+            matches!(&state, SlotState::Singleton(slot) if slot.time == t3),
+            "B migrated: expected Singleton(t3), got {state:?}"
+        );
+        assert_key_reads(&store, &segment_id, tt, &key_b, &[t3], "B migrated").await?;
+
+        store.delete_segment(&segment_id).await?;
+        Ok(())
+    }
+
+    /// Simulates pre-migration production data and verifies that mutation
+    /// operations (`insert`, `delete`, `clear`) work correctly on timers
+    /// that exist only in clustering columns with no `state` MAP entry.
+    #[tokio::test]
+    async fn test_pre_migration_mutations() -> Result<()> {
+        init_test_logging();
+        let (store, segment_id) = setup_test_store("pre_mig_mutations").await?;
+
+        let tt = TimerType::Application;
+        let t1 = CompactDateTime::from(1_000_000u32);
+        let t2 = CompactDateTime::from(2_000_000u32);
+        let t3 = CompactDateTime::from(3_000_000u32);
+
+        // Scenario C: insert_key_trigger on 1 pre-migration timer — both
+        // end up in clustering since state is Absent (no promotion).
+        let key_c: Key = format!("pre-mig-c-{}", Uuid::new_v4()).into();
+        store
+            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_c.clone(), t1, tt))
+            .await?;
+        store
+            .insert_key_trigger(&segment_id, Trigger::for_testing(key_c.clone(), t2, tt))
+            .await?;
+        assert_key_reads(&store, &segment_id, tt, &key_c, &[t1, t2], "C insert").await?;
+
+        // clear_and_schedule_key migrates to inline.
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_c.clone(), t3, tt))
+            .await?;
+        assert_key_reads(&store, &segment_id, tt, &key_c, &[t3], "C migrated").await?;
+
+        // Scenario D: clear_key_triggers on pre-migration data.
+        let key_d: Key = format!("pre-mig-d-{}", Uuid::new_v4()).into();
+        store
+            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_d.clone(), t1, tt))
+            .await?;
+        store
+            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_d.clone(), t2, tt))
+            .await?;
+        store.clear_key_triggers(&segment_id, tt, &key_d).await?;
+        assert_key_reads(&store, &segment_id, tt, &key_d, &[], "D cleared").await?;
+
+        // Scenario E: delete_key_trigger on pre-migration data.
+        let key_e: Key = format!("pre-mig-e-{}", Uuid::new_v4()).into();
+        store
+            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_e.clone(), t1, tt))
+            .await?;
+        store
+            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_e.clone(), t2, tt))
+            .await?;
+        store
+            .delete_key_trigger(&segment_id, tt, &key_e, t1)
+            .await?;
+        assert_key_reads(&store, &segment_id, tt, &key_e, &[t2], "E delete one").await?;
+        store
+            .delete_key_trigger(&segment_id, tt, &key_e, t2)
+            .await?;
+        assert_key_reads(&store, &segment_id, tt, &key_e, &[], "E delete all").await?;
+
+        store.delete_segment(&segment_id).await?;
+        Ok(())
+    }
+
+    /// Verifies `clear_key_triggers_all_types` clears both inline and
+    /// overflow states across different timer types simultaneously.
+    #[tokio::test]
+    async fn test_clear_all_types_clears_inline_and_overflow() -> Result<()> {
+        init_test_logging();
+
+        let slab_size = CompactDuration::new(60);
+        let config = test_cassandra_config("prosody_test");
+        let cassandra_store = CassandraStore::new(&config).await?;
+        let store =
+            CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
+
+        let segment_id = SegmentId::from(Uuid::new_v4());
+        let segment = Segment {
+            id: segment_id,
+            name: "clear_all_types".to_owned(),
+            slab_size,
+            version: SegmentVersion::V2,
+        };
+        store.insert_segment(segment).await?;
+
+        let key: Key = format!("clear-all-{}", Uuid::new_v4()).into();
+        let t1 = CompactDateTime::from(1_000_000u32);
+        let t2 = CompactDateTime::from(2_000_000u32);
+
+        // Set up: Application inline (1 timer), DeferredMessage overflow (2 timers).
+        store
+            .clear_and_schedule_key(
+                &segment_id,
+                Trigger::for_testing(key.clone(), t1, TimerType::Application),
+            )
+            .await?;
+        store
+            .clear_and_schedule_key(
+                &segment_id,
+                Trigger::for_testing(key.clone(), t1, TimerType::DeferredMessage),
+            )
+            .await?;
+        store
+            .insert_key_trigger(
+                &segment_id,
+                Trigger::for_testing(key.clone(), t2, TimerType::DeferredMessage),
+            )
+            .await?;
+
+        // Verify setup.
+        assert_key_reads(
+            &store,
+            &segment_id,
+            TimerType::Application,
+            &key,
+            &[t1],
+            "setup app",
+        )
+        .await?;
+        assert_key_reads(
+            &store,
+            &segment_id,
+            TimerType::DeferredMessage,
+            &key,
+            &[t1, t2],
+            "setup dm",
+        )
+        .await?;
+
+        // Clear all types.
+        store
+            .clear_key_triggers_all_types(&segment_id, &key)
+            .await?;
+
+        // Verify all types are Absent with no data.
+        for &variant in TimerType::VARIANTS {
+            let state = store.get_singleton_slot(&segment_id, &key, variant).await?;
+            assert_eq!(state, SlotState::Absent, "{variant:?} should be Absent");
+            assert_key_reads(
+                &store,
+                &segment_id,
+                variant,
+                &key,
+                &[],
+                &format!("{variant:?}"),
+            )
+            .await?;
+        }
+
+        store.delete_segment(&segment_id).await?;
+        Ok(())
+    }
+
     /// Verifies the singleton slot state machine lifecycle:
     /// Absent → Singleton → Singleton (replacement) → Absent (after promotion)
     /// → Singleton
@@ -1707,6 +2180,163 @@ mod test {
         );
 
         store.delete_segment(&segment_id).await?;
+
+        Ok(())
+    }
+
+    /// Property test verifying the singleton slot invariant:
+    ///
+    /// - **1 timer** for a `(segment_id, key, timer_type)` → singleton slot
+    ///   must hold it (`Singleton`), no clustering rows.
+    /// - **>1 timer** → singleton slot must be `Absent`, all timers in
+    ///   clustering rows.
+    /// - **0 timers** → singleton slot must be `Absent`.
+    ///
+    /// Applies a random sequence of operations then inspects every
+    /// `(segment_id, key, timer_type)` combination against the reference model.
+    #[test]
+    fn test_prop_singleton_invariant() {
+        use crate::test_util::TEST_RUNTIME;
+        use crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput;
+        use quickcheck::{QuickCheck, TestResult};
+        use tracing::Instrument;
+
+        fn prop(input: KeyTriggerTestInput) -> TestResult {
+            let runtime = &*TEST_RUNTIME;
+            let span = tracing::Span::current();
+
+            let slab_size = input.slab_size;
+            let store = match runtime.block_on(
+                async {
+                    let config = test_cassandra_config("prosody_test");
+                    let store = CassandraStore::new(&config).await?;
+                    CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await
+                }
+                .instrument(span.clone()),
+            ) {
+                Ok(s) => s,
+                Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
+            };
+
+            match runtime
+                .block_on(async { prop_singleton_invariant(&store, input).await }.instrument(span))
+            {
+                Ok(()) => TestResult::passed(),
+                Err(e) => TestResult::error(format!("{e:?}")),
+            }
+        }
+
+        init_test_logging();
+        QuickCheck::new()
+            .tests(get_test_count())
+            .quickcheck(prop as fn(KeyTriggerTestInput) -> TestResult);
+    }
+
+    /// Applies operations from [`KeyTriggerTestInput`] and verifies the
+    /// singleton invariant holds for every `(segment_id, key, timer_type)`.
+    async fn prop_singleton_invariant(
+        store: &CassandraTriggerStore,
+        input: KeyTriggerTestInput,
+    ) -> Result<()> {
+        use crate::timers::store::tests::prop_key_triggers::{
+            KeyTriggerModel, KeyTriggerOperation,
+        };
+
+        let key_pool = ["key-a", "key-b", "key-c"];
+
+        // Clean up before test
+        for segment_id in &input.segment_ids {
+            for key_str in &key_pool {
+                let key = Key::from(*key_str);
+                store.clear_key_triggers_all_types(segment_id, &key).await?;
+            }
+        }
+
+        // Apply all operations to both model and store
+        let mut model = KeyTriggerModel::new();
+        for op in &input.operations {
+            model.apply(op);
+            match op {
+                KeyTriggerOperation::Insert {
+                    segment_id,
+                    trigger,
+                } => {
+                    store
+                        .insert_key_trigger(segment_id, trigger.clone())
+                        .await?;
+                }
+                KeyTriggerOperation::Delete {
+                    segment_id,
+                    timer_type,
+                    key,
+                    time,
+                } => {
+                    store
+                        .delete_key_trigger(segment_id, *timer_type, key, *time)
+                        .await?;
+                }
+                KeyTriggerOperation::ClearByType {
+                    segment_id,
+                    timer_type,
+                    key,
+                } => {
+                    store
+                        .clear_key_triggers(segment_id, *timer_type, key)
+                        .await?;
+                }
+                KeyTriggerOperation::ClearAllTypes { segment_id, key } => {
+                    store.clear_key_triggers_all_types(segment_id, key).await?;
+                }
+                KeyTriggerOperation::ClearAndSchedule {
+                    segment_id,
+                    trigger,
+                } => {
+                    store
+                        .clear_and_schedule_key(segment_id, trigger.clone())
+                        .await?;
+                }
+                KeyTriggerOperation::GetTimes { .. }
+                | KeyTriggerOperation::GetTriggers { .. }
+                | KeyTriggerOperation::GetAllTypes { .. } => {}
+            }
+        }
+
+        // Verify singleton invariant for every (segment_id, key, timer_type)
+        for (segment_id, key) in &model.all_keys() {
+            for &timer_type in TimerType::VARIANTS {
+                let expected_count = model.get_times(segment_id, timer_type, key).len();
+                let slot_state = store
+                    .get_singleton_slot(segment_id, key, timer_type)
+                    .await?;
+
+                match expected_count {
+                    0 => {
+                        assert!(
+                            matches!(slot_state, SlotState::Absent),
+                            "Invariant violation: 0 timers for ({segment_id}, {key}, \
+                             {timer_type:?}) but singleton slot is {slot_state:?}"
+                        );
+                    }
+                    1 => {
+                        let expected_time = model.get_times(segment_id, timer_type, key)[0];
+                        assert!(
+                            matches!(&slot_state, SlotState::Singleton(slot) if slot.time == expected_time),
+                            "Invariant violation: exactly 1 timer (time={expected_time:?}) for \
+                             ({segment_id}, {key}, {timer_type:?}) but singleton slot is \
+                             {slot_state:?} — expected Singleton"
+                        );
+                    }
+                    n => {
+                        assert!(
+                            matches!(slot_state, SlotState::Absent),
+                            "Invariant violation: {n} timers for ({segment_id}, {key}, \
+                             {timer_type:?}) but singleton slot is {slot_state:?} — expected \
+                             Absent"
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
