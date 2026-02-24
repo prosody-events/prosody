@@ -67,14 +67,15 @@ pub struct InlineTimer {
 ///
 /// Determined by reading the `state` static map column and converting via
 /// `into_timer_state`:
-/// - No map entry → `Absent` (no timers or pre-migration data)
+/// - No map entry → `Absent` (post-V3: unambiguously 0 timers)
 /// - `inline = true` with valid time → `Inline` (exactly 1 timer, stored in
 ///   state column)
 /// - `inline = false/null` or corrupt data → `Overflow` (>1 timers, stored in
 ///   clustering rows)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimerState {
-    /// No timers for this key/type.
+    /// 0 timers for this key/type. Post-V3, `None` → `Absent` is
+    /// unambiguous: no clustering rows exist.
     Absent,
     /// Exactly one timer, stored inline in the state column.
     Inline(InlineTimer),
@@ -87,7 +88,7 @@ pub enum TimerState {
 /// Used only at the module boundary for serialization/deserialization.
 /// Convert to `TimerState` via `into_timer_state` for domain logic.
 #[derive(Clone, Debug, DeserializeValue, SerializeValue)]
-struct RawTimerState {
+pub(super) struct RawTimerState {
     /// `true` = inline data present; `false`/`null` = overflow marker.
     inline: Option<bool>,
     /// Timer time (present only when `inline = true`).
@@ -97,6 +98,8 @@ struct RawTimerState {
 }
 
 /// Converts a raw Cassandra UDT value into a resolved `TimerState`.
+///
+/// Post-V3, `None → Absent` is unambiguous: the key is new with 0 timers.
 ///
 /// Conversion rules:
 /// - `None` → `Absent`
@@ -137,10 +140,10 @@ pub struct CassandraTriggerStore {
     /// Tracks the current state of each key/type pair:
     /// - `Inline(timer)` — exactly 1 timer, stored in the state column
     /// - `Overflow` — >1 timers, stored in clustering rows
-    /// - `Absent` — 0 timers (only cached after our own writes, never from DB
-    ///   reads)
+    /// - `Absent` — 0 timers (post-V3: all states including Absent are cached)
     ///
-    /// Cache miss → fall back to DB read.
+    /// Cache miss → `resolve_state` reads all types from DB and warms the
+    /// cache for all `TimerType::VARIANTS` in a single query.
     #[educe(Debug(ignore))]
     state_cache: Arc<Cache<StateCacheKey, TimerState>>,
 }
@@ -352,30 +355,50 @@ impl CassandraTriggerStore {
         }
     }
 
-    /// Reads the state map for a partition (all timer types at once).
+    /// Resolves the timer state for a `(key, timer_type)` with cache-first
+    /// semantics, warming all types as a free side effect on a cache miss.
     ///
-    /// Returns the entire `state` map for use by `get_key_triggers_all_types`
-    /// where per-type state must be evaluated for each type simultaneously.
+    /// Logic:
+    /// 1. Cache hit → return immediately.
+    /// 2. Cache miss → call `fetch_state_map` (reads ALL types in 1 query). For
+    ///    each `TimerType::VARIANTS`: resolve via `into_timer_state` (post-V3:
+    ///    `None` → `Absent`), insert into cache.
+    /// 3. Return the requested type's state.
+    ///
+    /// Post-V3, a NULL/missing MAP entry unambiguously means "new key, 0
+    /// timers," so all states (including `Absent`) are cached.
     ///
     /// # Errors
     ///
-    /// Returns error if the database query fails.
-    #[instrument(level = "debug", skip(self), err)]
-    async fn get_timer_state_map(
+    /// Returns error if the DB read fails on a cache miss.
+    async fn resolve_state(
         &self,
         segment_id: &SegmentId,
         key: &Key,
-    ) -> Result<Option<HashMap<TimerType, TimerState>>, CassandraTriggerStoreError> {
-        let Some(raw_map) = self.fetch_state_map(segment_id, key).await? else {
-            return Ok(None);
-        };
+        timer_type: TimerType,
+    ) -> Result<TimerState, CassandraTriggerStoreError> {
+        let cache_key = (key.clone(), timer_type);
 
-        let resolved: HashMap<TimerType, TimerState> = raw_map
-            .into_iter()
-            .map(|(tt, raw)| (tt, into_timer_state(raw)))
-            .collect();
+        // Fast path: cache hit.
+        if let Some(state) = self.state_cache.get(&cache_key) {
+            return Ok(state);
+        }
 
-        Ok(Some(resolved))
+        // Cache miss: read all types from DB in one query.
+        let raw_map = self.fetch_state_map(segment_id, key).await?;
+        let raw_map = raw_map.unwrap_or_default();
+
+        let mut result = TimerState::Absent;
+
+        for &tt in TimerType::VARIANTS {
+            let state = into_timer_state(raw_map.get(&tt).and_then(Option::clone));
+            if tt == timer_type {
+                result = state.clone();
+            }
+            self.state_cache.insert((key.clone(), tt), state);
+        }
+
+        Ok(result)
     }
 
     /// Atomically clears clustering rows and sets inline state.
@@ -505,12 +528,15 @@ impl CassandraTriggerStore {
         Ok(())
     }
 
-    /// Counts remaining triggers for a key/type (LIMIT 2).
+    /// Counts remaining clustering triggers for a key/type (LIMIT 2).
     ///
     /// Used for demotion check after `delete_key_trigger`:
     /// - 0 remaining → state becomes `Absent`
     /// - 1 remaining → state becomes `Inline` (demote)
     /// - 2+ remaining → state stays `Overflow`
+    ///
+    /// Also used by migration tests to verify that singleton normalization
+    /// (1-row → Inline) deleted the clustering row.
     ///
     /// Returns a vector of up to 2 trigger times.
     ///
@@ -518,7 +544,7 @@ impl CassandraTriggerStore {
     ///
     /// Returns error if the database query fails.
     #[instrument(level = "debug", skip(self), err)]
-    async fn count_remaining_triggers(
+    pub(crate) async fn count_remaining_triggers(
         &self,
         segment_id: &SegmentId,
         key: &Key,
@@ -542,6 +568,91 @@ impl CassandraTriggerStore {
         }
 
         Ok(times)
+    }
+
+    /// Backfills the key state MAP entry for a single `(key, timer_type)` pair.
+    ///
+    /// Used during V2→V3 migration. For keys that have clustering rows but no
+    /// state MAP entry, this method writes the appropriate state:
+    /// - If state already non-Absent: skip (idempotent).
+    /// - 0 clustering rows: skip (stale slab entry, truly absent).
+    /// - 1 clustering row: normalize to inline state (concurrent
+    ///   `set_state_inline` + delete clustering row).
+    /// - ≥2 clustering rows: set overflow marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if any DB operation fails.
+    #[instrument(level = "debug", skip(self), err)]
+    pub(super) async fn backfill_key_state(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        // Skip if already has state (idempotency guard).
+        let state = self.get_timer_state(segment_id, key, timer_type).await?;
+        if !matches!(state, TimerState::Absent) {
+            return Ok(());
+        }
+
+        // Count remaining clustering rows (LIMIT 2).
+        let remaining = self
+            .count_remaining_triggers(segment_id, key, timer_type)
+            .await?;
+
+        match remaining.len() {
+            0 => {
+                // Stale slab entry — no clustering rows exist, nothing to do.
+            }
+            1 => {
+                // Exactly 1 row: normalize to inline state.
+                // Read the clustering row directly (bypassing state logic, since
+                // no state entry exists yet during backfill).
+                let remaining_time = remaining[0];
+                let stream = self
+                    .session()
+                    .execute_iter(
+                        self.queries().get_key_triggers.clone(),
+                        (segment_id, key.as_ref(), timer_type),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>)>()
+                    .map_err(CassandraStoreError::from)?;
+                pin_mut!(stream);
+
+                // Read the first (only) clustering row to extract its span.
+                let Some((_k, _t, _tt, span_map)) = cooperative(stream.try_next())
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                else {
+                    // Row vanished between count and read — skip.
+                    return Ok(());
+                };
+
+                let raw_state = RawTimerState {
+                    inline: Some(true),
+                    time: Some(remaining_time),
+                    span: Some(span_map),
+                };
+
+                // Concurrent: write inline state + delete clustering row.
+                tokio::try_join!(
+                    self.set_state_inline(segment_id, key, timer_type, raw_state),
+                    self.execute_unpaged_discard(
+                        &self.queries().delete_key_trigger,
+                        (segment_id, key.as_ref(), timer_type, remaining_time),
+                    )
+                )?;
+            }
+            _ => {
+                // ≥2 rows: mark as overflow.
+                self.set_state_overflow(segment_id, key, timer_type).await?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Inserts a trigger into clustering columns only.
@@ -954,25 +1065,24 @@ impl TriggerOperations for CassandraTriggerStore {
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
-        let cache_key = (key.clone(), timer_type);
+        let key_clone = key.clone();
 
         try_stream! {
-            let cached_state = self.state_cache.get(&cache_key);
-            let was_cached = cached_state.is_some();
-            Span::current().record("state_cached", was_cached);
+            let state = self.resolve_state(segment_id, &key_clone, timer_type).await?;
+            Span::current().record("state_cached", true);
 
-            match cached_state {
-                Some(TimerState::Inline(timer)) => {
-                    // Cache hit Inline: yield time from cache (0 DB queries).
+            match state {
+                TimerState::Inline(timer) => {
+                    // Inline: yield time from cache (0 clustering query).
                     yield timer.time;
                 }
-                Some(TimerState::Overflow) => {
-                    // Cache hit Overflow: skip state read, scan clustering only.
+                TimerState::Overflow => {
+                    // Overflow: scan clustering rows.
                     let stream = self
                         .session()
                         .execute_iter(
                             self.queries().get_key_times.clone(),
-                            (segment_id, key.as_ref(), timer_type),
+                            (segment_id, key_clone.as_ref(), timer_type),
                         )
                         .await
                         .map_err(CassandraStoreError::from)?
@@ -988,52 +1098,8 @@ impl TriggerOperations for CassandraTriggerStore {
                         yield time;
                     }
                 }
-                Some(TimerState::Absent) => {
-                    // Cache hit Absent (from our own clear/delete): yield nothing
-                    // (0 DB queries, known 0 timers).
-                }
-                None => {
-                    // Cache miss: read state from DB.
-                    let db_state = self.get_timer_state(segment_id, key, timer_type).await?;
-
-                    // Cache Inline and Overflow from DB, but NOT Absent
-                    // (ambiguous: 0 timers or pre-migration data).
-                    match &db_state {
-                        TimerState::Inline(_) | TimerState::Overflow => {
-                            self.state_cache.insert(cache_key, db_state.clone());
-                        }
-                        TimerState::Absent => {}
-                    }
-
-                    match db_state {
-                        TimerState::Inline(timer) => {
-                            yield timer.time;
-                        }
-                        TimerState::Overflow | TimerState::Absent => {
-                            // DB Overflow: scan clustering only.
-                            // DB Absent: scan clustering (pre-migration safe — may
-                            // have timers in clustering with no state entry).
-                            let stream = self
-                                .session()
-                                .execute_iter(
-                                    self.queries().get_key_times.clone(),
-                                    (segment_id, key.as_ref(), timer_type),
-                                )
-                                .await
-                                .map_err(CassandraStoreError::from)?
-                                .rows_stream::<(CompactDateTime,)>()
-                                .map_err(CassandraStoreError::from)?;
-
-                            pin_mut!(stream);
-                            while let Some((time,)) =
-                                cooperative(stream.try_next())
-                                    .await
-                                    .map_err(CassandraStoreError::from)?
-                            {
-                                yield time;
-                            }
-                        }
-                    }
+                TimerState::Absent => {
+                    // Post-V3 Absent is unambiguous: 0 timers, yield nothing.
                 }
             }
         }
@@ -1047,17 +1113,14 @@ impl TriggerOperations for CassandraTriggerStore {
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let key_clone = key.clone();
-        let cache_key = (key.clone(), timer_type);
 
         try_stream! {
-            let cached_state = self.state_cache.get(&cache_key);
-            let was_cached = cached_state.is_some();
-            Span::current().record("state_cached", was_cached);
+            let state = self.resolve_state(segment_id, &key_clone, timer_type).await?;
+            Span::current().record("state_cached", true);
 
-            match cached_state {
-                Some(TimerState::Inline(timer)) => {
-                    // Cache hit Inline: create span from stored HashMap and yield
-                    // trigger (0 DB queries).
+            match state {
+                TimerState::Inline(timer) => {
+                    // Inline: yield trigger from cache (0 clustering query).
                     let context = self.propagator().extract(&timer.span);
                     let span = info_span!("fetch_key_trigger_inline");
                     if let Err(error) = span.set_parent(context) {
@@ -1065,8 +1128,8 @@ impl TriggerOperations for CassandraTriggerStore {
                     }
                     yield Trigger::new(key_clone.clone(), timer.time, timer_type, span);
                 }
-                Some(TimerState::Overflow) => {
-                    // Cache hit Overflow: skip state read, scan clustering only.
+                TimerState::Overflow => {
+                    // Overflow: scan clustering rows.
                     let stream = self
                         .session()
                         .execute_iter(
@@ -1092,67 +1155,14 @@ impl TriggerOperations for CassandraTriggerStore {
                         yield Trigger::new(key_clone.clone(), time, timer_type, span);
                     }
                 }
-                Some(TimerState::Absent) => {
-                    // Cache hit Absent (from our own clear/delete): yield nothing
-                    // (0 DB queries, known 0 timers).
-                }
-                None => {
-                    // Cache miss: read state from DB.
-                    let db_state = self.get_timer_state(segment_id, &key_clone, timer_type).await?;
-
-                    // Cache Inline and Overflow from DB, but NOT Absent
-                    // (ambiguous: 0 timers or pre-migration data).
-                    match &db_state {
-                        TimerState::Inline(_) | TimerState::Overflow => {
-                            self.state_cache.insert(cache_key, db_state.clone());
-                        }
-                        TimerState::Absent => {}
-                    }
-
-                    match db_state {
-                        TimerState::Inline(timer) => {
-                            let context = self.propagator().extract(&timer.span);
-                            let span = info_span!("fetch_key_trigger_inline");
-                            if let Err(error) = span.set_parent(context) {
-                                debug!("failed to set parent span: {error:#}");
-                            }
-                            yield Trigger::new(key_clone.clone(), timer.time, timer_type, span);
-                        }
-                        TimerState::Overflow | TimerState::Absent => {
-                            // DB Overflow: scan clustering only.
-                            // DB Absent: scan clustering (pre-migration safe).
-                            let stream = self
-                                .session()
-                                .execute_iter(
-                                    self.queries().get_key_triggers.clone(),
-                                    (segment_id, key_clone.as_ref(), timer_type),
-                                )
-                                .await
-                                .map_err(CassandraStoreError::from)?
-                                .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>)>()
-                                .map_err(CassandraStoreError::from)?;
-
-                            pin_mut!(stream);
-                            while let Some((_key_str, time, _timer_type, span_map)) =
-                                cooperative(stream.try_next())
-                                    .await
-                                    .map_err(CassandraStoreError::from)?
-                            {
-                                let context = self.propagator().extract(&span_map);
-                                let span = info_span!("fetch_key_trigger");
-                                if let Err(error) = span.set_parent(context) {
-                                    debug!("failed to set parent span: {error:#}");
-                                }
-                                yield Trigger::new(key_clone.clone(), time, timer_type, span);
-                            }
-                        }
-                    }
+                TimerState::Absent => {
+                    // Post-V3 Absent is unambiguous: 0 timers, yield nothing.
                 }
             }
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
     fn get_key_triggers_all_types(
         &self,
         segment_id: &SegmentId,
@@ -1161,80 +1171,99 @@ impl TriggerOperations for CassandraTriggerStore {
         let key_clone = key.clone();
 
         try_stream! {
-            // Read state map FIRST (sequential, not concurrent) to get a
-            // consistent snapshot of which types are in inline state before
-            // reading clustering rows. This avoids the race where a concurrent
-            // insert_key_trigger promotes an inline to clustering between the
-            // two reads.
-            let empty = HashMap::new();
-            let state_map = self.get_timer_state_map(segment_id, &key_clone).await?;
-            let state_map = state_map.as_ref().unwrap_or(&empty);
+            // Resolve state for every type. The first call does one DB read
+            // and warms all types; subsequent calls are cache hits.
+            let mut state_map: HashMap<TimerType, TimerState> =
+                HashMap::with_capacity(TimerType::VARIANTS.len());
 
-            let clustering_stream = self.session()
-                .execute_iter(
-                    self.queries().get_key_triggers_all_types.clone(),
-                    (segment_id, key_clone.as_ref()),
-                )
-                .await
-                .map_err(CassandraStoreError::from)?
-                .rows_stream()
-                .map_err(CassandraStoreError::from)?;
-
-            pin_mut!(clustering_stream);
-
-            // Merge two sorted sources by (timer_type, time):
-            //
-            //   Inline entries — TimerType::VARIANTS (i8-ascending), at most
-            //   one trigger per type.
-            //
-            //   Clustering — Cassandra stream in (timer_type, time) order,
-            //   skipping NULL static-only rows.
-
-            let mut variants_iter = TimerType::VARIANTS.iter();
-            let mut inline_next = advance_inline(
-                &key_clone, state_map, &mut variants_iter, self.propagator(),
-            );
-
-            // For each clustering row, flush any inline entries that sort before it.
-            while let Some(clustering) = advance_clustering(
-                &key_clone, &mut clustering_stream, self.propagator(),
-            ).await? {
-                while let Some(s) = inline_next.take() {
-                    if (s.timer_type, s.time) <= (clustering.timer_type, clustering.time) {
-                        yield s;
-                        inline_next = advance_inline(
-                            &key_clone, state_map, &mut variants_iter, self.propagator(),
-                        );
-                    } else {
-                        inline_next = Some(s);
-                        break;
-                    }
-                }
-                yield clustering;
+            for &tt in TimerType::VARIANTS {
+                let state = self.resolve_state(segment_id, &key_clone, tt).await?;
+                state_map.insert(tt, state);
             }
 
-            // Drain remaining inline entries.
-            while let Some(trigger) = inline_next {
-                yield trigger;
-                inline_next = advance_inline(
-                    &key_clone, state_map, &mut variants_iter, self.propagator(),
+            Span::current().record("state_cached", true);
+
+            // Check if any type is Overflow — if so, clustering scan needed.
+            let has_overflow = state_map.values().any(|s| matches!(s, TimerState::Overflow));
+
+            if has_overflow {
+                // At least one type needs clustering — run the merge.
+                let clustering_stream = self.session()
+                    .execute_iter(
+                        self.queries().get_key_triggers_all_types.clone(),
+                        (segment_id, key_clone.as_ref()),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .rows_stream()
+                    .map_err(CassandraStoreError::from)?;
+
+                pin_mut!(clustering_stream);
+
+                // Merge two sorted sources by (timer_type, time):
+                //
+                //   Inline entries — TimerType::VARIANTS (i8-ascending), at
+                //   most one trigger per type.
+                //
+                //   Clustering — Cassandra stream in (timer_type, time)
+                //   order, skipping NULL static-only rows.
+
+                let mut variants_iter = TimerType::VARIANTS.iter();
+                let mut inline_next = advance_inline(
+                    &key_clone, &state_map, &mut variants_iter, self.propagator(),
                 );
+
+                // For each clustering row, flush any inline entries that
+                // sort before it.
+                while let Some(clustering) = advance_clustering(
+                    &key_clone, &mut clustering_stream, self.propagator(),
+                ).await? {
+                    while let Some(s) = inline_next.take() {
+                        if (s.timer_type, s.time) <= (clustering.timer_type, clustering.time) {
+                            yield s;
+                            inline_next = advance_inline(
+                                &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                            );
+                        } else {
+                            inline_next = Some(s);
+                            break;
+                        }
+                    }
+                    yield clustering;
+                }
+
+                // Drain remaining inline entries.
+                while let Some(trigger) = inline_next {
+                    yield trigger;
+                    inline_next = advance_inline(
+                        &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                    );
+                }
+            } else {
+                // All types are Inline or Absent — yield inline entries in
+                // type order, no clustering query needed.
+                for &tt in TimerType::VARIANTS {
+                    if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
+                        let context = self.propagator().extract(&timer.span);
+                        let span = info_span!("fetch_key_trigger_inline");
+                        if let Err(error) = span.set_parent(context) {
+                            debug!("failed to set parent span: {error:#}");
+                        }
+                        yield Trigger::new(key_clone.clone(), timer.time, tt, span);
+                    }
+                }
             }
         }
     }
 
     /// Inserts a trigger into the key index with state-aware transitions.
     ///
-    /// Cache-first logic determines the write strategy:
-    /// - **Inline(old) hit**: Promote old timer to clustering + write new to
+    /// Uses `resolve_state` (cache-first, warms all types on miss):
+    /// - **Inline(old)**: Promote old timer to clustering + write new to
     ///   clustering + set overflow state → `Overflow`
-    /// - **Overflow hit**: Write clustering only (1 query) → stays `Overflow`
-    /// - **Absent hit** (from our own clear/delete — known 0 timers): Set
-    ///   inline state with new timer → `Inline(new)`
-    /// - **Cache miss, DB Absent** (ambiguous: pre-migration safe): Write
-    ///   clustering only, do NOT cache
-    /// - **Cache miss, DB Inline/Overflow**: Same as cache hit logic, cache
-    ///   result
+    /// - **Overflow**: Write clustering only (1 query) → stays `Overflow`
+    /// - **Absent**: Set inline state with new timer directly → `Inline(new)`
+    ///   (post-V3 Absent is unambiguous: 0 timers, no clustering rows)
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn insert_key_trigger(
         &self,
@@ -1244,14 +1273,9 @@ impl TriggerOperations for CassandraTriggerStore {
         let timer_type = trigger.timer_type;
         let key = trigger.key.clone();
         let cache_key = (key.clone(), timer_type);
-        let cached_state = self.state_cache.get(&cache_key);
-        let was_cached = cached_state.is_some();
-        Span::current().record("state_cached", was_cached);
 
-        let state = match cached_state {
-            Some(state) => state,
-            None => self.get_timer_state(segment_id, &key, timer_type).await?,
-        };
+        let state = self.resolve_state(segment_id, &key, timer_type).await?;
+        Span::current().record("state_cached", true);
 
         match state {
             TimerState::Inline(old_timer) => {
@@ -1277,32 +1301,26 @@ impl TriggerOperations for CassandraTriggerStore {
                 self.state_cache.insert(cache_key, TimerState::Overflow);
             }
             TimerState::Absent => {
-                if was_cached {
-                    // Cache Absent = from our own clear/delete → known 0 timers.
-                    // Set inline state directly.
-                    let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
-                    let context = trigger.span.load().context();
-                    self.propagator().inject_context(&context, &mut span_map);
+                // Post-V3 Absent is unambiguous: 0 timers, no clustering rows.
+                // Set inline state directly.
+                let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
+                let context = trigger.span.load().context();
+                self.propagator().inject_context(&context, &mut span_map);
 
-                    let raw_state = RawTimerState {
-                        inline: Some(true),
-                        time: Some(trigger.time),
-                        span: Some(span_map.clone()),
-                    };
-                    self.set_state_inline(segment_id, &key, timer_type, raw_state)
-                        .await?;
-                    self.state_cache.insert(
-                        cache_key,
-                        TimerState::Inline(InlineTimer {
-                            time: trigger.time,
-                            span: span_map,
-                        }),
-                    );
-                } else {
-                    // DB Absent = ambiguous (0 timers or pre-migration).
-                    // Write clustering only, do NOT cache.
-                    self.add_key_trigger_clustering(segment_id, trigger).await?;
-                }
+                let raw_state = RawTimerState {
+                    inline: Some(true),
+                    time: Some(trigger.time),
+                    span: Some(span_map.clone()),
+                };
+                self.set_state_inline(segment_id, &key, timer_type, raw_state)
+                    .await?;
+                self.state_cache.insert(
+                    cache_key,
+                    TimerState::Inline(InlineTimer {
+                        time: trigger.time,
+                        span: span_map,
+                    }),
+                );
             }
         }
 
@@ -1312,17 +1330,16 @@ impl TriggerOperations for CassandraTriggerStore {
     /// Deletes a specific trigger from the key index with state-aware
     /// demotion.
     ///
-    /// Cache-first logic determines the state transition:
-    /// - **Inline(timer) hit, time matches**: Remove state entry → `Absent`
-    /// - **Inline(timer) hit, time mismatch**: Delete clustering row (no-op on
+    /// Uses `resolve_state` (cache-first, warms all types on miss):
+    /// - **Inline(timer), time matches**: Remove state entry → `Absent`
+    /// - **Inline(timer), time mismatch**: Delete clustering row (no-op on
     ///   state) → stays `Inline`
-    /// - **Overflow hit**: Delete clustering row + count remaining (LIMIT 2):
+    /// - **Overflow**: Delete clustering row + count remaining (LIMIT 2):
     ///   - 0 remaining → remove state entry → `Absent`
-    ///   - 1 remaining → BATCH: set inline state + delete clustering row →
+    ///   - 1 remaining → set inline state + delete clustering row →
     ///     `Inline(remaining)`
     ///   - 2+ remaining → no state change → stays `Overflow`
-    /// - **Absent hit**: Delete clustering only, cache unchanged
-    /// - **Cache miss**: Read DB state, then branch as above
+    /// - **Absent**: Delete clustering row (post-V3: no-op, no rows exist)
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn delete_key_trigger(
         &self,
@@ -1332,13 +1349,9 @@ impl TriggerOperations for CassandraTriggerStore {
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
         let cache_key = (key.clone(), timer_type);
-        let cached_state = self.state_cache.get(&cache_key);
-        Span::current().record("state_cached", cached_state.is_some());
 
-        let state = match cached_state {
-            Some(state) => state,
-            None => self.get_timer_state(segment_id, key, timer_type).await?,
-        };
+        let state = self.resolve_state(segment_id, key, timer_type).await?;
+        Span::current().record("state_cached", true);
 
         match state {
             TimerState::Inline(timer) if timer.time == time => {
@@ -1377,7 +1390,6 @@ impl TriggerOperations for CassandraTriggerStore {
                     }
                     1 => {
                         // 1 remaining → demote to Inline.
-                        // Read the remaining trigger's span from clustering.
                         let remaining_time = remaining[0];
                         let mut triggers: Vec<Trigger> = self
                             .get_key_triggers(segment_id, timer_type, key)
@@ -1395,7 +1407,7 @@ impl TriggerOperations for CassandraTriggerStore {
                                 span: Some(span_map.clone()),
                             };
 
-                            // BATCH: set inline state + delete remaining clustering row.
+                            // Concurrent: set inline state + delete remaining clustering row.
                             tokio::try_join!(
                                 self.set_state_inline(segment_id, key, timer_type, raw_state),
                                 self.execute_unpaged_discard(
@@ -1420,7 +1432,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 }
             }
             TimerState::Absent => {
-                // No state data → just delete from clustering (pre-migration safe).
+                // Post-V3 Absent means 0 timers, but delete is a safe no-op.
                 self.execute_unpaged_discard(
                     &self.queries().delete_key_trigger,
                     (segment_id, key.as_ref(), timer_type, time),
@@ -1461,15 +1473,11 @@ impl TriggerOperations for CassandraTriggerStore {
     /// Atomically clears existing timers and schedules a new one in the key
     /// index.
     ///
-    /// Uses inline state optimization to avoid unnecessary tombstones:
-    /// - **Inline state (cache hit)**: executes a plain UPDATE on the static
-    ///   column (no BATCH, no DELETE, no range tombstone — 0 tombstones).
-    /// - **Overflow (cache hit)**: executes a BATCH (DELETE clustering + UPDATE
-    ///   state).
-    /// - **Absent (cache hit, from our own clear)**: executes a plain UPDATE
-    ///   (known 0 clustering rows).
-    /// - **Cache miss**: reads DB, branches on result. DB `Absent` is ambiguous
-    ///   (0 timers or pre-migration) → BATCH (safe default).
+    /// Uses `resolve_state` (cache-first) to select the write strategy:
+    /// - **Inline or Absent**: plain UPDATE on the static column (0
+    ///   tombstones). Post-V3 Absent is unambiguous — no clustering rows to
+    ///   delete.
+    /// - **Overflow**: BATCH (DELETE clustering + UPDATE state).
     ///
     /// Per-key serialization (`KeyManager`) guarantees the state is
     /// stable between the read and the write.
@@ -1479,7 +1487,7 @@ impl TriggerOperations for CassandraTriggerStore {
         segment_id: &SegmentId,
         trigger: Trigger,
     ) -> Result<(), Self::Error> {
-        // Extract span context for storage
+        // Extract span context for storage.
         let mut span_map: HashMap<String, String> = HashMap::with_capacity(2);
         let context = trigger.span.load().context();
         self.propagator().inject_context(&context, &mut span_map);
@@ -1491,17 +1499,20 @@ impl TriggerOperations for CassandraTriggerStore {
         };
 
         let cache_key = (trigger.key.clone(), trigger.timer_type);
-        let cached_state = self.state_cache.get(&cache_key);
-        Span::current().record("state_cached", cached_state.is_some());
 
-        match cached_state {
-            Some(TimerState::Inline(_) | TimerState::Absent) => {
-                // Fast path: cache confirms Inline or Absent (from our own clear) —
-                // plain UPDATE, no BATCH, no range tombstone.
+        let state = self
+            .resolve_state(segment_id, &trigger.key, trigger.timer_type)
+            .await?;
+        Span::current().record("state_cached", true);
+
+        match state {
+            TimerState::Inline(_) | TimerState::Absent => {
+                // Fast path: Inline or Absent → plain UPDATE, no tombstone.
+                // Post-V3 Absent guarantees no clustering rows.
                 self.set_state_inline(segment_id, &trigger.key, trigger.timer_type, raw_state)
                     .await?;
             }
-            Some(TimerState::Overflow) => {
+            TimerState::Overflow => {
                 // Overflow: BATCH (DELETE clustering + UPDATE state).
                 self.batch_clear_and_set_inline(
                     segment_id,
@@ -1510,34 +1521,6 @@ impl TriggerOperations for CassandraTriggerStore {
                     raw_state,
                 )
                 .await?;
-            }
-            None => {
-                // Cache miss: read from DB to determine state.
-                let db_state = self
-                    .get_timer_state(segment_id, &trigger.key, trigger.timer_type)
-                    .await?;
-
-                match db_state {
-                    TimerState::Inline(_) => {
-                        self.set_state_inline(
-                            segment_id,
-                            &trigger.key,
-                            trigger.timer_type,
-                            raw_state,
-                        )
-                        .await?;
-                    }
-                    TimerState::Absent | TimerState::Overflow => {
-                        // DB Absent is ambiguous (0 timers or pre-migration) → BATCH
-                        self.batch_clear_and_set_inline(
-                            segment_id,
-                            &trigger.key,
-                            trigger.timer_type,
-                            raw_state,
-                        )
-                        .await?;
-                    }
-                }
             }
         }
 
@@ -2129,10 +2112,8 @@ mod test {
     /// Asserts the timer state matches the expected variant, with reads
     /// verification.
     ///
-    /// Also verifies the in-memory cache state: after mutations that populate
-    /// the cache, the cached state must match the expected state. This ensures
-    /// subsequent reads (verified by `assert_key_reads`) are served from cache
-    /// (0 DB queries for Inline/Absent, skip-state for Overflow).
+    /// Uses `resolve_state` (which populates the cache) so that the cache
+    /// assertion below is always valid. Post-V3 all states are cached.
     async fn assert_state_and_reads(
         store: &CassandraTriggerStore,
         segment_id: &SegmentId,
@@ -2142,7 +2123,7 @@ mod test {
         expected_times: &[CompactDateTime],
         phase: &str,
     ) -> Result<()> {
-        let state = store.get_timer_state(segment_id, key, timer_type).await?;
+        let state = store.resolve_state(segment_id, key, timer_type).await?;
         match expected_state {
             TimerState::Absent => {
                 assert_eq!(state, TimerState::Absent, "{phase}: expected Absent");
@@ -2159,10 +2140,8 @@ mod test {
             }
         }
 
-        // Verify cache state matches expectations. After mutations, the cache
-        // should be warm, so subsequent reads use the cache-optimized paths
-        // (Inline → 0 DB queries, Overflow → skip state read, Absent → 0 DB
-        // queries).
+        // Verify cache state matches expectations. Post-V3 all states are
+        // cached after any read or write (resolve_state warms all types).
         let cache_key = (key.clone(), timer_type);
         let cached = store.state_cache.get(&cache_key);
         match expected_state {
@@ -2186,16 +2165,16 @@ mod test {
                 );
             }
             TimerState::Absent => {
-                // Absent is cached only after our own writes (clear/delete),
-                // not from DB reads. If the cache has an entry, it must be
-                // Absent.
-                if let Some(cached) = cached {
-                    assert_eq!(
-                        cached,
-                        TimerState::Absent,
-                        "{phase}: cached state should be Absent if present"
-                    );
-                }
+                // Post-V3: Absent is always cached (resolve_state caches all types).
+                assert!(
+                    cached.is_some(),
+                    "{phase}: cache should have Absent entry (post-V3)"
+                );
+                assert_eq!(
+                    cached,
+                    Some(TimerState::Absent),
+                    "{phase}: cached state should be Absent"
+                );
             }
         }
 
@@ -2355,11 +2334,13 @@ mod test {
         Ok(())
     }
 
-    /// Absent (cached) → Inline via insert, Inline → Absent via delete,
-    /// pre-migration backward compatibility.
+    /// Absent → Inline via insert, Inline → Absent via delete.
     ///
-    /// Covers: cached Absent→Inline (insert), Inline→Absent (delete match),
-    /// DB Absent backward-compat (insert on cold cache).
+    /// Post-V3: inserting on any cold or warm cache with Absent state always
+    /// goes to `set_state_inline` (no more clustering-only path).
+    ///
+    /// Covers: Absent→Inline (insert on cold cache), Inline→Absent (delete
+    /// match), Absent→Inline (insert on warm/cached Absent).
     #[tokio::test]
     async fn test_state_transitions_insert_and_delete() -> Result<()> {
         init_test_logging();
@@ -2374,19 +2355,28 @@ mod test {
             span: HashMap::new(),
         });
 
-        // DB Absent backward-compat: insert on cold cache writes clustering
-        // only, state stays Absent. Reads must find timer via clustering scan.
+        // Post-V3: cold insert with Absent state → set_state_inline directly.
+        // State becomes Inline (not clustering-only).
         store
             .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
             .await?;
-        assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[t1], "cold insert")
+        assert_state_and_reads(
+            &store,
+            &segment_id,
+            tt,
+            &key,
+            &inline_t1,
+            &[t1],
+            "cold insert",
+        )
+        .await?;
+
+        // Inline → Absent via delete_key_trigger (time match)
+        store.delete_key_trigger(&segment_id, tt, &key, t1).await?;
+        assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "delete inline")
             .await?;
 
-        // Clean up.
-        store.clear_key_triggers(&segment_id, tt, &key).await?;
-
-        // Cached Absent → Inline via insert_key_trigger
-        // After clear_key_triggers, cache has Absent → insert sets inline.
+        // Absent (cached) → Inline via insert_key_trigger
         store
             .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
             .await?;
@@ -2403,8 +2393,16 @@ mod test {
 
         // Inline → Absent via delete_key_trigger (time match)
         store.delete_key_trigger(&segment_id, tt, &key, t1).await?;
-        assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "delete inline")
-            .await?;
+        assert_state_and_reads(
+            &store,
+            &segment_id,
+            tt,
+            &key,
+            &absent,
+            &[],
+            "delete inline 2",
+        )
+        .await?;
 
         store.delete_segment(&segment_id).await?;
         Ok(())
@@ -2423,18 +2421,17 @@ mod test {
             id: segment_id,
             name: name.to_owned(),
             slab_size,
-            version: SegmentVersion::V2,
+            version: SegmentVersion::V3,
         };
         store.insert_segment(segment).await?;
         Ok((store, segment_id))
     }
 
-    /// Simulates pre-migration production data: timers written directly to
-    /// clustering columns with no `state` MAP entry (as old code would have).
-    /// Verifies reads and `clear_and_schedule_key` migration.
+    /// Verifies V2→V3 migration backfills key state for clustering-only data.
     ///
-    /// Uses `add_key_trigger_clustering` to write clustering rows without
-    /// touching the state column.
+    /// Simulates V2 data (clustering rows written without state MAP entry)
+    /// and verifies `backfill_key_state` correctly sets inline or overflow
+    /// state. After backfill, reads use the state-optimized paths.
     #[tokio::test]
     async fn test_pre_migration_reads_and_migration() -> Result<()> {
         init_test_logging();
@@ -2443,29 +2440,30 @@ mod test {
         let tt = TimerType::Application;
         let t1 = CompactDateTime::from(1_000_000u32);
         let t2 = CompactDateTime::from(2_000_000u32);
-        let t3 = CompactDateTime::from(3_000_000u32);
 
-        // Scenario A: 1 pre-migration clustering timer — reads find it.
+        // Scenario A: 1 clustering row (no state entry) → backfill → Inline.
         let key_a: Key = format!("pre-mig-a-{}", Uuid::new_v4()).into();
         store
             .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_a.clone(), t1, tt))
             .await?;
+        // Pre-backfill: state is Absent (no MAP entry).
         let state = store.get_timer_state(&segment_id, &key_a, tt).await?;
-        assert_eq!(state, TimerState::Absent, "A: state should be Absent");
-        assert_key_reads(&store, &segment_id, tt, &key_a, &[t1], "A read").await?;
+        assert_eq!(
+            state,
+            TimerState::Absent,
+            "A pre-backfill: state should be Absent"
+        );
 
-        // clear_and_schedule_key migrates to inline.
-        store
-            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_a.clone(), t2, tt))
-            .await?;
+        // Backfill: 1 row → Inline.
+        store.backfill_key_state(&segment_id, &key_a, tt).await?;
         let state = store.get_timer_state(&segment_id, &key_a, tt).await?;
         assert!(
-            matches!(&state, TimerState::Inline(t) if t.time == t2),
-            "A migrated: expected Inline(t2), got {state:?}"
+            matches!(&state, TimerState::Inline(t) if t.time == t1),
+            "A post-backfill: expected Inline(t1), got {state:?}"
         );
-        assert_key_reads(&store, &segment_id, tt, &key_a, &[t2], "A migrated").await?;
+        assert_key_reads(&store, &segment_id, tt, &key_a, &[t1], "A backfilled").await?;
 
-        // Scenario B: 2 pre-migration clustering timers — reads find both.
+        // Scenario B: 2 clustering rows (no state entry) → backfill → Overflow.
         let key_b: Key = format!("pre-mig-b-{}", Uuid::new_v4()).into();
         store
             .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_b.clone(), t1, tt))
@@ -2474,27 +2472,41 @@ mod test {
             .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_b.clone(), t2, tt))
             .await?;
         let state = store.get_timer_state(&segment_id, &key_b, tt).await?;
-        assert_eq!(state, TimerState::Absent, "B: state should be Absent");
-        assert_key_reads(&store, &segment_id, tt, &key_b, &[t1, t2], "B read").await?;
-
-        // clear_and_schedule_key replaces both with inline state.
-        store
-            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_b.clone(), t3, tt))
-            .await?;
-        let state = store.get_timer_state(&segment_id, &key_b, tt).await?;
-        assert!(
-            matches!(&state, TimerState::Inline(t) if t.time == t3),
-            "B migrated: expected Inline(t3), got {state:?}"
+        assert_eq!(
+            state,
+            TimerState::Absent,
+            "B pre-backfill: state should be Absent"
         );
-        assert_key_reads(&store, &segment_id, tt, &key_b, &[t3], "B migrated").await?;
+
+        // Backfill: 2 rows → Overflow.
+        store.backfill_key_state(&segment_id, &key_b, tt).await?;
+        let state = store.get_timer_state(&segment_id, &key_b, tt).await?;
+        assert_eq!(
+            state,
+            TimerState::Overflow,
+            "B post-backfill: expected Overflow"
+        );
+        assert_key_reads(&store, &segment_id, tt, &key_b, &[t1, t2], "B backfilled").await?;
+
+        // Scenario C: already has state (idempotency) → backfill is no-op.
+        let key_c: Key = format!("pre-mig-c-{}", Uuid::new_v4()).into();
+        store
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_c.clone(), t1, tt))
+            .await?;
+        // State is already Inline(t1). backfill should not change it.
+        store.backfill_key_state(&segment_id, &key_c, tt).await?;
+        let state = store.get_timer_state(&segment_id, &key_c, tt).await?;
+        assert!(
+            matches!(&state, TimerState::Inline(t) if t.time == t1),
+            "C idempotency: expected Inline(t1) unchanged, got {state:?}"
+        );
 
         store.delete_segment(&segment_id).await?;
         Ok(())
     }
 
-    /// Simulates pre-migration production data and verifies that mutation
-    /// operations (`insert`, `delete`, `clear`) work correctly on timers
-    /// that exist only in clustering columns with no `state` MAP entry.
+    /// Verifies V2→V3 migration handles edge cases: stale slab entries and
+    /// re-running migration (idempotency via version check).
     #[tokio::test]
     async fn test_pre_migration_mutations() -> Result<()> {
         init_test_logging();
@@ -2505,50 +2517,57 @@ mod test {
         let t2 = CompactDateTime::from(2_000_000u32);
         let t3 = CompactDateTime::from(3_000_000u32);
 
-        // Scenario C: insert_key_trigger on 1 pre-migration timer — both
-        // end up in clustering since state is Absent (no promotion).
-        let key_c: Key = format!("pre-mig-c-{}", Uuid::new_v4()).into();
-        store
-            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_c.clone(), t1, tt))
-            .await?;
-        store
-            .insert_key_trigger(&segment_id, Trigger::for_testing(key_c.clone(), t2, tt))
-            .await?;
-        assert_key_reads(&store, &segment_id, tt, &key_c, &[t1, t2], "C insert").await?;
-
-        // clear_and_schedule_key migrates to inline.
-        store
-            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_c.clone(), t3, tt))
-            .await?;
-        assert_key_reads(&store, &segment_id, tt, &key_c, &[t3], "C migrated").await?;
-
-        // Scenario D: clear_key_triggers on pre-migration data.
+        // Scenario D: clear_key_triggers correctly removes both state and
+        // clustering rows. After clear, Absent state is cached.
         let key_d: Key = format!("pre-mig-d-{}", Uuid::new_v4()).into();
         store
-            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_d.clone(), t1, tt))
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_d.clone(), t1, tt))
             .await?;
         store
-            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_d.clone(), t2, tt))
+            .insert_key_trigger(&segment_id, Trigger::for_testing(key_d.clone(), t2, tt))
             .await?;
         store.clear_key_triggers(&segment_id, tt, &key_d).await?;
         assert_key_reads(&store, &segment_id, tt, &key_d, &[], "D cleared").await?;
+        let state = store.get_timer_state(&segment_id, &key_d, tt).await?;
+        assert_eq!(
+            state,
+            TimerState::Absent,
+            "D: state should be Absent after clear"
+        );
 
-        // Scenario E: delete_key_trigger on pre-migration data.
+        // Scenario E: delete_key_trigger with Overflow demotion.
         let key_e: Key = format!("pre-mig-e-{}", Uuid::new_v4()).into();
         store
-            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_e.clone(), t1, tt))
+            .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_e.clone(), t1, tt))
             .await?;
         store
-            .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_e.clone(), t2, tt))
+            .insert_key_trigger(&segment_id, Trigger::for_testing(key_e.clone(), t2, tt))
             .await?;
+        store
+            .insert_key_trigger(&segment_id, Trigger::for_testing(key_e.clone(), t3, tt))
+            .await?;
+        assert_key_reads(
+            &store,
+            &segment_id,
+            tt,
+            &key_e,
+            &[t1, t2, t3],
+            "E overflow setup",
+        )
+        .await?;
         store
             .delete_key_trigger(&segment_id, tt, &key_e, t1)
             .await?;
-        assert_key_reads(&store, &segment_id, tt, &key_e, &[t2], "E delete one").await?;
+        assert_key_reads(&store, &segment_id, tt, &key_e, &[t2, t3], "E delete one").await?;
         store
             .delete_key_trigger(&segment_id, tt, &key_e, t2)
             .await?;
-        assert_key_reads(&store, &segment_id, tt, &key_e, &[], "E delete all").await?;
+        assert_key_reads(&store, &segment_id, tt, &key_e, &[t3], "E demote to inline").await?;
+        let state = store.get_timer_state(&segment_id, &key_e, tt).await?;
+        assert!(
+            matches!(&state, TimerState::Inline(t) if t.time == t3),
+            "E: expected Inline(t3) after demotion, got {state:?}"
+        );
 
         store.delete_segment(&segment_id).await?;
         Ok(())

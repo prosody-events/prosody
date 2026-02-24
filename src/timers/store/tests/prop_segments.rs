@@ -76,7 +76,7 @@ impl Arbitrary for SegmentTestInput {
                         id: segment_id,
                         name: format!("segment-{}", u8::arbitrary(g) % 10),
                         slab_size,
-                        version: SegmentVersion::V2,
+                        version: SegmentVersion::V3,
                     };
                     SegmentOperation::Insert(segment)
                 }
@@ -96,7 +96,7 @@ impl Arbitrary for SegmentTestInput {
                         let inserted_vec: Vec<_> = inserted_segments.iter().copied().collect();
                         let update_segment_id =
                             inserted_vec[usize::arbitrary(g) % inserted_vec.len()];
-                        let version = SegmentVersion::V2;
+                        let version = SegmentVersion::V3;
                         SegmentOperation::UpdateVersion {
                             segment_id: update_segment_id,
                             version,

@@ -347,7 +347,7 @@ impl Arbitrary for HighLevelTestInput {
             id: Uuid::new_v4(),
             name: "segment-0".to_owned(),
             slab_size,
-            version: SegmentVersion::V2,
+            version: SegmentVersion::V3,
         }];
 
         // Generate 10-50 operations

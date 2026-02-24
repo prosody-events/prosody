@@ -59,8 +59,10 @@ pub mod tests;
 ///
 /// Determines which Cassandra table schema is used for storing triggers.
 /// - V1: Legacy schema without `timer_type` field
-/// - V2: Current schema with `timer_type` field for Application vs
-///   `DeferredMessage`
+/// - V2: Schema with `timer_type` field; `state` MAP may be absent for
+///   pre-migration keys (ambiguous: 0 timers or clustering-only data)
+/// - V3: Post-migration schema; `state` MAP is always populated, so NULL
+///   unambiguously means 0 timers
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SegmentVersion {
@@ -68,6 +70,8 @@ pub enum SegmentVersion {
     V1 = 1,
     /// V2 schema with `timer_type` field.
     V2 = 2,
+    /// V3 schema: all keys have state entries backfilled; NULL = new key.
+    V3 = 3,
 }
 
 impl From<SegmentVersion> for i8 {
@@ -83,6 +87,7 @@ impl TryFrom<i8> for SegmentVersion {
         match value {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
+            3 => Ok(Self::V3),
             _ => Err(InvalidSegmentVersionError(value)),
         }
     }
@@ -97,7 +102,7 @@ impl fmt::Display for InvalidSegmentVersionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Invalid segment version: {}. Expected 1 (V1) or 2 (V2)",
+            "Invalid segment version: {}. Expected 1 (V1), 2 (V2), or 3 (V3)",
             self.0
         )
     }
@@ -107,7 +112,7 @@ impl Error for InvalidSegmentVersionError {}
 
 impl ClassifyError for InvalidSegmentVersionError {
     fn classify_error(&self) -> ErrorCategory {
-        // Invalid segment version value (not 1 or 2). Indicates data corruption or
+        // Invalid segment version value (not 1, 2, or 3). Indicates data corruption or
         // incompatible schema version in database. Not recoverable by retry.
         ErrorCategory::Permanent
     }

@@ -222,6 +222,8 @@ See `CachedTimerDeferStore` for the reference implementation.
 ## Active Technologies
 - Rust Edition 2024 (stable) + scylla 1.2 (Cassandra driver), tokio 1.45, parking_lot, scc, quick_cache 0.6, tracing, tracing-opentelemetry 0.32, opentelemetry 0.31 (001-reduce-timer-tombstones)
 - Apache Cassandra (via scylla-rust-driver) - `timer_typed_keys` and `timer_typed_slabs` tables (001-reduce-timer-tombstones)
+- Rust Edition 2024 (stable) + scylla 1.2 (Cassandra driver), tokio 1.45, parking_lot 0.12, quick_cache 0.6, scc 3.0, tracing 0.1, tracing-opentelemetry 0.32, opentelemetry 0.31, thiserror 2.0, async-stream 0.3, smallvec 1.15, strum 0.27 (001-reduce-timer-tombstones)
+- Apache Cassandra via scylla-rust-driver — `timer_typed_keys` and `timer_typed_slabs` tables (001-reduce-timer-tombstones)
 
 - Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer
   middleware (001-simplified-prop-tests)
