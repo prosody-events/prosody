@@ -21,7 +21,7 @@ use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::TriggerStore;
+use crate::timers::store::{TriggerStore, TriggerStoreProvider};
 use crate::timers::{PendingTimer, TimerManager};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use ahash::RandomState;
@@ -84,8 +84,10 @@ struct PartitionContext {
 /// Contains all the parameters needed to configure message processing
 /// for a Kafka partition, including buffer sizes, concurrency limits,
 /// and filtering options.
+///
+/// `P` is a [`TriggerStoreProvider`] that creates per-partition stores.
 #[derive(Clone, Debug)]
-pub struct PartitionConfiguration<T> {
+pub struct PartitionConfiguration<P> {
     /// Consumer group identifier
     pub group_id: Arc<str>,
 
@@ -113,8 +115,9 @@ pub struct PartitionConfiguration<T> {
     /// Shared counter tracking watermark updates
     pub watermark_version: Arc<CachePadded<AtomicUsize>>,
 
-    /// Timer store
-    pub trigger_store: T,
+    /// Trigger store provider — creates per-partition stores with independent
+    /// caches.
+    pub trigger_provider: P,
 
     /// Timer slab size
     pub timer_slab_size: CompactDuration,
@@ -168,15 +171,15 @@ impl PartitionManager {
     /// # Returns
     ///
     /// A new `PartitionManager` instance
-    pub fn new<T, S>(
-        config: PartitionConfiguration<S>,
+    pub fn new<T, P>(
+        config: PartitionConfiguration<P>,
         handler: T,
         topic: Topic,
         partition: Partition,
     ) -> Self
     where
         T: EventHandler + Send + Sync + 'static,
-        S: TriggerStore,
+        P: TriggerStoreProvider,
     {
         // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
@@ -340,14 +343,14 @@ impl PartitionManager {
 /// * `partition_info` - Information about the partition being processed
 /// * `handler` - Handler that processes messages
 /// * `context` - Runtime context containing channels and trackers
-async fn handle_messages<T, S>(
-    config: PartitionConfiguration<S>,
+async fn handle_messages<T, P>(
+    config: PartitionConfiguration<P>,
     partition_info: PartitionInfo,
     handler: T,
     context: PartitionContext,
 ) where
     T: EventHandler,
-    S: TriggerStore,
+    P: TriggerStoreProvider,
 {
     let PartitionContext {
         offsets,
@@ -363,7 +366,7 @@ async fn handle_messages<T, S>(
         NonZeroUsize::new(config.idempotence_cache_size).map(|size| Cache::new(size.into()));
 
     // Create a processing pipeline for incoming messages
-    let message_events = build_message_stream(
+    let message_events = build_message_stream::<P::Store>(
         &offsets,
         message_rx,
         &config.group_id,
@@ -378,6 +381,14 @@ async fn handle_messages<T, S>(
     );
     let segment_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
 
+    // Create a per-partition store via the provider. Each partition gets its own
+    // store instance with an independent cache, sharing the underlying session.
+    let trigger_store = config.trigger_provider.create_store(
+        partition_info.topic,
+        partition_info.partition,
+        &config.group_id,
+    );
+
     let (timer_stream, timer_manager) = loop {
         if *shutdown_rx.borrow() {
             return;
@@ -387,7 +398,7 @@ async fn handle_messages<T, S>(
             segment_id,
             config.timer_slab_size,
             &name,
-            config.trigger_store.clone(),
+            trigger_store.clone(),
             heartbeats.clone(),
         )
         .await
@@ -404,7 +415,7 @@ async fn handle_messages<T, S>(
     let combined_stream = select(message_events, timer_events);
 
     // Define how to process each message
-    let process = |event: UncommittedEvent<S>| async {
+    let process = |event: UncommittedEvent<P::Store>| async {
         // Process message with handler
         debug!(?event, "calling handler");
 
@@ -446,7 +457,7 @@ async fn handle_messages<T, S>(
 
     // Create key manager to handle concurrent processing while maintaining key
     // order
-    KeyManager::<UncommittedEvent<S>, _, _>::new(process, config.max_enqueued_per_key)
+    KeyManager::<UncommittedEvent<P::Store>, _, _>::new(process, config.max_enqueued_per_key)
         .process_messages(
             combined_stream,
             heartbeats.register("event processor"),

@@ -340,15 +340,15 @@ impl Arbitrary for HighLevelTestInput {
         // Generate a slab size for this test (60-660 seconds for faster tests)
         let slab_size = CompactDuration::new((u32::arbitrary(g) % 600) + 60);
 
-        // Generate 2 segments with random UUIDs, all using the same slab_size
-        let segments: Vec<Segment> = (0_u32..2_u32)
-            .map(|i| Segment {
-                id: Uuid::new_v4(),
-                name: format!("segment-{i}"),
-                slab_size,
-                version: SegmentVersion::V2,
-            })
-            .collect();
+        // Single segment per trial — matches the production invariant that each
+        // store instance is scoped to one partition (one segment). Using multiple
+        // segments would break the per-partition state cache.
+        let segments: Vec<Segment> = vec![Segment {
+            id: Uuid::new_v4(),
+            name: "segment-0".to_owned(),
+            slab_size,
+            version: SegmentVersion::V2,
+        }];
 
         // Generate 10-50 operations
         let op_count = (usize::arbitrary(g) % 40) + 10;

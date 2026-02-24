@@ -6,8 +6,7 @@ use crate::Key;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::timers::UncommittedTimer;
-use crate::timers::store::adapter::TableAdapter;
-use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
 use crossbeam_utils::CachePadded;
@@ -27,7 +26,7 @@ trait HasProcessedOffsets {
 }
 
 /// Returns a default `PartitionConfiguration` with sensible defaults.
-fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>> {
+fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider> {
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
         buffer_size: 10,
@@ -38,7 +37,7 @@ fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>
         shutdown_timeout: Duration::from_secs(1),
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
-        trigger_store: memory_store(),
+        trigger_provider: InMemoryTriggerStoreProvider::new(),
         timer_slab_size: CompactDuration::new(30),
     }
 }

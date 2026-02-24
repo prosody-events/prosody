@@ -28,7 +28,7 @@ use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::TriggerStore;
+use crate::timers::store::TriggerStoreProvider;
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///
@@ -42,12 +42,12 @@ use crate::timers::store::TriggerStore;
 ///
 /// * `T` - Type implementing `HandlerProvider` to create message handlers for
 ///   partitions
-pub struct Context<T, S>
+pub struct Context<T, P>
 where
     T: HandlerProvider,
 {
     /// Partition-level configuration settings
-    config: PartitionConfiguration<S>,
+    config: PartitionConfiguration<P>,
 
     /// Creates message handlers for partitions
     handler_provider: T,
@@ -58,7 +58,7 @@ where
     telemetry: TelemetrySender,
 }
 
-impl<T, S> Context<T, S>
+impl<T, P> Context<T, P>
 where
     T: HandlerProvider,
 {
@@ -72,13 +72,14 @@ where
     ///
     /// * `config` - Consumer configuration including buffer sizes and timeouts
     /// * `handler_provider` - Creates message handlers for partitions
+    /// * `trigger_provider` - Factory for per-partition trigger stores
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
     /// * `allowed_events` - Optional filter for permitted event types
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
-        trigger_store: S,
+        trigger_provider: P,
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers>,
         allowed_events: Option<AhoCorasick>,
@@ -99,7 +100,7 @@ where
             shutdown_timeout: config.shutdown_timeout,
             stall_threshold: config.stall_threshold,
             watermark_version,
-            trigger_store,
+            trigger_provider,
             timer_slab_size,
         };
 
@@ -112,17 +113,17 @@ where
     }
 }
 
-impl<T, S> ClientContext for Context<T, S>
+impl<T, P> ClientContext for Context<T, P>
 where
     T: HandlerProvider,
-    S: TriggerStore,
+    P: TriggerStoreProvider,
 {
 }
 
-impl<T, S> ConsumerContext for Context<T, S>
+impl<T, P> ConsumerContext for Context<T, P>
 where
     T: HandlerProvider,
-    S: TriggerStore,
+    P: TriggerStoreProvider,
 {
     /// Handles partition assignments and revocations during consumer group
     /// rebalancing.

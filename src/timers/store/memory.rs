@@ -17,14 +17,15 @@
 //! All maps use [`scc::HashMap`] for concurrent access, and values are stored
 //! in [`BTreeSet`] to maintain sorted order where needed.
 
-use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
+use crate::timers::store::TriggerStoreProvider;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
+use crate::{Key, Partition, Topic};
 use async_stream::try_stream;
 use futures::TryStreamExt;
 use futures::stream::Stream;
@@ -712,6 +713,38 @@ impl TriggerOperations for InMemoryTriggerStore {
 #[must_use]
 pub fn memory_store() -> TableAdapter<InMemoryTriggerStore> {
     TableAdapter::new(InMemoryTriggerStore::new())
+}
+
+/// Trivial provider for tests that creates a fresh `InMemoryTriggerStore` per
+/// partition.
+#[derive(Clone, Debug)]
+pub struct InMemoryTriggerStoreProvider;
+
+impl InMemoryTriggerStoreProvider {
+    /// Creates a new provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for InMemoryTriggerStoreProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TriggerStoreProvider for InMemoryTriggerStoreProvider {
+    type Store = TableAdapter<InMemoryTriggerStore>;
+
+    fn create_store(
+        &self,
+        _topic: Topic,
+        _partition: Partition,
+        _consumer_group: &str,
+    ) -> Self::Store {
+        memory_store()
+    }
 }
 
 #[cfg(test)]

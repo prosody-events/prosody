@@ -1,17 +1,18 @@
 -- Migration: add_singleton_slots
 -- Timestamp: 20260217
--- Purpose: Add static singleton slot support to reduce tombstones for single-timer keys
+-- Purpose: Add static timer state support to reduce tombstones for single-timer keys
 
--- Create UDT for timer slot data
--- Stores time and span context for singleton timer entries
-create type if not exists {{KEYSPACE}}.timer_slot (
+-- Create UDT for timer state data
+-- Stores inline flag, time and span context for timer state entries
+create type if not exists {{KEYSPACE}}.key_timer_state (
+    inline boolean,
     time int,
     span frozen<map<text, text>>
 );
 
--- Add static map column for singleton timers
--- Key = timer_type (tinyint), Value = frozen timer_slot
+-- Add static map column for timer state
+-- Key = timer_type (tinyint), Value = frozen key_timer_state
 -- Static column means one value per partition (segment_id, key)
 alter table {{KEYSPACE}}.{{TABLE_TYPED_KEYS}} add (
-    singleton_timers map<tinyint, frozen<timer_slot>> static
+    state map<tinyint, frozen<key_timer_state>> static
 );

@@ -20,10 +20,8 @@ use crate::consumer::middleware::defer::timer::store::{
 };
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::adapter::TableAdapter;
-use crate::timers::store::cassandra::{CassandraTriggerStore, CassandraTriggerStoreError};
-use crate::timers::store::memory::InMemoryTriggerStore;
-use crate::timers::store::memory::memory_store;
+use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
+use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -130,17 +128,17 @@ impl StorageBackend {
 /// let slab_size = CompactDuration::new(3600);
 /// let stores = StorePair::new(&config, slab_size, false).await?;
 ///
-/// // Pattern match to get all stores - they're guaranteed to match storage types
+/// // Pattern match to get all providers - they're guaranteed to match storage types
 /// match stores {
 ///     StorePair::Memory {
-///         trigger,
+///         trigger_provider,
 ///         message_provider,
 ///         timer_provider,
 ///     } => {
 ///         // All are in-memory
 ///     }
 ///     StorePair::Cassandra {
-///         trigger,
+///         trigger_provider,
 ///         message_provider,
 ///         timer_provider,
 ///     } => {
@@ -154,8 +152,8 @@ impl StorageBackend {
 pub enum StorePair {
     /// All stores use in-memory storage.
     Memory {
-        /// In-memory trigger store wrapped in `TableAdapter`.
-        trigger: TableAdapter<InMemoryTriggerStore>,
+        /// Trigger store provider (Memory) — creates per-partition stores.
+        trigger_provider: InMemoryTriggerStoreProvider,
         /// Message defer store provider (Memory).
         message_provider: MemoryMessageDeferStoreProvider,
         /// Timer defer store provider (Memory).
@@ -163,8 +161,9 @@ pub enum StorePair {
     },
     /// All stores use Cassandra storage with a shared session.
     Cassandra {
-        /// Cassandra trigger store wrapped in `TableAdapter`.
-        trigger: TableAdapter<CassandraTriggerStore>,
+        /// Trigger store provider (Cassandra) — creates per-partition stores
+        /// with independent caches sharing the Cassandra session.
+        trigger_provider: CassandraTriggerStoreProvider,
         /// Message defer store provider (Cassandra with resources).
         message_provider: CassandraMessageDeferStoreProvider,
         /// Timer defer store provider (Cassandra with resources).
@@ -246,15 +245,17 @@ impl StorePair {
         let backend = StorageBackend::new(config, mock).await?;
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
-                trigger: memory_store(),
+                trigger_provider: InMemoryTriggerStoreProvider::new(),
                 message_provider: MemoryMessageDeferStoreProvider::new(),
                 timer_provider: MemoryTimerDeferStoreProvider::new(),
             }),
 
             StorageBackend::Cassandra { store, keyspace } => {
-                // All stores share the same CassandraStore via clone (cheap Arc clone)
-                let trigger =
-                    CassandraTriggerStore::with_store(store.clone(), keyspace, slab_size).await?;
+                // Create trigger store provider (prepares queries once, creates
+                // per-partition stores with independent caches on demand)
+                let trigger_provider =
+                    CassandraTriggerStoreProvider::with_store(store.clone(), keyspace, slab_size)
+                        .await?;
 
                 // Create segment store for defer stores (shared across message and timer)
                 let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;
@@ -279,7 +280,7 @@ impl StorePair {
                 );
 
                 Ok(Self::Cassandra {
-                    trigger: TableAdapter::new(trigger),
+                    trigger_provider,
                     message_provider,
                     timer_provider,
                 })

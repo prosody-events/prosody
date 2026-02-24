@@ -19,12 +19,12 @@
 //! suitable for testing and development. Production storage backends can
 //! implement the same trait to provide durability.
 
-use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{TimerType, Trigger};
+use crate::{Key, Partition, Topic};
 use educe::Educe;
 use futures::Stream;
 use std::cmp::Ordering;
@@ -50,9 +50,6 @@ pub mod operations;
 /// This module is public to allow returning concrete `TableAdapter<T>` types
 /// from factory functions, but it's not re-exported at the crate root.
 pub mod adapter;
-
-/// Write-through cache wrapper for [`TriggerStore`] implementations.
-pub mod cached;
 
 #[cfg(test)]
 /// Comprehensive test suite for [`TriggerStore`] implementations.
@@ -175,6 +172,22 @@ pub struct Segment {
 
     /// Schema version determining the table schema.
     pub version: SegmentVersion,
+}
+
+/// Factory for partition-specific [`TriggerStore`] instances.
+///
+/// Holds shared resources (Cassandra session, prepared statements) and creates
+/// per-partition stores with independent caches. Store creation is synchronous.
+///
+/// Follows the same pattern as `TimerDeferStoreProvider` and
+/// `MessageDeferStoreProvider`.
+pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
+    /// The store type created by this provider.
+    type Store: TriggerStore;
+
+    /// Creates a store for the specified partition (synchronous, no I/O).
+    fn create_store(&self, topic: Topic, partition: Partition, consumer_group: &str)
+    -> Self::Store;
 }
 
 /// Public trigger storage interface.

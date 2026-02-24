@@ -22,7 +22,6 @@ use crate::timers::loader::{State, get_or_create_segment, slab_loader};
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
-use crate::timers::store::cached::CachedTriggerStore;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerType, Trigger};
 use async_stream::try_stream;
@@ -118,47 +117,6 @@ where
             .map(move |trigger| PendingTimer::new(trigger, cloned_manager.clone()));
 
         Ok((stream, manager))
-    }
-
-    /// Creates a timer manager with a write-through cache wrapping the store.
-    ///
-    /// Wraps the provided store in a [`CachedTriggerStore`] to accelerate
-    /// key-level reads for recently written timers.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Unique identifier for the timer segment.
-    /// * `slab_size` - Duration of each time-based slab.
-    /// * `name` - Human-readable name for the segment.
-    /// * `store` - Persistent [`TriggerStore`] implementation.
-    /// * `heartbeats` - Heartbeat registry for background tasks.
-    /// * `cache_capacity` - Maximum entries in the trigger cache.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TimerManagerError`] if initialization fails.
-    pub async fn with_cache(
-        segment_id: SegmentId,
-        slab_size: CompactDuration,
-        name: &str,
-        store: T,
-        heartbeats: HeartbeatRegistry,
-        cache_capacity: usize,
-    ) -> Result<
-        (
-            impl Stream<Item = PendingTimer<CachedTriggerStore<T>>>,
-            TimerManager<CachedTriggerStore<T>>,
-        ),
-        TimerManagerError<T::Error>,
-    > {
-        TimerManager::new(
-            segment_id,
-            slab_size,
-            name,
-            CachedTriggerStore::new(store, cache_capacity),
-            heartbeats,
-        )
-        .await
     }
 
     /// Retrieves all scheduled execution times for a given key.

@@ -266,8 +266,7 @@ async fn setup_v2_state(
 
         let slab = Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time);
 
-        store
-            .add_trigger(&segment, slab, trigger)
+        Box::pin(store.add_trigger(&segment, slab, trigger))
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to add V2 trigger: {e:?}"))?;
     }

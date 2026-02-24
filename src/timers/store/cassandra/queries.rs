@@ -243,17 +243,16 @@ cassandra_queries! {
         ),
 
         // =========================================================================
-        // Singleton Slot Operations (Phase 3: Reduce Timer Tombstones)
+        // State Column Operations (Inline/Overflow Timer State)
         // =========================================================================
 
-        /// Gets the `singleton_timers` static map column for a key partition
-        get_singleton_slot: (
-            "SELECT singleton_timers FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+        /// Gets the `state` static map column for a key partition
+        get_state: (
+            "SELECT state FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
             TABLE_TYPED_KEYS
         ),
 
-
-        /// Inserts a trigger into clustering columns
+        /// Inserts a trigger into clustering columns with TTL
         insert_key_trigger_clustering: (
             "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?",
             TABLE_TYPED_KEYS
@@ -265,44 +264,56 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
-        /// Removes a singleton slot entry entirely (returns to Absent state, not Overflow)
-        remove_singleton_entry: (
-            "DELETE singleton_timers[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+        /// Removes a state entry for a single timer type (returns to Absent for that type)
+        remove_state_entry: (
+            "DELETE state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
             TABLE_TYPED_KEYS
         ),
 
-        /// Clears the entire `singleton_timers` static column (all timer types at once)
-        clear_singleton_slots: (
-            "DELETE singleton_timers FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+        /// Clears the entire `state` static column (all timer types at once)
+        clear_state: (
+            "DELETE state FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
             TABLE_TYPED_KEYS
         ),
 
-        /// Updates the singleton slot (static column only) with TTL — no DELETE, no BATCH
-        set_singleton_slot: (
-            "UPDATE $keyspace.{} USING TTL ? SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?",
+        /// Sets inline timer state (static column only) with TTL — no DELETE, no BATCH
+        set_state_inline: (
+            "UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?",
             TABLE_TYPED_KEYS
         ),
 
-        /// Updates the singleton slot (static column only) without TTL — no DELETE, no BATCH
-        set_singleton_slot_no_ttl: (
-            "UPDATE $keyspace.{} SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?",
+        /// Sets inline timer state (static column only) without TTL — no DELETE, no BATCH
+        set_state_inline_no_ttl: (
+            "UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?",
             TABLE_TYPED_KEYS
         ),
 
-        /// BATCH: Clear and set singleton slot with TTL (atomic delete clustering + update static)
-        batch_clear_and_set_singleton: (
+        /// Sets overflow state marker (static column only) without TTL
+        set_state_overflow: (
+            "UPDATE $keyspace.{} SET state[?] = {inline: false, time: null, span: null} WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Counts remaining triggers for a key/type (LIMIT 2 for demotion check)
+        count_key_triggers: (
+            "SELECT time FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 2",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Clear clustering rows and set inline state with TTL
+        batch_clear_and_set_inline: (
             "BEGIN UNLOGGED BATCH \
              DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?; \
-             UPDATE $keyspace.{} USING TTL ? SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
-        /// BATCH: Clear and set singleton slot without TTL
-        batch_clear_and_set_singleton_no_ttl: (
+        /// BATCH: Clear clustering rows and set inline state without TTL
+        batch_clear_and_set_inline_no_ttl: (
             "BEGIN UNLOGGED BATCH \
              DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?; \
-             UPDATE $keyspace.{} SET singleton_timers[?] = ? WHERE segment_id = ? AND key = ?; \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),

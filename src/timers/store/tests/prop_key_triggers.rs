@@ -107,10 +107,10 @@ pub enum KeyTriggerOperation {
 
 impl Arbitrary for KeyTriggerTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Generate 3 random v4 UUIDs unique to this trial
-        // v4 UUIDs have a structure that prevents QuickCheck from shrinking them
-        // into colliding values
-        let segment_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        // Single segment per trial — matches the production invariant that each
+        // store instance is scoped to one partition (one segment). Using multiple
+        // segments would break the per-partition state cache.
+        let segment_ids = vec![Uuid::new_v4()];
 
         // Generate a slab size for this test (1 second to 7 days to avoid TTL overflow)
         let slab_size = CompactDuration::new(u32::arbitrary(g).clamp(1, 604_800));
