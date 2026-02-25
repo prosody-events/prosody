@@ -763,17 +763,18 @@ impl CassandraTriggerStore {
             &self.queries().batch_promote_and_set_overflow_no_ttl,
             |ttl| {
                 (
-                    ttl,
                     segment_id,
                     key.as_ref(),
                     timer_type,
                     promoted.time,
                     promoted.span,
+                    ttl,
                     segment_id,
                     key.as_ref(),
                     timer_type,
                     new.time,
                     new.span,
+                    ttl,
                     timer_type,
                     &overflow_state,
                     segment_id,
@@ -1445,14 +1446,21 @@ impl TriggerOperations for CassandraTriggerStore {
                 // transition is atomic at the partition level.
                 let mut new_span_map: HashMap<String, String> = HashMap::with_capacity(2);
                 let context = trigger.span.load().context();
-                self.propagator().inject_context(&context, &mut new_span_map);
+                self.propagator()
+                    .inject_context(&context, &mut new_span_map);
 
                 self.batch_promote_and_set_overflow(
                     segment_id,
                     &key,
                     timer_type,
-                    ClusteringEntry { time: old_timer.time, span: &old_timer.span },
-                    ClusteringEntry { time: trigger.time, span: &new_span_map },
+                    ClusteringEntry {
+                        time: old_timer.time,
+                        span: &old_timer.span,
+                    },
+                    ClusteringEntry {
+                        time: trigger.time,
+                        span: &new_span_map,
+                    },
                 )
                 .await?;
                 self.state_cache.insert(cache_key, TimerState::Overflow);

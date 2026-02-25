@@ -331,11 +331,11 @@ cassandra_queries! {
         ),
 
         /// BATCH: Insert two clustering rows (promoted + new) and set overflow state with TTL.
-        /// Batch-level USING TTL applies to both INSERTs; the UPDATE has no TTL.
+        /// Per-statement USING TTL applies to each INSERT; the UPDATE has no TTL.
         batch_promote_and_set_overflow: (
-            "BEGIN UNLOGGED BATCH USING TTL ? \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
+            "BEGIN UNLOGGED BATCH \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?; \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?; \
              UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
