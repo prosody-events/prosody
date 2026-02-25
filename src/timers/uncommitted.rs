@@ -33,6 +33,7 @@ use arc_swap::ArcSwap;
 use educe::Educe;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
 use tracing::{Span, warn};
 
@@ -143,6 +144,9 @@ where
 
     /// Indicates if this timer has already been committed or aborted.
     completed: bool,
+
+    /// Global timer semaphore permit; released when this trigger is dropped.
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl<T> PendingTimer<T>
@@ -172,8 +176,17 @@ where
                 timer_type,
                 manager,
                 completed: false,
+                permit: None,
             },
         }
+    }
+
+    /// Attach a global timer semaphore permit to this timer.
+    ///
+    /// The permit is released automatically when the underlying
+    /// [`UncommittedTrigger`] is dropped (via `commit`, `abort`, or `Drop`).
+    pub fn set_permit(&mut self, permit: OwnedSemaphorePermit) {
+        self.uncommitted.permit = Some(permit);
     }
 
     /// Transition this timer to the firing state.

@@ -42,7 +42,7 @@ use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
@@ -118,6 +118,9 @@ pub struct PartitionConfiguration<T> {
 
     /// Timer slab size
     pub timer_slab_size: CompactDuration,
+
+    /// Global semaphore bounding in-flight timer events across all partitions
+    pub timer_semaphore: Arc<Semaphore>,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -401,7 +404,7 @@ async fn handle_messages<T, S>(
         }
     };
 
-    let timer_events = build_timer_stream(timer_stream);
+    let timer_events = build_timer_stream(timer_stream, config.timer_semaphore.clone());
     let combined_stream = select(message_events, timer_events);
 
     // Define how to process each message
@@ -524,7 +527,10 @@ where
     }
 }
 
-fn build_timer_stream<T, S>(timer_stream: S) -> impl Stream<Item = UncommittedEvent<T>>
+fn build_timer_stream<T, S>(
+    timer_stream: S,
+    semaphore: Arc<Semaphore>,
+) -> impl Stream<Item = UncommittedEvent<T>>
 where
     S: Stream<Item = PendingTimer<T>>,
     T: TriggerStore,
@@ -532,7 +538,12 @@ where
     stream! {
         pin_mut!(timer_stream);
 
-        while let Some(timer) = cooperative(timer_stream.next()).await {
+        while let Some(mut timer) = cooperative(timer_stream.next()).await {
+            // Block until a permit is available, providing backpressure when
+            // the global in-flight timer cap is reached.
+            if let Ok(permit) = semaphore.clone().acquire_owned().await {
+                timer.set_permit(permit);
+            }
             yield UncommittedEvent::Timer(timer);
         }
     }

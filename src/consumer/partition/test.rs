@@ -40,6 +40,7 @@ fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         trigger_store: memory_store(),
         timer_slab_size: CompactDuration::new(30),
+        timer_semaphore: Arc::new(Semaphore::new(10)),
     }
 }
 

@@ -21,6 +21,7 @@ use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
@@ -89,6 +90,8 @@ where
             CompactDuration::new(10 * 60)
         });
 
+        let timer_semaphore = Arc::new(Semaphore::new(config.max_uncommitted));
+
         let config = PartitionConfiguration {
             group_id: Arc::from(config.group_id.as_str()),
             buffer_size: config.max_uncommitted,
@@ -101,6 +104,7 @@ where
             watermark_version,
             trigger_store,
             timer_slab_size,
+            timer_semaphore,
         };
 
         Self {
