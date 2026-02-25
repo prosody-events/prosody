@@ -29,6 +29,7 @@ use educe::Educe;
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use std::sync::Arc;
 use tokio::spawn;
+use tokio::sync::watch;
 use tokio::task::coop::cooperative;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
@@ -91,6 +92,7 @@ where
         name: &str,
         store: T,
         heartbeats: HeartbeatRegistry,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
@@ -106,6 +108,7 @@ where
             segment.clone(),
             state.clone(),
             heartbeats.register("timer loader"),
+            shutdown_rx,
         ));
 
         // Build the manager wrapper.
@@ -552,6 +555,7 @@ mod tests {
     use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
     use std::time::Duration;
+    use tokio::sync::watch;
     use tokio::task;
     use tokio::time::{self, advance, timeout};
     use tracing::Span;
@@ -573,24 +577,32 @@ mod tests {
         ))
     }
 
-    /// Helper function to set up a timer manager for testing
+    /// Helper function to set up a timer manager for testing.
+    ///
+    /// Returns `(stream, manager, _shutdown_tx)`. The caller holds
+    /// `_shutdown_tx` and can send `true` to stop the background slab loader.
     async fn setup_timer_manager() -> Result<(
         impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
+        watch::Sender<bool>,
     )> {
         let store = memory_store();
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        TimerManager::new(
+        let (stream, manager) = TimerManager::new(
             segment_id,
             slab_size,
             "test-manager",
             store,
             HeartbeatRegistry::test(),
+            shutdown_rx,
         )
         .await
-        .map_err(|e| eyre!("Failed to create timer manager: {}", e))
+        .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
+
+        Ok((stream, manager, shutdown_tx))
     }
 
     /// Helper: count scheduled times for a key and timer type
@@ -631,12 +643,14 @@ mod tests {
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
 
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let result = TimerManager::new(
             segment_id,
             slab_size,
             "test-creation",
             store,
             HeartbeatRegistry::test(),
+            shutdown_rx,
         )
         .await;
 
@@ -653,7 +667,7 @@ mod tests {
     async fn test_schedule_timer_basic() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("test-key", 60, TimerType::Application)?;
 
         let result = manager.schedule(trigger.clone()).await;
@@ -673,7 +687,7 @@ mod tests {
     async fn test_schedule_multiple_timers_same_key() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let key = Key::from("multi-timer-key");
 
         // Schedule multiple timers for the same key
@@ -703,7 +717,7 @@ mod tests {
     async fn test_schedule_multiple_keys() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
 
         let trigger1 = create_test_trigger("key-1", 60, TimerType::Application)?;
         let trigger2 = create_test_trigger("key-2", 120, TimerType::Application)?;
@@ -732,7 +746,7 @@ mod tests {
     async fn test_scheduled_times_empty_key() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let nonexistent_key = Key::from("nonexistent");
 
         let scheduled_times = manager
@@ -747,7 +761,7 @@ mod tests {
     async fn test_unschedule_timer() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("unschedule-key", 60, TimerType::Application)?;
 
         // Schedule then unschedule
@@ -770,7 +784,7 @@ mod tests {
     async fn test_unschedule_nonexistent_timer() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let key = Key::from("nonexistent-key");
         let time = CompactDateTime::now()?;
 
@@ -787,7 +801,7 @@ mod tests {
     async fn test_unschedule_all_timers() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let key = Key::from("unschedule-all-key");
 
         // Schedule multiple timers
@@ -825,7 +839,7 @@ mod tests {
     async fn test_unschedule_all_empty_key() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let empty_key = Key::from("empty-key");
 
         // Unschedule all on empty key should succeed
@@ -840,7 +854,7 @@ mod tests {
     async fn test_complete_timer() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("complete-key", 60, TimerType::Application)?;
 
         // Schedule timer
@@ -865,7 +879,7 @@ mod tests {
     async fn test_complete_nonexistent_timer() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let key = Key::from("nonexistent");
         let time = CompactDateTime::now()?;
 
@@ -879,7 +893,7 @@ mod tests {
     async fn test_abort_timer() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("abort-key", 60, TimerType::Application)?;
 
         // Schedule timer
@@ -904,7 +918,7 @@ mod tests {
     async fn test_abort_nonexistent_timer() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let key = Key::from("nonexistent");
         let time = CompactDateTime::now()?;
 
@@ -917,7 +931,7 @@ mod tests {
     async fn test_timer_stream_delivery() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
 
         // Schedule a timer for immediate execution
         let now = CompactDateTime::now()?;
@@ -952,7 +966,7 @@ mod tests {
     async fn test_concurrent_operations() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let manager = Arc::new(manager);
 
         // Spawn multiple concurrent operations
@@ -996,7 +1010,7 @@ mod tests {
     async fn test_timer_lifecycle() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("lifecycle-key", 60, TimerType::Application)?;
 
         // 1. Schedule timer
@@ -1026,7 +1040,7 @@ mod tests {
     async fn test_edge_case_same_time_different_keys() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let base_time = CompactDateTime::now()?.add_duration(CompactDuration::new(60))?;
 
         // Schedule multiple timers for the same time but different keys
@@ -1071,7 +1085,7 @@ mod tests {
     async fn test_time_boundary_conditions() -> Result<()> {
         time::pause();
 
-        let (_stream, manager) = setup_timer_manager().await?;
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
 
         // Test with minimum time (current time)
         let now = CompactDateTime::now()?;
@@ -1117,7 +1131,7 @@ mod tests {
     async fn test_timer_type_isolation_end_to_end() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let key = Key::from("isolation-key");
         let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?;
 
@@ -1210,7 +1224,7 @@ mod tests {
     async fn test_timer_type_unschedule_isolation() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let key = Key::from("unschedule-isolation-key");
         let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?;
 
@@ -1284,7 +1298,7 @@ mod tests {
         // T049: Schedule same timer while firing transitions to FiringRescheduled
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("reschedule-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1335,7 +1349,7 @@ mod tests {
         // T050: Multiple reschedules while firing are no-op (idempotent)
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("idempotent-key", 1, TimerType::Application)?;
 
         // Schedule and fire
@@ -1389,7 +1403,7 @@ mod tests {
         // T051: Commit from FIRING state deletes DB row
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("delete-key", 1, TimerType::Application)?;
 
         // Schedule and fire
@@ -1429,7 +1443,7 @@ mod tests {
         // T052: Commit from FIRING_RESCHEDULED state keeps DB row
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("keep-key", 1, TimerType::Application)?;
 
         // Schedule, fire, and reschedule
@@ -1461,7 +1475,7 @@ mod tests {
         // T053: Abort from FIRING_RESCHEDULED transitions to SCHEDULED
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("abort-reschedule-key", 1, TimerType::Application)?;
 
         // Schedule, fire, and reschedule
@@ -1496,7 +1510,7 @@ mod tests {
         // again
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("e2e-key", 1, TimerType::Application)?;
 
         // 1. Schedule timer
@@ -1560,7 +1574,7 @@ mod tests {
         // T058: Verify unschedule when firing (not rescheduled) is a no-op
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("unschedule-firing-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1623,7 +1637,7 @@ mod tests {
         // T059: Verify unschedule when firing+rescheduled cancels the reschedule
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("cancel-reschedule-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1709,7 +1723,7 @@ mod tests {
         // T061: Verify firing timers are excluded from scheduled_times()
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("exclude-firing-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1762,7 +1776,7 @@ mod tests {
         // Verify FiringRescheduled timers are included in scheduled_times()
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("include-rescheduled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1827,7 +1841,7 @@ mod tests {
         // Verify fire() returns Some for a scheduled timer
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("fire-scheduled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1867,7 +1881,7 @@ mod tests {
         // fire()
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("fire-cancelled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1904,7 +1918,7 @@ mod tests {
         // T069: End-to-end integration test: reschedule then abort, timer fires again
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("reschedule-abort-key", 1, TimerType::Application)?;
 
         // 1. Schedule timer
@@ -1970,7 +1984,7 @@ mod tests {
         // Verify abort from Firing state keeps DB row but removes from ActiveTriggers
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("abort-firing-key", 1, TimerType::Application)?;
 
         // Schedule timer

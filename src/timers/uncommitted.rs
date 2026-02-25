@@ -417,28 +417,37 @@ mod tests {
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, TryStreamExt};
     use std::time::Duration;
+    use tokio::sync::watch;
     use tokio::task;
     use tokio::time::{self, advance};
     use uuid::Uuid;
 
-    /// Helper function to set up a timer manager for testing
+    /// Helper function to set up a timer manager for testing.
+    ///
+    /// Returns `(stream, manager, _shutdown_tx)`. The caller holds
+    /// `_shutdown_tx` and can send `true` to stop the background slab loader.
     async fn setup_timer_manager() -> Result<(
         impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
+        watch::Sender<bool>,
     )> {
         let store = memory_store();
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        TimerManager::new(
+        let (stream, manager) = TimerManager::new(
             segment_id,
             slab_size,
             "test-manager",
             store,
             HeartbeatRegistry::test(),
+            shutdown_rx,
         )
         .await
-        .map_err(|e| eyre!("Failed to create timer manager: {}", e))
+        .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
+
+        Ok((stream, manager, shutdown_tx))
     }
 
     /// Helper function to create a test trigger
@@ -461,7 +470,7 @@ mod tests {
     async fn test_pending_timer_fire_consumes() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("fire-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -497,7 +506,7 @@ mod tests {
     async fn test_firing_timer_commit() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("commit-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -533,7 +542,7 @@ mod tests {
     async fn test_firing_timer_abort() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         let trigger = create_test_trigger("abort-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;

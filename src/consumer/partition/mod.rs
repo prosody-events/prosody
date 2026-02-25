@@ -389,6 +389,7 @@ async fn handle_messages<T, S>(
             &name,
             config.trigger_store.clone(),
             heartbeats.clone(),
+            shutdown_rx.clone(),
         )
         .await
         {

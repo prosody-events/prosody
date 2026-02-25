@@ -18,9 +18,10 @@ use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
 use futures::{StreamExt, TryStreamExt};
 use rand::RngExt;
-use std::ops::RangeInclusive;
+use std::ops::{ControlFlow, RangeInclusive};
 use std::time::Duration;
 use tokio::select;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{debug, error};
 
@@ -87,6 +88,23 @@ impl<T> State<T> {
     }
 }
 
+/// Mutable per-iteration state for [`slab_loader`].
+struct LoaderContext {
+    preload_window: CompactDuration,
+    loaded_slab_ids: HashSet<SlabId>,
+    highest_loaded_slab_id: Option<SlabId>,
+}
+
+impl LoaderContext {
+    fn new(slab_size: CompactDuration) -> Self {
+        Self {
+            preload_window: calculate_preload(slab_size),
+            loaded_slab_ids: HashSet::new(),
+            highest_loaded_slab_id: None,
+        }
+    }
+}
+
 /// Background task that continuously loads upcoming slabs and cleans up old
 /// ones.
 ///
@@ -98,6 +116,8 @@ impl<T> State<T> {
 /// 5. Removes slabs whose triggers have all completed.
 /// 6. Waits until it's time to load the next slab.
 ///
+/// The loop exits cleanly when `shutdown_rx` receives `true`.
+///
 /// # Type Parameters
 ///
 /// * `T` - A [`TriggerStore`] implementation for persistent storage.
@@ -107,90 +127,120 @@ impl<T> State<T> {
 /// * `segment` - The timer segment to manage slab loading for
 /// * `state` - Shared state containing the trigger store and scheduler
 /// * `heartbeat` - Heartbeat monitor for detecting stalled loader operations
-pub async fn slab_loader<T>(segment: Segment, state: SlabLock<State<T>>, heartbeat: Heartbeat)
+/// * `shutdown_rx` - Watch receiver; loop exits when the value becomes `true`
+pub async fn slab_loader<T>(
+    segment: Segment,
+    state: SlabLock<State<T>>,
+    heartbeat: Heartbeat,
+    mut shutdown_rx: watch::Receiver<bool>,
+) where
+    T: TriggerStore,
+{
+    let mut ctx = LoaderContext::new(segment.slab_size);
+
+    loop {
+        select! {
+            result = slab_loader_iteration(&segment, &state, &heartbeat, &mut ctx) => {
+                if result.is_break() {
+                    return;
+                }
+            },
+            _ = shutdown_rx.wait_for(|&v| v) => {
+                debug!("Slab loader shutting down");
+                return;
+            },
+        }
+    }
+}
+
+/// Runs one iteration of the slab-loader loop.
+///
+/// Returns [`ControlFlow::Break`] when the loader has reached the maximum slab
+/// ID and should stop permanently. Returns [`ControlFlow::Continue`] otherwise.
+async fn slab_loader_iteration<T>(
+    segment: &Segment,
+    state: &SlabLock<State<T>>,
+    heartbeat: &Heartbeat,
+    ctx: &mut LoaderContext,
+) -> ControlFlow<()>
 where
     T: TriggerStore,
 {
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-    // Initialize jittered preload window
-    let mut preload_window = calculate_preload(segment.slab_size);
-    let mut loaded_slab_ids = HashSet::new();
-    let mut highest_loaded_slab_id: Option<SlabId> = None;
+    // Signal that the loader is active
+    heartbeat.beat();
 
-    loop {
-        // Signal that the loader is active
-        heartbeat.beat();
-
-        // Compute the target time to preload (current time + preload window)
-        let now = match CompactDateTime::now() {
-            Ok(now) => now,
-            Err(error) => {
-                error!("Failed to get current time: {error:#}; retrying");
-                sleep(RETRY_DELAY).await;
-                continue;
-            }
-        };
-
-        let target_time = match now.add_duration(preload_window) {
-            Ok(time) => time,
-            Err(error) => {
-                error!("Failed to calculate target time: {error:#}; retrying");
-                sleep(RETRY_DELAY).await;
-                continue;
-            }
-        };
-
-        // Map target time to its slab ID
-        let target_slab = Slab::from_time(segment.id, segment.slab_size, target_time);
-        let target_slab_id = target_slab.id();
-
-        // Determine the next slab ID to load
-        let start_slab_id = highest_loaded_slab_id.map_or(0, |id| id + 1);
-
-        if start_slab_id <= target_slab_id {
-            let load_range = start_slab_id..=target_slab_id;
-            debug!("Loading slabs {start_slab_id}..={target_slab_id}");
-
-            // Load the slabs in parallel and update ownership
-            match load_slabs(&state, &segment, load_range).await {
-                Ok(loaded) => {
-                    loaded_slab_ids.extend(loaded);
-                    highest_loaded_slab_id = Some(target_slab_id);
-                    debug!("Successfully loaded slabs up to {target_slab_id}");
-
-                    // Re-jitter preload window for next cycle
-                    preload_window = calculate_preload(segment.slab_size);
-                }
-                Err(error) => {
-                    error!("Failed to load slabs: {error:#}; retrying in {RETRY_DELAY:?}");
-                    sleep(RETRY_DELAY).await;
-                    continue;
-                }
-            }
+    // Compute the target time to preload (current time + preload window)
+    let now = match CompactDateTime::now() {
+        Ok(now) => now,
+        Err(error) => {
+            error!("Failed to get current time: {error:#}; retrying");
+            sleep(RETRY_DELAY).await;
+            return ControlFlow::Continue(());
         }
+    };
 
-        // Determine the next slab chronologically
-        let Some(next_slab) = target_slab.next() else {
-            error!("Out of slab range - reached maximum slab ID");
-            return;
-        };
-
-        // Remove any slabs whose triggers have completed
-        if let Err(error) = remove_completed_slabs(&state, &segment, &mut loaded_slab_ids).await {
-            error!("Failed to remove completed slabs: {error:#}");
+    let target_time = match now.add_duration(ctx.preload_window) {
+        Ok(time) => time,
+        Err(error) => {
+            error!("Failed to calculate target time: {error:#}; retrying");
+            sleep(RETRY_DELAY).await;
+            return ControlFlow::Continue(());
         }
+    };
 
-        // Calculate wait time until next slab needs loading
-        let wait_time = calculate_wait_time(next_slab.range().start, preload_window);
-        if !wait_time.is_zero() {
-            debug!("Waiting {wait_time} before next load cycle");
-            select! {
-                () = sleep(wait_time.into()) => {},
-                () = heartbeat.next() => {},
+    // Map target time to its slab ID
+    let target_slab = Slab::from_time(segment.id, segment.slab_size, target_time);
+    let target_slab_id = target_slab.id();
+
+    // Determine the next slab ID to load
+    let start_slab_id = ctx.highest_loaded_slab_id.map_or(0, |id| id + 1);
+
+    if start_slab_id <= target_slab_id {
+        let load_range = start_slab_id..=target_slab_id;
+        debug!("Loading slabs {start_slab_id}..={target_slab_id}");
+
+        // Load the slabs in parallel and update ownership
+        match load_slabs(state, segment, load_range).await {
+            Ok(loaded) => {
+                ctx.loaded_slab_ids.extend(loaded);
+                ctx.highest_loaded_slab_id = Some(target_slab_id);
+                debug!("Successfully loaded slabs up to {target_slab_id}");
+
+                // Re-jitter preload window for next cycle
+                ctx.preload_window = calculate_preload(segment.slab_size);
+            }
+            Err(error) => {
+                error!("Failed to load slabs: {error:#}; retrying in {RETRY_DELAY:?}");
+                sleep(RETRY_DELAY).await;
+                return ControlFlow::Continue(());
             }
         }
     }
+
+    // Determine the next slab chronologically
+    let Some(next_slab) = target_slab.next() else {
+        error!("Out of slab range - reached maximum slab ID");
+        return ControlFlow::Break(());
+    };
+
+    // Remove any slabs whose triggers have completed
+    if let Err(error) = remove_completed_slabs(state, segment, &mut ctx.loaded_slab_ids).await {
+        error!("Failed to remove completed slabs: {error:#}");
+    }
+
+    // Calculate wait time until next slab needs loading
+    let wait_time = calculate_wait_time(next_slab.range().start, ctx.preload_window);
+    if !wait_time.is_zero() {
+        debug!("Waiting {wait_time} before next load cycle");
+        select! {
+            () = sleep(wait_time.into()) => {},
+            () = heartbeat.next() => {},
+        }
+    }
+
+    ControlFlow::Continue(())
 }
 
 /// Computes how long to wait before loading a slab that begins at `load_time`.
@@ -451,6 +501,7 @@ mod tests {
     use color_eyre::eyre::{Result, eyre};
     use futures::future;
     use std::time::Duration;
+    use tokio::sync::watch;
     use tokio::task;
     use tokio::time::{advance, pause};
     use tracing::Span;
@@ -786,10 +837,12 @@ mod tests {
 
         // We need to spawn the slab_loader in a separate task since it runs
         // indefinitely
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let loader_handle = tokio::spawn(slab_loader(
             segment.clone(),
             slab_lock.clone(),
             test_heartbeat,
+            shutdown_rx,
         ));
 
         // Give it a moment to start
@@ -823,10 +876,12 @@ mod tests {
             Heartbeat::new("test-slab-loader-advancement", Duration::from_secs(30));
 
         // Spawn the loader
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let loader_handle = tokio::spawn(slab_loader(
             segment.clone(),
             slab_lock.clone(),
             test_heartbeat,
+            shutdown_rx,
         ));
 
         // Let it load initial slabs
@@ -1081,10 +1136,12 @@ mod tests {
         let test_heartbeat = Heartbeat::new("test-slab-loader-errors", Duration::from_secs(30));
 
         // Spawn the loader
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let loader_handle = tokio::spawn(slab_loader(
             segment.clone(),
             slab_lock.clone(),
             test_heartbeat,
+            shutdown_rx,
         ));
 
         // Give it time to start and handle any initial time operations
@@ -1096,6 +1153,37 @@ mod tests {
 
         // Cancel the loader
         loader_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slab_loader_shutdown() -> Result<()> {
+        pause();
+
+        let store = memory_store();
+        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
+        let state = State::new(store.clone(), scheduler);
+        let slab_lock = SlabLock::new(state);
+        let segment = create_test_segment();
+
+        store.insert_segment(segment.clone()).await?;
+
+        let test_heartbeat = Heartbeat::new("test-shutdown", Duration::from_secs(30));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let loader_handle =
+            tokio::spawn(slab_loader(segment, slab_lock, test_heartbeat, shutdown_rx));
+
+        advance(Duration::from_millis(100)).await;
+        task::yield_now().await;
+        assert!(!loader_handle.is_finished());
+
+        shutdown_tx.send(true)?;
+        advance(Duration::from_millis(100)).await;
+        task::yield_now().await;
+
+        assert!(loader_handle.is_finished());
+        loader_handle.await?;
         Ok(())
     }
 
