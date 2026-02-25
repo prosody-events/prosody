@@ -47,6 +47,13 @@ pub(crate) mod migration;
 /// Cache key for the per-partition timer state cache.
 type StateCacheKey = (Key, TimerType);
 
+/// A single clustering-row entry passed to `batch_promote_and_set_overflow`.
+#[derive(Debug)]
+struct ClusteringEntry<'a> {
+    time: CompactDateTime,
+    span: &'a HashMap<String, String>,
+}
+
 /// A single row returned by `peek_first_key_trigger`: trigger time and span
 /// context.
 type PeekedTrigger = (CompactDateTime, HashMap<String, String>);
@@ -720,6 +727,81 @@ impl CassandraTriggerStore {
         Ok(())
     }
 
+    /// Atomically inserts two clustering rows and sets overflow state.
+    ///
+    /// Uses a Cassandra UNLOGGED BATCH to:
+    /// 1. INSERT the promoted (previously-inline) timer into clustering rows
+    /// 2. INSERT the new timer into clustering rows
+    /// 3. UPDATE the `state[type]` to `Overflow`
+    ///
+    /// All three statements target the same `(segment_id, key)` partition, so
+    /// an unlogged batch is correct and carries no cross-partition coordination
+    /// overhead. This is the safe path for the Inline→Overflow transition.
+    ///
+    /// TTL is computed from the later of the two trigger times so that neither
+    /// clustering row expires before the other timer fires. The batch-level
+    /// `USING TTL` applies to both INSERTs; the state UPDATE carries no TTL,
+    /// matching the behaviour of the standalone `set_state_overflow` call.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the database batch execution fails.
+    #[instrument(level = "debug", skip(self), err)]
+    async fn batch_promote_and_set_overflow(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+        promoted: ClusteringEntry<'_>,
+        new: ClusteringEntry<'_>,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        let overflow_state = TimerState::Overflow;
+        let ttl_time = promoted.time.max(new.time);
+        self.execute_with_optional_ttl(
+            ttl_time,
+            &self.queries().batch_promote_and_set_overflow,
+            &self.queries().batch_promote_and_set_overflow_no_ttl,
+            |ttl| {
+                (
+                    ttl,
+                    segment_id,
+                    key.as_ref(),
+                    timer_type,
+                    promoted.time,
+                    promoted.span,
+                    segment_id,
+                    key.as_ref(),
+                    timer_type,
+                    new.time,
+                    new.span,
+                    timer_type,
+                    &overflow_state,
+                    segment_id,
+                    key.as_ref(),
+                )
+            },
+            || {
+                (
+                    segment_id,
+                    key.as_ref(),
+                    timer_type,
+                    promoted.time,
+                    promoted.span,
+                    segment_id,
+                    key.as_ref(),
+                    timer_type,
+                    new.time,
+                    new.span,
+                    timer_type,
+                    &overflow_state,
+                    segment_id,
+                    key.as_ref(),
+                )
+            },
+        )
+        .await
+    }
+
     /// Inserts a trigger into clustering columns only.
     ///
     /// Used when multiple timers exist for a key/type. Does not touch the
@@ -1359,18 +1441,20 @@ impl TriggerOperations for CassandraTriggerStore {
         match state {
             TimerState::Inline(old_timer) => {
                 // Promote: old inline → clustering, new → clustering, state → Overflow.
-                let context = self.propagator().extract(&old_timer.span);
-                let span = info_span!("promote_inline_to_clustering");
-                if let Err(error) = span.set_parent(context) {
-                    debug!("failed to set parent span: {error:#}");
-                }
-                let promoted = Trigger::new(key.clone(), old_timer.time, timer_type, span);
-                // Write both clustering rows and set overflow concurrently.
-                tokio::try_join!(
-                    self.add_key_trigger_clustering(segment_id, promoted),
-                    self.add_key_trigger_clustering(segment_id, trigger),
-                    self.set_state_overflow(segment_id, &key, timer_type),
-                )?;
+                // All three writes are issued as a single UNLOGGED BATCH so the
+                // transition is atomic at the partition level.
+                let mut new_span_map: HashMap<String, String> = HashMap::with_capacity(2);
+                let context = trigger.span.load().context();
+                self.propagator().inject_context(&context, &mut new_span_map);
+
+                self.batch_promote_and_set_overflow(
+                    segment_id,
+                    &key,
+                    timer_type,
+                    ClusteringEntry { time: old_timer.time, span: &old_timer.span },
+                    ClusteringEntry { time: trigger.time, span: &new_span_map },
+                )
+                .await?;
                 self.state_cache.insert(cache_key, TimerState::Overflow);
             }
             TimerState::Overflow => {

@@ -330,5 +330,26 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
+        /// BATCH: Insert two clustering rows (promoted + new) and set overflow state with TTL.
+        /// Batch-level USING TTL applies to both INSERTs; the UPDATE has no TTL.
+        batch_promote_and_set_overflow: (
+            "BEGIN UNLOGGED BATCH USING TTL ? \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Insert two clustering rows (promoted + new) and set overflow state without TTL
+        batch_promote_and_set_overflow_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
     }
 }
