@@ -253,7 +253,7 @@ pub(crate) async fn migrate_segment_version(
     // Phase 3: Update segment version (atomic marker indicating migration complete)
     // This is the critical point - after this, the system uses v2 tables
     store
-        .update_segment_version(&segment_id, SegmentVersion::V2, segment.slab_size)
+        .update_segment_version(SegmentVersion::V2, segment.slab_size)
         .await?;
 
     info!("Successfully migrated segment {segment_id} from V1 to V2");
@@ -357,7 +357,7 @@ pub(crate) async fn migrate_key_states(
     info!("Starting V2→V3 key state migration for segment {segment_id}");
 
     // Collect all slab IDs.
-    let slab_ids: Vec<SlabId> = store.get_slabs(&segment_id).try_collect().await?;
+    let slab_ids: Vec<SlabId> = store.get_slabs().try_collect().await?;
     debug!(
         "Found {} slabs to scan for key state migration",
         slab_ids.len()
@@ -409,7 +409,7 @@ pub(crate) async fn migrate_key_states(
 
     // Commit point: bump version to V3.
     store
-        .update_segment_version(&segment_id, SegmentVersion::V3, segment.slab_size)
+        .update_segment_version(SegmentVersion::V3, segment.slab_size)
         .await?;
 
     info!("Successfully migrated segment {segment_id} from V2 to V3");
@@ -481,7 +481,7 @@ async fn migrate_triggers_to_new_slabs(
 
                     // Register new slab metadata if first time seeing this ID
                     if new_slab_ids.insert(new_slab.id()) {
-                        store.insert_slab(&segment_id, new_slab.clone()).await?;
+                        store.insert_slab(new_slab.clone()).await?;
                     }
 
                     // Write trigger to new slab (key table unchanged)
@@ -571,7 +571,7 @@ async fn cleanup_old_slabs_with_overlap_protection(
                 let segment_id = segment.id;
 
                 // Delete metadata ONLY if slab_id is not reused (shared row in timer_segments)
-                if !is_reused && let Err(error) = store.delete_slab(&segment_id, slab_id).await {
+                if !is_reused && let Err(error) = store.delete_slab(slab_id).await {
                     warn!(
                         "Failed to delete metadata for old slab {slab_id} (segment {segment_id}): \
                          {error:#}"
@@ -651,7 +651,7 @@ pub(crate) async fn migrate_slab_size(
     );
 
     // Phase 1: Collect all slabs with old slab_size (non-destructive)
-    let old_slab_ids: Vec<_> = store.get_slabs(&segment_id).try_collect().await?;
+    let old_slab_ids: Vec<_> = store.get_slabs().try_collect().await?;
 
     debug!(
         "Found {} slabs to migrate for segment {segment_id}",
@@ -665,7 +665,7 @@ pub(crate) async fn migrate_slab_size(
     // Phase 3: Update segment slab_size (atomic marker indicating migration
     // complete). Preserve the existing version so V3 stays V3.
     store
-        .update_segment_version(&segment_id, segment.version, desired_slab_size)
+        .update_segment_version(segment.version, desired_slab_size)
         .await?;
 
     info!(

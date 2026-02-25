@@ -15,14 +15,13 @@ use crate::Key;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 
 pub use crate::timers::error::TimerManagerError;
 use crate::timers::loader::{State, get_or_create_segment, slab_loader};
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerType, Trigger};
 use async_stream::try_stream;
 use educe::Educe;
@@ -86,14 +85,12 @@ where
     /// - The scheduler fails to initialize.
     /// - The slab loader task cannot be spawned.
     pub async fn new(
-        segment_id: SegmentId,
-        slab_size: CompactDuration,
         name: &str,
         store: T,
         heartbeats: HeartbeatRegistry,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
-        let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
+        let segment = get_or_create_segment(&store, name).await?;
 
         // Initialize the in-memory scheduler.
         let (trigger_rx, scheduler) = TriggerScheduler::new(&heartbeats);
@@ -149,14 +146,13 @@ where
     {
         let slab_lock = self.0.state.clone();
         let key = key.clone();
-        let segment_id = self.0.segment.id;
 
         try_stream! {
             let state = slab_lock.trigger_lock().await;
 
             let stream = state
                 .store
-                .get_key_times(&segment_id, timer_type, &key)
+                .get_key_times(timer_type, &key)
                 .map_err(TimerManagerError::Store);
 
             pin_mut!(stream);
@@ -267,7 +263,7 @@ where
                 // The store layer handles singleton/overflow routing internally.
                 state
                     .store
-                    .add_trigger(&self.0.segment, slab, trigger.clone())
+                    .add_trigger(slab, trigger.clone())
                     .await
                     .map_err(TimerManagerError::Store)?;
 
@@ -354,7 +350,7 @@ where
                 // Remove from persistent storage.
                 state
                     .store
-                    .remove_trigger(&self.0.segment, &slab, key, time, timer_type)
+                    .remove_trigger(&slab, key, time, timer_type)
                     .await
                     .map_err(TimerManagerError::Store)
             }
@@ -430,7 +426,7 @@ where
         // Get all existing triggers for this key/type
         let existing_triggers: Vec<Trigger> = state
             .store
-            .get_key_triggers(&self.0.segment.id, trigger.timer_type, &trigger.key)
+            .get_key_triggers(trigger.timer_type, &trigger.key)
             .map_err(TimerManagerError::Store)
             .try_collect()
             .await?;
@@ -523,7 +519,7 @@ where
         );
         state
             .store
-            .clear_and_schedule(&self.0.segment, new_slab, trigger, old_slabs)
+            .clear_and_schedule(new_slab, trigger, old_slabs)
             .await
             .map_err(TimerManagerError::Store)?;
 
@@ -614,7 +610,7 @@ where
         // Remove from storage.
         state
             .store
-            .remove_trigger(&self.0.segment, &slab, key, time, timer_type)
+            .remove_trigger(&slab, key, time, timer_type)
             .await
             .map_err(TimerManagerError::Store)?;
 
@@ -751,6 +747,7 @@ mod tests {
     use super::*;
     use crate::consumer::{Keyed, Uncommitted};
     use crate::timers::UncommittedTimer;
+    use crate::timers::duration::CompactDuration;
     use crate::timers::store::SegmentVersion;
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
@@ -794,18 +791,9 @@ mod tests {
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
     )> {
         let store = memory_store(test_segment());
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(300);
-
-        TimerManager::new(
-            segment_id,
-            slab_size,
-            "test-manager",
-            store,
-            HeartbeatRegistry::test(),
-        )
-        .await
-        .map_err(|e| eyre!("Failed to create timer manager: {}", e))
+        TimerManager::new("test-manager", store, HeartbeatRegistry::test())
+            .await
+            .map_err(|e| eyre!("Failed to create timer manager: {}", e))
     }
 
     /// Helper: count scheduled times for a key and timer type
@@ -842,25 +830,17 @@ mod tests {
     async fn test_new_timer_manager_creation() -> Result<()> {
         time::pause();
 
-        let store = memory_store(test_segment());
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(300);
+        let segment = test_segment();
+        let store = memory_store(segment.clone());
 
-        let result = TimerManager::new(
-            segment_id,
-            slab_size,
-            "test-creation",
-            store,
-            HeartbeatRegistry::test(),
-        )
-        .await;
+        let result = TimerManager::new("test-creation", store, HeartbeatRegistry::test()).await;
 
         assert!(result.is_ok(), "Timer manager creation should succeed");
 
         let (_stream, manager) = result?;
-        assert_eq!(manager.0.segment.id, segment_id);
-        assert_eq!(manager.0.segment.slab_size, slab_size);
-        assert_eq!(manager.0.segment.name, "test-creation");
+        assert_eq!(manager.0.segment.id, segment.id);
+        assert_eq!(manager.0.segment.name, segment.name);
+        assert_eq!(manager.0.segment.slab_size, segment.slab_size);
         Ok(())
     }
 

@@ -249,12 +249,7 @@ async fn setup_v2_state(
 ) -> color_eyre::Result<()> {
     // Insert segment metadata at version V2.
     store
-        .insert_segment(Segment {
-            id: input.segment_id,
-            name: input.segment_name.clone(),
-            version: SegmentVersion::V2,
-            slab_size: input.initial_slab_size,
-        })
+        .insert_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V2 segment: {e:?}"))?;
 
@@ -264,7 +259,7 @@ async fn setup_v2_state(
         let slab = Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time);
         if registered_slabs.insert(slab.id()) {
             store
-                .insert_slab(&input.segment_id, slab)
+                .insert_slab(slab)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Failed to insert slab: {e:?}"))?;
         }
@@ -306,15 +301,8 @@ async fn setup_v3_state(
     store: &TableAdapter<CassandraTriggerStore>,
     input: &MigrationTestInput,
 ) -> color_eyre::Result<()> {
-    let segment = Segment {
-        id: input.segment_id,
-        name: input.segment_name.clone(),
-        version: SegmentVersion::V3,
-        slab_size: input.initial_slab_size,
-    };
-
     store
-        .insert_segment(segment.clone())
+        .insert_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 segment: {e:?}"))?;
 
@@ -327,7 +315,7 @@ async fn setup_v3_state(
         );
         let slab = Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time);
 
-        Box::pin(store.add_trigger(&segment, slab, trigger))
+        Box::pin(store.add_trigger(slab, trigger))
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to add V3 trigger: {e:?}"))?;
     }
@@ -349,7 +337,7 @@ async fn verify_segment_metadata(
     initial_version: SegmentVersion,
 ) -> color_eyre::Result<()> {
     let segment = store
-        .get_segment(&model.segment.id)
+        .get_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to get segment: {e:?}"))?
         .ok_or_else(|| color_eyre::eyre::eyre!("Segment {} not found", model.segment.id))?;
@@ -408,7 +396,7 @@ async fn verify_data_preservation(
         // Get triggers for all timer types
         for &timer_type in TimerType::VARIANTS {
             let triggers: Vec<Trigger> = store
-                .get_key_triggers(&model.segment.id, timer_type, key)
+                .get_key_triggers(timer_type, key)
                 .try_collect()
                 .await
                 .map_err(|e| {
@@ -531,7 +519,7 @@ async fn verify_dual_index_consistency(
 
         for &timer_type in TimerType::VARIANTS {
             let triggers: Vec<Trigger> = store
-                .get_key_triggers(&model.segment.id, timer_type, key)
+                .get_key_triggers(timer_type, key)
                 .try_collect()
                 .await
                 .map_err(|e| {
@@ -570,7 +558,7 @@ async fn verify_no_extra_slabs(
 ) -> color_eyre::Result<()> {
     // Get ALL slabs for this segment
     let all_slabs: Vec<SlabId> = operations
-        .get_slabs(&model.segment.id)
+        .get_slabs()
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to get all slabs: {e:?}"))?;
@@ -655,7 +643,7 @@ async fn verify_cleanup(
         for old_slab_id in obsolete_slabs {
             // Check if old slab still exists in metadata
             let all_slabs: Vec<SlabId> = operations
-                .get_slabs(&input.segment_id)
+                .get_slabs()
                 .try_collect()
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Failed to check slab cleanup: {e:?}"))?;
@@ -802,7 +790,7 @@ pub async fn prop_migration_invariants(
             let cassandra_base = CassandraStore::new(&config).await?;
             let segment = Segment {
                 id: input.segment_id,
-                name: String::new(),
+                name: input.segment_name.clone(),
                 slab_size: input.initial_slab_size,
                 version: SegmentVersion::V2,
             };
@@ -817,7 +805,7 @@ pub async fn prop_migration_invariants(
             let cassandra_base = CassandraStore::new(&config).await?;
             let segment = Segment {
                 id: input.segment_id,
-                name: String::new(),
+                name: input.segment_name.clone(),
                 slab_size: input.initial_slab_size,
                 version: SegmentVersion::V3,
             };
@@ -845,7 +833,7 @@ pub async fn prop_migration_invariants(
     // Trigger migration by calling get_segment()
     // Note: Empty V1 segments (no triggers) don't exist in the database
     let segment_opt = store
-        .get_segment(&input.segment_id)
+        .get_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to trigger migration: {e:?}"))?;
 
@@ -874,7 +862,7 @@ pub async fn prop_migration_invariants(
     // Cleanup phase: Delete segment (success or failure)
     store
         .operations()
-        .delete_segment(&input.segment_id)
+        .delete_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to cleanup segment: {e:?}"))?;
 

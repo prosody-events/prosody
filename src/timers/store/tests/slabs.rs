@@ -50,7 +50,7 @@ where
 
     // Test range 5..=15 should return [5, 10, 15]
     let range_slabs: Vec<u32> = store
-        .get_slab_range(&segment.id, 5..=15)
+        .get_slab_range(5..=15)
         .try_collect()
         .await
         .map_err(|e| format!("Failed to get slab range: {e:?}"))?;
@@ -66,7 +66,7 @@ where
 
     // Test range 0..=0 should return [0]
     let range_slabs: Vec<u32> = store
-        .get_slab_range(&segment.id, 0..=0)
+        .get_slab_range(0..=0)
         .try_collect()
         .await
         .map_err(|e| format!("Failed to get slab range: {e:?}"))?;
@@ -79,7 +79,7 @@ where
 
     // Test range 25..=30 should return [] (no slabs in range)
     let range_slabs: Vec<u32> = store
-        .get_slab_range(&segment.id, 25..=30)
+        .get_slab_range(25..=30)
         .try_collect()
         .await
         .map_err(|e| format!("Failed to get slab range: {e:?}"))?;

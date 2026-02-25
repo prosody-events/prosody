@@ -12,7 +12,7 @@ use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
+use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
@@ -248,7 +248,7 @@ where
 
     let loaded = state
         .store
-        .get_slab_range(&segment.id, slab_range)
+        .get_slab_range(slab_range)
         .map_err(TimerManagerError::Store)
         .map_ok(|slab_id| async move {
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
@@ -293,7 +293,7 @@ where
 
     let deleted_slab_ids = iter(completed_slab_ids)
         .map(|slab_id| async move {
-            store_ref.delete_slab(&segment.id, slab_id).await?;
+            store_ref.delete_slab(slab_id).await?;
             Ok(slab_id)
         })
         .buffer_unordered(DELETE_CONCURRENCY)
@@ -369,14 +369,13 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
 
 /// Retrieves or creates a [`Segment`] in the store.
 ///
-/// If a segment with `segment_id` exists, it is returned. Otherwise, a new
-/// segment is inserted with the given `slab_size` and `name`.
+/// If a segment already exists in the store, it is returned. Otherwise, a new
+/// segment is inserted using the store's segment identity with the given
+/// `name`.
 ///
 /// # Arguments
 ///
 /// * `store` - The persistent trigger store.
-/// * `segment_id` - Unique identifier for the segment.
-/// * `slab_size` - Slab duration for time partitioning.
 /// * `name` - Human-readable name for the segment.
 ///
 /// # Errors
@@ -388,35 +387,25 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
 /// The existing or newly created [`Segment`] object.
 pub async fn get_or_create_segment<T>(
     store: &T,
-    segment_id: SegmentId,
-    slab_size: CompactDuration,
-    name: &str,
+    _name: &str,
 ) -> Result<Segment, TimerManagerError<T::Error>>
 where
     T: TriggerStore,
 {
     if let Some(segment) = store
-        .get_segment(&segment_id)
+        .get_segment()
         .await
         .map_err(TimerManagerError::Store)?
     {
         return Ok(segment);
     }
 
-    // Create new segment as v2
-    let segment = Segment {
-        id: segment_id,
-        name: name.to_owned(),
-        slab_size,
-        version: SegmentVersion::V2,
-    };
-
     store
-        .insert_segment(segment.clone())
+        .insert_segment()
         .await
         .map_err(TimerManagerError::Store)?;
 
-    Ok(segment)
+    Ok(store.segment())
 }
 
 /// Calculates a jittered preload duration between the minimum and slab size.
@@ -445,10 +434,10 @@ mod tests {
     use crate::Key;
     use crate::heartbeat::HeartbeatRegistry;
     use crate::timers::duration::CompactDuration;
-    use crate::timers::store::Segment;
     use crate::timers::store::memory::memory_store;
+    use crate::timers::store::{Segment, SegmentVersion};
     use crate::timers::{TimerType, Trigger};
-    use color_eyre::eyre::{Result, eyre};
+    use color_eyre::eyre::{self as eyre, Result};
     use futures::future;
     use std::time::Duration;
     use tokio::task;
@@ -583,41 +572,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_new() -> Result<()> {
-        let store = memory_store(create_test_segment());
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(60);
-        let name = "test-segment";
+        let test_segment = create_test_segment();
+        let store = memory_store(test_segment.clone());
 
-        let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
-        assert_eq!(segment.id, segment_id);
-        assert_eq!(segment.name, name);
-        assert_eq!(segment.slab_size, slab_size);
+        let segment = get_or_create_segment(&store, "test-segment").await?;
+        assert_eq!(segment.id, test_segment.id);
+        assert_eq!(segment.name, test_segment.name);
+        assert_eq!(segment.slab_size, test_segment.slab_size);
 
         // Check that it was stored
-        let retrieved = store.get_segment(&segment_id).await?;
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.ok_or_else(|| eyre!("Expected segment to be stored"))?;
-        assert_eq!(retrieved.name, name);
+        let retrieved = store.get_segment().await?;
+        let retrieved = retrieved.ok_or_else(|| eyre::eyre!("Expected segment to be stored"))?;
+        assert_eq!(retrieved.id, test_segment.id);
+        assert_eq!(retrieved.name, test_segment.name);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_get_or_create_segment_existing() -> Result<()> {
-        let store = memory_store(create_test_segment());
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(60);
-        let name1 = "first-segment";
-        let name2 = "second-segment";
+        let test_segment = create_test_segment();
+        let store = memory_store(test_segment.clone());
 
-        // Create first segment
-        let segment1 = get_or_create_segment(&store, segment_id, slab_size, name1).await?;
+        // Create the segment
+        let segment1 = get_or_create_segment(&store, "first-segment").await?;
 
-        // Try to create second segment with same ID but different name
-        let segment2 = get_or_create_segment(&store, segment_id, slab_size, name2).await?;
+        // Second call should return the same (already persisted) segment
+        let segment2 = get_or_create_segment(&store, "second-segment").await?;
 
-        // Should return the first segment (existing one)
-        assert_eq!(segment1.name, segment2.name);
+        // Should return the first segment (existing one — name unchanged)
         assert_eq!(segment1.id, segment2.id);
+        assert_eq!(segment1.name, segment2.name);
         Ok(())
     }
 
@@ -644,14 +628,14 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert the segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create a slab by adding a trigger at an appropriate time
         let slab_id = 1;
         let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
         let slab = Slab::new(segment.id, slab_id, segment.slab_size);
         let trigger = create_test_trigger(1, time);
-        store.add_trigger(&segment, slab, trigger).await?;
+        store.add_trigger(slab, trigger).await?;
 
         let loaded = load_slabs(&slab_lock, &segment, 1..=1).await?;
         assert_eq!(loaded, vec![1]);
@@ -671,14 +655,14 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert the segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create multiple slabs by adding triggers at appropriate times
         for slab_id in 1..=3 {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         let mut loaded = load_slabs(&slab_lock, &segment, 1..=3).await?;
@@ -711,15 +695,15 @@ mod tests {
         let slab = Slab::new(segment.id, slab_id, segment.slab_size);
 
         // Insert segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Add some triggers to the slab
         let now = CompactDateTime::now()?;
         let trigger1 = create_test_trigger(1, now);
         let trigger2 = create_test_trigger(2, now);
 
-        store.add_trigger(&segment, slab.clone(), trigger1).await?;
-        store.add_trigger(&segment, slab.clone(), trigger2).await?;
+        store.add_trigger(slab.clone(), trigger1).await?;
+        store.add_trigger(slab.clone(), trigger2).await?;
 
         load_triggers(&store, &scheduler, slab).await?;
         Ok(())
@@ -734,7 +718,7 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create a loaded_slab_ids set with some slabs
         let mut loaded_slab_ids = HashSet::new();
@@ -747,7 +731,7 @@ mod tests {
             let time = CompactDateTime::from(*slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
             let trigger = create_test_trigger((*slab_id).into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         remove_completed_slabs(&slab_lock, &segment, &mut loaded_slab_ids).await?;
@@ -779,7 +763,7 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert the segment
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create test heartbeat
         let test_heartbeat = Heartbeat::new("test-slab-loader", Duration::from_secs(30));
@@ -816,7 +800,7 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert the segment
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create test heartbeat
         let test_heartbeat =
@@ -881,7 +865,7 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create some loaded slabs
         let mut loaded_slab_ids = HashSet::new();
@@ -894,7 +878,7 @@ mod tests {
             let time = CompactDateTime::from(*slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
             let trigger = create_test_trigger((*slab_id).into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         // Add an active trigger to slab 2
@@ -922,7 +906,7 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert the segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Set initial ownership
         {
@@ -935,7 +919,7 @@ mod tests {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         let result = load_slabs(&slab_lock, &segment, 6..=10).await;
@@ -957,7 +941,7 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert the segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Set high initial ownership
         {
@@ -970,7 +954,7 @@ mod tests {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
             let slab = Slab::new(segment.id, slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         let loaded = load_slabs(&slab_lock, &segment, 1..=5).await?;
@@ -1029,18 +1013,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_concurrent() -> Result<()> {
-        let store = memory_store(create_test_segment());
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(60);
-        let name = "concurrent-test";
+        let test_segment = create_test_segment();
+        let store = memory_store(test_segment.clone());
 
         // Create multiple concurrent futures trying to create the same segment
         let futures: Vec<_> = (0_i32..10_i32)
             .map(|_| {
                 let store_clone = store.clone();
-                async move {
-                    get_or_create_segment(&store_clone, segment_id, slab_size, name).await
-                }
+                async move { get_or_create_segment(&store_clone, "concurrent-test").await }
             })
             .collect();
 
@@ -1050,17 +1030,16 @@ mod tests {
         // All should succeed and return the same segment
         for result in results {
             let segment = result?;
-            assert_eq!(segment.id, segment_id);
-            assert_eq!(segment.name, name);
-            assert_eq!(segment.slab_size, slab_size);
+            assert_eq!(segment.id, test_segment.id);
+            assert_eq!(segment.name, test_segment.name);
+            assert_eq!(segment.slab_size, test_segment.slab_size);
         }
 
-        // Verify only one segment exists in the store
-        let stored_segment = store.get_segment(&segment_id).await?;
+        // Verify the segment was stored
+        let stored_segment = store.get_segment().await?;
         let stored_segment =
-            stored_segment.ok_or_else(|| eyre!("Expected segment to be stored"))?;
-        assert_eq!(stored_segment.id, segment_id);
-        assert_eq!(stored_segment.name, name);
+            stored_segment.ok_or_else(|| eyre::eyre!("Expected segment to be stored"))?;
+        assert_eq!(stored_segment.id, test_segment.id);
         Ok(())
     }
 
@@ -1075,7 +1054,7 @@ mod tests {
         let segment = create_test_segment();
 
         // Insert the segment
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create test heartbeat
         let test_heartbeat = Heartbeat::new("test-slab-loader-errors", Duration::from_secs(30));

@@ -7,6 +7,7 @@
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
@@ -78,29 +79,38 @@ where
     type Error = T::Error;
 
     // ===================================================================
-    // Pass-through methods (7 methods): Delegate directly to operations
+    // Segment accessors
     // ===================================================================
 
-    fn get_segment(
-        &self,
-        segment_id: &SegmentId,
-    ) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send {
-        self.operations.get_segment(segment_id)
+    fn segment(&self) -> Segment {
+        self.operations.segment().clone()
     }
 
-    fn insert_segment(
-        &self,
-        segment: Segment,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.operations.insert_segment(segment)
+    fn segment_id(&self) -> SegmentId {
+        self.operations.segment().id
+    }
+
+    fn slab_size(&self) -> CompactDuration {
+        self.operations.segment().slab_size
+    }
+
+    // ===================================================================
+    // Pass-through methods: Delegate directly to operations
+    // ===================================================================
+
+    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send {
+        self.operations.get_segment()
+    }
+
+    fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.operations.insert_segment()
     }
 
     fn get_slab_range(
         &self,
-        segment_id: &SegmentId,
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
-        self.operations.get_slab_range(segment_id, range)
+        self.operations.get_slab_range(range)
     }
 
     fn get_slab_triggers_all_types(
@@ -110,58 +120,45 @@ where
         self.operations.get_slab_triggers_all_types(slab)
     }
 
-    fn delete_slab(
-        &self,
-        segment_id: &SegmentId,
-        slab_id: SlabId,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.operations.delete_slab(segment_id, slab_id)
+    fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.operations.delete_slab(slab_id)
     }
 
     fn get_key_times(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
-        self.operations.get_key_times(segment_id, timer_type, key)
+        self.operations.get_key_times(timer_type, key)
     }
 
     fn get_key_triggers(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        self.operations
-            .get_key_triggers(segment_id, timer_type, key)
+        self.operations.get_key_triggers(timer_type, key)
     }
 
     // ===================================================================
-    // Coordinated writes (2 methods): Use try_join! for best-effort dual-table
+    // Coordinated writes: Use try_join! for best-effort dual-table
     // consistency
     // ===================================================================
 
-    #[instrument(level = "debug", skip(self, segment, slab, trigger), err)]
-    async fn add_trigger(
-        &self,
-        segment: &Segment,
-        slab: Slab,
-        trigger: Trigger,
-    ) -> Result<(), Self::Error> {
+    #[instrument(level = "debug", skip(self, slab, trigger), err)]
+    async fn add_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
         // Coordinate: slab metadata + slab trigger + key trigger
         try_join!(
-            self.operations.insert_slab(&segment.id, slab.clone()),
+            self.operations.insert_slab(slab.clone()),
             self.operations.insert_slab_trigger(slab, trigger.clone()),
-            self.operations.insert_key_trigger(&segment.id, trigger),
+            self.operations.insert_key_trigger(trigger),
         )?;
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self, segment, slab), err)]
+    #[instrument(level = "debug", skip(self, slab), err)]
     async fn remove_trigger(
         &self,
-        segment: &Segment,
         slab: &Slab,
         key: &Key,
         time: CompactDateTime,
@@ -171,20 +168,14 @@ where
         try_join!(
             self.operations
                 .delete_slab_trigger(slab, timer_type, key, time),
-            self.operations
-                .delete_key_trigger(&segment.id, timer_type, key, time),
+            self.operations.delete_key_trigger(timer_type, key, time),
         )?;
         Ok(())
     }
 
-    #[instrument(
-        level = "debug",
-        skip(self, segment, new_slab, new_trigger, old_slabs),
-        err
-    )]
+    #[instrument(level = "debug", skip(self, new_slab, new_trigger, old_slabs), err)]
     async fn clear_and_schedule(
         &self,
-        segment: &Segment,
         new_slab: Slab,
         new_trigger: Trigger,
         old_slabs: Vec<Slab>,
@@ -245,11 +236,10 @@ where
         // - UPDATEs the static singleton slot with the new timer
         // For singleton→singleton replacement, no tombstones are created.
         try_join!(
-            self.operations.insert_slab(&segment.id, new_slab.clone()),
+            self.operations.insert_slab(new_slab.clone()),
             self.operations
                 .insert_slab_trigger(new_slab, new_trigger.clone()),
-            self.operations
-                .clear_and_schedule_key(&segment.id, new_trigger),
+            self.operations.clear_and_schedule_key(new_trigger),
         )?;
 
         debug!(

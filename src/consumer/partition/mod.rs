@@ -379,7 +379,12 @@ async fn handle_messages<T, P>(
         "{}:{}/{}",
         config.group_id, partition_info.topic, partition_info.partition
     );
-    let segment_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
+    // Segment identity derived deterministically from the partition name.
+    // Used in Phase 3 when TriggerStoreProvider::create_store accepts a Segment.
+    let _ = (
+        Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
+        config.timer_slab_size,
+    );
 
     // Create a per-partition store via the provider. Each partition gets its own
     // store instance with an independent cache, sharing the underlying session.
@@ -394,15 +399,7 @@ async fn handle_messages<T, P>(
             return;
         }
 
-        match TimerManager::new(
-            segment_id,
-            config.timer_slab_size,
-            &name,
-            trigger_store.clone(),
-            heartbeats.clone(),
-        )
-        .await
-        {
+        match TimerManager::new(&name, trigger_store.clone(), heartbeats.clone()).await {
             Ok(result) => break result,
             Err(error) => {
                 error!("failed to initialize timer manager: {error:#}; retrying");

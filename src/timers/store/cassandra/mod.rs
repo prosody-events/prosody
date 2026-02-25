@@ -231,12 +231,6 @@ impl CassandraTriggerStore {
         }
     }
 
-    /// Returns the segment this store is scoped to.
-    #[must_use]
-    pub fn segment(&self) -> &Segment {
-        &self.segment
-    }
-
     fn session(&self) -> &Session {
         self.store.session()
     }
@@ -824,21 +818,22 @@ impl CassandraTriggerStore {
 impl TriggerOperations for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
 
-    #[instrument(level = "debug", skip(self), err)]
-    async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
-        // Validate that the segment's slab_size matches the configured slab_size
-        if segment.slab_size != self.segment.slab_size {
-            return Err(CassandraTriggerStoreError::SlabSizeMismatch {
-                segment_id: segment.id,
-                segment_slab_size: segment.slab_size,
-                configured_slab_size: self.segment.slab_size,
-            });
-        }
+    fn segment(&self) -> &Segment {
+        &self.segment
+    }
 
+    #[instrument(level = "debug", skip(self), err)]
+    async fn insert_segment(&self) -> Result<(), Self::Error> {
+        let segment = &self.segment;
         self.session()
             .execute_unpaged(
                 &self.queries().insert_segment,
-                (segment.id, segment.name, segment.slab_size, segment.version),
+                (
+                    segment.id,
+                    &segment.name,
+                    segment.slab_size,
+                    segment.version,
+                ),
             )
             .await
             .map_err(CassandraStoreError::from)?;
@@ -847,7 +842,8 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), err)]
-    async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
+    async fn get_segment(&self) -> Result<Option<Segment>, Self::Error> {
+        let segment_id = &self.segment.id;
         let Some(segment) = self.get_segment_unchecked(segment_id).await? else {
             return Ok(None);
         };
@@ -859,7 +855,8 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), err)]
-    async fn delete_segment(&self, segment_id: &SegmentId) -> Result<(), Self::Error> {
+    async fn delete_segment(&self) -> Result<(), Self::Error> {
+        let segment_id = &self.segment.id;
         self.session()
             .execute_unpaged(&self.queries().delete_segment, (segment_id,))
             .await
@@ -869,10 +866,8 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn get_slabs(
-        &self,
-        segment_id: &SegmentId,
-    ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
+    fn get_slabs(&self) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
+        let segment_id = self.segment.id;
         try_stream! {
             let stream = self
                 .session()
@@ -916,9 +911,9 @@ impl TriggerOperations for CassandraTriggerStore {
     // 2. slab_id >= i32::MIN AND slab_id <= end (for high u32 values, negative i32)
     fn get_slab_range(
         &self,
-        segment_id: &SegmentId,
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send {
+        let segment_id = self.segment.id;
         try_stream! {
             // First, validate that this is a proper range in u32 space
             // If start > end in u32 terms, this is an invalid range and we should return
@@ -1015,7 +1010,8 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), err)]
-    async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
+    async fn insert_slab(&self, slab: Slab) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
         self.execute_with_optional_ttl(
@@ -1029,11 +1025,8 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), err)]
-    async fn delete_slab(
-        &self,
-        segment_id: &SegmentId,
-        slab_id: SlabId,
-    ) -> Result<(), Self::Error> {
+    async fn delete_slab(&self, slab_id: SlabId) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         self.session()
             .execute_unpaged(
                 &self.queries().delete_slab,
@@ -1193,14 +1186,14 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
     fn get_key_times(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
         let key_clone = key.clone();
+        let segment_id = self.segment.id;
 
         try_stream! {
-            let (state, cached) = self.resolve_state(segment_id, &key_clone, timer_type).await?;
+            let (state, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
             match state {
@@ -1240,14 +1233,14 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
     fn get_key_triggers(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let key_clone = key.clone();
+        let segment_id = self.segment.id;
 
         try_stream! {
-            let (state, cached) = self.resolve_state(segment_id, &key_clone, timer_type).await?;
+            let (state, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
             match state {
@@ -1297,14 +1290,14 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty))]
     fn get_key_triggers_all_types(
         &self,
-        segment_id: &SegmentId,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let key_clone = key.clone();
+        let segment_id = self.segment.id;
 
         try_stream! {
             // Read all types in a single query, then build the state_map.
-            let raw_map = self.fetch_state_map(segment_id, &key_clone).await?;
+            let raw_map = self.fetch_state_map(&segment_id, &key_clone).await?;
             let raw_map = raw_map.unwrap_or_default();
 
             let mut state_map: HashMap<TimerType, TimerState> =
@@ -1411,16 +1404,13 @@ impl TriggerOperations for CassandraTriggerStore {
     /// - **Absent**: Set inline state with new timer directly → `Inline(new)`
     ///   (post-V3 Absent is unambiguous: 0 timers, no clustering rows)
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
-    async fn insert_key_trigger(
-        &self,
-        segment_id: &SegmentId,
-        trigger: Trigger,
-    ) -> Result<(), Self::Error> {
+    async fn insert_key_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         let timer_type = trigger.timer_type;
         let key = trigger.key.clone();
         let cache_key = (key.clone(), timer_type);
 
-        let (state, cached) = self.resolve_state(segment_id, &key, timer_type).await?;
+        let (state, cached) = self.resolve_state(&segment_id, &key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
         match state {
@@ -1431,7 +1421,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 let new_span_map = extract_span_map(self.propagator(), &trigger);
 
                 self.batch_promote_and_set_overflow(
-                    segment_id,
+                    &segment_id,
                     &key,
                     timer_type,
                     ClusteringEntry {
@@ -1448,7 +1438,8 @@ impl TriggerOperations for CassandraTriggerStore {
             }
             TimerState::Overflow => {
                 // Already overflow: write clustering only. State is unchanged.
-                self.add_key_trigger_clustering(segment_id, trigger).await?;
+                self.add_key_trigger_clustering(&segment_id, trigger)
+                    .await?;
             }
             TimerState::Absent => {
                 // Post-V3 Absent is unambiguous: 0 timers, no clustering rows.
@@ -1459,7 +1450,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     time: trigger.time,
                     span: span_map,
                 });
-                self.set_state_inline(segment_id, &key, timer_type, &state)
+                self.set_state_inline(&segment_id, &key, timer_type, &state)
                     .await?;
                 self.state_cache.insert(cache_key, state);
             }
@@ -1484,21 +1475,22 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn delete_key_trigger(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         let cache_key = (key.clone(), timer_type);
 
-        let (state, cached) = self.resolve_state(segment_id, key, timer_type).await?;
+        let (state, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
         match state {
             TimerState::Inline(timer) if timer.time == time => {
                 // Inline timer matches the delete target → remove state, become Absent.
                 // No clustering row exists for inline timers, so only remove state.
-                self.remove_state_entry(segment_id, key, timer_type).await?;
+                self.remove_state_entry(&segment_id, key, timer_type)
+                    .await?;
                 self.state_cache.insert(cache_key, TimerState::Absent);
             }
             TimerState::Inline(_) => {
@@ -1506,7 +1498,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 // State stays Inline (the inline timer is untouched).
                 self.execute_unpaged_discard(
                     &self.queries().delete_key_trigger,
-                    (segment_id, key.as_ref(), timer_type, time),
+                    (&segment_id, key.as_ref(), timer_type, time),
                 )
                 .await?;
             }
@@ -1514,27 +1506,31 @@ impl TriggerOperations for CassandraTriggerStore {
                 // Delete the clustering row first.
                 self.execute_unpaged_discard(
                     &self.queries().delete_key_trigger,
-                    (segment_id, key.as_ref(), timer_type, time),
+                    (&segment_id, key.as_ref(), timer_type, time),
                 )
                 .await?;
 
                 // Count remaining times (LIMIT 2, no span — cheap).
-                let times = self.peek_trigger_times(segment_id, key, timer_type).await?;
+                let times = self
+                    .peek_trigger_times(&segment_id, key, timer_type)
+                    .await?;
 
                 match times.as_slice() {
                     [] => {
                         // 0 remaining → Absent.
-                        self.remove_state_entry(segment_id, key, timer_type).await?;
+                        self.remove_state_entry(&segment_id, key, timer_type)
+                            .await?;
                         self.state_cache.insert(cache_key, TimerState::Absent);
                     }
                     [remaining_time] => {
                         // 1 remaining → fetch span and demote to Inline.
                         let Some((confirmed_time, span_map)) = self
-                            .peek_first_key_trigger(segment_id, key, timer_type)
+                            .peek_first_key_trigger(&segment_id, key, timer_type)
                             .await?
                         else {
                             // Row vanished between count and read — treat as Absent.
-                            self.remove_state_entry(segment_id, key, timer_type).await?;
+                            self.remove_state_entry(&segment_id, key, timer_type)
+                                .await?;
                             self.state_cache.insert(cache_key, TimerState::Absent);
                             return Ok(());
                         };
@@ -1546,10 +1542,10 @@ impl TriggerOperations for CassandraTriggerStore {
 
                         // Concurrent: set inline state + delete remaining clustering row.
                         tokio::try_join!(
-                            self.set_state_inline(segment_id, key, timer_type, &state),
+                            self.set_state_inline(&segment_id, key, timer_type, &state),
                             self.execute_unpaged_discard(
                                 &self.queries().delete_key_trigger,
-                                (segment_id, key.as_ref(), timer_type, confirmed_time),
+                                (&segment_id, key.as_ref(), timer_type, confirmed_time),
                             )
                         )?;
 
@@ -1575,16 +1571,16 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self), err)]
     async fn clear_key_triggers(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         // Concurrent: remove state entry AND clear clustering rows
         tokio::try_join!(
-            self.remove_state_entry(segment_id, key, timer_type),
+            self.remove_state_entry(&segment_id, key, timer_type),
             self.execute_unpaged_discard(
                 &self.queries().clear_key_triggers,
-                (segment_id, key.as_ref(), timer_type),
+                (&segment_id, key.as_ref(), timer_type),
             )
         )?;
 
@@ -1607,11 +1603,8 @@ impl TriggerOperations for CassandraTriggerStore {
     /// Per-key serialization (`KeyManager`) guarantees the state is
     /// stable between the read and the write.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
-    async fn clear_and_schedule_key(
-        &self,
-        segment_id: &SegmentId,
-        trigger: Trigger,
-    ) -> Result<(), Self::Error> {
+    async fn clear_and_schedule_key(&self, trigger: Trigger) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         // Extract span context for storage.
         let span_map = extract_span_map(self.propagator(), &trigger);
 
@@ -1623,7 +1616,7 @@ impl TriggerOperations for CassandraTriggerStore {
         let cache_key = (trigger.key.clone(), trigger.timer_type);
 
         let (resolved, cached) = self
-            .resolve_state(segment_id, &trigger.key, trigger.timer_type)
+            .resolve_state(&segment_id, &trigger.key, trigger.timer_type)
             .await?;
         Span::current().record("state_cached", cached);
 
@@ -1631,13 +1624,13 @@ impl TriggerOperations for CassandraTriggerStore {
             TimerState::Inline(_) | TimerState::Absent => {
                 // Fast path: Inline or Absent → plain UPDATE, no tombstone.
                 // Post-V3 Absent guarantees no clustering rows.
-                self.set_state_inline(segment_id, &trigger.key, trigger.timer_type, &new_state)
+                self.set_state_inline(&segment_id, &trigger.key, trigger.timer_type, &new_state)
                     .await?;
             }
             TimerState::Overflow => {
                 // Overflow: BATCH (DELETE clustering + UPDATE state).
                 self.batch_clear_and_set_inline(
-                    segment_id,
+                    &segment_id,
                     &trigger.key,
                     trigger.timer_type,
                     &new_state,
@@ -1652,18 +1645,15 @@ impl TriggerOperations for CassandraTriggerStore {
     }
 
     #[instrument(level = "debug", skip(self), err)]
-    async fn clear_key_triggers_all_types(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-    ) -> Result<(), Self::Error> {
+    async fn clear_key_triggers_all_types(&self, key: &Key) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         // Concurrent: clear clustering rows AND the state static column.
         tokio::try_join!(
             self.execute_unpaged_discard(
                 &self.queries().clear_key_triggers_all_types,
-                (segment_id, key.as_ref()),
+                (&segment_id, key.as_ref()),
             ),
-            self.execute_unpaged_discard(&self.queries().clear_state, (segment_id, key.as_ref()),)
+            self.execute_unpaged_discard(&self.queries().clear_state, (&segment_id, key.as_ref()),)
         )?;
 
         // After success, cache Absent for all types.
@@ -1681,10 +1671,10 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self), err)]
     async fn update_segment_version(
         &self,
-        segment_id: &SegmentId,
         new_version: SegmentVersion,
         new_slab_size: CompactDuration,
     ) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         self.session()
             .execute_unpaged(
                 &self.queries().update_segment_version,

@@ -109,58 +109,36 @@ impl InMemoryTriggerStore {
             inner: Arc::new(Inner::default()),
         }
     }
-
-    /// Returns the segment this store is scoped to.
-    #[must_use]
-    pub fn segment(&self) -> Segment {
-        self.segment.clone()
-    }
 }
 
 impl TriggerOperations for InMemoryTriggerStore {
     type Error = Infallible;
 
+    fn segment(&self) -> &Segment {
+        &self.segment
+    }
+
     // -- Segment management operations --
 
-    /// Insert or update a segment's metadata.
-    ///
-    /// Registers the segment ID, name, and slab size.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment` - The segment configuration to store.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
-    async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
+    async fn insert_segment(&self) -> Result<(), Self::Error> {
+        let segment = &self.segment;
         self.inner
             .segments
             .upsert_async(
                 segment.id,
-                (segment.name, segment.slab_size, segment.version),
+                (segment.name.clone(), segment.slab_size, segment.version),
             )
             .await;
 
         Ok(())
     }
 
-    /// Retrieve a segment's configuration by its ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Identifier of the segment to look up.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(segment))` if found.
-    /// * `Ok(None)` if no segment with that ID exists.
-    /// * Never returns `Err`.
-    async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
-        Ok(self.inner.segments.get_async(segment_id).await.map(|e| {
+    async fn get_segment(&self) -> Result<Option<Segment>, Self::Error> {
+        let segment_id = self.segment.id;
+        Ok(self.inner.segments.get_async(&segment_id).await.map(|e| {
             let (name, slab_size, version) = e.get();
             Segment {
-                id: *segment_id,
+                id: segment_id,
                 name: name.clone(),
                 slab_size: *slab_size,
                 version: *version,
@@ -168,20 +146,12 @@ impl TriggerOperations for InMemoryTriggerStore {
         }))
     }
 
-    /// Delete a segment and its slab registrations.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Identifier of the segment to remove.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
-    async fn delete_segment(&self, segment_id: &SegmentId) -> Result<(), Self::Error> {
+    async fn delete_segment(&self) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         // Remove from both the segments map and the segment_slabs map.
         join!(
-            self.inner.segments.remove_async(segment_id),
-            self.inner.segment_slabs.remove_async(segment_id)
+            self.inner.segments.remove_async(&segment_id),
+            self.inner.segment_slabs.remove_async(&segment_id)
         );
 
         Ok(())
@@ -189,18 +159,10 @@ impl TriggerOperations for InMemoryTriggerStore {
 
     // -- Slab management operations --
 
-    /// Stream all slab IDs registered under a segment.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment whose slabs to list.
-    ///
-    /// # Returns
-    ///
-    /// A stream of `SlabId`. Never yields an error.
-    fn get_slabs(&self, segment_id: &SegmentId) -> impl Stream<Item = Result<SlabId, Self::Error>> {
+    fn get_slabs(&self) -> impl Stream<Item = Result<SlabId, Self::Error>> {
+        let segment_id = self.segment.id;
         try_stream! {
-            let Some(entry) = self.inner.segment_slabs.get_async(segment_id).await else {
+            let Some(entry) = self.inner.segment_slabs.get_async(&segment_id).await else {
                 return;
             };
 
@@ -210,23 +172,13 @@ impl TriggerOperations for InMemoryTriggerStore {
         }
     }
 
-    /// Stream slab IDs in a specified inclusive range.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment to query.
-    /// * `range` - Inclusive range of slab IDs to include.
-    ///
-    /// # Returns
-    ///
-    /// A stream of `SlabId`. Never yields an error.
     fn get_slab_range(
         &self,
-        segment_id: &SegmentId,
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> {
+        let segment_id = self.segment.id;
         try_stream! {
-            let Some(entry) = self.inner.segment_slabs.get_async(segment_id).await else {
+            let Some(entry) = self.inner.segment_slabs.get_async(&segment_id).await else {
                 return;
             };
 
@@ -236,20 +188,11 @@ impl TriggerOperations for InMemoryTriggerStore {
         }
     }
 
-    /// Register a slab ID under a segment.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Owner segment.
-    /// * `slab_id` - Identifier of the slab to add.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
-    async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
+    async fn insert_slab(&self, slab: Slab) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
         self.inner
             .segment_slabs
-            .entry_async(*segment_id)
+            .entry_async(segment_id)
             .await
             .or_default()
             .get_mut()
@@ -258,24 +201,9 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(())
     }
 
-    /// Unregister a slab ID from a segment.
-    ///
-    /// Does not clear slab triggers; use `clear_slab_triggers` for that.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Owner segment.
-    /// * `slab_id` - Identifier of the slab to remove.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error.
-    async fn delete_slab(
-        &self,
-        segment_id: &SegmentId,
-        slab_id: SlabId,
-    ) -> Result<(), Self::Error> {
-        let Some(mut entry) = self.inner.segment_slabs.get_async(segment_id).await else {
+    async fn delete_slab(&self, slab_id: SlabId) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let Some(mut entry) = self.inner.segment_slabs.get_async(&segment_id).await else {
             return Ok(());
         };
 
@@ -436,46 +364,31 @@ impl TriggerOperations for InMemoryTriggerStore {
 
     /// Stream all scheduled times for a given key and timer type.
     ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment to query.
-    /// * `timer_type` - The timer type to query (Application or
-    ///   `DeferredMessage`).
-    /// * `key` - Entity key.
-    ///
     /// # Returns
     ///
     /// A stream of `CompactDateTime`. Never yields an error.
     fn get_key_times(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send {
-        self.get_key_triggers(segment_id, timer_type, key)
+        self.get_key_triggers(timer_type, key)
             .map_ok(|trigger| trigger.time)
     }
 
     /// Stream all triggers for a given key and timer type.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment to query.
-    /// * `timer_type` - The timer type to query (Application or
-    ///   `DeferredMessage`).
-    /// * `key` - Entity key.
     ///
     /// # Returns
     ///
     /// A stream of `Trigger`. Never yields an error.
     fn get_key_triggers(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        let segment_id = self.segment.id;
         try_stream! {
-            let partition_key = (*segment_id, key.clone());
+            let partition_key = (segment_id, key.clone());
             let Some(triggers_map) = self.inner.key_triggers.get_async(&partition_key).await else {
                 return;
             };
@@ -491,21 +404,16 @@ impl TriggerOperations for InMemoryTriggerStore {
 
     /// Stream ALL triggers for a given key across all timer types.
     ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment to query.
-    /// * `key` - Entity key.
-    ///
     /// # Returns
     ///
     /// A stream of all `Trigger`s for the key, regardless of timer type.
     fn get_key_triggers_all_types(
         &self,
-        segment_id: &SegmentId,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
+        let segment_id = self.segment.id;
         try_stream! {
-            let partition_key = (*segment_id, key.clone());
+            let partition_key = (segment_id, key.clone());
             let Some(triggers_map) = self.inner.key_triggers.get_async(&partition_key).await else {
                 return;
             };
@@ -519,20 +427,12 @@ impl TriggerOperations for InMemoryTriggerStore {
 
     /// Insert a trigger into the key-based index.
     ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment for the key.
-    /// * `trigger` - The `Trigger` to add.
-    ///
     /// # Errors
     ///
     /// Never returns an error.
-    async fn insert_key_trigger(
-        &self,
-        segment_id: &SegmentId,
-        trigger: Trigger,
-    ) -> Result<(), Self::Error> {
-        let partition_key = (*segment_id, trigger.key.clone());
+    async fn insert_key_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let partition_key = (segment_id, trigger.key.clone());
         let clustering_key = (trigger.timer_type, trigger.time);
 
         self.inner
@@ -548,24 +448,17 @@ impl TriggerOperations for InMemoryTriggerStore {
 
     /// Delete a specific trigger from the key-based index.
     ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment for the key.
-    /// * `timer_type` - The timer type (Application or `DeferredMessage`).
-    /// * `key` - Trigger's key.
-    /// * `time` - Trigger's scheduled time.
-    ///
     /// # Errors
     ///
     /// Never returns an error.
     async fn delete_key_trigger(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
-        let partition_key = (*segment_id, key.clone());
+        let segment_id = self.segment.id;
+        let partition_key = (segment_id, key.clone());
         let clustering_key = (timer_type, time);
 
         let Some(mut entry) = self.inner.key_triggers.get_async(&partition_key).await else {
@@ -580,25 +473,18 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(())
     }
 
-    /// Remove all triggers for a key and timer type across both indices.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment` - Segment ID.
-    /// * `timer_type` - The timer type to clear (Application or
-    ///   `DeferredMessage`).
-    /// * `key` - Entity key.
+    /// Remove all triggers for a key and timer type from the key index.
     ///
     /// # Errors
     ///
     /// Never returns an error.
     async fn clear_key_triggers(
         &self,
-        segment: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> Result<(), Self::Error> {
-        let partition_key = (*segment, key.clone());
+        let segment_id = self.segment.id;
+        let partition_key = (segment_id, key.clone());
         let Some(mut entry) = self.inner.key_triggers.get_async(&partition_key).await else {
             return Ok(());
         };
@@ -620,20 +506,12 @@ impl TriggerOperations for InMemoryTriggerStore {
     ///
     /// For in-memory store, this simply clears and inserts.
     ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment ID.
-    /// * `trigger` - The new trigger to schedule.
-    ///
     /// # Errors
     ///
     /// Never returns an error.
-    async fn clear_and_schedule_key(
-        &self,
-        segment_id: &SegmentId,
-        trigger: Trigger,
-    ) -> Result<(), Self::Error> {
-        let partition_key = (*segment_id, trigger.key.clone());
+    async fn clear_and_schedule_key(&self, trigger: Trigger) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let partition_key = (segment_id, trigger.key.clone());
         let clustering_key = (trigger.timer_type, trigger.time);
 
         // Get or create the partition entry
@@ -657,24 +535,12 @@ impl TriggerOperations for InMemoryTriggerStore {
 
     /// Remove all triggers for a key across ALL timer types from the key index.
     ///
-    /// This is a low-level primitive that clears the entire partition
-    /// `(segment_id, key)` which contains all `(timer_type, time)` clustering
-    /// keys.
-    ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment ID.
-    /// * `key` - Entity key.
-    ///
     /// # Errors
     ///
     /// Never returns an error.
-    async fn clear_key_triggers_all_types(
-        &self,
-        segment_id: &SegmentId,
-        key: &Key,
-    ) -> Result<(), Self::Error> {
-        let partition_key = (*segment_id, key.clone());
+    async fn clear_key_triggers_all_types(&self, key: &Key) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let partition_key = (segment_id, key.clone());
         self.inner.key_triggers.remove_async(&partition_key).await;
         Ok(())
     }
@@ -683,28 +549,22 @@ impl TriggerOperations for InMemoryTriggerStore {
 
     /// Update segment metadata including version and slab size.
     ///
-    /// # Arguments
-    ///
-    /// * `segment_id` - Segment to update.
-    /// * `new_version` - New schema version (1 or 2).
-    /// * `new_slab_size` - New slab size for the segment.
-    ///
     /// # Errors
     ///
     /// Never returns an error.
     async fn update_segment_version(
         &self,
-        segment_id: &SegmentId,
         new_version: SegmentVersion,
         new_slab_size: CompactDuration,
     ) -> Result<(), Self::Error> {
-        if let Some(entry) = self.inner.segments.get_async(segment_id).await {
+        let segment_id = self.segment.id;
+        if let Some(entry) = self.inner.segments.get_async(&segment_id).await {
             let (name, ..) = entry.get();
             let name = name.clone();
             drop(entry);
             self.inner
                 .segments
-                .upsert_async(*segment_id, (name, new_slab_size, new_version))
+                .upsert_async(segment_id, (name, new_slab_size, new_version))
                 .await;
         }
         Ok(())

@@ -662,7 +662,7 @@ where
         .collect();
 
     let actual: Vec<CompactDateTime> = store
-        .get_key_times(segment_id, timer_type, key)
+        .get_key_times(timer_type, key)
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -698,7 +698,7 @@ where
         .collect();
 
     let actual: Vec<Trigger> = store
-        .get_key_triggers(segment_id, timer_type, key)
+        .get_key_triggers(timer_type, key)
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetKeyTriggers failed: {e:?}"))?;
@@ -736,7 +736,7 @@ where
         .collect();
 
     let actual: Vec<SlabId> = store
-        .get_slab_range(segment_id, range.clone())
+        .get_slab_range(range.clone())
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetSlabRange failed: {e:?}"))?;
@@ -763,57 +763,45 @@ where
 {
     for (op_idx, op) in operations.iter().enumerate() {
         match op {
-            HighLevelOperation::AddTrigger {
-                segment,
-                slab,
-                trigger,
-            } => {
+            HighLevelOperation::AddTrigger { slab, trigger, .. } => {
                 model.apply(op);
                 store
-                    .add_trigger(segment, slab.clone(), trigger.clone())
+                    .add_trigger(slab.clone(), trigger.clone())
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger failed: {e:?}")
                     })?;
             }
             HighLevelOperation::RemoveTrigger {
-                segment,
                 slab,
                 key,
                 time,
                 timer_type,
+                ..
             } => {
                 model.apply(op);
                 store
-                    .remove_trigger(segment, slab, key, *time, *timer_type)
+                    .remove_trigger(slab, key, *time, *timer_type)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} RemoveTrigger failed: {e:?}")
                     })?;
             }
-            HighLevelOperation::DeleteSlab {
-                segment_id,
-                slab_id,
-            } => {
+            HighLevelOperation::DeleteSlab { slab_id, .. } => {
                 model.apply(op);
-                store.delete_slab(segment_id, *slab_id).await.map_err(|e| {
+                store.delete_slab(*slab_id).await.map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} DeleteSlab failed: {e:?}")
                 })?;
             }
             HighLevelOperation::ClearAndSchedule {
-                segment,
                 new_slab,
                 new_trigger,
                 old_slabs,
+                ..
             } => {
                 model.apply(op);
                 store
-                    .clear_and_schedule(
-                        segment,
-                        new_slab.clone(),
-                        new_trigger.clone(),
-                        old_slabs.clone(),
-                    )
+                    .clear_and_schedule(new_slab.clone(), new_trigger.clone(), old_slabs.clone())
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Op #{op_idx} ClearAndSchedule failed: {e:?}")
@@ -865,18 +853,16 @@ where
             let slab = Slab::from_time(*segment_id, segment.slab_size, *time);
             // Ignore errors during cleanup - triggers may have been removed by test
             // operations
-            let _ = store
-                .remove_trigger(segment, &slab, key, *time, *timer_type)
-                .await;
+            let _ = store.remove_trigger(&slab, key, *time, *timer_type).await;
         }
     }
 
     // Delete all slabs that were created
     let mut deleted_slabs = HashSet::new();
-    for (segment_id, slab_id, _timer_type) in model.slab_index.keys() {
-        if deleted_slabs.insert((*segment_id, *slab_id)) {
+    for (_segment_id, slab_id, _timer_type) in model.slab_index.keys() {
+        if deleted_slabs.insert(*slab_id) {
             // Ignore errors - slabs may have been deleted by test operations
-            let _ = store.delete_slab(segment_id, *slab_id).await;
+            let _ = store.delete_slab(*slab_id).await;
         }
     }
 
@@ -938,7 +924,7 @@ where
     let mut key_triggers = HashSet::new();
     for (segment_id, key, timer_type) in model.key_index.keys() {
         let triggers: Vec<Trigger> = store
-            .get_key_triggers(segment_id, *timer_type, key)
+            .get_key_triggers(*timer_type, key)
             .try_collect()
             .await
             .map_err(|e| {
@@ -1003,9 +989,9 @@ where
     S::Error: Debug,
 {
     // Insert all segments first
-    for segment in &input.segments {
+    for _segment in &input.segments {
         store
-            .insert_segment(segment.clone())
+            .insert_segment()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to insert segment: {e:?}"))?;
     }

@@ -223,29 +223,35 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
     // ===================================================================
+    // Segment Accessors
+    // ===================================================================
+
+    /// Returns the segment this store is scoped to.
+    fn segment(&self) -> Segment;
+
+    /// Returns the segment ID this store is scoped to.
+    fn segment_id(&self) -> SegmentId;
+
+    /// Returns the slab size for this store's segment.
+    fn slab_size(&self) -> CompactDuration;
+
+    // ===================================================================
     // Segment Operations (2 methods) - Used by Loader
     // ===================================================================
 
-    /// Retrieves segment metadata by ID.
-    fn get_segment(
-        &self,
-        segment_id: &SegmentId,
-    ) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
+    /// Retrieves this store's segment metadata from persistent storage.
+    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
 
-    /// Creates a new segment with metadata.
-    fn insert_segment(
-        &self,
-        segment: Segment,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// Persists this store's segment metadata.
+    fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
     // Slab Query Operations (2 methods) - Used by Loader
     // ===================================================================
 
-    /// Streams slab IDs within a time range for a segment.
+    /// Streams slab IDs within a time range for this store's segment.
     fn get_slab_range(
         &self,
-        segment_id: &SegmentId,
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
 
@@ -260,11 +266,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     // ===================================================================
 
     /// Deletes slab metadata (does not delete triggers).
-    fn delete_slab(
-        &self,
-        segment_id: &SegmentId,
-        slab_id: SlabId,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
     // Key Query Operations (2 methods) - Used by TimerManager
@@ -276,7 +278,6 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// More efficient than `get_key_triggers` when span data not needed.
     fn get_key_times(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
@@ -286,7 +287,6 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Includes all metadata (key, time, `timer_type`, span).
     fn get_key_triggers(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
@@ -301,7 +301,6 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Transactional backends can provide ACID guarantees.
     fn add_trigger(
         &self,
-        segment: &Segment,
         slab: Slab,
         trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -309,7 +308,6 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Removes a trigger from both slab and key tables.
     fn remove_trigger(
         &self,
-        segment: &Segment,
         slab: &Slab,
         key: &Key,
         time: CompactDateTime,
@@ -334,13 +332,11 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// # Parameters
     ///
-    /// * `segment` - The segment containing this timer
     /// * `new_slab` - The slab for the new timer
     /// * `new_trigger` - The new timer to schedule
     /// * `old_slabs` - Slabs containing old timers to remove from slab index
     fn clear_and_schedule(
         &self,
-        segment: &Segment,
         new_slab: Slab,
         new_trigger: Trigger,
         old_slabs: Vec<Slab>,

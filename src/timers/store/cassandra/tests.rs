@@ -71,7 +71,7 @@ async fn setup_test_store_with_version(
     let store =
         CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
             .await?;
-    store.insert_segment(segment).await?;
+    store.insert_segment().await?;
     Ok((store, segment_id))
 }
 
@@ -124,7 +124,7 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
             .await?;
 
     // Insert the test segment
-    store.insert_segment(segment.clone()).await?;
+    store.insert_segment().await?;
 
     // Test SlabId values that will cause wrap-around issues
     let boundary = 2_147_483_648u32; // 2^31, becomes negative in i32
@@ -140,13 +140,13 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
     // Insert test slabs
     for &slab_id in &test_slab_ids {
         let slab = Slab::new(segment_id, slab_id, segment.slab_size);
-        store.insert_slab(&segment_id, slab).await?;
+        store.insert_slab(slab).await?;
     }
 
     // Test Case 1: Range that crosses the wrap-around boundary
     let cross_boundary_range = RangeInclusive::new(boundary - 1, boundary + 1);
     let result: HashSet<SlabId> = store
-        .get_slab_range(&segment_id, cross_boundary_range)
+        .get_slab_range(cross_boundary_range)
         .try_collect()
         .await?;
 
@@ -157,10 +157,7 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
 
     // Test Case 2: Range entirely in "negative" i32 space (high u32 values)
     let high_range = RangeInclusive::new(boundary, SlabId::MAX);
-    let result: HashSet<SlabId> = store
-        .get_slab_range(&segment_id, high_range)
-        .try_collect()
-        .await?;
+    let result: HashSet<SlabId> = store.get_slab_range(high_range).try_collect().await?;
 
     let expected: HashSet<SlabId> = vec![boundary, boundary + 1, SlabId::MAX - 1, SlabId::MAX]
         .into_iter()
@@ -169,10 +166,7 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
 
     // Test Case 3: Range entirely in "positive" i32 space (low u32 values)
     let low_range = RangeInclusive::new(boundary - 2, boundary - 1);
-    let result: HashSet<SlabId> = store
-        .get_slab_range(&segment_id, low_range)
-        .try_collect()
-        .await?;
+    let result: HashSet<SlabId> = store.get_slab_range(low_range).try_collect().await?;
 
     let expected: HashSet<SlabId> = vec![boundary - 2, boundary - 1].into_iter().collect();
     assert_eq!(result, expected, "Low range (positive i32) failed");
@@ -180,7 +174,7 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
     // Test Case 4: Single element at boundary
     let single_boundary_range = RangeInclusive::new(boundary, boundary);
     let result: Vec<SlabId> = store
-        .get_slab_range(&segment_id, single_boundary_range)
+        .get_slab_range(single_boundary_range)
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -190,16 +184,13 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
 
     // Test Case 5: Invalid range (start > end in u32 space)
     let invalid_range = RangeInclusive::new(SlabId::MAX - 1, boundary - 2);
-    let result: HashSet<SlabId> = store
-        .get_slab_range(&segment_id, invalid_range)
-        .try_collect()
-        .await?;
+    let result: HashSet<SlabId> = store.get_slab_range(invalid_range).try_collect().await?;
 
     let expected: HashSet<SlabId> = HashSet::new();
     assert_eq!(result, expected, "Invalid range should return empty set");
 
     // Cleanup
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
 
     Ok(())
 }
@@ -222,7 +213,7 @@ async fn test_simple_wrap_around() -> Result<()> {
         CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
             .await?;
 
-    store.insert_segment(segment.clone()).await?;
+    store.insert_segment().await?;
 
     // The critical boundary: 2^31 = 2,147,483,648
     // Values below this are positive i32, values at/above are negative i32
@@ -232,14 +223,14 @@ async fn test_simple_wrap_around() -> Result<()> {
     // Insert test slabs
     for &slab_id in &test_ids {
         let slab = Slab::new(segment_id, slab_id, segment.slab_size);
-        store.insert_slab(&segment_id, slab).await?;
+        store.insert_slab(slab).await?;
     }
 
     // Test the critical range that crosses the wrap-around boundary
     let wrap_range = RangeInclusive::new(boundary - 1, boundary + 1);
     let mut results = Vec::new();
 
-    let stream = store.get_slab_range(&segment_id, wrap_range);
+    let stream = store.get_slab_range(wrap_range);
     pin_mut!(stream);
     while let Some(result) = stream.next().await {
         results.push(result?);
@@ -253,7 +244,7 @@ async fn test_simple_wrap_around() -> Result<()> {
     assert_eq!(results, expected, "Wrap-around range query failed");
 
     // Cleanup
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
 
     Ok(())
 }
@@ -261,14 +252,11 @@ async fn test_simple_wrap_around() -> Result<()> {
 /// Collects sorted times from `get_key_times`.
 async fn collect_key_times(
     store: &CassandraTriggerStore,
-    segment_id: &SegmentId,
     timer_type: TimerType,
     key: &Key,
 ) -> Result<Vec<CompactDateTime>> {
-    let mut times: Vec<CompactDateTime> = store
-        .get_key_times(segment_id, timer_type, key)
-        .try_collect()
-        .await?;
+    let mut times: Vec<CompactDateTime> =
+        store.get_key_times(timer_type, key).try_collect().await?;
     times.sort();
     Ok(times)
 }
@@ -276,12 +264,11 @@ async fn collect_key_times(
 /// Collects sorted times from `get_key_triggers`.
 async fn collect_trigger_times(
     store: &CassandraTriggerStore,
-    segment_id: &SegmentId,
     timer_type: TimerType,
     key: &Key,
 ) -> Result<Vec<CompactDateTime>> {
     let mut times: Vec<CompactDateTime> = store
-        .get_key_triggers(segment_id, timer_type, key)
+        .get_key_triggers(timer_type, key)
         .map_ok(|t| t.time)
         .try_collect()
         .await?;
@@ -293,12 +280,11 @@ async fn collect_trigger_times(
 /// `get_key_triggers_all_types`.
 async fn collect_all_types_times(
     store: &CassandraTriggerStore,
-    segment_id: &SegmentId,
     timer_type: TimerType,
     key: &Key,
 ) -> Result<Vec<CompactDateTime>> {
     let mut times: Vec<CompactDateTime> = store
-        .get_key_triggers_all_types(segment_id, key)
+        .get_key_triggers_all_types(key)
         .try_filter_map(|t| async move {
             if t.timer_type == timer_type {
                 Ok(Some(t.time))
@@ -313,27 +299,26 @@ async fn collect_all_types_times(
 }
 
 /// Asserts that all three read paths return the expected sorted times for
-/// a `(segment_id, key, timer_type)`.
+/// a `(key, timer_type)`.
 async fn assert_key_reads(
     store: &CassandraTriggerStore,
-    segment_id: &SegmentId,
     timer_type: TimerType,
     key: &Key,
     expected: &[CompactDateTime],
     phase: &str,
 ) -> Result<()> {
     assert_eq!(
-        collect_key_times(store, segment_id, timer_type, key).await?,
+        collect_key_times(store, timer_type, key).await?,
         expected,
         "{phase}: get_key_times"
     );
     assert_eq!(
-        collect_trigger_times(store, segment_id, timer_type, key).await?,
+        collect_trigger_times(store, timer_type, key).await?,
         expected,
         "{phase}: get_key_triggers"
     );
     assert_eq!(
-        collect_all_types_times(store, segment_id, timer_type, key).await?,
+        collect_all_types_times(store, timer_type, key).await?,
         expected,
         "{phase}: get_key_triggers_all_types"
     );
@@ -405,7 +390,7 @@ async fn assert_state_and_reads(
         }
     }
 
-    assert_key_reads(store, segment_id, timer_type, key, expected_times, phase).await
+    assert_key_reads(store, timer_type, key, expected_times, phase).await
 }
 
 /// Absent → Inline → Overflow → demotion via delete → Absent.
@@ -436,13 +421,13 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
 
     // Absent → Inline via clear_and_schedule_key
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     assert_state_and_reads(&store, &segment_id, tt, &key, &inline_t1, &[t1], "schedule").await?;
 
     // Inline → Overflow via insert_key_trigger (promotion)
     store
-        .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t2, tt))
+        .insert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
         .await?;
     assert_state_and_reads(
         &store,
@@ -456,14 +441,14 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
     .await?;
 
     // Overflow → Inline(t2) via delete_key_trigger (2→1 demotion)
-    store.delete_key_trigger(&segment_id, tt, &key, t1).await?;
+    store.delete_key_trigger(tt, &key, t1).await?;
     assert_state_and_reads(&store, &segment_id, tt, &key, &inline_t2, &[t2], "demote").await?;
 
     // Inline → Absent via delete_key_trigger (1→0)
-    store.delete_key_trigger(&segment_id, tt, &key, t2).await?;
+    store.delete_key_trigger(tt, &key, t2).await?;
     assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "delete last").await?;
 
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
     Ok(())
 }
 
@@ -494,15 +479,15 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
 
     // Overflow → Inline via clear_and_schedule_key
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     store
-        .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t2, tt))
+        .insert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
         .await?;
-    assert_key_reads(&store, &segment_id, tt, &key, &[t1, t2], "overflow setup").await?;
+    assert_key_reads(&store, tt, &key, &[t1, t2], "overflow setup").await?;
 
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t3, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t3, tt))
         .await?;
     assert_state_and_reads(
         &store,
@@ -516,17 +501,17 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
     .await?;
 
     // Inline → Absent via clear_key_triggers
-    store.clear_key_triggers(&segment_id, tt, &key).await?;
+    store.clear_key_triggers(tt, &key).await?;
     assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "clear inline").await?;
 
     // Overflow → Absent via clear_key_triggers
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     store
-        .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t2, tt))
+        .insert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
         .await?;
-    store.clear_key_triggers(&segment_id, tt, &key).await?;
+    store.clear_key_triggers(tt, &key).await?;
     assert_state_and_reads(
         &store,
         &segment_id,
@@ -540,10 +525,10 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
 
     // Inline → Inline via clear_and_schedule_key (no tombstone)
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t2, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t2, tt))
         .await?;
     assert_state_and_reads(
         &store,
@@ -556,7 +541,7 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
     )
     .await?;
 
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
     Ok(())
 }
 
@@ -584,7 +569,7 @@ async fn test_state_transitions_insert_and_delete() -> Result<()> {
     // Post-V3: cold insert with Absent state → set_state_inline directly.
     // State becomes Inline (not clustering-only).
     store
-        .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+        .insert_key_trigger(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     assert_state_and_reads(
         &store,
@@ -598,12 +583,12 @@ async fn test_state_transitions_insert_and_delete() -> Result<()> {
     .await?;
 
     // Inline → Absent via delete_key_trigger (time match)
-    store.delete_key_trigger(&segment_id, tt, &key, t1).await?;
+    store.delete_key_trigger(tt, &key, t1).await?;
     assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "delete inline").await?;
 
     // Absent (cached) → Inline via insert_key_trigger
     store
-        .insert_key_trigger(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+        .insert_key_trigger(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     assert_state_and_reads(
         &store,
@@ -617,7 +602,7 @@ async fn test_state_transitions_insert_and_delete() -> Result<()> {
     .await?;
 
     // Inline → Absent via delete_key_trigger (time match)
-    store.delete_key_trigger(&segment_id, tt, &key, t1).await?;
+    store.delete_key_trigger(tt, &key, t1).await?;
     assert_state_and_reads(
         &store,
         &segment_id,
@@ -629,7 +614,7 @@ async fn test_state_transitions_insert_and_delete() -> Result<()> {
     )
     .await?;
 
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
     Ok(())
 }
 
@@ -670,7 +655,7 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
         matches!(&state, TimerState::Inline(t) if t.time == t1),
         "A post-backfill: expected Inline(t1), got {state:?}"
     );
-    assert_key_reads(&store, &segment_id, tt, &key_a, &[t1], "A backfilled").await?;
+    assert_key_reads(&store, tt, &key_a, &[t1], "A backfilled").await?;
 
     // Scenario B: 2 clustering rows (no state entry) → backfill → Overflow.
     let key_b: Key = format!("pre-mig-b-{}", Uuid::new_v4()).into();
@@ -698,12 +683,12 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
         TimerState::Overflow,
         "B post-backfill: expected Overflow"
     );
-    assert_key_reads(&store, &segment_id, tt, &key_b, &[t1, t2], "B backfilled").await?;
+    assert_key_reads(&store, tt, &key_b, &[t1, t2], "B backfilled").await?;
 
     // Scenario C: already has state (idempotency) → backfill is no-op.
     let key_c: Key = format!("pre-mig-c-{}", Uuid::new_v4()).into();
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_c.clone(), t1, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key_c.clone(), t1, tt))
         .await?;
     // State is already Inline(t1). backfill should not change it.
     store.backfill_key_state(&segment_id, &key_c, tt).await?;
@@ -715,7 +700,7 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
         "C idempotency: expected Inline(t1) unchanged, got {state:?}"
     );
 
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
     Ok(())
 }
 
@@ -735,13 +720,13 @@ async fn test_pre_migration_mutations() -> Result<()> {
     // clustering rows. After clear, Absent state is cached.
     let key_d: Key = format!("pre-mig-d-{}", Uuid::new_v4()).into();
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_d.clone(), t1, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key_d.clone(), t1, tt))
         .await?;
     store
-        .insert_key_trigger(&segment_id, Trigger::for_testing(key_d.clone(), t2, tt))
+        .insert_key_trigger(Trigger::for_testing(key_d.clone(), t2, tt))
         .await?;
-    store.clear_key_triggers(&segment_id, tt, &key_d).await?;
-    assert_key_reads(&store, &segment_id, tt, &key_d, &[], "D cleared").await?;
+    store.clear_key_triggers(tt, &key_d).await?;
+    assert_key_reads(&store, tt, &key_d, &[], "D cleared").await?;
     let (state, _) = store.resolve_state(&segment_id, &key_d, tt).await?;
     assert_eq!(
         state,
@@ -752,38 +737,26 @@ async fn test_pre_migration_mutations() -> Result<()> {
     // Scenario E: delete_key_trigger with Overflow demotion.
     let key_e: Key = format!("pre-mig-e-{}", Uuid::new_v4()).into();
     store
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key_e.clone(), t1, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key_e.clone(), t1, tt))
         .await?;
     store
-        .insert_key_trigger(&segment_id, Trigger::for_testing(key_e.clone(), t2, tt))
+        .insert_key_trigger(Trigger::for_testing(key_e.clone(), t2, tt))
         .await?;
     store
-        .insert_key_trigger(&segment_id, Trigger::for_testing(key_e.clone(), t3, tt))
+        .insert_key_trigger(Trigger::for_testing(key_e.clone(), t3, tt))
         .await?;
-    assert_key_reads(
-        &store,
-        &segment_id,
-        tt,
-        &key_e,
-        &[t1, t2, t3],
-        "E overflow setup",
-    )
-    .await?;
-    store
-        .delete_key_trigger(&segment_id, tt, &key_e, t1)
-        .await?;
-    assert_key_reads(&store, &segment_id, tt, &key_e, &[t2, t3], "E delete one").await?;
-    store
-        .delete_key_trigger(&segment_id, tt, &key_e, t2)
-        .await?;
-    assert_key_reads(&store, &segment_id, tt, &key_e, &[t3], "E demote to inline").await?;
+    assert_key_reads(&store, tt, &key_e, &[t1, t2, t3], "E overflow setup").await?;
+    store.delete_key_trigger(tt, &key_e, t1).await?;
+    assert_key_reads(&store, tt, &key_e, &[t2, t3], "E delete one").await?;
+    store.delete_key_trigger(tt, &key_e, t2).await?;
+    assert_key_reads(&store, tt, &key_e, &[t3], "E demote to inline").await?;
     let (state, _) = store.resolve_state(&segment_id, &key_e, tt).await?;
     assert!(
         matches!(&state, TimerState::Inline(t) if t.time == t3),
         "E: expected Inline(t3) after demotion, got {state:?}"
     );
 
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
     Ok(())
 }
 
@@ -801,37 +774,31 @@ async fn test_clear_all_types_clears_inline_and_overflow() -> Result<()> {
 
     // Set up: Application inline (1 timer), DeferredMessage overflow (2 timers).
     store
-        .clear_and_schedule_key(
-            &segment_id,
-            Trigger::for_testing(key.clone(), t1, TimerType::Application),
-        )
+        .clear_and_schedule_key(Trigger::for_testing(
+            key.clone(),
+            t1,
+            TimerType::Application,
+        ))
         .await?;
     store
-        .clear_and_schedule_key(
-            &segment_id,
-            Trigger::for_testing(key.clone(), t1, TimerType::DeferredMessage),
-        )
+        .clear_and_schedule_key(Trigger::for_testing(
+            key.clone(),
+            t1,
+            TimerType::DeferredMessage,
+        ))
         .await?;
     store
-        .insert_key_trigger(
-            &segment_id,
-            Trigger::for_testing(key.clone(), t2, TimerType::DeferredMessage),
-        )
+        .insert_key_trigger(Trigger::for_testing(
+            key.clone(),
+            t2,
+            TimerType::DeferredMessage,
+        ))
         .await?;
 
     // Verify setup.
+    assert_key_reads(&store, TimerType::Application, &key, &[t1], "setup app").await?;
     assert_key_reads(
         &store,
-        &segment_id,
-        TimerType::Application,
-        &key,
-        &[t1],
-        "setup app",
-    )
-    .await?;
-    assert_key_reads(
-        &store,
-        &segment_id,
         TimerType::DeferredMessage,
         &key,
         &[t1, t2],
@@ -840,26 +807,16 @@ async fn test_clear_all_types_clears_inline_and_overflow() -> Result<()> {
     .await?;
 
     // Clear all types.
-    store
-        .clear_key_triggers_all_types(&segment_id, &key)
-        .await?;
+    store.clear_key_triggers_all_types(&key).await?;
 
     // Verify all types are Absent with no data.
     for &variant in TimerType::VARIANTS {
         let (state, _) = store.resolve_state(&segment_id, &key, variant).await?;
         assert_eq!(state, TimerState::Absent, "{variant:?} should be Absent");
-        assert_key_reads(
-            &store,
-            &segment_id,
-            variant,
-            &key,
-            &[],
-            &format!("{variant:?}"),
-        )
-        .await?;
+        assert_key_reads(&store, variant, &key, &[], &format!("{variant:?}")).await?;
     }
 
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
     Ok(())
 }
 
@@ -890,7 +847,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
 
     // Phase 2: clear_and_schedule_key(t1) → Inline(t1)
     let trigger1 = Trigger::for_testing(key.clone(), t1, TimerType::Application);
-    store.clear_and_schedule_key(&segment_id, trigger1).await?;
+    store.clear_and_schedule_key(trigger1).await?;
 
     let (state, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
@@ -903,7 +860,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
     // Phase 3: clear_and_schedule_key(t2) → Inline(t2) (Inline→Inline, no
     // tombstone)
     let trigger2 = Trigger::for_testing(key.clone(), t2, TimerType::Application);
-    store.clear_and_schedule_key(&segment_id, trigger2).await?;
+    store.clear_and_schedule_key(trigger2).await?;
 
     let (state, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
@@ -916,7 +873,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
     // Phase 4: insert_key_trigger(t3) promotes inline to clustering → state
     // becomes Overflow
     let trigger3 = Trigger::for_testing(key.clone(), t3, TimerType::Application);
-    store.insert_key_trigger(&segment_id, trigger3).await?;
+    store.insert_key_trigger(trigger3).await?;
 
     let (state, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
@@ -930,7 +887,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
     // Phase 5: clear_and_schedule_key(t4) on an overflow key → back to
     // Inline(t4)
     let trigger4 = Trigger::for_testing(key.clone(), t4, TimerType::Application);
-    store.clear_and_schedule_key(&segment_id, trigger4).await?;
+    store.clear_and_schedule_key(trigger4).await?;
 
     let (state, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
@@ -942,7 +899,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
 
     // Phase 6: Verify get_key_times returns exactly [t4].
     let times: Vec<CompactDateTime> = store
-        .get_key_times(&segment_id, TimerType::Application, &key)
+        .get_key_times(TimerType::Application, &key)
         .try_collect()
         .await?;
     assert_eq!(
@@ -962,9 +919,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
     );
 
     // Phase 8: Cleanup — clear_key_triggers_all_types resets everything.
-    store
-        .clear_key_triggers_all_types(&segment_id, &key)
-        .await?;
+    store.clear_key_triggers_all_types(&key).await?;
 
     let (state, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
@@ -975,7 +930,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
         "phase 8: expected Absent after cleanup"
     );
 
-    store.delete_segment(&segment_id).await?;
+    store.delete_segment().await?;
 
     Ok(())
 }
@@ -1032,46 +987,40 @@ fn test_prop_timer_state_invariant() {
         .quickcheck(prop as fn(KeyTriggerTestInput) -> TestResult);
 }
 
-/// Verifies that `CassandraTriggerStoreProvider` creates stores with
-/// independent caches but a shared Cassandra session.
+/// Verifies that two `CassandraTriggerStore` instances sharing a session have
+/// independent caches.
 ///
-/// 1. Create provider, call `create_store` twice.
-/// 2. Write via store A → store A cache is warm.
-/// 3. Store B cache is cold (no entry for same key).
-/// 4. Store B can still read the data via DB (shared session).
+/// Both stores are scoped to the same segment so that store B can observe
+/// data written by store A through the shared Cassandra session.
+///
+/// 1. Build store A (insert segment, write a trigger) → cache is warm.
+/// 2. Build store B with the same segment but a fresh cache → cache is cold.
+/// 3. Store B reads the same key via the shared session → returns t1.
+/// 4. After the read, store B's cache is now warm.
 #[tokio::test]
 async fn test_provider_creates_independent_stores() -> Result<()> {
-    use crate::timers::store::TriggerStoreProvider;
-    use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
-
     init_test_logging();
 
     let slab_size = CompactDuration::new(60);
-    let config = test_cassandra_config("prosody_test");
-    let provider = CassandraTriggerStoreProvider::with_store(
-        CassandraStore::new(&config).await?,
-        &config.keyspace,
-        slab_size,
-    )
-    .await?;
-
-    // Create two independent stores from the same provider.
-    let store_a = provider.create_store("test-topic".into(), 0, "test-group");
-    let store_b = provider.create_store("test-topic".into(), 1, "test-group");
-
-    // Access inner CassandraTriggerStore for direct TriggerOperations use.
-    let ops_a = store_a.operations();
-    let ops_b = store_b.operations();
-
-    // Set up a shared segment (both stores share the session, so both see it).
-    let segment_id = SegmentId::from(Uuid::new_v4());
     let segment = Segment {
-        id: segment_id,
+        id: SegmentId::from(Uuid::new_v4()),
         name: "provider_independent".to_owned(),
         slab_size,
-        version: SegmentVersion::V2,
+        version: SegmentVersion::V3,
     };
-    ops_a.insert_segment(segment).await?;
+    let config = test_cassandra_config("prosody_test");
+
+    // Build store A with the chosen segment.
+    let base_a = CassandraStore::new(&config).await?;
+    let ops_a =
+        CassandraTriggerStore::with_store(base_a, &config.keyspace, segment.clone()).await?;
+    ops_a.insert_segment().await?;
+
+    // Build store B with the same segment but a fresh (cold) cache, sharing
+    // the same prepared queries.
+    let base_b = CassandraStore::new(&config).await?;
+    let ops_b =
+        CassandraTriggerStore::with_store(base_b, &config.keyspace, segment.clone()).await?;
 
     let key: Key = format!("provider-test-{}", Uuid::new_v4()).into();
     let tt = TimerType::Application;
@@ -1079,7 +1028,7 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
 
     // Write via store A: clear_and_schedule_key populates store A's cache.
     ops_a
-        .clear_and_schedule_key(&segment_id, Trigger::for_testing(key.clone(), t1, tt))
+        .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
 
     // Store A cache is warm: Inline(t1).
@@ -1097,11 +1046,8 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
         "store B cache should be cold (None), got {cached_b:?}"
     );
 
-    // Store B can still read the data (proves shared session).
-    let times: Vec<CompactDateTime> = ops_b
-        .get_key_times(&segment_id, tt, &key)
-        .try_collect()
-        .await?;
+    // Store B can still read the data via shared keyspace (same segment ID).
+    let times: Vec<CompactDateTime> = ops_b.get_key_times(tt, &key).try_collect().await?;
     assert_eq!(times, vec![t1], "store B should read t1 via shared session");
 
     // After the read, store B's cache should now be warm (Inline cached from DB).
@@ -1112,7 +1058,7 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     );
 
     // Cleanup.
-    ops_a.delete_segment(&segment_id).await?;
+    ops_a.delete_segment().await?;
 
     Ok(())
 }
@@ -1128,10 +1074,10 @@ async fn prop_timer_state_invariant(
     let key_pool = ["key-a", "key-b", "key-c"];
 
     // Clean up before test
-    for segment_id in &input.segment_ids {
+    for _segment_id in &input.segment_ids {
         for key_str in &key_pool {
             let key = Key::from(*key_str);
-            store.clear_key_triggers_all_types(segment_id, &key).await?;
+            store.clear_key_triggers_all_types(&key).await?;
         }
     }
 
@@ -1140,43 +1086,27 @@ async fn prop_timer_state_invariant(
     for op in &input.operations {
         model.apply(op);
         match op {
-            KeyTriggerOperation::Insert {
-                segment_id,
-                trigger,
-            } => {
-                store
-                    .insert_key_trigger(segment_id, trigger.clone())
-                    .await?;
+            KeyTriggerOperation::Insert { trigger, .. } => {
+                store.insert_key_trigger(trigger.clone()).await?;
             }
             KeyTriggerOperation::Delete {
-                segment_id,
                 timer_type,
                 key,
                 time,
+                ..
             } => {
-                store
-                    .delete_key_trigger(segment_id, *timer_type, key, *time)
-                    .await?;
+                store.delete_key_trigger(*timer_type, key, *time).await?;
             }
             KeyTriggerOperation::ClearByType {
-                segment_id,
-                timer_type,
-                key,
+                timer_type, key, ..
             } => {
-                store
-                    .clear_key_triggers(segment_id, *timer_type, key)
-                    .await?;
+                store.clear_key_triggers(*timer_type, key).await?;
             }
-            KeyTriggerOperation::ClearAllTypes { segment_id, key } => {
-                store.clear_key_triggers_all_types(segment_id, key).await?;
+            KeyTriggerOperation::ClearAllTypes { key, .. } => {
+                store.clear_key_triggers_all_types(key).await?;
             }
-            KeyTriggerOperation::ClearAndSchedule {
-                segment_id,
-                trigger,
-            } => {
-                store
-                    .clear_and_schedule_key(segment_id, trigger.clone())
-                    .await?;
+            KeyTriggerOperation::ClearAndSchedule { trigger, .. } => {
+                store.clear_and_schedule_key(trigger.clone()).await?;
             }
             KeyTriggerOperation::GetTimes { .. }
             | KeyTriggerOperation::GetTriggers { .. }

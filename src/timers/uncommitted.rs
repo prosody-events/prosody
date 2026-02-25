@@ -437,18 +437,10 @@ mod tests {
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
     )> {
         let store = memory_store(test_segment());
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(300);
 
-        TimerManager::new(
-            segment_id,
-            slab_size,
-            "test-manager",
-            store,
-            HeartbeatRegistry::test(),
-        )
-        .await
-        .map_err(|e| eyre!("Failed to create timer manager: {}", e))
+        TimerManager::new("test-manager", store, HeartbeatRegistry::test())
+            .await
+            .map_err(|e| eyre!("Failed to create timer manager: {}", e))
     }
 
     /// Helper function to create a test trigger

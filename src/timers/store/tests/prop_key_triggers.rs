@@ -343,7 +343,7 @@ where
 {
     let model_times = model.get_times(segment_id, timer_type, key);
     let store_times: Vec<CompactDateTime> = operations
-        .get_key_times(segment_id, timer_type, key)
+        .get_key_times(timer_type, key)
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Get key times failed: {e:?}"))?;
@@ -387,7 +387,7 @@ where
 {
     let model_triggers = model.get_triggers(segment_id, timer_type, key);
     let store_triggers: Vec<Trigger> = operations
-        .get_key_triggers(segment_id, timer_type, key)
+        .get_key_triggers(timer_type, key)
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Get key triggers failed: {e:?}"))?;
@@ -423,7 +423,7 @@ where
 
     // Verify times match trigger times
     let store_times: Vec<CompactDateTime> = operations
-        .get_key_times(segment_id, timer_type, key)
+        .get_key_times(timer_type, key)
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Get key times failed: {e:?}"))?;
@@ -457,7 +457,7 @@ where
 {
     let model_all = model.get_all_types(segment_id, key);
     let store_all: Vec<Trigger> = operations
-        .get_key_triggers_all_types(segment_id, key)
+        .get_key_triggers_all_types(key)
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Get key triggers all types failed: {e:?}"))?;
@@ -506,13 +506,10 @@ where
     T::Error: Error + Send + Sync + 'static,
 {
     match op {
-        KeyTriggerOperation::Insert {
-            segment_id,
-            trigger,
-        } => {
+        KeyTriggerOperation::Insert { trigger, .. } => {
             model.apply(op);
             operations
-                .insert_key_trigger(segment_id, trigger.clone())
+                .insert_key_trigger(trigger.clone())
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} Insert trigger failed: {e:?}")
@@ -542,48 +539,43 @@ where
                 .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetAllTypes: {e}"))?;
         }
         KeyTriggerOperation::Delete {
-            segment_id,
             timer_type,
             key,
             time,
+            ..
         } => {
             model.apply(op);
             operations
-                .delete_key_trigger(segment_id, *timer_type, key, *time)
+                .delete_key_trigger(*timer_type, key, *time)
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} Delete trigger failed: {e:?}")
                 })?;
         }
         KeyTriggerOperation::ClearByType {
-            segment_id,
-            timer_type,
-            key,
+            timer_type, key, ..
         } => {
             model.apply(op);
             operations
-                .clear_key_triggers(segment_id, *timer_type, key)
+                .clear_key_triggers(*timer_type, key)
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} Clear triggers by type failed: {e:?}")
                 })?;
         }
-        KeyTriggerOperation::ClearAllTypes { segment_id, key } => {
+        KeyTriggerOperation::ClearAllTypes { key, .. } => {
             model.apply(op);
             operations
-                .clear_key_triggers_all_types(segment_id, key)
+                .clear_key_triggers_all_types(key)
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} Clear all triggers for key failed: {e:?}")
                 })?;
         }
-        KeyTriggerOperation::ClearAndSchedule {
-            segment_id,
-            trigger,
-        } => {
+        KeyTriggerOperation::ClearAndSchedule { trigger, .. } => {
             model.apply(op);
             operations
-                .clear_and_schedule_key(segment_id, trigger.clone())
+                .clear_and_schedule_key(trigger.clone())
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} ClearAndSchedule key failed: {e:?}")
@@ -629,11 +621,11 @@ where
     // rerun
     let key_pool = ["key-a", "key-b", "key-c"]; // Match the pool in Arbitrary
 
-    for segment_id in &input.segment_ids {
+    for _segment_id in &input.segment_ids {
         for key_str in &key_pool {
             let key = Key::from(*key_str);
             operations
-                .clear_key_triggers_all_types(segment_id, &key)
+                .clear_key_triggers_all_types(&key)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Failed to clear key triggers: {e:?}"))?;
         }
