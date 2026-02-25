@@ -452,7 +452,6 @@ async fn handle_messages<T, S>(
             combined_stream,
             heartbeats.register("event processor"),
             shutdown_rx.clone(),
-            config.max_uncommitted,
             config.shutdown_timeout,
         )
         .await;

@@ -128,7 +128,6 @@ where
     /// * `messages` - A stream of incoming messages to process
     /// * `heartbeat` - A heartbeat used to detect stalled processing
     /// * `shutdown_rx` - A receiver for shutdown signals
-    /// * `max_execution_count` - Maximum number of concurrent tasks allowed
     /// * `shutdown_timeout` - How long to wait for in-flight tasks during
     ///   shutdown
     pub async fn process_messages<S>(
@@ -136,7 +135,6 @@ where
         messages: S,
         heartbeat: Heartbeat,
         mut shutdown_rx: watch::Receiver<bool>,
-        max_execution_count: usize,
         shutdown_timeout: Duration,
     ) where
         S: Stream<Item = M>,
@@ -145,8 +143,6 @@ where
         F: FnMut(M) -> Fut,
         Fut: Future,
     {
-        debug_assert!(max_execution_count > 0, "max_concurrency cannot be zero");
-
         pin_mut!(messages);
         let shutdown_rx = &mut shutdown_rx;
 
@@ -154,57 +150,27 @@ where
         loop {
             heartbeat.beat();
 
-            let execution_count = self.executing.len();
-            if execution_count < max_execution_count {
-                // Capacity available - can process new messages
-                debug!(
-                    %execution_count, %max_execution_count,
-                    "waiting for new message or existing execution to complete"
-                );
-                select! {
-                    // Process the next available message from the executing queue
-                    Some(hash_value) = self.executing.next() => {
-                        self.handle_completion(shutdown_rx, hash_value);
-                    }
-
-                    // Ensure heartbeat is recorded even if nothing happens
-                    () = heartbeat.next() => {}
-
-                    // Check for shutdown signal
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-
-                    // Fetch and process the next message from the input stream
-                    maybe_message = messages.next() => match maybe_message {
-                        None => break, // Stream ended
-                        Some(message) => self.dispatch_message(shutdown_rx, message).await,
-                    },
+            select! {
+                // Process the next available message from the executing queue
+                Some(hash_value) = self.executing.next() => {
+                    self.handle_completion(shutdown_rx, hash_value);
                 }
-            } else {
-                // At capacity - can only process completions
-                debug!(
-                    %execution_count, %max_execution_count,
-                    "limit reached; waiting for existing executions to complete"
-                );
-                select! {
-                    // Wait for a task to complete
-                    Some(hash_value) = self.executing.next() => {
-                        self.handle_completion(shutdown_rx, hash_value);
-                    }
 
-                    // Ensure heartbeat is recorded
-                    () = heartbeat.next() => {}
+                // Ensure heartbeat is recorded even if nothing happens
+                () = heartbeat.next() => {}
 
-                    // Check for shutdown signal
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
+                // Check for shutdown signal
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
                     }
                 }
+
+                // Fetch and process the next message from the input stream
+                maybe_message = messages.next() => match maybe_message {
+                    None => break, // Stream ended
+                    Some(message) => self.dispatch_message(shutdown_rx, message).await,
+                },
             }
         }
 

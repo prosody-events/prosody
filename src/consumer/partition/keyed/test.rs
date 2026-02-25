@@ -108,7 +108,6 @@ async fn prevents_concurrent_key_execution_impl(
             iter(messages),
             Heartbeat::new("test", Duration::from_secs(30)),
             shutdown_rx,
-            64,
             Duration::from_millis(100),
         )
         .await;
@@ -153,7 +152,6 @@ async fn processes_messages_in_order_impl(
         iter(messages.clone()),
         Heartbeat::new("test", Duration::from_secs(30)),
         shutdown_rx,
-        64,
         Duration::from_millis(100),
     )
     .await;

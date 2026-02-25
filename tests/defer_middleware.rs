@@ -244,8 +244,6 @@ impl DeferTestEnvironment {
             .probe_port(None) // Disable probe server to allow parallel test execution
             .build()?;
 
-        let scheduler_config = SchedulerConfiguration::builder().build()?;
-
         // Use unique keyspace per test to avoid interference
         let keyspace = format!("test_defer_{}", Uuid::new_v4().simple());
         let cassandra_config = CassandraConfiguration::builder()
@@ -263,6 +261,7 @@ impl DeferTestEnvironment {
             segment_store,
         );
 
+        let scheduler_config = SchedulerConfiguration::builder().build()?;
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
         let failure_tracker = FailureTracker::new(
@@ -335,8 +334,6 @@ impl DeferTestEnvironment {
             .probe_port(None) // Disable probe server to allow parallel test execution
             .build()?;
 
-        let scheduler_config = SchedulerConfiguration::builder().build()?;
-
         // Use unique keyspace per test
         let keyspace = format!("test_defer_{}", Uuid::new_v4().simple());
         let cassandra_config = CassandraConfiguration::builder()
@@ -354,6 +351,7 @@ impl DeferTestEnvironment {
             segment_store,
         );
 
+        let scheduler_config = SchedulerConfiguration::builder().build()?;
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
         let failure_tracker = FailureTracker::new(
