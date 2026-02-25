@@ -706,7 +706,7 @@ async fn verify_key_state_invariant(
     for ((key, timer_type), count) in &counts {
         let state = store
             .operations()
-            .get_timer_state(&model.segment.id, key, *timer_type)
+            .fetch_state(&model.segment.id, key, *timer_type)
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to get timer state: {e:?}"))?;
 
