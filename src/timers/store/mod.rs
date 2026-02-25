@@ -19,12 +19,12 @@
 //! suitable for testing and development. Production storage backends can
 //! implement the same trait to provide durability.
 
+use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{TimerType, Trigger};
-use crate::{Key, Partition, Topic};
 use educe::Educe;
 use futures::Stream;
 use std::cmp::Ordering;
@@ -179,20 +179,16 @@ pub struct Segment {
     pub version: SegmentVersion,
 }
 
-/// Factory for partition-specific [`TriggerStore`] instances.
+/// Factory for segment-scoped [`TriggerStore`] instances.
 ///
 /// Holds shared resources (Cassandra session, prepared statements) and creates
-/// per-partition stores with independent caches. Store creation is synchronous.
-///
-/// Follows the same pattern as `TimerDeferStoreProvider` and
-/// `MessageDeferStoreProvider`.
+/// per-segment stores with independent caches. Store creation is synchronous.
 pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
     /// The store type created by this provider.
     type Store: TriggerStore;
 
-    /// Creates a store for the specified partition (synchronous, no I/O).
-    fn create_store(&self, topic: Topic, partition: Partition, consumer_group: &str)
-    -> Self::Store;
+    /// Creates a store scoped to the specified segment (synchronous, no I/O).
+    fn create_store(&self, segment: Segment) -> Self::Store;
 }
 
 /// Public trigger storage interface.

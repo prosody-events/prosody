@@ -21,7 +21,7 @@ use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::{TriggerStore, TriggerStoreProvider};
+use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerStoreProvider};
 use crate::timers::{PendingTimer, TimerManager};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use ahash::RandomState;
@@ -379,20 +379,16 @@ async fn handle_messages<T, P>(
         "{}:{}/{}",
         config.group_id, partition_info.topic, partition_info.partition
     );
-    // Segment identity derived deterministically from the partition name.
-    // Used in Phase 3 when TriggerStoreProvider::create_store accepts a Segment.
-    let _ = (
-        Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
-        config.timer_slab_size,
-    );
+    let segment = Segment {
+        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
+        name: name.clone(),
+        slab_size: config.timer_slab_size,
+        version: SegmentVersion::V3,
+    };
 
-    // Create a per-partition store via the provider. Each partition gets its own
+    // Create a per-segment store via the provider. Each partition gets its own
     // store instance with an independent cache, sharing the underlying session.
-    let trigger_store = config.trigger_provider.create_store(
-        partition_info.topic,
-        partition_info.partition,
-        &config.group_id,
-    );
+    let trigger_store = config.trigger_provider.create_store(segment);
 
     let (timer_stream, timer_manager) = loop {
         if *shutdown_rx.borrow() {

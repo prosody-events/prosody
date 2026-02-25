@@ -1,3 +1,4 @@
+use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -11,7 +12,6 @@ use crate::timers::store::cassandra::queries::Queries;
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{InvalidSegmentVersionError, Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
-use crate::{Key, Partition, Topic};
 use async_stream::try_stream;
 use educe::Educe;
 use futures::{Stream, TryStreamExt, pin_mut};
@@ -34,8 +34,6 @@ use tokio::task::coop::cooperative;
 use tracing::field::Empty;
 use tracing::{Span, debug, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use uuid::Uuid;
-
 mod queries;
 
 #[cfg(test)]
@@ -1720,8 +1718,7 @@ pub async fn cassandra_store(
     Ok(TableAdapter::new(cassandra))
 }
 
-/// Factory holding shared Cassandra resources for creating per-partition
-/// stores.
+/// Factory holding shared Cassandra resources for creating per-segment stores.
 ///
 /// Each call to `create_store` produces a `CassandraTriggerStore` with its own
 /// independent `state_cache` but sharing the Cassandra session and prepared
@@ -1730,7 +1727,6 @@ pub async fn cassandra_store(
 pub struct CassandraTriggerStoreProvider {
     store: CassandraStore,
     queries: Arc<Queries>,
-    slab_size: CompactDuration,
 }
 
 impl CassandraTriggerStoreProvider {
@@ -1740,14 +1736,9 @@ impl CassandraTriggerStoreProvider {
     ///
     /// * `store` - Shared Cassandra session
     /// * `queries` - Shared prepared statements
-    /// * `slab_size` - Time partitioning size
     #[must_use]
-    pub fn new(store: CassandraStore, queries: Arc<Queries>, slab_size: CompactDuration) -> Self {
-        Self {
-            store,
-            queries,
-            slab_size,
-        }
+    pub fn new(store: CassandraStore, queries: Arc<Queries>) -> Self {
+        Self { store, queries }
     }
 
     /// Creates a new provider by preparing queries against an existing
@@ -1763,32 +1754,16 @@ impl CassandraTriggerStoreProvider {
     pub async fn with_store(
         store: CassandraStore,
         keyspace: &str,
-        slab_size: CompactDuration,
     ) -> Result<Self, CassandraTriggerStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
-        Ok(Self {
-            store,
-            queries,
-            slab_size,
-        })
+        Ok(Self { store, queries })
     }
 }
 
 impl TriggerStoreProvider for CassandraTriggerStoreProvider {
     type Store = TableAdapter<CassandraTriggerStore>;
 
-    fn create_store(
-        &self,
-        _topic: Topic,
-        _partition: Partition,
-        _consumer_group: &str,
-    ) -> Self::Store {
-        let segment = Segment {
-            id: Uuid::new_v4(),
-            name: String::new(),
-            slab_size: self.slab_size,
-            version: SegmentVersion::V3,
-        };
+    fn create_store(&self, segment: Segment) -> Self::Store {
         TableAdapter::new(CassandraTriggerStore::with_shared(
             self.store.clone(),
             Arc::clone(&self.queries),

@@ -845,16 +845,12 @@ impl ProsodyConsumer {
                 heartbeats: heartbeats.clone(),
             })?,
             TriggerStoreConfiguration::Cassandra(cassandra_config) => {
-                let slab_size = consumer_config.slab_size.try_into()?;
                 let store = CassandraStore::new(cassandra_config)
                     .await
                     .map_err(CassandraTriggerStoreError::from)?;
-                let trigger_provider = CassandraTriggerStoreProvider::with_store(
-                    store,
-                    &cassandra_config.keyspace,
-                    slab_size,
-                )
-                .await?;
+                let trigger_provider =
+                    CassandraTriggerStoreProvider::with_store(store, &cassandra_config.keyspace)
+                        .await?;
                 initialize_consumer(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
@@ -915,8 +911,7 @@ impl ProsodyConsumer {
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         // Create both stores atomically - ensures trigger and defer stores match
-        let slab_size = consumer_config.slab_size.try_into()?;
-        let stores = StorePair::new(trigger_store_config, slab_size, consumer_config.mock).await?;
+        let stores = StorePair::new(trigger_store_config, consumer_config.mock).await?;
 
         let telemetry = Telemetry::new();
         let monopolization_middleware =

@@ -17,6 +17,7 @@
 //! All maps use [`scc::HashMap`] for concurrent access, and values are stored
 //! in [`BTreeSet`] to maintain sorted order where needed.
 
+use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -25,7 +26,6 @@ use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
-use crate::{Key, Partition, Topic};
 use async_stream::try_stream;
 use futures::TryStreamExt;
 use futures::stream::Stream;
@@ -35,7 +35,6 @@ use std::convert::Infallible;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::join;
-use uuid::Uuid;
 
 /// In-memory, concurrent implementation of
 /// [`TriggerStore`](super::TriggerStore) for testing and development.
@@ -609,18 +608,7 @@ impl Default for InMemoryTriggerStoreProvider {
 impl TriggerStoreProvider for InMemoryTriggerStoreProvider {
     type Store = TableAdapter<InMemoryTriggerStore>;
 
-    fn create_store(
-        &self,
-        _topic: Topic,
-        _partition: Partition,
-        _consumer_group: &str,
-    ) -> Self::Store {
-        let segment = Segment {
-            id: Uuid::new_v4(),
-            name: String::new(),
-            slab_size: CompactDuration::new(60),
-            version: SegmentVersion::V3,
-        };
+    fn create_store(&self, segment: Segment) -> Self::Store {
         memory_store(segment)
     }
 }

@@ -19,7 +19,6 @@ use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
 };
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::timers::duration::CompactDuration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::sync::Arc;
@@ -122,11 +121,9 @@ impl StorageBackend {
 /// ```no_run
 /// # use prosody::consumer::storage::{StorageBackend, StorePair};
 /// # use prosody::high_level::config::TriggerStoreConfiguration;
-/// # use prosody::timers::duration::CompactDuration;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = TriggerStoreConfiguration::InMemory;
-/// let slab_size = CompactDuration::new(3600);
-/// let stores = StorePair::new(&config, slab_size, false).await?;
+/// let stores = StorePair::new(&config, false).await?;
 ///
 /// // Pattern match to get all providers - they're guaranteed to match storage types
 /// match stores {
@@ -214,7 +211,6 @@ impl StorePair {
     /// # Arguments
     ///
     /// * `config` - Trigger store configuration (`InMemory` or `Cassandra`)
-    /// * `slab_size` - Slab size for trigger store time partitioning
     /// * `mock` - If true, uses in-memory storage regardless of config
     ///
     /// # Errors
@@ -226,20 +222,13 @@ impl StorePair {
     /// ```no_run
     /// # use prosody::consumer::storage::StorePair;
     /// # use prosody::high_level::config::TriggerStoreConfiguration;
-    /// # use prosody::timers::duration::CompactDuration;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let stores = StorePair::new(
-    ///     &TriggerStoreConfiguration::InMemory,
-    ///     CompactDuration::new(3600),
-    ///     false,
-    /// )
-    /// .await?;
+    /// let stores = StorePair::new(&TriggerStoreConfiguration::InMemory, false).await?;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn new(
         config: &TriggerStoreConfiguration,
-        slab_size: CompactDuration,
         mock: bool,
     ) -> Result<Self, StoreCreationError> {
         let backend = StorageBackend::new(config, mock).await?;
@@ -254,8 +243,7 @@ impl StorePair {
                 // Create trigger store provider (prepares queries once, creates
                 // per-partition stores with independent caches on demand)
                 let trigger_provider =
-                    CassandraTriggerStoreProvider::with_store(store.clone(), keyspace, slab_size)
-                        .await?;
+                    CassandraTriggerStoreProvider::with_store(store.clone(), keyspace).await?;
 
                 // Create segment store for defer stores (shared across message and timer)
                 let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;
