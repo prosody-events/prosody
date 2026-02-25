@@ -447,8 +447,13 @@ impl DeferTestEnvironment {
     async fn expect_no_event(&mut self, timeout_millis: u64) -> Result<()> {
         let event_result =
             timeout(Duration::from_millis(timeout_millis), self.event_rx.recv()).await;
-        ensure!(event_result.is_err(), "Expected no event but received one");
-        Ok(())
+        match event_result {
+            Err(_) => Ok(()),
+            Ok(Some(event)) => color_eyre::eyre::bail!(
+                "Expected no event within {timeout_millis}ms but received: {event:?}"
+            ),
+            Ok(None) => color_eyre::eyre::bail!("Event channel closed unexpectedly"),
+        }
     }
 
     /// Configure which values should fail with transient errors.
@@ -549,17 +554,27 @@ async fn run_multiple_messages_queued_in_order() -> Result<()> {
     env.send_message("test-key", &json!({"value": 3_i64}))
         .await?;
 
-    // First message should fail (transient error that will be deferred)
+    // msg1 fails on the first attempt (retry_count=0 → immediate retry).
     let event = env.expect_event(5).await?;
     ensure!(
         matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
-        "Expected first message to fail with transient error"
+        "Expected first message to fail with transient error, got: {event:?}"
     );
 
-    // Messages 2 and 3 should be queued (no immediate events)
+    // The immediate retry (retry_count=0) fires right away and fails again,
+    // re-deferring with retry_count=1 (base delay = 1s). Drain this second
+    // failure so the next retry is delayed and msgs 2 and 3 remain queued.
+    let event = env.expect_event(5).await?;
+    ensure!(
+        matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
+        "Expected second transient failure for value=1, got: {event:?}"
+    );
+
+    // Now msg1 is waiting for its retry_count=1 backoff (~1s). msgs 2 and 3
+    // must be queued and silent during this window.
     env.expect_no_event(500).await?;
 
-    // Clear failure condition so retries succeed
+    // Clear failure condition so the next retry succeeds.
     env.clear_failing_values();
 
     // Defer middleware handles timer internally and retries via on_message
@@ -569,7 +584,7 @@ async fn run_multiple_messages_queued_in_order() -> Result<()> {
         ensure!(
             matches!(event, HandlerEvent::MessageSuccess { ref key, value }
                 if key == "test-key" && value == expected_value),
-            "Expected message value={expected_value} to succeed"
+            "Expected MessageSuccess {{ value: {expected_value} }}, got: {event:?}"
         );
     }
 

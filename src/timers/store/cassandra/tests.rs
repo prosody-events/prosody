@@ -641,7 +641,8 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
         .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_a.clone(), t1, tt))
         .await?;
     // Pre-backfill: state is Absent (no MAP entry).
-    // Uses fetch_state (DB-direct): add_key_trigger_clustering does not update the cache.
+    // Uses fetch_state (DB-direct): add_key_trigger_clustering does not update the
+    // cache.
     let state = store.fetch_state(&segment_id, &key_a, tt).await?;
     assert_eq!(
         state,
@@ -667,7 +668,8 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
     store
         .add_key_trigger_clustering(&segment_id, Trigger::for_testing(key_b.clone(), t2, tt))
         .await?;
-    // Uses fetch_state (DB-direct): add_key_trigger_clustering does not update the cache.
+    // Uses fetch_state (DB-direct): add_key_trigger_clustering does not update the
+    // cache.
     let state = store.fetch_state(&segment_id, &key_b, tt).await?;
     assert_eq!(
         state,
@@ -693,7 +695,8 @@ async fn test_pre_migration_reads_and_migration() -> Result<()> {
         .await?;
     // State is already Inline(t1). backfill should not change it.
     store.backfill_key_state(&segment_id, &key_c, tt).await?;
-    // Uses fetch_state (DB-direct): verify backfill did not overwrite existing state.
+    // Uses fetch_state (DB-direct): verify backfill did not overwrite existing
+    // state.
     let state = store.fetch_state(&segment_id, &key_c, tt).await?;
     assert!(
         matches!(&state, TimerState::Inline(t) if t.time == t1),
