@@ -800,24 +800,30 @@ pub async fn prop_migration_invariants(
             // MAP entries.  backfill_key_state must populate state from scratch.
             let config = test_cassandra_config("prosody_test");
             let cassandra_base = CassandraStore::new(&config).await?;
-            let cassandra_store = CassandraTriggerStore::with_store(
-                cassandra_base,
-                &config.keyspace,
-                input.initial_slab_size,
-            )
-            .await?;
+            let segment = Segment {
+                id: input.segment_id,
+                name: String::new(),
+                slab_size: input.initial_slab_size,
+                version: SegmentVersion::V2,
+            };
+            let cassandra_store =
+                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
+                    .await?;
             setup_v2_state(&cassandra_store, &input).await?;
         }
         SegmentVersion::V3 => {
             // Write V3 layout: triggers go through the full state-aware path.
             let config = test_cassandra_config("prosody_test");
             let cassandra_base = CassandraStore::new(&config).await?;
-            let cassandra_store = CassandraTriggerStore::with_store(
-                cassandra_base,
-                &config.keyspace,
-                input.initial_slab_size,
-            )
-            .await?;
+            let segment = Segment {
+                id: input.segment_id,
+                name: String::new(),
+                slab_size: input.initial_slab_size,
+                version: SegmentVersion::V3,
+            };
+            let cassandra_store =
+                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
+                    .await?;
             let store = TableAdapter::new(cassandra_store);
             setup_v3_state(&store, &input).await?;
         }
@@ -826,9 +832,14 @@ pub async fn prop_migration_invariants(
     // Migration phase: Create store with target_slab_size
     let config = test_cassandra_config("prosody_test");
     let cassandra_base = CassandraStore::new(&config).await?;
+    let segment = Segment {
+        id: input.segment_id,
+        name: String::new(),
+        slab_size: input.target_slab_size,
+        version: SegmentVersion::V3,
+    };
     let cassandra_store =
-        CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, input.target_slab_size)
-            .await?;
+        CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment).await?;
     let store = TableAdapter::new(cassandra_store);
 
     // Trigger migration by calling get_segment()

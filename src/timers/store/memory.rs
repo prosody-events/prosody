@@ -35,6 +35,7 @@ use std::convert::Infallible;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::join;
+use uuid::Uuid;
 
 /// In-memory, concurrent implementation of
 /// [`TriggerStore`](super::TriggerStore) for testing and development.
@@ -54,8 +55,11 @@ use tokio::join;
 ///
 /// For tests that need the concrete type, you can use
 /// `InMemoryTriggerStore::new()` directly.
-#[derive(Clone, Debug, Default)]
-pub struct InMemoryTriggerStore(Arc<Inner>);
+#[derive(Clone, Debug)]
+pub struct InMemoryTriggerStore {
+    segment: Segment,
+    inner: Arc<Inner>,
+}
 
 /// Partition key for slab triggers: (`segment_id`, `slab_size`, `slab_id`)
 type SlabPartitionKey = (SegmentId, CompactDuration, SlabId);
@@ -74,7 +78,6 @@ type KeyClusteringKey = (TimerType, CompactDateTime);
 /// Maintains concurrent maps to support dual indexing and segment management.
 #[derive(Debug, Default)]
 struct Inner {
-    /// Maps each segment ID to its (name, `slab_size`, version).
     segments: HashMap<SegmentId, (String, CompactDuration, SegmentVersion)>,
 
     /// Maps each segment ID to its active set of slab IDs.
@@ -94,14 +97,23 @@ struct Inner {
 }
 
 impl InMemoryTriggerStore {
-    /// Create a new, empty in-memory trigger store.
+    /// Create a new, empty in-memory trigger store scoped to the given segment.
     ///
     /// # Returns
     ///
     /// A ready-to-use `InMemoryTriggerStore`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(segment: Segment) -> Self {
+        Self {
+            segment,
+            inner: Arc::new(Inner::default()),
+        }
+    }
+
+    /// Returns the segment this store is scoped to.
+    #[must_use]
+    pub fn segment(&self) -> Segment {
+        self.segment.clone()
     }
 }
 
@@ -122,7 +134,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     ///
     /// Never returns an error.
     async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
-        self.0
+        self.inner
             .segments
             .upsert_async(
                 segment.id,
@@ -145,7 +157,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// * `Ok(None)` if no segment with that ID exists.
     /// * Never returns `Err`.
     async fn get_segment(&self, segment_id: &SegmentId) -> Result<Option<Segment>, Self::Error> {
-        Ok(self.0.segments.get_async(segment_id).await.map(|e| {
+        Ok(self.inner.segments.get_async(segment_id).await.map(|e| {
             let (name, slab_size, version) = e.get();
             Segment {
                 id: *segment_id,
@@ -168,8 +180,8 @@ impl TriggerOperations for InMemoryTriggerStore {
     async fn delete_segment(&self, segment_id: &SegmentId) -> Result<(), Self::Error> {
         // Remove from both the segments map and the segment_slabs map.
         join!(
-            self.0.segments.remove_async(segment_id),
-            self.0.segment_slabs.remove_async(segment_id)
+            self.inner.segments.remove_async(segment_id),
+            self.inner.segment_slabs.remove_async(segment_id)
         );
 
         Ok(())
@@ -188,7 +200,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// A stream of `SlabId`. Never yields an error.
     fn get_slabs(&self, segment_id: &SegmentId) -> impl Stream<Item = Result<SlabId, Self::Error>> {
         try_stream! {
-            let Some(entry) = self.0.segment_slabs.get_async(segment_id).await else {
+            let Some(entry) = self.inner.segment_slabs.get_async(segment_id).await else {
                 return;
             };
 
@@ -214,7 +226,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> {
         try_stream! {
-            let Some(entry) = self.0.segment_slabs.get_async(segment_id).await else {
+            let Some(entry) = self.inner.segment_slabs.get_async(segment_id).await else {
                 return;
             };
 
@@ -235,7 +247,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     ///
     /// Never returns an error.
     async fn insert_slab(&self, segment_id: &SegmentId, slab: Slab) -> Result<(), Self::Error> {
-        self.0
+        self.inner
             .segment_slabs
             .entry_async(*segment_id)
             .await
@@ -263,7 +275,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         segment_id: &SegmentId,
         slab_id: SlabId,
     ) -> Result<(), Self::Error> {
-        let Some(mut entry) = self.0.segment_slabs.get_async(segment_id).await else {
+        let Some(mut entry) = self.inner.segment_slabs.get_async(segment_id).await else {
             return Ok(());
         };
 
@@ -299,7 +311,7 @@ impl TriggerOperations for InMemoryTriggerStore {
 
         try_stream! {
             let partition_key = (segment_id, slab_size, slab_id);
-            let Some(triggers_map) = self.0.slab_triggers.get_async(&partition_key).await else {
+            let Some(triggers_map) = self.inner.slab_triggers.get_async(&partition_key).await else {
                 return;
             };
 
@@ -331,7 +343,7 @@ impl TriggerOperations for InMemoryTriggerStore {
 
         try_stream! {
             let partition_key = (segment_id, slab_size, slab_id);
-            let Some(triggers_map) = self.0.slab_triggers.get_async(&partition_key).await else {
+            let Some(triggers_map) = self.inner.slab_triggers.get_async(&partition_key).await else {
                 return;
             };
 
@@ -356,7 +368,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         let partition_key = (*slab.segment_id(), slab.size(), slab.id());
         let clustering_key = (trigger.timer_type, trigger.key.clone(), trigger.time);
 
-        self.0
+        self.inner
             .slab_triggers
             .entry_async(partition_key)
             .await
@@ -389,7 +401,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         let partition_key = (*slab.segment_id(), slab.size(), slab.id());
         let clustering_key = (timer_type, key.clone(), time);
 
-        let Some(mut entry) = self.0.slab_triggers.get_async(&partition_key).await else {
+        let Some(mut entry) = self.inner.slab_triggers.get_async(&partition_key).await else {
             return Ok(());
         };
 
@@ -416,7 +428,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     async fn clear_slab_triggers(&self, slab: &Slab) -> Result<(), Self::Error> {
         // Clear the entire partition (all timer types)
         let partition_key = (*slab.segment_id(), slab.size(), slab.id());
-        self.0.slab_triggers.remove_async(&partition_key).await;
+        self.inner.slab_triggers.remove_async(&partition_key).await;
         Ok(())
     }
 
@@ -464,7 +476,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         try_stream! {
             let partition_key = (*segment_id, key.clone());
-            let Some(triggers_map) = self.0.key_triggers.get_async(&partition_key).await else {
+            let Some(triggers_map) = self.inner.key_triggers.get_async(&partition_key).await else {
                 return;
             };
 
@@ -494,7 +506,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         try_stream! {
             let partition_key = (*segment_id, key.clone());
-            let Some(triggers_map) = self.0.key_triggers.get_async(&partition_key).await else {
+            let Some(triggers_map) = self.inner.key_triggers.get_async(&partition_key).await else {
                 return;
             };
 
@@ -523,7 +535,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         let partition_key = (*segment_id, trigger.key.clone());
         let clustering_key = (trigger.timer_type, trigger.time);
 
-        self.0
+        self.inner
             .key_triggers
             .entry_async(partition_key)
             .await
@@ -556,7 +568,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         let partition_key = (*segment_id, key.clone());
         let clustering_key = (timer_type, time);
 
-        let Some(mut entry) = self.0.key_triggers.get_async(&partition_key).await else {
+        let Some(mut entry) = self.inner.key_triggers.get_async(&partition_key).await else {
             return Ok(());
         };
 
@@ -587,7 +599,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         key: &Key,
     ) -> Result<(), Self::Error> {
         let partition_key = (*segment, key.clone());
-        let Some(mut entry) = self.0.key_triggers.get_async(&partition_key).await else {
+        let Some(mut entry) = self.inner.key_triggers.get_async(&partition_key).await else {
             return Ok(());
         };
 
@@ -626,7 +638,7 @@ impl TriggerOperations for InMemoryTriggerStore {
 
         // Get or create the partition entry
         let mut entry = self
-            .0
+            .inner
             .key_triggers
             .entry_async(partition_key)
             .await
@@ -663,7 +675,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         key: &Key,
     ) -> Result<(), Self::Error> {
         let partition_key = (*segment_id, key.clone());
-        self.0.key_triggers.remove_async(&partition_key).await;
+        self.inner.key_triggers.remove_async(&partition_key).await;
         Ok(())
     }
 
@@ -686,11 +698,11 @@ impl TriggerOperations for InMemoryTriggerStore {
         new_version: SegmentVersion,
         new_slab_size: CompactDuration,
     ) -> Result<(), Self::Error> {
-        if let Some(entry) = self.0.segments.get_async(segment_id).await {
+        if let Some(entry) = self.inner.segments.get_async(segment_id).await {
             let (name, ..) = entry.get();
             let name = name.clone();
             drop(entry);
-            self.0
+            self.inner
                 .segments
                 .upsert_async(*segment_id, (name, new_slab_size, new_version))
                 .await;
@@ -699,7 +711,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     }
 }
 
-/// Creates a new in-memory trigger store.
+/// Creates a new in-memory trigger store scoped to the given segment.
 ///
 /// Returns an implementation of `TriggerStore` backed by in-memory data
 /// structures. This is the recommended way to create an in-memory store.
@@ -707,12 +719,12 @@ impl TriggerOperations for InMemoryTriggerStore {
 /// # Example
 ///
 /// ```rust,ignore
-/// let store = memory_store();
+/// let store = memory_store(segment);
 /// let manager = TimerManager::new(..., store);
 /// ```
 #[must_use]
-pub fn memory_store() -> TableAdapter<InMemoryTriggerStore> {
-    TableAdapter::new(InMemoryTriggerStore::new())
+pub fn memory_store(segment: Segment) -> TableAdapter<InMemoryTriggerStore> {
+    TableAdapter::new(InMemoryTriggerStore::new(segment))
 }
 
 /// Trivial provider for tests that creates a fresh `InMemoryTriggerStore` per
@@ -743,15 +755,23 @@ impl TriggerStoreProvider for InMemoryTriggerStoreProvider {
         _partition: Partition,
         _consumer_group: &str,
     ) -> Self::Store {
-        memory_store()
+        let segment = Segment {
+            id: Uuid::new_v4(),
+            name: String::new(),
+            slab_size: CompactDuration::new(60),
+            version: SegmentVersion::V3,
+        };
+        memory_store(segment)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::{InMemoryTriggerStore, memory_store};
+    use crate::timers::store::{Segment, SegmentVersion};
     use crate::trigger_store_tests;
     use std::convert::Infallible;
+    use uuid::Uuid;
 
     // Run the full suite of TriggerStore compliance tests on this implementation.
     // Low-level tests use InMemoryTriggerStore directly
@@ -759,8 +779,24 @@ mod test {
     // Uses QuickCheck's default test count (no external systems involved)
     trigger_store_tests!(
         InMemoryTriggerStore,
-        |_slab_size| async { Result::<_, Infallible>::Ok(InMemoryTriggerStore::new()) },
+        |slab_size| async move {
+            let segment = Segment {
+                id: Uuid::new_v4(),
+                name: String::new(),
+                slab_size,
+                version: SegmentVersion::V3,
+            };
+            Result::<_, Infallible>::Ok(InMemoryTriggerStore::new(segment))
+        },
         crate::timers::store::adapter::TableAdapter<InMemoryTriggerStore>,
-        |_slab_size| async { Result::<_, Infallible>::Ok(memory_store()) }
+        |slab_size| async move {
+            let segment = Segment {
+                id: Uuid::new_v4(),
+                name: String::new(),
+                slab_size,
+                version: SegmentVersion::V3,
+            };
+            Result::<_, Infallible>::Ok(memory_store(segment))
+        }
     );
 }

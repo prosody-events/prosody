@@ -476,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_new() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
 
@@ -486,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_is_owned_when_none() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
 
@@ -497,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_is_owned_with_ownership() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -513,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_extend_ownership() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -583,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_new() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(60);
         let name = "test-segment";
@@ -603,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_existing() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(60);
         let name1 = "first-segment";
@@ -623,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_empty_range() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
         let slab_lock = SlabLock::new(state);
@@ -637,7 +637,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_single_slab() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -664,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_multiple_slabs() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -693,7 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_triggers_empty_slab() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
         let slab = Slab::new(segment.id, 1, segment.slab_size);
@@ -704,7 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_triggers_with_triggers() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
         let slab_id = 1;
@@ -727,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_completed_slabs_no_active() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -772,7 +772,7 @@ mod tests {
     async fn test_slab_loader_basic_operation() -> Result<()> {
         pause();
 
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -809,7 +809,7 @@ mod tests {
     async fn test_slab_loader_time_advancement() -> Result<()> {
         pause();
 
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -874,7 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_completed_slabs_with_active_triggers() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler.clone());
         let slab_lock = SlabLock::new(state);
@@ -915,7 +915,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_extends_ownership_correctly() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -950,7 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_preserves_higher_ownership() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
@@ -984,7 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_ownership_edge_cases() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_concurrent() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(60);
         let name = "concurrent-test";
@@ -1068,7 +1068,7 @@ mod tests {
     async fn test_slab_loader_handles_time_errors() -> Result<()> {
         pause();
 
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);

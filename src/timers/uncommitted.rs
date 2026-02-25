@@ -414,6 +414,7 @@ mod tests {
     use crate::timers::manager::TimerManager;
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+    use crate::timers::store::{Segment, SegmentVersion};
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, TryStreamExt};
     use std::time::Duration;
@@ -421,12 +422,21 @@ mod tests {
     use tokio::time::{self, advance};
     use uuid::Uuid;
 
+    fn test_segment() -> Segment {
+        Segment {
+            id: Uuid::new_v4(),
+            name: "test-segment".to_owned(),
+            slab_size: CompactDuration::new(300),
+            version: SegmentVersion::V3,
+        }
+    }
+
     /// Helper function to set up a timer manager for testing
     async fn setup_timer_manager() -> Result<(
         impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
     )> {
-        let store = memory_store();
+        let store = memory_store(test_segment());
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
 

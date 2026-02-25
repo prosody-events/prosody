@@ -59,11 +59,6 @@ async fn setup_test_store_with_version(
     version: SegmentVersion,
 ) -> Result<(CassandraTriggerStore, SegmentId)> {
     let slab_size = CompactDuration::new(60);
-    let config = test_cassandra_config("prosody_test");
-    let cassandra_store = CassandraStore::new(&config).await?;
-    let store =
-        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
-
     let segment_id = SegmentId::from(Uuid::new_v4());
     let segment = Segment {
         id: segment_id,
@@ -71,6 +66,11 @@ async fn setup_test_store_with_version(
         slab_size,
         version,
     };
+    let config = test_cassandra_config("prosody_test");
+    let cassandra_store = CassandraStore::new(&config).await?;
+    let store =
+        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
+            .await?;
     store.insert_segment(segment).await?;
     Ok((store, segment_id))
 }
@@ -83,12 +83,24 @@ trigger_store_tests!(
     |slab_size| async move {
         let config = test_cassandra_config("prosody_test");
         let store = CassandraStore::new(&config).await?;
-        CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await
+        let segment = Segment {
+            id: Uuid::new_v4(),
+            name: String::new(),
+            slab_size,
+            version: SegmentVersion::V3,
+        };
+        CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
     },
     crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
     |slab_size| async move {
         let config = test_cassandra_config("prosody_test");
-        cassandra_store(&config, slab_size).await
+        let segment = Segment {
+            id: Uuid::new_v4(),
+            name: String::new(),
+            slab_size,
+            version: SegmentVersion::V3,
+        };
+        cassandra_store(&config, segment).await
     },
     get_test_count()
 );
@@ -98,11 +110,6 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
     init_test_logging();
 
     let slab_size = CompactDuration::new(60); // 1 minute slabs
-    let config = test_cassandra_config("prosody_test");
-    let cassandra_store = CassandraStore::new(&config).await?;
-    let store =
-        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
-
     let segment_id = SegmentId::from(Uuid::new_v4());
     let segment = Segment {
         id: segment_id,
@@ -110,6 +117,11 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
         slab_size,
         version: SegmentVersion::V1,
     };
+    let config = test_cassandra_config("prosody_test");
+    let cassandra_store = CassandraStore::new(&config).await?;
+    let store =
+        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
+            .await?;
 
     // Insert the test segment
     store.insert_segment(segment.clone()).await?;
@@ -197,11 +209,6 @@ async fn test_simple_wrap_around() -> Result<()> {
     init_test_logging();
 
     let slab_size = CompactDuration::new(60);
-    let config = test_cassandra_config("prosody_test");
-    let cassandra_store = CassandraStore::new(&config).await?;
-    let store =
-        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, slab_size).await?;
-
     let segment_id = SegmentId::from(Uuid::new_v4());
     let segment = Segment {
         id: segment_id,
@@ -209,6 +216,11 @@ async fn test_simple_wrap_around() -> Result<()> {
         slab_size,
         version: SegmentVersion::V1,
     };
+    let config = test_cassandra_config("prosody_test");
+    let cassandra_store = CassandraStore::new(&config).await?;
+    let store =
+        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
+            .await?;
 
     store.insert_segment(segment.clone()).await?;
 
@@ -992,7 +1004,13 @@ fn test_prop_timer_state_invariant() {
             async {
                 let config = test_cassandra_config("prosody_test");
                 let store = CassandraStore::new(&config).await?;
-                CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await
+                let segment = Segment {
+                    id: Uuid::new_v4(),
+                    name: String::new(),
+                    slab_size,
+                    version: SegmentVersion::V3,
+                };
+                CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
             }
             .instrument(span.clone()),
         ) {

@@ -34,6 +34,7 @@ use tokio::task::coop::cooperative;
 use tracing::field::Empty;
 use tracing::{Span, debug, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use uuid::Uuid;
 
 mod queries;
 
@@ -171,7 +172,7 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for TimerState {
 pub struct CassandraTriggerStore {
     store: CassandraStore,
     queries: Arc<Queries>,
-    slab_size: CompactDuration,
+    segment: Segment,
     /// Per-partition cache of `(Key, TimerType) → TimerState`.
     ///
     /// Tracks the current state of each key/type pair:
@@ -197,7 +198,7 @@ impl CassandraTriggerStore {
     ///
     /// * `store` - Existing `CassandraStore` to share
     /// * `keyspace` - Cassandra keyspace name for query preparation
-    /// * `slab_size` - Target slab size for automatic migration
+    /// * `segment` - Segment this store is scoped to
     ///
     /// # Errors
     ///
@@ -205,14 +206,14 @@ impl CassandraTriggerStore {
     pub async fn with_store(
         store: CassandraStore,
         keyspace: &str,
-        slab_size: CompactDuration,
+        segment: Segment,
     ) -> Result<Self, CassandraTriggerStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
         Ok(Self {
             store,
             queries,
-            slab_size,
+            segment,
             state_cache: Arc::new(Cache::new(STATE_CACHE_CAPACITY)),
         })
     }
@@ -221,17 +222,19 @@ impl CassandraTriggerStore {
     ///
     /// Used by `CassandraTriggerStoreProvider` to create per-partition stores
     /// that share the session and queries but have independent caches.
-    fn with_shared(
-        store: CassandraStore,
-        queries: Arc<Queries>,
-        slab_size: CompactDuration,
-    ) -> Self {
+    fn with_shared(store: CassandraStore, queries: Arc<Queries>, segment: Segment) -> Self {
         Self {
             store,
             queries,
-            slab_size,
+            segment,
             state_cache: Arc::new(Cache::new(STATE_CACHE_CAPACITY)),
         }
+    }
+
+    /// Returns the segment this store is scoped to.
+    #[must_use]
+    pub fn segment(&self) -> &Segment {
+        &self.segment
     }
 
     fn session(&self) -> &Session {
@@ -824,11 +827,11 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self), err)]
     async fn insert_segment(&self, segment: Segment) -> Result<(), Self::Error> {
         // Validate that the segment's slab_size matches the configured slab_size
-        if segment.slab_size != self.slab_size {
+        if segment.slab_size != self.segment.slab_size {
             return Err(CassandraTriggerStoreError::SlabSizeMismatch {
                 segment_id: segment.id,
                 segment_slab_size: segment.slab_size,
-                configured_slab_size: self.slab_size,
+                configured_slab_size: self.segment.slab_size,
             });
         }
 
@@ -849,7 +852,8 @@ impl TriggerOperations for CassandraTriggerStore {
             return Ok(None);
         };
 
-        let segment = migration::migrate_segment_if_needed(self, segment, self.slab_size).await?;
+        let segment =
+            migration::migrate_segment_if_needed(self, segment, self.segment.slab_size).await?;
 
         Ok(Some(segment))
     }
@@ -1701,7 +1705,7 @@ impl TriggerOperations for CassandraTriggerStore {
 /// # Arguments
 ///
 /// * `config` - Cassandra connection and TTL configuration
-/// * `slab_size` - Target slab size for automatic migration
+/// * `segment` - Segment this store is scoped to
 ///
 /// # Errors
 ///
@@ -1714,16 +1718,15 @@ impl TriggerOperations for CassandraTriggerStore {
 ///
 /// ```rust,ignore
 /// let config = CassandraConfiguration { ... };
-/// let slab_size = CompactDuration::new(3600);
-/// let store = cassandra_store(&config, slab_size).await?;
+/// let store = cassandra_store(&config, segment).await?;
 /// let manager = TimerManager::new(..., store);
 /// ```
 pub async fn cassandra_store(
     config: &CassandraConfiguration,
-    slab_size: CompactDuration,
+    segment: Segment,
 ) -> Result<TableAdapter<CassandraTriggerStore>, CassandraTriggerStoreError> {
     let store = CassandraStore::new(config).await?;
-    let cassandra = CassandraTriggerStore::with_store(store, &config.keyspace, slab_size).await?;
+    let cassandra = CassandraTriggerStore::with_store(store, &config.keyspace, segment).await?;
     Ok(TableAdapter::new(cassandra))
 }
 
@@ -1790,10 +1793,16 @@ impl TriggerStoreProvider for CassandraTriggerStoreProvider {
         _partition: Partition,
         _consumer_group: &str,
     ) -> Self::Store {
+        let segment = Segment {
+            id: Uuid::new_v4(),
+            name: String::new(),
+            slab_size: self.slab_size,
+            version: SegmentVersion::V3,
+        };
         TableAdapter::new(CassandraTriggerStore::with_shared(
             self.store.clone(),
             Arc::clone(&self.queries),
-            self.slab_size,
+            segment,
         ))
     }
 }

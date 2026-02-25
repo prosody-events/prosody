@@ -751,6 +751,7 @@ mod tests {
     use super::*;
     use crate::consumer::{Keyed, Uncommitted};
     use crate::timers::UncommittedTimer;
+    use crate::timers::store::SegmentVersion;
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use crate::timers::uncommitted::UncommittedTriggerGuard;
@@ -761,6 +762,15 @@ mod tests {
     use tokio::time::{self, advance, timeout};
     use tracing::Span;
     use uuid::Uuid;
+
+    fn test_segment() -> Segment {
+        Segment {
+            id: Uuid::new_v4(),
+            name: "test-segment".to_owned(),
+            slab_size: CompactDuration::new(300),
+            version: SegmentVersion::V3,
+        }
+    }
 
     /// Helper function to create a test trigger
     fn create_test_trigger(
@@ -783,7 +793,7 @@ mod tests {
         impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
     )> {
-        let store = memory_store();
+        let store = memory_store(test_segment());
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
 
@@ -832,7 +842,7 @@ mod tests {
     async fn test_new_timer_manager_creation() -> Result<()> {
         time::pause();
 
-        let store = memory_store();
+        let store = memory_store(test_segment());
         let segment_id = Uuid::new_v4();
         let slab_size = CompactDuration::new(300);
 
