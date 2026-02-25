@@ -725,7 +725,7 @@ async fn verify_key_state_invariant(
                 // deleted — the trigger lives exclusively in the state MAP now.
                 let clustering_rows = store
                     .operations()
-                    .count_remaining_triggers(&model.segment.id, key, *timer_type)
+                    .peek_trigger_times(&model.segment.id, key, *timer_type)
                     .await
                     .map_err(|e| {
                         color_eyre::eyre::eyre!("Failed to count clustering rows: {e:?}")

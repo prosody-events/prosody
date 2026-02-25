@@ -252,6 +252,12 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
+        /// Gets a single entry from the `state` static map column for a key partition
+        get_state_entry: (
+            "SELECT state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            TABLE_TYPED_KEYS
+        ),
+
         /// Inserts a trigger into clustering columns with TTL
         insert_key_trigger_clustering: (
             "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?",
@@ -290,13 +296,19 @@ cassandra_queries! {
 
         /// Sets overflow state marker (static column only) without TTL
         set_state_overflow: (
-            "UPDATE $keyspace.{} SET state[?] = {inline: false, time: null, span: null} WHERE segment_id = ? AND key = ?",
+            "UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?",
             TABLE_TYPED_KEYS
         ),
 
-        /// Counts remaining triggers for a key/type (LIMIT 2 for demotion check)
+        /// Reads up to 2 remaining trigger times for a key/type (demotion check)
         count_key_triggers: (
             "SELECT time FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 2",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Reads the first remaining trigger (time + span) for a key/type (inline demotion)
+        peek_first_key_trigger: (
+            "SELECT time, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 1",
             TABLE_TYPED_KEYS
         ),
 
