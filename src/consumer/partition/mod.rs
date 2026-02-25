@@ -95,9 +95,6 @@ pub struct PartitionConfiguration<T> {
     /// Maximum number of uncommitted messages allowed
     pub max_uncommitted: usize,
 
-    /// Maximum number of queued messages per key
-    pub max_enqueued_per_key: usize,
-
     /// Size of idempotence cache for message deduplication
     pub idempotence_cache_size: usize,
 
@@ -450,7 +447,7 @@ async fn handle_messages<T, S>(
 
     // Create key manager to handle concurrent processing while maintaining key
     // order
-    KeyManager::<UncommittedEvent<S>, _, _>::new(process, config.max_enqueued_per_key)
+    KeyManager::<UncommittedEvent<S>, _, _>::new(process)
         .process_messages(
             combined_stream,
             heartbeats.register("event processor"),

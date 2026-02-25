@@ -222,7 +222,6 @@ fields, so you can mix both approaches.
 |----------------------------------|------------------------------------------------------|------------------------|
 | `PROSODY_MAX_CONCURRENCY`        | Max messages being processed simultaneously          | 32                     |
 | `PROSODY_MAX_UNCOMMITTED`        | Max queued messages before pausing consumption       | 64                     |
-| `PROSODY_MAX_ENQUEUED_PER_KEY`   | Max queued messages per key before pausing           | 8                      |
 | `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
 | `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |
 | `PROSODY_POLL_INTERVAL`          | How often to fetch new messages from Kafka           | 100ms                  |
