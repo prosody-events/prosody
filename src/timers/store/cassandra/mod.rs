@@ -1042,7 +1042,7 @@ impl TriggerOperations for CassandraTriggerStore {
         slab: &Slab,
         timer_type: TimerType,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        let segment_id = slab.segment_id();
+        let segment_id = self.segment.id;
         let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
@@ -1076,7 +1076,7 @@ impl TriggerOperations for CassandraTriggerStore {
         &self,
         slab: &Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        let segment_id = slab.segment_id();
+        let segment_id = self.segment.id;
         let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
 
@@ -1113,7 +1113,7 @@ impl TriggerOperations for CassandraTriggerStore {
     async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
         let span_map = extract_span_map(self.propagator(), &trigger);
 
-        let segment_id = slab.segment_id();
+        let segment_id = self.segment.id;
         let slab_size = slab.size().seconds() as i32;
         let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
         let key = trigger.key.as_ref();
@@ -1150,7 +1150,7 @@ impl TriggerOperations for CassandraTriggerStore {
             .execute_unpaged(
                 &self.queries().delete_slab_trigger,
                 (
-                    slab.segment_id(),
+                    self.segment.id,
                     slab.size().seconds() as i32,
                     i32::from_le_bytes(slab.id().to_le_bytes()),
                     timer_type,
@@ -1170,7 +1170,7 @@ impl TriggerOperations for CassandraTriggerStore {
             .execute_unpaged(
                 &self.queries().clear_slab_triggers,
                 (
-                    slab.segment_id(),
+                    self.segment.id,
                     slab.size().seconds() as i32,
                     i32::from_le_bytes(slab.id().to_le_bytes()),
                 ),

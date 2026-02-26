@@ -232,7 +232,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         slab: &Slab,
         timer_type: TimerType,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> {
-        let segment_id = *slab.segment_id();
+        let segment_id = self.segment.id;
         let slab_size = slab.size();
         let slab_id = slab.id();
 
@@ -264,7 +264,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         &self,
         slab: &Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> {
-        let segment_id = *slab.segment_id();
+        let segment_id = self.segment.id;
         let slab_size = slab.size();
         let slab_id = slab.id();
 
@@ -292,7 +292,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     ///
     /// Never returns an error.
     async fn insert_slab_trigger(&self, slab: Slab, trigger: Trigger) -> Result<(), Self::Error> {
-        let partition_key = (*slab.segment_id(), slab.size(), slab.id());
+        let partition_key = (self.segment.id, slab.size(), slab.id());
         let clustering_key = (trigger.timer_type, trigger.key.clone(), trigger.time);
 
         self.inner
@@ -325,7 +325,7 @@ impl TriggerOperations for InMemoryTriggerStore {
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
-        let partition_key = (*slab.segment_id(), slab.size(), slab.id());
+        let partition_key = (self.segment.id, slab.size(), slab.id());
         let clustering_key = (timer_type, key.clone(), time);
 
         let Some(mut entry) = self.inner.slab_triggers.get_async(&partition_key).await else {
@@ -354,7 +354,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// Never returns an error.
     async fn clear_slab_triggers(&self, slab: &Slab) -> Result<(), Self::Error> {
         // Clear the entire partition (all timer types)
-        let partition_key = (*slab.segment_id(), slab.size(), slab.id());
+        let partition_key = (self.segment.id, slab.size(), slab.id());
         self.inner.slab_triggers.remove_async(&partition_key).await;
         Ok(())
     }
