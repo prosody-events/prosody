@@ -18,7 +18,7 @@ version = "0.12.0"
 [dependencies]
 ahash = "0.8"
 aho-corasick = "1.1"
-arc-swap = "1.7"
+arc-swap = "1.8"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
@@ -30,7 +30,7 @@ dyn-clone = "1.0"
 educe = "0.6"
 fixedstr = { version = "0.5", features = ["flex-str"] }
 futures = "0.3"
-humantime = "2.2"
+humantime = "2.3"
 internment = "0.8"
 intervallum = "1.4"
 nohash-hasher = "0.2"
@@ -49,24 +49,27 @@ quanta = "0.12"
 quick_cache = "0.6"
 rand = "0.10"
 rdkafka = { version = "0.39", features = ["tracing"] }
-rust-embed = { version = "8.7", features = ["include-exclude"] }
-scc = "3.0"
-scylla = { version = "1.2", features = ["chrono-04"] }
+rust-embed = { version = "8.11", features = ["include-exclude"] }
+scc = "3.6"
+scylla = { version = "1.5", features = ["chrono-04"] }
 serde = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
 simd-json = { version = "0.17", features = ["serde_impl"], optional = true }
 smallvec = { version = "1.15", features = ["const_generics", "union"] }
 thiserror = "2.0"
-tokio = { version = "1.45", features = ["macros", "sync"] }
+tokio = { version = "1.49", features = ["macros", "parking_lot", "sync"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["time"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.17", features = ["v5"] }
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "parking_lot",
+] }
+uuid = { version = "1.21", features = ["v5"] }
 validator = { version = "0.20", features = ["derive"] }
-whoami = "2.0"
+whoami = "2.1"
 
 [features]
 default = ["cmake-build"]
