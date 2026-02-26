@@ -1180,24 +1180,29 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
     managers.read().len() as u32
 }
 
-/// Bundles all inputs required by [`initialize_consumer`] into a single struct.
-///
-/// Avoids a long argument list and satisfies Clippy's `too_many_arguments` lint.
-/// All fields map directly to the parameters described in
-/// [`initialize_consumer`]'s documentation.
+/// Parameters passed to [`initialize_consumer`] to create a consumer instance.
 struct ConsumerInitParams<T, S>
 where
     T: HandlerProvider,
     S: TriggerStore,
 {
+    /// Consumer configuration (Kafka settings, buffer sizes, timeouts).
     config: ConsumerConfiguration,
+    /// Factory for creating per-partition message handlers.
     handler_provider: T,
+    /// Persistent storage backend for timer triggers.
     trigger_store: S,
+    /// Shared atomic counter for tracking watermark changes.
     watermark_version: Arc<WatermarkVersion>,
+    /// Thread-safe map of active partition managers.
     managers: Arc<Managers>,
+    /// Optional event type filter; `None` passes all events through.
     allowed_events: Option<AhoCorasick>,
+    /// Sender for consumer-level telemetry events.
     telemetry: TelemetrySender,
+    /// Atomic flag for coordinating consumer shutdown.
     shutdown: Arc<AtomicBool>,
+    /// Registry for monitoring consumer-level actors for stalls.
     heartbeats: HeartbeatRegistry,
 }
 
