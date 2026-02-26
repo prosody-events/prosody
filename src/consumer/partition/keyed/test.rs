@@ -173,7 +173,7 @@ async fn processes_messages_in_order_impl(
         let actual = processed_values.get();
         if actual != &expected_values {
             return TestResult::error(format!(
-                "key {key} processed out of order: expected {expected_values:?}, got {actual:?}"
+                "key {key} processed values mismatch: expected {expected_values:?}, got {actual:?}"
             ));
         }
     }
