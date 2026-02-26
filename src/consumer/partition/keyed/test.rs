@@ -146,11 +146,16 @@ async fn processes_messages_in_order_impl(Messages(messages): Messages) -> TestR
 
     for (key, expected_values) in expected {
         let Some(processed_values) = processed.get_sync(&key) else {
-            return TestResult::failed();
+            return TestResult::error(format!(
+                "key {key} was never processed (expected {expected_values:?})"
+            ));
         };
 
-        if processed_values.get() != &expected_values {
-            return TestResult::failed();
+        let actual = processed_values.get();
+        if actual != &expected_values {
+            return TestResult::error(format!(
+                "key {key} processed values mismatch: expected {expected_values:?}, got {actual:?}"
+            ));
         }
     }
 
