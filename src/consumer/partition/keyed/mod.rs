@@ -9,7 +9,6 @@
 //! - Processing messages with the same key sequentially to maintain order
 //! - Processing messages with different keys concurrently to maximize
 //!   throughput
-//! - Managing backpressure through configurable queue size limits per key
 //! - Graceful shutdown with timeout for in-flight operations
 //! - Heartbeat monitoring to detect stalled processing
 
@@ -53,6 +52,14 @@ type HashValue = u64;
 /// - Preserves message order within each key
 /// - Enables concurrent processing across different keys
 /// - Provides graceful shutdown with timeout for in-flight operations
+///
+/// # Backpressure
+///
+/// `KeyManager` does **not** apply any backpressure of its own. It will
+/// accept messages from the input stream as fast as they arrive, queuing them
+/// internally without bound. The input stream must be backpressured externally
+/// (e.g. by the partition-level semaphore in [`PartitionManager`]) to prevent
+/// unbounded memory growth.
 pub struct KeyManager<M, F, Fut>
 where
     Fut: Future,
