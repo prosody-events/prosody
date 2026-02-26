@@ -30,7 +30,7 @@ use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::stream::select;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, pin_mut};
 use quick_cache::UnitWeighter;
 use quick_cache::unsync::Cache;
 use serde_json::Value;
@@ -403,7 +403,9 @@ async fn handle_messages<T, S>(
     };
 
     let timer_events = stream! {
-        let mut timer_stream = timer_stream;
+        let timer_stream = timer_stream;
+        pin_mut!(timer_stream);
+
         while let Some(timer) = cooperative(timer_stream.next()).await {
             yield UncommittedEvent::Timer(timer);
         }

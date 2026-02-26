@@ -420,7 +420,7 @@ mod tests {
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use color_eyre::eyre::{Result, eyre};
-    use futures::{StreamExt, TryStreamExt};
+    use futures::{StreamExt, TryStreamExt, pin_mut};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Semaphore, watch};
@@ -479,7 +479,9 @@ mod tests {
     async fn test_pending_timer_fire_consumes() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("fire-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -515,7 +517,9 @@ mod tests {
     async fn test_firing_timer_commit() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("commit-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -551,7 +555,9 @@ mod tests {
     async fn test_firing_timer_abort() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("abort-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
