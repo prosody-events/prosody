@@ -73,6 +73,13 @@ where
     /// * `slab_size` - Duration of each time-based slab.
     /// * `name` - Human-readable name for the segment.
     /// * `store` - Persistent [`TriggerStore`] implementation.
+    /// * `heartbeats` - Registry for monitoring timer loader and scheduler
+    ///   liveness.
+    /// * `shutdown_rx` - Watch channel signaling partition shutdown; the slab
+    ///   loader exits when this becomes `true`.
+    /// * `semaphore` - Global semaphore bounding in-flight timer events across
+    ///   all partitions; the timer stream blocks when all permits are held and
+    ///   terminates if the semaphore is closed.
     ///
     /// # Returns
     ///
