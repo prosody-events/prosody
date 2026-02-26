@@ -7,6 +7,9 @@
 //! - **Background Slab Loader**: Preloads upcoming timer slabs.
 //! - **In-Memory Scheduler**: Precise, delay-queue based timer dispatch.
 //! - **Application**: Delivers timers as an async stream of [`PendingTimer`].
+//! - **Global Backpressure**: A shared [`tokio::sync::Semaphore`] bounds
+//!   in-flight timer events across all partitions; the stream blocks when all
+//!   permits are held and terminates if the semaphore is closed.
 //!
 //! The manager ensures timers survive restarts, supports distributed ownership,
 //! and provides at-least-once delivery semantics for timer events.
@@ -24,12 +27,12 @@ use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerType, Trigger};
-use async_stream::try_stream;
+use async_stream::{stream, try_stream};
 use educe::Educe;
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use std::sync::Arc;
 use tokio::spawn;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::coop::cooperative;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
@@ -73,6 +76,13 @@ where
     /// * `slab_size` - Duration of each time-based slab.
     /// * `name` - Human-readable name for the segment.
     /// * `store` - Persistent [`TriggerStore`] implementation.
+    /// * `heartbeats` - Registry for monitoring timer loader and scheduler
+    ///   liveness.
+    /// * `shutdown_rx` - Watch channel signaling partition shutdown; the slab
+    ///   loader exits when this becomes `true`.
+    /// * `semaphore` - Global semaphore bounding in-flight timer events across
+    ///   all partitions; the timer stream blocks when all permits are held and
+    ///   terminates if the semaphore is closed.
     ///
     /// # Returns
     ///
@@ -85,7 +95,6 @@ where
     /// Returns [`TimerManagerError`] if:
     /// - The segment metadata cannot be created or retrieved.
     /// - The scheduler fails to initialize.
-    /// - The slab loader task cannot be spawned.
     pub async fn new(
         segment_id: SegmentId,
         slab_size: CompactDuration,
@@ -93,6 +102,7 @@ where
         store: T,
         heartbeats: HeartbeatRegistry,
         shutdown_rx: watch::Receiver<bool>,
+        semaphore: Arc<Semaphore>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
@@ -115,9 +125,19 @@ where
         let manager = Self(Arc::new(TimerManagerInner { segment, state }));
         let cloned_manager = manager.clone();
 
-        // Wrap the scheduler receiver into an UncommittedTimer stream.
-        let stream = ReceiverStream::new(trigger_rx)
-            .map(move |trigger| PendingTimer::new(trigger, cloned_manager.clone()));
+        // Wrap the scheduler receiver into a PendingTimer stream, acquiring a
+        // semaphore permit per timer to bound global in-flight timer events.
+        // If the semaphore is closed the stream terminates rather than
+        // silently dropping timers.
+        let stream = stream! {
+            let mut receiver = ReceiverStream::new(trigger_rx);
+            while let Some(trigger) = receiver.next().await {
+                let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                    break;
+                };
+                yield PendingTimer::new(trigger, cloned_manager.clone(), permit);
+            }
+        };
 
         Ok((stream, manager))
     }
@@ -440,7 +460,8 @@ where
     /// - From `FiringRescheduled`: transitions to `Scheduled` (keeps DB row,
     ///   timer will fire again).
     ///
-    /// Typically invoked by `FiringTimer::commit()`.
+    /// Typically invoked by [`crate::timers::uncommitted::FiringTimer`]'s
+    /// [`crate::consumer::Uncommitted::commit()`] impl.
     ///
     /// # Arguments
     ///
@@ -504,8 +525,9 @@ where
     ///   `DelayQueue`, will fire again without restart).
     ///
     /// Does not delete the timer from persistent storage; it can be reloaded
-    /// and retried later by the slab loader (from `Firing`) or fires again
-    /// immediately (from `FiringRescheduled`).
+    /// and retried later by the slab loader (from `Firing`) or fires again at
+    /// its scheduled time via the existing queue entry (from
+    /// `FiringRescheduled`).
     ///
     /// # Arguments
     ///
@@ -554,8 +576,12 @@ mod tests {
     use crate::timers::uncommitted::UncommittedTriggerGuard;
     use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Semaphore;
     use tokio::sync::watch;
+
+    const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
     use tokio::task;
     use tokio::time::{self, advance, timeout};
     use tracing::Span;
@@ -598,6 +624,7 @@ mod tests {
             store,
             HeartbeatRegistry::test(),
             shutdown_rx,
+            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
         )
         .await
         .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
@@ -651,6 +678,7 @@ mod tests {
             store,
             HeartbeatRegistry::test(),
             shutdown_rx,
+            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
         )
         .await;
 
@@ -931,7 +959,8 @@ mod tests {
     async fn test_timer_stream_delivery() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
 
         // Schedule a timer for immediate execution
         let now = CompactDateTime::now()?;
@@ -1131,7 +1160,9 @@ mod tests {
     async fn test_timer_type_isolation_end_to_end() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let key = Key::from("isolation-key");
         let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?;
 
@@ -1224,7 +1255,9 @@ mod tests {
     async fn test_timer_type_unschedule_isolation() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let key = Key::from("unschedule-isolation-key");
         let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?;
 
@@ -1298,7 +1331,9 @@ mod tests {
         // T049: Schedule same timer while firing transitions to FiringRescheduled
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("reschedule-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1349,7 +1384,9 @@ mod tests {
         // T050: Multiple reschedules while firing are no-op (idempotent)
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("idempotent-key", 1, TimerType::Application)?;
 
         // Schedule and fire
@@ -1403,7 +1440,9 @@ mod tests {
         // T051: Commit from FIRING state deletes DB row
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("delete-key", 1, TimerType::Application)?;
 
         // Schedule and fire
@@ -1443,7 +1482,9 @@ mod tests {
         // T052: Commit from FIRING_RESCHEDULED state keeps DB row
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("keep-key", 1, TimerType::Application)?;
 
         // Schedule, fire, and reschedule
@@ -1475,7 +1516,9 @@ mod tests {
         // T053: Abort from FIRING_RESCHEDULED transitions to SCHEDULED
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("abort-reschedule-key", 1, TimerType::Application)?;
 
         // Schedule, fire, and reschedule
@@ -1510,7 +1553,9 @@ mod tests {
         // again
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("e2e-key", 1, TimerType::Application)?;
 
         // 1. Schedule timer
@@ -1574,7 +1619,9 @@ mod tests {
         // T058: Verify unschedule when firing (not rescheduled) is a no-op
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("unschedule-firing-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1637,7 +1684,9 @@ mod tests {
         // T059: Verify unschedule when firing+rescheduled cancels the reschedule
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("cancel-reschedule-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1723,7 +1772,9 @@ mod tests {
         // T061: Verify firing timers are excluded from scheduled_times()
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("exclude-firing-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1776,7 +1827,9 @@ mod tests {
         // Verify FiringRescheduled timers are included in scheduled_times()
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("include-rescheduled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1841,7 +1894,9 @@ mod tests {
         // Verify fire() returns Some for a scheduled timer
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("fire-scheduled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1881,7 +1936,9 @@ mod tests {
         // fire()
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("fire-cancelled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1918,7 +1975,9 @@ mod tests {
         // T069: End-to-end integration test: reschedule then abort, timer fires again
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("reschedule-abort-key", 1, TimerType::Application)?;
 
         // 1. Schedule timer
@@ -1984,7 +2043,9 @@ mod tests {
         // Verify abort from Firing state keeps DB row but removes from ActiveTriggers
         time::pause();
 
-        let (mut stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+
         let trigger = create_test_trigger("abort-firing-key", 1, TimerType::Application)?;
 
         // Schedule timer

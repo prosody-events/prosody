@@ -457,20 +457,6 @@ pub struct ConsumerConfiguration {
     #[validate(range(min = 1_usize))]
     pub max_uncommitted: usize,
 
-    /// Maximum number of enqueued messages per key.
-    ///
-    /// Environment variable: `PROSODY_MAX_ENQUEUED_PER_KEY`
-    /// Default: 8
-    ///
-    /// Controls how many messages with the same key can be queued before
-    /// backpressuring.
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?",
-        setter(into)
-    )]
-    #[validate(range(min = 1_usize))]
-    pub max_enqueued_per_key: usize,
-
     /// Partition idempotence cache size.
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
@@ -883,6 +869,7 @@ impl ProsodyConsumer {
     /// * `trigger_store_config` - The trigger store configuration.
     /// * `retry_config` - The retry configuration.
     /// * `monopolization_config` - The monopolization detection configuration.
+    /// * `defer_config` - The defer middleware configuration.
     /// * `common_config` - The common middleware configuration.
     /// * `handler` - The fallible message handler.
     ///
@@ -940,7 +927,6 @@ impl ProsodyConsumer {
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     defer_config.clone(),
                     consumer_config,
-                    &common_config.scheduler,
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
@@ -976,7 +962,6 @@ impl ProsodyConsumer {
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     defer_config.clone(),
                     consumer_config,
-                    &common_config.scheduler,
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
@@ -1195,40 +1180,29 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
     managers.read().len() as u32
 }
 
-/// Initializes and starts consumer components for Kafka message processing.
-///
-/// This function creates and configures the core consumer infrastructure
-/// including the Kafka consumer, polling task, and optional probe server. It
-/// sets up the consumer with proper configuration, subscribes to topics, and
-/// returns the initialized components ready for message processing.
-///
-/// # Arguments
-///
-/// * `config` - The consumer configuration containing Kafka settings and
-///   processing options
-/// * `handler_provider` - Factory for creating message handlers per partition
-/// * `trigger_store` - Storage backend for timer triggers
-/// * `watermark_version` - Atomic counter for tracking offset changes
-/// * `managers` - Thread-safe storage for partition managers
-/// * `allowed_events` - Optional event type filter for message processing
-/// * `shutdown` - Atomic flag for coordinating consumer shutdown
-///
-/// # Returns
-///
-/// Parameters for initializing a consumer
+/// Parameters passed to [`initialize_consumer`] to create a consumer instance.
 struct ConsumerInitParams<T, S>
 where
     T: HandlerProvider,
     S: TriggerStore,
 {
+    /// Consumer configuration (Kafka settings, buffer sizes, timeouts).
     config: ConsumerConfiguration,
+    /// Factory for creating per-partition message handlers.
     handler_provider: T,
+    /// Persistent storage backend for timer triggers.
     trigger_store: S,
+    /// Shared atomic counter for tracking watermark changes.
     watermark_version: Arc<WatermarkVersion>,
+    /// Thread-safe map of active partition managers.
     managers: Arc<Managers>,
+    /// Optional event type filter; `None` passes all events through.
     allowed_events: Option<AhoCorasick>,
+    /// Sender for consumer-level telemetry events.
     telemetry: TelemetrySender,
+    /// Atomic flag for coordinating consumer shutdown.
     shutdown: Arc<AtomicBool>,
+    /// Registry for monitoring consumer-level actors for stalls.
     heartbeats: HeartbeatRegistry,
 }
 

@@ -9,7 +9,6 @@
 //! - Processing messages with the same key sequentially to maintain order
 //! - Processing messages with different keys concurrently to maximize
 //!   throughput
-//! - Managing backpressure through configurable queue size limits per key
 //! - Graceful shutdown with timeout for in-flight operations
 //! - Heartbeat monitoring to detect stalled processing
 
@@ -52,15 +51,20 @@ type HashValue = u64;
 ///
 /// - Preserves message order within each key
 /// - Enables concurrent processing across different keys
-/// - Enforces per-key backpressure through configurable queue limits
 /// - Provides graceful shutdown with timeout for in-flight operations
+///
+/// # Backpressure
+///
+/// `KeyManager` does **not** apply any backpressure of its own. It will
+/// accept messages from the input stream as fast as they arrive, queuing them
+/// internally without bound. The input stream must be backpressured externally
+/// to prevent unbounded memory growth. In the standard wiring, this is provided
+/// by the bounded `mpsc` channel in [`super::PartitionManager`] — messages are only
+/// pulled into `KeyManager` after they have been accepted from that channel.
 pub struct KeyManager<M, F, Fut>
 where
     Fut: Future,
 {
-    /// Maximum number of messages allowed to be queued per key
-    max_enqueued_per_key: usize,
-
     /// Function that processes a message and returns a future
     process: F,
 
@@ -81,31 +85,17 @@ impl<M, F, Fut> KeyManager<M, F, Fut>
 where
     Fut: Future,
 {
-    /// Creates a new `KeyManager` with the specified processing function and
-    /// queue limits.
+    /// Creates a new `KeyManager` with the specified processing function.
     ///
     /// # Arguments
     ///
     /// * `process` - A function that processes a message and returns a future
-    /// * `max_enqueued_per_key` - The maximum number of messages that can be
-    ///   queued per key
     ///
     /// # Returns
     ///
     /// A new `KeyManager` instance
-    ///
-    /// # Panics
-    ///
-    /// Panics if `max_enqueued_per_key` is zero, as it would prevent message
-    /// processing
-    pub fn new(process: F, max_enqueued_per_key: usize) -> Self {
-        debug_assert!(
-            max_enqueued_per_key > 0,
-            "max_enqueued_per_key cannot be zero"
-        );
-
+    pub fn new(process: F) -> Self {
         Self {
-            max_enqueued_per_key,
             process,
             executing: FuturesUnordered::default(),
             busy: IntSet::default(),
@@ -128,7 +118,6 @@ where
     /// * `messages` - A stream of incoming messages to process
     /// * `heartbeat` - A heartbeat used to detect stalled processing
     /// * `shutdown_rx` - A receiver for shutdown signals
-    /// * `max_execution_count` - Maximum number of concurrent tasks allowed
     /// * `shutdown_timeout` - How long to wait for in-flight tasks during
     ///   shutdown
     pub async fn process_messages<S>(
@@ -136,7 +125,6 @@ where
         messages: S,
         heartbeat: Heartbeat,
         mut shutdown_rx: watch::Receiver<bool>,
-        max_execution_count: usize,
         shutdown_timeout: Duration,
     ) where
         S: Stream<Item = M>,
@@ -145,8 +133,6 @@ where
         F: FnMut(M) -> Fut,
         Fut: Future,
     {
-        debug_assert!(max_execution_count > 0, "max_concurrency cannot be zero");
-
         pin_mut!(messages);
         let shutdown_rx = &mut shutdown_rx;
 
@@ -154,57 +140,27 @@ where
         loop {
             heartbeat.beat();
 
-            let execution_count = self.executing.len();
-            if execution_count < max_execution_count {
-                // Capacity available - can process new messages
-                debug!(
-                    %execution_count, %max_execution_count,
-                    "waiting for new message or existing execution to complete"
-                );
-                select! {
-                    // Process the next available message from the executing queue
-                    Some(hash_value) = self.executing.next() => {
-                        self.handle_completion(shutdown_rx, hash_value);
-                    }
-
-                    // Ensure heartbeat is recorded even if nothing happens
-                    () = heartbeat.next() => {}
-
-                    // Check for shutdown signal
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-
-                    // Fetch and process the next message from the input stream
-                    maybe_message = messages.next() => match maybe_message {
-                        None => break, // Stream ended
-                        Some(message) => self.dispatch_message(shutdown_rx, message).await,
-                    },
+            select! {
+                // Process the next available message from the executing queue
+                Some(hash_value) = self.executing.next() => {
+                    self.handle_completion(shutdown_rx, hash_value);
                 }
-            } else {
-                // At capacity - can only process completions
-                debug!(
-                    %execution_count, %max_execution_count,
-                    "limit reached; waiting for existing executions to complete"
-                );
-                select! {
-                    // Wait for a task to complete
-                    Some(hash_value) = self.executing.next() => {
-                        self.handle_completion(shutdown_rx, hash_value);
-                    }
 
-                    // Ensure heartbeat is recorded
-                    () = heartbeat.next() => {}
+                // Ensure heartbeat is recorded even if nothing happens
+                () = heartbeat.next() => {}
 
-                    // Check for shutdown signal
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
+                // Check for shutdown signal
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
                     }
                 }
+
+                // Fetch and process the next message from the input stream
+                maybe_message = messages.next() => match maybe_message {
+                    None => break, // Stream ended
+                    Some(message) => self.dispatch_message(shutdown_rx, message),
+                },
             }
         }
 
@@ -250,7 +206,7 @@ where
     /// * `shutdown_rx` - Receiver for shutdown signals
     /// * `message` - The message to dispatch
     #[instrument(level = "debug", skip(self, shutdown_rx))]
-    async fn dispatch_message(&mut self, shutdown_rx: &mut watch::Receiver<bool>, message: M)
+    fn dispatch_message(&mut self, shutdown_rx: &mut watch::Receiver<bool>, message: M)
     where
         M: Keyed + Debug,
         M::Key: Hash,
@@ -265,7 +221,7 @@ where
 
         // If the key is busy, enqueue the message; otherwise process it immediately
         if self.busy.contains(&hash_value) {
-            self.enqueue_message(shutdown_rx, message, hash_value).await;
+            self.enqueue_message(message, hash_value);
         } else {
             self.process_message(shutdown_rx, message, hash_value);
         }
@@ -310,51 +266,17 @@ where
 
     /// Enqueues a message for a key that is currently busy.
     ///
-    /// If the queue for the key is at capacity, this function waits for space
-    /// to become available before enqueuing the message.
-    ///
     /// # Arguments
     ///
-    /// * `shutdown_rx` - Receiver for shutdown signals
     /// * `message` - The message to enqueue
     /// * `hash_value` - The hash value of the message's key
-    #[instrument(level = "debug", skip(self, shutdown_rx))]
-    async fn enqueue_message(
-        &mut self,
-        shutdown_rx: &mut watch::Receiver<bool>,
-        message: M,
-        hash_value: HashValue,
-    ) where
-        F: FnMut(M) -> Fut,
-        Fut: Future,
+    #[instrument(level = "debug", skip(self))]
+    fn enqueue_message(&mut self, message: M, hash_value: HashValue)
+    where
         M: Debug,
     {
         debug!(?message, hash_value, "enqueuing message");
 
-        // Check the current queue length
-        let queue_len = self
-            .enqueued
-            .get(&hash_value)
-            .map(VecDeque::len)
-            .unwrap_or_default();
-
-        // Wait for space in the queue if it's full
-        if queue_len >= self.max_enqueued_per_key {
-            debug!("queue {hash_value} is full with {queue_len} items; processing paused");
-
-            // Wait for any task to complete, looking for our hash value
-            while let Some(value) = self.executing.next().await {
-                self.handle_completion(shutdown_rx, value);
-
-                // If the completed task was for our key, we now have space
-                if value == hash_value {
-                    debug!("queue {hash_value} is no longer full");
-                    break;
-                }
-            }
-        }
-
-        // Add the message to the queue for this key
         self.enqueued
             .entry(hash_value)
             .or_default()

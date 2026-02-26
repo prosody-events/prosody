@@ -32,7 +32,6 @@ fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>
         group_id: Arc::from("test-group"),
         buffer_size: 10,
         max_uncommitted: 10,
-        max_enqueued_per_key: 1,
         idempotence_cache_size: 0,
         allowed_events: None,
         shutdown_timeout: Duration::from_secs(1),
@@ -40,6 +39,7 @@ fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         trigger_store: memory_store(),
         timer_slab_size: CompactDuration::new(30),
+        timer_semaphore: Arc::new(Semaphore::new(10)),
     }
 }
 
@@ -76,8 +76,7 @@ async fn test_partition_manager_ordering() {
     init_test_logging();
 
     let handler = TestHandler::new();
-    let mut config = default_config();
-    config.max_enqueued_per_key = 2;
+    let config = default_config();
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send messages with the same key and increasing offsets

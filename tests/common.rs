@@ -119,9 +119,6 @@ pub struct TestInput {
 
     /// The number of consumers that should be spawned for the test.
     pub consumer_count: SmallCount,
-
-    /// The maximum number of messages that can be enqueued per key.
-    pub max_enqueued_per_key: SmallCount,
 }
 
 /// Creates a test topic with a specified partition count.
@@ -162,17 +159,13 @@ pub async fn create_test_topic(
 /// # Arguments
 ///
 /// * `topic` - The topic for which configurations are created.
-/// * `max_enqueued_per_key` - Maximum messages to enqueue per key.
 ///
 /// Returns producer and consumer configurations.
 ///
 /// # Errors
 ///
 /// Returns an error if configuration creation fails.
-pub fn create_configs(
-    topic: &Topic,
-    max_enqueued_per_key: SmallCount,
-) -> Result<(ProducerConfiguration, ConsumerConfiguration)> {
+pub fn create_configs(topic: &Topic) -> Result<(ProducerConfiguration, ConsumerConfiguration)> {
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Configure the producer settings
@@ -186,7 +179,6 @@ pub fn create_configs(
         .bootstrap_servers(bootstrap)
         .group_id("test-consumer")
         .subscribed_topics(&[topic.to_string()])
-        .max_enqueued_per_key(max_enqueued_per_key.value())
         .commit_interval(StdDuration::from_secs(1))
         .stall_threshold(StdDuration::from_secs(60))
         .probe_port(None)
@@ -382,7 +374,7 @@ pub fn verify_results(
 pub async fn run_test(input: TestInput) -> Result<()> {
     // Create test topic and configuration settings
     let (topic, admin_client) = create_test_topic(input.partition_count).await?;
-    let (producer_config, consumer_config) = create_configs(&topic, input.max_enqueued_per_key)?;
+    let (producer_config, consumer_config) = create_configs(&topic)?;
 
     // Setup channels and task management
     let (messages_tx, messages_rx) = channel(input.partition_count.value());

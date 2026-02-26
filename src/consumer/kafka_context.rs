@@ -21,6 +21,7 @@ use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
@@ -42,6 +43,7 @@ use crate::timers::store::TriggerStore;
 ///
 /// * `T` - Type implementing `HandlerProvider` to create message handlers for
 ///   partitions
+/// * `S` - Type implementing `TriggerStore` for persistent timer trigger storage
 pub struct Context<T, S>
 where
     T: HandlerProvider,
@@ -72,9 +74,11 @@ where
     ///
     /// * `config` - Consumer configuration including buffer sizes and timeouts
     /// * `handler_provider` - Creates message handlers for partitions
+    /// * `trigger_store` - Persistent storage backend for timer triggers
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
     /// * `allowed_events` - Optional filter for permitted event types
+    /// * `telemetry` - Sender for partition-level telemetry events
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
@@ -89,11 +93,12 @@ where
             CompactDuration::new(10 * 60)
         });
 
+        let timer_semaphore = Arc::new(Semaphore::new(config.max_uncommitted));
+
         let config = PartitionConfiguration {
             group_id: Arc::from(config.group_id.as_str()),
             buffer_size: config.max_uncommitted,
             max_uncommitted: config.max_uncommitted,
-            max_enqueued_per_key: config.max_enqueued_per_key,
             idempotence_cache_size: config.idempotence_cache_size,
             allowed_events,
             shutdown_timeout: config.shutdown_timeout,
@@ -101,6 +106,7 @@ where
             watermark_version,
             trigger_store,
             timer_slab_size,
+            timer_semaphore,
         };
 
         Self {
@@ -219,7 +225,8 @@ where
     /// Handles post-rebalance processing.
     ///
     /// This method is called by librdkafka after a rebalance operation has
-    /// completed. Currently, it simply logs that the rebalance has
+    /// completed. For assignment events, it resumes consumption on the newly
+    /// assigned partitions. For all events, it logs that the rebalance has
     /// completed.
     ///
     /// # Arguments

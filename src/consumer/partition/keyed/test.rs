@@ -5,7 +5,6 @@
 //! functioning of the `KeyManager`, focusing on concurrent execution prevention
 //! and complete message processing.
 
-use std::cmp::max;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -36,17 +35,13 @@ struct SimpleMessages(Vec<u8>);
 /// # Arguments
 ///
 /// * `messages` - A `SimpleMessages` instance containing the test messages.
-/// * `max_enqueued` - The maximum number of messages to enqueue per key.
 ///
 /// # Returns
 ///
 /// A `TestResult` indicating whether the test passed or failed.
 #[quickcheck]
-fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8) -> TestResult {
-    TEST_RUNTIME.block_on(prevents_concurrent_key_execution_impl(
-        messages,
-        max_enqueued,
-    ))
+fn prevents_concurrent_key_execution(messages: SimpleMessages) -> TestResult {
+    TEST_RUNTIME.block_on(prevents_concurrent_key_execution_impl(messages))
 }
 
 /// Verifies that `KeyManager` processes messages for each key in order.
@@ -54,14 +49,13 @@ fn prevents_concurrent_key_execution(messages: SimpleMessages, max_enqueued: u8)
 /// # Arguments
 ///
 /// * `messages` - A `Messages` instance containing the test messages.
-/// * `max_enqueued` - The maximum number of messages to enqueue per key.
 ///
 /// # Returns
 ///
 /// A `TestResult` indicating whether the test passed or failed.
 #[quickcheck]
-fn processes_messages_in_order(messages: Messages, max_enqueued: u8) -> TestResult {
-    TEST_RUNTIME.block_on(processes_messages_in_order_impl(messages, max_enqueued))
+fn processes_messages_in_order(messages: Messages) -> TestResult {
+    TEST_RUNTIME.block_on(processes_messages_in_order_impl(messages))
 }
 
 /// Implements the test for preventing concurrent execution of messages with the
@@ -70,16 +64,13 @@ fn processes_messages_in_order(messages: Messages, max_enqueued: u8) -> TestResu
 /// # Arguments
 ///
 /// * `messages` - A `SimpleMessages` instance containing the test messages.
-/// * `max_enqueued` - The maximum number of messages to enqueue per key.
 ///
 /// # Returns
 ///
 /// A `TestResult` indicating whether the test passed or failed.
 async fn prevents_concurrent_key_execution_impl(
     SimpleMessages(messages): SimpleMessages,
-    max_enqueued: u8,
 ) -> TestResult {
-    let max_enqueued = max(max_enqueued as usize, 1);
     let failed = Arc::new(AtomicBool::new(false));
     let active_keys = Arc::new(HashSet::with_capacity(messages.len()));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -103,12 +94,11 @@ async fn prevents_concurrent_key_execution_impl(
     };
 
     // Process all messages using the KeyManager
-    KeyManager::new(process_fn, max_enqueued)
+    KeyManager::new(process_fn)
         .process_messages(
             iter(messages),
             Heartbeat::new("test", Duration::from_secs(30)),
             shutdown_rx,
-            64,
             Duration::from_millis(100),
         )
         .await;
@@ -127,33 +117,24 @@ async fn prevents_concurrent_key_execution_impl(
 /// # Arguments
 ///
 /// * `messages` - A `Messages` instance containing the test messages.
-/// * `max_enqueued` - The maximum number of messages to enqueue per key.
 ///
 /// # Returns
 ///
 /// A `TestResult` indicating whether the test passed or failed.
-async fn processes_messages_in_order_impl(
-    Messages(messages): Messages,
-    max_enqueued: u8,
-) -> TestResult {
-    let max_enqueued = max(max_enqueued as usize, 1);
+async fn processes_messages_in_order_impl(Messages(messages): Messages) -> TestResult {
     let processed: Arc<HashMap<u8, Vec<u16>>> = Arc::new(HashMap::new());
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    KeyManager::new(
-        |(key, value)| {
-            let processed = processed.clone();
-            async move {
-                processed.entry_async(key).await.or_default().push(value);
-            }
-        },
-        max_enqueued,
-    )
+    KeyManager::new(|(key, value)| {
+        let processed = processed.clone();
+        async move {
+            processed.entry_async(key).await.or_default().push(value);
+        }
+    })
     .process_messages(
         iter(messages.clone()),
         Heartbeat::new("test", Duration::from_secs(30)),
         shutdown_rx,
-        64,
         Duration::from_millis(100),
     )
     .await;

@@ -29,7 +29,6 @@ use prosody::consumer::middleware::defer::{
     DeferConfiguration, FailureTracker, MessageDeferMiddleware,
 };
 use prosody::consumer::middleware::log::LogMiddleware;
-use prosody::consumer::middleware::scheduler::SchedulerConfiguration;
 use prosody::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use prosody::consumer::{ConsumerConfiguration, DemandType, Keyed, ProsodyConsumer};
 use prosody::error::{ClassifyError, ErrorCategory};
@@ -244,8 +243,6 @@ impl DeferTestEnvironment {
             .probe_port(None) // Disable probe server to allow parallel test execution
             .build()?;
 
-        let scheduler_config = SchedulerConfiguration::builder().build()?;
-
         // Use unique keyspace per test to avoid interference
         let keyspace = format!("test_defer_{}", Uuid::new_v4().simple());
         let cassandra_config = CassandraConfiguration::builder()
@@ -274,7 +271,6 @@ impl DeferTestEnvironment {
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
-            &scheduler_config,
             message_provider,
             failure_tracker,
             &heartbeats,
@@ -335,8 +331,6 @@ impl DeferTestEnvironment {
             .probe_port(None) // Disable probe server to allow parallel test execution
             .build()?;
 
-        let scheduler_config = SchedulerConfiguration::builder().build()?;
-
         // Use unique keyspace per test
         let keyspace = format!("test_defer_{}", Uuid::new_v4().simple());
         let cassandra_config = CassandraConfiguration::builder()
@@ -365,7 +359,6 @@ impl DeferTestEnvironment {
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
-            &scheduler_config,
             message_provider,
             failure_tracker,
             &heartbeats,
