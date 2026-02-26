@@ -7,6 +7,9 @@
 //! - **Background Slab Loader**: Preloads upcoming timer slabs.
 //! - **In-Memory Scheduler**: Precise, delay-queue based timer dispatch.
 //! - **Application**: Delivers timers as an async stream of [`PendingTimer`].
+//! - **Global Backpressure**: A shared [`tokio::sync::Semaphore`] bounds
+//!   in-flight timer events across all partitions; the stream blocks when all
+//!   permits are held and terminates if the semaphore is closed.
 //!
 //! The manager ensures timers survive restarts, supports distributed ownership,
 //! and provides at-least-once delivery semantics for timer events.
@@ -92,7 +95,6 @@ where
     /// Returns [`TimerManagerError`] if:
     /// - The segment metadata cannot be created or retrieved.
     /// - The scheduler fails to initialize.
-    /// - The slab loader task cannot be spawned.
     pub async fn new(
         segment_id: SegmentId,
         slab_size: CompactDuration,
@@ -458,7 +460,8 @@ where
     /// - From `FiringRescheduled`: transitions to `Scheduled` (keeps DB row,
     ///   timer will fire again).
     ///
-    /// Typically invoked by `FiringTimer::commit()`.
+    /// Typically invoked by [`crate::timers::uncommitted::FiringTimer`]'s
+    /// [`crate::consumer::Uncommitted::commit()`] impl.
     ///
     /// # Arguments
     ///
@@ -522,8 +525,9 @@ where
     ///   `DelayQueue`, will fire again without restart).
     ///
     /// Does not delete the timer from persistent storage; it can be reloaded
-    /// and retried later by the slab loader (from `Firing`) or fires again
-    /// immediately (from `FiringRescheduled`).
+    /// and retried later by the slab loader (from `Firing`) or fires again at
+    /// its scheduled time via the existing queue entry (from
+    /// `FiringRescheduled`).
     ///
     /// # Arguments
     ///

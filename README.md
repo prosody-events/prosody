@@ -505,12 +505,12 @@ graph TD
     B --> C[Partition Manager: Topic A, Partition 0]
     B --> D[Partition Manager: Topic A, Partition 1]
     B --> E[Partition Manager: Topic B, Partition 0]
-    C --> F[Bounded Queue: User ID 1]
-    C --> G[Bounded Queue: User ID 2]
-    D --> H[Bounded Queue: User ID 3]
-    D --> I[Bounded Queue: User ID 4]
-    E --> J[Bounded Queue: Product ID 1]
-    E --> K[Bounded Queue: Product ID 2]
+    C --> F[Key Queue: User ID 1]
+    C --> G[Key Queue: User ID 2]
+    D --> H[Key Queue: User ID 3]
+    D --> I[Key Queue: User ID 4]
+    E --> J[Key Queue: Product ID 1]
+    E --> K[Key Queue: Product ID 2]
 ```
 
 1. **Partition-Level Parallelism**: Each Kafka partition is managed by a separate `PartitionManager`. This allows for
@@ -518,7 +518,7 @@ graph TD
    messages and tracking offsets for its assigned partition.
 
 2. **Key-Based Queuing**: Within each partition, messages are further divided based on their keys. Each unique key
-   within a partition has its own bounded queue. This ensures that messages with the same key are processed in order.
+   within a partition has its own queue. This ensures that messages with the same key are processed in order.
 
 3. **Concurrent Processing**: Different keys can be processed concurrently, even within the same partition, allowing for
    high throughput. The `PartitionManager` can process messages from different key queues simultaneously.
@@ -535,7 +535,7 @@ graph TD
       from that specific partition. Other partitions continue to make progress, ensuring that a slowdown in one
       partition
       doesn't affect the entire consumer
-    - **Per-key queuing**: Each key has bounded queues to prevent memory exhaustion
+    - **Per-key queuing**: Each key has its own queue to preserve message order; the global semaphore prevents unbounded growth by pausing consumption when the in-flight count reaches `PROSODY_MAX_UNCOMMITTED`
 
 ### Message Flow
 
@@ -573,7 +573,7 @@ visibility of message processing across different services.
 
 This architecture allows Prosody to achieve high throughput by processing different partitions and keys concurrently,
 while still maintaining strict ordering for messages with the same key. It also provides backpressure management by
-limiting the number of in-flight messages per key and partition through bounded queues and selective partition pausing.
+limiting the total number of in-flight messages across all keys within a partition through a global semaphore and selective partition pausing.
 
 ### Component Organization
 

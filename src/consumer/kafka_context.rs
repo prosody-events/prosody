@@ -43,6 +43,7 @@ use crate::timers::store::TriggerStore;
 ///
 /// * `T` - Type implementing `HandlerProvider` to create message handlers for
 ///   partitions
+/// * `S` - Type implementing `TriggerStore` for persistent timer trigger storage
 pub struct Context<T, S>
 where
     T: HandlerProvider,
@@ -73,9 +74,11 @@ where
     ///
     /// * `config` - Consumer configuration including buffer sizes and timeouts
     /// * `handler_provider` - Creates message handlers for partitions
+    /// * `trigger_store` - Persistent storage backend for timer triggers
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
     /// * `allowed_events` - Optional filter for permitted event types
+    /// * `telemetry` - Sender for partition-level telemetry events
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
@@ -222,7 +225,8 @@ where
     /// Handles post-rebalance processing.
     ///
     /// This method is called by librdkafka after a rebalance operation has
-    /// completed. Currently, it simply logs that the rebalance has
+    /// completed. For assignment events, it resumes consumption on the newly
+    /// assigned partitions. For all events, it logs that the rebalance has
     /// completed.
     ///
     /// # Arguments

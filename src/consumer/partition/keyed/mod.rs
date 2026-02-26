@@ -58,8 +58,9 @@ type HashValue = u64;
 /// `KeyManager` does **not** apply any backpressure of its own. It will
 /// accept messages from the input stream as fast as they arrive, queuing them
 /// internally without bound. The input stream must be backpressured externally
-/// (e.g. by the partition-level semaphore in [`PartitionManager`]) to prevent
-/// unbounded memory growth.
+/// to prevent unbounded memory growth. In the standard wiring, this is provided
+/// by the bounded `mpsc` channel in [`super::PartitionManager`] — messages are only
+/// pulled into `KeyManager` after they have been accepted from that channel.
 pub struct KeyManager<M, F, Fut>
 where
     Fut: Future,

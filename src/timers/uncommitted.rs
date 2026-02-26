@@ -14,8 +14,8 @@
 //! 2. Activation: call [`PendingTimer::fire()`] to transition to
 //!    [`FiringTimer`]
 //! 3. Processing: application handles the timer event
-//! 4. Acknowledgment: application calls [`Uncommitted::commit()`] or
-//!    [`Uncommitted::abort()`] on [`FiringTimer`]
+//! 4. Acknowledgment: application calls [`FiringTimer::commit()`] or
+//!    [`FiringTimer::abort()`] on [`FiringTimer`]
 //! 5. Cleanup: timers are removed from storage or left for retry
 //!
 //! Timers use at-least-once delivery and survive restarts. Successful commits
@@ -159,6 +159,8 @@ where
     ///
     /// * `trigger` - The timer event with key, time, and tracing context.
     /// * `manager` - The [`TimerManager`] that will handle commit and abort.
+    /// * `permit` - Semaphore permit bounding global timer concurrency; held
+    ///   until this timer is dropped.
     ///
     /// # Returns
     ///

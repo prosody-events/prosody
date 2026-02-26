@@ -8,7 +8,7 @@
 //! - Preserves strict ordering for messages with the same key
 //! - Tracks and commits message offsets for exactly-once processing
 //! - Manages graceful shutdown of partition processing
-//! - Implements backpressure through buffer capacity limits
+//! - Implements backpressure through the bounded message channel
 //! - Deduplicates messages using event IDs
 //!
 //! The core component is `PartitionManager`, which coordinates all aspects
@@ -82,7 +82,7 @@ struct PartitionContext {
 /// Configuration settings for a partition manager.
 ///
 /// Contains all the parameters needed to configure message processing
-/// for a Kafka partition, including buffer sizes, concurrency limits,
+/// for a Kafka partition, including buffer sizes, timer concurrency,
 /// and filtering options.
 #[derive(Clone, Debug)]
 pub struct PartitionConfiguration<T> {
@@ -126,7 +126,7 @@ pub struct PartitionConfiguration<T> {
 /// - Queuing messages by key to maintain ordering for each key
 /// - Tracking and committing message offsets to ensure at-least-once processing
 /// - Managing graceful partition shutdown during rebalancing
-/// - Enforcing backpressure through queue capacity limits
+/// - Enforcing backpressure through the bounded message channel
 /// - Monitoring for processing stalls
 #[derive(Educe)]
 #[educe(Debug)]
@@ -488,7 +488,8 @@ async fn handle_messages<T, S>(
 ///
 /// # Returns
 ///
-/// A stream of `UncommittedMessage` objects ready for processing
+/// A stream of [`UncommittedEvent`] items (each wrapping an
+/// [`UncommittedMessage`] or a timer) ready for processing
 fn build_message_stream<T>(
     offsets: &OffsetTracker,
     mut message_rx: Receiver<ConsumerMessage>,
