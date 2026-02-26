@@ -146,7 +146,7 @@ where
     completed: bool,
 
     /// Global timer semaphore permit; released when this trigger is dropped.
-    permit: Option<OwnedSemaphorePermit>,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl<T> PendingTimer<T>
@@ -164,7 +164,7 @@ where
     ///
     /// A new [`PendingTimer`] in the pending state.
     #[must_use]
-    pub fn new(trigger: Trigger, manager: TimerManager<T>) -> Self {
+    pub fn new(trigger: Trigger, manager: TimerManager<T>, permit: OwnedSemaphorePermit) -> Self {
         let key = trigger.key.clone();
         let time = trigger.time;
         let timer_type = trigger.timer_type;
@@ -176,17 +176,9 @@ where
                 timer_type,
                 manager,
                 completed: false,
-                permit: None,
+                _permit: permit,
             },
         }
-    }
-
-    /// Attach a global timer semaphore permit to this timer.
-    ///
-    /// The permit is released automatically when the underlying
-    /// [`UncommittedTrigger`] is dropped (via `commit`, `abort`, or `Drop`).
-    pub fn set_permit(&mut self, permit: OwnedSemaphorePermit) {
-        self.uncommitted.permit = Some(permit);
     }
 
     /// Transition this timer to the firing state.
@@ -429,8 +421,9 @@ mod tests {
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, TryStreamExt};
+    use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::watch;
+    use tokio::sync::{Semaphore, watch};
     use tokio::task;
     use tokio::time::{self, advance};
     use uuid::Uuid;
@@ -456,6 +449,7 @@ mod tests {
             store,
             HeartbeatRegistry::test(),
             shutdown_rx,
+            Arc::new(Semaphore::new(64)),
         )
         .await
         .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;

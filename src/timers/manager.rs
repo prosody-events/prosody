@@ -24,12 +24,12 @@ use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerType, Trigger};
-use async_stream::try_stream;
+use async_stream::{stream, try_stream};
 use educe::Educe;
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use std::sync::Arc;
 use tokio::spawn;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::coop::cooperative;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
@@ -93,6 +93,7 @@ where
         store: T,
         heartbeats: HeartbeatRegistry,
         shutdown_rx: watch::Receiver<bool>,
+        semaphore: Arc<Semaphore>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
@@ -115,11 +116,21 @@ where
         let manager = Self(Arc::new(TimerManagerInner { segment, state }));
         let cloned_manager = manager.clone();
 
-        // Wrap the scheduler receiver into an UncommittedTimer stream.
-        let stream = ReceiverStream::new(trigger_rx)
-            .map(move |trigger| PendingTimer::new(trigger, cloned_manager.clone()));
+        // Wrap the scheduler receiver into a PendingTimer stream, acquiring a
+        // semaphore permit per timer to bound global in-flight timer events.
+        // If the semaphore is closed the stream terminates rather than
+        // silently dropping timers.
+        let stream = stream! {
+            let mut receiver = ReceiverStream::new(trigger_rx);
+            while let Some(trigger) = receiver.next().await {
+                let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                    break;
+                };
+                yield PendingTimer::new(trigger, cloned_manager.clone(), permit);
+            }
+        };
 
-        Ok((stream, manager))
+        Ok((Box::pin(stream), manager))
     }
 
     /// Retrieves all scheduled execution times for a given key.
@@ -554,7 +565,9 @@ mod tests {
     use crate::timers::uncommitted::UncommittedTriggerGuard;
     use color_eyre::eyre::{Result, eyre};
     use futures::StreamExt;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Semaphore;
     use tokio::sync::watch;
     use tokio::task;
     use tokio::time::{self, advance, timeout};
@@ -598,6 +611,7 @@ mod tests {
             store,
             HeartbeatRegistry::test(),
             shutdown_rx,
+            Arc::new(Semaphore::new(64)),
         )
         .await
         .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
@@ -651,6 +665,7 @@ mod tests {
             store,
             HeartbeatRegistry::test(),
             shutdown_rx,
+            Arc::new(Semaphore::new(64)),
         )
         .await;
 

@@ -20,9 +20,9 @@ use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::timers::TimerManager;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStore;
-use crate::timers::{PendingTimer, TimerManager};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use ahash::RandomState;
 use aho_corasick::{AhoCorasick, Anchored, Input};
@@ -30,7 +30,7 @@ use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::stream::select;
-use futures::{Stream, StreamExt, pin_mut};
+use futures::{Stream, StreamExt};
 use quick_cache::UnitWeighter;
 use quick_cache::unsync::Cache;
 use serde_json::Value;
@@ -44,7 +44,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
-use tokio::task::coop::cooperative;
 use tokio::time::sleep;
 use tracing::{debug, debug_span, error, info, info_span, instrument};
 use uuid::Uuid;
@@ -390,6 +389,7 @@ async fn handle_messages<T, S>(
             config.trigger_store.clone(),
             heartbeats.clone(),
             shutdown_rx.clone(),
+            config.timer_semaphore.clone(),
         )
         .await
         {
@@ -401,7 +401,7 @@ async fn handle_messages<T, S>(
         }
     };
 
-    let timer_events = build_timer_stream(timer_stream, config.timer_semaphore.clone());
+    let timer_events = timer_stream.map(UncommittedEvent::Timer);
     let combined_stream = select(message_events, timer_events);
 
     // Define how to process each message
@@ -520,28 +520,6 @@ where
             };
 
             yield UncommittedEvent::Message(uncommitted);
-        }
-    }
-}
-
-fn build_timer_stream<T, S>(
-    timer_stream: S,
-    semaphore: Arc<Semaphore>,
-) -> impl Stream<Item = UncommittedEvent<T>>
-where
-    S: Stream<Item = PendingTimer<T>>,
-    T: TriggerStore,
-{
-    stream! {
-        pin_mut!(timer_stream);
-
-        while let Some(mut timer) = cooperative(timer_stream.next()).await {
-            // Block until a permit is available, providing backpressure when
-            // the global in-flight timer cap is reached.
-            if let Ok(permit) = semaphore.clone().acquire_owned().await {
-                timer.set_permit(permit);
-            }
-            yield UncommittedEvent::Timer(timer);
         }
     }
 }
