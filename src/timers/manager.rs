@@ -569,6 +569,8 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Semaphore;
     use tokio::sync::watch;
+
+    const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
     use tokio::task;
     use tokio::time::{self, advance, timeout};
     use tracing::Span;
@@ -611,7 +613,7 @@ mod tests {
             store,
             HeartbeatRegistry::test(),
             shutdown_rx,
-            Arc::new(Semaphore::new(64)),
+            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
         )
         .await
         .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
@@ -665,7 +667,7 @@ mod tests {
             store,
             HeartbeatRegistry::test(),
             shutdown_rx,
-            Arc::new(Semaphore::new(64)),
+            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
         )
         .await;
 

@@ -926,7 +926,6 @@ impl ProsodyConsumer {
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     defer_config.clone(),
                     consumer_config,
-                    &common_config.scheduler,
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
@@ -962,7 +961,6 @@ impl ProsodyConsumer {
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     defer_config.clone(),
                     consumer_config,
-                    &common_config.scheduler,
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,

@@ -44,6 +44,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
+use tokio::task::coop::cooperative;
 use tokio::time::sleep;
 use tracing::{debug, debug_span, error, info, info_span, instrument};
 use uuid::Uuid;
@@ -401,7 +402,12 @@ async fn handle_messages<T, S>(
         }
     };
 
-    let timer_events = timer_stream.map(UncommittedEvent::Timer);
+    let timer_events = stream! {
+        let mut timer_stream = timer_stream;
+        while let Some(timer) = cooperative(timer_stream.next()).await {
+            yield UncommittedEvent::Timer(timer);
+        }
+    };
     let combined_stream = select(message_events, timer_events);
 
     // Define how to process each message

@@ -24,7 +24,6 @@ use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
 use crate::consumer::middleware::defer::error::{DeferError, DeferInitError, DeferResult};
-use crate::consumer::middleware::scheduler::SchedulerConfiguration;
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
@@ -77,7 +76,6 @@ where
     pub fn new(
         config: DeferConfiguration,
         consumer_config: &ConsumerConfiguration,
-        scheduler_config: &SchedulerConfiguration,
         provider: P,
         decider: FailureTracker,
         heartbeats: &HeartbeatRegistry,
@@ -94,7 +92,7 @@ where
         let loader_config = LoaderConfiguration {
             bootstrap_servers: consumer_config.bootstrap_servers.clone(),
             group_id: loader_group_id,
-            max_permits: scheduler_config.max_concurrency,
+            max_permits: consumer_config.max_uncommitted,
             cache_size: config.cache_size,
             poll_interval: consumer_config.poll_interval,
             seek_timeout: config.seek_timeout,

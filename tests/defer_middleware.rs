@@ -29,7 +29,6 @@ use prosody::consumer::middleware::defer::{
     DeferConfiguration, FailureTracker, MessageDeferMiddleware,
 };
 use prosody::consumer::middleware::log::LogMiddleware;
-use prosody::consumer::middleware::scheduler::SchedulerConfiguration;
 use prosody::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use prosody::consumer::{ConsumerConfiguration, DemandType, Keyed, ProsodyConsumer};
 use prosody::error::{ClassifyError, ErrorCategory};
@@ -261,7 +260,6 @@ impl DeferTestEnvironment {
             segment_store,
         );
 
-        let scheduler_config = SchedulerConfiguration::builder().build()?;
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
         let failure_tracker = FailureTracker::new(
@@ -273,7 +271,6 @@ impl DeferTestEnvironment {
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
-            &scheduler_config,
             message_provider,
             failure_tracker,
             &heartbeats,
@@ -351,7 +348,6 @@ impl DeferTestEnvironment {
             segment_store,
         );
 
-        let scheduler_config = SchedulerConfiguration::builder().build()?;
         let telemetry = Telemetry::new();
         let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
         let failure_tracker = FailureTracker::new(
@@ -363,7 +359,6 @@ impl DeferTestEnvironment {
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
-            &scheduler_config,
             message_provider,
             failure_tracker,
             &heartbeats,
