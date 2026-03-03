@@ -161,9 +161,7 @@ impl MigrationModel {
         let mut slab_ids: Vec<SlabId> = self
             .triggers
             .iter()
-            .map(|(_, time, _)| {
-                Slab::from_time(self.segment.id, self.segment.slab_size, *time).id()
-            })
+            .map(|(_, time, _)| Slab::from_time(self.segment.slab_size, *time).id())
             .collect();
         slab_ids.sort_unstable();
         slab_ids.dedup();
@@ -199,8 +197,7 @@ async fn setup_v1_state(
     // Step 2: Calculate unique slab IDs from triggers
     let mut slab_ids = HashSet::default();
     for trigger_data in &input.triggers {
-        let slab_id =
-            Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time).id();
+        let slab_id = Slab::from_time(input.initial_slab_size, trigger_data.time).id();
         slab_ids.insert(slab_id);
     }
 
@@ -223,7 +220,7 @@ async fn setup_v1_state(
         operations
             .add_trigger(
                 &input.segment_id,
-                Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time).id(),
+                Slab::from_time(input.initial_slab_size, trigger_data.time).id(),
                 v1_trigger,
             )
             .await
@@ -256,7 +253,7 @@ async fn setup_v2_state(
     // Register each unique slab in the slab index.
     let mut registered_slabs = HashSet::default();
     for trigger_data in &input.triggers {
-        let slab = Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time);
+        let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
         if registered_slabs.insert(slab.id()) {
             store
                 .insert_slab(slab)
@@ -269,7 +266,7 @@ async fn setup_v2_state(
     // deliberately omit any write to the state MAP column. This is the exact
     // layout produced by old V2 write paths before state backfill existed.
     for trigger_data in &input.triggers {
-        let slab = Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time);
+        let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
         let trigger = Trigger::new(
             trigger_data.key.clone(),
             trigger_data.time,
@@ -313,7 +310,7 @@ async fn setup_v3_state(
             trigger_data.timer_type,
             Span::current(),
         );
-        let slab = Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time);
+        let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
 
         Box::pin(store.add_trigger(slab, trigger))
             .await
@@ -440,7 +437,7 @@ async fn verify_correct_indexing(
         HashMap::default();
 
     for (key, time, timer_type) in &model.triggers {
-        let slab = Slab::from_time(model.segment.id, model.segment.slab_size, *time);
+        let slab = Slab::from_time(model.segment.slab_size, *time);
         expected_by_slab
             .entry(slab.id())
             .or_default()
@@ -449,7 +446,7 @@ async fn verify_correct_indexing(
 
     // Verify each slab has correct triggers
     for (slab_id, expected) in &expected_by_slab {
-        let slab = Slab::new(model.segment.id, *slab_id, model.segment.slab_size);
+        let slab = Slab::new(*slab_id, model.segment.slab_size);
 
         let actual_triggers: Vec<Trigger> = store
             .get_slab_triggers_all_types(&slab)
@@ -493,7 +490,7 @@ async fn verify_dual_index_consistency(
     let slab_ids = model.expected_slab_ids();
 
     for slab_id in slab_ids {
-        let slab = Slab::new(model.segment.id, slab_id, model.segment.slab_size);
+        let slab = Slab::new(slab_id, model.segment.slab_size);
         let triggers: Vec<Trigger> = store
             .get_slab_triggers_all_types(&slab)
             .try_collect()
@@ -629,8 +626,7 @@ async fn verify_cleanup(
         // Calculate old slab IDs
         let mut old_slab_ids = HashSet::default();
         for trigger_data in &input.triggers {
-            let old_slab_id =
-                Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time).id();
+            let old_slab_id = Slab::from_time(input.initial_slab_size, trigger_data.time).id();
             old_slab_ids.insert(old_slab_id);
         }
 

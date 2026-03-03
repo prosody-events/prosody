@@ -78,7 +78,7 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let slab = Slab::from_time(segment.id, segment.slab_size, trigger.time);
+    let slab = Slab::from_time(segment.slab_size, trigger.time);
     store
         .add_trigger(slab, trigger.clone())
         .await
@@ -182,7 +182,7 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let slab = Slab::from_time(segment.id, segment.slab_size, time);
+    let slab = Slab::from_time(segment.slab_size, time);
     store
         .remove_trigger(&slab, key, time, TimerType::Application)
         .await
@@ -218,7 +218,7 @@ where
 
     // Remove each trigger
     for time in times {
-        let slab = Slab::from_time(segment.id, segment.slab_size, time);
+        let slab = Slab::from_time(segment.slab_size, time);
         store
             .remove_trigger(&slab, key, time, timer_type)
             .await
@@ -265,7 +265,7 @@ where
 
         // Verify slab consistency for each time
         for &time in expected_times {
-            let slab = Slab::from_time(segment.id, segment.slab_size, time);
+            let slab = Slab::from_time(segment.slab_size, time);
             let slab_triggers = get_slab_triggers_all_types(store, &slab).await?;
 
             // Check if this trigger is in the correct slab

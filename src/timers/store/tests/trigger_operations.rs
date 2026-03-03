@@ -68,7 +68,7 @@ where
 
     // Check slab-based retrieval
     if let Some(trigger) = input.triggers.first() {
-        let slab = Slab::from_time(input.segment.id, input.segment.slab_size, trigger.time);
+        let slab = Slab::from_time(input.segment.slab_size, trigger.time);
 
         let slab_triggers = get_slab_triggers(store, &slab).await?;
 
@@ -77,7 +77,7 @@ where
             .triggers
             .iter()
             .filter(|t| {
-                let t_slab = Slab::from_time(input.segment.id, input.segment.slab_size, t.time);
+                let t_slab = Slab::from_time(input.segment.slab_size, t.time);
                 t_slab.id() == slab.id()
             })
             .cloned()
@@ -103,7 +103,7 @@ where
         }
 
         // Check it's also gone from the slab
-        let trigger_slab = Slab::from_time(input.segment.id, input.segment.slab_size, trigger.time);
+        let trigger_slab = Slab::from_time(input.segment.slab_size, trigger.time);
         let remaining_slab_triggers = get_slab_triggers(store, &trigger_slab).await?;
 
         let trigger_in_slab = remaining_slab_triggers

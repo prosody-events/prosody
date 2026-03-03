@@ -531,7 +531,7 @@ impl V1Operations {
                 let self_clone = self.clone();
                 async move {
                     // Calculate which slab this trigger belongs to
-                    let slab = Slab::from_time(segment_id_copy, slab_size, trigger.time);
+                    let slab = Slab::from_time(slab_size, trigger.time);
                     self_clone
                         .delete_slab_trigger(
                             &segment_id_copy,

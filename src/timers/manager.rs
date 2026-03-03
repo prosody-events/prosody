@@ -213,7 +213,7 @@ where
     /// - The scheduler enqueue fails.
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
         // Determine the slab for this trigger time.
-        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, trigger.time);
+        let slab = Slab::from_time(self.0.segment.slab_size, trigger.time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -307,7 +307,7 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         // Identify the slab containing this time.
-        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
+        let slab = Slab::from_time(self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -419,7 +419,7 @@ where
         &self,
         trigger: Trigger,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        let new_slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, trigger.time);
+        let new_slab = Slab::from_time(self.0.segment.slab_size, trigger.time);
         let new_slab_id = new_slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -435,7 +435,7 @@ where
         let old_slabs: Vec<Slab> = existing_triggers
             .iter()
             .filter(|t| t.time != trigger.time)
-            .map(|t| Slab::from_time(self.0.segment.id, self.0.segment.slab_size, t.time))
+            .map(|t| Slab::from_time(self.0.segment.slab_size, t.time))
             .collect();
 
         debug!(
@@ -580,7 +580,7 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         // Derive the slab and lock state.
-        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
+        let slab = Slab::from_time(self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -635,7 +635,7 @@ where
     /// * `time` - The scheduled execution time to abort.
     /// * `timer_type` - The timer type classification.
     pub async fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
-        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
+        let slab = Slab::from_time(self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -686,7 +686,7 @@ async fn unschedule_replaced_timers<T: TriggerStore>(
             continue; // Same time as new - already handled by caller
         }
 
-        let old_slab_id = Slab::from_time(segment.id, segment.slab_size, old_trigger.time).id();
+        let old_slab_id = Slab::from_time(segment.slab_size, old_trigger.time).id();
 
         let old_state = state
             .scheduler

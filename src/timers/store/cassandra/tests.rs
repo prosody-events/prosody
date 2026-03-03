@@ -139,7 +139,7 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
 
     // Insert test slabs
     for &slab_id in &test_slab_ids {
-        let slab = Slab::new(segment_id, slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, segment.slab_size);
         store.insert_slab(slab).await?;
     }
 
@@ -222,7 +222,7 @@ async fn test_simple_wrap_around() -> Result<()> {
 
     // Insert test slabs
     for &slab_id in &test_ids {
-        let slab = Slab::new(segment_id, slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, segment.slab_size);
         store.insert_slab(slab).await?;
     }
 

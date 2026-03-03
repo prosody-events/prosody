@@ -1,31 +1,29 @@
 //! Time-based partitioning for efficient timer storage and retrieval.
 //!
 //! Defines the [`Slab`] type and its operations. A [`Slab`] is a fixed-duration
-//! time window within a segment. Timers whose execution times fall into the
-//! same window are grouped into the same slab, enabling efficient range queries
-//! and storage organization.
+//! time window. Timers whose execution times fall into the same window are
+//! grouped into the same slab, enabling efficient range queries and storage
+//! organization.
 //!
 //! Slab calculations use `slab_id = floor(epoch_seconds / slab_size_seconds)`
 //! to partition time. Slabs implement [`Ord`] and [`PartialOrd`], ordering
-//! first by segment ID, then by slab ID.
+//! by slab ID.
 
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::SegmentId;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::ops::Range;
 
-/// Unique identifier for a time-based slab within a segment.
+/// Unique identifier for a time-based slab.
 pub type SlabId = u32;
 
-/// A time-based partition of timer data within a segment.
+/// A time-based partition of timer data.
 ///
 /// Groups all timers whose execution times fall within the same fixed-duration
 /// window. This partitioning allows fast loading, unloading, and querying of
 /// timers by time ranges.
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Slab {
-    segment_id: SegmentId,
     id: SlabId,
     size: CompactDuration,
 }
@@ -35,23 +33,17 @@ impl Slab {
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment this slab belongs to.
-    /// * `id` - The numeric slab identifier within the segment.
+    /// * `id` - The numeric slab identifier.
     /// * `size` - The duration each slab covers.
     #[must_use]
-    pub fn new(segment_id: SegmentId, id: SlabId, size: CompactDuration) -> Self {
-        Slab {
-            segment_id,
-            id,
-            size,
-        }
+    pub fn new(id: SlabId, size: CompactDuration) -> Self {
+        Slab { id, size }
     }
 
     /// Calculates which slab contains the specified time.
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - The segment this slab belongs to.
     /// * `size` - The duration each slab covers.
     /// * `time` - The timestamp to locate.
     ///
@@ -60,7 +52,7 @@ impl Slab {
     /// A [`Slab`] whose time range includes `time`. If `size.seconds() == 0`,
     /// returns slab ID 0 to avoid division by zero.
     #[must_use]
-    pub fn from_time(segment_id: SegmentId, size: CompactDuration, time: CompactDateTime) -> Self {
+    pub fn from_time(size: CompactDuration, time: CompactDateTime) -> Self {
         let epoch_secs = time.epoch_seconds();
         let slab_secs = size.seconds();
 
@@ -71,23 +63,13 @@ impl Slab {
             epoch_secs.saturating_div(slab_secs)
         };
 
-        Slab {
-            segment_id,
-            id,
-            size,
-        }
+        Slab { id, size }
     }
 
     /// Returns this slab's numeric identifier.
     #[must_use]
     pub fn id(&self) -> SlabId {
         self.id
-    }
-
-    /// Returns the segment identifier for this slab.
-    #[must_use]
-    pub fn segment_id(&self) -> &SegmentId {
-        &self.segment_id
     }
 
     /// Returns the duration each slab covers.
@@ -161,21 +143,17 @@ impl Slab {
 }
 
 impl Debug for Slab {
-    /// Debug format: `Slab(segment_id/slab_id)`.
+    /// Debug format: `Slab(42)`.
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "Slab({}/{})", self.segment_id, self.id)
+        write!(f, "Slab({})", self.id)
     }
 }
 
 impl Display for Slab {
-    /// Display format: `segment_id/slab_id[start—end]`.
+    /// Display format: `42[180—240]`.
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let range = self.range();
-        write!(
-            f,
-            "{}/{}[{}—{}]",
-            self.segment_id, self.id, range.start, range.end
-        )
+        write!(f, "{}[{}—{}]", self.id, range.start, range.end)
     }
 }
 
@@ -184,54 +162,46 @@ mod tests {
     use super::*;
     use crate::timers::datetime::CompactDateTime;
     use crate::timers::duration::CompactDuration;
-    use uuid::Uuid;
 
     #[test]
     fn test_slab_new() {
-        let segment_id = Uuid::new_v4();
         let slab_id = 42;
         let size = CompactDuration::new(60); // 60 seconds
 
-        let slab = Slab::new(segment_id, slab_id, size);
+        let slab = Slab::new(slab_id, size);
 
-        assert_eq!(slab.segment_id(), &segment_id);
         assert_eq!(slab.id(), slab_id);
         assert_eq!(slab.size(), size);
     }
 
     #[test]
     fn test_slab_from_time() {
-        let segment_id = Uuid::new_v4();
         let size = CompactDuration::new(60); // 60 seconds
         let time = CompactDateTime::from(123_i32); // 123 seconds since epoch
 
-        let slab = Slab::from_time(segment_id, size, time);
+        let slab = Slab::from_time(size, time);
 
-        assert_eq!(slab.segment_id(), &segment_id);
         assert_eq!(slab.size(), size);
         assert_eq!(slab.id(), 2); // 123 / 60 = 2
     }
 
     #[test]
     fn test_slab_from_time_zero_size() {
-        let segment_id = Uuid::new_v4();
         let size = CompactDuration::new(0); // Zero duration
         let time = CompactDateTime::from(123_i32); // 123 seconds since epoch
 
-        let slab = Slab::from_time(segment_id, size, time);
+        let slab = Slab::from_time(size, time);
 
-        assert_eq!(slab.segment_id(), &segment_id);
         assert_eq!(slab.size(), size);
         assert_eq!(slab.id(), 0); // Slab ID should default to 0 for zero size
     }
 
     #[test]
     fn test_slab_range() {
-        let segment_id = Uuid::new_v4();
         let slab_id = 3;
         let size = CompactDuration::new(60); // 60 seconds
 
-        let slab = Slab::new(segment_id, slab_id, size);
+        let slab = Slab::new(slab_id, size);
         let range = slab.range();
 
         assert_eq!(range.start.epoch_seconds(), 180); // 3 * 60 = 180
@@ -240,11 +210,10 @@ mod tests {
 
     #[test]
     fn test_slab_range_zero_size() {
-        let segment_id = Uuid::new_v4();
         let slab_id = 3;
         let size = CompactDuration::new(0); // Zero duration
 
-        let slab = Slab::new(segment_id, slab_id, size);
+        let slab = Slab::new(slab_id, size);
         let range = slab.range();
 
         assert_eq!(range.start.epoch_seconds(), 0); // Start should be 0
@@ -253,29 +222,27 @@ mod tests {
 
     #[test]
     fn test_slab_debug() {
-        let segment_id = Uuid::new_v4();
         let slab_id = 42;
         let size = CompactDuration::new(60); // 60 seconds
 
-        let slab = Slab::new(segment_id, slab_id, size);
+        let slab = Slab::new(slab_id, size);
         let debug_str = format!("{slab:?}");
 
-        assert_eq!(debug_str, format!("Slab({segment_id}/{slab_id})"));
+        assert_eq!(debug_str, format!("Slab({slab_id})"));
     }
 
     #[test]
     fn test_slab_display() {
-        let segment_id = Uuid::new_v4();
         let slab_id = 3;
         let size = CompactDuration::new(60); // 60 seconds
 
-        let slab = Slab::new(segment_id, slab_id, size);
+        let slab = Slab::new(slab_id, size);
         let display_str = format!("{slab}");
 
         assert_eq!(
             display_str,
             format!(
-                "{segment_id}/{slab_id}[{}—{}]",
+                "{slab_id}[{}—{}]",
                 CompactDateTime::from(180_i32), // Start of range
                 CompactDateTime::from(240_i32)  // End of range
             )
@@ -284,12 +251,11 @@ mod tests {
 
     #[test]
     fn test_slab_equality() {
-        let segment_id = Uuid::new_v4();
         let size = CompactDuration::new(60); // 60 seconds
 
-        let slab1 = Slab::new(segment_id, 1, size);
-        let slab2 = Slab::new(segment_id, 1, size);
-        let slab3 = Slab::new(segment_id, 2, size);
+        let slab1 = Slab::new(1, size);
+        let slab2 = Slab::new(1, size);
+        let slab3 = Slab::new(2, size);
 
         assert_eq!(slab1, slab2);
         assert_ne!(slab1, slab3);
@@ -297,11 +263,10 @@ mod tests {
 
     #[test]
     fn test_slab_ordering() {
-        let segment_id = Uuid::new_v4();
         let size = CompactDuration::new(60); // 60 seconds
 
-        let slab1 = Slab::new(segment_id, 1, size);
-        let slab2 = Slab::new(segment_id, 2, size);
+        let slab1 = Slab::new(1, size);
+        let slab2 = Slab::new(2, size);
 
         assert!(slab1 < slab2);
         assert!(slab2 > slab1);

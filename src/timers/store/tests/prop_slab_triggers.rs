@@ -4,10 +4,7 @@
 //! simple reference model to verify correctness.
 //!
 //! Each store instance is scoped to exactly one segment. All slab trigger
-//! operations are routed through that segment's partition — the `segment_id`
-//! embedded in a slab is ignored by the store, which always uses its own
-//! `self.segment.id`. This test constructs all slabs using the store's own
-//! segment ID to reflect that invariant.
+//! operations are routed through that segment's partition.
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
@@ -311,10 +308,8 @@ where
     T: TriggerOperations + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
-    let segment_id = operations.segment().id;
-
     for slab_id in model.all_slab_ids() {
-        let slab = Slab::new(segment_id, slab_id, slab_size);
+        let slab = Slab::new(slab_id, slab_size);
 
         // Verify get_slab_triggers for each timer type
         for &timer_type in TimerType::VARIANTS {
@@ -367,10 +362,6 @@ where
 /// 3. For every `Get` operation, verify the store's response matches the model
 /// 4. After all operations, verify final state matches
 ///
-/// All slabs are constructed using `operations.segment().id` — the store's own
-/// segment — since the store always queries its own partition regardless of
-/// what `segment_id` was embedded in the slab.
-///
 /// # Errors
 ///
 /// Returns an error if:
@@ -386,11 +377,9 @@ where
     T: TriggerOperations + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
-    let segment_id = operations.segment().id;
-
     // Clean up the slabs from any previous trial
     for slab_id in 0u32..5 {
-        let slab = Slab::new(segment_id, slab_id, input.slab_size);
+        let slab = Slab::new(slab_id, input.slab_size);
         operations
             .clear_slab_triggers(&slab)
             .await
@@ -403,7 +392,7 @@ where
         match op {
             SlabTriggerOperation::Insert { slab_id, trigger } => {
                 model.apply(op);
-                let slab = Slab::new(segment_id, *slab_id, input.slab_size);
+                let slab = Slab::new(*slab_id, input.slab_size);
                 operations
                     .insert_slab_trigger(slab, trigger.clone())
                     .await
@@ -415,12 +404,12 @@ where
                 slab_id,
                 timer_type,
             } => {
-                let slab = Slab::new(segment_id, *slab_id, input.slab_size);
+                let slab = Slab::new(*slab_id, input.slab_size);
                 verify_slab_triggers_by_type(operations, &model, &slab, *timer_type, op_idx)
                     .await?;
             }
             SlabTriggerOperation::GetAllTypes(slab_id) => {
-                let slab = Slab::new(segment_id, *slab_id, input.slab_size);
+                let slab = Slab::new(*slab_id, input.slab_size);
                 verify_slab_triggers_all_types(operations, &model, &slab, op_idx).await?;
             }
             SlabTriggerOperation::Delete {
@@ -430,7 +419,7 @@ where
                 time,
             } => {
                 model.apply(op);
-                let slab = Slab::new(segment_id, *slab_id, input.slab_size);
+                let slab = Slab::new(*slab_id, input.slab_size);
                 operations
                     .delete_slab_trigger(&slab, *timer_type, key, *time)
                     .await
@@ -440,7 +429,7 @@ where
             }
             SlabTriggerOperation::Clear(slab_id) => {
                 model.apply(op);
-                let slab = Slab::new(segment_id, *slab_id, input.slab_size);
+                let slab = Slab::new(*slab_id, input.slab_size);
                 operations.clear_slab_triggers(&slab).await.map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} Clear slab failed: {e:?}")
                 })?;

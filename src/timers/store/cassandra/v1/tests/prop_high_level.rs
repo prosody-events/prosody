@@ -111,7 +111,7 @@ impl Arbitrary for V1HighLevelTestInput {
                     // AddTrigger
                     let key: Key = format!("key-{}", u8::arbitrary(g) % 5).into();
                     let time = CompactDateTime::arbitrary(g);
-                    let slab = Slab::from_time(segment_id, slab_size, time);
+                    let slab = Slab::from_time(slab_size, time);
                     let slab_id = slab.id();
 
                     existing_triggers.insert((segment_id, slab_id, key.clone(), time), ());
@@ -132,7 +132,7 @@ impl Arbitrary for V1HighLevelTestInput {
                         // Generate random remove (might not exist)
                         let key: Key = format!("key-{}", u8::arbitrary(g) % 5).into();
                         let time = CompactDateTime::arbitrary(g);
-                        let slab = Slab::from_time(segment_id, slab_size, time);
+                        let slab = Slab::from_time(slab_size, time);
                         let slab_id = slab.id();
 
                         V1HighLevelOperation::RemoveTrigger {
@@ -173,7 +173,7 @@ impl Arbitrary for V1HighLevelTestInput {
                 3 => {
                     // DeleteSlab
                     let time = CompactDateTime::arbitrary(g);
-                    let slab = Slab::from_time(segment_id, slab_size, time);
+                    let slab = Slab::from_time(slab_size, time);
                     let slab_id = slab.id();
 
                     // Remove all triggers in this slab
@@ -188,7 +188,7 @@ impl Arbitrary for V1HighLevelTestInput {
                 4 => {
                     // GetSlabTriggers query
                     let time = CompactDateTime::arbitrary(g);
-                    let slab = Slab::from_time(segment_id, slab_size, time);
+                    let slab = Slab::from_time(slab_size, time);
                     let slab_id = slab.id();
 
                     V1HighLevelOperation::GetSlabTriggers {
@@ -294,7 +294,7 @@ impl V1HighLevelModel {
 
                 // Remove from slab index for each trigger
                 for (k, time) in &triggers_to_remove {
-                    let slab = Slab::from_time(*segment_id, *slab_size, *time);
+                    let slab = Slab::from_time(*slab_size, *time);
                     if let Some(triggers) = self.slab_index.get_mut(&(*segment_id, slab.id())) {
                         triggers.remove(&(k.clone(), *time));
                     }

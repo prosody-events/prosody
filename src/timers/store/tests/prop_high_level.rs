@@ -154,7 +154,7 @@ fn generate_add_trigger(
     let key = random_key(g);
     let time = CompactDateTime::arbitrary(g);
     let timer_type = random_timer_type(g);
-    let slab = Slab::from_time(segment.id, segment.slab_size, time);
+    let slab = Slab::from_time(segment.slab_size, time);
 
     existing_triggers.insert((segment.id, slab.id(), key.clone(), time, timer_type));
 
@@ -177,7 +177,7 @@ fn generate_remove_trigger(
         let key = random_key(g);
         let time = CompactDateTime::arbitrary(g);
         let timer_type = random_timer_type(g);
-        let slab = Slab::from_time(segment.id, segment.slab_size, time);
+        let slab = Slab::from_time(segment.slab_size, time);
 
         HighLevelOperation::RemoveTrigger {
             segment: segment.clone(),
@@ -199,7 +199,7 @@ fn generate_remove_trigger(
             .find(|s| s.id == *seg_id)
             .unwrap_or(&segments[0])
             .clone();
-        let slab = Slab::from_time(*seg_id, segment.slab_size, *time);
+        let slab = Slab::from_time(segment.slab_size, *time);
 
         HighLevelOperation::RemoveTrigger {
             segment,
@@ -218,7 +218,7 @@ fn generate_delete_slab(
     existing_triggers: &mut ExistingTriggers,
 ) -> HighLevelOperation {
     let time = CompactDateTime::arbitrary(g);
-    let slab = Slab::from_time(segment.id, segment.slab_size, time);
+    let slab = Slab::from_time(segment.slab_size, time);
     let slab_id = slab.id();
 
     // Remove all triggers in this slab from existing_triggers
@@ -258,7 +258,7 @@ fn generate_clear_and_schedule(
         new_time = CompactDateTime::arbitrary(g);
     }
 
-    let new_slab = Slab::from_time(segment.id, segment.slab_size, new_time);
+    let new_slab = Slab::from_time(segment.slab_size, new_time);
 
     // Build old_slabs from the complete slab tracker (survives delete_slab)
     let old_slabs: Vec<Slab> = key_trigger_slabs
@@ -266,7 +266,7 @@ fn generate_clear_and_schedule(
         .map(|slab_ids| {
             slab_ids
                 .iter()
-                .map(|&sid| Slab::new(segment.id, sid, segment.slab_size))
+                .map(|&sid| Slab::new(sid, segment.slab_size))
                 .collect()
         })
         .unwrap_or_default();
@@ -299,7 +299,7 @@ fn generate_clear_and_schedule(
 /// Generates a `GetSlabTriggersAllTypes` query operation.
 fn generate_get_slab_triggers_all_types(g: &mut Gen, segment: &Segment) -> HighLevelOperation {
     let time = CompactDateTime::arbitrary(g);
-    let slab = Slab::from_time(segment.id, segment.slab_size, time);
+    let slab = Slab::from_time(segment.slab_size, time);
     HighLevelOperation::GetSlabTriggersAllTypes { slab }
 }
 
@@ -398,7 +398,7 @@ impl Arbitrary for HighLevelTestInput {
                         ..
                     } = op
                     {
-                        let slab = Slab::from_time(segment.id, segment.slab_size, time);
+                        let slab = Slab::from_time(segment.slab_size, time);
                         let map_key = (segment.id, key.clone(), timer_type);
                         let has_more = existing_triggers.iter().any(|(seg, sid, k, _, tt)| {
                             *seg == segment.id && *sid == slab.id() && k == key && *tt == timer_type
@@ -610,12 +610,11 @@ where
     S::Error: Debug,
 {
     // Get expected from model - collect all triggers for this slab across ALL timer
-    // types
+    // types. The store is single-segment, so segment filtering is not needed here.
     let mut expected = BTreeSet::new();
-    let target_seg_id = slab.segment_id();
     let target_slab_id = slab.id();
-    for ((seg_id, slab_id, _timer_type), trigger_set) in &model.slab_index {
-        if seg_id == target_seg_id && *slab_id == target_slab_id {
+    for ((_seg_id, slab_id, _timer_type), trigger_set) in &model.slab_index {
+        if *slab_id == target_slab_id {
             expected.extend(trigger_set.iter().cloned());
         }
     }
@@ -850,7 +849,7 @@ where
             .ok_or_else(|| color_eyre::eyre::eyre!("Segment not found during cleanup"))?;
 
         for (key, time, timer_type) in trigger_set {
-            let slab = Slab::from_time(*segment_id, segment.slab_size, *time);
+            let slab = Slab::from_time(segment.slab_size, *time);
             // Ignore errors during cleanup - triggers may have been removed by test
             // operations
             let _ = store.remove_trigger(&slab, key, *time, *timer_type).await;
@@ -900,7 +899,7 @@ where
             .iter()
             .find(|s| s.id == *segment_id)
             .unwrap_or(&segments[0]);
-        let slab = Slab::new(*segment_id, *slab_id, segment.slab_size);
+        let slab = Slab::new(*slab_id, segment.slab_size);
 
         let triggers: Vec<Trigger> = store
             .get_slab_triggers_all_types(&slab)

@@ -281,8 +281,6 @@ where
     T: TriggerOperations + Send + Sync,
     T::Error: Error + Send + Sync + 'static,
 {
-    let segment = operations.segment().clone();
-
     // Clean up slabs from any previous trial
     let slab_ids: Vec<SlabId> = operations
         .get_slabs()
@@ -303,7 +301,7 @@ where
         match op {
             SlabMetadataOperation::InsertSlab { slab_id } => {
                 model.apply(op);
-                let slab = Slab::new(segment.id, *slab_id, input.slab_size);
+                let slab = Slab::new(*slab_id, input.slab_size);
                 operations.insert_slab(slab).await.map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} InsertSlab failed: {e:?}")
                 })?;

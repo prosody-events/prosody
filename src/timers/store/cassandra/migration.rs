@@ -226,7 +226,7 @@ pub(crate) async fn migrate_segment_version(
                         // Recalculate slab based on trigger time and segment slab_size.
                         // Since slab_size is unchanged during version migration, this produces
                         // the same slab_id as V1, so slab metadata row already exists.
-                        let target_slab = Slab::from_time(segment_id, slab_size, v2_trigger.time);
+                        let target_slab = Slab::from_time(slab_size, v2_trigger.time);
 
                         // Write to V2 tables (slab and key indices).
                         // Use add_key_trigger_clustering (not insert_key_trigger) to
@@ -370,7 +370,7 @@ pub(crate) async fn migrate_key_states(
             let slab_size = segment.slab_size;
 
             async move {
-                let slab = Slab::new(segment_id, slab_id, slab_size);
+                let slab = Slab::new(slab_id, slab_size);
                 let triggers: Vec<_> = store
                     .get_slab_triggers_all_types(&slab)
                     .try_collect()
@@ -469,15 +469,14 @@ async fn migrate_triggers_to_new_slabs(
             let store = store.clone();
 
             async move {
-                let segment_id = segment.id;
                 let old_slab_size = segment.slab_size;
-                let old_slab = Slab::new(segment_id, old_slab_id, old_slab_size);
+                let old_slab = Slab::new(old_slab_id, old_slab_size);
                 let mut new_slab_ids = HashSet::default();
                 let trigger_stream = store.get_slab_triggers_all_types(&old_slab);
                 tokio::pin!(trigger_stream);
 
                 while let Some(trigger) = cooperative(trigger_stream.try_next()).await? {
-                    let new_slab = Slab::from_time(segment_id, desired_slab_size, trigger.time);
+                    let new_slab = Slab::from_time(desired_slab_size, trigger.time);
 
                     // Register new slab metadata if first time seeing this ID
                     if new_slab_ids.insert(new_slab.id()) {
@@ -583,7 +582,7 @@ async fn cleanup_old_slabs_with_overlap_protection(
                 // ALWAYS clear old triggers - they're in a separate partition due to slab_size
                 // in partition key: (segment_id, OLD_slab_size, id) != (segment_id,
                 // NEW_slab_size, id)
-                let old_slab = Slab::new(segment_id, slab_id, old_slab_size);
+                let old_slab = Slab::new(slab_id, old_slab_size);
                 if let Err(error) = store.clear_slab_triggers(&old_slab).await {
                     warn!(
                         "Failed to clear triggers for old slab {slab_id} (segment {segment_id}): \

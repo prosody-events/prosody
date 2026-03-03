@@ -142,7 +142,7 @@ where
         };
 
         // Map target time to its slab ID
-        let target_slab = Slab::from_time(segment.id, segment.slab_size, target_time);
+        let target_slab = Slab::from_time(segment.slab_size, target_time);
         let target_slab_id = target_slab.id();
 
         // Determine the next slab ID to load
@@ -251,7 +251,7 @@ where
         .get_slab_range(slab_range)
         .map_err(TimerManagerError::Store)
         .map_ok(|slab_id| async move {
-            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            let slab = Slab::new(slab_id, segment.slab_size);
             load_triggers(store_ref, scheduler_ref, slab).await?;
             Ok(slab_id)
         })
@@ -360,7 +360,7 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
     scheduler
         .active_triggers()
         .scan_active_times(|time, _timer_type| {
-            active_slab_ids.insert(Slab::from_time(segment.id, segment.slab_size, time).id());
+            active_slab_ids.insert(Slab::from_time(segment.slab_size, time).id());
         })
         .await;
 
@@ -633,7 +633,7 @@ mod tests {
         // Create a slab by adding a trigger at an appropriate time
         let slab_id = 1;
         let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
-        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, segment.slab_size);
         let trigger = create_test_trigger(1, time);
         store.add_trigger(slab, trigger).await?;
 
@@ -660,7 +660,7 @@ mod tests {
         // Create multiple slabs by adding triggers at appropriate times
         for slab_id in 1..=3 {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            let slab = Slab::new(slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
             store.add_trigger(slab, trigger).await?;
         }
@@ -680,7 +680,7 @@ mod tests {
         let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
-        let slab = Slab::new(segment.id, 1, segment.slab_size);
+        let slab = Slab::new(1, segment.slab_size);
 
         load_triggers(&store, &scheduler, slab).await?;
         Ok(())
@@ -692,7 +692,7 @@ mod tests {
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
         let slab_id = 1;
-        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, segment.slab_size);
 
         // Insert segment first
         store.insert_segment().await?;
@@ -729,7 +729,7 @@ mod tests {
         // Create slabs in store by adding triggers
         for slab_id in &loaded_slab_ids {
             let time = CompactDateTime::from(*slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
+            let slab = Slab::new(*slab_id, segment.slab_size);
             let trigger = create_test_trigger((*slab_id).into(), time);
             store.add_trigger(slab, trigger).await?;
         }
@@ -876,7 +876,7 @@ mod tests {
         // Create slabs by adding triggers
         for slab_id in &loaded_slab_ids {
             let time = CompactDateTime::from(*slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
+            let slab = Slab::new(*slab_id, segment.slab_size);
             let trigger = create_test_trigger((*slab_id).into(), time);
             store.add_trigger(slab, trigger).await?;
         }
@@ -884,7 +884,7 @@ mod tests {
         // Add an active trigger to slab 2
         let now = CompactDateTime::now()?;
         let trigger = create_test_trigger(1, now);
-        let _slab = Slab::from_time(segment.id, segment.slab_size, now);
+        let _slab = Slab::from_time(segment.slab_size, now);
 
         // Schedule the trigger to make it active
         scheduler.schedule(trigger.clone()).await?;
@@ -917,7 +917,7 @@ mod tests {
         // Create slabs beyond current ownership by adding triggers
         for slab_id in 6..=10 {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            let slab = Slab::new(slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
             store.add_trigger(slab, trigger).await?;
         }
@@ -952,7 +952,7 @@ mod tests {
         // Create and load lower range slabs by adding triggers
         for slab_id in 1..=5 {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            let slab = Slab::new(slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
             store.add_trigger(slab, trigger).await?;
         }
@@ -1003,8 +1003,8 @@ mod tests {
         // Should include slabs for both triggers
         assert!(!active_ids.is_empty());
 
-        let expected_slab1 = Slab::from_time(segment.id, segment.slab_size, now);
-        let expected_slab2 = Slab::from_time(segment.id, segment.slab_size, future);
+        let expected_slab1 = Slab::from_time(segment.slab_size, now);
+        let expected_slab2 = Slab::from_time(segment.slab_size, future);
 
         assert!(active_ids.contains(&expected_slab1.id()));
         assert!(active_ids.contains(&expected_slab2.id()));
