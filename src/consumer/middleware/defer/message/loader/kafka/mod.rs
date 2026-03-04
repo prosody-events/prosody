@@ -724,17 +724,19 @@ fn seek_to_first_active_offset(
         // Seek (~10-100ms) vs sequential read of N messages (~1-10ms):
         // - Don't seek: within threshold and before target (sequential read cheaper)
         // - Seek: past target (backward), too far behind
-        // - Don't seek: unknown position (Invalid) - trust assign() positioned
-        //   correctly
-        //
-        // Note: position() returns Invalid after assign() until first message is
-        // consumed. In this state, assign() already positioned the consumer at
-        // the requested offset, so seeking is unnecessary and adds latency.
-        let should_seek = current_position.is_some_and(|position| {
-            let past_target = position > min_offset;
-            let too_far_behind = position + discard_threshold < min_offset;
-            past_target || too_far_behind
-        });
+        // - Seek: unknown position (Invalid) — position() returns Invalid after
+        //   incremental_assign() until the first message is consumed. assign_if_needed
+        //   only assigns on the first request; concurrent lower-offset requests skip
+        //   re-assignment, so the consumer may be anchored above min_offset. Always
+        //   seek when Invalid to land at the correct starting point.
+        let should_seek = match current_position {
+            None => true,
+            Some(position) => {
+                let past_target = position > min_offset;
+                let too_far_behind = position + discard_threshold < min_offset;
+                past_target || too_far_behind
+            }
+        };
 
         debug!(
             topic = %AsRef::<str>::as_ref(topic),

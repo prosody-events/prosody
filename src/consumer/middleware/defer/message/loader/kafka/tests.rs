@@ -572,7 +572,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         assert_eq!(msg1.offset(), offsets[50]);
 
         // Load offset 55 - partition was unassigned after 50, position is Invalid.
-        // With Invalid position, we trust assign() and don't seek.
+        // We seek to min_offset (55) in this state.
         let msg2 = timeout(
             Duration::from_secs(10),
             loader.load_message(topic, 0, offsets[55]),
@@ -581,8 +581,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         assert_eq!(msg2.offset(), offsets[55]);
 
         // Load offset 70 - partition was unassigned after 55, position is Invalid.
-        // With Invalid position, we trust assign() and don't seek.
-        // Previously this could timeout because Invalid triggered unnecessary seek.
+        // We seek to min_offset (70) in this state.
         let msg3 = timeout(
             Duration::from_secs(10),
             loader.load_message(topic, 0, offsets[70]),
@@ -1224,20 +1223,25 @@ mod seek_decision {
     /// `seek_to_first_active_offset`. This mirrors the production logic for
     /// testability.
     fn should_seek(current_position: Option<i64>, min_offset: i64, discard_threshold: i64) -> bool {
-        current_position.is_some_and(|position| {
-            let past_target = position > min_offset;
-            let too_far_behind = position + discard_threshold < min_offset;
-            past_target || too_far_behind
-        })
+        match current_position {
+            None => true,
+            Some(position) => {
+                let past_target = position > min_offset;
+                let too_far_behind = position + discard_threshold < min_offset;
+                past_target || too_far_behind
+            }
+        }
     }
 
     #[test]
-    fn invalid_position_does_not_seek() {
-        // After assign() but before first poll(), position() returns Invalid (None).
-        // We trust assign() positioned correctly, so don't seek.
-        assert!(!should_seek(None, 70, 5));
-        assert!(!should_seek(None, 0, 10));
-        assert!(!should_seek(None, 1000, 100));
+    fn invalid_position_always_seeks() {
+        // After incremental_assign() but before first poll(), position() returns
+        // Invalid (None). assign_if_needed only assigns on the first request;
+        // concurrent lower-offset requests skip re-assignment, so the consumer may
+        // be anchored above min_offset. Always seek when Invalid.
+        assert!(should_seek(None, 70, 5));
+        assert!(should_seek(None, 0, 10));
+        assert!(should_seek(None, 1000, 100));
     }
 
     #[test]
