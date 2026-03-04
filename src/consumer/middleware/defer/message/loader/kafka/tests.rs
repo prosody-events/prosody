@@ -1217,6 +1217,104 @@ async fn test_lower_offsets_falsely_reported_deleted_when_assigned_at_higher_off
     result
 }
 
+/// Test: Concurrent requests where the first-arriving offset is high (valid),
+/// a second is low (valid), and a third is deleted — all on the same partition.
+///
+/// This is the realistic production scenario: deferred messages from a
+/// compacted topic where some older messages have been deleted and some
+/// lower-offset messages are still valid. The seek after seeing `Invalid`
+/// position must land at `min_offset` (the lowest valid request), not at the
+/// high-offset assignment anchor.
+///
+/// With the fix (`None => true`):
+/// - Seek fires to `min_offset` = `low_valid`.
+/// - Consumer reads from `low_valid` upward.
+/// - `split_off` correctly marks deleted offsets as deleted.
+/// - `high_valid` and `low_valid` are fulfilled normally.
+///
+/// Without the fix:
+/// - No seek fires (`Invalid` position → `should_seek = false`).
+/// - Consumer reads from `high_valid` (the assignment anchor).
+/// - `split_off(high_valid)` misidentifies `low_valid` as deleted.
+#[tokio::test]
+async fn test_concurrent_mixed_deleted_and_valid_lower_offsets() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+    init_test_logging();
+
+    let topic_name = test_topic("mixed_deleted_valid");
+    create_topic(&topic_name).await?;
+
+    let result = async {
+        let offsets = produce_messages(&topic_name, 100).await?;
+
+        // Delete offsets 0–39 (LSO becomes 40). offsets[40] is now the LSO.
+        delete_records_up_to(&Topic::from(topic_name.as_str()), 40).await?;
+
+        let topic = Topic::from(topic_name.as_str());
+
+        // discard_threshold=0 so every forward gap triggers a seek — makes
+        // the seek-vs-no-seek distinction maximally clear.
+        let config = LoaderConfiguration {
+            bootstrap_servers: vec!["localhost:9094".to_owned()],
+            group_id: "prosody-test".to_owned(),
+            max_permits: 10,
+            cache_size: 10,
+            poll_interval: Duration::from_millis(100),
+            seek_timeout: Duration::from_secs(5),
+            discard_threshold: 0,
+        };
+        let loader = KafkaLoader::new(config, &HeartbeatRegistry::test())?;
+
+        // high_valid (80): valid, arrives first → assignment anchored here.
+        // low_deleted (20): deleted (< LSO 40), arrives second.
+        // low_valid (50): valid (>= LSO 40), arrives third, below assignment anchor.
+        //
+        // Without the fix: consumer reads from 80, split_off(80) marks both 20
+        // and 50 as deleted — 50 is a false positive.
+        // With the fix: seek to min_offset=20 (below LSO → auto-reset to 40),
+        // poll returns 40 (LSO), split_off(40) marks only 20 as deleted, then
+        // poll returns 50, then 80. Both valid offsets are fulfilled correctly.
+        let high_valid = offsets[80];
+        let low_deleted = offsets[20];
+        let low_valid = offsets[50];
+
+        let (r_high, r_deleted, r_valid) = tokio::join!(
+            timeout(Duration::from_secs(30), loader.load_message(topic, 0, high_valid)),
+            timeout(Duration::from_secs(30), loader.load_message(topic, 0, low_deleted)),
+            timeout(Duration::from_secs(30), loader.load_message(topic, 0, low_valid)),
+        );
+
+        // High offset succeeds.
+        let msg_high = r_high??;
+        assert_eq!(msg_high.offset(), high_valid);
+
+        // low_deleted is genuinely deleted — must get OffsetDeleted.
+        let result_deleted = r_deleted?;
+        let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, lso)) = result_deleted else {
+            color_eyre::eyre::bail!(
+                "low_deleted (offset {low_deleted}) should be OffsetDeleted, got: {:?}",
+                result_deleted
+            );
+        };
+        assert_eq!(requested, low_deleted);
+        assert!(lso >= offsets[40], "lso {lso} should be >= LSO boundary {}", offsets[40]);
+
+        // low_valid exists on the broker — must succeed, not get OffsetDeleted.
+        let msg_valid = r_valid?.map_err(|e| {
+            color_eyre::eyre::eyre!(
+                "low_valid (offset {low_valid}) should succeed on a non-deleted offset, got: {e}"
+            )
+        })?;
+        assert_eq!(msg_valid.offset(), low_valid);
+
+        Ok(())
+    }
+    .await;
+
+    delete_topic(&topic_name).await?;
+    result
+}
+
 /// Unit tests for seek decision logic (no Kafka required)
 mod seek_decision {
     /// Helper to compute `should_seek` using the same logic as
@@ -1278,10 +1376,26 @@ mod seek_decision {
     }
 
     #[test]
-    fn position_ahead_of_target_within_threshold_does_not_seek() {
-        // Position (52) > target (50) → past_target is true → should seek
-        // Wait, this is "past target" meaning we've already read past it
-        // We need to go BACK, so we must seek
+    fn position_past_target_always_seeks() {
+        // Position (52) > target (50) → past_target is true → must seek backward
         assert!(should_seek(Some(52), 50, 5));
+    }
+
+    #[test]
+    fn threshold_boundary_exact() {
+        // position + threshold == min_offset → NOT too far behind → don't seek
+        // 50 + 5 = 55, min = 55 → exactly at boundary → don't seek
+        assert!(!should_seek(Some(50), 55, 5));
+        // 50 + 5 = 55, min = 56 → one past boundary → seek
+        assert!(should_seek(Some(50), 56, 5));
+    }
+
+    #[test]
+    fn zero_threshold_seeks_any_forward_gap() {
+        // threshold=0: position + 0 < min_offset whenever position < min_offset
+        assert!(should_seek(Some(49), 50, 0));
+        assert!(should_seek(Some(0), 1, 0));
+        // position == min_offset: not past, not behind → don't seek
+        assert!(!should_seek(Some(50), 50, 0));
     }
 }
