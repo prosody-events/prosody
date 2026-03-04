@@ -1132,7 +1132,7 @@ async fn test_sequential_multi_partition_loading() -> color_eyre::Result<()> {
 /// 5. `notify_deleted_offsets` fires `OffsetDeleted` for LOW1 and LOW2, even
 ///    though those offsets exist and have not been compacted or expired.
 ///
-/// # Why `futures::join!` makes the race deterministic
+/// # Why `tokio::join!` makes the race deterministic
 ///
 /// All three `load_message` calls run concurrently within a single task.
 /// `semaphore.acquire_owned()` returns `Poll::Ready` immediately when permits
@@ -1227,10 +1227,10 @@ async fn test_lower_offsets_falsely_reported_deleted_when_assigned_at_higher_off
 /// high-offset assignment anchor.
 ///
 /// With the fix (`None => true`):
-/// - Seek fires to `min_offset` = `low_valid`.
-/// - Consumer reads from `low_valid` upward.
-/// - `split_off` correctly marks deleted offsets as deleted.
-/// - `high_valid` and `low_valid` are fulfilled normally.
+/// - Seek fires to `min_offset` = `low_deleted` (the lowest pending offset).
+/// - `low_deleted` is below LSO; Kafka auto-resets to LSO (40).
+/// - `split_off(40)` marks only `low_deleted` as deleted; `low_valid` and
+///   `high_valid` remain in the active map and are fulfilled normally.
 ///
 /// Without the fix:
 /// - No seek fires (`Invalid` position → `should_seek = false`).
