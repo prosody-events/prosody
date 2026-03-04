@@ -94,7 +94,6 @@ where
             group_id: Arc::from(config.group_id.as_str()),
             buffer_size: config.max_uncommitted,
             max_uncommitted: config.max_uncommitted,
-            max_enqueued_per_key: config.max_enqueued_per_key,
             idempotence_cache_size: config.idempotence_cache_size,
             allowed_events,
             shutdown_timeout: config.shutdown_timeout,

@@ -457,20 +457,6 @@ pub struct ConsumerConfiguration {
     #[validate(range(min = 1_usize))]
     pub max_uncommitted: usize,
 
-    /// Maximum number of enqueued messages per key.
-    ///
-    /// Environment variable: `PROSODY_MAX_ENQUEUED_PER_KEY`
-    /// Default: 8
-    ///
-    /// Controls how many messages with the same key can be queued before
-    /// backpressuring.
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MAX_ENQUEUED_PER_KEY\", 8)?",
-        setter(into)
-    )]
-    #[validate(range(min = 1_usize))]
-    pub max_enqueued_per_key: usize,
-
     /// Partition idempotence cache size.
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
@@ -943,7 +929,6 @@ impl ProsodyConsumer {
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     defer_config.clone(),
                     consumer_config,
-                    &common_config.scheduler,
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
@@ -979,7 +964,6 @@ impl ProsodyConsumer {
                 let message_defer_middleware = MessageDeferMiddleware::new(
                     defer_config.clone(),
                     consumer_config,
-                    &common_config.scheduler,
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
