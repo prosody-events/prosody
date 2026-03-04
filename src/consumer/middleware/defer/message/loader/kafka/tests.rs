@@ -5,11 +5,13 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::tracing::init_test_logging;
 use futures::future::join_all;
 use rdkafka::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use std::time::{Duration, Instant};
+use tokio::task::spawn_blocking;
+use tokio::time::timeout;
 
 fn test_topic(name: &str) -> String {
     format!("loader_test_{name}_{}", uuid::Uuid::new_v4())
@@ -21,7 +23,7 @@ fn loader_config() -> LoaderConfiguration {
         group_id: "prosody-test".to_owned(),
         max_permits: 10,
         cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
-        poll_interval: Duration::from_secs(1),
+        poll_interval: Duration::from_millis(50),
         seek_timeout: Duration::from_secs(5),
         discard_threshold: 10,
     }
@@ -50,8 +52,49 @@ async fn create_topic_with_partitions(name: &str, partitions: u16) -> color_eyre
         .partition_count(partitions)
         .build()?;
     admin.create_topic(&topic_config).await?;
-    sleep(Duration::from_secs(2)).await;
+    wait_for_topic(name, partitions).await?;
     Ok(())
+}
+
+/// Polls Kafka metadata until the topic is visible with the expected number of
+/// partitions. Replaces the fixed 2-second sleep that previously preceded every
+/// test, cutting topic-creation overhead from ~2 s to the actual broker
+/// propagation time (~50–200 ms locally).
+///
+/// Each `fetch_metadata` call has a built-in 500ms timeout that yields the
+/// async runtime while the blocking call is in-flight — no extra sleep needed.
+async fn wait_for_topic(name: &str, expected_partitions: u16) -> color_eyre::Result<()> {
+    let consumer: Arc<BaseConsumer> = Arc::new(
+        ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9094")
+            .set("group.id", "prosody-test-setup")
+            .create()?,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let meta = spawn_blocking({
+            let name = name.to_owned();
+            let consumer = Arc::clone(&consumer);
+            move || consumer.fetch_metadata(Some(&name), Duration::from_millis(500))
+        })
+        .await?;
+
+        if let Ok(meta) = meta {
+            let ready = meta.topics().iter().any(|t| {
+                t.name() == name
+                    && t.partitions().len() == usize::from(expected_partitions)
+                    && t.partitions().iter().all(|p| p.error().is_none())
+            });
+            if ready {
+                return Ok(());
+            }
+        }
+
+        if Instant::now() >= deadline {
+            color_eyre::eyre::bail!("topic {name} did not become ready within 10s");
+        }
+    }
 }
 
 async fn delete_topic(name: &str) -> color_eyre::Result<()> {
@@ -96,10 +139,50 @@ async fn produce_messages_to_partition(
 async fn delete_records_up_to(topic: &Topic, offset: crate::Offset) -> color_eyre::Result<()> {
     let admin = admin()?;
     admin.delete_records([(*topic, 0_i32, offset)]).await?;
-    // Wait for Kafka to propagate the deletion across all brokers
-    // Experiments show this can take time - increase to 5 seconds
-    sleep(Duration::from_secs(5)).await;
+    wait_for_lso(topic, offset).await?;
     Ok(())
+}
+
+/// Polls `fetch_watermarks` until the low watermark (LSO) reaches `expected`.
+/// Replaces the fixed 5-second sleep, cutting deletion propagation overhead
+/// from ~5 s to the actual broker propagation time (~50–500 ms locally).
+///
+/// Each `fetch_watermarks` call has a built-in 500ms timeout that yields the
+/// async runtime while the blocking call is in-flight — no extra sleep needed.
+async fn wait_for_lso(topic: &Topic, expected_lso: crate::Offset) -> color_eyre::Result<()> {
+    let consumer: Arc<BaseConsumer> = Arc::new(
+        ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9094")
+            .set("group.id", "prosody-test-setup")
+            .create()?,
+    );
+
+    let topic_str = topic.to_string();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let lso = spawn_blocking({
+            let topic_str = topic_str.clone();
+            let consumer = Arc::clone(&consumer);
+            move || {
+                consumer
+                    .fetch_watermarks(&topic_str, 0, Duration::from_millis(500))
+                    .map(|(low, _high)| low)
+            }
+        })
+        .await?;
+
+        if let Ok(lso) = lso
+            && lso >= expected_lso
+        {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            color_eyre::eyre::bail!(
+                "LSO for {topic}/0 did not reach {expected_lso} within 15s"
+            );
+        }
+    }
 }
 
 /// Test: Load a valid message successfully
@@ -557,7 +640,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
             group_id: "prosody-test".to_owned(),
             max_permits: 10,
             cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
-            poll_interval: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(50),
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 5, // Small threshold for testing
         };
@@ -919,7 +1002,7 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
             group_id: "prosody-test".to_owned(),
             max_permits: 20, // Allow many concurrent loads
             cache_size: 2,   // But only 2 cache permits
-            poll_interval: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(50),
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 10,
         };
