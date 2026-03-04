@@ -700,7 +700,10 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
 ///
 /// # Errors
 ///
-/// Returns a `KafkaError` if seeking fails (caller should poll to recover)
+/// Returns a `KafkaError` if seeking fails. The caller must NOT poll after
+/// a seek failure — the consumer's position is unknown and polling would
+/// risk misclassifying pending offsets as deleted. The caller should retry
+/// the seek on the next iteration.
 fn seek_to_first_active_offset(
     active: &ActiveRequests,
     consumer: &BaseConsumer,
