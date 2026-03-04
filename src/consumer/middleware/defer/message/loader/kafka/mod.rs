@@ -444,8 +444,14 @@ fn poll_loop(
             config.discard_threshold,
             config.seek_timeout,
         ) {
-            warn!(error = %format_args!("{error:#}"), "Seek failed, will retry after poll");
-            // Fall through to poll() which provides backoff via its timeout
+            warn!(error = %format_args!("{error:#}"), "Seek failed, retrying next iteration");
+            // Do NOT fall through to poll(). If the seek failed, the consumer's
+            // position is unknown — polling and running split_off with an
+            // untrustworthy position would misclassify pending offsets as
+            // deleted, which is data corruption. Skip this iteration and retry
+            // the seek next time around. The seek_timeout provides implicit
+            // backoff (~5s) so this does not spin.
+            continue;
         }
 
         // Poll once per iteration
