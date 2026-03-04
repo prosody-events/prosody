@@ -14,8 +14,8 @@
 //! 2. Activation: call [`PendingTimer::fire()`] to transition to
 //!    [`FiringTimer`]
 //! 3. Processing: application handles the timer event
-//! 4. Acknowledgment: application calls [`Uncommitted::commit()`] or
-//!    [`Uncommitted::abort()`] on [`FiringTimer`]
+//! 4. Acknowledgment: application calls [`FiringTimer::commit()`] or
+//!    [`FiringTimer::abort()`] on [`FiringTimer`]
 //! 5. Cleanup: timers are removed from storage or left for retry
 //!
 //! Timers use at-least-once delivery and survive restarts. Successful commits
@@ -33,6 +33,7 @@ use arc_swap::ArcSwap;
 use educe::Educe;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
 use tracing::{Span, warn};
 
@@ -143,6 +144,9 @@ where
 
     /// Indicates if this timer has already been committed or aborted.
     completed: bool,
+
+    /// Global timer semaphore permit; released when this trigger is dropped.
+    _permit: OwnedSemaphorePermit,
 }
 
 impl<T> PendingTimer<T>
@@ -155,12 +159,14 @@ where
     ///
     /// * `trigger` - The timer event with key, time, and tracing context.
     /// * `manager` - The [`TimerManager`] that will handle commit and abort.
+    /// * `permit` - Semaphore permit bounding global timer concurrency; held
+    ///   until this timer is dropped.
     ///
     /// # Returns
     ///
     /// A new [`PendingTimer`] in the pending state.
     #[must_use]
-    pub fn new(trigger: Trigger, manager: TimerManager<T>) -> Self {
+    pub fn new(trigger: Trigger, manager: TimerManager<T>, permit: OwnedSemaphorePermit) -> Self {
         let key = trigger.key.clone();
         let time = trigger.time;
         let timer_type = trigger.timer_type;
@@ -172,6 +178,7 @@ where
                 timer_type,
                 manager,
                 completed: false,
+                _permit: permit,
             },
         }
     }
@@ -416,8 +423,13 @@ mod tests {
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use crate::timers::store::{Segment, SegmentVersion};
     use color_eyre::eyre::{Result, eyre};
-    use futures::StreamExt;
+    use futures::{StreamExt, pin_mut};
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::{Semaphore, watch};
+
+    const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+
     use tokio::task;
     use tokio::time::{self, advance};
     use uuid::Uuid;
@@ -431,16 +443,27 @@ mod tests {
         }
     }
 
-    /// Helper function to set up a timer manager for testing
+    /// Helper function to set up a timer manager for testing.
+    ///
+    /// Returns `(stream, manager, _shutdown_tx)`. The caller holds
+    /// `_shutdown_tx` and can send `true` to stop the background slab loader.
     async fn setup_timer_manager() -> Result<(
         impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
+        watch::Sender<bool>,
     )> {
         let store = memory_store(test_segment());
-
-        TimerManager::new("test-manager", store, HeartbeatRegistry::test())
-            .await
-            .map_err(|e| eyre!("Failed to create timer manager: {}", e))
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (stream, manager) = TimerManager::new(
+            "test-manager",
+            store,
+            HeartbeatRegistry::test(),
+            shutdown_rx,
+            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
+        )
+        .await
+        .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
+        Ok((stream, manager, shutdown_tx))
     }
 
     /// Helper function to create a test trigger
@@ -463,7 +486,8 @@ mod tests {
     async fn test_pending_timer_fire_consumes() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
         let trigger = create_test_trigger("fire-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -499,7 +523,8 @@ mod tests {
     async fn test_firing_timer_commit() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
         let trigger = create_test_trigger("commit-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -534,7 +559,8 @@ mod tests {
     async fn test_firing_timer_abort() -> Result<()> {
         time::pause();
 
-        let (mut stream, manager) = setup_timer_manager().await?;
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
         let trigger = create_test_trigger("abort-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;

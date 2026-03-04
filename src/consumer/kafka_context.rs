@@ -21,6 +21,7 @@ use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
@@ -42,6 +43,8 @@ use crate::timers::store::TriggerStoreProvider;
 ///
 /// * `T` - Type implementing `HandlerProvider` to create message handlers for
 ///   partitions
+/// * `P` - Type implementing `TriggerStoreProvider` for persistent timer
+///   trigger storage
 pub struct Context<T, P>
 where
     T: HandlerProvider,
@@ -90,6 +93,8 @@ where
             CompactDuration::new(10 * 60)
         });
 
+        let timer_semaphore = Arc::new(Semaphore::new(config.max_uncommitted));
+
         let config = PartitionConfiguration {
             group_id: Arc::from(config.group_id.as_str()),
             buffer_size: config.max_uncommitted,
@@ -101,6 +106,7 @@ where
             watermark_version,
             trigger_provider,
             timer_slab_size,
+            timer_semaphore,
         };
 
         Self {
@@ -219,7 +225,8 @@ where
     /// Handles post-rebalance processing.
     ///
     /// This method is called by librdkafka after a rebalance operation has
-    /// completed. Currently, it simply logs that the rebalance has
+    /// completed. For assignment events, it resumes consumption on the newly
+    /// assigned partitions. For all events, it logs that the rebalance has
     /// completed.
     ///
     /// # Arguments

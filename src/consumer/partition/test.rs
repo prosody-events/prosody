@@ -38,6 +38,7 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider> {
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         trigger_provider: InMemoryTriggerStoreProvider::new(),
         timer_slab_size: CompactDuration::new(30),
+        timer_semaphore: Arc::new(Semaphore::new(10)),
     }
 }
 

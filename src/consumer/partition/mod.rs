@@ -8,7 +8,7 @@
 //! - Preserves strict ordering for messages with the same key
 //! - Tracks and commits message offsets for exactly-once processing
 //! - Manages graceful shutdown of partition processing
-//! - Implements backpressure through buffer capacity limits
+//! - Implements backpressure through the bounded message channel
 //! - Deduplicates messages using event IDs
 //!
 //! The core component is `PartitionManager`, which coordinates all aspects
@@ -20,9 +20,9 @@ use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::timers::TimerManager;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerStoreProvider};
-use crate::timers::{PendingTimer, TimerManager};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use ahash::RandomState;
 use aho_corasick::{AhoCorasick, Anchored, Input};
@@ -42,7 +42,7 @@ use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
@@ -82,7 +82,7 @@ struct PartitionContext {
 /// Configuration settings for a partition manager.
 ///
 /// Contains all the parameters needed to configure message processing
-/// for a Kafka partition, including buffer sizes, concurrency limits,
+/// for a Kafka partition, including buffer sizes, timer concurrency,
 /// and filtering options.
 ///
 /// `P` is a [`TriggerStoreProvider`] that creates per-partition stores.
@@ -118,6 +118,9 @@ pub struct PartitionConfiguration<P> {
 
     /// Timer slab size
     pub timer_slab_size: CompactDuration,
+
+    /// Global semaphore bounding in-flight timer events across all partitions
+    pub timer_semaphore: Arc<Semaphore>,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -126,7 +129,7 @@ pub struct PartitionConfiguration<P> {
 /// - Queuing messages by key to maintain ordering for each key
 /// - Tracking and committing message offsets to ensure at-least-once processing
 /// - Managing graceful partition shutdown during rebalancing
-/// - Enforcing backpressure through queue capacity limits
+/// - Enforcing backpressure through the bounded message channel
 /// - Monitoring for processing stalls
 #[derive(Educe)]
 #[educe(Debug)]
@@ -392,7 +395,15 @@ async fn handle_messages<T, P>(
             return;
         }
 
-        match TimerManager::new(&name, trigger_store.clone(), heartbeats.clone()).await {
+        match TimerManager::new(
+            &name,
+            trigger_store.clone(),
+            heartbeats.clone(),
+            shutdown_rx.clone(),
+            config.timer_semaphore.clone(),
+        )
+        .await
+        {
             Ok(result) => break result,
             Err(error) => {
                 error!("failed to initialize timer manager: {error:#}; retrying");
@@ -401,7 +412,14 @@ async fn handle_messages<T, P>(
         }
     };
 
-    let timer_events = build_timer_stream(timer_stream);
+    let timer_events = stream! {
+        let timer_stream = timer_stream;
+        pin_mut!(timer_stream);
+
+        while let Some(timer) = cooperative(timer_stream.next()).await {
+            yield UncommittedEvent::Timer(timer);
+        }
+    };
     let combined_stream = select(message_events, timer_events);
 
     // Define how to process each message
@@ -480,7 +498,8 @@ async fn handle_messages<T, P>(
 ///
 /// # Returns
 ///
-/// A stream of `UncommittedMessage` objects ready for processing
+/// A stream of [`UncommittedEvent`] items (each wrapping an
+/// [`UncommittedMessage`] or a timer) ready for processing
 fn build_message_stream<T>(
     offsets: &OffsetTracker,
     mut message_rx: Receiver<ConsumerMessage>,
@@ -520,20 +539,6 @@ where
             };
 
             yield UncommittedEvent::Message(uncommitted);
-        }
-    }
-}
-
-fn build_timer_stream<T, S>(timer_stream: S) -> impl Stream<Item = UncommittedEvent<T>>
-where
-    S: Stream<Item = PendingTimer<T>>,
-    T: TriggerStore,
-{
-    stream! {
-        pin_mut!(timer_stream);
-
-        while let Some(timer) = cooperative(timer_stream.next()).await {
-            yield UncommittedEvent::Timer(timer);
         }
     }
 }
