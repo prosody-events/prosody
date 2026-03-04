@@ -1112,6 +1112,112 @@ async fn test_sequential_multi_partition_loading() -> color_eyre::Result<()> {
     result
 }
 
+/// Test: Requests for lower offsets arrive while partition is already assigned
+/// at a higher offset.
+///
+/// # Bug reproduced
+///
+/// `assign_if_needed` only assigns a partition on the *first* request for that
+/// partition. If subsequent requests target *lower* offsets, no re-assignment
+/// and no seek is issued (position is `Invalid` after assign → `should_seek`
+/// is false). The poll loop reads from the high offset, and the lazy-validation
+/// `split_off` logic then misidentifies all pending lower offsets as deleted.
+///
+/// # Trigger conditions
+///
+/// 1. Request A arrives for offset HIGH → `assign_if_needed` assigns at HIGH.
+/// 2. Requests B, C arrive for offsets LOW1, LOW2 (< HIGH) before A is
+///    fulfilled → partition already in `active`, no re-assign, no seek.
+/// 3. Poll returns message at HIGH.
+/// 4. `split_off(HIGH)` leaves LOW1, LOW2 in `deleted_offsets`.
+/// 5. `notify_deleted_offsets` fires `OffsetDeleted` for LOW1 and LOW2, even
+///    though those offsets exist and have not been compacted or expired.
+///
+/// # Why `futures::join!` makes the race deterministic
+///
+/// All three `load_message` calls run concurrently within a single task.
+/// `semaphore.acquire_owned()` returns `Poll::Ready` immediately when permits
+/// are available, so all three futures advance past the semaphore without
+/// yielding to the runtime. The mpsc channel has `max_permits` capacity, so
+/// all three `tx.send()` calls also complete without yielding. By the time any
+/// future yields on `rx.await`, all three requests are already queued in the
+/// channel. The poll loop's first drain therefore sees HIGH, LOW1, LOW2 in
+/// arrival order, processes them in a single iteration, and triggers the bug.
+#[tokio::test]
+async fn test_lower_offsets_falsely_reported_deleted_when_assigned_at_higher_offset()
+-> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+    init_test_logging();
+
+    let topic_name = test_topic("false_deleted");
+    create_topic(&topic_name).await?;
+
+    let result = async {
+        // Produce 50 messages. The gap between low and high offsets (35
+        // messages) far exceeds discard_threshold=0, so the loader cannot read
+        // forward from HIGH to reach LOW1/LOW2; the only path back is a seek,
+        // which the bug suppresses.
+        let offsets = produce_messages(&topic_name, 50).await?;
+        let topic = Topic::from(topic_name.as_str());
+
+        // discard_threshold=0: every forward gap triggers a seek. With the
+        // bug, no seek fires because position() is Invalid after the initial
+        // assign(). Setting it to 0 makes the intended seek behaviour explicit.
+        let config = LoaderConfiguration {
+            bootstrap_servers: vec!["localhost:9094".to_owned()],
+            group_id: "prosody-test".to_owned(),
+            max_permits: 10,
+            cache_size: 10,
+            poll_interval: Duration::from_millis(100),
+            seek_timeout: Duration::from_secs(5),
+            discard_threshold: 0,
+        };
+        let loader = KafkaLoader::new(config, &HeartbeatRegistry::test())?;
+
+        let low1 = offsets[5];
+        let low2 = offsets[10];
+        let high = offsets[40];
+
+        // Run all three loads concurrently from one task. Because the semaphore
+        // has 10 permits and the channel has 10 slots, all three futures
+        // advance through acquire() + send() without yielding, queuing HIGH
+        // first (join! polls left-to-right), then LOW1, LOW2. The poll loop
+        // drains all three in its first iteration: HIGH anchors the assignment,
+        // LOW1/LOW2 skip assign_if_needed, and the bug fires.
+        let (r_high, r_low1, r_low2) = tokio::join!(
+            timeout(Duration::from_secs(15), loader.load_message(topic, 0, high)),
+            timeout(Duration::from_secs(15), loader.load_message(topic, 0, low1)),
+            timeout(Duration::from_secs(15), loader.load_message(topic, 0, low2)),
+        );
+
+        // The high-offset load should always succeed.
+        let msg_high = r_high??;
+        assert_eq!(msg_high.offset(), high, "high-offset load should succeed");
+
+        // LOW1 and LOW2 exist on the broker (infinite retention, no compaction).
+        // With the bug they receive OffsetDeleted; without the bug they succeed.
+        let msg_low1 = r_low1?.map_err(|e| {
+            color_eyre::eyre::eyre!(
+                "low1 (offset {low1}) should load successfully on a non-compacted topic, got: {e}"
+            )
+        })?;
+        assert_eq!(msg_low1.offset(), low1);
+
+        let msg_low2 = r_low2?.map_err(|e| {
+            color_eyre::eyre::eyre!(
+                "low2 (offset {low2}) should load successfully on a non-compacted topic, got: {e}"
+            )
+        })?;
+        assert_eq!(msg_low2.offset(), low2);
+
+        Ok(())
+    }
+    .await;
+
+    delete_topic(&topic_name).await?;
+    result
+}
+
 /// Unit tests for seek decision logic (no Kafka required)
 mod seek_decision {
     /// Helper to compute `should_seek` using the same logic as
