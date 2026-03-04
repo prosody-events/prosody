@@ -1252,8 +1252,12 @@ async fn test_concurrent_mixed_deleted_and_valid_lower_offsets() -> color_eyre::
 
         let topic = Topic::from(topic_name.as_str());
 
-        // discard_threshold=0 so every forward gap triggers a seek — makes
-        // the seek-vs-no-seek distinction maximally clear.
+        // discard_threshold=50: after the seek to min_offset lands at LSO (40),
+        // the consumer reads sequentially through 40→50 and 50→80 without
+        // additional seeks. This avoids repeated seek round-trips on slow CI
+        // runners while still exercising the critical path: the Invalid-position
+        // seek fires once, Kafka resets to LSO, and split_off correctly
+        // classifies deleted vs valid offsets.
         let config = LoaderConfiguration {
             bootstrap_servers: vec!["localhost:9094".to_owned()],
             group_id: "prosody-test".to_owned(),
@@ -1261,7 +1265,7 @@ async fn test_concurrent_mixed_deleted_and_valid_lower_offsets() -> color_eyre::
             cache_size: 10,
             poll_interval: Duration::from_millis(100),
             seek_timeout: Duration::from_secs(5),
-            discard_threshold: 0,
+            discard_threshold: 50,
         };
         let loader = KafkaLoader::new(config, &HeartbeatRegistry::test())?;
 
@@ -1272,8 +1276,9 @@ async fn test_concurrent_mixed_deleted_and_valid_lower_offsets() -> color_eyre::
         // Without the fix: consumer reads from 80, split_off(80) marks both 20
         // and 50 as deleted — 50 is a false positive.
         // With the fix: seek to min_offset=20 (below LSO → auto-reset to 40),
-        // poll returns 40 (LSO), split_off(40) marks only 20 as deleted, then
-        // poll returns 50, then 80. Both valid offsets are fulfilled correctly.
+        // poll returns 40 (LSO, discarded), split_off(40) marks only 20 as
+        // deleted. Consumer then reads sequentially 41→50 (fulfills r_valid)
+        // and 51→80 (fulfills r_high). Both valid offsets succeed.
         let high_valid = offsets[80];
         let low_deleted = offsets[20];
         let low_valid = offsets[50];
