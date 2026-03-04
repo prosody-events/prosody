@@ -57,7 +57,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 simd-json = { version = "0.17", features = ["serde_impl"], optional = true }
 smallvec = { version = "1.15", features = ["const_generics", "union"] }
-strum = { version = "0.27.2", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "parking_lot", "sync"] }
 tokio-stream = "0.1"
