@@ -444,7 +444,7 @@ fn poll_loop(
             config.discard_threshold,
             config.seek_timeout,
         ) {
-            warn!(error = %format_args!("{error:#}"), "Seek failed, retrying next iteration");
+            warn!("Seek failed, retrying next iteration: {error:#}");
             // Do NOT fall through to poll(). If the seek failed, the consumer's
             // position is unknown — polling and running split_off with an
             // untrustworthy position would misclassify pending offsets as
