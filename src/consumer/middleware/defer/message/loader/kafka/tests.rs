@@ -1279,9 +1279,18 @@ async fn test_concurrent_mixed_deleted_and_valid_lower_offsets() -> color_eyre::
         let low_valid = offsets[50];
 
         let (r_high, r_deleted, r_valid) = tokio::join!(
-            timeout(Duration::from_secs(30), loader.load_message(topic, 0, high_valid)),
-            timeout(Duration::from_secs(30), loader.load_message(topic, 0, low_deleted)),
-            timeout(Duration::from_secs(30), loader.load_message(topic, 0, low_valid)),
+            timeout(
+                Duration::from_secs(30),
+                loader.load_message(topic, 0, high_valid)
+            ),
+            timeout(
+                Duration::from_secs(30),
+                loader.load_message(topic, 0, low_deleted)
+            ),
+            timeout(
+                Duration::from_secs(30),
+                loader.load_message(topic, 0, low_valid)
+            ),
         );
 
         // High offset succeeds.
@@ -1297,7 +1306,11 @@ async fn test_concurrent_mixed_deleted_and_valid_lower_offsets() -> color_eyre::
             );
         };
         assert_eq!(requested, low_deleted);
-        assert!(lso >= offsets[40], "lso {lso} should be >= LSO boundary {}", offsets[40]);
+        assert!(
+            lso >= offsets[40],
+            "lso {lso} should be >= LSO boundary {}",
+            offsets[40]
+        );
 
         // low_valid exists on the broker — must succeed, not get OffsetDeleted.
         let msg_valid = r_valid?.map_err(|e| {
