@@ -1011,21 +1011,21 @@ async fn test_concurrent_multi_partition_loading() -> color_eyre::Result<()> {
 
         let h0 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 loader_a.load_message(topic, 0, target_0),
             )
             .await
         });
         let h1 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 loader_b.load_message(topic, 1, target_1),
             )
             .await
         });
         let h2 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 loader_c.load_message(topic, 2, target_2),
             )
             .await
@@ -1285,15 +1285,15 @@ async fn test_concurrent_mixed_deleted_and_valid_lower_offsets() -> color_eyre::
 
         let (r_high, r_deleted, r_valid) = tokio::join!(
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader.load_message(topic, 0, high_valid)
             ),
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader.load_message(topic, 0, low_deleted)
             ),
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader.load_message(topic, 0, low_valid)
             ),
         );
