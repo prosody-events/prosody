@@ -178,9 +178,7 @@ async fn wait_for_lso(topic: &Topic, expected_lso: crate::Offset) -> color_eyre:
         }
 
         if Instant::now() >= deadline {
-            color_eyre::eyre::bail!(
-                "LSO for {topic}/0 did not reach {expected_lso} within 15s"
-            );
+            color_eyre::eyre::bail!("LSO for {topic}/0 did not reach {expected_lso} within 15s");
         }
     }
 }
