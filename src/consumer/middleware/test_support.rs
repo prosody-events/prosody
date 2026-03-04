@@ -8,7 +8,6 @@ use std::convert::Infallible;
 use std::future::{self, Future};
 use std::sync::Arc;
 
-use futures::stream::{self, Stream};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
@@ -259,7 +258,7 @@ impl EventContext for MockEventContext {
     fn scheduled(
         &self,
         _timer_type: TimerType,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        stream::empty()
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
+        future::ready(Ok(Vec::new()))
     }
 }

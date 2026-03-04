@@ -18,7 +18,6 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
 use color_eyre::eyre::eyre;
-use futures::{Stream, stream};
 use parking_lot::Mutex;
 use std::convert::Infallible;
 use std::error::Error;
@@ -172,8 +171,8 @@ impl EventContext for MockContext {
     fn scheduled(
         &self,
         _timer_type: TimerType,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        stream::empty()
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
+        ready(Ok(Vec::new()))
     }
 }
 

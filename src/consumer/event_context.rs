@@ -17,17 +17,14 @@ use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
 use crate::timers::{TimerManager, TimerType, Trigger};
 use arc_swap::ArcSwapOption;
-use async_stream::try_stream;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 use educe::Educe;
-use futures::stream::once;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, pin_mut};
+use futures::FutureExt;
 use serde::de::StdError;
 use std::error::Error;
 use std::future::{Future, ready};
 use std::ops::AsyncFnOnce;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::watch;
@@ -175,16 +172,16 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// A stream of scheduled time results.
+    /// A `Vec` of all scheduled times on success.
     ///
     /// # Errors
     ///
-    /// Items will be `Err(Self::Error)` if retrieving times from the persistent
+    /// Returns `Err(Self::Error)` if retrieving times from the persistent
     /// store fails.
     fn scheduled(
         &self,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static;
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static;
 
     /// Return a boxed, type-erased event context
     fn boxed(self) -> BoxEventContext {
@@ -447,38 +444,37 @@ where
     fn scheduled(
         &self,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        let inner = self.inner.load();
-        let Some(inner) = inner.as_ref() else {
-            return once(ready(Err(TimerManagerError::InvalidContext))).left_stream();
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
+        // Cannot use `run_cancellable` here: the trait requires `+ 'static` on
+        // the returned future, but `run_cancellable` borrows `self` via the
+        // `AsyncFnOnce` closure. Instead we clone the required handles up front
+        // and move them into the returned `async move` block — the same pattern
+        // used by `on_shutdown` and `on_message_cancelled`.
+        let guard = self.inner.load();
+        let Some(inner) = guard.as_ref() else {
+            return ready(Err(TimerManagerError::InvalidContext)).left_future();
         };
 
-        // Short-circuit before creating the stream
         if *inner.shutdown_rx.borrow() {
-            return once(ready(Err(TimerManagerError::Shutdown))).left_stream();
+            return ready(Err(TimerManagerError::Shutdown)).left_future();
         }
         if *inner.message_cancel_rx.borrow() {
-            return once(ready(Err(TimerManagerError::Cancelled))).left_stream();
+            return ready(Err(TimerManagerError::Cancelled)).left_future();
         }
 
         let mut shutdown_rx = inner.shutdown_rx.clone();
         let mut cancel_rx = inner.message_cancel_rx.clone();
         let inner = Arc::clone(inner);
 
-        try_stream! {
-            let scheduled_timers = inner.timers.scheduled_times(&inner.key, timer_type);
-            pin_mut!(scheduled_timers);
-
-            while let Some(time) = select! {
+        async move {
+            select! {
                 biased;
                 _ = shutdown_rx.wait_for(|v| *v) => Err(TimerManagerError::Shutdown),
                 _ = cancel_rx.wait_for(|v| *v) => Err(TimerManagerError::Cancelled),
-                item = scheduled_timers.try_next() => item,
-            }? {
-                yield time;
+                result = inner.timers.scheduled_times(&inner.key, timer_type) => result,
             }
         }
-        .right_stream()
+        .right_future()
     }
 }
 
@@ -602,10 +598,10 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     /// # Arguments
     ///
     /// * `timer_type` – The timer type.
-    fn scheduled(
+    async fn scheduled(
         &self,
         timer_type: TimerType,
-    ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxEventContextError>> + Send + 'static>>;
+    ) -> Result<Vec<CompactDateTime>, BoxEventContextError>;
 
     /// Synchronously check if message cancellation has been requested (includes
     /// partition shutdown).
@@ -660,15 +656,13 @@ where
             .map_err(|e| Box::new(e) as BoxEventContextError)
     }
 
-    fn scheduled(
+    async fn scheduled(
         &self,
         timer_type: TimerType,
-    ) -> Pin<Box<dyn Stream<Item = Result<CompactDateTime, BoxEventContextError>> + Send + 'static>>
-    {
-        Box::pin(
-            EventContext::scheduled(self, timer_type)
-                .map_err(|e| Box::new(e) as BoxEventContextError),
-        )
+    ) -> Result<Vec<CompactDateTime>, BoxEventContextError> {
+        EventContext::scheduled(self, timer_type)
+            .await
+            .map_err(|e| Box::new(e) as BoxEventContextError)
     }
 
     fn should_cancel(&self) -> bool {

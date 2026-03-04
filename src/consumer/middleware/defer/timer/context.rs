@@ -23,11 +23,9 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use async_stream::try_stream;
-use futures::{Stream, TryFutureExt, TryStreamExt, pin_mut};
-use std::cmp::Ordering;
+use futures::TryFutureExt;
+use std::future::Future;
 use thiserror::Error;
-use tokio::task::coop::cooperative;
 
 /// Context wrapper that unifies active and deferred timer operations.
 ///
@@ -41,7 +39,8 @@ use tokio::task::coop::cooperative;
 /// - `unschedule()`: Removes from both defer store and inner context
 /// - `clear_scheduled()`: Clears both stores, cancels `DeferredTimer`, deletes
 ///   key
-/// - `scheduled()`: Merges streams from both stores, sorted and deduplicated
+/// - `scheduled()`: Fetches from both stores concurrently, merges, sorts, and
+///   deduplicates
 /// - `clear_and_schedule()`: Deletes key, clears `DeferredTimer`, delegates to
 ///   inner
 ///
@@ -283,102 +282,36 @@ where
     fn scheduled(
         &self,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        merge_scheduled_streams(
-            self.inner.clone(),
-            self.store.clone(),
-            self.key().clone(),
-            timer_type,
-        )
-    }
-}
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
+        let inner = self.inner.clone();
+        let store = self.store.clone();
+        let key = self.key().clone();
 
-/// Implementation of `scheduled()` that handles both Application and
-/// non-Application types.
-fn merge_scheduled_streams<C, S>(
-    inner: C,
-    store: S,
-    key: Key,
-    timer_type: TimerType,
-) -> impl Stream<Item = Result<CompactDateTime, TimerDeferContextError<C::Error, S::Error>>>
-+ Send
-+ 'static
-where
-    C: EventContext + Clone + Send + Sync,
-    S: TimerDeferStore + Clone + Send + Sync,
-{
-    try_stream! {
-        let active_stream = inner.scheduled(timer_type);
-        pin_mut!(active_stream);
-
-        // Non-Application timers: just pass through from inner context
-        if timer_type != TimerType::Application {
-            while let Some(time) = advance_active(&mut active_stream).await? {
-                yield time;
+        async move {
+            // Non-Application timers pass through to inner context unchanged
+            if timer_type != TimerType::Application {
+                return inner
+                    .scheduled(timer_type)
+                    .await
+                    .map_err(TimerDeferContextError::Context);
             }
-            return;
-        }
 
-        // Application timers: merge active and deferred streams
-        let deferred_stream = store.deferred_times(&key);
-        pin_mut!(deferred_stream);
+            // Application timers: merge active and deferred, then sort+dedup
+            let (mut active, deferred) = tokio::try_join!(
+                inner
+                    .scheduled(timer_type)
+                    .map_err(TimerDeferContextError::Context),
+                store
+                    .deferred_times(&key)
+                    .map_err(TimerDeferContextError::Store),
+            )?;
 
-        let (mut active_next, mut deferred_next) = tokio::try_join!(
-            advance_active(&mut active_stream),
-            advance_deferred(&mut deferred_stream),
-        )?;
-
-        // Merge while both streams have items
-        while let (Some(active), Some(deferred)) = (active_next, deferred_next) {
-            match active.cmp(&deferred) {
-                Ordering::Less => {
-                    yield active;
-                    active_next = advance_active(&mut active_stream).await?;
-                }
-                Ordering::Greater => {
-                    yield deferred;
-                    deferred_next = advance_deferred(&mut deferred_stream).await?;
-                }
-                Ordering::Equal => {
-                    yield active;
-                    (active_next, deferred_next) = tokio::try_join!(
-                        advance_active(&mut active_stream),
-                        advance_deferred(&mut deferred_stream),
-                    )?;
-                }
-            }
-        }
-
-        // Drain remaining from active
-        while let Some(active) = active_next {
-            yield active;
-            active_next = advance_active(&mut active_stream).await?;
-        }
-
-        // Drain remaining from deferred
-        while let Some(deferred) = deferred_next {
-            yield deferred;
-            deferred_next = advance_deferred(&mut deferred_stream).await?;
+            active.extend(deferred);
+            active.sort_unstable();
+            active.dedup();
+            Ok(active)
         }
     }
-}
-
-/// Advances a stream, wrapping errors in `TimerDeferContextError::Context`.
-async fn advance_active<CE, SE>(
-    stream: &mut (impl Stream<Item = Result<CompactDateTime, CE>> + Unpin),
-) -> Result<Option<CompactDateTime>, TimerDeferContextError<CE, SE>> {
-    cooperative(stream.try_next())
-        .await
-        .map_err(TimerDeferContextError::Context)
-}
-
-/// Advances a stream, wrapping errors in `TimerDeferContextError::Store`.
-async fn advance_deferred<CE, SE>(
-    stream: &mut (impl Stream<Item = Result<CompactDateTime, SE>> + Unpin),
-) -> Result<Option<CompactDateTime>, TimerDeferContextError<CE, SE>> {
-    cooperative(stream.try_next())
-        .await
-        .map_err(TimerDeferContextError::Store)
 }
 
 /// Errors from timer defer context operations.

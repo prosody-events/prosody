@@ -416,7 +416,7 @@ mod tests {
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use crate::timers::store::{Segment, SegmentVersion};
     use color_eyre::eyre::{Result, eyre};
-    use futures::{StreamExt, TryStreamExt};
+    use futures::StreamExt;
     use std::time::Duration;
     use tokio::task;
     use tokio::time::{self, advance};
@@ -524,7 +524,6 @@ mod tests {
         // Verify the timer was removed from storage
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(times.is_empty(), "Timer should be removed after commit");
 
@@ -560,7 +559,6 @@ mod tests {
         // Verify the timer is still in storage (abort preserves DB state)
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(times.len(), 1, "Timer should remain in storage after abort");
         assert!(times.contains(&trigger.time));
