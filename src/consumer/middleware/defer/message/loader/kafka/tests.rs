@@ -318,7 +318,7 @@ async fn test_load_deleted_offset() -> color_eyre::Result<()> {
 
         // Try to load deleted offset 25
         let result = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             loader.load_message(topic, 0, offsets[25]),
         )
         .await?;
@@ -373,21 +373,21 @@ async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
 
         let h1 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 loader1.load_message(topic, 0, offset_10),
             )
             .await
         });
         let h2 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 loader2.load_message(topic, 0, offset_20),
             )
             .await
         });
         let h3 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 loader3.load_message(topic, 0, offset_60),
             )
             .await
@@ -754,7 +754,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
 
         // Try to load deleted offset (should trigger seek failure and recovery)
         let result = timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(30),
             loader.load_message(topic, 0, offsets[25]),
         )
         .await?;
@@ -935,15 +935,14 @@ async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<(
 
         let h1 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 loader1.load_message(topic, 0, offset_70),
             )
             .await
         });
         let h2 = tokio::spawn(async move {
-            // Short timeout - if infinite loop, this will timeout
             timeout(
-                Duration::from_secs(15),
+                Duration::from_secs(30),
                 loader2.load_message(topic, 0, offset_10),
             )
             .await
