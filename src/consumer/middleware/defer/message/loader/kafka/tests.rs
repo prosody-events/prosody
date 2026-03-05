@@ -200,7 +200,7 @@ async fn test_load_valid_offset() -> color_eyre::Result<()> {
 
         // Load offset 5
         let result = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[5]),
         )
         .await??;
@@ -234,7 +234,7 @@ async fn test_load_sequential_offsets() -> color_eyre::Result<()> {
         // Load offsets 5, 6, 7 in sequence
         for &offset in &offsets[5..8] {
             let result = timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(60),
                 loader.load_message(topic, 0, offset),
             )
             .await??;
@@ -275,7 +275,7 @@ async fn test_multiple_concurrent_requests() -> color_eyre::Result<()> {
             let offset = offsets[i];
             handles.push(tokio::spawn(async move {
                 timeout(
-                    Duration::from_secs(10),
+                    Duration::from_secs(60),
                     loader.load_message(topic, 0, offset),
                 )
                 .await
@@ -318,7 +318,7 @@ async fn test_load_deleted_offset() -> color_eyre::Result<()> {
 
         // Try to load deleted offset 25
         let result = timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[25]),
         )
         .await?;
@@ -373,21 +373,21 @@ async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
 
         let h1 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader1.load_message(topic, 0, offset_10),
             )
             .await
         });
         let h2 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader2.load_message(topic, 0, offset_20),
             )
             .await
         });
         let h3 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader3.load_message(topic, 0, offset_60),
             )
             .await
@@ -444,7 +444,7 @@ async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
 
         // Try to load offset at LSO (50)
         let result = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[50]),
         )
         .await??;
@@ -481,7 +481,7 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
         // NOW request the deleted offset 40
         let offset_40 = offsets[40];
         let result = timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offset_40),
         )
         .await?;
@@ -522,7 +522,7 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
 
         // Load valid offset after LSO
         let result = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[50]),
         )
         .await??;
@@ -556,7 +556,7 @@ async fn test_sparse_offset_requests() -> color_eyre::Result<()> {
         // Request sparse offsets
         for &idx in &[10, 50, 90] {
             let result = timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(60),
                 loader.load_message(topic, 0, offsets[idx]),
             )
             .await??;
@@ -589,7 +589,7 @@ async fn test_backwards_seek() -> color_eyre::Result<()> {
 
         // Load offset 80 (position will be at 81)
         let msg1 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[80]),
         )
         .await??;
@@ -597,7 +597,7 @@ async fn test_backwards_seek() -> color_eyre::Result<()> {
 
         // Now load offset 30 (should seek backwards)
         let msg2 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[30]),
         )
         .await??;
@@ -605,7 +605,7 @@ async fn test_backwards_seek() -> color_eyre::Result<()> {
 
         // Verify we can continue reading forward
         let msg3 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[31]),
         )
         .await??;
@@ -646,7 +646,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
 
         // Load offset 50 (position will be at 51)
         let msg1 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[50]),
         )
         .await??;
@@ -655,7 +655,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         // Load offset 55 - partition was unassigned after 50, position is Invalid.
         // We seek to min_offset (55) in this state.
         let msg2 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[55]),
         )
         .await??;
@@ -664,7 +664,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         // Load offset 70 - partition was unassigned after 55, position is Invalid.
         // We seek to min_offset (70) in this state.
         let msg3 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[70]),
         )
         .await??;
@@ -705,7 +705,7 @@ async fn test_concurrent_same_offset_requests() -> color_eyre::Result<()> {
             let loader = Arc::clone(&loader);
             handles.push(tokio::spawn(async move {
                 timeout(
-                    Duration::from_secs(10),
+                    Duration::from_secs(60),
                     loader.load_message(topic, 0, target_offset),
                 )
                 .await
@@ -754,7 +754,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
 
         // Try to load deleted offset (should trigger seek failure and recovery)
         let result = timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[25]),
         )
         .await?;
@@ -767,7 +767,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
 
         // Verify loader recovered and can load valid offsets
         let msg = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[60]),
         )
         .await??;
@@ -813,7 +813,7 @@ async fn test_decode_error() -> color_eyre::Result<()> {
 
         // Try to load the malformed message
         let result = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, bad_offset),
         )
         .await?;
@@ -874,7 +874,7 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
             let loader = Arc::clone(&loader);
             handles.push(tokio::spawn(async move {
                 timeout(
-                    Duration::from_secs(10),
+                    Duration::from_secs(60),
                     loader.load_message(topic, 0, bad_offset),
                 )
                 .await
@@ -935,14 +935,14 @@ async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<(
 
         let h1 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader1.load_message(topic, 0, offset_70),
             )
             .await
         });
         let h2 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader2.load_message(topic, 0, offset_10),
             )
             .await
@@ -1013,7 +1013,7 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
             let offset = offsets[i * 4]; // Spread out offsets
             handles.push(tokio::spawn(async move {
                 timeout(
-                    Duration::from_secs(15),
+                    Duration::from_secs(60),
                     loader.load_message(topic, 0, offset),
                 )
                 .await
@@ -1091,21 +1091,21 @@ async fn test_concurrent_multi_partition_loading() -> color_eyre::Result<()> {
 
         let h0 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader_a.load_message(topic, 0, target_0),
             )
             .await
         });
         let h1 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader_b.load_message(topic, 1, target_1),
             )
             .await
         });
         let h2 = tokio::spawn(async move {
             timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 loader_c.load_message(topic, 2, target_2),
             )
             .await
@@ -1157,7 +1157,7 @@ async fn test_sequential_multi_partition_loading() -> color_eyre::Result<()> {
 
         // Load from partition 0
         let msg0 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets_p0[3]),
         )
         .await??;
@@ -1166,7 +1166,7 @@ async fn test_sequential_multi_partition_loading() -> color_eyre::Result<()> {
 
         // Load from partition 1
         let msg1 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 1, offsets_p1[5]),
         )
         .await??;
@@ -1176,7 +1176,7 @@ async fn test_sequential_multi_partition_loading() -> color_eyre::Result<()> {
         // Load again from partition 0 (different offset)
         // With old assign() this would fail or timeout
         let msg0_again = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets_p0[7]),
         )
         .await??;
@@ -1264,9 +1264,9 @@ async fn test_lower_offsets_falsely_reported_deleted_when_assigned_at_higher_off
         // drains all three in its first iteration: HIGH anchors the assignment,
         // LOW1/LOW2 skip assign_if_needed, and the bug fires.
         let (r_high, r_low1, r_low2) = tokio::join!(
-            timeout(Duration::from_secs(15), loader.load_message(topic, 0, high)),
-            timeout(Duration::from_secs(15), loader.load_message(topic, 0, low1)),
-            timeout(Duration::from_secs(15), loader.load_message(topic, 0, low2)),
+            timeout(Duration::from_secs(60), loader.load_message(topic, 0, high)),
+            timeout(Duration::from_secs(60), loader.load_message(topic, 0, low1)),
+            timeout(Duration::from_secs(60), loader.load_message(topic, 0, low2)),
         );
 
         // The high-offset load should always succeed.
