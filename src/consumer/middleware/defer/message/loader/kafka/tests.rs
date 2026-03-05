@@ -2,12 +2,16 @@ use super::*;
 use crate::Topic;
 use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use futures::future::join_all;
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use std::env;
+use std::iter::once_with;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::spawn_blocking;
@@ -143,6 +147,24 @@ async fn delete_records_up_to(topic: &Topic, offset: crate::Offset) -> color_eyr
     Ok(())
 }
 
+/// Deletes records across multiple partitions in a single admin call, then
+/// waits for each partition's LSO to reach the requested level.
+///
+/// `deletions` is a slice of `(partition, offset)` pairs.
+async fn delete_records_multi(
+    topic: &Topic,
+    deletions: &[(i32, crate::Offset)],
+) -> color_eyre::Result<()> {
+    let admin = admin()?;
+    admin
+        .delete_records(deletions.iter().map(|&(p, o)| (*topic, p, o)))
+        .await?;
+    for &(partition, offset) in deletions {
+        wait_for_lso_partition(topic, partition, offset).await?;
+    }
+    Ok(())
+}
+
 /// Polls `fetch_watermarks` until the low watermark (LSO) reaches `expected`.
 /// Replaces the fixed 5-second sleep, cutting deletion propagation overhead
 /// from ~5 s to the actual broker propagation time (~50–500 ms locally).
@@ -150,6 +172,14 @@ async fn delete_records_up_to(topic: &Topic, offset: crate::Offset) -> color_eyr
 /// Each `fetch_watermarks` call has a built-in 500ms timeout that yields the
 /// async runtime while the blocking call is in-flight — no extra sleep needed.
 async fn wait_for_lso(topic: &Topic, expected_lso: crate::Offset) -> color_eyre::Result<()> {
+    wait_for_lso_partition(topic, 0, expected_lso).await
+}
+
+async fn wait_for_lso_partition(
+    topic: &Topic,
+    partition: i32,
+    expected_lso: crate::Offset,
+) -> color_eyre::Result<()> {
     let consumer: Arc<BaseConsumer> = Arc::new(
         ClientConfig::new()
             .set("bootstrap.servers", "localhost:9094")
@@ -165,7 +195,7 @@ async fn wait_for_lso(topic: &Topic, expected_lso: crate::Offset) -> color_eyre:
             let consumer = Arc::clone(&consumer);
             move || {
                 consumer
-                    .fetch_watermarks(&topic_str, 0, Duration::from_millis(500))
+                    .fetch_watermarks(&topic_str, partition, Duration::from_millis(500))
                     .map(|(low, _high)| low)
             }
         })
@@ -178,7 +208,9 @@ async fn wait_for_lso(topic: &Topic, expected_lso: crate::Offset) -> color_eyre:
         }
 
         if Instant::now() >= deadline {
-            color_eyre::eyre::bail!("LSO for {topic}/0 did not reach {expected_lso} within 15s");
+            color_eyre::eyre::bail!(
+                "LSO for {topic}/{partition} did not reach {expected_lso} within 15s"
+            );
         }
     }
 }
@@ -1411,6 +1443,370 @@ async fn test_concurrent_mixed_deleted_and_valid_lower_offsets() -> color_eyre::
 
     delete_topic(&topic_name).await?;
     result
+}
+
+/// Regression test for cross-partition LSO contamination.
+///
+/// Scenario (shrunk from property test):
+/// - 2-partition topic
+/// - Partition 1: all but the last offset deleted (lso = offsets[19])
+/// - Partition 0: no deletion at all
+///
+/// Bug: concurrent requests to both partitions caused partition 1's deletion
+/// state to bleed into partition 0, incorrectly reporting valid offsets on
+/// partition 0 as `OffsetDeleted`.
+#[tokio::test]
+async fn test_cross_partition_lso_contamination() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+    init_test_logging();
+
+    let topic_name = test_topic("cross_partition_lso");
+    create_topic_with_partitions(&topic_name, 2).await?;
+
+    let result = async {
+        let offsets_p0 = produce_messages_to_partition(&topic_name, 0, 20).await?;
+        let offsets_p1 = produce_messages_to_partition(&topic_name, 1, 20).await?;
+
+        // Delete all of partition 1 except the last offset (lso = offsets_p1[19])
+        let topic = Topic::from(topic_name.as_str());
+        delete_records_multi(&topic, &[(1_i32, offsets_p1[19])]).await?;
+
+        let loader = Arc::new(KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?);
+
+        // Fire requests concurrently across both partitions.
+        // Partition 1 requests include deleted offsets (indices 0–18) and the
+        // LSO boundary (index 19). Partition 0 requests are all valid.
+        let requests: &[(i32, i64)] = &[
+            (1, offsets_p1[16]),
+            (0, offsets_p0[18]),
+            (0, offsets_p0[18]),
+            (1, offsets_p1[11]),
+            (1, offsets_p1[8]),
+            (0, offsets_p0[19]),
+            (0, offsets_p0[19]),
+            (0, offsets_p0[6]),
+            (0, offsets_p0[19]),
+            (0, offsets_p0[19]),
+            (0, offsets_p0[3]),
+        ];
+
+        let results = join_all(requests.iter().map(|&(partition, offset)| {
+            let loader = Arc::clone(&loader);
+            async move {
+                timeout(
+                    Duration::from_secs(60),
+                    loader.load_message(topic, partition, offset),
+                )
+                .await
+            }
+        }))
+        .await;
+
+        for (result, &(partition, offset)) in results.into_iter().zip(requests) {
+            let load_result = result?;
+            if partition == 1_i32 && offset < offsets_p1[19] {
+                // Deleted — expect OffsetDeleted
+                let Err(KafkaLoaderError::OffsetDeleted(_, got_partition, got_offset, _)) =
+                    load_result
+                else {
+                    color_eyre::eyre::bail!(
+                        "partition {partition} offset {offset} expected OffsetDeleted, \
+                         got: {load_result:?}"
+                    );
+                };
+                assert_eq!(got_partition, partition);
+                assert_eq!(got_offset, offset);
+            } else {
+                // Valid — expect Ok
+                let Ok(msg) = load_result else {
+                    color_eyre::eyre::bail!(
+                        "partition {partition} offset {offset} expected Ok, \
+                         got: {load_result:?}"
+                    );
+                };
+                assert_eq!(msg.partition(), partition);
+                assert_eq!(msg.offset(), offset);
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    delete_topic(&topic_name).await?;
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Property-based test: multi-topic, multi-partition loader with deleted offsets
+// ---------------------------------------------------------------------------
+
+/// One partition's setup: how many messages to produce and how far to delete.
+/// `lso == 0` means no deletion; otherwise `offsets[lso]` is the new LSO.
+#[derive(Clone, Debug)]
+struct PartitionSpec {
+    message_count: usize,
+    lso: usize,
+}
+
+/// One topic's setup: 1–64 partitions.
+#[derive(Clone, Debug)]
+struct TopicSpec {
+    partitions: Vec<PartitionSpec>,
+}
+
+/// A single load request referencing a topic/partition/offset by index.
+#[derive(Clone, Debug)]
+struct LoadRequest {
+    topic: usize,
+    partition: usize,
+    offset: usize,
+}
+
+/// A complete scenario: 1–4 topics and 3–12 concurrent load requests.
+#[derive(Clone, Debug)]
+struct LoaderScenario {
+    topics: Vec<TopicSpec>,
+    requests: Vec<LoadRequest>,
+}
+
+fn arbitrary_partition_spec(g: &mut Gen) -> PartitionSpec {
+    let message_count = (usize::arbitrary(g) % 41) + 20; // 20..=60
+    let lso = usize::arbitrary(g) % message_count; // 0..message_count (0 = no deletion)
+    PartitionSpec { message_count, lso }
+}
+
+fn arbitrary_topic_spec(g: &mut Gen) -> TopicSpec {
+    let partition_count = (usize::arbitrary(g) % 16) + 1; // 1..=16
+    TopicSpec {
+        partitions: (0..partition_count)
+            .map(|_| arbitrary_partition_spec(g))
+            .collect(),
+    }
+}
+
+fn arbitrary_request(g: &mut Gen, topics: &[TopicSpec]) -> LoadRequest {
+    let topic = usize::arbitrary(g) % topics.len();
+    let partition = usize::arbitrary(g) % topics[topic].partitions.len();
+    let offset = usize::arbitrary(g) % topics[topic].partitions[partition].message_count;
+    LoadRequest {
+        topic,
+        partition,
+        offset,
+    }
+}
+
+impl Arbitrary for LoaderScenario {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let topic_count = (usize::arbitrary(g) % 4) + 1; // 1..=4
+        let topics: Vec<TopicSpec> = (0..topic_count).map(|_| arbitrary_topic_spec(g)).collect();
+        let request_count = (usize::arbitrary(g) % 10) + 3; // 3..=12
+        let requests = (0..request_count)
+            .map(|_| arbitrary_request(g, &topics))
+            .collect();
+        LoaderScenario { topics, requests }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let s = self.clone();
+        Box::new(
+            // 1. Remove requests from the end one at a time (keep at least 3)
+            (3..s.requests.len())
+                .rev()
+                .map({
+                    let s = s.clone();
+                    move |len| LoaderScenario {
+                        topics: s.topics.clone(),
+                        requests: s.requests[..len].to_vec(),
+                    }
+                })
+            // 2. Remove the last topic (keep at least 1), drop dangling requests
+            .chain(once_with({
+                let s = s.clone();
+                move || {
+                    if s.topics.len() <= 1 {
+                        return None;
+                    }
+                    let topics = s.topics[..s.topics.len() - 1].to_vec();
+                    let requests = s
+                        .requests
+                        .iter()
+                        .filter(|r| r.topic < topics.len())
+                        .cloned()
+                        .collect();
+                    Some(LoaderScenario { topics, requests })
+                }
+            }).flatten())
+            // 3. Halve message counts (min 20), clamp lso and offset indices
+            .chain(once_with({
+                let s = s.clone();
+                move || {
+                    let topics: Vec<TopicSpec> = s.topics.iter().map(|t| TopicSpec {
+                        partitions: t.partitions.iter().map(|p| {
+                            let message_count = (p.message_count / 2).max(20);
+                            PartitionSpec {
+                                message_count,
+                                lso: p.lso.min(message_count - 1),
+                            }
+                        }).collect(),
+                    }).collect();
+                    let requests = s.requests.iter().map(|r| {
+                        let max = topics[r.topic].partitions[r.partition].message_count - 1;
+                        LoadRequest { offset: r.offset.min(max), ..*r }
+                    }).collect();
+                    LoaderScenario { topics, requests }
+                }
+            })),
+        )
+    }
+}
+
+/// Produce messages to all partitions of a single topic concurrently.
+async fn produce_all_partitions(
+    topic_name: &str,
+    specs: &[PartitionSpec],
+) -> color_eyre::Result<Vec<Vec<i64>>> {
+    join_all(
+        specs
+            .iter()
+            .enumerate()
+            .map(|(p, spec)| produce_messages_to_partition(topic_name, p as i32, spec.message_count)),
+    )
+    .await
+    .into_iter()
+    .collect()
+}
+
+/// Delete records for any partition in `specs` where `lso > 0`.
+async fn delete_partition_records(
+    topic: &Topic,
+    specs: &[PartitionSpec],
+    offsets: &[Vec<i64>],
+) -> color_eyre::Result<()> {
+    let deletions: Vec<(i32, crate::Offset)> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.lso > 0)
+        .map(|(p, spec)| (p as i32, offsets[p][spec.lso]))
+        .collect();
+    if !deletions.is_empty() {
+        delete_records_multi(topic, &deletions).await?;
+    }
+    Ok(())
+}
+
+/// Assert the outcome of one load request against the expected deleted/valid boundary.
+fn assert_load_result(
+    result: Result<ConsumerMessage, KafkaLoaderError>,
+    topic: usize,
+    partition: usize,
+    offset_idx: usize,
+    expected_offset: i64,
+    lso: usize,
+) -> color_eyre::Result<()> {
+    if offset_idx < lso {
+        let Err(KafkaLoaderError::OffsetDeleted(_, got_partition, got_offset, _)) = result else {
+            color_eyre::eyre::bail!(
+                "topic {topic} partition {partition} offset_idx {offset_idx} \
+                 (offset {expected_offset}) expected OffsetDeleted (lso_idx={lso}), \
+                 got: {result:?}"
+            );
+        };
+        assert_eq!(got_partition, partition as i32);
+        assert_eq!(got_offset, expected_offset);
+    } else {
+        let Ok(msg) = result else {
+            color_eyre::eyre::bail!(
+                "topic {topic} partition {partition} offset_idx {offset_idx} \
+                 (offset {expected_offset}) expected Ok (lso_idx={lso}), \
+                 got: {result:?}"
+            );
+        };
+        assert_eq!(msg.offset(), expected_offset);
+        assert_eq!(msg.partition(), partition as i32);
+    }
+    Ok(())
+}
+
+async fn run_scenario_async(scenario: LoaderScenario) -> color_eyre::Result<()> {
+    // Create all topics concurrently
+    let topic_names: Vec<String> = scenario.topics.iter().map(|_| test_topic("prop_multi")).collect();
+    join_all(
+        topic_names
+            .iter()
+            .zip(scenario.topics.iter())
+            .map(|(name, t)| create_topic_with_partitions(name, t.partitions.len() as u16)),
+    )
+    .await
+    .into_iter()
+    .collect::<color_eyre::Result<Vec<()>>>()?;
+
+    let result = async {
+        let topics: Vec<Topic> = topic_names.iter().map(|n| Topic::from(n.as_str())).collect();
+
+        // Produce and delete for all topics concurrently
+        // offsets[t][p] = Vec<i64> of produced offsets
+        let offsets: Vec<Vec<Vec<i64>>> = join_all(
+            topic_names
+                .iter()
+                .zip(scenario.topics.iter())
+                .map(|(name, t)| produce_all_partitions(name, &t.partitions)),
+        )
+        .await
+        .into_iter()
+        .collect::<color_eyre::Result<_>>()?;
+
+        for (t, topic_spec) in scenario.topics.iter().enumerate() {
+            delete_partition_records(&topics[t], &topic_spec.partitions, &offsets[t]).await?;
+        }
+
+        let loader = Arc::new(KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?);
+
+        let results = join_all(scenario.requests.iter().map(|req| {
+            let loader = Arc::clone(&loader);
+            let topic = topics[req.topic];
+            let partition = req.partition as i32;
+            let offset = offsets[req.topic][req.partition][req.offset];
+            async move {
+                timeout(Duration::from_secs(60), loader.load_message(topic, partition, offset)).await
+            }
+        }))
+        .await;
+
+        for (result, req) in results.into_iter().zip(&scenario.requests) {
+            let expected_offset = offsets[req.topic][req.partition][req.offset];
+            let lso = scenario.topics[req.topic].partitions[req.partition].lso;
+            assert_load_result(result?, req.topic, req.partition, req.offset, expected_offset, lso)?;
+        }
+
+        Ok(())
+    }
+    .await;
+
+    for name in &topic_names {
+        let _ = delete_topic(name).await;
+    }
+    result
+}
+
+fn run_loader_scenario(scenario: LoaderScenario) -> TestResult {
+    match TEST_RUNTIME.block_on(run_scenario_async(scenario)) {
+        Ok(()) => TestResult::passed(),
+        Err(e) => TestResult::error(e.to_string()),
+    }
+}
+
+#[test]
+fn prop_multi_partition_deleted_offsets() {
+    let _ = color_eyre::install();
+    init_test_logging();
+    let test_count = env::var("INTEGRATION_TESTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5);
+    QuickCheck::new()
+        .tests(test_count)
+        .quickcheck(run_loader_scenario as fn(LoaderScenario) -> TestResult);
 }
 
 /// Unit tests for seek decision logic (no Kafka required)

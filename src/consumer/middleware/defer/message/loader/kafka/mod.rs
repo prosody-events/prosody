@@ -52,7 +52,6 @@ use rdkafka::{Message, TopicPartitionList};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -80,11 +79,30 @@ mod tests;
 /// permits initially to maintain backpressure semantics.
 type Responses = SmallVec<[oneshot::Sender<Result<DecodedMessage, KafkaLoaderError>>; 1]>;
 
-/// Active load requests indexed by topic-partition, then by offset.
+/// Per-partition state for the loader poll loop.
+///
+/// Groups the pending offset map with the `pending_seek` target so both are
+/// scoped to the same partition and dropped together when the partition is
+/// removed from `active`.
+///
+/// `pending_seek` holds the offset we last sought to. It is `Some` while we
+/// are waiting for the broker to deliver a message at or past that offset, and
+/// `None` once the seek has materialised. A new seek is issued (replacing the
+/// stored value) whenever `min_offset < pending_seek`, which handles the case
+/// where a lower-offset request arrives after the seek was already dispatched.
+#[derive(Default)]
+struct PartitionState {
+    offsets: BTreeMap<Offset, Responses>,
+    pending_seek: Option<Offset>,
+}
+
+/// Active load requests indexed by topic-partition.
 ///
 /// Each partition tracks its requested offsets in sorted order (via
-/// [`BTreeMap`]) to efficiently find the minimum offset for seek optimization.
-type ActiveRequests = HashMap<(Topic, Partition), BTreeMap<Offset, Responses>>;
+/// [`BTreeMap`] inside [`PartitionState`]) to efficiently find the minimum
+/// offset for seek optimization. `pending_seek` is managed per-partition so
+/// a message on one partition does not clear the flag for another.
+type ActiveRequests = HashMap<(Topic, Partition), PartitionState>;
 
 /// Configuration for the Kafka message loader.
 ///
@@ -394,15 +412,6 @@ fn poll_loop(
 ) {
     let mut active: ActiveRequests = HashMap::default();
     let propagator = new_propagator();
-    // Tracks whether a seek has been issued but not yet materialised.
-    //
-    // After seek_partitions() succeeds, position() returns Invalid (None) until
-    // the first message is consumed. If we re-evaluate the seek condition before
-    // a message arrives, None => true triggers another seek — resetting the
-    // consumer back to the deleted offset and preventing the broker's auto-reset
-    // from ever delivering the LSO message. Holding this flag true until a
-    // message is actually received breaks that cycle.
-    let mut pending_seek = false;
 
     #[cfg(not(target_arch = "arm"))]
     let mut buffers = Buffers::default();
@@ -426,7 +435,6 @@ fn poll_loop(
 
         // If idle, wait for a request (with heartbeat timeout)
         if active.is_empty() {
-            pending_seek = false;
             debug!("Poll loop idle, waiting for requests");
             if let Some(request) = Handle::current().block_on(async {
                 select! {
@@ -443,36 +451,28 @@ fn poll_loop(
 
         debug!(
             active_partitions = active.len(),
-            total_pending_offsets = active.values().map(BTreeMap::len).sum::<usize>(),
+            total_pending_offsets = active.values().map(|s| s.offsets.len()).sum::<usize>(),
             "Poll loop iteration with active requests"
         );
 
-        // Seek to first active offset if beneficial, but only if no seek is
-        // already pending. A seek is only materialised (position() advances out
-        // of Invalid) after the consumer receives a message from the broker.
-        // Re-seeking while pending_seek is true would reset the consumer back to
-        // the (possibly deleted) target offset on every iteration, preventing
-        // the broker's auto-reset from ever delivering the LSO message.
-        if !pending_seek {
-            match seek_to_first_active_offset(
-                &active,
-                consumer,
-                config.discard_threshold,
-                config.seek_timeout,
-            ) {
-                Ok(seeked) => pending_seek = seeked,
-                Err(error) => {
-                    warn!("Seek failed, retrying next iteration: {error:#}");
-                    // Do NOT fall through to poll(). If the seek failed, the
-                    // consumer's position is unknown — polling and running
-                    // split_off with an untrustworthy position would
-                    // misclassify pending offsets as deleted, which is data
-                    // corruption. Skip this iteration and retry the seek next
-                    // time around. The seek_timeout provides implicit backoff
-                    // (~5s) so this does not spin.
-                    continue;
-                }
-            }
+        // Seek partitions that need it. Per-partition pending_seek flags prevent
+        // re-seeking a partition before the broker's auto-reset delivers the LSO
+        // message. Partitions with pending_seek are skipped inside the function.
+        if let Err(error) = seek_to_first_active_offset(
+            &mut active,
+            consumer,
+            config.discard_threshold,
+            config.seek_timeout,
+        ) {
+            warn!("Seek failed, retrying next iteration: {error:#}");
+            // Do NOT fall through to poll(). If the seek failed, the
+            // consumer's position is unknown — polling and running
+            // split_off with an untrustworthy position would
+            // misclassify pending offsets as deleted, which is data
+            // corruption. Skip this iteration and retry the seek next
+            // time around. The seek_timeout provides implicit backoff
+            // (~5s) so this does not spin.
+            continue;
         }
 
         // Poll once per iteration
@@ -480,9 +480,6 @@ fn poll_loop(
             debug!("Poll returned no message");
             continue;
         };
-
-        // A message arrived — seek has materialised (position will advance).
-        pending_seek = false;
 
         process_poll_result(
             result,
@@ -522,18 +519,45 @@ fn process_poll_result(
 
     debug!(topic = %msg_topic, partition = msg_partition, offset = msg_offset, "Polled message");
 
-    let Some(partition_requests) = active.get_mut(&(msg_topic, msg_partition)) else {
+    let Some(state) = active.get_mut(&(msg_topic, msg_partition)) else {
         debug!(topic = %msg_topic, partition = msg_partition, offset = msg_offset,
             "Received message for partition with no active requests");
         return;
     };
 
-    // LAZY VALIDATION: Detect deleted offsets (LSO moved forward)
-    let mut deleted_offsets = partition_requests.split_off(&msg_offset);
-    mem::swap(&mut deleted_offsets, partition_requests);
+    // LAZY VALIDATION: Detect deleted offsets (LSO moved forward).
+    //
+    // `pending_seek` records the offset we sought to when the seek was
+    // dispatched. Requests that arrived in the channel AFTER the seek was
+    // issued have offsets below `pending_seek` and are NOT deleted — they
+    // just arrived late and need a fresh seek. Only offsets in the range
+    // `[pending_seek, msg_offset)` were genuinely skipped by the broker
+    // (i.e., deleted via retention/compaction).
+    //
+    // When `pending_seek` is None (sequential read, no seek was issued), fall
+    // back to the current minimum offset as the split boundary — the original
+    // behaviour before this fix was introduced.
+    let split_start = state
+        .pending_seek
+        .take()
+        .unwrap_or_else(|| state.offsets.keys().next().copied().unwrap_or(msg_offset));
+
+    // Split out entries that were present at seek time: [split_start..)
+    // Entries in [0..split_start) are late arrivals; they stay in state.offsets.
+    let working_set = state.offsets.split_off(&split_start);
+
+    // Within the seek-time entries, partition into deleted and future:
+    //   deleted  = [split_start..msg_offset)
+    //   remaining = [msg_offset..)
+    let mut deleted_offsets = working_set;
+    let remaining = deleted_offsets.split_off(&msg_offset);
+
+    // Merge future entries back so they aren't lost.
+    state.offsets.extend(remaining);
+
     notify_deleted_offsets(deleted_offsets, msg_topic, msg_partition, msg_offset);
 
-    let Some(senders) = partition_requests.remove(&msg_offset) else {
+    let Some(senders) = state.offsets.remove(&msg_offset) else {
         debug!(topic = %msg_topic, partition = msg_partition, offset = msg_offset,
             "Discarding intermediate message (not requested)");
         cleanup_if_empty(active, consumer, msg_topic, msg_partition);
@@ -624,7 +648,7 @@ fn cleanup_if_empty(
 ) {
     let should_cleanup = active
         .get(&(topic, partition))
-        .is_some_and(BTreeMap::is_empty);
+        .is_some_and(|s| s.offsets.is_empty());
 
     if should_cleanup {
         active.remove(&(topic, partition));
@@ -676,9 +700,9 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
         return;
     }
 
-    let partition_requests = active.entry((topic, partition)).or_default();
+    let state = active.entry((topic, partition)).or_default();
 
-    match partition_requests.entry(offset) {
+    match state.offsets.entry(offset) {
         Entry::Vacant(entry) => {
             // First request for this offset
             debug!(
@@ -715,21 +739,21 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
 /// detects deletions when messages arrive. Seek failures (network errors,
 /// Kafka down) trigger retry via the caller's continue loop.
 ///
+/// Partitions whose `pending_seek` flag is already set are skipped: a seek is
+/// only materialised (position advances out of Invalid) after the consumer
+/// receives a message from the broker. Re-seeking before that point resets the
+/// consumer back to the (possibly deleted) target offset on every iteration,
+/// preventing the broker's auto-reset from delivering the LSO message.
+/// `pending_seek` is set here for each partition whose seek succeeds and is
+/// cleared in [`process_poll_result`] when a message is received.
+///
 /// # Arguments
 ///
-/// * `active` - Map of active requests by topic-partition and offset
+/// * `active` - Map of active requests by topic-partition (mutated to set
+///   `pending_seek` flags)
 /// * `consumer` - The Kafka consumer to seek
 /// * `discard_threshold` - Number of messages to read before seeking
 /// * `seek_timeout` - Timeout for seek operations
-///
-/// # Returns
-///
-/// `Ok(true)` if a seek was issued, `Ok(false)` if no seek was needed.
-/// The caller must not seek again until a message is received when `Ok(true)`
-/// is returned: a seek is only materialised (position advances out of Invalid)
-/// after consuming a message. Re-seeking before that point resets the consumer
-/// back to the (possibly deleted) target offset on every iteration, preventing
-/// the broker's auto-reset from delivering the LSO message.
 ///
 /// # Errors
 ///
@@ -738,21 +762,28 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
 /// risk misclassifying pending offsets as deleted. The caller should retry
 /// the seek on the next iteration.
 fn seek_to_first_active_offset(
-    active: &ActiveRequests,
+    active: &mut ActiveRequests,
     consumer: &BaseConsumer,
     discard_threshold: i64,
     seek_timeout: Duration,
-) -> KafkaResult<bool> {
+) -> KafkaResult<()> {
     if active.is_empty() {
-        return Ok(false);
+        return Ok(());
     }
 
     let mut seek_list = TopicPartitionList::new();
 
-    for ((topic, partition), offsets) in active {
-        let Some((&min_offset, _)) = offsets.first_key_value() else {
+    for ((topic, partition), state) in active.iter() {
+        let Some((&min_offset, _)) = state.offsets.first_key_value() else {
             continue;
         };
+
+        // Skip if we already have a seek in flight that will land at or before
+        // min_offset. If a new lower-offset request arrived after the seek was
+        // dispatched, min_offset < pending_seek and we must re-seek.
+        if state.pending_seek.is_some_and(|s| s <= min_offset) {
+            continue;
+        }
 
         let current_position = consumer
             .position()?
@@ -805,7 +836,7 @@ fn seek_to_first_active_offset(
     }
 
     if seek_list.count() == 0 {
-        return Ok(false);
+        return Ok(());
     }
 
     debug!(
@@ -814,7 +845,9 @@ fn seek_to_first_active_offset(
     );
     let result = consumer.seek_partitions(seek_list, Timeout::After(seek_timeout))?;
 
-    // Check for per-partition seek errors.
+    // Set pending_seek for each partition that succeeded before checking for
+    // errors. This way, if partition A succeeds and partition B fails, A's flag
+    // is correctly set before we return the error.
     for elem in result.elements() {
         if let Err(e) = elem.error() {
             warn!(
@@ -831,9 +864,15 @@ fn seek_to_first_active_offset(
             offset = ?elem.offset(),
             "Seek succeeded for partition"
         );
+        if let rdkafka::Offset::Offset(sought_offset) = elem.offset() {
+            let key = (Topic::from(elem.topic()), elem.partition());
+            if let Some(state) = active.get_mut(&key) {
+                state.pending_seek = Some(sought_offset);
+            }
+        }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 /// Assigns a partition at the requested offset if not already assigned.
