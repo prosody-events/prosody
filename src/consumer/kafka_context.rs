@@ -43,7 +43,8 @@ use crate::timers::store::TriggerStore;
 ///
 /// * `T` - Type implementing `HandlerProvider` to create message handlers for
 ///   partitions
-/// * `S` - Type implementing `TriggerStore` for persistent timer trigger storage
+/// * `S` - Type implementing `TriggerStore` for persistent timer trigger
+///   storage
 pub struct Context<T, S>
 where
     T: HandlerProvider,
