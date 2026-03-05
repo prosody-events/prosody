@@ -394,12 +394,15 @@ fn poll_loop(
 ) {
     let mut active: ActiveRequests = HashMap::default();
     let propagator = new_propagator();
-    // Tracks whether a seek fired on the previous iteration. A seek is only
-    // materialised (position() advances out of Invalid) after the next poll.
-    // Skipping the seek when this flag is set guarantees at least one poll
-    // between consecutive seeks, preventing an infinite seek-without-poll loop
-    // on deleted offsets where seek "succeeds" but position stays None.
-    let mut just_seeked = false;
+    // Tracks whether a seek has been issued but not yet materialised.
+    //
+    // After seek_partitions() succeeds, position() returns Invalid (None) until
+    // the first message is consumed. If we re-evaluate the seek condition before
+    // a message arrives, None => true triggers another seek — resetting the
+    // consumer back to the deleted offset and preventing the broker's auto-reset
+    // from ever delivering the LSO message. Holding this flag true until a
+    // message is actually received breaks that cycle.
+    let mut pending_seek = false;
 
     #[cfg(not(target_arch = "arm"))]
     let mut buffers = Buffers::default();
@@ -423,7 +426,7 @@ fn poll_loop(
 
         // If idle, wait for a request (with heartbeat timeout)
         if active.is_empty() {
-            just_seeked = false;
+            pending_seek = false;
             debug!("Poll loop idle, waiting for requests");
             if let Some(request) = Handle::current().block_on(async {
                 select! {
@@ -444,21 +447,20 @@ fn poll_loop(
             "Poll loop iteration with active requests"
         );
 
-        // Seek to first active offset if beneficial. Skipped when just_seeked
-        // is set: a seek is only materialised after the next poll, so re-seeking
-        // before polling would spin forever on deleted offsets where seek
-        // succeeds but position() stays None until a message is received.
-        if just_seeked {
-            // Seeked last iteration — skip seeking, fall through to poll.
-            just_seeked = false;
-        } else {
+        // Seek to first active offset if beneficial, but only if no seek is
+        // already pending. A seek is only materialised (position() advances out
+        // of Invalid) after the consumer receives a message from the broker.
+        // Re-seeking while pending_seek is true would reset the consumer back to
+        // the (possibly deleted) target offset on every iteration, preventing
+        // the broker's auto-reset from ever delivering the LSO message.
+        if !pending_seek {
             match seek_to_first_active_offset(
                 &active,
                 consumer,
                 config.discard_threshold,
                 config.seek_timeout,
             ) {
-                Ok(seeked) => just_seeked = seeked,
+                Ok(seeked) => pending_seek = seeked,
                 Err(error) => {
                     warn!("Seek failed, retrying next iteration: {error:#}");
                     // Do NOT fall through to poll(). If the seek failed, the
@@ -478,6 +480,9 @@ fn poll_loop(
             debug!("Poll returned no message");
             continue;
         };
+
+        // A message arrived — seek has materialised (position will advance).
+        pending_seek = false;
 
         process_poll_result(
             result,
@@ -720,9 +725,11 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
 /// # Returns
 ///
 /// `Ok(true)` if a seek was issued, `Ok(false)` if no seek was needed.
-/// The caller must not seek again before polling when `Ok(true)` is returned:
-/// a seek is only materialised (position advances out of Invalid) after the
-/// next poll, so re-seeking immediately would spin on deleted offsets.
+/// The caller must not seek again until a message is received when `Ok(true)`
+/// is returned: a seek is only materialised (position advances out of Invalid)
+/// after consuming a message. Re-seeking before that point resets the consumer
+/// back to the (possibly deleted) target offset on every iteration, preventing
+/// the broker's auto-reset from delivering the LSO message.
 ///
 /// # Errors
 ///
