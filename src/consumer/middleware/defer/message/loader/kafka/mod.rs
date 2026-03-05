@@ -394,6 +394,12 @@ fn poll_loop(
 ) {
     let mut active: ActiveRequests = HashMap::default();
     let propagator = new_propagator();
+    // Tracks whether a seek fired on the previous iteration. A seek is only
+    // materialised (position() advances out of Invalid) after the next poll.
+    // Skipping the seek when this flag is set guarantees at least one poll
+    // between consecutive seeks, preventing an infinite seek-without-poll loop
+    // on deleted offsets where seek "succeeds" but position stays None.
+    let mut just_seeked = false;
 
     #[cfg(not(target_arch = "arm"))]
     let mut buffers = Buffers::default();
@@ -417,6 +423,7 @@ fn poll_loop(
 
         // If idle, wait for a request (with heartbeat timeout)
         if active.is_empty() {
+            just_seeked = false;
             debug!("Poll loop idle, waiting for requests");
             if let Some(request) = Handle::current().block_on(async {
                 select! {
@@ -437,21 +444,33 @@ fn poll_loop(
             "Poll loop iteration with active requests"
         );
 
-        // Seek to first active offset if beneficial
-        if let Err(error) = seek_to_first_active_offset(
-            &active,
-            consumer,
-            config.discard_threshold,
-            config.seek_timeout,
-        ) {
-            warn!("Seek failed, retrying next iteration: {error:#}");
-            // Do NOT fall through to poll(). If the seek failed, the consumer's
-            // position is unknown — polling and running split_off with an
-            // untrustworthy position would misclassify pending offsets as
-            // deleted, which is data corruption. Skip this iteration and retry
-            // the seek next time around. The seek_timeout provides implicit
-            // backoff (~5s) so this does not spin.
-            continue;
+        // Seek to first active offset if beneficial. Skipped when just_seeked
+        // is set: a seek is only materialised after the next poll, so re-seeking
+        // before polling would spin forever on deleted offsets where seek
+        // succeeds but position() stays None until a message is received.
+        if just_seeked {
+            // Seeked last iteration — skip seeking, fall through to poll.
+            just_seeked = false;
+        } else {
+            match seek_to_first_active_offset(
+                &active,
+                consumer,
+                config.discard_threshold,
+                config.seek_timeout,
+            ) {
+                Ok(seeked) => just_seeked = seeked,
+                Err(error) => {
+                    warn!("Seek failed, retrying next iteration: {error:#}");
+                    // Do NOT fall through to poll(). If the seek failed, the
+                    // consumer's position is unknown — polling and running
+                    // split_off with an untrustworthy position would
+                    // misclassify pending offsets as deleted, which is data
+                    // corruption. Skip this iteration and retry the seek next
+                    // time around. The seek_timeout provides implicit backoff
+                    // (~5s) so this does not spin.
+                    continue;
+                }
+            }
         }
 
         // Poll once per iteration
@@ -698,6 +717,13 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
 /// * `discard_threshold` - Number of messages to read before seeking
 /// * `seek_timeout` - Timeout for seek operations
 ///
+/// # Returns
+///
+/// `Ok(true)` if a seek was issued, `Ok(false)` if no seek was needed.
+/// The caller must not seek again before polling when `Ok(true)` is returned:
+/// a seek is only materialised (position advances out of Invalid) after the
+/// next poll, so re-seeking immediately would spin on deleted offsets.
+///
 /// # Errors
 ///
 /// Returns a `KafkaError` if seeking fails. The caller must NOT poll after
@@ -709,9 +735,9 @@ fn seek_to_first_active_offset(
     consumer: &BaseConsumer,
     discard_threshold: i64,
     seek_timeout: Duration,
-) -> KafkaResult<()> {
+) -> KafkaResult<bool> {
     if active.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut seek_list = TopicPartitionList::new();
@@ -771,35 +797,36 @@ fn seek_to_first_active_offset(
         }
     }
 
-    if seek_list.count() > 0 {
-        debug!(
-            partition_count = seek_list.count(),
-            "Executing seek operation"
-        );
-        let result = consumer.seek_partitions(seek_list, Timeout::After(seek_timeout))?;
+    if seek_list.count() == 0 {
+        return Ok(false);
+    }
 
-        // Check for seek failures (network errors, timeouts, etc.)
-        for elem in result.elements() {
-            if let Err(e) = elem.error() {
-                warn!(
-                    topic = elem.topic(),
-                    partition = elem.partition(),
-                    offset = ?elem.offset(),
-                    error = %format_args!("{e:#}"),
-                    "Seek failed for partition"
-                );
-                return Err(e);
-            }
-            debug!(
+    debug!(
+        partition_count = seek_list.count(),
+        "Executing seek operation"
+    );
+    let result = consumer.seek_partitions(seek_list, Timeout::After(seek_timeout))?;
+
+    // Check for per-partition seek errors.
+    for elem in result.elements() {
+        if let Err(e) = elem.error() {
+            warn!(
                 topic = elem.topic(),
                 partition = elem.partition(),
                 offset = ?elem.offset(),
-                "Seek succeeded for partition"
+                "Seek failed for partition: {e:#}"
             );
+            return Err(e);
         }
+        debug!(
+            topic = elem.topic(),
+            partition = elem.partition(),
+            offset = ?elem.offset(),
+            "Seek succeeded for partition"
+        );
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Assigns a partition at the requested offset if not already assigned.
