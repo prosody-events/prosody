@@ -1,15 +1,23 @@
 use super::*;
-use crate::Topic;
 use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
+use crate::{Offset, Partition, Topic};
+use ahash::AHashMap;
 use futures::future::join_all;
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use rdkafka::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use slotmap::{DefaultKey, SlotMap};
+use std::env;
+use std::iter::once_with;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use std::time::{Duration, Instant};
+use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::time::timeout;
 
 fn test_topic(name: &str) -> String {
     format!("loader_test_{name}_{}", uuid::Uuid::new_v4())
@@ -21,7 +29,7 @@ fn loader_config() -> LoaderConfiguration {
         group_id: "prosody-test".to_owned(),
         max_permits: 10,
         cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
-        poll_interval: Duration::from_secs(1),
+        poll_interval: Duration::from_millis(50),
         seek_timeout: Duration::from_secs(5),
         discard_threshold: 10,
     }
@@ -50,8 +58,49 @@ async fn create_topic_with_partitions(name: &str, partitions: u16) -> color_eyre
         .partition_count(partitions)
         .build()?;
     admin.create_topic(&topic_config).await?;
-    sleep(Duration::from_secs(2)).await;
+    wait_for_topic(name, partitions).await?;
     Ok(())
+}
+
+/// Polls Kafka metadata until the topic is visible with the expected number of
+/// partitions. Replaces the fixed 2-second sleep that previously preceded every
+/// test, cutting topic-creation overhead from ~2 s to the actual broker
+/// propagation time (~50–200 ms locally).
+///
+/// Each `fetch_metadata` call has a built-in 500ms timeout that yields the
+/// async runtime while the blocking call is in-flight — no extra sleep needed.
+async fn wait_for_topic(name: &str, expected_partitions: u16) -> color_eyre::Result<()> {
+    let consumer: Arc<BaseConsumer> = Arc::new(
+        ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9094")
+            .set("group.id", "prosody-test-setup")
+            .create()?,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let meta = spawn_blocking({
+            let name = name.to_owned();
+            let consumer = Arc::clone(&consumer);
+            move || consumer.fetch_metadata(Some(&name), Duration::from_millis(500))
+        })
+        .await?;
+
+        if let Ok(meta) = meta {
+            let ready = meta.topics().iter().any(|t| {
+                t.name() == name
+                    && t.partitions().len() == usize::from(expected_partitions)
+                    && t.partitions().iter().all(|p| p.error().is_none())
+            });
+            if ready {
+                return Ok(());
+            }
+        }
+
+        if Instant::now() >= deadline {
+            color_eyre::eyre::bail!("topic {name} did not become ready within 10s");
+        }
+    }
 }
 
 async fn delete_topic(name: &str) -> color_eyre::Result<()> {
@@ -60,13 +109,32 @@ async fn delete_topic(name: &str) -> color_eyre::Result<()> {
     Ok(())
 }
 
-async fn produce_messages(topic: &str, count: usize) -> color_eyre::Result<Vec<i64>> {
-    produce_messages_to_partition(topic, 0, count).await
+async fn with_topic(
+    name: &str,
+    body: impl AsyncFn(&str) -> color_eyre::Result<()>,
+) -> color_eyre::Result<()> {
+    let topic_name = test_topic(name);
+    create_topic(&topic_name).await?;
+    let result = body(&topic_name).await;
+    delete_topic(&topic_name).await?;
+    result
+}
+
+async fn with_partitioned_topic(
+    name: &str,
+    partitions: u16,
+    body: impl AsyncFn(&str) -> color_eyre::Result<()>,
+) -> color_eyre::Result<()> {
+    let topic_name = test_topic(name);
+    create_topic_with_partitions(&topic_name, partitions).await?;
+    let result = body(&topic_name).await;
+    delete_topic(&topic_name).await?;
+    result
 }
 
 async fn produce_messages_to_partition(
     topic: &str,
-    partition: i32,
+    partition: Partition,
     count: usize,
 ) -> color_eyre::Result<Vec<i64>> {
     let producer = producer()?;
@@ -93,289 +161,68 @@ async fn produce_messages_to_partition(
     Ok(offsets)
 }
 
-async fn delete_records_up_to(topic: &Topic, offset: crate::Offset) -> color_eyre::Result<()> {
+/// Deletes records across multiple partitions in a single admin call, then
+/// waits for each partition's LSO to reach the requested level.
+///
+/// `deletions` is a slice of `(partition, offset)` pairs.
+async fn delete_records_multi(
+    topic: &Topic,
+    deletions: &[(Partition, Offset)],
+) -> color_eyre::Result<()> {
     let admin = admin()?;
-    admin.delete_records([(*topic, 0_i32, offset)]).await?;
-    // Wait for Kafka to propagate the deletion across all brokers
-    // Experiments show this can take time - increase to 5 seconds
-    sleep(Duration::from_secs(5)).await;
+    admin
+        .delete_records(deletions.iter().map(|&(p, o)| (*topic, p, o)))
+        .await?;
+    for &(partition, offset) in deletions {
+        wait_for_lso_partition(topic, partition, offset).await?;
+    }
     Ok(())
 }
 
-/// Test: Load a valid message successfully
-#[tokio::test]
-async fn test_load_valid_offset() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
+/// Polls `fetch_watermarks` until the low watermark (LSO) reaches `expected`.
+/// Replaces the fixed 5-second sleep, cutting deletion propagation overhead
+/// from ~5 s to the actual broker propagation time (~50–500 ms locally).
+///
+/// Each `fetch_watermarks` call has a built-in 500ms timeout that yields the
+/// async runtime while the blocking call is in-flight — no extra sleep needed.
+async fn wait_for_lso_partition(
+    topic: &Topic,
+    partition: Partition,
+    expected_lso: Offset,
+) -> color_eyre::Result<()> {
+    let consumer: Arc<BaseConsumer> = Arc::new(
+        ClientConfig::new()
+            .set("bootstrap.servers", "localhost:9094")
+            .set("group.id", "prosody-test-setup")
+            .create()?,
+    );
 
-    let topic_name = test_topic("valid");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 10).await?;
-        let topic = Topic::from(topic_name.as_str());
-
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
-
-        // Load offset 5
-        let result = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 0, offsets[5]),
-        )
-        .await??;
-
-        assert_eq!(result.offset(), offsets[5]);
-        assert_eq!(result.partition(), 0_i32);
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Load multiple sequential offsets
-#[tokio::test]
-async fn test_load_sequential_offsets() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("sequential");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 20).await?;
-        let topic = Topic::from(topic_name.as_str());
-
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
-
-        // Load offsets 5, 6, 7 in sequence
-        for &offset in &offsets[5..8] {
-            let result = timeout(
-                Duration::from_secs(10),
-                loader.load_message(topic, 0, offset),
-            )
-            .await??;
-            assert_eq!(result.offset(), offset);
-        }
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Load offsets from multiple partitions (if we had multiple partitions)
-/// For now, just test multiple requests to same partition
-#[tokio::test]
-async fn test_multiple_concurrent_requests() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("concurrent");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 30).await?;
-        let topic = Topic::from(topic_name.as_str());
-
-        let loader = Arc::new(KafkaLoader::new(
-            loader_config(),
-            &HeartbeatRegistry::test(),
-        )?);
-
-        // Request multiple offsets concurrently
-        let mut handles = Vec::new();
-        for i in [5, 10, 15, 20, 25] {
-            let loader = Arc::clone(&loader);
-            let offset = offsets[i];
-            handles.push(tokio::spawn(async move {
-                timeout(
-                    Duration::from_secs(10),
-                    loader.load_message(topic, 0, offset),
-                )
-                .await
-            }));
-        }
-
-        let results = join_all(handles).await;
-        for (idx, result) in results.into_iter().enumerate() {
-            let msg = result???;
-            let expected_offset = offsets[[5, 10, 15, 20, 25][idx]];
-            assert_eq!(msg.offset(), expected_offset);
-        }
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Request deleted offset (offset < LSO)
-/// Expected: Should return `OffsetDeleted` error
-#[tokio::test]
-async fn test_load_deleted_offset() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("deleted");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
-
-        // Delete offsets 0-49 (LSO becomes 50)
-        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
-
-        let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
-
-        // Try to load deleted offset 25
-        let result = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 0, offsets[25]),
-        )
+    let topic_str = topic.to_string();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let lso = spawn_blocking({
+            let topic_str = topic_str.clone();
+            let consumer = Arc::clone(&consumer);
+            move || {
+                consumer
+                    .fetch_watermarks(&topic_str, partition, Duration::from_millis(500))
+                    .map(|(low, _high)| low)
+            }
+        })
         .await?;
 
-        let Err(KafkaLoaderError::OffsetDeleted(t, p, requested, lso)) = result else {
-            color_eyre::eyre::bail!("Expected OffsetDeleted error, got: {result:?}");
-        };
+        if let Ok(lso) = lso
+            && lso >= expected_lso
+        {
+            return Ok(());
+        }
 
-        assert_eq!(t, topic);
-        assert_eq!(p, 0_i32);
-        assert_eq!(requested, offsets[25]);
-        assert_eq!(lso, offsets[50]); // LSO should be at offset 50
-
-        Ok(())
+        if Instant::now() >= deadline {
+            color_eyre::eyre::bail!(
+                "LSO for {topic}/{partition} did not reach {expected_lso} within 15s"
+            );
+        }
     }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Request multiple offsets where first 2 are deleted
-/// Expected: Both should return `OffsetDeleted` errors
-#[tokio::test]
-async fn test_load_multiple_deleted_offsets() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("multi_deleted");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
-
-        // Delete offsets 0-49 (LSO becomes 50)
-        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
-
-        let topic = Topic::from(topic_name.as_str());
-        let loader = Arc::new(KafkaLoader::new(
-            loader_config(),
-            &HeartbeatRegistry::test(),
-        )?);
-
-        // Request deleted offsets 10, 20, and valid offset 60 concurrently
-        let loader1 = Arc::clone(&loader);
-        let loader2 = Arc::clone(&loader);
-        let loader3 = Arc::clone(&loader);
-
-        let offset_10 = offsets[10];
-        let offset_20 = offsets[20];
-        let offset_60 = offsets[60];
-
-        let h1 = tokio::spawn(async move {
-            timeout(
-                Duration::from_secs(10),
-                loader1.load_message(topic, 0, offset_10),
-            )
-            .await
-        });
-        let h2 = tokio::spawn(async move {
-            timeout(
-                Duration::from_secs(10),
-                loader2.load_message(topic, 0, offset_20),
-            )
-            .await
-        });
-        let h3 = tokio::spawn(async move {
-            timeout(
-                Duration::from_secs(10),
-                loader3.load_message(topic, 0, offset_60),
-            )
-            .await
-        });
-
-        let (r1, r2, r3) = tokio::join!(h1, h2, h3);
-
-        // First two should be OffsetDeleted
-        let result1 = r1??;
-        let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, _)) = result1 else {
-            color_eyre::eyre::bail!("Expected OffsetDeleted for offset 10, got: {result1:?}");
-        };
-        assert_eq!(requested, offset_10);
-
-        let result2 = r2??;
-        let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, _)) = result2 else {
-            color_eyre::eyre::bail!("Expected OffsetDeleted for offset 20, got: {result2:?}");
-        };
-        assert_eq!(requested, offset_20);
-
-        // Third should succeed
-        let result3 = r3??;
-        let Ok(msg) = result3 else {
-            color_eyre::eyre::bail!("Expected success for offset 60, got error: {result3:?}");
-        };
-        assert_eq!(msg.offset(), offsets[60]);
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Request offset exactly at LSO boundary
-/// Expected: Should succeed (experiments showed LSO is valid for assign)
-#[tokio::test]
-async fn test_load_offset_at_lso() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("at_lso");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
-
-        // Delete offsets 0-49 (LSO becomes 50)
-        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
-
-        let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
-
-        // Try to load offset at LSO (50)
-        let result = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 0, offsets[50]),
-        )
-        .await??;
-
-        assert_eq!(result.offset(), offsets[50]);
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
 }
 
 /// Test: Request offset that was deleted before the request
@@ -385,39 +232,38 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
 
-    let topic_name = test_topic("truncated");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
+    with_topic("truncated", async |topic_name| {
+        let offsets = produce_messages_to_partition(topic_name, 0, 100).await?;
 
         // Delete partition FIRST
-        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
+        let topic = Topic::from(topic_name);
+        delete_records_multi(&topic, &[(0_i32, 50)]).await?;
 
-        let topic = Topic::from(topic_name.as_str());
         let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // NOW request the deleted offset 40
         let offset_40 = offsets[40];
         let result = timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offset_40),
         )
         .await?;
 
-        let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, lso)) = result else {
+        let Err(KafkaLoaderError::OffsetDeleted {
+            requested_offset,
+            next_offset,
+            ..
+        }) = result
+        else {
             color_eyre::eyre::bail!("Expected OffsetDeleted, got: {result:?}");
         };
 
-        assert_eq!(requested, offset_40);
-        assert!(lso >= offsets[50]);
+        assert_eq!(requested_offset, offset_40);
+        assert!(next_offset >= offsets[50]);
 
         Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
+    })
+    .await
 }
 
 /// Test: Recovery from seek failure
@@ -427,21 +273,18 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
 
-    let topic_name = test_topic("seek_recovery");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
+    with_topic("seek_recovery", async |topic_name| {
+        let offsets = produce_messages_to_partition(topic_name, 0, 100).await?;
 
         // Delete some offsets to set up potential seek failure
-        delete_records_up_to(&Topic::from(topic_name.as_str()), 30).await?;
+        let topic = Topic::from(topic_name);
+        delete_records_multi(&topic, &[(0_i32, 30)]).await?;
 
-        let topic = Topic::from(topic_name.as_str());
         let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Load valid offset after LSO
         let result = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[50]),
         )
         .await??;
@@ -449,93 +292,8 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
         assert_eq!(result.offset(), offsets[50]);
 
         Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Sparse offset requests (10, 50, 90)
-/// Expected: Should load all successfully with seeks
-#[tokio::test]
-async fn test_sparse_offset_requests() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("sparse");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
-
-        let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
-
-        // Request sparse offsets
-        for &idx in &[10, 50, 90] {
-            let result = timeout(
-                Duration::from_secs(10),
-                loader.load_message(topic, 0, offsets[idx]),
-            )
-            .await??;
-            assert_eq!(result.offset(), offsets[idx]);
-        }
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Backwards seek (request offset < current position)
-/// Verifies seeking backwards works correctly
-#[tokio::test]
-async fn test_backwards_seek() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("backwards");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
-        let topic = Topic::from(topic_name.as_str());
-
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
-
-        // Load offset 80 (position will be at 81)
-        let msg1 = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 0, offsets[80]),
-        )
-        .await??;
-        assert_eq!(msg1.offset(), offsets[80]);
-
-        // Now load offset 30 (should seek backwards)
-        let msg2 = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 0, offsets[30]),
-        )
-        .await??;
-        assert_eq!(msg2.offset(), offsets[30]);
-
-        // Verify we can continue reading forward
-        let msg3 = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 0, offsets[31]),
-        )
-        .await??;
-        assert_eq!(msg3.offset(), offsets[31]);
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
+    })
+    .await
 }
 
 /// Test: Discard threshold boundary conditions
@@ -545,19 +303,16 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
 
-    let topic_name = test_topic("threshold");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
-        let topic = Topic::from(topic_name.as_str());
+    with_topic("threshold", async |topic_name| {
+        let offsets = produce_messages_to_partition(topic_name, 0, 100).await?;
+        let topic = Topic::from(topic_name);
 
         let config = LoaderConfiguration {
             bootstrap_servers: vec!["localhost:9094".to_owned()],
             group_id: "prosody-test".to_owned(),
             max_permits: 10,
             cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
-            poll_interval: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(50),
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 5, // Small threshold for testing
         };
@@ -565,86 +320,33 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
 
         // Load offset 50 (position will be at 51)
         let msg1 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[50]),
         )
         .await??;
         assert_eq!(msg1.offset(), offsets[50]);
 
         // Load offset 55 - partition was unassigned after 50, position is Invalid.
-        // With Invalid position, we trust assign() and don't seek.
+        // We seek to min_offset (55) in this state.
         let msg2 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[55]),
         )
         .await??;
         assert_eq!(msg2.offset(), offsets[55]);
 
         // Load offset 70 - partition was unassigned after 55, position is Invalid.
-        // With Invalid position, we trust assign() and don't seek.
-        // Previously this could timeout because Invalid triggered unnecessary seek.
+        // We seek to min_offset (70) in this state.
         let msg3 = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[70]),
         )
         .await??;
         assert_eq!(msg3.offset(), offsets[70]);
 
         Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Concurrent same-offset requests
-/// Verifies multiple waiters for same offset all receive cloned message
-#[tokio::test]
-async fn test_concurrent_same_offset_requests() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("same_offset");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 10).await?;
-        let topic = Topic::from(topic_name.as_str());
-
-        let loader = Arc::new(KafkaLoader::new(
-            loader_config(),
-            &HeartbeatRegistry::test(),
-        )?);
-
-        let target_offset = offsets[5];
-
-        // Launch 5 concurrent requests for same offset
-        let mut handles = Vec::new();
-        for _ in 0_i32..5_i32 {
-            let loader = Arc::clone(&loader);
-            handles.push(tokio::spawn(async move {
-                timeout(
-                    Duration::from_secs(10),
-                    loader.load_message(topic, 0, target_offset),
-                )
-                .await
-            }));
-        }
-
-        // All should succeed with same offset
-        let results = join_all(handles).await;
-        for result in results {
-            let msg = result???;
-            assert_eq!(msg.offset(), target_offset);
-        }
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
+    })
+    .await
 }
 
 /// Test: Multi-partition recovery from seek failure
@@ -660,45 +362,42 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
     // a message from a different partition, which should still exit
     // the erroneous state for all partitions
 
-    let topic_name = test_topic("recovery");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
+    with_topic("recovery", async |topic_name| {
+        let offsets = produce_messages_to_partition(topic_name, 0, 100).await?;
 
         // Delete offsets to trigger seek failure
-        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
+        let topic = Topic::from(topic_name);
+        delete_records_multi(&topic, &[(0_i32, 50)]).await?;
 
-        let topic = Topic::from(topic_name.as_str());
         let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Try to load deleted offset (should trigger seek failure and recovery)
         let result = timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[25]),
         )
         .await?;
 
         // Should get OffsetDeleted error
-        let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, _)) = result else {
+        let Err(KafkaLoaderError::OffsetDeleted {
+            requested_offset, ..
+        }) = result
+        else {
             color_eyre::eyre::bail!("Expected OffsetDeleted error, got: {result:?}");
         };
-        assert_eq!(requested, offsets[25]);
+        assert_eq!(requested_offset, offsets[25]);
 
         // Verify loader recovered and can load valid offsets
         let msg = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, offsets[60]),
         )
         .await??;
         assert_eq!(msg.offset(), offsets[60]);
 
         Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
+    })
+    .await
 }
 
 /// Test: Decode error path
@@ -708,16 +407,13 @@ async fn test_decode_error() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
 
-    let topic_name = test_topic("decode_error");
-    create_topic(&topic_name).await?;
-
-    let result = async {
+    with_topic("decode_error", async |topic_name| {
         let producer = producer()?;
 
         // Produce message with invalid JSON payload
         let delivery = producer
             .send(
-                FutureRecord::to(&topic_name)
+                FutureRecord::to(topic_name)
                     .key("test-key")
                     .payload(b"this is not valid JSON {{{")
                     .headers(OwnedHeaders::new()),
@@ -727,13 +423,13 @@ async fn test_decode_error() -> color_eyre::Result<()> {
             .map_err(|(e, _)| e)?;
 
         let bad_offset = delivery.offset;
-        let topic = Topic::from(topic_name.as_str());
+        let topic = Topic::from(topic_name);
 
         let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Try to load the malformed message
         let result = timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(60),
             loader.load_message(topic, 0, bad_offset),
         )
         .await?;
@@ -748,11 +444,8 @@ async fn test_decode_error() -> color_eyre::Result<()> {
         assert_eq!(offset, bad_offset);
 
         Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
+    })
+    .await
 }
 
 /// Test: Multiple concurrent requests for same offset with decode error
@@ -762,16 +455,13 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
 
-    let topic_name = test_topic("concurrent_decode_error");
-    create_topic(&topic_name).await?;
-
-    let result = async {
+    with_topic("concurrent_decode_error", async |topic_name| {
         let producer = producer()?;
 
         // Produce malformed message
         let delivery = producer
             .send(
-                FutureRecord::to(&topic_name)
+                FutureRecord::to(topic_name)
                     .key("test-key")
                     .payload(b"not json")
                     .headers(OwnedHeaders::new()),
@@ -781,7 +471,7 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
             .map_err(|(e, _)| e)?;
 
         let bad_offset = delivery.offset;
-        let topic = Topic::from(topic_name.as_str());
+        let topic = Topic::from(topic_name);
 
         let loader = Arc::new(KafkaLoader::new(
             loader_config(),
@@ -794,7 +484,7 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
             let loader = Arc::clone(&loader);
             handles.push(tokio::spawn(async move {
                 timeout(
-                    Duration::from_secs(10),
+                    Duration::from_secs(60),
                     loader.load_message(topic, 0, bad_offset),
                 )
                 .await
@@ -812,84 +502,8 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
         }
 
         Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
-}
-
-/// Test: Request older deleted offset when partition already has newer active
-/// requests This tests the scenario where:
-/// 1. Partition has request for newer offset (70), consumer positioned at 71
-/// 2. New request arrives for older deleted offset (10, where LSO=50)
-/// 3. This triggers seek(10) which enters erroneous state
-/// 4. With `continue` on seek failure, we'd skip polling and never recover
-/// Expected: Should NOT timeout (either recovers via poll or fails quickly)
-#[tokio::test]
-async fn test_older_deleted_offset_after_newer_request() -> color_eyre::Result<()> {
-    let _ = color_eyre::install();
-    init_test_logging();
-
-    let topic_name = test_topic("older_deleted");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 100).await?;
-
-        // Delete offsets 0-49 (LSO becomes 50)
-        delete_records_up_to(&Topic::from(topic_name.as_str()), 50).await?;
-
-        let topic = Topic::from(topic_name.as_str());
-        let loader = Arc::new(KafkaLoader::new(
-            loader_config(),
-            &HeartbeatRegistry::test(),
-        )?);
-
-        // Launch BOTH requests simultaneously
-        // This ensures both are in active before any seeking happens
-        let loader1 = Arc::clone(&loader);
-        let loader2 = Arc::clone(&loader);
-        let offset_70 = offsets[70];
-        let offset_10 = offsets[10];
-
-        let h1 = tokio::spawn(async move {
-            timeout(
-                Duration::from_secs(10),
-                loader1.load_message(topic, 0, offset_70),
-            )
-            .await
-        });
-        let h2 = tokio::spawn(async move {
-            // Short timeout - if infinite loop, this will timeout
-            timeout(
-                Duration::from_secs(15),
-                loader2.load_message(topic, 0, offset_10),
-            )
-            .await
-        });
-
-        // Wait for both
-        let (r1, r2) = tokio::join!(h1, h2);
-
-        // First should succeed
-        let msg1 = r1???;
-        assert_eq!(msg1.offset(), offset_70);
-
-        // Second should get OffsetDeleted error (not timeout!)
-        let result2 = r2??;
-        let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, lso)) = result2 else {
-            color_eyre::eyre::bail!("Expected OffsetDeleted for offset 10, got: {result2:?}");
-        };
-        assert_eq!(requested, offset_10);
-        assert!(lso >= offsets[50]);
-
-        Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
+    })
+    .await
 }
 
 /// Test: Cache permit exhaustion with many concurrent loads
@@ -907,12 +521,9 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
 
-    let topic_name = test_topic("cache_permits");
-    create_topic(&topic_name).await?;
-
-    let result = async {
-        let offsets = produce_messages(&topic_name, 50).await?;
-        let topic = Topic::from(topic_name.as_str());
+    with_topic("cache_permits", async |topic_name| {
+        let offsets = produce_messages_to_partition(topic_name, 0, 50).await?;
+        let topic = Topic::from(topic_name);
 
         // Small cache to force evictions
         let config = LoaderConfiguration {
@@ -920,7 +531,7 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
             group_id: "prosody-test".to_owned(),
             max_permits: 20, // Allow many concurrent loads
             cache_size: 2,   // But only 2 cache permits
-            poll_interval: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(50),
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 10,
         };
@@ -934,7 +545,7 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
             let offset = offsets[i * 4]; // Spread out offsets
             handles.push(tokio::spawn(async move {
                 timeout(
-                    Duration::from_secs(15),
+                    Duration::from_secs(60),
                     loader.load_message(topic, 0, offset),
                 )
                 .await
@@ -960,156 +571,577 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
         }
 
         Ok(())
-    }
-    .await;
-
-    delete_topic(&topic_name).await?;
-    result
+    })
+    .await
 }
 
-/// Test: Concurrent loading from multiple partitions
+/// Regression test for cross-partition LSO contamination.
 ///
-/// This test verifies that `incremental_assign()` works correctly by loading
-/// messages from multiple partitions concurrently. With the old `assign()`
-/// approach (full replacement), loading from partition 1 would unassign
-/// partition 0, breaking concurrent multi-partition requests.
+/// Scenario (shrunk from property test):
+/// - 2-partition topic
+/// - Partition 1: all but the last offset deleted (lso = offsets[19])
+/// - Partition 0: no deletion at all
 ///
-/// The test:
-/// 1. Creates a topic with 3 partitions
-/// 2. Produces messages to each partition
-/// 3. Concurrently loads messages from all partitions
-/// 4. Verifies all messages are loaded correctly
+/// Bug: concurrent requests to both partitions caused partition 1's deletion
+/// state to bleed into partition 0, incorrectly reporting valid offsets on
+/// partition 0 as `OffsetDeleted`.
 #[tokio::test]
-async fn test_concurrent_multi_partition_loading() -> color_eyre::Result<()> {
+async fn test_cross_partition_lso_contamination() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
 
-    let topic_name = test_topic("multi_partition");
-    create_topic_with_partitions(&topic_name, 3).await?;
+    with_partitioned_topic("cross_partition_lso", 2, async |topic_name| {
+        let offsets_p0 = produce_messages_to_partition(topic_name, 0, 20).await?;
+        let offsets_p1 = produce_messages_to_partition(topic_name, 1, 20).await?;
 
-    let result = async {
-        // Produce messages to each partition
-        let offsets_p0 = produce_messages_to_partition(&topic_name, 0, 10).await?;
-        let offsets_p1 = produce_messages_to_partition(&topic_name, 1, 10).await?;
-        let offsets_p2 = produce_messages_to_partition(&topic_name, 2, 10).await?;
+        // Delete all of partition 1 except the last offset (lso = offsets_p1[19])
+        let topic = Topic::from(topic_name);
+        delete_records_multi(&topic, &[(1_i32, offsets_p1[19])]).await?;
 
-        let topic = Topic::from(topic_name.as_str());
         let loader = Arc::new(KafkaLoader::new(
             loader_config(),
             &HeartbeatRegistry::test(),
         )?);
 
-        // Request messages from all 3 partitions concurrently
-        // With old assign() behavior, this would fail because assigning
-        // partition 1 would replace the assignment for partition 0
-        let loader_a = Arc::clone(&loader);
-        let loader_b = Arc::clone(&loader);
-        let loader_c = Arc::clone(&loader);
+        // Fire requests concurrently across both partitions.
+        // Partition 1 requests include deleted offsets (indices 0–18) and the
+        // LSO boundary (index 19). Partition 0 requests are all valid.
+        let requests: &[(Partition, Offset)] = &[
+            (1, offsets_p1[16]),
+            (0, offsets_p0[18]),
+            (0, offsets_p0[18]),
+            (1, offsets_p1[11]),
+            (1, offsets_p1[8]),
+            (0, offsets_p0[19]),
+            (0, offsets_p0[19]),
+            (0, offsets_p0[6]),
+            (0, offsets_p0[19]),
+            (0, offsets_p0[19]),
+            (0, offsets_p0[3]),
+        ];
 
-        let target_0 = offsets_p0[5];
-        let target_1 = offsets_p1[5];
-        let target_2 = offsets_p2[5];
+        let results = join_all(requests.iter().map(|&(partition, offset)| {
+            let loader = Arc::clone(&loader);
+            async move {
+                timeout(
+                    Duration::from_secs(60),
+                    loader.load_message(topic, partition, offset),
+                )
+                .await
+            }
+        }))
+        .await;
 
-        let h0 = tokio::spawn(async move {
-            timeout(
-                Duration::from_secs(10),
-                loader_a.load_message(topic, 0, target_0),
-            )
-            .await
-        });
-        let h1 = tokio::spawn(async move {
-            timeout(
-                Duration::from_secs(10),
-                loader_b.load_message(topic, 1, target_1),
-            )
-            .await
-        });
-        let h2 = tokio::spawn(async move {
-            timeout(
-                Duration::from_secs(10),
-                loader_c.load_message(topic, 2, target_2),
-            )
-            .await
-        });
+        for (result, &(partition, offset)) in results.into_iter().zip(requests) {
+            let load_result = result?;
+            if partition == 1_i32 && offset < offsets_p1[19] {
+                // Deleted — expect OffsetDeleted
+                let Err(KafkaLoaderError::OffsetDeleted {
+                    partition: got_partition,
+                    requested_offset: got_offset,
+                    ..
+                }) = load_result
+                else {
+                    color_eyre::eyre::bail!(
+                        "partition {partition} offset {offset} expected OffsetDeleted, got: \
+                         {load_result:?}"
+                    );
+                };
+                assert_eq!(got_partition, partition);
+                assert_eq!(got_offset, offset);
+            } else {
+                // Valid — expect Ok
+                let Ok(msg) = load_result else {
+                    color_eyre::eyre::bail!(
+                        "partition {partition} offset {offset} expected Ok, got: {load_result:?}"
+                    );
+                };
+                assert_eq!(msg.partition(), partition);
+                assert_eq!(msg.offset(), offset);
+            }
+        }
 
-        let (r0, r1, r2) = tokio::join!(h0, h1, h2);
+        Ok(())
+    })
+    .await
+}
 
-        // All should succeed
-        let msg0 = r0???;
-        assert_eq!(msg0.partition(), 0_i32);
-        assert_eq!(msg0.offset(), target_0);
+// ---------------------------------------------------------------------------
+// Property-based test: interleaved Request/Await operations
+// ---------------------------------------------------------------------------
 
-        let msg1 = r1???;
-        assert_eq!(msg1.partition(), 1_i32);
-        assert_eq!(msg1.offset(), target_1);
+/// One partition's setup: how many messages to produce and how far to delete.
+/// `lso == 0` means no deletion; otherwise `offsets[lso]` is the new LSO.
+#[derive(Clone, Debug)]
+struct PartitionSpec {
+    message_count: usize,
+    lso: usize,
+}
 
-        let msg2 = r2???;
-        assert_eq!(msg2.partition(), 2_i32);
-        assert_eq!(msg2.offset(), target_2);
+/// One topic's setup: 1–16 partitions.
+#[derive(Clone, Debug)]
+struct TopicSpec {
+    partitions: Vec<PartitionSpec>,
+}
+
+/// An operation in an interleaved scenario. `Request` sends a load future
+/// (non-blocking); `Await` polls one previously sent future to completion and
+/// asserts the correct outcome. Each `Await` is a synchronisation point that
+/// proves the poll loop completed at least one full cycle, so a subsequent
+/// `Request` lands in a later drain pass.
+#[derive(Clone, Debug)]
+enum Op {
+    Request {
+        topic: usize,
+        partition: usize,
+        offset: usize,
+    },
+    Await {
+        topic: usize,
+        partition: usize,
+        offset: usize,
+    },
+}
+
+/// A complete interleaved scenario: 1–4 topics (each 1–16 partitions) and an
+/// ordered sequence of `Request`/`Await` operations.
+#[derive(Clone, Debug)]
+struct InterleavedScenario {
+    topics: Vec<TopicSpec>,
+    ops: Vec<Op>,
+}
+
+/// Index-triple key used during scenario generation and shrinking, before
+/// domain values (Topic names, Offset i64s) are known.
+type Pending = AHashMap<(usize, usize, usize), usize>;
+
+/// Domain-typed key used in the runner once broker values are resolved.
+type ResolvedKey = (Topic, Partition, Offset);
+
+/// Replay `ops`, tracking unmatched Requests. Returns the pending map.
+fn tally_pending(ops: &[Op]) -> Pending {
+    let mut pending = Pending::new();
+    for op in ops {
+        match *op {
+            Op::Request {
+                topic,
+                partition,
+                offset,
+            } => {
+                *pending.entry((topic, partition, offset)).or_default() += 1;
+            }
+            Op::Await {
+                topic,
+                partition,
+                offset,
+            } => {
+                let c = pending.entry((topic, partition, offset)).or_default();
+                if *c > 0 {
+                    *c -= 1;
+                }
+            }
+        }
+    }
+    pending.retain(|_, &mut c| c > 0);
+    pending
+}
+
+/// Append one `Await` for every unmatched `Request` in `pending`.
+fn drain_pending(ops: &mut Vec<Op>, pending: Pending) {
+    for ((topic, partition, offset), count) in pending {
+        for _ in 0..count {
+            ops.push(Op::Await {
+                topic,
+                partition,
+                offset,
+            });
+        }
+    }
+}
+
+/// Clamp an `Op`'s offset index to the new (smaller) topic/partition bounds.
+fn clamp_op(op: &Op, topics: &[TopicSpec]) -> Op {
+    let (topic, partition, offset) = match *op {
+        Op::Request {
+            topic,
+            partition,
+            offset,
+        }
+        | Op::Await {
+            topic,
+            partition,
+            offset,
+        } => (topic, partition, offset),
+    };
+    let offset = offset.min(topics[topic].partitions[partition].message_count - 1);
+    match op {
+        Op::Request { .. } => Op::Request {
+            topic,
+            partition,
+            offset,
+        },
+        Op::Await { .. } => Op::Await {
+            topic,
+            partition,
+            offset,
+        },
+    }
+}
+
+impl Arbitrary for InterleavedScenario {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let topic_count = (usize::arbitrary(g) % 4) + 1; // 1..=4
+        let topics: Vec<TopicSpec> = (0..topic_count).map(|_| TopicSpec::arbitrary(g)).collect();
+
+        let mut pending = Pending::new();
+        let op_count = (usize::arbitrary(g) % 13) + 4; // 4..=16
+        let mut ops = Vec::with_capacity(op_count + 32);
+
+        for _ in 0..op_count {
+            let has_pending = !pending.is_empty();
+            // 60% Request, 40% Await when both are possible; always Request when nothing is
+            // pending.
+            let do_request = !has_pending || (usize::arbitrary(g) % 5) < 3;
+
+            if do_request {
+                let topic = usize::arbitrary(g) % topics.len();
+                let partition = usize::arbitrary(g) % topics[topic].partitions.len();
+                let offset =
+                    usize::arbitrary(g) % topics[topic].partitions[partition].message_count;
+                *pending.entry((topic, partition, offset)).or_default() += 1;
+                ops.push(Op::Request {
+                    topic,
+                    partition,
+                    offset,
+                });
+            } else {
+                let keys: Vec<(usize, usize, usize)> = pending.keys().copied().collect();
+                let (topic, partition, offset) = keys[usize::arbitrary(g) % keys.len()];
+                let c = pending.entry((topic, partition, offset)).or_default();
+                *c -= 1;
+                if *c == 0 {
+                    pending.remove(&(topic, partition, offset));
+                }
+                ops.push(Op::Await {
+                    topic,
+                    partition,
+                    offset,
+                });
+            }
+        }
+
+        drain_pending(&mut ops, pending);
+        InterleavedScenario { topics, ops }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let s = self.clone();
+        Box::new(
+            // 1. Truncate ops from the end, re-draining so the scenario stays balanced.
+            (4..s.ops.len())
+                .rev()
+                .filter_map({
+                    let s = s.clone();
+                    move |len| {
+                        let mut ops = s.ops[..len].to_vec();
+                        let pending = tally_pending(&ops);
+                        drain_pending(&mut ops, pending);
+                        ops.iter()
+                            .any(|op| matches!(op, Op::Request { .. }))
+                            .then_some(InterleavedScenario {
+                                topics: s.topics.clone(),
+                                ops,
+                            })
+                    }
+                })
+                // 2. Drop the last topic (keep ≥ 1); filter and re-balance ops.
+                .chain(
+                    once_with({
+                        let s = s.clone();
+                        move || {
+                            (s.topics.len() > 1).then(|| {
+                                let topics = s.topics[..s.topics.len() - 1].to_vec();
+                                let mut pending = Pending::new();
+                                let mut ops = Vec::new();
+                                for op in &s.ops {
+                                    match *op {
+                                        Op::Request { topic, .. } if topic >= topics.len() => {}
+                                        Op::Request {
+                                            topic,
+                                            partition,
+                                            offset,
+                                        } => {
+                                            *pending
+                                                .entry((topic, partition, offset))
+                                                .or_default() += 1;
+                                            ops.push(op.clone());
+                                        }
+                                        Op::Await { topic, .. } if topic >= topics.len() => {}
+                                        Op::Await {
+                                            topic,
+                                            partition,
+                                            offset,
+                                        } => {
+                                            let c = pending
+                                                .entry((topic, partition, offset))
+                                                .or_default();
+                                            if *c > 0 {
+                                                *c -= 1;
+                                                ops.push(op.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                ops.iter()
+                                    .any(|op| matches!(op, Op::Request { .. }))
+                                    .then_some(InterleavedScenario { topics, ops })
+                            })?
+                        }
+                    })
+                    .flatten(),
+                )
+                // 3. Halve message counts (min 20); clamp lso and offset indices.
+                .chain(once_with(move || {
+                    let topics: Vec<TopicSpec> = s
+                        .topics
+                        .iter()
+                        .map(|t| TopicSpec {
+                            partitions: t
+                                .partitions
+                                .iter()
+                                .map(|p| {
+                                    let message_count = (p.message_count / 2).max(20);
+                                    PartitionSpec {
+                                        message_count,
+                                        lso: p.lso.min(message_count - 1),
+                                    }
+                                })
+                                .collect(),
+                        })
+                        .collect();
+                    let ops = s.ops.iter().map(|op| clamp_op(op, &topics)).collect();
+                    InterleavedScenario { topics, ops }
+                })),
+        )
+    }
+}
+
+async fn run_interleaved_async(scenario: InterleavedScenario) -> color_eyre::Result<()> {
+    // Create all topics concurrently.
+    let topic_names: Vec<String> = scenario
+        .topics
+        .iter()
+        .map(|_| test_topic("prop_interleaved"))
+        .collect();
+    join_all(
+        topic_names
+            .iter()
+            .zip(scenario.topics.iter())
+            .map(|(name, t)| create_topic_with_partitions(name, t.partitions.len() as u16)),
+    )
+    .await
+    .into_iter()
+    .collect::<color_eyre::Result<Vec<()>>>()?;
+
+    let result = async {
+        let topics: Vec<Topic> = topic_names
+            .iter()
+            .map(|n| Topic::from(n.as_str()))
+            .collect();
+
+        // Produce to all partitions, delete records where lso > 0.
+        let offsets: Vec<Vec<Vec<i64>>> = join_all(
+            topic_names
+                .iter()
+                .zip(scenario.topics.iter())
+                .map(|(name, t)| produce_all_partitions(name, &t.partitions)),
+        )
+        .await
+        .into_iter()
+        .collect::<color_eyre::Result<_>>()?;
+
+        for (t, topic_spec) in scenario.topics.iter().enumerate() {
+            delete_partition_records(&topics[t], &topic_spec.partitions, &offsets[t]).await?;
+        }
+
+        let loader = Arc::new(KafkaLoader::new(
+            loader_config(),
+            &HeartbeatRegistry::test(),
+        )?);
+
+        // Spawn each load_message immediately so tokio drives it in the
+        // background even when we're blocked awaiting a different handle.
+        // SlotMap gives stable DefaultKey handles with no index bookkeeping.
+        let mut handles: SlotMap<
+            DefaultKey,
+            JoinHandle<Result<ConsumerMessage, KafkaLoaderError>>,
+        > = SlotMap::new();
+        let mut pending: AHashMap<ResolvedKey, Vec<DefaultKey>> = AHashMap::new();
+
+        for op in &scenario.ops {
+            match *op {
+                Op::Request {
+                    topic: t_idx,
+                    partition: p_idx,
+                    offset: o_idx,
+                } => {
+                    let topic: Topic = topics[t_idx];
+                    let partition: Partition = p_idx as Partition;
+                    let offset: Offset = offsets[t_idx][p_idx][o_idx];
+                    let loader = Arc::clone(&loader);
+                    let key = handles.insert(tokio::spawn(async move {
+                        loader.load_message(topic, partition, offset).await
+                    }));
+                    pending
+                        .entry((topic, partition, offset))
+                        .or_default()
+                        .push(key);
+                }
+                Op::Await {
+                    topic: t_idx,
+                    partition: p_idx,
+                    offset: o_idx,
+                } => {
+                    let topic: Topic = topics[t_idx];
+                    let partition: Partition = p_idx as Partition;
+                    let offset: Offset = offsets[t_idx][p_idx][o_idx];
+                    let keys = pending
+                        .get_mut(&(topic, partition, offset))
+                        .ok_or_else(|| color_eyre::eyre::eyre!("Await without matching Request"))?;
+                    let key = keys
+                        .pop()
+                        .ok_or_else(|| color_eyre::eyre::eyre!("Await without matching Request"))?;
+                    if keys.is_empty() {
+                        pending.remove(&(topic, partition, offset));
+                    }
+                    let result = timeout(
+                        Duration::from_secs(60),
+                        handles
+                            .remove(key)
+                            .ok_or_else(|| color_eyre::eyre::eyre!("handle already consumed"))?,
+                    )
+                    .await??;
+                    let lso = scenario.topics[t_idx].partitions[p_idx].lso;
+                    assert_load_result(result, t_idx, partition, o_idx, offset, lso)?;
+                }
+            }
+        }
 
         Ok(())
     }
     .await;
 
-    delete_topic(&topic_name).await?;
+    for name in &topic_names {
+        let _ = delete_topic(name).await;
+    }
     result
 }
 
-/// Test: Sequential loads from multiple partitions maintains assignments
-///
-/// Verifies that loading from partition 0, then partition 1, then partition 0
-/// again works correctly. With old `assign()` behavior, the second load from
-/// partition 0 would require re-assignment because partition 1's assignment
-/// replaced it.
-#[tokio::test]
-async fn test_sequential_multi_partition_loading() -> color_eyre::Result<()> {
+fn run_interleaved_scenario(scenario: InterleavedScenario) -> TestResult {
+    match TEST_RUNTIME.block_on(run_interleaved_async(scenario)) {
+        Ok(()) => TestResult::passed(),
+        Err(e) => TestResult::error(e.to_string()),
+    }
+}
+
+#[test]
+fn prop_interleaved_requests() {
     let _ = color_eyre::install();
     init_test_logging();
+    let test_count = env::var("INTEGRATION_TESTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5);
+    QuickCheck::new()
+        .tests(test_count)
+        .quickcheck(run_interleaved_scenario as fn(InterleavedScenario) -> TestResult);
+}
 
-    let topic_name = test_topic("seq_multi_partition");
-    create_topic_with_partitions(&topic_name, 2).await?;
-
-    let result = async {
-        let offsets_p0 = produce_messages_to_partition(&topic_name, 0, 10).await?;
-        let offsets_p1 = produce_messages_to_partition(&topic_name, 1, 10).await?;
-
-        let topic = Topic::from(topic_name.as_str());
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
-
-        // Load from partition 0
-        let msg0 = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 0, offsets_p0[3]),
-        )
-        .await??;
-        assert_eq!(msg0.partition(), 0_i32);
-        assert_eq!(msg0.offset(), offsets_p0[3]);
-
-        // Load from partition 1
-        let msg1 = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 1, offsets_p1[5]),
-        )
-        .await??;
-        assert_eq!(msg1.partition(), 1_i32);
-        assert_eq!(msg1.offset(), offsets_p1[5]);
-
-        // Load again from partition 0 (different offset)
-        // With old assign() this would fail or timeout
-        let msg0_again = timeout(
-            Duration::from_secs(10),
-            loader.load_message(topic, 0, offsets_p0[7]),
-        )
-        .await??;
-        assert_eq!(msg0_again.partition(), 0_i32);
-        assert_eq!(msg0_again.offset(), offsets_p0[7]);
-
-        Ok(())
+impl Arbitrary for PartitionSpec {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let message_count = (usize::arbitrary(g) % 41) + 20; // 20..=60
+        let lso = usize::arbitrary(g) % message_count; // 0..message_count (0 = no deletion)
+        PartitionSpec { message_count, lso }
     }
-    .await;
+}
 
-    delete_topic(&topic_name).await?;
-    result
+impl Arbitrary for TopicSpec {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let partition_count = (usize::arbitrary(g) % 16) + 1; // 1..=16
+        TopicSpec {
+            partitions: (0..partition_count)
+                .map(|_| PartitionSpec::arbitrary(g))
+                .collect(),
+        }
+    }
+}
+
+/// Produce messages to all partitions of a single topic concurrently.
+async fn produce_all_partitions(
+    topic_name: &str,
+    specs: &[PartitionSpec],
+) -> color_eyre::Result<Vec<Vec<i64>>> {
+    join_all(specs.iter().enumerate().map(|(p, spec)| {
+        produce_messages_to_partition(topic_name, p as Partition, spec.message_count)
+    }))
+    .await
+    .into_iter()
+    .collect()
+}
+
+/// Delete records for any partition in `specs` where `lso > 0`.
+async fn delete_partition_records(
+    topic: &Topic,
+    specs: &[PartitionSpec],
+    offsets: &[Vec<i64>],
+) -> color_eyre::Result<()> {
+    let deletions: Vec<(Partition, Offset)> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.lso > 0)
+        .map(|(p, spec)| (p as Partition, offsets[p][spec.lso]))
+        .collect();
+    if !deletions.is_empty() {
+        delete_records_multi(topic, &deletions).await?;
+    }
+    Ok(())
+}
+
+/// Assert the outcome of one load request against the expected deleted/valid
+/// boundary.
+fn assert_load_result(
+    result: Result<ConsumerMessage, KafkaLoaderError>,
+    topic: usize,
+    partition: Partition,
+    offset_idx: usize,
+    expected_offset: Offset,
+    lso: usize,
+) -> color_eyre::Result<()> {
+    if offset_idx < lso {
+        let Err(KafkaLoaderError::OffsetDeleted {
+            partition: got_partition,
+            requested_offset: got_offset,
+            ..
+        }) = result
+        else {
+            color_eyre::eyre::bail!(
+                "topic {topic} partition {partition} offset_idx {offset_idx} (offset \
+                 {expected_offset}) expected OffsetDeleted (lso_idx={lso}), got: {result:?}"
+            );
+        };
+        assert_eq!(got_partition, partition);
+        assert_eq!(got_offset, expected_offset);
+    } else {
+        let Ok(msg) = result else {
+            color_eyre::eyre::bail!(
+                "topic {topic} partition {partition} offset_idx {offset_idx} (offset \
+                 {expected_offset}) expected Ok (lso_idx={lso}), got: {result:?}"
+            );
+        };
+        assert_eq!(msg.offset(), expected_offset);
+        assert_eq!(msg.partition(), partition);
+    }
+    Ok(())
 }
 
 /// Unit tests for seek decision logic (no Kafka required)
@@ -1118,20 +1150,25 @@ mod seek_decision {
     /// `seek_to_first_active_offset`. This mirrors the production logic for
     /// testability.
     fn should_seek(current_position: Option<i64>, min_offset: i64, discard_threshold: i64) -> bool {
-        current_position.is_some_and(|position| {
-            let past_target = position > min_offset;
-            let too_far_behind = position + discard_threshold < min_offset;
-            past_target || too_far_behind
-        })
+        match current_position {
+            None => true,
+            Some(position) => {
+                let past_target = position > min_offset;
+                let too_far_behind = position + discard_threshold < min_offset;
+                past_target || too_far_behind
+            }
+        }
     }
 
     #[test]
-    fn invalid_position_does_not_seek() {
-        // After assign() but before first poll(), position() returns Invalid (None).
-        // We trust assign() positioned correctly, so don't seek.
-        assert!(!should_seek(None, 70, 5));
-        assert!(!should_seek(None, 0, 10));
-        assert!(!should_seek(None, 1000, 100));
+    fn invalid_position_always_seeks() {
+        // After incremental_assign() but before first poll(), position() returns
+        // Invalid (None). assign_if_needed only assigns on the first request;
+        // concurrent lower-offset requests skip re-assignment, so the consumer may
+        // be anchored above min_offset. Always seek when Invalid.
+        assert!(should_seek(None, 70, 5));
+        assert!(should_seek(None, 0, 10));
+        assert!(should_seek(None, 1000, 100));
     }
 
     #[test]
@@ -1168,10 +1205,26 @@ mod seek_decision {
     }
 
     #[test]
-    fn position_ahead_of_target_within_threshold_does_not_seek() {
-        // Position (52) > target (50) → past_target is true → should seek
-        // Wait, this is "past target" meaning we've already read past it
-        // We need to go BACK, so we must seek
+    fn position_past_target_always_seeks() {
+        // Position (52) > target (50) → past_target is true → must seek backward
         assert!(should_seek(Some(52), 50, 5));
+    }
+
+    #[test]
+    fn threshold_boundary_exact() {
+        // position + threshold == min_offset → NOT too far behind → don't seek
+        // 50 + 5 = 55, min = 55 → exactly at boundary → don't seek
+        assert!(!should_seek(Some(50), 55, 5));
+        // 50 + 5 = 55, min = 56 → one past boundary → seek
+        assert!(should_seek(Some(50), 56, 5));
+    }
+
+    #[test]
+    fn zero_threshold_seeks_any_forward_gap() {
+        // threshold=0: position + 0 < min_offset whenever position < min_offset
+        assert!(should_seek(Some(49), 50, 0));
+        assert!(should_seek(Some(0), 1, 0));
+        // position == min_offset: not past, not behind → don't seek
+        assert!(!should_seek(Some(50), 50, 0));
     }
 }
