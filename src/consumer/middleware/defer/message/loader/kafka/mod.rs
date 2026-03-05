@@ -787,6 +787,10 @@ fn seek_to_first_active_offset(
 
     let mut seek_list = TopicPartitionList::new();
 
+    // One call retrieves positions for all assigned partitions from local
+    // librdkafka state — no network round-trip.
+    let positions = consumer.position()?;
+
     for ((topic, partition), state) in active.iter() {
         let Some((&min_offset, _)) = state.offsets.first_key_value() else {
             continue;
@@ -799,8 +803,7 @@ fn seek_to_first_active_offset(
             continue;
         }
 
-        let current_position = consumer
-            .position()?
+        let current_position = positions
             .find_partition(topic.as_ref(), *partition)
             .and_then(|elem| match elem.offset() {
                 rdkafka::Offset::Offset(offset) => Some(offset),
