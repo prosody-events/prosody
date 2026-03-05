@@ -47,8 +47,17 @@ use tokio::join;
 ///
 /// ```rust,no_run
 /// use prosody::timers::store::memory::memory_store;
+/// use prosody::timers::store::{Segment, SegmentVersion};
+/// use prosody::timers::duration::CompactDuration;
+/// use uuid::Uuid;
 ///
-/// let store = memory_store();
+/// let segment = Segment {
+///     id: Uuid::new_v4(),
+///     name: "example".to_string(),
+///     slab_size: CompactDuration::new(600),
+///     version: SegmentVersion::V2,
+/// };
+/// let store = memory_store(segment);
 /// // Now you can call TriggerStore methods on `store`
 /// ```
 ///
