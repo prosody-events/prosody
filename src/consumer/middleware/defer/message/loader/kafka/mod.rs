@@ -20,15 +20,25 @@
 //!
 //! # Deleted Offset Handling
 //!
-//! When messages are deleted via retention or compaction, the Log Start Offset
-//! (LSO) moves forward. The loader handles this by:
+//! Two Kafka mechanisms can make an offset unreadable:
 //!
-//! 1. **Assign/seek auto-reset**: rdkafka automatically positions at LSO when
-//!    assigning or seeking to deleted offsets
-//! 2. **Lazy validation**: Compares `requested_offset` < `received_offset` to
-//!    detect deletions after messages arrive
-//! 3. **Explicit errors**: Returns [`KafkaLoaderError::OffsetDeleted`] with the
-//!    LSO
+//! - **Truncation** (time-based retention, `delete_records`): a contiguous
+//!   prefix of the partition is removed and the Log Start Offset (LSO)
+//!   advances. Seeking to a deleted offset auto-resets to the LSO.
+//! - **Compaction**: individual messages are removed by key, leaving holes
+//!   anywhere in the log. The LSO does not move; seeking to a compacted offset
+//!   delivers the next surviving message after the hole.
+//!
+//! The loader handles both cases identically:
+//!
+//! 1. **Assign/seek**: rdkafka automatically positions past the missing offset
+//!    in both cases.
+//! 2. **Lazy validation**: when a message arrives at offset M, any pending
+//!    requests in `[pending_seek, M)` are classified as deleted.
+//! 3. **Explicit errors**: returns [`KafkaLoaderError::OffsetDeleted`] carrying
+//!    `next_offset` — the offset of the first message the broker actually
+//!    delivered. For truncation this equals the LSO; for a compaction hole it
+//!    is the next surviving message after the gap.
 //!
 //! This approach avoids upfront offset validation (which requires metadata
 //! queries) and lets rdkafka handle offset recovery automatically.
@@ -583,19 +593,23 @@ fn notify_deleted_offsets(
     deleted_offsets: BTreeMap<Offset, Responses>,
     topic: Topic,
     partition: Partition,
-    log_start_offset: Offset,
+    next_offset: Offset,
 ) {
-    for (deleted_offset, senders) in deleted_offsets {
+    for (requested_offset, senders) in deleted_offsets {
         warn!(
             topic = %topic,
             partition = partition,
-            requested_offset = deleted_offset,
-            log_start_offset = log_start_offset,
+            requested_offset = requested_offset,
+            next_offset = next_offset,
             affected_requests = senders.len(),
-            "Deferred message was deleted due to retention/compaction"
+            "Deferred message offset no longer exists (deleted by retention or compaction)"
         );
-        let error =
-            KafkaLoaderError::OffsetDeleted(topic, partition, deleted_offset, log_start_offset);
+        let error = KafkaLoaderError::OffsetDeleted {
+            topic,
+            partition,
+            requested_offset,
+            next_offset,
+        };
         for sender in senders {
             let _ = sender.send(Err(error.clone()));
         }
@@ -1006,15 +1020,37 @@ pub enum KafkaLoaderError {
     #[error("Loader has shut down")]
     LoaderShutdown,
 
-    /// The requested offset has been deleted due to retention or compaction.
+    /// The requested offset no longer exists due to retention or compaction.
     ///
-    /// Contains the topic, partition, requested offset, and current log start
-    /// offset.
+    /// `next_offset` is the offset of the first message the broker delivered
+    /// after seeking to `requested_offset`:
+    ///
+    /// - **Truncation** (retention/`delete_records`): the broker auto-resets to
+    ///   the Log Start Offset (LSO), so `next_offset` equals the LSO.
+    /// - **Compaction hole**: the broker skips the missing key and delivers the
+    ///   next surviving message, so `next_offset` is that message's offset. The
+    ///   LSO is unchanged and may be much lower.
+    ///
+    /// In both cases `next_offset` is the lowest offset that can currently be
+    /// read from this partition at or after `requested_offset`.
     #[error(
-        "Offset {2} has been deleted from partition {0}/{1} (log start offset: {3}). The \
-         requested message no longer exists due to retention or compaction."
+        "Offset {requested_offset} has been deleted from partition {topic}/{partition} (next \
+         offset: {next_offset}). The requested message no longer exists due to retention or \
+         compaction."
     )]
-    OffsetDeleted(Topic, Partition, Offset, Offset),
+    OffsetDeleted {
+        /// The topic containing the deleted offset.
+        topic: Topic,
+        /// The partition containing the deleted offset.
+        partition: Partition,
+        /// The offset that was requested but no longer exists.
+        requested_offset: Offset,
+        /// The offset of the first message the broker delivered after seeking
+        /// to `requested_offset`. For truncation this equals the partition LSO;
+        /// for a compaction hole it is the next surviving message after the
+        /// gap.
+        next_offset: Offset,
+    },
 
     /// Failed to create the Kafka consumer.
     #[error("Failed to create Kafka consumer: {0:#}")]
@@ -1041,7 +1077,7 @@ impl ClassifyError for KafkaLoaderError {
             Self::Kafka(kafka_error) => kafka_error.classify_error(),
 
             // Permanent errors - data issues that won't resolve
-            Self::DecodeError(..) | Self::OffsetDeleted(..) => ErrorCategory::Permanent,
+            Self::DecodeError(..) | Self::OffsetDeleted { .. } => ErrorCategory::Permanent,
         }
     }
 }

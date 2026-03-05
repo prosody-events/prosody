@@ -249,12 +249,17 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
         )
         .await?;
 
-        let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, lso)) = result else {
+        let Err(KafkaLoaderError::OffsetDeleted {
+            requested_offset,
+            next_offset,
+            ..
+        }) = result
+        else {
             color_eyre::eyre::bail!("Expected OffsetDeleted, got: {result:?}");
         };
 
-        assert_eq!(requested, offset_40);
-        assert!(lso >= offsets[50]);
+        assert_eq!(requested_offset, offset_40);
+        assert!(next_offset >= offsets[50]);
 
         Ok(())
     })
@@ -374,10 +379,13 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
         .await?;
 
         // Should get OffsetDeleted error
-        let Err(KafkaLoaderError::OffsetDeleted(_, _, requested, _)) = result else {
+        let Err(KafkaLoaderError::OffsetDeleted {
+            requested_offset, ..
+        }) = result
+        else {
             color_eyre::eyre::bail!("Expected OffsetDeleted error, got: {result:?}");
         };
-        assert_eq!(requested, offsets[25]);
+        assert_eq!(requested_offset, offsets[25]);
 
         // Verify loader recovered and can load valid offsets
         let msg = timeout(
@@ -628,8 +636,11 @@ async fn test_cross_partition_lso_contamination() -> color_eyre::Result<()> {
             let load_result = result?;
             if partition == 1_i32 && offset < offsets_p1[19] {
                 // Deleted — expect OffsetDeleted
-                let Err(KafkaLoaderError::OffsetDeleted(_, got_partition, got_offset, _)) =
-                    load_result
+                let Err(KafkaLoaderError::OffsetDeleted {
+                    partition: got_partition,
+                    requested_offset: got_offset,
+                    ..
+                }) = load_result
                 else {
                     color_eyre::eyre::bail!(
                         "partition {partition} offset {offset} expected OffsetDeleted, got: \
@@ -1107,7 +1118,12 @@ fn assert_load_result(
     lso: usize,
 ) -> color_eyre::Result<()> {
     if offset_idx < lso {
-        let Err(KafkaLoaderError::OffsetDeleted(_, got_partition, got_offset, _)) = result else {
+        let Err(KafkaLoaderError::OffsetDeleted {
+            partition: got_partition,
+            requested_offset: got_offset,
+            ..
+        }) = result
+        else {
             color_eyre::eyre::bail!(
                 "topic {topic} partition {partition} offset_idx {offset_idx} (offset \
                  {expected_offset}) expected OffsetDeleted (lso_idx={lso}), got: {result:?}"
