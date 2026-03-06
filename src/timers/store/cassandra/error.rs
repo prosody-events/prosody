@@ -1,3 +1,14 @@
+//! Errors for the Cassandra trigger store.
+//!
+//! Most failures are network or timeout errors that should be retried; a few
+//! are programming or configuration mistakes (slab-size mismatch, serialising
+//! `Absent` as a UDT) that indicate a bug and must not be retried. The
+//! [`ClassifyError`] impl on [`CassandraTriggerStoreError`] makes that
+//! distinction explicit so the retry layer doesn't need to inspect error
+//! messages.
+//!
+//! [`ClassifyError`]: crate::error::ClassifyError
+
 use crate::cassandra::errors::CassandraStoreError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;

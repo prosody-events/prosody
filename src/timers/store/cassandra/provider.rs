@@ -1,3 +1,18 @@
+//! Store construction and the [`TriggerStoreProvider`] impl.
+//!
+//! Prepared statements are expensive to create — each one involves a
+//! round-trip to Cassandra and a parse/plan cycle.
+//! [`CassandraTriggerStoreProvider`] therefore prepares queries once and shares
+//! them (via `Arc<Queries>`) across every per-segment store it creates. Each
+//! store still gets its own `state_cache` so per-partition state doesn't bleed
+//! between segments.
+//!
+//! [`cassandra_store`] is a simpler entry point that owns its own session;
+//! prefer [`CassandraTriggerStoreProvider`] wherever multiple segments are
+//! served from the same process.
+//!
+//! [`TriggerStoreProvider`]: crate::timers::store::TriggerStoreProvider
+
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::timers::store::Segment;
 use crate::timers::store::TriggerStoreProvider;

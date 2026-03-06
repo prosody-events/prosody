@@ -1,3 +1,23 @@
+//! Cassandra-specific state-column helpers.
+//!
+//! The `state` map column is the core of the V3 tombstone-reduction design:
+//! every write to the key index goes through one of the helpers here, which
+//! choose the cheapest Cassandra operation for the current state transition.
+//! Specifically:
+//!
+//! - `Absent → Inline`: plain `UPDATE state[type] = …` — zero tombstones.
+//! - `Inline → Inline`: same plain `UPDATE` — no BATCH, no DELETE.
+//! - `Inline → Overflow`: an unlogged BATCH that promotes the old inline timer
+//!   into a new clustering row at the same time as the new one is inserted,
+//!   keeping the transition atomic at the partition level.
+//! - `Overflow → Inline`: a BATCH that deletes all clustering rows and sets the
+//!   new inline state atomically — one round-trip, zero residual tombstones.
+//!
+//! `resolve_state` is the cache-first entry point used by all higher-level
+//! operations: it returns an `Arc<AsyncMutex<TimerState>>` that callers lock
+//! before reading and hold through the write, serialising per-key mutations
+//! without a global lock.
+
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;

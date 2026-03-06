@@ -1,3 +1,14 @@
+//! Integration tests for [`CassandraTriggerStore`].
+//!
+//! These tests run against a real Cassandra node and are skipped automatically
+//! when one isn't available. They exist because the V3 state-column logic
+//! involves conditional write paths (inline vs. overflow vs. absent) and
+//! concurrent mutex semantics that are hard to exercise meaningfully with a
+//! mock. Running against actual Cassandra also catches serialisation bugs,
+//! TTL edge-cases, and UDT schema mismatches that unit tests cannot.
+//!
+//! [`CassandraTriggerStore`]: super::CassandraTriggerStore
+
 use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;

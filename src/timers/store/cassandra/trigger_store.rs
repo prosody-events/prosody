@@ -1,3 +1,20 @@
+//! [`TriggerOperations`] implementation for [`CassandraTriggerStore`].
+//!
+//! Each method resolves the current [`TimerState`] (via the cache or a DB
+//! read) before issuing writes, so it can pick the cheapest Cassandra
+//! operation: a plain `UPDATE` for the common inline path, or a tombstone-free
+//! BATCH only when clustering rows actually need to change.
+//!
+//! `get_key_triggers_all_types` is the most complex method: it reads the full
+//! `state` map in one query, then merges inline entries (sorted by
+//! `TimerType` discriminant) with a clustering-row stream in a single pass,
+//! yielding triggers in `(timer_type, time)` order without issuing a
+//! clustering scan for types that are already inline-or-absent.
+//!
+//! [`TriggerOperations`]: crate::timers::store::operations::TriggerOperations
+//! [`CassandraTriggerStore`]: crate::timers::store::cassandra::CassandraTriggerStore
+//! [`TimerState`]: crate::timers::store::cassandra::TimerState
+
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;

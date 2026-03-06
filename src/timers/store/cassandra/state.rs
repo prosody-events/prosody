@@ -1,3 +1,19 @@
+//! The `state` column domain model and per-partition cache.
+//!
+//! The V3 schema stores a `state` static map column alongside clustering rows.
+//! Each `(key, timer_type)` entry in that map is a `key_timer_state` UDT,
+//! represented here as [`TimerState`]. Reading this single column tells the
+//! store how many timers exist for a key without touching the clustering rows
+//! at all — the common single-timer path never issues a clustering scan.
+//!
+//! The in-memory cache (`CachedState` — an `Arc<AsyncMutex<TimerState>>`)
+//! keeps the resolved state hot between operations. Wrapping in
+//! `Arc<AsyncMutex>` lets callers clone the handle out of the cache before
+//! awaiting the lock, so no shard lock is held across any async boundary.
+//! All read-modify-write sequences hold this mutex for their full duration,
+//! eliminating the TOCTOU window that existed before per-key serialisation was
+//! added.
+
 use crate::Key;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;

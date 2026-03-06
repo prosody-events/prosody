@@ -1,3 +1,24 @@
+//! Cassandra-backed [`TriggerStore`] implementation.
+//!
+//! The V3 schema eliminates range tombstones by maintaining a `state` static
+//! map column alongside the clustering rows. Every `(key, timer_type)` pair
+//! carries a [`TimerState`] — [`Absent`], [`Inline`], or [`Overflow`] — that
+//! lets the common single-timer case skip clustering row I/O entirely and
+//! allows `clear_and_schedule_key` to issue a plain `UPDATE` instead of a
+//! `DELETE`-bearing `BATCH`.
+//!
+//! This file is the public hub: it defines [`CassandraTriggerStore`], its
+//! constructors, and the shared low-level helpers (`execute_with_optional_ttl`,
+//! etc.) that all submodules call. The bulk of the logic lives in focused
+//! submodules to keep individual files navigable.
+//!
+//! [`TriggerStore`]: crate::timers::store::TriggerStore
+//! [`Absent`]: crate::timers::store::cassandra::TimerState::Absent
+//! [`Inline`]: crate::timers::store::cassandra::TimerState::Inline
+//! [`Overflow`]: crate::timers::store::cassandra::TimerState::Overflow
+//! [`CassandraTriggerStore`]: crate::timers::store::cassandra::CassandraTriggerStore
+//! [`TimerState`]: crate::timers::store::cassandra::TimerState
+
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
