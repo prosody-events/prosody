@@ -351,5 +351,25 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
+        /// BATCH: Clear clustering rows for a single timer type + remove state entry.
+        /// Same partition — no cross-partition overhead.
+        batch_clear_key_triggers: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?; \
+             DELETE state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Clear all clustering rows + clear entire state column.
+        /// Same partition — no cross-partition overhead.
+        batch_clear_key_triggers_all_types: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
+             DELETE state FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
     }
 }
