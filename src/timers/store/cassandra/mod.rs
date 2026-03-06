@@ -14,7 +14,7 @@ use crate::timers::store::{InvalidSegmentVersionError, Segment, SegmentId, Segme
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use educe::Educe;
-use futures::{Stream, TryStreamExt, pin_mut};
+use futures::{Stream, TryStreamExt, future::join_all, pin_mut};
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::sync::Cache;
 use scylla::_macro_internal::{
@@ -30,6 +30,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use strum::VariantArray;
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::coop::cooperative;
 use tracing::field::Empty;
 use tracing::{Span, debug, info_span, instrument};
@@ -63,9 +64,20 @@ type PeekedTrigger = (CompactDateTime, HashMap<String, String>);
 /// Capacity for the per-partition state cache.
 ///
 /// Sized to cover the active working set of keys within a single partition.
-/// Cache misses simply fall back to a DB read, so undersizing only costs an
-/// extra query.
+/// Cache misses fall back to a DB read, so undersizing only costs an extra
+/// query. On eviction of a hot key, the placeholder guard mechanism in
+/// `quick_cache` ensures the next two concurrent accessors still serialize
+/// correctly via the re-created mutex.
 const STATE_CACHE_CAPACITY: usize = 8_192;
+
+/// Cached value type: an async mutex wrapping the resolved timer state.
+///
+/// Wrapping in `Arc<AsyncMutex<…>>` allows callers to clone the handle out of
+/// the cache (dropping the internal shard lock), then `.lock().await` without
+/// holding any cache internals across an await point.  All state-mutating
+/// operations hold this lock for their entire read-then-write sequence,
+/// preventing TOCTOU races between concurrent `EventContext` callers.
+type CachedState = Arc<AsyncMutex<TimerState>>;
 
 /// Timer data for a single inlined timer.
 ///
@@ -181,7 +193,7 @@ pub struct CassandraTriggerStore {
     /// Cache miss → `resolve_state` reads only the requested type via
     /// `fetch_state` (single map-entry query) and caches the result.
     #[educe(Debug(ignore))]
-    state_cache: Arc<Cache<StateCacheKey, TimerState>>,
+    state_cache: Arc<Cache<StateCacheKey, CachedState>>,
 }
 
 impl CassandraTriggerStore {
@@ -395,13 +407,16 @@ impl CassandraTriggerStore {
     /// semantics.
     ///
     /// Logic:
-    /// 1. Cache hit → return `(state, true)` immediately.
-    /// 2. Cache miss → call `fetch_state` (reads only the requested type),
-    ///    insert into cache, return `(state, false)`.
+    /// 1. Cache hit → clone the `Arc<AsyncMutex<TimerState>>` and return
+    ///    `(handle, true)` immediately.
+    /// 2. Cache miss → fetch state from DB, wrap in a new
+    ///    `Arc<AsyncMutex<TimerState>>`, insert into cache, return `(handle,
+    ///    false)`.
     ///
-    /// The `bool` indicates whether the result was served from the cache
-    /// (`true`) or required a DB round-trip (`false`). Callers record this as
-    /// the `state_cached` tracing field.
+    /// The returned `Arc` handle lets callers lock the mutex after dropping
+    /// all cache-internal guards (no await across a shard lock).  The `bool`
+    /// indicates whether the result was a cache hit; callers record it as the
+    /// `state_cached` tracing field.
     ///
     /// Post-V3, a NULL/missing MAP entry unambiguously means "new key, 0
     /// timers," so all states (including `Absent`) are cached.
@@ -414,19 +429,22 @@ impl CassandraTriggerStore {
         segment_id: &SegmentId,
         key: &Key,
         timer_type: TimerType,
-    ) -> Result<(TimerState, bool), CassandraTriggerStoreError> {
+    ) -> Result<(CachedState, bool), CassandraTriggerStoreError> {
         let cache_key = (key.clone(), timer_type);
 
-        // Fast path: cache hit.
-        if let Some(state) = self.state_cache.get(&cache_key) {
-            return Ok((state, true));
+        // Fast path: cache hit — clone the Arc, shard lock drops immediately.
+        match self.state_cache.get_value_or_guard_async(&cache_key).await {
+            Ok(handle) => Ok((handle, true)),
+            Err(guard) => {
+                // Cache miss: read only the requested type from DB.
+                let state = self.fetch_state(segment_id, key, timer_type).await?;
+                let handle = Arc::new(AsyncMutex::new(state));
+                // Ignore eviction: if the entry was evicted between the miss
+                // and here, the next caller will re-fetch from DB.
+                let _ = guard.insert(handle.clone());
+                Ok((handle, false))
+            }
         }
-
-        // Cache miss: read only the requested type from DB.
-        let state = self.fetch_state(segment_id, key, timer_type).await?;
-        self.state_cache.insert(cache_key, state.clone());
-
-        Ok((state, false))
     }
 
     /// Atomically clears clustering rows and sets inline state.
@@ -1191,9 +1209,11 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
 
         try_stream! {
-            let (state, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
+            let (handle, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
+            // Lock briefly to read the state, then release before any DB I/O.
+            let state = handle.lock().await.clone();
             match state {
                 TimerState::Inline(timer) => {
                     // Inline: yield time from cache (0 clustering query).
@@ -1238,9 +1258,11 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
 
         try_stream! {
-            let (state, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
+            let (handle, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
+            // Lock briefly to read the state, then release before any DB I/O.
+            let state = handle.lock().await.clone();
             match state {
                 TimerState::Inline(timer) => {
                     // Inline: yield trigger from cache (0 clustering query).
@@ -1313,7 +1335,10 @@ impl TriggerOperations for CassandraTriggerStore {
             // Warm the per-type cache from the bulk read so subsequent
             // single-type operations on this key avoid separate DB reads.
             for (&tt, state) in &state_map {
-                self.state_cache.insert((key_clone.clone(), tt), state.clone());
+                self.state_cache.insert(
+                    (key_clone.clone(), tt),
+                    Arc::new(AsyncMutex::new(state.clone())),
+                );
             }
 
             // This path always reads from the DB (fetch_state_map is not
@@ -1406,12 +1431,12 @@ impl TriggerOperations for CassandraTriggerStore {
         let segment_id = self.segment.id;
         let timer_type = trigger.timer_type;
         let key = trigger.key.clone();
-        let cache_key = (key.clone(), timer_type);
 
-        let (state, cached) = self.resolve_state(&segment_id, &key, timer_type).await?;
+        let (handle, cached) = self.resolve_state(&segment_id, &key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
-        match state {
+        let mut guard = handle.lock().await;
+        match &*guard {
             TimerState::Inline(old_timer) => {
                 // Promote: old inline → clustering, new → clustering, state → Overflow.
                 // All three writes are issued as a single UNLOGGED BATCH so the
@@ -1424,7 +1449,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     timer_type,
                     ClusteringEntry {
                         time: old_timer.time,
-                        span: &old_timer.span,
+                        span: &old_timer.span.clone(),
                     },
                     ClusteringEntry {
                         time: trigger.time,
@@ -1432,7 +1457,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     },
                 )
                 .await?;
-                self.state_cache.insert(cache_key, TimerState::Overflow);
+                *guard = TimerState::Overflow;
             }
             TimerState::Overflow => {
                 // Already overflow: write clustering only. State is unchanged.
@@ -1444,13 +1469,13 @@ impl TriggerOperations for CassandraTriggerStore {
                 // Set inline state directly.
                 let span_map = extract_span_map(self.propagator(), &trigger);
 
-                let state = TimerState::Inline(InlineTimer {
+                let new_state = TimerState::Inline(InlineTimer {
                     time: trigger.time,
                     span: span_map,
                 });
-                self.set_state_inline(&segment_id, &key, timer_type, &state)
+                self.set_state_inline(&segment_id, &key, timer_type, &new_state)
                     .await?;
-                self.state_cache.insert(cache_key, state);
+                *guard = new_state;
             }
         }
 
@@ -1478,18 +1503,18 @@ impl TriggerOperations for CassandraTriggerStore {
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
-        let cache_key = (key.clone(), timer_type);
 
-        let (state, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
+        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
         Span::current().record("state_cached", cached);
 
-        match state {
+        let mut guard = handle.lock().await;
+        match &*guard {
             TimerState::Inline(timer) if timer.time == time => {
                 // Inline timer matches the delete target → remove state, become Absent.
                 // No clustering row exists for inline timers, so only remove state.
                 self.remove_state_entry(&segment_id, key, timer_type)
                     .await?;
-                self.state_cache.insert(cache_key, TimerState::Absent);
+                *guard = TimerState::Absent;
             }
             TimerState::Inline(_) => {
                 // Inline timer does not match → delete from clustering (may be a no-op).
@@ -1518,7 +1543,7 @@ impl TriggerOperations for CassandraTriggerStore {
                         // 0 remaining → Absent.
                         self.remove_state_entry(&segment_id, key, timer_type)
                             .await?;
-                        self.state_cache.insert(cache_key, TimerState::Absent);
+                        *guard = TimerState::Absent;
                     }
                     [remaining_time] => {
                         // 1 remaining → fetch span and demote to Inline.
@@ -1529,25 +1554,25 @@ impl TriggerOperations for CassandraTriggerStore {
                             // Row vanished between count and read — treat as Absent.
                             self.remove_state_entry(&segment_id, key, timer_type)
                                 .await?;
-                            self.state_cache.insert(cache_key, TimerState::Absent);
+                            *guard = TimerState::Absent;
                             return Ok(());
                         };
 
-                        let state = TimerState::Inline(InlineTimer {
+                        let new_state = TimerState::Inline(InlineTimer {
                             time: *remaining_time,
                             span: span_map,
                         });
 
                         // Concurrent: set inline state + delete remaining clustering row.
                         tokio::try_join!(
-                            self.set_state_inline(&segment_id, key, timer_type, &state),
+                            self.set_state_inline(&segment_id, key, timer_type, &new_state),
                             self.execute_unpaged_discard(
                                 &self.queries().delete_key_trigger,
                                 (&segment_id, key.as_ref(), timer_type, confirmed_time),
                             )
                         )?;
 
-                        self.state_cache.insert(cache_key, state);
+                        *guard = new_state;
                     }
                     _ => {
                         // 2+ remaining → stays Overflow, no state change
@@ -1573,7 +1598,21 @@ impl TriggerOperations for CassandraTriggerStore {
         key: &Key,
     ) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
-        // Concurrent: remove state entry AND clear clustering rows
+        let handle = match self
+            .state_cache
+            .get_value_or_guard_async(&(key.clone(), timer_type))
+            .await
+        {
+            Ok(h) => h,
+            Err(guard) => {
+                let h = Arc::new(AsyncMutex::new(TimerState::Absent));
+                let _ = guard.insert(h.clone());
+                h
+            }
+        };
+        let mut guard = handle.lock().await;
+
+        // Concurrent: remove state entry AND clear clustering rows.
         tokio::try_join!(
             self.remove_state_entry(&segment_id, key, timer_type),
             self.execute_unpaged_discard(
@@ -1582,10 +1621,7 @@ impl TriggerOperations for CassandraTriggerStore {
             )
         )?;
 
-        // After success, cache Absent.
-        self.state_cache
-            .insert((key.clone(), timer_type), TimerState::Absent);
-
+        *guard = TimerState::Absent;
         Ok(())
     }
 
@@ -1598,8 +1634,8 @@ impl TriggerOperations for CassandraTriggerStore {
     ///   delete.
     /// - **Overflow**: BATCH (DELETE clustering + UPDATE state).
     ///
-    /// Per-key serialization (`KeyManager`) guarantees the state is
-    /// stable between the read and the write.
+    /// Per-key lock (`lock_key`) guarantees the state is stable between the
+    /// read and the write.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn clear_and_schedule_key(&self, trigger: Trigger) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
@@ -1611,14 +1647,13 @@ impl TriggerOperations for CassandraTriggerStore {
             span: span_map,
         });
 
-        let cache_key = (trigger.key.clone(), trigger.timer_type);
-
-        let (resolved, cached) = self
+        let (handle, cached) = self
             .resolve_state(&segment_id, &trigger.key, trigger.timer_type)
             .await?;
         Span::current().record("state_cached", cached);
 
-        match resolved {
+        let mut guard = handle.lock().await;
+        match &*guard {
             TimerState::Inline(_) | TimerState::Absent => {
                 // Fast path: Inline or Absent → plain UPDATE, no tombstone.
                 // Post-V3 Absent guarantees no clustering rows.
@@ -1637,14 +1672,35 @@ impl TriggerOperations for CassandraTriggerStore {
             }
         }
 
-        // After success, cache Inline state.
-        self.state_cache.insert(cache_key, new_state);
+        *guard = new_state;
         Ok(())
     }
 
     #[instrument(level = "debug", skip(self), err)]
     async fn clear_key_triggers_all_types(&self, key: &Key) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
+
+        // Acquire per-key locks for all timer types before mutating.
+        // Order is deterministic (matches TimerType discriminant order) so
+        // two concurrent clear_key_triggers_all_types calls cannot deadlock.
+        let mut handles = Vec::with_capacity(TimerType::VARIANTS.len());
+        for &tt in TimerType::VARIANTS {
+            let handle = match self
+                .state_cache
+                .get_value_or_guard_async(&(key.clone(), tt))
+                .await
+            {
+                Ok(h) => h,
+                Err(guard) => {
+                    let h = Arc::new(AsyncMutex::new(TimerState::Absent));
+                    let _ = guard.insert(h.clone());
+                    h
+                }
+            };
+            handles.push(handle);
+        }
+        let mut guards: Vec<_> = join_all(handles.iter().map(|h| h.lock())).await;
+
         // Concurrent: clear clustering rows AND the state static column.
         tokio::try_join!(
             self.execute_unpaged_discard(
@@ -1654,10 +1710,9 @@ impl TriggerOperations for CassandraTriggerStore {
             self.execute_unpaged_discard(&self.queries().clear_state, (&segment_id, key.as_ref()),)
         )?;
 
-        // After success, cache Absent for all types.
-        for &timer_type in TimerType::VARIANTS {
-            self.state_cache
-                .insert((key.clone(), timer_type), TimerState::Absent);
+        // Update all cached states to Absent.
+        for guard in &mut guards {
+            **guard = TimerState::Absent;
         }
 
         Ok(())

@@ -46,9 +46,9 @@ use tokio::join;
 /// # Examples
 ///
 /// ```rust,no_run
+/// use prosody::timers::duration::CompactDuration;
 /// use prosody::timers::store::memory::memory_store;
 /// use prosody::timers::store::{Segment, SegmentVersion};
-/// use prosody::timers::duration::CompactDuration;
 /// use uuid::Uuid;
 ///
 /// let segment = Segment {

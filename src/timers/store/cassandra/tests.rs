@@ -339,7 +339,8 @@ async fn assert_state_and_reads(
     expected_times: &[CompactDateTime],
     phase: &str,
 ) -> Result<()> {
-    let (state, _) = store.resolve_state(segment_id, key, timer_type).await?;
+    let (handle, _) = store.resolve_state(segment_id, key, timer_type).await?;
+    let state = handle.lock().await.clone();
     match expected_state {
         TimerState::Absent => {
             assert_eq!(state, TimerState::Absent, "{phase}: expected Absent");
@@ -359,12 +360,15 @@ async fn assert_state_and_reads(
     // Verify the cache entry for this specific type matches the expected state.
     // resolve_state above populated the cache for this type.
     let cache_key = (key.clone(), timer_type);
-    let cached = store.state_cache.get(&cache_key);
+    let cached = store
+        .state_cache
+        .get(&cache_key)
+        .map(|h| h.try_lock().map(|g| g.clone()));
     match expected_state {
         TimerState::Inline(expected) => {
             assert!(cached.is_some(), "{phase}: cache should have Inline entry");
             assert!(
-                matches!(&cached, Some(TimerState::Inline(t)) if t.time == expected.time),
+                matches!(&cached, Some(Ok(TimerState::Inline(t))) if t.time == expected.time),
                 "{phase}: cached state should be Inline({}), got {cached:?}",
                 expected.time,
             );
@@ -374,18 +378,16 @@ async fn assert_state_and_reads(
                 cached.is_some(),
                 "{phase}: cache should have Overflow entry"
             );
-            assert_eq!(
-                cached,
-                Some(TimerState::Overflow),
-                "{phase}: cached state should be Overflow"
+            assert!(
+                matches!(cached, Some(Ok(TimerState::Overflow))),
+                "{phase}: cached state should be Overflow, got {cached:?}"
             );
         }
         TimerState::Absent => {
             assert!(cached.is_some(), "{phase}: cache should have Absent entry");
-            assert_eq!(
-                cached,
-                Some(TimerState::Absent),
-                "{phase}: cached state should be Absent"
+            assert!(
+                matches!(cached, Some(Ok(TimerState::Absent))),
+                "{phase}: cached state should be Absent, got {cached:?}"
             );
         }
     }
@@ -727,9 +729,9 @@ async fn test_pre_migration_mutations() -> Result<()> {
         .await?;
     store.clear_key_triggers(tt, &key_d).await?;
     assert_key_reads(&store, tt, &key_d, &[], "D cleared").await?;
-    let (state, _) = store.resolve_state(&segment_id, &key_d, tt).await?;
+    let (handle, _) = store.resolve_state(&segment_id, &key_d, tt).await?;
     assert_eq!(
-        state,
+        *handle.lock().await,
         TimerState::Absent,
         "D: state should be Absent after clear"
     );
@@ -750,7 +752,8 @@ async fn test_pre_migration_mutations() -> Result<()> {
     assert_key_reads(&store, tt, &key_e, &[t2, t3], "E delete one").await?;
     store.delete_key_trigger(tt, &key_e, t2).await?;
     assert_key_reads(&store, tt, &key_e, &[t3], "E demote to inline").await?;
-    let (state, _) = store.resolve_state(&segment_id, &key_e, tt).await?;
+    let (handle, _) = store.resolve_state(&segment_id, &key_e, tt).await?;
+    let state = handle.lock().await.clone();
     assert!(
         matches!(&state, TimerState::Inline(t) if t.time == t3),
         "E: expected Inline(t3) after demotion, got {state:?}"
@@ -811,8 +814,12 @@ async fn test_clear_all_types_clears_inline_and_overflow() -> Result<()> {
 
     // Verify all types are Absent with no data.
     for &variant in TimerType::VARIANTS {
-        let (state, _) = store.resolve_state(&segment_id, &key, variant).await?;
-        assert_eq!(state, TimerState::Absent, "{variant:?} should be Absent");
+        let (handle, _) = store.resolve_state(&segment_id, &key, variant).await?;
+        assert_eq!(
+            *handle.lock().await,
+            TimerState::Absent,
+            "{variant:?} should be Absent"
+        );
         assert_key_reads(&store, variant, &key, &[], &format!("{variant:?}")).await?;
     }
 
@@ -840,18 +847,23 @@ async fn test_inline_state_round_trip() -> Result<()> {
     let t4 = CompactDateTime::from(4_000_000u32);
 
     // Phase 1: Initial state — no data, state is Absent.
-    let (state, _) = store
+    let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
         .await?;
-    assert_eq!(state, TimerState::Absent, "phase 1: expected Absent");
+    assert_eq!(
+        *handle.lock().await,
+        TimerState::Absent,
+        "phase 1: expected Absent"
+    );
 
     // Phase 2: clear_and_schedule_key(t1) → Inline(t1)
     let trigger1 = Trigger::for_testing(key.clone(), t1, TimerType::Application);
     store.clear_and_schedule_key(trigger1).await?;
 
-    let (state, _) = store
+    let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
         .await?;
+    let state = handle.lock().await.clone();
     assert!(
         matches!(&state, TimerState::Inline(t) if t.time == t1),
         "phase 2: expected Inline(t1), got {state:?}"
@@ -862,9 +874,10 @@ async fn test_inline_state_round_trip() -> Result<()> {
     let trigger2 = Trigger::for_testing(key.clone(), t2, TimerType::Application);
     store.clear_and_schedule_key(trigger2).await?;
 
-    let (state, _) = store
+    let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
         .await?;
+    let state = handle.lock().await.clone();
     assert!(
         matches!(&state, TimerState::Inline(t) if t.time == t2),
         "phase 3: expected Inline(t2), got {state:?}"
@@ -875,11 +888,11 @@ async fn test_inline_state_round_trip() -> Result<()> {
     let trigger3 = Trigger::for_testing(key.clone(), t3, TimerType::Application);
     store.insert_key_trigger(trigger3).await?;
 
-    let (state, _) = store
+    let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
         .await?;
     assert_eq!(
-        state,
+        *handle.lock().await,
         TimerState::Overflow,
         "phase 4: expected Overflow after promotion"
     );
@@ -889,9 +902,10 @@ async fn test_inline_state_round_trip() -> Result<()> {
     let trigger4 = Trigger::for_testing(key.clone(), t4, TimerType::Application);
     store.clear_and_schedule_key(trigger4).await?;
 
-    let (state, _) = store
+    let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
         .await?;
+    let state = handle.lock().await.clone();
     assert!(
         matches!(&state, TimerState::Inline(t) if t.time == t4),
         "phase 5: expected Inline(t4), got {state:?}"
@@ -909,11 +923,11 @@ async fn test_inline_state_round_trip() -> Result<()> {
     );
 
     // Phase 7: Type isolation — DeferredMessage state is still Absent.
-    let (state, _) = store
+    let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::DeferredMessage)
         .await?;
     assert_eq!(
-        state,
+        *handle.lock().await,
         TimerState::Absent,
         "phase 7: DeferredMessage state should be Absent"
     );
@@ -921,11 +935,11 @@ async fn test_inline_state_round_trip() -> Result<()> {
     // Phase 8: Cleanup — clear_key_triggers_all_types resets everything.
     store.clear_key_triggers_all_types(&key).await?;
 
-    let (state, _) = store
+    let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
         .await?;
     assert_eq!(
-        state,
+        *handle.lock().await,
         TimerState::Absent,
         "phase 8: expected Absent after cleanup"
     );
@@ -1034,17 +1048,16 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     // Store A cache is warm: Inline(t1).
     let cache_key = (key.clone(), tt);
     let cached_a = ops_a.state_cache.get(&cache_key);
+    assert!(cached_a.is_some(), "store A cache should have Inline(t1)");
+    let cached_a_state = cached_a.as_ref().map(|h| h.try_lock().map(|g| g.clone()));
     assert!(
-        matches!(&cached_a, Some(TimerState::Inline(timer)) if timer.time == t1),
-        "store A cache should have Inline(t1), got {cached_a:?}"
+        matches!(&cached_a_state, Some(Ok(TimerState::Inline(timer))) if timer.time == t1),
+        "store A cache should have Inline(t1), got {cached_a_state:?}"
     );
 
     // Store B cache is cold: no entry for this key.
     let cached_b = ops_b.state_cache.get(&cache_key);
-    assert!(
-        cached_b.is_none(),
-        "store B cache should be cold (None), got {cached_b:?}"
-    );
+    assert!(cached_b.is_none(), "store B cache should be cold (None)");
 
     // Store B can still read the data via shared keyspace (same segment ID).
     let times: Vec<CompactDateTime> = ops_b.get_key_times(tt, &key).try_collect().await?;
@@ -1052,9 +1065,11 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
 
     // After the read, store B's cache should now be warm (Inline cached from DB).
     let warm_b = ops_b.state_cache.get(&cache_key);
+    assert!(warm_b.is_some(), "store B cache should be warm after read");
+    let warm_b_state = warm_b.as_ref().map(|h| h.try_lock().map(|g| g.clone()));
     assert!(
-        matches!(&warm_b, Some(TimerState::Inline(t)) if t.time == t1),
-        "store B cache should be warm after read, got {warm_b:?}"
+        matches!(&warm_b_state, Some(Ok(TimerState::Inline(t))) if t.time == t1),
+        "store B cache should be warm after read, got {warm_b_state:?}"
     );
 
     // Cleanup.
@@ -1118,7 +1133,8 @@ async fn prop_timer_state_invariant(
     for (segment_id, key) in &model.all_keys() {
         for &timer_type in TimerType::VARIANTS {
             let expected_count = model.get_times(segment_id, timer_type, key).len();
-            let (timer_state, _) = store.resolve_state(segment_id, key, timer_type).await?;
+            let (handle, _) = store.resolve_state(segment_id, key, timer_type).await?;
+            let timer_state = handle.lock().await.clone();
 
             match expected_count {
                 0 => {
