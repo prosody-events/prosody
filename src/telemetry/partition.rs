@@ -349,5 +349,4 @@ impl TelemetryPartitionSender {
             source,
         );
     }
-
 }

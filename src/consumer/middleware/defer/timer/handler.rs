@@ -352,7 +352,11 @@ where
                 self.schedule_retry_timer(context, new_retry_count).await?;
 
                 self.sender.emit_timer(
-                    TimerEventType::Failed { demand_type: DemandType::Failure, error_category, exception },
+                    TimerEventType::Failed {
+                        demand_type: DemandType::Failure,
+                        error_category,
+                        exception,
+                    },
                     trigger.key.clone(),
                     trigger.time,
                     trigger.timer_type,
@@ -383,7 +387,11 @@ where
                 self.complete_and_advance(context, trigger).await?;
 
                 self.sender.emit_timer(
-                    TimerEventType::Failed { demand_type: DemandType::Failure, error_category, exception },
+                    TimerEventType::Failed {
+                        demand_type: DemandType::Failure,
+                        error_category,
+                        exception,
+                    },
                     trigger.key.clone(),
                     trigger.time,
                     trigger.timer_type,
@@ -394,7 +402,11 @@ where
             }
             ErrorCategory::Terminal => {
                 self.sender.emit_timer(
-                    TimerEventType::Failed { demand_type: DemandType::Failure, error_category, exception },
+                    TimerEventType::Failed {
+                        demand_type: DemandType::Failure,
+                        error_category,
+                        exception,
+                    },
                     trigger.key.clone(),
                     trigger.time,
                     trigger.timer_type,

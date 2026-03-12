@@ -22,7 +22,10 @@ use prosody::high_level::mode::Mode;
 use prosody::high_level::{ConsumerBuilders, HighLevelClient};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
+use prosody::timers::TimerType;
 use prosody::timers::Trigger;
+use prosody::timers::datetime::CompactDateTime;
+use prosody::timers::duration::CompactDuration;
 use prosody::tracing::init_test_logging;
 use rdkafka::ClientConfig;
 use rdkafka::Message;
@@ -42,6 +45,8 @@ const CASSANDRA_HOST: &str = "localhost:9042";
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Top-level timeout for any single integration test.
 const TEST_TIMEOUT: Duration = Duration::from_secs(45);
+/// Timeout for tests that involve timer scheduling (3 s delay + startup).
+const TIMER_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Test Handlers ────────────────────────────────────────────────────────────
 
@@ -100,6 +105,135 @@ impl FallibleHandler for ForwardHandler {
     async fn shutdown(self) {}
 }
 
+/// Handler that always fails on messages.
+#[derive(Clone)]
+struct FailingHandler {
+    tx: Sender<String>,
+}
+
+impl FallibleHandler for FailingHandler {
+    type Error = TestError;
+
+    async fn on_message<C>(
+        &self,
+        _ctx: C,
+        msg: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let _ = self.tx.send(msg.key().to_string()).await;
+        Err(TestError)
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        _trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// Handler that schedules a timer on message, then succeeds on timer.
+#[derive(Clone)]
+struct TimerSchedulingHandler {
+    msg_tx: Sender<String>,
+    timer_tx: Sender<String>,
+}
+
+impl FallibleHandler for TimerSchedulingHandler {
+    type Error = TestError;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        msg: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let key = msg.key().to_string();
+        let schedule_time = CompactDateTime::now()
+            .and_then(|now| now.add_duration(CompactDuration::new(3)))
+            .map_err(|_| TestError)?;
+        ctx.schedule(schedule_time, TimerType::Application)
+            .await
+            .map_err(|_| TestError)?;
+        let _ = self.msg_tx.send(key).await;
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let _ = self.timer_tx.send(trigger.key.to_string()).await;
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// Handler that schedules a timer on message, then fails on timer.
+#[derive(Clone)]
+struct TimerFailingHandler {
+    msg_tx: Sender<String>,
+    timer_tx: Sender<String>,
+}
+
+impl FallibleHandler for TimerFailingHandler {
+    type Error = TestError;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        msg: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let key = msg.key().to_string();
+        let schedule_time = CompactDateTime::now()
+            .and_then(|now| now.add_duration(CompactDuration::new(3)))
+            .map_err(|_| TestError)?;
+        ctx.schedule(schedule_time, TimerType::Application)
+            .await
+            .map_err(|_| TestError)?;
+        let _ = self.msg_tx.send(key).await;
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let _ = self.timer_tx.send(trigger.key.to_string()).await;
+        Err(TestError)
+    }
+
+    async fn shutdown(self) {}
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn bootstrap_servers() -> Vec<String> {
@@ -153,6 +287,71 @@ async fn consume_telemetry_event_by_type(
     }
 }
 
+/// Validates the field contract for a `prosody.message.succeeded` event.
+fn assert_succeeded_contract(succeeded: &Value, expected_key: &str) -> Result<()> {
+    assert_eq!(
+        succeeded.get("type").and_then(Value::as_str),
+        Some("prosody.message.succeeded"),
+        "succeeded type mismatch"
+    );
+    let event_time = succeeded
+        .get("eventTime")
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("succeeded: missing eventTime"))?;
+    ensure!(
+        chrono::DateTime::parse_from_rfc3339(event_time).is_ok(),
+        "succeeded: eventTime not RFC 3339: {event_time}"
+    );
+    ensure!(
+        succeeded.get("offset").and_then(Value::as_i64).is_some(),
+        "succeeded: offset should be an integer"
+    );
+    ensure!(
+        succeeded.get("topic").and_then(Value::as_str).is_some(),
+        "succeeded: topic should be a string"
+    );
+    ensure!(
+        succeeded.get("partition").and_then(Value::as_i64).is_some(),
+        "succeeded: partition should be an integer"
+    );
+    assert_eq!(
+        succeeded.get("key").and_then(Value::as_str),
+        Some(expected_key),
+        "succeeded: key mismatch"
+    );
+    ensure!(
+        succeeded
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "succeeded: source should be non-empty"
+    );
+    ensure!(
+        succeeded
+            .get("hostname")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "succeeded: hostname should be non-empty"
+    );
+    let demand = succeeded
+        .get("demandType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("succeeded: missing demandType"))?;
+    ensure!(
+        demand == "normal" || demand == "failure",
+        "succeeded: demandType invalid: {demand}"
+    );
+    ensure!(
+        succeeded.get("errorCategory").is_none(),
+        "succeeded: errorCategory should be absent"
+    );
+    ensure!(
+        succeeded.get("exception").is_none(),
+        "succeeded: exception should be absent"
+    );
+    Ok(())
+}
+
 /// Asserts no telemetry events arrive within the given duration.
 async fn assert_no_telemetry_events(consumer: &StreamConsumer, wait: Duration) -> Result<()> {
     let result = timeout(wait, consumer.recv()).await;
@@ -193,6 +392,48 @@ fn build_client(
         emitter: TelemetryEmitterConfiguration {
             topic: telemetry_topic.to_owned(),
             enabled: emitter_enabled,
+        },
+    };
+
+    let mut cassandra_builder = CassandraConfigurationBuilder::default();
+    cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
+
+    let client = HighLevelClient::new(
+        Mode::BestEffort,
+        &mut producer_builder,
+        &consumer_builders,
+        &cassandra_builder,
+    )?;
+    Ok(client)
+}
+
+fn build_typed_client<T: FallibleHandler>(
+    source_topic: &str,
+    telemetry_topic: &str,
+) -> Result<HighLevelClient<T>> {
+    let mut producer_builder = ProducerConfigurationBuilder::default();
+    producer_builder
+        .bootstrap_servers(bootstrap_servers())
+        .source_system("test-telemetry");
+
+    let mut consumer_builder = ConsumerConfigurationBuilder::default();
+    consumer_builder
+        .bootstrap_servers(bootstrap_servers())
+        .group_id(Uuid::new_v4().to_string())
+        .subscribed_topics(vec![source_topic.to_owned()])
+        .probe_port(None);
+
+    let consumer_builders = ConsumerBuilders {
+        consumer: consumer_builder,
+        retry: RetryConfigurationBuilder::default(),
+        failure_topic: FailureTopicConfigurationBuilder::default(),
+        scheduler: SchedulerConfigurationBuilder::default(),
+        monopolization: MonopolizationConfigurationBuilder::default(),
+        defer: DeferConfigurationBuilder::default(),
+        timeout: TimeoutConfigurationBuilder::default(),
+        emitter: TelemetryEmitterConfiguration {
+            topic: telemetry_topic.to_owned(),
+            enabled: true,
         },
     };
 
@@ -303,6 +544,31 @@ async fn producer_message_sent_on_kafka() -> Result<()> {
         assert!(
             sent.get("source").and_then(Value::as_str).is_some(),
             "sent event should have source"
+        );
+
+        let sent_event_time = sent
+            .get("eventTime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| eyre!("sent: missing eventTime"))?;
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(sent_event_time).is_ok(),
+            "sent: eventTime not RFC 3339: {sent_event_time}"
+        );
+        ensure!(
+            sent.get("topic")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty()),
+            "sent: topic should be a non-empty string"
+        );
+        ensure!(
+            sent.get("partition").and_then(Value::as_i64).is_some(),
+            "sent: partition should be an integer"
+        );
+        ensure!(
+            sent.get("hostname")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty()),
+            "sent: hostname should be non-empty"
         );
 
         admin.delete_topic(&dest_topic).await?;
@@ -457,6 +723,15 @@ async fn json_payload_contract_validation() -> Result<()> {
             "exception should be absent on dispatched event"
         );
 
+        // ── succeeded event contract ──
+        let succeeded = consume_telemetry_event_by_type(
+            &telemetry_consumer,
+            "prosody.message.succeeded",
+            RECEIVE_TIMEOUT,
+        )
+        .await?;
+        assert_succeeded_contract(&succeeded, "contract-key")?;
+
         client.unsubscribe().await?;
         admin.delete_topic(&source_topic).await?;
         admin.delete_topic(&telemetry_topic).await?;
@@ -464,4 +739,255 @@ async fn json_payload_contract_validation() -> Result<()> {
     })
     .await
     .map_err(|_| eyre!("test timed out after {TEST_TIMEOUT:?}"))?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn message_failed_event_on_kafka() -> Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        init_test_logging();
+
+        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
+        let telemetry_topic = Uuid::new_v4().to_string();
+        let source_topic = Uuid::new_v4().to_string();
+        let source: Topic = source_topic.as_str().into();
+
+        create_topic(admin, &telemetry_topic).await?;
+        create_topic(admin, &source_topic).await?;
+
+        let client: HighLevelClient<FailingHandler> =
+            build_typed_client(&source_topic, &telemetry_topic)?;
+
+        let (fail_tx, mut fail_rx) = channel(16);
+        client.subscribe(FailingHandler { tx: fail_tx }).await?;
+
+        let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
+
+        client
+            .send(source, "fail-key", &json!({"v": 1_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, fail_rx.recv()).await?;
+
+        let failed = consume_telemetry_event_by_type(
+            &telemetry_consumer,
+            "prosody.message.failed",
+            RECEIVE_TIMEOUT,
+        )
+        .await?;
+
+        assert_eq!(
+            failed.get("type").and_then(Value::as_str),
+            Some("prosody.message.failed"),
+            "type mismatch"
+        );
+        assert_eq!(
+            failed.get("key").and_then(Value::as_str),
+            Some("fail-key"),
+            "key mismatch"
+        );
+        assert_eq!(
+            failed.get("errorCategory").and_then(Value::as_str),
+            Some("permanent"),
+            "errorCategory should be 'permanent'"
+        );
+        ensure!(
+            failed
+                .get("exception")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty()),
+            "exception should be non-empty"
+        );
+
+        client.unsubscribe().await?;
+        admin.delete_topic(&source_topic).await?;
+        admin.delete_topic(&telemetry_topic).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| eyre!("test timed out after {TEST_TIMEOUT:?}"))?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timer_lifecycle_events_on_kafka() -> Result<()> {
+    timeout(TIMER_TEST_TIMEOUT, async {
+        init_test_logging();
+
+        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
+        let telemetry_topic = Uuid::new_v4().to_string();
+        let source_topic = Uuid::new_v4().to_string();
+        let source: Topic = source_topic.as_str().into();
+
+        create_topic(admin, &telemetry_topic).await?;
+        create_topic(admin, &source_topic).await?;
+
+        let client: HighLevelClient<TimerSchedulingHandler> =
+            build_typed_client(&source_topic, &telemetry_topic)?;
+
+        let (msg_tx, mut msg_rx) = channel(16);
+        let (timer_tx, mut timer_rx) = channel(16);
+        client
+            .subscribe(TimerSchedulingHandler { msg_tx, timer_tx })
+            .await?;
+
+        let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
+
+        client
+            .send(source, "timer-key", &json!({"v": 1_i32}))
+            .await?;
+
+        // Wait for message handler to complete (timer scheduled inside)
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Wait for timer handler to fire (~3 s delay)
+        let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
+
+        let scheduled = consume_telemetry_event_by_type(
+            &telemetry_consumer,
+            "prosody.timer.scheduled",
+            RECEIVE_TIMEOUT,
+        )
+        .await?;
+        assert_eq!(
+            scheduled.get("type").and_then(Value::as_str),
+            Some("prosody.timer.scheduled")
+        );
+        assert_eq!(
+            scheduled.get("key").and_then(Value::as_str),
+            Some("timer-key")
+        );
+        let sched_time = scheduled
+            .get("scheduledTime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| eyre!("scheduled: missing scheduledTime"))?;
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(sched_time).is_ok(),
+            "scheduled: scheduledTime not RFC 3339: {sched_time}"
+        );
+        ensure!(
+            scheduled.get("timerType").and_then(Value::as_str).is_some(),
+            "scheduled: timerType should be present"
+        );
+
+        let dispatched = consume_telemetry_event_by_type(
+            &telemetry_consumer,
+            "prosody.timer.dispatched",
+            RECEIVE_TIMEOUT,
+        )
+        .await?;
+        assert_eq!(
+            dispatched.get("type").and_then(Value::as_str),
+            Some("prosody.timer.dispatched")
+        );
+        assert_eq!(
+            dispatched.get("key").and_then(Value::as_str),
+            Some("timer-key")
+        );
+        let disp_sched_time = dispatched
+            .get("scheduledTime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| eyre!("dispatched: missing scheduledTime"))?;
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(disp_sched_time).is_ok(),
+            "dispatched: scheduledTime not RFC 3339"
+        );
+
+        let timer_succeeded = consume_telemetry_event_by_type(
+            &telemetry_consumer,
+            "prosody.timer.succeeded",
+            RECEIVE_TIMEOUT,
+        )
+        .await?;
+        assert_eq!(
+            timer_succeeded.get("type").and_then(Value::as_str),
+            Some("prosody.timer.succeeded")
+        );
+        assert_eq!(
+            timer_succeeded.get("key").and_then(Value::as_str),
+            Some("timer-key")
+        );
+        ensure!(
+            timer_succeeded
+                .get("timerType")
+                .and_then(Value::as_str)
+                .is_some(),
+            "succeeded: timerType should be present"
+        );
+
+        client.unsubscribe().await?;
+        admin.delete_topic(&source_topic).await?;
+        admin.delete_topic(&telemetry_topic).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timer_failed_event_on_kafka() -> Result<()> {
+    timeout(TIMER_TEST_TIMEOUT, async {
+        init_test_logging();
+
+        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
+        let telemetry_topic = Uuid::new_v4().to_string();
+        let source_topic = Uuid::new_v4().to_string();
+        let source: Topic = source_topic.as_str().into();
+
+        create_topic(admin, &telemetry_topic).await?;
+        create_topic(admin, &source_topic).await?;
+
+        let client: HighLevelClient<TimerFailingHandler> =
+            build_typed_client(&source_topic, &telemetry_topic)?;
+
+        let (msg_tx, mut msg_rx) = channel(16);
+        let (timer_tx, mut timer_rx) = channel(16);
+        client
+            .subscribe(TimerFailingHandler { msg_tx, timer_tx })
+            .await?;
+
+        let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
+
+        client
+            .send(source, "timer-fail-key", &json!({"v": 1_i32}))
+            .await?;
+
+        // Wait for message handler to complete (timer scheduled inside)
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Wait for timer handler to fire (~3 s delay)
+        let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
+
+        let timer_failed = consume_telemetry_event_by_type(
+            &telemetry_consumer,
+            "prosody.timer.failed",
+            RECEIVE_TIMEOUT,
+        )
+        .await?;
+
+        assert_eq!(
+            timer_failed.get("type").and_then(Value::as_str),
+            Some("prosody.timer.failed")
+        );
+        assert_eq!(
+            timer_failed.get("key").and_then(Value::as_str),
+            Some("timer-fail-key")
+        );
+        assert_eq!(
+            timer_failed.get("errorCategory").and_then(Value::as_str),
+            Some("permanent"),
+            "errorCategory should be 'permanent'"
+        );
+        ensure!(
+            timer_failed
+                .get("exception")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty()),
+            "exception should be non-empty"
+        );
+
+        client.unsubscribe().await?;
+        admin.delete_topic(&source_topic).await?;
+        admin.delete_topic(&telemetry_topic).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
 }

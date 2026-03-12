@@ -417,6 +417,7 @@ pub enum EmitterError {
 mod tests {
     use super::*;
     use crate::consumer::DemandType;
+    use crate::error::ErrorCategory;
     use crate::telemetry::Telemetry;
     use crate::telemetry::event::{
         KeyEvent, KeyState, MessageEventType, MessageSentEvent, MessageTelemetryEvent,
@@ -425,7 +426,7 @@ mod tests {
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
-    use color_eyre::eyre::{Result, bail, ensure};
+    use color_eyre::eyre::{Result, bail, ensure, eyre};
     use std::sync::Arc;
 
     fn timer_event(key: &str) -> Data {
@@ -499,21 +500,187 @@ mod tests {
     }
 
     #[test]
-    fn serialize_event_partition_returns_none() {
-        let data = Data::Partition(PartitionEvent {
+    fn serialize_returns_none_for_internal_variants() {
+        let partition = Data::Partition(PartitionEvent {
             state: PartitionState::Assigned,
         });
-        assert!(serialize_event(&data, "topic", 0, "host").is_none());
-    }
+        assert!(serialize_event(&partition, "topic", 0, "host").is_none());
 
-    #[test]
-    fn serialize_event_key_event_returns_none() {
-        let data = Data::Key(KeyEvent {
+        let key = Data::Key(KeyEvent {
             key: Arc::from("k"),
             demand_type: DemandType::Normal,
             state: KeyState::HandlerInvoked,
         });
-        assert!(serialize_event(&data, "topic", 0, "host").is_none());
+        assert!(serialize_event(&key, "topic", 0, "host").is_none());
+    }
+
+    fn parse_serialized(data: &Data) -> Result<serde_json::Value> {
+        let (_, bytes) = serialize_event(data, "src-topic", 7, "test-host")
+            .ok_or_else(|| eyre!("serialize_event returned None"))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        Ok(value)
+    }
+
+    #[test]
+    fn serialize_timer_scheduled_omits_optional_fields() -> Result<()> {
+        let data = Data::Timer(TimerTelemetryEvent {
+            event_type: TimerEventType::Scheduled,
+            event_time: Utc::now(),
+            scheduled_time: CompactDateTime::from(1_700_000_000_u32),
+            timer_type: TimerType::Application,
+            key: Arc::from("t-key"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        assert_eq!(v["type"], "prosody.timer.scheduled");
+        assert_eq!(v["timerType"], "application");
+        assert_eq!(v["key"], "t-key");
+        assert_eq!(v["hostname"], "test-host");
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
+            "eventTime not RFC 3339"
+        );
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(v["scheduledTime"].as_str().unwrap_or("")).is_ok(),
+            "scheduledTime not RFC 3339"
+        );
+        // Optional fields must be absent
+        assert!(v.get("demandType").is_none());
+        assert!(v.get("errorCategory").is_none());
+        assert!(v.get("exception").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_timer_failed_includes_error_fields() -> Result<()> {
+        let data = Data::Timer(TimerTelemetryEvent {
+            event_type: TimerEventType::Failed {
+                demand_type: DemandType::Failure,
+                error_category: ErrorCategory::Permanent,
+                exception: "boom".into(),
+            },
+            event_time: Utc::now(),
+            scheduled_time: CompactDateTime::from(1_700_000_000_u32),
+            timer_type: TimerType::DeferredTimer,
+            key: Arc::from("t-fail"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        assert_eq!(v["type"], "prosody.timer.failed");
+        assert_eq!(v["errorCategory"], "permanent");
+        assert_eq!(v["exception"], "boom");
+        assert_eq!(v["demandType"], "failure");
+        assert_eq!(v["timerType"], "deferredTimer");
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_message_dispatched_omits_error_fields() -> Result<()> {
+        let data = Data::Message(MessageTelemetryEvent {
+            event_type: MessageEventType::Dispatched {
+                demand_type: DemandType::Normal,
+            },
+            event_time: Utc::now(),
+            offset: 42,
+            key: Arc::from("m-key"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        assert_eq!(v["type"], "prosody.message.dispatched");
+        assert_eq!(v["demandType"], "normal");
+        assert_eq!(v["offset"], 42_i32);
+        assert!(v.get("errorCategory").is_none());
+        assert!(v.get("exception").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_message_failed_includes_error_fields() -> Result<()> {
+        let data = Data::Message(MessageTelemetryEvent {
+            event_type: MessageEventType::Failed {
+                demand_type: DemandType::Normal,
+                error_category: ErrorCategory::Transient,
+                exception: "oops".into(),
+            },
+            event_time: Utc::now(),
+            offset: 99,
+            key: Arc::from("m-fail"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        assert_eq!(v["type"], "prosody.message.failed");
+        assert_eq!(v["errorCategory"], "transient");
+        assert_eq!(v["exception"], "oops");
+        assert_eq!(v["demandType"], "normal");
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_message_succeeded_omits_error_fields() -> Result<()> {
+        let data = Data::Message(MessageTelemetryEvent {
+            event_type: MessageEventType::Succeeded {
+                demand_type: DemandType::Normal,
+            },
+            event_time: Utc::now(),
+            offset: 10,
+            key: Arc::from("m-ok"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        assert_eq!(v["type"], "prosody.message.succeeded");
+        assert_eq!(v["demandType"], "normal");
+        assert_eq!(v["key"], "m-ok");
+        assert_eq!(v["offset"], 10_i32);
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
+            "eventTime not RFC 3339"
+        );
+        assert!(v.get("errorCategory").is_none());
+        assert!(v.get("exception").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_message_sent_fields() -> Result<()> {
+        let data = Data::MessageSent(MessageSentEvent {
+            event_time: Utc::now(),
+            topic: "dest-topic".into(),
+            partition: 3,
+            offset: 77,
+            key: Arc::from("s-key"),
+            source: Arc::from("producer-src"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        assert_eq!(v["type"], "prosody.message.sent");
+        assert_eq!(v["key"], "s-key");
+        assert_eq!(v["topic"], "dest-topic");
+        assert_eq!(v["partition"], 3_i32);
+        assert_eq!(v["offset"], 77_i32);
+        assert_eq!(v["source"], "producer-src");
+        assert_eq!(v["hostname"], "test-host");
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(v["eventTime"].as_str().unwrap_or("")).is_ok(),
+            "eventTime not RFC 3339"
+        );
+        Ok(())
     }
 
     #[test]
