@@ -143,11 +143,11 @@
 
 **Purpose**: Verify quality across all scenarios
 
-- [ ] T042 Run `cargo clippy` and `cargo clippy --tests` — fix any warnings to zero
-- [ ] T043 [P] Run `cargo doc` — fix any documentation warnings
-- [ ] T044 [P] Run `cargo +nightly fmt` — format all modified files
-- [ ] T045 Run `cargo test` — verify all existing tests pass with the new telemetry plumbing (pipe output to temp file per constitution)
-- [ ] T046 Verify existing internal telemetry subscribers (virtual-time fairness, monopolization detection) still work — they should ignore the new `Data` variants via wildcard/default match arms
+- [x] T042 Run `cargo clippy` and `cargo clippy --tests` — fix any warnings to zero
+- [x] T043 [P] Run `cargo doc` — fix any documentation warnings
+- [x] T044 [P] Run `cargo +nightly fmt` — format all modified files
+- [x] T045 Run `cargo test` — verify all existing tests pass with the new telemetry plumbing (pipe output to temp file per constitution)
+- [x] T046 Verify existing internal telemetry subscribers (virtual-time fairness, monopolization detection) still work — they should ignore the new `Data` variants via wildcard/default match arms
 
 ---
 
