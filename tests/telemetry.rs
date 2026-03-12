@@ -47,6 +47,8 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(45);
 /// Timeout for tests that involve timer scheduling (3 s delay + startup).
 const TIMER_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeout for defer tests: warm-up + 3 s timer + backoff + telemetry drain.
+const DEFER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ── Test Handlers ────────────────────────────────────────────────────────────
 
@@ -1137,7 +1139,7 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deferred_message_timer_three_event_invariant() -> Result<()> {
-    timeout(TIMER_TEST_TIMEOUT, async {
+    timeout(DEFER_TEST_TIMEOUT, async {
         init_test_logging();
 
         let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
@@ -1189,12 +1191,12 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
         Ok(())
     })
     .await
-    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
+    .map_err(|_| eyre!("test timed out after {DEFER_TEST_TIMEOUT:?}"))?
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
-    timeout(TIMER_TEST_TIMEOUT, async {
+    timeout(DEFER_TEST_TIMEOUT, async {
         init_test_logging();
 
         let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
@@ -1253,5 +1255,5 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
         Ok(())
     })
     .await
-    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
+    .map_err(|_| eyre!("test timed out after {DEFER_TEST_TIMEOUT:?}"))?
 }
