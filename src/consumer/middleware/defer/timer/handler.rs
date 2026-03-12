@@ -235,11 +235,11 @@ where
             "Loaded deferred timer - attempting retry"
         );
 
-        // Retry inner handler with stored Application timer
+        // Emit dispatched for the DeferredTimer that actually fired.
         self.sender.timer_dispatched(
-            stored_trigger.key.clone(),
-            stored_trigger.time,
-            stored_trigger.timer_type,
+            trigger.key.clone(),
+            trigger.time,
+            trigger.timer_type,
             DemandType::Failure,
             self.source.clone(),
         );
@@ -250,14 +250,14 @@ where
             .await
         {
             return self
-                .handle_retry_failure(&context, &stored_trigger, retry_count, error)
+                .handle_retry_failure(&context, &trigger, &stored_trigger, retry_count, error)
                 .await;
         }
 
         self.sender.timer_succeeded(
-            stored_trigger.key.clone(),
-            stored_trigger.time,
-            stored_trigger.timer_type,
+            trigger.key.clone(),
+            trigger.time,
+            trigger.timer_type,
             DemandType::Failure,
             self.source.clone(),
         );
@@ -327,10 +327,15 @@ where
     }
 
     /// Handles retry failures by error category.
+    ///
+    /// `deferred_trigger` is the `DeferredTimer` that fired (used for
+    /// telemetry). `stored_trigger` is the original `Application` timer
+    /// retrieved from the store (used for store operations).
     async fn handle_retry_failure<C>(
         &self,
         context: &C,
-        trigger: &Trigger,
+        deferred_trigger: &Trigger,
+        stored_trigger: &Trigger,
         retry_count: u32,
         error: T::Error,
     ) -> Result<(), DeferError<S::Error, T::Error>>
@@ -345,7 +350,7 @@ where
                 // Always re-defer: timer is committed to queue
                 let new_retry_count = self
                     .store
-                    .increment_retry_count(&trigger.key, retry_count)
+                    .increment_retry_count(&deferred_trigger.key, retry_count)
                     .await
                     .map_err(DeferError::Store)?;
 
@@ -357,15 +362,15 @@ where
                         error_category,
                         exception,
                     },
-                    trigger.key.clone(),
-                    trigger.time,
-                    trigger.timer_type,
+                    deferred_trigger.key.clone(),
+                    deferred_trigger.time,
+                    deferred_trigger.timer_type,
                     self.source.clone(),
                 );
 
                 info!(
-                    key = ?trigger.key,
-                    time = %trigger.time,
+                    key = ?deferred_trigger.key,
+                    time = %deferred_trigger.time,
                     retry_count = new_retry_count,
                     topic = %self.topic,
                     partition = self.partition,
@@ -376,15 +381,15 @@ where
             }
             ErrorCategory::Permanent => {
                 warn!(
-                    key = ?trigger.key,
-                    time = %trigger.time,
+                    key = ?deferred_trigger.key,
+                    time = %deferred_trigger.time,
                     retry_count = retry_count,
                     topic = %self.topic,
                     partition = self.partition,
                     "Permanent handler error during retry - removing from queue: {error:#}"
                 );
 
-                self.complete_and_advance(context, trigger).await?;
+                self.complete_and_advance(context, stored_trigger).await?;
 
                 self.sender.emit_timer(
                     TimerEventType::Failed {
@@ -392,9 +397,9 @@ where
                         error_category,
                         exception,
                     },
-                    trigger.key.clone(),
-                    trigger.time,
-                    trigger.timer_type,
+                    deferred_trigger.key.clone(),
+                    deferred_trigger.time,
+                    deferred_trigger.timer_type,
                     self.source.clone(),
                 );
 
@@ -407,9 +412,9 @@ where
                         error_category,
                         exception,
                     },
-                    trigger.key.clone(),
-                    trigger.time,
-                    trigger.timer_type,
+                    deferred_trigger.key.clone(),
+                    deferred_trigger.time,
+                    deferred_trigger.timer_type,
                     self.source.clone(),
                 );
 

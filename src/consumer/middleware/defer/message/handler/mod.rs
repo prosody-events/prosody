@@ -30,8 +30,8 @@ use crate::consumer::middleware::{
 use crate::consumer::{ConsumerConfiguration, DemandType, Keyed};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::Telemetry;
-use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::telemetry::event::TimerEventType;
+use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Offset, Partition, Topic};

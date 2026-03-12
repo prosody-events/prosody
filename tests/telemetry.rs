@@ -589,7 +589,8 @@ fn assert_timer_three_event_invariant(
     Ok(())
 }
 
-/// Asserts the two-event invariant for a message: dispatched → succeeded/failed.
+/// Asserts the two-event invariant for a message: dispatched →
+/// succeeded/failed.
 fn assert_message_two_event_invariant(events: &[Value], expect_success: bool) -> Result<()> {
     let types: Vec<&str> = events
         .iter()
@@ -674,7 +675,11 @@ fn build_typed_client<T: FallibleHandler>(
     source_topic: &str,
     telemetry_topic: &str,
 ) -> Result<HighLevelClient<T>> {
-    build_typed_client_with_defer(source_topic, telemetry_topic, DeferConfigurationBuilder::default())
+    build_typed_client_with_defer(
+        source_topic,
+        telemetry_topic,
+        DeferConfigurationBuilder::default(),
+    )
 }
 
 fn build_typed_client_with_defer<T: FallibleHandler>(
@@ -1070,8 +1075,7 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
         let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
 
         let events =
-            collect_timer_events_for_key(&telemetry_consumer, "timer-key", RECEIVE_TIMEOUT)
-                .await?;
+            collect_timer_events_for_key(&telemetry_consumer, "timer-key", RECEIVE_TIMEOUT).await?;
         assert_timer_three_event_invariant(&events, "application", true)?;
 
         client.unsubscribe().await?;
