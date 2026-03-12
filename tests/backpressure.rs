@@ -79,7 +79,7 @@ async fn test_backpressure() -> Result<()> {
         .source_system("test-producer")
         .build()?;
 
-    let producer = ProsodyProducer::new(&producer_config)?;
+    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
 
     // Produce a large number of messages
     let total = 1_000u32;

@@ -76,7 +76,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
         Telemetry::new(),
     )
     .await?;
-    let producer = ProsodyProducer::new(&producer_config)?;
+    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
 
     let key = "test-key";
 

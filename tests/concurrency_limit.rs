@@ -226,7 +226,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
         .bootstrap_servers(bootstrap.clone())
         .source_system("test-producer")
         .build()?;
-    let producer = ProsodyProducer::new(&producer_config)?;
+    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
 
     // Produce messages with varying keys to distribute across partitions
     produce_messages(&producer, topic, total_messages, num_keys).await?;

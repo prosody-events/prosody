@@ -274,6 +274,7 @@ impl DeferTestEnvironment {
             message_provider,
             failure_tracker,
             &heartbeats,
+            &telemetry,
         )?;
 
         let handler_provider = defer_middleware
@@ -293,6 +294,7 @@ impl DeferTestEnvironment {
                 .bootstrap_servers(vec!["localhost:9094".to_owned()])
                 .source_system("defer-integration-test".to_owned())
                 .build()?,
+            Telemetry::new().sender(),
         )?;
 
         Ok(Self {
@@ -362,6 +364,7 @@ impl DeferTestEnvironment {
             message_provider,
             failure_tracker,
             &heartbeats,
+            &telemetry,
         )?;
 
         let handler_provider = defer_middleware
@@ -381,6 +384,7 @@ impl DeferTestEnvironment {
                 .bootstrap_servers(vec!["localhost:9094".to_owned()])
                 .source_system("defer-integration-test".to_owned())
                 .build()?,
+            Telemetry::new().sender(),
         )?;
 
         Ok(Self {
@@ -549,7 +553,15 @@ async fn run_multiple_messages_queued_in_order() -> Result<()> {
         "Expected first message to fail with transient error"
     );
 
-    // Messages 2 and 3 should be queued (no immediate events)
+    // The zero-delay first retry (retry_count=0) fires immediately and also
+    // fails — drain it before asserting silence for messages 2 and 3.
+    let event = env.expect_event(5).await?;
+    ensure!(
+        matches!(event, HandlerEvent::MessageFailedTransient { ref key, value: 1 } if key == "test-key"),
+        "Expected immediate re-failure of value=1 on zero-delay first retry"
+    );
+
+    // Messages 2 and 3 should be queued (no events during the 1s backoff window)
     env.expect_no_event(500).await?;
 
     // Clear failure condition so retries succeed

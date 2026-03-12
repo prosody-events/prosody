@@ -190,14 +190,8 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 
 ## Active Technologies
 
-- Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (dev-dependencies), existing defer
-  middleware (001-simplified-prop-tests)
-- N/A (tests use `MemoryMessageDeferStore`) (001-simplified-prop-tests)
-- Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6, tokio, parking_lo (
-  001-simplified-prop-tests)
-- Rust Edition 2024 (stable) + scylla-rust-driver, tokio, scc, parking_lot, uuid, thiserror (
-  002-segment-based-defer-schema)
-- Apache Cassandra (via scylla driver) (002-segment-based-defer-schema)
+- Rust Edition 2024 (stable) + rdkafka 0.39, tokio 1.49, futures 0.3, serde 1.0, simd-json 0.17 (non-ARM), serde_json
+  1.0 (ARM fallback), opentelemetry 0.31, tracing 0.1, tracing-opentelemetry 0.32, whoami 2.1 (002-kafka-telemetry)
 
 ## Recent Changes
 

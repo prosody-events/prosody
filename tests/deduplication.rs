@@ -73,7 +73,7 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
     let handler = TestHandler { messages_tx };
 
     // Initialize the producer and consumer
-    let producer = ProsodyProducer::new(&producer_config)?;
+    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
     let consumer = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),

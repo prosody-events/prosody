@@ -9,6 +9,7 @@ use crate::consumer::ConsumerConfiguration;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
+use crate::telemetry::Telemetry;
 use crate::{ConsumerGroup, Partition, Topic};
 use std::sync::Arc;
 
@@ -31,6 +32,7 @@ where
     provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
+    telemetry: Telemetry,
 }
 
 impl<P, D> TimerDeferMiddleware<P, D>
@@ -45,12 +47,14 @@ where
         provider: P,
         decider: D,
         consumer_config: &ConsumerConfiguration,
+        telemetry: &Telemetry,
     ) -> Self {
         Self {
             config,
             provider,
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
+            telemetry: telemetry.clone(),
         }
     }
 }
@@ -67,6 +71,7 @@ where
     store_provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
+    telemetry: Telemetry,
 }
 
 impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
@@ -86,6 +91,7 @@ where
             store_provider: self.provider.clone(),
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
+            telemetry: self.telemetry.clone(),
         }
     }
 }
@@ -110,6 +116,8 @@ where
         // Inner handler first
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
 
+        let sender = self.telemetry.partition_sender(topic, partition);
+
         // Timer defer wraps inner handler
         TimerDeferHandler {
             handler: inner_handler,
@@ -118,6 +126,8 @@ where
             config: self.config.clone(),
             topic,
             partition,
+            sender,
+            source: self.consumer_group.clone(),
         }
     }
 }

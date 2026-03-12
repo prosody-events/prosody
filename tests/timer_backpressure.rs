@@ -146,7 +146,7 @@ async fn test_timer_backpressure() -> Result<()> {
         .source_system("test-timer-producer")
         .build()?;
 
-    let producer = ProsodyProducer::new(&producer_config)?;
+    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
 
     // Send messages that will schedule timers
     let total = 500u32;

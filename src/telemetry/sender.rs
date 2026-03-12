@@ -1,13 +1,18 @@
 //! Global telemetry sender for consumer lifecycle events.
 
 use crate::consumer::DemandType;
+use crate::propagator::new_propagator;
 use crate::telemetry::event::{
-    Data, KeyEvent, KeyState, PartitionEvent, PartitionState, TelemetryEvent,
+    Data, KeyEvent, KeyState, MessageSentEvent, PartitionEvent, PartitionState, TelemetryEvent,
 };
+use crate::telemetry::injector::TelemetryInjector;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::{Key, Partition, Topic};
+use chrono::Utc;
 use educe::Educe;
+use opentelemetry::propagation::TextMapCompositePropagator;
 use quanta::Clock;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Global telemetry sender for emitting lifecycle events.
@@ -22,11 +27,18 @@ pub struct TelemetrySender {
 
     #[educe(Debug(ignore))]
     clock: Clock,
+
+    #[educe(Debug(ignore))]
+    propagator: Arc<TextMapCompositePropagator>,
 }
 
 impl TelemetrySender {
     pub(crate) fn new(tx: broadcast::Sender<TelemetryEvent>, clock: Clock) -> Self {
-        Self { tx, clock }
+        Self {
+            tx,
+            clock,
+            propagator: Arc::new(new_propagator()),
+        }
     }
 
     /// Emits a partition paused event.
@@ -186,11 +198,111 @@ impl TelemetrySender {
         });
     }
 
+    /// Emits a producer message sent event.
+    pub fn message_sent(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: i64,
+        key: Key,
+        source: Arc<str>,
+    ) {
+        let injector = TelemetryInjector::extract(&self.propagator);
+        let (trace_parent, trace_state) = injector.into_parts();
+        let timestamp = self.clock.now();
+        let _ = self.tx.send(TelemetryEvent {
+            timestamp,
+            topic,
+            partition,
+            data: Data::MessageSent(MessageSentEvent {
+                event_time: Utc::now(),
+                topic,
+                partition,
+                offset,
+                key,
+                source,
+                trace_parent,
+                trace_state,
+            }),
+        });
+    }
+
     /// Creates a partition-scoped telemetry sender.
     ///
     /// Returns a sender pre-configured for a specific topic and partition.
     #[must_use]
     pub fn for_partition(&self, topic: Topic, partition: Partition) -> TelemetryPartitionSender {
         TelemetryPartitionSender::new(topic, partition, self.tx.clone(), self.clock.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::Telemetry;
+    use crate::telemetry::event::Data;
+    use chrono::Utc;
+    use color_eyre::eyre::{Result, bail, ensure};
+
+    #[test]
+    fn message_sent_emits_correct_variant() -> Result<()> {
+        let telemetry = Telemetry::new();
+        let mut rx = telemetry.subscribe();
+        let sender = telemetry.sender();
+
+        let topic: Topic = "test-topic".into();
+        let partition: Partition = 3;
+        let offset: i64 = 42;
+        let key: Key = Arc::from("test-key");
+        let source: Arc<str> = Arc::from("test-source");
+
+        sender.message_sent(topic, partition, offset, key.clone(), source.clone());
+
+        let event = rx.try_recv()?;
+        assert_eq!(event.topic, topic);
+        assert_eq!(event.partition, partition);
+
+        let Data::MessageSent(msg) = event.data else {
+            bail!("expected Data::MessageSent variant");
+        };
+        assert_eq!(msg.topic, topic);
+        assert_eq!(msg.partition, partition);
+        assert_eq!(msg.offset, offset);
+        assert_eq!(msg.key, key);
+        assert_eq!(&*msg.source, &*source);
+        Ok(())
+    }
+
+    #[test]
+    fn message_sent_event_time_is_recent() -> Result<()> {
+        let telemetry = Telemetry::new();
+        let mut rx = telemetry.subscribe();
+        let sender = telemetry.sender();
+
+        let topic: Topic = "time-topic".into();
+        let key: Key = Arc::from("time-key");
+        let source: Arc<str> = Arc::from("time-source");
+
+        let before = Utc::now();
+        sender.message_sent(topic, 0, 0, key, source);
+        let after = Utc::now();
+
+        let event = rx.try_recv()?;
+        let Data::MessageSent(msg) = event.data else {
+            bail!("expected Data::MessageSent variant");
+        };
+
+        ensure!(
+            msg.event_time >= before,
+            "event_time predates call: {:?} < {:?}",
+            msg.event_time,
+            before
+        );
+        ensure!(
+            msg.event_time <= after + chrono::Duration::seconds(5),
+            "event_time too far in the future: {:?}",
+            msg.event_time
+        );
+        Ok(())
     }
 }

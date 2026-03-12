@@ -29,6 +29,9 @@ use crate::consumer::middleware::{
 };
 use crate::consumer::{ConsumerConfiguration, DemandType, Keyed};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::telemetry::Telemetry;
+use crate::telemetry::event::TimerEventType;
+use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
@@ -61,6 +64,7 @@ where
     provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
+    telemetry: Telemetry,
 }
 
 impl<P> MessageDeferMiddleware<P, KafkaLoader, FailureTracker>
@@ -79,6 +83,7 @@ where
         provider: P,
         decider: FailureTracker,
         heartbeats: &HeartbeatRegistry,
+        telemetry: &Telemetry,
     ) -> Result<Self, DeferInitError> {
         use super::loader::LoaderConfiguration;
         use validator::Validate;
@@ -106,6 +111,7 @@ where
             provider,
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
+            telemetry: telemetry.clone(),
         })
     }
 }
@@ -124,6 +130,7 @@ where
     store_provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
+    telemetry: Telemetry,
 }
 
 /// Per-partition handler wrapping an inner handler with defer logic.
@@ -141,6 +148,8 @@ where
     pub(crate) config: DeferConfiguration,
     pub(crate) topic: Topic,
     pub(crate) partition: Partition,
+    pub(crate) sender: TelemetryPartitionSender,
+    pub(crate) source: Arc<str>,
 }
 
 impl<P, L, D> HandlerMiddleware for MessageDeferMiddleware<P, L, D>
@@ -162,6 +171,7 @@ where
             store_provider: self.provider.clone(),
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
+            telemetry: self.telemetry.clone(),
         }
     }
 }
@@ -187,6 +197,8 @@ where
         // Inner handler
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
 
+        let sender = self.telemetry.partition_sender(topic, partition);
+
         // Message defer wraps inner handler
         MessageDeferHandler {
             handler: inner_handler,
@@ -196,6 +208,8 @@ where
             config: self.config.clone(),
             topic,
             partition,
+            sender,
+            source: self.consumer_group.clone(),
         }
     }
 }
@@ -325,7 +339,10 @@ where
     where
         C: EventContext,
     {
-        match error.classify_error() {
+        let error_category = error.classify_error();
+        let exception = format!("{error:?}").into_boxed_str();
+
+        match error_category {
             ErrorCategory::Transient => {
                 // Always re-defer: message is committed to queue, dropping would
                 // violate ordering for messages queued behind it.
@@ -336,6 +353,15 @@ where
                     .map_err(DeferError::Store)?;
 
                 self.schedule_retry_timer(context, new_retry_count).await?;
+
+                self.sender.message_failed(
+                    message_key.clone(),
+                    offset,
+                    DemandType::Failure,
+                    self.source.clone(),
+                    error_category,
+                    exception,
+                );
 
                 info!(
                     key = ?message_key,
@@ -361,9 +387,29 @@ where
                 self.complete_and_advance(context, message_key, offset)
                     .await?;
 
+                self.sender.message_failed(
+                    message_key.clone(),
+                    offset,
+                    DemandType::Failure,
+                    self.source.clone(),
+                    error_category,
+                    exception,
+                );
+
                 Err(DeferError::Handler(error))
             }
-            ErrorCategory::Terminal => Err(DeferError::Handler(error)),
+            ErrorCategory::Terminal => {
+                self.sender.message_failed(
+                    message_key.clone(),
+                    offset,
+                    DemandType::Failure,
+                    self.source.clone(),
+                    error_category,
+                    exception,
+                );
+
+                Err(DeferError::Handler(error))
+            }
         }
     }
 
@@ -490,6 +536,85 @@ where
 
         Ok(())
     }
+
+    /// Retries a deferred message and emits timer + message telemetry.
+    async fn retry_deferred_message<C>(
+        &self,
+        context: C,
+        trigger: &Trigger,
+        message_key: &Key,
+        offset: Offset,
+        retry_count: u32,
+        message: ConsumerMessage,
+    ) -> DeferResult<(), M::Error, T::Error, L::Error>
+    where
+        C: EventContext,
+    {
+        self.sender.timer_dispatched(
+            trigger.key.clone(),
+            trigger.time,
+            trigger.timer_type,
+            DemandType::Failure,
+            self.source.clone(),
+        );
+
+        self.sender.message_dispatched(
+            message_key.clone(),
+            offset,
+            DemandType::Failure,
+            self.source.clone(),
+        );
+
+        match self
+            .handler
+            .on_message(context.clone(), message, DemandType::Failure)
+            .await
+        {
+            Ok(()) => {
+                self.sender.timer_succeeded(
+                    trigger.key.clone(),
+                    trigger.time,
+                    trigger.timer_type,
+                    DemandType::Failure,
+                    self.source.clone(),
+                );
+                self.sender.message_succeeded(
+                    message_key.clone(),
+                    offset,
+                    DemandType::Failure,
+                    self.source.clone(),
+                );
+                self.complete_and_advance(&context, message_key, offset)
+                    .await?;
+                info!(
+                    key = ?message_key,
+                    offset = offset,
+                    retry_count = retry_count,
+                    topic = %self.topic,
+                    partition = self.partition,
+                    "Deferred message retry succeeded"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let error_category = error.classify_error();
+                let exception = format!("{error:?}").into_boxed_str();
+                self.sender.emit_timer(
+                    TimerEventType::Failed {
+                        demand_type: DemandType::Failure,
+                        error_category,
+                        exception,
+                    },
+                    trigger.key.clone(),
+                    trigger.time,
+                    trigger.timer_type,
+                    self.source.clone(),
+                );
+                self.handle_retry_failure(&context, message_key, offset, retry_count, error)
+                    .await
+            }
+        }
+    }
 }
 
 impl<T, M, L, D> FallibleHandler for MessageDeferHandler<T, M, L, D>
@@ -597,20 +722,16 @@ where
             .await
             .map_err(DeferError::Store)?
         else {
-            // Queue empty (race or already processed): clear orphaned timer.
             debug!(
                 key = ?message_key,
                 topic = %self.topic,
                 partition = self.partition,
                 "Clearing orphaned defer timer: queue empty"
             );
-
-            // Clean up any orphaned store state for this key
             self.store
                 .delete_key(message_key)
                 .await
                 .map_err(DeferError::Store)?;
-
             return Ok(());
         };
 
@@ -618,7 +739,7 @@ where
             .load_deferred_message(&context, message_key, offset, retry_count)
             .await?
         else {
-            return Ok(()); // Load failure handled internally.
+            return Ok(());
         };
 
         debug!(
@@ -630,31 +751,8 @@ where
             "Loaded deferred message - attempting retry"
         );
 
-        // Retry handler; on failure, handle_retry_failure maintains invariants.
-        match self
-            .handler
-            .on_message(context.clone(), message, DemandType::Failure)
+        self.retry_deferred_message(context, &trigger, message_key, offset, retry_count, message)
             .await
-        {
-            Ok(()) => {
-                self.complete_and_advance(&context, message_key, offset)
-                    .await?;
-
-                info!(
-                    key = ?message_key,
-                    offset = offset,
-                    retry_count = retry_count,
-                    topic = %self.topic,
-                    partition = self.partition,
-                    "Deferred message retry succeeded"
-                );
-                Ok(())
-            }
-            Err(error) => {
-                self.handle_retry_failure(&context, message_key, offset, retry_count, error)
-                    .await
-            }
-        }
     }
 
     async fn shutdown(self) {
