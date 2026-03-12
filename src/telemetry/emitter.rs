@@ -4,6 +4,7 @@
 //! and produces them concurrently to a configured Kafka topic using
 //! `buffer_unordered`.
 
+use crate::Key;
 use crate::consumer::DemandType;
 use crate::error::ErrorCategory;
 use crate::telemetry::Telemetry;
@@ -13,7 +14,6 @@ use crate::telemetry::event::{
 };
 use crate::timers::TimerType;
 use crate::util::from_env_with_fallback;
-use crate::Key;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
@@ -371,7 +371,12 @@ pub fn spawn_telemetry_emitter(
                             event.partition,
                             &hostname,
                         ),
-                        Err(_lagged) => None,
+                        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(
+                            n,
+                        )) => {
+                            warn!("telemetry emitter lagged, dropped {n} events");
+                            None
+                        }
                     }
                 }
             })
