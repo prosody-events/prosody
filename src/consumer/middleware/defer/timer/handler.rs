@@ -28,9 +28,12 @@ use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
 use crate::consumer::{DemandType, Keyed};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::telemetry::event::TimerEventType;
+use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::datetime::{CompactDateTime, CompactDateTimeError};
 use crate::timers::{TimerType, Trigger};
 use crate::{Partition, Topic};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Per-partition handler wrapping an inner handler with timer defer logic.
@@ -55,6 +58,10 @@ where
     pub(crate) topic: Topic,
     /// Partition this handler is processing.
     pub(crate) partition: Partition,
+    /// Telemetry sender for this partition.
+    pub(crate) sender: TelemetryPartitionSender,
+    /// Consumer group id used as source in telemetry events.
+    pub(crate) source: Arc<str>,
 }
 
 impl<T, S, D> FallibleHandler for TimerDeferHandler<T, S, D>
@@ -229,6 +236,14 @@ where
         );
 
         // Retry inner handler with stored Application timer
+        self.sender.timer_dispatched(
+            stored_trigger.key.clone(),
+            stored_trigger.time,
+            stored_trigger.timer_type,
+            DemandType::Failure,
+            self.source.clone(),
+        );
+
         if let Err(error) = self
             .handler
             .on_timer(context.clone(), stored_trigger.clone(), DemandType::Failure)
@@ -238,6 +253,14 @@ where
                 .handle_retry_failure(&context, &stored_trigger, retry_count, error)
                 .await;
         }
+
+        self.sender.timer_succeeded(
+            stored_trigger.key.clone(),
+            stored_trigger.time,
+            stored_trigger.timer_type,
+            DemandType::Failure,
+            self.source.clone(),
+        );
 
         self.complete_and_advance(&context, &stored_trigger).await?;
 
@@ -314,7 +337,10 @@ where
     where
         C: EventContext,
     {
-        match error.classify_error() {
+        let error_category = error.classify_error();
+        let exception = format!("{error:?}").into_boxed_str();
+
+        match error_category {
             ErrorCategory::Transient => {
                 // Always re-defer: timer is committed to queue
                 let new_retry_count = self
@@ -324,6 +350,14 @@ where
                     .map_err(DeferError::Store)?;
 
                 self.schedule_retry_timer(context, new_retry_count).await?;
+
+                self.sender.emit_timer(
+                    TimerEventType::Failed { demand_type: DemandType::Failure, error_category, exception },
+                    trigger.key.clone(),
+                    trigger.time,
+                    trigger.timer_type,
+                    self.source.clone(),
+                );
 
                 info!(
                     key = ?trigger.key,
@@ -348,9 +382,27 @@ where
 
                 self.complete_and_advance(context, trigger).await?;
 
+                self.sender.emit_timer(
+                    TimerEventType::Failed { demand_type: DemandType::Failure, error_category, exception },
+                    trigger.key.clone(),
+                    trigger.time,
+                    trigger.timer_type,
+                    self.source.clone(),
+                );
+
                 Err(DeferError::Handler(error))
             }
-            ErrorCategory::Terminal => Err(DeferError::Handler(error)),
+            ErrorCategory::Terminal => {
+                self.sender.emit_timer(
+                    TimerEventType::Failed { demand_type: DemandType::Failure, error_category, exception },
+                    trigger.key.clone(),
+                    trigger.time,
+                    trigger.timer_type,
+                    self.source.clone(),
+                );
+
+                Err(DeferError::Handler(error))
+            }
         }
     }
 

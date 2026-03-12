@@ -28,6 +28,7 @@ use crate::consumer::middleware::defer::message::loader::{MemoryLoader, MessageL
 use crate::consumer::middleware::defer::message::store::CachedDeferStore;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
+use crate::telemetry::Telemetry;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
 use color_eyre::eyre::eyre;
@@ -155,6 +156,9 @@ impl TestHarness {
         // middleware stack
         let cached_store = CachedDeferStore::new(store.clone(), config.cache_size);
 
+        let telemetry = Telemetry::new();
+        let sender = telemetry.partition_sender(topic, partition);
+
         let handler = MessageDeferHandler {
             handler: inner_handler.clone(),
             loader: loader.clone(),
@@ -163,6 +167,8 @@ impl TestHarness {
             config,
             topic,
             partition,
+            sender,
+            source: Arc::from("test"),
         };
 
         Ok(Self {

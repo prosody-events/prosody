@@ -274,6 +274,7 @@ impl DeferTestEnvironment {
             message_provider,
             failure_tracker,
             &heartbeats,
+            &telemetry,
         )?;
 
         let handler_provider = defer_middleware
@@ -363,6 +364,7 @@ impl DeferTestEnvironment {
             message_provider,
             failure_tracker,
             &heartbeats,
+            &telemetry,
         )?;
 
         let handler_provider = defer_middleware

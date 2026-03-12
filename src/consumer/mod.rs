@@ -964,6 +964,7 @@ impl ProsodyConsumer {
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
+                    &telemetry,
                 )?;
 
                 let timer_defer_middleware = TimerDeferMiddleware::new(
@@ -971,6 +972,7 @@ impl ProsodyConsumer {
                     timer_provider,
                     failure_tracker,
                     consumer_config,
+                    &telemetry,
                 );
 
                 let provider = common_middleware
@@ -999,6 +1001,7 @@ impl ProsodyConsumer {
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
+                    &telemetry,
                 )?;
 
                 let timer_defer_middleware = TimerDeferMiddleware::new(
@@ -1006,6 +1009,7 @@ impl ProsodyConsumer {
                     timer_provider,
                     failure_tracker,
                     consumer_config,
+                    &telemetry,
                 );
 
                 let provider = common_middleware

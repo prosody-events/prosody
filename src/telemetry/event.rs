@@ -83,35 +83,6 @@ pub enum KeyState {
     MiddlewareExited,
 }
 
-/// Telemetry event name for JSON serialization.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
-pub enum TelemetryEventName {
-    /// Timer was written to store.
-    #[serde(rename = "prosody.timer.scheduled")]
-    TimerScheduled,
-    /// Timer fired, handler about to be called.
-    #[serde(rename = "prosody.timer.dispatched")]
-    TimerDispatched,
-    /// Timer handler returned Ok.
-    #[serde(rename = "prosody.timer.succeeded")]
-    TimerSucceeded,
-    /// Timer handler returned Err.
-    #[serde(rename = "prosody.timer.failed")]
-    TimerFailed,
-    /// Message dispatched to handler.
-    #[serde(rename = "prosody.message.dispatched")]
-    MessageDispatched,
-    /// Message handler returned Ok.
-    #[serde(rename = "prosody.message.succeeded")]
-    MessageSucceeded,
-    /// Message handler returned Err.
-    #[serde(rename = "prosody.message.failed")]
-    MessageFailed,
-    /// Message produced successfully.
-    #[serde(rename = "prosody.message.sent")]
-    MessageSent,
-}
-
 /// Timer lifecycle event for external telemetry emission.
 #[derive(Clone, Debug)]
 pub struct TimerTelemetryEvent {

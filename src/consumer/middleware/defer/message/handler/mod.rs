@@ -29,6 +29,8 @@ use crate::consumer::middleware::{
 };
 use crate::consumer::{ConsumerConfiguration, DemandType, Keyed};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::telemetry::Telemetry;
+use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
@@ -61,6 +63,7 @@ where
     provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
+    telemetry: Telemetry,
 }
 
 impl<P> MessageDeferMiddleware<P, KafkaLoader, FailureTracker>
@@ -79,6 +82,7 @@ where
         provider: P,
         decider: FailureTracker,
         heartbeats: &HeartbeatRegistry,
+        telemetry: &Telemetry,
     ) -> Result<Self, DeferInitError> {
         use super::loader::LoaderConfiguration;
         use validator::Validate;
@@ -106,6 +110,7 @@ where
             provider,
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
+            telemetry: telemetry.clone(),
         })
     }
 }
@@ -124,6 +129,7 @@ where
     store_provider: P,
     decider: D,
     consumer_group: ConsumerGroup,
+    telemetry: Telemetry,
 }
 
 /// Per-partition handler wrapping an inner handler with defer logic.
@@ -141,6 +147,8 @@ where
     pub(crate) config: DeferConfiguration,
     pub(crate) topic: Topic,
     pub(crate) partition: Partition,
+    pub(crate) sender: TelemetryPartitionSender,
+    pub(crate) source: Arc<str>,
 }
 
 impl<P, L, D> HandlerMiddleware for MessageDeferMiddleware<P, L, D>
@@ -162,6 +170,7 @@ where
             store_provider: self.provider.clone(),
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
+            telemetry: self.telemetry.clone(),
         }
     }
 }
@@ -187,6 +196,8 @@ where
         // Inner handler
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
 
+        let sender = self.telemetry.partition_sender(topic, partition);
+
         // Message defer wraps inner handler
         MessageDeferHandler {
             handler: inner_handler,
@@ -196,6 +207,8 @@ where
             config: self.config.clone(),
             topic,
             partition,
+            sender,
+            source: self.consumer_group.clone(),
         }
     }
 }
@@ -325,7 +338,10 @@ where
     where
         C: EventContext,
     {
-        match error.classify_error() {
+        let error_category = error.classify_error();
+        let exception = format!("{error:?}").into_boxed_str();
+
+        match error_category {
             ErrorCategory::Transient => {
                 // Always re-defer: message is committed to queue, dropping would
                 // violate ordering for messages queued behind it.
@@ -336,6 +352,15 @@ where
                     .map_err(DeferError::Store)?;
 
                 self.schedule_retry_timer(context, new_retry_count).await?;
+
+                self.sender.message_failed(
+                    message_key.clone(),
+                    offset,
+                    DemandType::Failure,
+                    self.source.clone(),
+                    error_category,
+                    exception,
+                );
 
                 info!(
                     key = ?message_key,
@@ -361,9 +386,29 @@ where
                 self.complete_and_advance(context, message_key, offset)
                     .await?;
 
+                self.sender.message_failed(
+                    message_key.clone(),
+                    offset,
+                    DemandType::Failure,
+                    self.source.clone(),
+                    error_category,
+                    exception,
+                );
+
                 Err(DeferError::Handler(error))
             }
-            ErrorCategory::Terminal => Err(DeferError::Handler(error)),
+            ErrorCategory::Terminal => {
+                self.sender.message_failed(
+                    message_key.clone(),
+                    offset,
+                    DemandType::Failure,
+                    self.source.clone(),
+                    error_category,
+                    exception,
+                );
+
+                Err(DeferError::Handler(error))
+            }
         }
     }
 
@@ -631,12 +676,26 @@ where
         );
 
         // Retry handler; on failure, handle_retry_failure maintains invariants.
+        self.sender.message_dispatched(
+            message_key.clone(),
+            offset,
+            DemandType::Failure,
+            self.source.clone(),
+        );
+
         match self
             .handler
             .on_message(context.clone(), message, DemandType::Failure)
             .await
         {
             Ok(()) => {
+                self.sender.message_succeeded(
+                    message_key.clone(),
+                    offset,
+                    DemandType::Failure,
+                    self.source.clone(),
+                );
+
                 self.complete_and_advance(&context, message_key, offset)
                     .await?;
 
