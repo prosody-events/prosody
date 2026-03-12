@@ -107,6 +107,7 @@
 //!         monopolization: Default::default(),
 //!         defer: DeferConfigurationBuilder::default(),
 //!         timeout: TimeoutConfigurationBuilder::default(),
+//!         emitter: Default::default(),
 //!     };
 //!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
