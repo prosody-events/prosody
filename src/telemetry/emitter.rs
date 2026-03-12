@@ -345,6 +345,7 @@ pub fn spawn_telemetry_emitter(
         .create()?;
 
     let rx = telemetry.subscribe();
+    let telemetry_topic: Arc<str> = config.topic.as_str().into();
 
     tokio::spawn(async move {
         BroadcastStream::new(rx)
@@ -357,17 +358,17 @@ pub fn spawn_telemetry_emitter(
                             event.topic.as_ref(),
                             event.partition,
                             &hostname,
-                        )
-                        .map(|bytes| (event.topic, bytes)),
+                        ),
                         Err(_lagged) => None,
                     }
                 }
             })
-            .map(|(event_topic, bytes)| {
+            .map(|bytes| {
                 let producer = producer.clone();
+                let topic = telemetry_topic.clone();
                 async move {
                     let record =
-                        FutureRecord::<str, [u8]>::to(event_topic.as_ref()).payload(bytes.as_ref());
+                        FutureRecord::<str, [u8]>::to(&topic).payload(bytes.as_ref());
                     if let Err((e, _)) = producer.send(record, Timeout::Never).await {
                         warn!("telemetry produce error: {e}");
                     }
@@ -393,4 +394,47 @@ pub enum EmitterError {
     /// Failed to create the Kafka producer.
     #[error("failed to create Kafka producer: {0}")]
     Kafka(#[from] KafkaError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::Telemetry;
+    use color_eyre::eyre::{Result, ensure};
+
+    #[test]
+    fn config_default_values() {
+        let config = TelemetryEmitterConfiguration::default();
+        assert_eq!(config.topic, "prosody.telemetry-events");
+        assert!(config.enabled, "default should be enabled");
+    }
+
+    #[test]
+    fn config_builder_topic_override() -> Result<()> {
+        let config = TelemetryEmitterConfiguration::builder()
+            .topic("custom")
+            .build()?;
+        assert_eq!(config.topic, "custom");
+        Ok(())
+    }
+
+    #[test]
+    fn config_builder_enabled_false() -> Result<()> {
+        let config = TelemetryEmitterConfiguration::builder()
+            .enabled(false)
+            .build()?;
+        ensure!(!config.enabled, "should be disabled");
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_emitter_disabled_returns_ok() -> Result<()> {
+        let config = TelemetryEmitterConfiguration {
+            topic: "test".to_owned(),
+            enabled: false,
+        };
+        let telemetry = Telemetry::new();
+        spawn_telemetry_emitter(&config, &[], &telemetry)?;
+        Ok(())
+    }
 }
