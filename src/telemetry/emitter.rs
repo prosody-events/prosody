@@ -367,8 +367,7 @@ pub fn spawn_telemetry_emitter(
                 let producer = producer.clone();
                 let topic = telemetry_topic.clone();
                 async move {
-                    let record =
-                        FutureRecord::<str, [u8]>::to(&topic).payload(bytes.as_ref());
+                    let record = FutureRecord::<str, [u8]>::to(&topic).payload(bytes.as_ref());
                     if let Err((e, _)) = producer.send(record, Timeout::Never).await {
                         warn!("telemetry produce error: {e}");
                     }

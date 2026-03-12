@@ -304,7 +304,6 @@ mod tests {
         TimerTelemetryEvent,
     };
     use crate::timers::TimerType;
-    use tokio::sync::broadcast;
     use crate::timers::datetime::CompactDateTime;
     use std::error::Error;
     use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -312,6 +311,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Semaphore;
+    use tokio::sync::broadcast;
     use tokio::time::sleep as tokio_sleep;
     use tracing::Span;
 
@@ -626,10 +626,7 @@ mod tests {
 
     // === Data::Message Event Tests ===
 
-    fn create_test_message_with_fields(
-        key: &str,
-        offset: i64,
-    ) -> Option<ConsumerMessage> {
+    fn create_test_message_with_fields(key: &str, offset: i64) -> Option<ConsumerMessage> {
         let semaphore = Arc::new(Semaphore::new(10));
         let permit = semaphore.try_acquire_owned().ok()?;
         Some(ConsumerMessage::new(
@@ -643,9 +640,7 @@ mod tests {
         ))
     }
 
-    fn collect_events(
-        rx: &mut broadcast::Receiver<TelemetryEvent>,
-    ) -> Vec<TelemetryEvent> {
+    fn collect_events(rx: &mut broadcast::Receiver<TelemetryEvent>) -> Vec<TelemetryEvent> {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -675,17 +670,21 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let dispatched = events.iter().find_map(|e| match &e.data {
-            Data::Message(m @ MessageTelemetryEvent {
-                event_type: MessageEventType::Dispatched { .. },
-                ..
-            }) => Some(m),
+            Data::Message(
+                m @ MessageTelemetryEvent {
+                    event_type: MessageEventType::Dispatched { .. },
+                    ..
+                },
+            ) => Some(m),
             _ => None,
         });
         let succeeded = events.iter().find_map(|e| match &e.data {
-            Data::Message(m @ MessageTelemetryEvent {
-                event_type: MessageEventType::Succeeded { .. },
-                ..
-            }) => Some(m),
+            Data::Message(
+                m @ MessageTelemetryEvent {
+                    event_type: MessageEventType::Succeeded { .. },
+                    ..
+                },
+            ) => Some(m),
             _ => None,
         });
 
@@ -728,10 +727,12 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let failed = events.iter().find_map(|e| match &e.data {
-            Data::Message(m @ MessageTelemetryEvent {
-                event_type: MessageEventType::Failed { .. },
-                ..
-            }) => Some(m),
+            Data::Message(
+                m @ MessageTelemetryEvent {
+                    event_type: MessageEventType::Failed { .. },
+                    ..
+                },
+            ) => Some(m),
             _ => None,
         });
 
@@ -750,13 +751,8 @@ mod tests {
             "Failed should have Permanent error_category"
         );
         // exception should be non-empty
-        if let Some(MessageEventType::Failed { exception, .. }) =
-            f.map(|m| &m.event_type)
-        {
-            assert!(
-                !exception.is_empty(),
-                "exception should be non-empty"
-            );
+        if let Some(MessageEventType::Failed { exception, .. }) = f.map(|m| &m.event_type) {
+            assert!(!exception.is_empty(), "exception should be non-empty");
         }
     }
 
@@ -782,10 +778,12 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let failed = events.iter().find_map(|e| match &e.data {
-            Data::Message(m @ MessageTelemetryEvent {
-                event_type: MessageEventType::Failed { .. },
-                ..
-            }) => Some(m),
+            Data::Message(
+                m @ MessageTelemetryEvent {
+                    event_type: MessageEventType::Failed { .. },
+                    ..
+                },
+            ) => Some(m),
             _ => None,
         });
 
@@ -803,16 +801,8 @@ mod tests {
 
     // === Data::Timer Event Tests ===
 
-    fn create_test_trigger_with_fields(
-        key: &str,
-        time: u32,
-        timer_type: TimerType,
-    ) -> Trigger {
-        Trigger::for_testing(
-            Arc::from(key),
-            CompactDateTime::from(time),
-            timer_type,
-        )
+    fn create_test_trigger_with_fields(key: &str, time: u32, timer_type: TimerType) -> Trigger {
+        Trigger::for_testing(Arc::from(key), CompactDateTime::from(time), timer_type)
     }
 
     #[tokio::test]
@@ -826,8 +816,7 @@ mod tests {
             source: Arc::from("test-group"),
         };
         let context = MockEventContext::new();
-        let trigger =
-            create_test_trigger_with_fields("timer-key", 5000, TimerType::Application);
+        let trigger = create_test_trigger_with_fields("timer-key", 5000, TimerType::Application);
 
         let _ = telemetry_handler
             .on_timer(context, trigger, DemandType::Normal)
@@ -836,17 +825,21 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let dispatched = events.iter().find_map(|e| match &e.data {
-            Data::Timer(t @ TimerTelemetryEvent {
-                event_type: TimerEventType::Dispatched { .. },
-                ..
-            }) => Some(t),
+            Data::Timer(
+                t @ TimerTelemetryEvent {
+                    event_type: TimerEventType::Dispatched { .. },
+                    ..
+                },
+            ) => Some(t),
             _ => None,
         });
         let succeeded = events.iter().find_map(|e| match &e.data {
-            Data::Timer(t @ TimerTelemetryEvent {
-                event_type: TimerEventType::Succeeded { .. },
-                ..
-            }) => Some(t),
+            Data::Timer(
+                t @ TimerTelemetryEvent {
+                    event_type: TimerEventType::Succeeded { .. },
+                    ..
+                },
+            ) => Some(t),
             _ => None,
         });
 
@@ -883,10 +876,12 @@ mod tests {
         let events = collect_events(&mut rx);
 
         let failed = events.iter().find_map(|e| match &e.data {
-            Data::Timer(t @ TimerTelemetryEvent {
-                event_type: TimerEventType::Failed { .. },
-                ..
-            }) => Some(t),
+            Data::Timer(
+                t @ TimerTelemetryEvent {
+                    event_type: TimerEventType::Failed { .. },
+                    ..
+                },
+            ) => Some(t),
             _ => None,
         });
 
@@ -904,9 +899,7 @@ mod tests {
             ),
             "Failed should have correct demand_type and error_category"
         );
-        if let Some(TimerEventType::Failed { exception, .. }) =
-            f.map(|t| &t.event_type)
-        {
+        if let Some(TimerEventType::Failed { exception, .. }) = f.map(|t| &t.event_type) {
             assert!(!exception.is_empty(), "exception should be non-empty");
         }
     }
@@ -933,7 +926,8 @@ mod tests {
         let events = collect_events(&mut rx);
 
         // Should have 4 total events:
-        // Key(HandlerInvoked), Message(Dispatched), Key(HandlerSucceeded), Message(Succeeded)
+        // Key(HandlerInvoked), Message(Dispatched), Key(HandlerSucceeded),
+        // Message(Succeeded)
         assert_eq!(events.len(), 4, "Should emit exactly 4 events");
 
         let key_events: Vec<_> = events

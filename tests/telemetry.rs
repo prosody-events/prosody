@@ -4,6 +4,7 @@
 //! are serialized to JSON and produced to a dedicated Kafka telemetry topic.
 
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
@@ -23,7 +24,6 @@ use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::timers::Trigger;
 use prosody::tracing::init_test_logging;
-use prosody::Topic;
 use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -163,7 +163,8 @@ async fn assert_no_telemetry_events(consumer: &StreamConsumer, wait: Duration) -
     Ok(())
 }
 
-/// Build a `HighLevelClient` for best-effort mode with a custom telemetry topic.
+/// Build a `HighLevelClient` for best-effort mode with a custom telemetry
+/// topic.
 fn build_client(
     source_topic: &str,
     telemetry_topic: &str,
@@ -281,9 +282,7 @@ async fn producer_message_sent_on_kafka() -> Result<()> {
         let client = build_client(&dest_topic, &telemetry_topic, true)?;
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
-        client
-            .send(dest, "sent-key", &json!({"v": 1_i32}))
-            .await?;
+        client.send(dest, "sent-key", &json!({"v": 1_i32})).await?;
 
         let sent = consume_telemetry_event_by_type(
             &telemetry_consumer,
@@ -296,10 +295,7 @@ async fn producer_message_sent_on_kafka() -> Result<()> {
             sent.get("type").and_then(Value::as_str),
             Some("prosody.message.sent")
         );
-        assert_eq!(
-            sent.get("key").and_then(Value::as_str),
-            Some("sent-key")
-        );
+        assert_eq!(sent.get("key").and_then(Value::as_str), Some("sent-key"));
         assert!(
             sent.get("offset").and_then(Value::as_i64).is_some(),
             "sent event should have offset"
