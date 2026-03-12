@@ -27,6 +27,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::warn;
 use validator::Validate;
 use whoami::hostname;
@@ -371,9 +372,7 @@ pub fn spawn_telemetry_emitter(
                             event.partition,
                             &hostname,
                         ),
-                        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(
-                            n,
-                        )) => {
+                        Err(BroadcastStreamRecvError::Lagged(n)) => {
                             warn!("telemetry emitter lagged, dropped {n} events");
                             None
                         }
