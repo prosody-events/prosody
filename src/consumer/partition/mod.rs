@@ -20,9 +20,10 @@ use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::timers::TimerManager;
+use crate::telemetry::sender::TelemetrySender;
+use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig};
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::TriggerStore;
+use crate::timers::store::{SegmentId, TriggerStore};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use ahash::RandomState;
 use aho_corasick::{AhoCorasick, Anchored, Input};
@@ -118,6 +119,9 @@ pub struct PartitionConfiguration<T> {
 
     /// Global semaphore bounding in-flight timer events across all partitions
     pub timer_semaphore: Arc<Semaphore>,
+
+    /// Telemetry sender for creating partition-scoped telemetry senders
+    pub telemetry_sender: TelemetrySender,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -324,6 +328,57 @@ impl PartitionManager {
     }
 }
 
+/// Initializes a timer manager for the partition, retrying on failure until
+/// the shutdown signal is received.
+///
+/// Returns `None` if shutdown is signaled before initialization succeeds.
+async fn init_timer_manager<S>(
+    config: &PartitionConfiguration<S>,
+    partition_info: &PartitionInfo,
+    segment_id: SegmentId,
+    name: &str,
+    heartbeats: &HeartbeatRegistry,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Option<(
+    impl Stream<Item = PendingTimer<S>> + use<S>,
+    TimerManager<S>,
+)>
+where
+    S: TriggerStore,
+{
+    loop {
+        if *shutdown_rx.borrow() {
+            return None;
+        }
+
+        let timer_config = TimerManagerConfig {
+            segment_id,
+            slab_size: config.timer_slab_size,
+            name: name.to_owned(),
+            store: config.trigger_store.clone(),
+            telemetry: config
+                .telemetry_sender
+                .for_partition(partition_info.topic, partition_info.partition),
+            source: config.group_id.clone(),
+        };
+
+        match TimerManager::new(
+            timer_config,
+            heartbeats.clone(),
+            shutdown_rx.clone(),
+            config.timer_semaphore.clone(),
+        )
+        .await
+        {
+            Ok(result) => return Some(result),
+            Err(error) => {
+                error!("failed to initialize timer manager: {error:#}; retrying");
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 /// Processes messages for a partition.
 ///
 /// This function implements the main message processing pipeline:
@@ -378,28 +433,17 @@ async fn handle_messages<T, S>(
     );
     let segment_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
 
-    let (timer_stream, timer_manager) = loop {
-        if *shutdown_rx.borrow() {
-            return;
-        }
-
-        match TimerManager::new(
-            segment_id,
-            config.timer_slab_size,
-            &name,
-            config.trigger_store.clone(),
-            heartbeats.clone(),
-            shutdown_rx.clone(),
-            config.timer_semaphore.clone(),
-        )
-        .await
-        {
-            Ok(result) => break result,
-            Err(error) => {
-                error!("failed to initialize timer manager: {error:#}; retrying");
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
+    let Some((timer_stream, timer_manager)) = init_timer_manager(
+        &config,
+        &partition_info,
+        segment_id,
+        &name,
+        &heartbeats,
+        &shutdown_rx,
+    )
+    .await
+    else {
+        return;
     };
 
     let timer_events = stream! {

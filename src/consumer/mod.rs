@@ -124,6 +124,7 @@
 
 use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
+use serde::Serialize;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
@@ -230,7 +231,8 @@ const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 /// Demand types allow the system to distinguish between normal processing
 /// and failure handling scenarios, enabling different processing behaviors
 /// for the same event type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DemandType {
     /// Normal demand represents the initial processing attempt of an event.
     Normal,
@@ -693,10 +695,11 @@ fn build_common_middleware(
     config: &CommonMiddlewareConfiguration,
     stall_threshold: Duration,
     telemetry: &Telemetry,
+    source: Arc<str>,
 ) -> Result<impl HandlerMiddleware, ConsumerError> {
     let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, telemetry)?;
     let timeout_middleware = TimeoutMiddleware::new(&config.timeout, stall_threshold)?;
-    let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
+    let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone(), source);
 
     // Layer common middleware: telemetry -> timeout -> scheduler -> shutdown
     Ok(telemetry_middleware
@@ -913,8 +916,12 @@ impl ProsodyConsumer {
             &heartbeats,
         );
 
-        let common_middleware =
-            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
+        let common_middleware = build_common_middleware(
+            common_config,
+            consumer_config.stall_threshold,
+            &telemetry,
+            Arc::from(consumer_config.group_id.as_str()),
+        )?;
 
         // Build middleware stack with concrete provider types (determined by StorePair
         // variant)
@@ -1036,8 +1043,12 @@ impl ProsodyConsumer {
         let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
-        let common_middleware =
-            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
+        let common_middleware = build_common_middleware(
+            common_config,
+            consumer_config.stall_threshold,
+            &telemetry,
+            Arc::from(consumer_config.group_id.as_str()),
+        )?;
 
         let provider = common_middleware
             .layer(retry_middleware.clone()) // retry the task a fixed number of times
@@ -1080,8 +1091,12 @@ impl ProsodyConsumer {
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         let telemetry = Telemetry::new();
-        let common_middleware =
-            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
+        let common_middleware = build_common_middleware(
+            common_config,
+            consumer_config.stall_threshold,
+            &telemetry,
+            Arc::from(consumer_config.group_id.as_str()),
+        )?;
 
         // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then log
         let provider = common_middleware

@@ -415,10 +415,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Topic;
     use crate::consumer::Uncommitted;
     use crate::heartbeat::HeartbeatRegistry;
+    use crate::telemetry::Telemetry;
     use crate::timers::duration::CompactDuration;
-    use crate::timers::manager::TimerManager;
+    use crate::timers::manager::{TimerManager, TimerManagerConfig};
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use color_eyre::eyre::{Result, eyre};
@@ -443,14 +445,20 @@ mod tests {
     )> {
         let store = memory_store();
         let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(300);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let telemetry = Telemetry::new();
+
+        let config = TimerManagerConfig {
+            segment_id,
+            slab_size: CompactDuration::new(300),
+            name: "test-manager".to_owned(),
+            store,
+            telemetry: telemetry.partition_sender(Topic::from("test"), 0),
+            source: Arc::from(""),
+        };
 
         let (stream, manager) = TimerManager::new(
-            segment_id,
-            slab_size,
-            "test-manager",
-            store,
+            config,
             HeartbeatRegistry::test(),
             shutdown_rx,
             Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),

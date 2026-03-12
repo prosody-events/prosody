@@ -10,6 +10,8 @@ use tokio::sync::broadcast;
 
 /// Telemetry event definitions.
 pub mod event;
+/// Trace context extractor for telemetry events.
+pub(crate) mod injector;
 /// Partition-scoped telemetry sender.
 pub mod partition;
 /// Global telemetry sender.

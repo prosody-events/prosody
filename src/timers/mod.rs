@@ -56,6 +56,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::ParseError;
 use arc_swap::ArcSwap;
 use educe::Educe;
+use serde::Serialize;
 use std::sync::Arc;
 use tracing::Span;
 
@@ -76,7 +77,8 @@ pub mod uncommitted;
 ///
 /// Timers can have different types that determine their purpose and routing.
 /// This is an internal classification not exposed to applications.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
 #[repr(i8)]
 pub enum TimerType {
     /// User-scheduled application timers (default).
@@ -199,5 +201,5 @@ const LOAD_CONCURRENCY: usize = 16;
 pub const DELETE_CONCURRENCY: usize = 16;
 
 // Re-export primary APIs for convenient access to timer functionality
-pub use manager::TimerManager;
+pub use manager::{TimerManager, TimerManagerConfig};
 pub use uncommitted::{FiringTimer, PendingTimer, UncommittedTimer};

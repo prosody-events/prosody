@@ -53,7 +53,7 @@
 //! # let handler = MyHandler;
 //!
 //! let provider = SchedulerMiddleware::new(&config, &telemetry).unwrap()
-//!     .layer(TelemetryMiddleware::new(telemetry)) // Monitor entire pipeline
+//!     .layer(TelemetryMiddleware::new(telemetry, std::sync::Arc::from("my-group"))) // Monitor entire pipeline
 //!     .layer(CancellationMiddleware)
 //!     .layer(RetryMiddleware::new(retry_config).unwrap())
 //!     .into_provider(handler);
@@ -66,14 +66,18 @@ use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
+use crate::error::ClassifyError;
+use crate::telemetry::event::TimerEventType;
 use crate::telemetry::{Telemetry, partition::TelemetryPartitionSender};
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
+use std::sync::Arc;
 
 /// Middleware that records telemetry events during message processing.
 #[derive(Clone, Debug)]
 pub struct TelemetryMiddleware {
     telemetry: Telemetry,
+    source: Arc<str>,
 }
 
 /// A provider that records telemetry events during message processing.
@@ -81,6 +85,7 @@ pub struct TelemetryMiddleware {
 pub struct TelemetryProvider<T> {
     provider: T,
     telemetry: Telemetry,
+    source: Arc<str>,
 }
 
 /// A handler that records telemetry events during message processing.
@@ -91,6 +96,7 @@ pub struct TelemetryProvider<T> {
 pub struct TelemetryHandler<T> {
     handler: T,
     sender: TelemetryPartitionSender,
+    source: Arc<str>,
 }
 
 impl TelemetryMiddleware {
@@ -99,9 +105,10 @@ impl TelemetryMiddleware {
     /// # Arguments
     ///
     /// * `telemetry` - The telemetry system for creating partition senders
+    /// * `source` - The consumer `group_id` used as source identifier in events
     #[must_use]
-    pub fn new(telemetry: Telemetry) -> Self {
-        Self { telemetry }
+    pub fn new(telemetry: Telemetry, source: Arc<str>) -> Self {
+        Self { telemetry, source }
     }
 }
 
@@ -115,6 +122,7 @@ impl HandlerMiddleware for TelemetryMiddleware {
         TelemetryProvider {
             provider,
             telemetry: self.telemetry.clone(),
+            source: self.source.clone(),
         }
     }
 }
@@ -130,6 +138,7 @@ where
         TelemetryHandler {
             handler: self.provider.handler_for_partition(topic, partition),
             sender: partition_sender,
+            source: self.source.clone(),
         }
     }
 }
@@ -165,17 +174,44 @@ where
         C: EventContext,
     {
         let key = message.key().clone();
+        let offset = message.offset();
 
         // Record handler invocation
         self.sender.handler_invoked(key.clone(), demand_type);
+
+        // Emit message dispatched
+        self.sender.message_dispatched(
+            key.clone(),
+            offset,
+            demand_type,
+            self.source.clone(),
+        );
 
         // Process the message with the wrapped handler
         let result = self.handler.on_message(context, message, demand_type).await;
 
         // Record success or failure
         match &result {
-            Ok(()) => self.sender.handler_succeeded(key, demand_type),
-            Err(_) => self.sender.handler_failed(key, demand_type),
+            Ok(()) => {
+                self.sender.handler_succeeded(key.clone(), demand_type);
+                self.sender.message_succeeded(
+                    key,
+                    offset,
+                    demand_type,
+                    self.source.clone(),
+                );
+            }
+            Err(e) => {
+                self.sender.handler_failed(key.clone(), demand_type);
+                self.sender.message_failed(
+                    key,
+                    offset,
+                    demand_type,
+                    self.source.clone(),
+                    e.classify_error(),
+                    format!("{e:?}").into_boxed_str(),
+                );
+            }
         }
 
         result
@@ -206,17 +242,50 @@ where
         C: EventContext,
     {
         let key = trigger.key.clone();
+        let scheduled_time = trigger.time;
+        let timer_type = trigger.timer_type;
 
         // Record handler invocation
         self.sender.handler_invoked(key.clone(), demand_type);
+
+        // Emit timer dispatched
+        self.sender.timer_dispatched(
+            key.clone(),
+            scheduled_time,
+            timer_type,
+            demand_type,
+            self.source.clone(),
+        );
 
         // Process the timer with the wrapped handler
         let result = self.handler.on_timer(context, trigger, demand_type).await;
 
         // Record success or failure
         match &result {
-            Ok(()) => self.sender.handler_succeeded(key, demand_type),
-            Err(_) => self.sender.handler_failed(key, demand_type),
+            Ok(()) => {
+                self.sender.handler_succeeded(key.clone(), demand_type);
+                self.sender.timer_succeeded(
+                    key,
+                    scheduled_time,
+                    timer_type,
+                    demand_type,
+                    self.source.clone(),
+                );
+            }
+            Err(e) => {
+                self.sender.handler_failed(key.clone(), demand_type);
+                self.sender.emit_timer(
+                    TimerEventType::Failed {
+                        demand_type,
+                        error_category: e.classify_error(),
+                        exception: format!("{e:?}").into_boxed_str(),
+                    },
+                    key,
+                    scheduled_time,
+                    timer_type,
+                    self.source.clone(),
+                );
+            }
         }
 
         result
@@ -354,6 +423,7 @@ mod tests {
         let telemetry_handler = TelemetryHandler {
             handler: handler.clone(),
             sender: telemetry.partition_sender("test-topic".into(), 0),
+            source: Arc::from("test-group"),
         };
         let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
@@ -375,6 +445,7 @@ mod tests {
         let telemetry_handler = TelemetryHandler {
             handler: handler.clone(),
             sender: telemetry.partition_sender("test-topic".into(), 0),
+            source: Arc::from("test-group"),
         };
         let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
@@ -396,6 +467,7 @@ mod tests {
         let telemetry_handler = TelemetryHandler {
             handler: handler.clone(),
             sender: telemetry.partition_sender("test-topic".into(), 0),
+            source: Arc::from("test-group"),
         };
         let context = MockEventContext::new();
         let trigger = create_test_trigger();
@@ -415,6 +487,7 @@ mod tests {
         let telemetry_handler = TelemetryHandler {
             handler: handler.clone(),
             sender: telemetry.partition_sender("test-topic".into(), 0),
+            source: Arc::from("test-group"),
         };
         let context = MockEventContext::new();
         let trigger = create_test_trigger();
@@ -437,6 +510,7 @@ mod tests {
         let telemetry_handler = TelemetryHandler {
             handler,
             sender: telemetry.partition_sender("test-topic".into(), 0),
+            source: Arc::from("test-group"),
         };
         let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
@@ -476,6 +550,7 @@ mod tests {
         let telemetry_handler = TelemetryHandler {
             handler,
             sender: telemetry.partition_sender("test-topic".into(), 0),
+            source: Arc::from("test-group"),
         };
         let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
@@ -515,6 +590,7 @@ mod tests {
         let telemetry_handler = TelemetryHandler {
             handler,
             sender: telemetry.partition_sender("test-topic".into(), 0),
+            source: Arc::from("test-group"),
         };
         let context = MockEventContext::new();
         let trigger = create_test_trigger();
@@ -546,7 +622,7 @@ mod tests {
     #[test]
     fn middleware_creates_provider() {
         let telemetry = Telemetry::new();
-        let middleware = TelemetryMiddleware::new(telemetry);
+        let middleware = TelemetryMiddleware::new(telemetry, Arc::from("test-group"));
         let inner_provider = FallibleCloneProvider::new(MockHandler::success());
         let _provider = middleware.with_provider(inner_provider);
         // If this compiles, middleware composition works

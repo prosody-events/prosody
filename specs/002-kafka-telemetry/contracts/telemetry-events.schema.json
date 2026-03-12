@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Prosody Telemetry Event",
+  "description": "Structured lifecycle event emitted by Prosody to a Kafka telemetry topic",
+  "oneOf": [
+    { "$ref": "#/$defs/timerScheduled" },
+    { "$ref": "#/$defs/timerDispatched" },
+    { "$ref": "#/$defs/timerSucceeded" },
+    { "$ref": "#/$defs/timerFailed" },
+    { "$ref": "#/$defs/messageDispatched" },
+    { "$ref": "#/$defs/messageSucceeded" },
+    { "$ref": "#/$defs/messageFailed" },
+    { "$ref": "#/$defs/messageSent" }
+  ],
+  "$defs": {
+    "traceFields": {
+      "type": "object",
+      "properties": {
+        "traceParent": { "type": "string", "description": "W3C traceparent header" },
+        "traceState": { "type": "string", "description": "W3C tracestate header" }
+      }
+    },
+    "baseFields": {
+      "type": "object",
+      "required": ["type", "eventTime", "topic", "partition", "key", "source", "hostname"],
+      "properties": {
+        "type": { "type": "string" },
+        "eventTime": { "type": "string", "format": "date-time", "description": "ISO 8601 wall-clock time at emission point" },
+        "topic": { "type": "string", "description": "Kafka topic (consumer source or producer destination)" },
+        "partition": { "type": "integer", "description": "Kafka partition" },
+        "key": { "type": "string", "description": "Message or timer entity key" },
+        "source": { "type": "string", "description": "Consumer group_id or producer source_system" },
+        "hostname": { "type": "string", "description": "Machine hostname, resolved once at startup" }
+      }
+    },
+    "errorFields": {
+      "type": "object",
+      "required": ["errorCategory", "exception"],
+      "properties": {
+        "errorCategory": { "type": "string", "enum": ["transient", "permanent", "terminal"] },
+        "exception": { "type": "string", "description": "Debug-formatted error" }
+      }
+    },
+    "timerFields": {
+      "type": "object",
+      "required": ["scheduledTime", "timerType"],
+      "properties": {
+        "scheduledTime": { "type": "string", "format": "date-time" },
+        "timerType": { "type": "string", "enum": ["application", "deferredMessage", "deferredTimer"] }
+      }
+    },
+    "timerScheduled": {
+      "allOf": [
+        { "$ref": "#/$defs/baseFields" },
+        { "$ref": "#/$defs/traceFields" },
+        { "$ref": "#/$defs/timerFields" },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "prosody.timer.scheduled" }
+          }
+        }
+      ]
+    },
+    "timerDispatched": {
+      "allOf": [
+        { "$ref": "#/$defs/baseFields" },
+        { "$ref": "#/$defs/traceFields" },
+        { "$ref": "#/$defs/timerFields" },
+        {
+          "type": "object",
+          "required": ["demandType"],
+          "properties": {
+            "type": { "const": "prosody.timer.dispatched" },
+            "demandType": { "type": "string", "enum": ["normal", "failure"] }
+          }
+        }
+      ]
+    },
+    "timerSucceeded": {
+      "allOf": [
+        { "$ref": "#/$defs/baseFields" },
+        { "$ref": "#/$defs/traceFields" },
+        { "$ref": "#/$defs/timerFields" },
+        {
+          "type": "object",
+          "required": ["demandType"],
+          "properties": {
+            "type": { "const": "prosody.timer.succeeded" },
+            "demandType": { "type": "string", "enum": ["normal", "failure"] }
+          }
+        }
+      ]
+    },
+    "timerFailed": {
+      "allOf": [
+        { "$ref": "#/$defs/baseFields" },
+        { "$ref": "#/$defs/traceFields" },
+        { "$ref": "#/$defs/timerFields" },
+        { "$ref": "#/$defs/errorFields" },
+        {
+          "type": "object",
+          "required": ["demandType"],
+          "properties": {
+            "type": { "const": "prosody.timer.failed" },
+            "demandType": { "type": "string", "enum": ["normal", "failure"] }
+          }
+        }
+      ]
+    },
+    "messageDispatched": {
+      "allOf": [
+        { "$ref": "#/$defs/baseFields" },
+        { "$ref": "#/$defs/traceFields" },
+        {
+          "type": "object",
+          "required": ["demandType", "offset"],
+          "properties": {
+            "type": { "const": "prosody.message.dispatched" },
+            "demandType": { "type": "string", "enum": ["normal", "failure"] },
+            "offset": { "type": "integer", "description": "Kafka offset of the consumed message" }
+          }
+        }
+      ]
+    },
+    "messageSucceeded": {
+      "allOf": [
+        { "$ref": "#/$defs/baseFields" },
+        { "$ref": "#/$defs/traceFields" },
+        {
+          "type": "object",
+          "required": ["demandType", "offset"],
+          "properties": {
+            "type": { "const": "prosody.message.succeeded" },
+            "demandType": { "type": "string", "enum": ["normal", "failure"] },
+            "offset": { "type": "integer" }
+          }
+        }
+      ]
+    },
+    "messageFailed": {
+      "allOf": [
+        { "$ref": "#/$defs/baseFields" },
+        { "$ref": "#/$defs/traceFields" },
+        { "$ref": "#/$defs/errorFields" },
+        {
+          "type": "object",
+          "required": ["demandType", "offset"],
+          "properties": {
+            "type": { "const": "prosody.message.failed" },
+            "demandType": { "type": "string", "enum": ["normal", "failure"] },
+            "offset": { "type": "integer" }
+          }
+        }
+      ]
+    },
+    "messageSent": {
+      "allOf": [
+        { "$ref": "#/$defs/baseFields" },
+        { "$ref": "#/$defs/traceFields" },
+        {
+          "type": "object",
+          "required": ["offset"],
+          "properties": {
+            "type": { "const": "prosody.message.sent" },
+            "offset": { "type": "integer", "description": "Kafka offset of the produced message" }
+          }
+        }
+      ]
+    }
+  }
+}

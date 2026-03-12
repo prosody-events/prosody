@@ -5,6 +5,7 @@ use super::*;
 use crate::Key;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
+use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::store::adapter::TableAdapter;
 use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
@@ -40,6 +41,7 @@ fn default_config() -> PartitionConfiguration<TableAdapter<InMemoryTriggerStore>
         trigger_store: memory_store(),
         timer_slab_size: CompactDuration::new(30),
         timer_semaphore: Arc::new(Semaphore::new(10)),
+        telemetry_sender: Telemetry::new().sender(),
     }
 }
 

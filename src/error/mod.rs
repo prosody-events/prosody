@@ -13,10 +13,13 @@
 //! - **Transient**: Everything else - errors that could be fixed by retry,
 //!   waiting, configuration changes, or code changes.
 
+use serde::Serialize;
+
 pub mod kafka;
 
 /// Categorizes errors in message processing.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ErrorCategory {
     /// Error is temporary and recovery is possible.
     Transient,

@@ -16,6 +16,7 @@
 
 use crate::Key;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -37,6 +38,31 @@ use tokio::task::coop::cooperative;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
 
+/// Configuration for a [`TimerManager`] instance.
+///
+/// Bundles all stable configuration parameters — segment identity, storage
+/// backend, and telemetry context — so they can be passed as a single value to
+/// [`TimerManager::new`].
+///
+/// # Type Parameters
+///
+/// * `T`: The [`TriggerStore`] backend for persistent timer data.
+#[derive(Clone)]
+pub struct TimerManagerConfig<T> {
+    /// Unique identifier for the timer segment.
+    pub segment_id: SegmentId,
+    /// Duration of each time-based slab.
+    pub slab_size: CompactDuration,
+    /// Human-readable name for the segment.
+    pub name: String,
+    /// Persistent storage backend for timer triggers.
+    pub store: T,
+    /// Partition-scoped telemetry sender for timer lifecycle events.
+    pub telemetry: TelemetryPartitionSender,
+    /// Consumer group ID used as the `source` field in telemetry events.
+    pub source: Arc<str>,
+}
+
 /// Manages timer scheduling, storage, and delivery for a specific segment.
 ///
 /// Partitions timers into time-based slabs, persists them in a
@@ -57,6 +83,10 @@ pub struct TimerManagerInner<T> {
     segment: Segment,
     /// Shared state for loader and scheduler (wrapped in a read–write lock).
     state: SlabLock<State<T>>,
+    /// Partition-scoped telemetry sender for timer lifecycle events.
+    telemetry: TelemetryPartitionSender,
+    /// Consumer group ID used as the `source` field in telemetry events.
+    source: Arc<str>,
 }
 
 impl<T> TimerManager<T>
@@ -72,10 +102,8 @@ where
     ///
     /// # Arguments
     ///
-    /// * `segment_id` - Unique identifier for the timer segment.
-    /// * `slab_size` - Duration of each time-based slab.
-    /// * `name` - Human-readable name for the segment.
-    /// * `store` - Persistent [`TriggerStore`] implementation.
+    /// * `config` - Stable configuration: segment identity, store, and
+    ///   telemetry context.
     /// * `heartbeats` - Registry for monitoring timer loader and scheduler
     ///   liveness.
     /// * `shutdown_rx` - Watch channel signaling partition shutdown; the slab
@@ -96,22 +124,21 @@ where
     /// - The segment metadata cannot be created or retrieved.
     /// - The scheduler fails to initialize.
     pub async fn new(
-        segment_id: SegmentId,
-        slab_size: CompactDuration,
-        name: &str,
-        store: T,
+        config: TimerManagerConfig<T>,
         heartbeats: HeartbeatRegistry,
         shutdown_rx: watch::Receiver<bool>,
         semaphore: Arc<Semaphore>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
-        let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
+        let segment =
+            get_or_create_segment(&config.store, config.segment_id, config.slab_size, &config.name)
+                .await?;
 
         // Initialize the in-memory scheduler.
         let (trigger_rx, scheduler) = TriggerScheduler::new(&heartbeats);
 
         // Share state between loader and API.
-        let state = SlabLock::new(State::new(store, scheduler.clone()));
+        let state = SlabLock::new(State::new(config.store, scheduler.clone()));
 
         // Spawn the background task to preload and clean slab data.
         spawn(slab_loader(
@@ -122,7 +149,12 @@ where
         ));
 
         // Build the manager wrapper.
-        let manager = Self(Arc::new(TimerManagerInner { segment, state }));
+        let manager = Self(Arc::new(TimerManagerInner {
+            segment,
+            state,
+            telemetry: config.telemetry,
+            source: config.source,
+        }));
         let cloned_manager = manager.clone();
 
         // Wrap the scheduler receiver into a PendingTimer stream, acquiring a
@@ -302,6 +334,14 @@ where
                     .add_trigger(&self.0.segment, slab, trigger.clone())
                     .await
                     .map_err(TimerManagerError::Store)?;
+
+                // Emit timer_scheduled telemetry after successful store write.
+                self.0.telemetry.timer_scheduled(
+                    trigger.key.clone(),
+                    trigger.time,
+                    trigger.timer_type,
+                    self.0.source.clone(),
+                );
 
                 // If we own the slab, enqueue in the in-memory scheduler.
                 if state.is_owned(slab_id) {
@@ -569,7 +609,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Topic;
     use crate::consumer::{Keyed, Uncommitted};
+    use crate::telemetry::Telemetry;
     use crate::timers::UncommittedTimer;
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
@@ -614,14 +656,20 @@ mod tests {
     )> {
         let store = memory_store();
         let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(300);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let telemetry = Telemetry::new();
+
+        let config = TimerManagerConfig {
+            segment_id,
+            slab_size: CompactDuration::new(300),
+            name: "test-manager".to_owned(),
+            store,
+            telemetry: telemetry.partition_sender(Topic::from("test"), 0),
+            source: Arc::from(""),
+        };
 
         let (stream, manager) = TimerManager::new(
-            segment_id,
-            slab_size,
-            "test-manager",
-            store,
+            config,
             HeartbeatRegistry::test(),
             shutdown_rx,
             Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
@@ -668,14 +716,19 @@ mod tests {
 
         let store = memory_store();
         let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(300);
+        let telemetry = Telemetry::new();
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let result = TimerManager::new(
+        let config = TimerManagerConfig {
             segment_id,
-            slab_size,
-            "test-creation",
+            slab_size: CompactDuration::new(300),
+            name: "test-creation".to_owned(),
             store,
+            telemetry: telemetry.partition_sender(Topic::from("test"), 0),
+            source: Arc::from(""),
+        };
+        let result = TimerManager::new(
+            config,
             HeartbeatRegistry::test(),
             shutdown_rx,
             Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
@@ -686,7 +739,7 @@ mod tests {
 
         let (_stream, manager) = result?;
         assert_eq!(manager.0.segment.id, segment_id);
-        assert_eq!(manager.0.segment.slab_size, slab_size);
+        assert_eq!(manager.0.segment.slab_size, CompactDuration::new(300));
         assert_eq!(manager.0.segment.name, "test-creation");
         Ok(())
     }
