@@ -13,6 +13,7 @@ use crate::telemetry::event::{
 };
 use crate::timers::TimerType;
 use crate::util::from_env_with_fallback;
+use crate::Key;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
@@ -284,23 +285,34 @@ fn serialize_message_sent(buf: &mut Vec<u8>, data: &MessageSentEvent, hostname: 
     json::to_writer(buf as &mut Vec<u8>, &payload).is_ok()
 }
 
-/// Serializes a `Data` variant into a thread-local buffer and returns owned
-/// bytes.
+/// Serializes a `Data` variant into a thread-local buffer and returns the
+/// record key alongside owned bytes.
 ///
-/// Returns `Some(Bytes)` for `Timer`, `Message`, and `MessageSent` variants;
-/// `None` for internal-only variants (`Partition`, `Key`).
-fn serialize_event(data: &Data, topic: &str, partition: i32, hostname: &str) -> Option<Bytes> {
+/// Returns `Some((key, Bytes))` for `Timer`, `Message`, and `MessageSent`
+/// variants; `None` for internal-only variants (`Partition`, `Key`).
+fn serialize_event(
+    data: &Data,
+    topic: &str,
+    partition: i32,
+    hostname: &str,
+) -> Option<(Key, Bytes)> {
     SERIALIZE_BUF.with_borrow_mut(|buf| {
         buf.clear();
 
-        let wrote = match data {
-            Data::Timer(t) => serialize_timer(buf, t, topic, partition, hostname),
-            Data::Message(m) => serialize_message(buf, m, topic, partition, hostname),
-            Data::MessageSent(s) => serialize_message_sent(buf, s, hostname),
+        let (wrote, key) = match data {
+            Data::Timer(t) => (
+                serialize_timer(buf, t, topic, partition, hostname),
+                t.key.clone(),
+            ),
+            Data::Message(m) => (
+                serialize_message(buf, m, topic, partition, hostname),
+                m.key.clone(),
+            ),
+            Data::MessageSent(s) => (serialize_message_sent(buf, s, hostname), s.key.clone()),
             Data::Partition(_) | Data::Key(_) => return None,
         };
 
-        wrote.then(|| Bytes::copy_from_slice(buf))
+        wrote.then(|| (key, Bytes::copy_from_slice(buf)))
     })
 }
 
@@ -363,11 +375,13 @@ pub fn spawn_telemetry_emitter(
                     }
                 }
             })
-            .map(|bytes| {
+            .map(|(key, bytes)| {
                 let producer = producer.clone();
                 let topic = telemetry_topic.clone();
                 async move {
-                    let record = FutureRecord::<str, [u8]>::to(&topic).payload(bytes.as_ref());
+                    let record = FutureRecord::to(&topic)
+                        .key(key.as_ref())
+                        .payload(bytes.as_ref());
                     if let Err((e, _)) = producer.send(record, Timeout::Never).await {
                         warn!("telemetry produce error: {e}");
                     }
@@ -398,8 +412,105 @@ pub enum EmitterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::DemandType;
     use crate::telemetry::Telemetry;
-    use color_eyre::eyre::{Result, ensure};
+    use crate::telemetry::event::{
+        KeyEvent, KeyState, MessageEventType, MessageSentEvent, MessageTelemetryEvent,
+        PartitionEvent, PartitionState, TimerEventType, TimerTelemetryEvent,
+    };
+    use crate::timers::TimerType;
+    use crate::timers::datetime::CompactDateTime;
+    use chrono::Utc;
+    use color_eyre::eyre::{Result, bail, ensure};
+    use std::sync::Arc;
+
+    fn timer_event(key: &str) -> Data {
+        Data::Timer(TimerTelemetryEvent {
+            event_type: TimerEventType::Scheduled,
+            event_time: Utc::now(),
+            scheduled_time: CompactDateTime::from(1000_u32),
+            timer_type: TimerType::Application,
+            key: Arc::from(key),
+            source: Arc::from("src"),
+            trace_parent: None,
+            trace_state: None,
+        })
+    }
+
+    fn message_event(key: &str) -> Data {
+        Data::Message(MessageTelemetryEvent {
+            event_type: MessageEventType::Dispatched {
+                demand_type: DemandType::Normal,
+            },
+            event_time: Utc::now(),
+            offset: 0,
+            key: Arc::from(key),
+            source: Arc::from("src"),
+            trace_parent: None,
+            trace_state: None,
+        })
+    }
+
+    fn message_sent_event(key: &str) -> Data {
+        Data::MessageSent(MessageSentEvent {
+            event_time: Utc::now(),
+            topic: "t".into(),
+            partition: 0,
+            offset: 0,
+            key: Arc::from(key),
+            source: Arc::from("src"),
+            trace_parent: None,
+            trace_state: None,
+        })
+    }
+
+    #[test]
+    fn serialize_event_timer_uses_payload_key() -> Result<()> {
+        let data = timer_event("my-timer-key");
+        let Some((key, _)) = serialize_event(&data, "topic", 0, "host") else {
+            bail!("timer event should serialize");
+        };
+        ensure!(key.as_ref() == "my-timer-key");
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_event_message_uses_payload_key() -> Result<()> {
+        let data = message_event("my-message-key");
+        let Some((key, _)) = serialize_event(&data, "topic", 0, "host") else {
+            bail!("message event should serialize");
+        };
+        ensure!(key.as_ref() == "my-message-key");
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_event_message_sent_uses_payload_key() -> Result<()> {
+        let data = message_sent_event("my-sent-key");
+        let Some((key, _)) = serialize_event(&data, "topic", 0, "host") else {
+            bail!("message sent event should serialize");
+        };
+        ensure!(key.as_ref() == "my-sent-key");
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_event_partition_returns_none() {
+        let data = Data::Partition(PartitionEvent {
+            state: PartitionState::Assigned,
+        });
+        assert!(serialize_event(&data, "topic", 0, "host").is_none());
+    }
+
+    #[test]
+    fn serialize_event_key_event_returns_none() {
+        let data = Data::Key(KeyEvent {
+            key: Arc::from("k"),
+            demand_type: DemandType::Normal,
+            state: KeyState::HandlerInvoked,
+        });
+        assert!(serialize_event(&data, "topic", 0, "host").is_none());
+    }
 
     #[test]
     fn config_default_values() {
