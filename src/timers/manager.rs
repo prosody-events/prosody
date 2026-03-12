@@ -130,9 +130,13 @@ where
         semaphore: Arc<Semaphore>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
-        let segment =
-            get_or_create_segment(&config.store, config.segment_id, config.slab_size, &config.name)
-                .await?;
+        let segment = get_or_create_segment(
+            &config.store,
+            config.segment_id,
+            config.slab_size,
+            &config.name,
+        )
+        .await?;
 
         // Initialize the in-memory scheduler.
         let (trigger_rx, scheduler) = TriggerScheduler::new(&heartbeats);

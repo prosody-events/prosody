@@ -2,6 +2,7 @@
 
 use crate::consumer::DemandType;
 use crate::error::ErrorCategory;
+use crate::propagator::new_propagator;
 use crate::telemetry::event::{
     Data, KeyEvent, KeyState, MessageEventType, MessageTelemetryEvent, PartitionEvent,
     PartitionState, TelemetryEvent, TimerEventType, TimerTelemetryEvent,
@@ -12,7 +13,6 @@ use crate::timers::datetime::CompactDateTime;
 use crate::{Key, Offset, Partition, Topic};
 use chrono::Utc;
 use educe::Educe;
-use crate::propagator::new_propagator;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use quanta::Clock;
 use std::sync::Arc;
@@ -305,7 +305,13 @@ impl TelemetryPartitionSender {
         timer_type: TimerType,
         source: Arc<str>,
     ) {
-        self.emit_timer(TimerEventType::Scheduled, key, scheduled_time, timer_type, source);
+        self.emit_timer(
+            TimerEventType::Scheduled,
+            key,
+            scheduled_time,
+            timer_type,
+            source,
+        );
     }
 
     /// Emits a timer dispatched event.
@@ -343,5 +349,4 @@ impl TelemetryPartitionSender {
             source,
         );
     }
-
 }

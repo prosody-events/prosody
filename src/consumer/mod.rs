@@ -124,7 +124,6 @@
 
 use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
-use serde::Serialize;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
@@ -177,6 +176,7 @@ use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
+use serde::Serialize;
 use std::env::var;
 use std::fmt::Debug;
 use std::future::Future;
@@ -635,6 +635,32 @@ pub struct CommonMiddlewareConfiguration {
     pub timeout: TimeoutConfiguration,
 }
 
+/// Configuration for middleware specific to pipeline consumers.
+///
+/// Bundles the retry, monopolization, and defer configurations that are
+/// only used by the pipeline processing mode.
+#[derive(Clone, Debug)]
+pub struct PipelineMiddlewareConfiguration {
+    /// Retry configuration for failed messages.
+    pub retry: RetryConfiguration,
+    /// Monopolization detection configuration.
+    pub monopolization: MonopolizationConfiguration,
+    /// Defer middleware configuration.
+    pub defer: DeferConfiguration,
+}
+
+/// Configuration for middleware specific to low-latency consumers.
+///
+/// Bundles the retry and failure-topic configurations that are only
+/// used by the low-latency processing mode.
+#[derive(Clone, Debug)]
+pub struct LowLatencyMiddlewareConfiguration {
+    /// Retry configuration for failed messages.
+    pub retry: RetryConfiguration,
+    /// Failure topic configuration for routing unrecoverable messages.
+    pub failure_topic: FailureTopicConfiguration,
+}
+
 /// High-level Kafka consumer implementation.
 ///
 /// `ProsodyConsumer` is the main entry point for consuming messages from Kafka
@@ -870,10 +896,9 @@ impl ProsodyConsumer {
     ///
     /// * `consumer_config` - The consumer configuration.
     /// * `trigger_store_config` - The trigger store configuration.
-    /// * `retry_config` - The retry configuration.
-    /// * `monopolization_config` - The monopolization detection configuration.
-    /// * `defer_config` - The defer middleware configuration.
+    /// * `pipeline_config` - The pipeline-specific middleware configuration.
     /// * `common_config` - The common middleware configuration.
+    /// * `telemetry` - The shared telemetry instance.
     /// * `handler` - The fallible message handler.
     ///
     /// # Returns
@@ -887,10 +912,9 @@ impl ProsodyConsumer {
     pub async fn pipeline_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
-        retry_config: RetryConfiguration,
-        monopolization_config: MonopolizationConfiguration,
-        defer_config: DeferConfiguration,
+        pipeline_config: PipelineMiddlewareConfiguration,
         common_config: &CommonMiddlewareConfiguration,
+        telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
@@ -899,8 +923,11 @@ impl ProsodyConsumer {
         // Create both stores atomically - ensures trigger and defer stores match
         let slab_size = consumer_config.slab_size.try_into()?;
         let stores = StorePair::new(trigger_store_config, slab_size, consumer_config.mock).await?;
-
-        let telemetry = Telemetry::new();
+        let PipelineMiddlewareConfiguration {
+            retry: retry_config,
+            monopolization: monopolization_config,
+            defer: defer_config,
+        } = pipeline_config;
         let monopolization_middleware =
             MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
         let heartbeats = HeartbeatRegistry::new(
@@ -1013,10 +1040,12 @@ impl ProsodyConsumer {
     ///
     /// * `consumer_config` - The consumer configuration.
     /// * `trigger_store_config` - The trigger store configuration.
-    /// * `retry_config` - The retry configuration.
-    /// * `topic_config` - The failure topic configuration.
+    /// * `low_latency_config` - The low-latency-specific middleware
+    ///   configuration.
+    /// * `common_config` - The common middleware configuration.
     /// * `producer` - The Prosody producer for sending messages to the failure
     ///   topic.
+    /// * `telemetry` - The shared telemetry instance.
     /// * `handler` - The fallible message handler.
     ///
     /// # Returns
@@ -1030,16 +1059,19 @@ impl ProsodyConsumer {
     pub async fn low_latency_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
-        retry_config: RetryConfiguration,
-        topic_config: FailureTopicConfiguration,
+        low_latency_config: LowLatencyMiddlewareConfiguration,
         common_config: &CommonMiddlewareConfiguration,
         producer: ProsodyProducer,
+        telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let telemetry = Telemetry::new();
+        let LowLatencyMiddlewareConfiguration {
+            retry: retry_config,
+            failure_topic: topic_config,
+        } = low_latency_config;
         let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
@@ -1085,12 +1117,12 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         common_config: &CommonMiddlewareConfiguration,
+        telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let telemetry = Telemetry::new();
         let common_middleware = build_common_middleware(
             common_config,
             consumer_config.stall_threshold,

@@ -1,13 +1,18 @@
 //! Global telemetry sender for consumer lifecycle events.
 
 use crate::consumer::DemandType;
+use crate::propagator::new_propagator;
 use crate::telemetry::event::{
-    Data, KeyEvent, KeyState, PartitionEvent, PartitionState, TelemetryEvent,
+    Data, KeyEvent, KeyState, MessageSentEvent, PartitionEvent, PartitionState, TelemetryEvent,
 };
+use crate::telemetry::injector::TelemetryInjector;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::{Key, Partition, Topic};
+use chrono::Utc;
 use educe::Educe;
+use opentelemetry::propagation::TextMapCompositePropagator;
 use quanta::Clock;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Global telemetry sender for emitting lifecycle events.
@@ -22,11 +27,18 @@ pub struct TelemetrySender {
 
     #[educe(Debug(ignore))]
     clock: Clock,
+
+    #[educe(Debug(ignore))]
+    propagator: Arc<TextMapCompositePropagator>,
 }
 
 impl TelemetrySender {
     pub(crate) fn new(tx: broadcast::Sender<TelemetryEvent>, clock: Clock) -> Self {
-        Self { tx, clock }
+        Self {
+            tx,
+            clock,
+            propagator: Arc::new(new_propagator()),
+        }
     }
 
     /// Emits a partition paused event.
@@ -182,6 +194,35 @@ impl TelemetrySender {
                 key,
                 demand_type,
                 state: KeyState::MiddlewareExited,
+            }),
+        });
+    }
+
+    /// Emits a producer message sent event.
+    pub fn message_sent(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: i64,
+        key: Key,
+        source: Arc<str>,
+    ) {
+        let injector = TelemetryInjector::extract(&self.propagator);
+        let (trace_parent, trace_state) = injector.into_parts();
+        let timestamp = self.clock.now();
+        let _ = self.tx.send(TelemetryEvent {
+            timestamp,
+            topic,
+            partition,
+            data: Data::MessageSent(MessageSentEvent {
+                event_time: Utc::now(),
+                topic,
+                partition,
+                offset,
+                key,
+                source,
+                trace_parent,
+                trace_state,
             }),
         });
     }

@@ -180,12 +180,8 @@ where
         self.sender.handler_invoked(key.clone(), demand_type);
 
         // Emit message dispatched
-        self.sender.message_dispatched(
-            key.clone(),
-            offset,
-            demand_type,
-            self.source.clone(),
-        );
+        self.sender
+            .message_dispatched(key.clone(), offset, demand_type, self.source.clone());
 
         // Process the message with the wrapped handler
         let result = self.handler.on_message(context, message, demand_type).await;
@@ -194,12 +190,8 @@ where
         match &result {
             Ok(()) => {
                 self.sender.handler_succeeded(key.clone(), demand_type);
-                self.sender.message_succeeded(
-                    key,
-                    offset,
-                    demand_type,
-                    self.source.clone(),
-                );
+                self.sender
+                    .message_succeeded(key, offset, demand_type, self.source.clone());
             }
             Err(e) => {
                 self.sender.handler_failed(key.clone(), demand_type);

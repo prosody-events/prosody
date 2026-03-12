@@ -19,6 +19,7 @@ use prosody::{
     },
     high_level::{ConsumerBuilders, HighLevelClient, HighLevelClientError, mode::Mode},
     producer::ProducerConfigurationBuilder,
+    telemetry::emitter::TelemetryEmitterConfiguration,
 };
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -119,6 +120,10 @@ fn create_high_level_client(
         monopolization: MonopolizationConfigurationBuilder::default(),
         defer: DeferConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
+        emitter: TelemetryEmitterConfiguration {
+            enabled: false,
+            ..Default::default()
+        },
     };
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);

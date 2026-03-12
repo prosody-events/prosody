@@ -92,13 +92,13 @@
 
 ### Implementation for Scenario 4
 
-- [ ] T026 [S4] Create `src/telemetry/emitter.rs` — add `TelemetryEmitterConfiguration` struct with `#[derive(Builder, Clone, Debug, Validate)]`, fields: `topic: String` (default `prosody.telemetry-events`), `enabled: bool` (default `true`)
-- [ ] T027 [S4] Add serialization payload structs to `src/telemetry/emitter.rs` — `TimerEventPayload<'a>`, `MessageEventPayload<'a>`, `MessageSentPayload<'a>` with `#[derive(Serialize)]` `#[serde(rename_all = "camelCase")]` and borrowed `&'a str` fields per plan Step 8
-- [ ] T028 [S4] Add `serialize_event()` helper function in `src/telemetry/emitter.rs` — matches on `Data::Timer`/`Data::Message`/`Data::MessageSent`, constructs the appropriate payload struct, serializes with `json::to_writer()` into provided buffer, returns `Option<()>` (None for non-telemetry variants); add simd-json/serde_json cfg gate
-- [ ] T029 [S4] Add `spawn_telemetry_emitter()` in `src/telemetry/emitter.rs` — takes `config`, `bootstrap_servers: &[String]`, `telemetry: &Telemetry`; resolves hostname via `whoami::hostname()`; creates `FutureProducer`; subscribes to broadcast; spawns tokio task with `BroadcastStream` → `filter_map` → thread-local serialize → `map` produce → `buffer_unordered(64)` → `for_each` log errors
-- [ ] T030 [S4] Add `EmitterError` error enum to `src/telemetry/emitter.rs` (derive `Debug, Error` via thiserror)
-- [ ] T031 [S4] Add `pub mod emitter;` to `src/telemetry/mod.rs`
-- [ ] T032 [S4] Re-export `TelemetryEmitterConfiguration`, `spawn_telemetry_emitter`, `EmitterError` from `src/telemetry/mod.rs` or `src/lib.rs` as needed
+- [x] T026 [S4] Create `src/telemetry/emitter.rs` — add `TelemetryEmitterConfiguration` struct with `#[derive(Builder, Clone, Debug, Validate)]`, fields: `topic: String` (default `prosody.telemetry-events`), `enabled: bool` (default `true`)
+- [x] T027 [S4] Add serialization payload structs to `src/telemetry/emitter.rs` — `TimerEventPayload<'a>`, `MessageEventPayload<'a>`, `MessageSentPayload<'a>` with `#[derive(Serialize)]` `#[serde(rename_all = "camelCase")]` and borrowed `&'a str` fields per plan Step 8
+- [x] T028 [S4] Add `serialize_event()` helper function in `src/telemetry/emitter.rs` — matches on `Data::Timer`/`Data::Message`/`Data::MessageSent`, constructs the appropriate payload struct, serializes with `json::to_writer()` into provided buffer, returns `Option<()>` (None for non-telemetry variants); add simd-json/serde_json cfg gate
+- [x] T029 [S4] Add `spawn_telemetry_emitter()` in `src/telemetry/emitter.rs` — takes `config`, `bootstrap_servers: &[String]`, `telemetry: &Telemetry`; resolves hostname via `whoami::hostname()`; creates `FutureProducer`; subscribes to broadcast; spawns tokio task with `BroadcastStream` → `filter_map` → thread-local serialize → `map` produce → `buffer_unordered(64)` → `for_each` log errors
+- [x] T030 [S4] Add `EmitterError` error enum to `src/telemetry/emitter.rs` (derive `Debug, Error` via thiserror)
+- [x] T031 [S4] Add `pub mod emitter;` to `src/telemetry/mod.rs`
+- [x] T032 [S4] Re-export `TelemetryEmitterConfiguration`, `spawn_telemetry_emitter`, `EmitterError` from `src/telemetry/mod.rs` or `src/lib.rs` as needed
 
 **Checkpoint**: Telemetry events from broadcast channel are serialized and produced to Kafka concurrently.
 
@@ -112,10 +112,10 @@
 
 ### Implementation for Scenario 3
 
-- [ ] T033 [S3] Add `propagator: TextMapCompositePropagator` field to `TelemetrySender` in `src/telemetry/sender.rs` — construct once in `new()`
-- [ ] T034 [S3] Add `message_sent()` method to `TelemetrySender` in `src/telemetry/sender.rs` — captures `Span::current()`, uses `TelemetryInjector::extract()`, builds `Data::MessageSent(MessageSentEvent { .. })`, sends via broadcast channel
-- [ ] T035 [S3] Add `telemetry: Option<TelemetrySender>` field and `with_telemetry(mut self, sender: TelemetrySender) -> Self` builder method to `ProsodyProducer` in `src/producer/mod.rs`
-- [ ] T036 [S3] Emit `message_sent` in `ProsodyProducer::send()` in `src/producer/mod.rs` — after successful delivery (after span recording), if `self.telemetry.is_some()`, call `sender.message_sent()` with destination topic, partition, offset, key, `Arc::from(self.source_system.as_ref())`
+- [x] T033 [S3] Add `propagator: TextMapCompositePropagator` field to `TelemetrySender` in `src/telemetry/sender.rs` — construct once in `new()`
+- [x] T034 [S3] Add `message_sent()` method to `TelemetrySender` in `src/telemetry/sender.rs` — captures `Span::current()`, uses `TelemetryInjector::extract()`, builds `Data::MessageSent(MessageSentEvent { .. })`, sends via broadcast channel
+- [x] T035 [S3] Add `telemetry: TelemetrySender` field and `with_telemetry(mut self, sender: TelemetrySender) -> Self` builder method to `ProsodyProducer` in `src/producer/mod.rs` — construct a default `Telemetry::new().sender()` in `ProsodyProducer::new()` so telemetry is always present (fire-and-forget if no subscribers)
+- [x] T036 [S3] Emit `message_sent` unconditionally in `ProsodyProducer::send()` in `src/producer/mod.rs` — after successful delivery (after span recording), call `self.telemetry.message_sent()` with destination topic, partition, offset, key, `Arc::from(self.source_system.as_ref())`
 
 **Checkpoint**: Producer telemetry events emitted. End-to-end trace correlation now possible (produce → consume → timer).
 
@@ -129,11 +129,11 @@
 
 ### Implementation for Scenario 5
 
-- [ ] T037 [S5] Add `telemetry: Telemetry` field to `HighLevelClient<T>` in `src/high_level/mod.rs` — create `Telemetry::new()` once in `HighLevelClient::new()`
-- [ ] T038 [S5] Wire telemetry into producer in `HighLevelClient::new()` in `src/high_level/mod.rs` — call `producer.with_telemetry(telemetry.sender())`
-- [ ] T039 [S5] In `subscribe()` in `src/high_level/mod.rs` — pass `telemetry.clone()` to consumer constructors so they use the shared broadcast channel
-- [ ] T040 [S5] Add `TelemetryEmitterConfiguration` to consumer builder or `HighLevelClient` params in `src/high_level/mod.rs` — when enabled, call `spawn_telemetry_emitter()` with consumer's bootstrap_servers
-- [ ] T041 [S5] Expose `pub fn telemetry(&self) -> &Telemetry` on `HighLevelClient` in `src/high_level/mod.rs`
+- [x] T037 [S5] Add `telemetry: Telemetry` field to `HighLevelClient<T>` in `src/high_level/mod.rs` — create `Telemetry::new()` once in `HighLevelClient::new()`
+- [x] T038 [S5] Wire telemetry into producer in `HighLevelClient::new()` in `src/high_level/mod.rs` — pass `telemetry.sender()` directly into producer factory constructors in `HighLevelClient::new()`
+- [x] T039 [S5] In `subscribe()` in `src/high_level/mod.rs` — pass `telemetry.clone()` to consumer constructors so they use the shared broadcast channel
+- [x] T040 [S5] Add `TelemetryEmitterConfiguration` to consumer builder or `HighLevelClient` params in `src/high_level/mod.rs` — when enabled, call `spawn_telemetry_emitter()` with consumer's bootstrap_servers
+- [x] T041 [S5] Expose `pub fn telemetry(&self) -> &Telemetry` on `HighLevelClient` in `src/high_level/mod.rs`
 
 **Checkpoint**: Telemetry fully wired — emitter running, all events flowing from middleware → broadcast → Kafka topic.
 

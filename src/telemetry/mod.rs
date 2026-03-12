@@ -8,6 +8,8 @@ use educe::Educe;
 use quanta::Clock;
 use tokio::sync::broadcast;
 
+/// Background Kafka emitter for telemetry events.
+pub mod emitter;
 /// Telemetry event definitions.
 pub mod event;
 /// Trace context extractor for telemetry events.
@@ -16,6 +18,11 @@ pub(crate) mod injector;
 pub mod partition;
 /// Global telemetry sender.
 pub mod sender;
+
+pub use emitter::{
+    EmitterError, TelemetryEmitterConfiguration, TelemetryEmitterConfigurationBuilder,
+    spawn_telemetry_emitter,
+};
 
 const TELEMETRY_CHANNEL_CAPACITY: usize = 8096;
 

@@ -28,6 +28,7 @@ use validator::Validate;
 
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
+use crate::telemetry::sender::TelemetrySender;
 use crate::util::{
     from_env, from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env,
 };
@@ -166,6 +167,10 @@ pub struct ProsodyProducer {
     /// OpenTelemetry context propagator.
     #[educe(Debug(ignore))]
     propagator: TextMapCompositePropagator,
+
+    /// Telemetry sender for emitting producer events.
+    #[educe(Debug(ignore))]
+    telemetry: TelemetrySender,
 }
 
 impl Clone for ProsodyProducer {
@@ -176,6 +181,7 @@ impl Clone for ProsodyProducer {
             producer: self.producer.clone(),
             idempotence_cache: self.idempotence_cache.clone(),
             propagator: new_propagator(),
+            telemetry: self.telemetry.clone(),
         }
     }
 }
@@ -197,7 +203,10 @@ impl ProsodyProducer {
     /// - The configuration is invalid
     /// - The hostname cannot be retrieved
     /// - The Kafka producer cannot be created
-    pub fn new(config: &ProducerConfiguration) -> Result<Self, ProducerError> {
+    pub fn new(
+        config: &ProducerConfiguration,
+        telemetry: TelemetrySender,
+    ) -> Result<Self, ProducerError> {
         config.validate()?;
 
         let send_timeout = config.send_timeout.map_or(Timeout::Never, Timeout::After);
@@ -227,6 +236,7 @@ impl ProsodyProducer {
             producer: client_config.create()?,
             idempotence_cache,
             propagator: new_propagator(),
+            telemetry,
         })
     }
 
@@ -247,9 +257,12 @@ impl ProsodyProducer {
     /// # Errors
     ///
     /// Returns a `ProducerError` if the producer creation fails.
-    pub fn pipeline_producer(mut config: ProducerConfiguration) -> Result<Self, ProducerError> {
+    pub fn pipeline_producer(
+        mut config: ProducerConfiguration,
+        telemetry: TelemetrySender,
+    ) -> Result<Self, ProducerError> {
         config.send_timeout = None;
-        Self::new(&config)
+        Self::new(&config, telemetry)
     }
 
     /// Creates a new `ProsodyProducer` instance optimized for low latency.
@@ -271,11 +284,12 @@ impl ProsodyProducer {
     /// Returns a `ProducerError` if the producer creation fails.
     pub(crate) fn low_latency_producer(
         mut config: ProducerConfiguration,
+        telemetry: TelemetrySender,
     ) -> Result<Self, ProducerError> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
-        Self::new(&config)
+        Self::new(&config, telemetry)
     }
 
     /// Creates a new `ProsodyProducer` instance optimized for best-effort.
@@ -297,11 +311,12 @@ impl ProsodyProducer {
     /// Returns a `ProducerError` if the producer creation fails.
     pub(crate) fn best_effort_producer(
         mut config: ProducerConfiguration,
+        telemetry: TelemetrySender,
     ) -> Result<Self, ProducerError> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
-        Self::new(&config)
+        Self::new(&config, telemetry)
     }
 
     /// Sends a message to a Kafka topic.
@@ -403,6 +418,15 @@ impl ProsodyProducer {
             .record("partition", delivery.partition)
             .record("offset", delivery.offset)
             .record("timestamp", debug(delivery.timestamp));
+
+        // Emit producer telemetry event
+        self.telemetry.message_sent(
+            topic,
+            delivery.partition,
+            delivery.offset,
+            key.clone(),
+            Arc::from(self.source_system.as_ref()),
+        );
 
         // Update the idempotence cache if needed
         let Some(cache) = &self.idempotence_cache else {
