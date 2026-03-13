@@ -15,7 +15,7 @@ use crate::telemetry::event::{
 use crate::timers::TimerType;
 use crate::util::from_env_with_fallback;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use derive_builder::Builder;
 use futures::StreamExt;
 use rdkafka::ClientConfig;
@@ -177,8 +177,9 @@ fn serialize_timer(
     partition: i32,
     hostname: &str,
 ) -> bool {
-    let event_time_str = data.event_time.to_rfc3339();
-    let scheduled_time_str = DateTime::<Utc>::from(data.scheduled_time).to_rfc3339();
+    let event_time_str = data.event_time.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let scheduled_time_str =
+        DateTime::<Utc>::from(data.scheduled_time).to_rfc3339_opts(SecondsFormat::Millis, true);
 
     let (type_str, demand_type, error_category, exception) = match &data.event_type {
         TimerEventType::Scheduled => ("prosody.timer.scheduled", None, None, None),
@@ -227,7 +228,7 @@ fn serialize_message(
     partition: i32,
     hostname: &str,
 ) -> bool {
-    let event_time_str = data.event_time.to_rfc3339();
+    let event_time_str = data.event_time.to_rfc3339_opts(SecondsFormat::Millis, true);
 
     let (type_str, demand_type, error_category, exception) = match &data.event_type {
         MessageEventType::Dispatched { demand_type } => {
@@ -268,7 +269,7 @@ fn serialize_message(
 }
 
 fn serialize_message_sent(buf: &mut Vec<u8>, data: &MessageSentEvent, hostname: &str) -> bool {
-    let event_time_str = data.event_time.to_rfc3339();
+    let event_time_str = data.event_time.to_rfc3339_opts(SecondsFormat::Millis, true);
 
     let payload = MessageSentPayload {
         event_type: "prosody.message.sent",
@@ -716,6 +717,92 @@ mod tests {
         };
         let telemetry = Telemetry::new();
         spawn_telemetry_emitter(&config, &[], &telemetry)?;
+        Ok(())
+    }
+
+    /// Asserts that a serialized timestamp field has millisecond precision and
+    /// uses the UTC `Z` suffix — i.e., the format `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+    fn assert_event_time_format(raw: &str, field: &str) -> Result<()> {
+        ensure!(
+            raw.ends_with('Z'),
+            "{field} timezone must be Z, got: {raw:?}"
+        );
+        let frac = raw
+            .rfind('.')
+            .map(|i| &raw[i + 1..raw.len() - 1])
+            .ok_or_else(|| eyre!("{field} has no fractional seconds: {raw:?}"))?;
+        ensure!(
+            frac.len() == 3 && frac.chars().all(|c| c.is_ascii_digit()),
+            "{field} must have exactly 3 fractional digits (milliseconds), got: {raw:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn event_time_has_millisecond_precision_and_z_suffix_timer() -> Result<()> {
+        let data = Data::Timer(TimerTelemetryEvent {
+            event_type: TimerEventType::Scheduled,
+            event_time: Utc::now(),
+            scheduled_time: CompactDateTime::from(1_700_000_000_u32),
+            timer_type: TimerType::Application,
+            key: Arc::from("prec-key"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        let event_time = v["eventTime"]
+            .as_str()
+            .ok_or_else(|| eyre!("eventTime missing"))?;
+        let scheduled_time = v["scheduledTime"]
+            .as_str()
+            .ok_or_else(|| eyre!("scheduledTime missing"))?;
+        assert_event_time_format(event_time, "eventTime")?;
+        assert_event_time_format(scheduled_time, "scheduledTime")?;
+        Ok(())
+    }
+
+    #[test]
+    fn event_time_has_millisecond_precision_and_z_suffix_message() -> Result<()> {
+        let data = Data::Message(MessageTelemetryEvent {
+            event_type: MessageEventType::Dispatched {
+                demand_type: DemandType::Normal,
+            },
+            event_time: Utc::now(),
+            offset: 1,
+            key: Arc::from("prec-msg-key"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        let event_time = v["eventTime"]
+            .as_str()
+            .ok_or_else(|| eyre!("eventTime missing"))?;
+        assert_event_time_format(event_time, "eventTime")?;
+        Ok(())
+    }
+
+    #[test]
+    fn event_time_has_millisecond_precision_and_z_suffix_message_sent() -> Result<()> {
+        let data = Data::MessageSent(MessageSentEvent {
+            event_time: Utc::now(),
+            topic: "t".into(),
+            partition: 0,
+            offset: 0,
+            key: Arc::from("prec-sent-key"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        let event_time = v["eventTime"]
+            .as_str()
+            .ok_or_else(|| eyre!("eventTime missing"))?;
+        assert_event_time_format(event_time, "eventTime")?;
         Ok(())
     }
 }
