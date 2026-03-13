@@ -179,7 +179,7 @@ fn serialize_timer(
 ) -> bool {
     let event_time_str = data.event_time.to_rfc3339_opts(SecondsFormat::Millis, true);
     let scheduled_time_str =
-        DateTime::<Utc>::from(data.scheduled_time).to_rfc3339_opts(SecondsFormat::Millis, true);
+        DateTime::<Utc>::from(data.scheduled_time).to_rfc3339_opts(SecondsFormat::Secs, true);
 
     let (type_str, demand_type, error_category, exception) = match &data.event_type {
         TimerEventType::Scheduled => ("prosody.timer.scheduled", None, None, None),
@@ -720,9 +720,9 @@ mod tests {
         Ok(())
     }
 
-    /// Asserts that a serialized timestamp field has millisecond precision and
-    /// uses the UTC `Z` suffix — i.e., the format `YYYY-MM-DDTHH:MM:SS.mmmZ`.
-    fn assert_event_time_format(raw: &str, field: &str) -> Result<()> {
+    /// Asserts that a serialized event time has millisecond precision and the
+    /// UTC `Z` suffix — i.e., `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+    fn assert_millis_format(raw: &str, field: &str) -> Result<()> {
         ensure!(
             raw.ends_with('Z'),
             "{field} timezone must be Z, got: {raw:?}"
@@ -734,6 +734,20 @@ mod tests {
         ensure!(
             frac.len() == 3 && frac.chars().all(|c| c.is_ascii_digit()),
             "{field} must have exactly 3 fractional digits (milliseconds), got: {raw:?}"
+        );
+        Ok(())
+    }
+
+    /// Asserts that a serialized scheduled time has second precision and the
+    /// UTC `Z` suffix — i.e., `YYYY-MM-DDTHH:MM:SSZ` (no fractional part).
+    fn assert_secs_format(raw: &str, field: &str) -> Result<()> {
+        ensure!(
+            raw.ends_with('Z'),
+            "{field} timezone must be Z, got: {raw:?}"
+        );
+        ensure!(
+            raw.rfind('.').is_none(),
+            "{field} must have no fractional seconds (second precision), got: {raw:?}"
         );
         Ok(())
     }
@@ -758,8 +772,8 @@ mod tests {
         let scheduled_time = v["scheduledTime"]
             .as_str()
             .ok_or_else(|| eyre!("scheduledTime missing"))?;
-        assert_event_time_format(event_time, "eventTime")?;
-        assert_event_time_format(scheduled_time, "scheduledTime")?;
+        assert_millis_format(event_time, "eventTime")?;
+        assert_secs_format(scheduled_time, "scheduledTime")?;
         Ok(())
     }
 
@@ -781,7 +795,7 @@ mod tests {
         let event_time = v["eventTime"]
             .as_str()
             .ok_or_else(|| eyre!("eventTime missing"))?;
-        assert_event_time_format(event_time, "eventTime")?;
+        assert_millis_format(event_time, "eventTime")?;
         Ok(())
     }
 
@@ -802,7 +816,7 @@ mod tests {
         let event_time = v["eventTime"]
             .as_str()
             .ok_or_else(|| eyre!("eventTime missing"))?;
-        assert_event_time_format(event_time, "eventTime")?;
+        assert_millis_format(event_time, "eventTime")?;
         Ok(())
     }
 }
