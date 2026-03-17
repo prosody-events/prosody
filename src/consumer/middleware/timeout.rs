@@ -17,7 +17,6 @@ use std::future::Future;
 use std::time::Duration;
 
 use derive_builder::Builder;
-use futures::pin_mut;
 use humantime::format_duration;
 use thiserror::Error;
 use tokio::select;
@@ -88,7 +87,11 @@ impl<T> TimeoutHandler<T> {
         F: Future<Output = Result<R, E>>,
     {
         let start = Instant::now();
-        pin_mut!(operation);
+        // Box::pin moves the downstream future to the heap. Without this,
+        // the entire composed middleware chain (including large futures like
+        // TimerManager::clear_and_schedule) lives on the stack frame,
+        // overflowing tokio's worker thread stack.
+        let mut operation = Box::pin(operation);
 
         select! {
             result = &mut operation => {
