@@ -23,6 +23,7 @@ async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
 axum-extra = { version = "0.12", features = ["routing"] }
+bytes = "1"
 chrono = "0.4"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
@@ -52,7 +53,7 @@ rdkafka = { version = "0.39", features = ["tracing"] }
 rust-embed = { version = "8.11", features = ["include-exclude"] }
 scc = "3.6"
 scylla = { version = "1.5", features = ["chrono-04"] }
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 simd-json = { version = "0.17", features = ["serde_impl"], optional = true }
@@ -60,7 +61,7 @@ smallvec = { version = "1.15", features = ["const_generics", "union"] }
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "parking_lot", "sync"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["time"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.32"

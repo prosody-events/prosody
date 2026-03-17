@@ -20,9 +20,10 @@ use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::timers::TimerManager;
+use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerStoreProvider};
+use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use ahash::RandomState;
 use aho_corasick::{AhoCorasick, Anchored, Input};
@@ -121,6 +122,9 @@ pub struct PartitionConfiguration<P> {
 
     /// Global semaphore bounding in-flight timer events across all partitions
     pub timer_semaphore: Arc<Semaphore>,
+
+    /// Telemetry sender for creating partition-scoped telemetry senders
+    pub telemetry_sender: TelemetrySender,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -327,22 +331,76 @@ impl PartitionManager {
     }
 }
 
+/// Initializes a timer manager for the partition, retrying on failure until
+/// the shutdown signal is received.
+///
+/// Returns `None` if shutdown is signaled before initialization succeeds.
+/// Arguments for [`init_timer_manager`] that don't depend on the store type.
+struct TimerInitContext<'a> {
+    name: &'a str,
+    telemetry_sender: &'a TelemetrySender,
+    group_id: &'a Arc<str>,
+    timer_semaphore: &'a Arc<Semaphore>,
+    partition_info: &'a PartitionInfo,
+    heartbeats: &'a HeartbeatRegistry,
+    shutdown_rx: &'a watch::Receiver<bool>,
+}
+
+async fn init_timer_manager<S>(
+    trigger_store: S,
+    ctx: TimerInitContext<'_>,
+) -> Option<(impl Stream<Item = PendingTimer<S>>, TimerManager<S>)>
+where
+    S: TriggerStore,
+{
+    loop {
+        if *ctx.shutdown_rx.borrow() {
+            return None;
+        }
+
+        let timer_config = TimerManagerConfig {
+            name: ctx.name.to_owned(),
+            store: trigger_store.clone(),
+            telemetry: ctx
+                .telemetry_sender
+                .for_partition(ctx.partition_info.topic, ctx.partition_info.partition),
+            source: ctx.group_id.clone(),
+        };
+
+        match TimerManager::new(
+            timer_config,
+            ctx.heartbeats.clone(),
+            ctx.shutdown_rx.clone(),
+            ctx.timer_semaphore.clone(),
+        )
+        .await
+        {
+            Ok(result) => return Some(result),
+            Err(error) => {
+                error!("failed to initialize timer manager: {error:#}; retrying");
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 /// Processes messages for a partition.
-///
-/// This function implements the main message processing pipeline:
-/// - Filters duplicate and out-of-order messages
-/// - Manages per-key message queues to preserve ordering
-/// - Handles offset tracking and commitment
-/// - Performs message deduplication
-/// - Applies backpressure when needed
-/// - Handles graceful shutdown when requested
-///
-/// # Arguments
-///
-/// * `config` - The partition configuration
-/// * `partition_info` - Information about the partition being processed
-/// * `handler` - Handler that processes messages
-/// * `context` - Runtime context containing channels and trackers
+/// Store-agnostic fields extracted from [`PartitionConfiguration`] for
+/// [`run_partition`].
+struct PartitionParams {
+    group_id: Arc<str>,
+    idempotence_cache_size: usize,
+    allowed_events: Option<AhoCorasick>,
+    shutdown_timeout: Duration,
+    timer_semaphore: Arc<Semaphore>,
+    telemetry_sender: TelemetrySender,
+    name: String,
+}
+
+/// Extracts the store from the provider `P` then delegates to
+/// [`run_partition`], which is generic only over `P::Store`.  This keeps the
+/// provider type `P` out of the long-lived coroutine state machine, preventing
+/// future-size explosion with the deeply nested middleware handler type `T`.
 async fn handle_messages<T, P>(
     config: PartitionConfiguration<P>,
     partition_info: PartitionInfo,
@@ -352,6 +410,62 @@ async fn handle_messages<T, P>(
     T: EventHandler,
     P: TriggerStoreProvider,
 {
+    let PartitionConfiguration {
+        group_id,
+        idempotence_cache_size,
+        allowed_events,
+        shutdown_timeout,
+        trigger_provider,
+        timer_slab_size,
+        timer_semaphore,
+        telemetry_sender,
+        ..
+    } = config;
+
+    let name = format!(
+        "{}:{}/{}",
+        group_id, partition_info.topic, partition_info.partition
+    );
+    let trigger_store = trigger_provider.create_store(Segment {
+        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
+        name: name.clone(),
+        slab_size: timer_slab_size,
+        version: SegmentVersion::V3,
+    });
+
+    let params = PartitionParams {
+        group_id,
+        idempotence_cache_size,
+        allowed_events,
+        shutdown_timeout,
+        timer_semaphore,
+        telemetry_sender,
+        name,
+    };
+
+    run_partition(trigger_store, partition_info, handler, context, params).await;
+}
+
+/// Core partition loop, generic only over `S: TriggerStore`.
+async fn run_partition<T, S>(
+    trigger_store: S,
+    partition_info: PartitionInfo,
+    handler: T,
+    context: PartitionContext,
+    params: PartitionParams,
+) where
+    T: EventHandler,
+    S: TriggerStore,
+{
+    let PartitionParams {
+        group_id,
+        idempotence_cache_size,
+        allowed_events,
+        shutdown_timeout,
+        timer_semaphore,
+        telemetry_sender,
+        name,
+    } = params;
     let PartitionContext {
         offsets,
         message_rx,
@@ -360,122 +474,94 @@ async fn handle_messages<T, P>(
     } = context;
 
     let mut highest_offset_seen = -1;
-
-    // Initialize idempotence cache if configured
     let mut idempotence_cache =
-        NonZeroUsize::new(config.idempotence_cache_size).map(|size| Cache::new(size.into()));
+        NonZeroUsize::new(idempotence_cache_size).map(|size| Cache::new(size.into()));
 
-    // Create a processing pipeline for incoming messages
-    let message_events = build_message_stream::<P::Store>(
+    let message_events = build_message_stream::<S>(
         &offsets,
         message_rx,
-        &config.group_id,
+        &group_id,
         &mut highest_offset_seen,
         &mut idempotence_cache,
-        config.allowed_events.as_ref(),
+        allowed_events.as_ref(),
     );
 
-    let name = format!(
-        "{}:{}/{}",
-        config.group_id, partition_info.topic, partition_info.partition
-    );
-    let segment = Segment {
-        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()),
-        name: name.clone(),
-        slab_size: config.timer_slab_size,
-        version: SegmentVersion::V3,
+    let timer_ctx = TimerInitContext {
+        name: &name,
+        telemetry_sender: &telemetry_sender,
+        group_id: &group_id,
+        timer_semaphore: &timer_semaphore,
+        partition_info: &partition_info,
+        heartbeats: &heartbeats,
+        shutdown_rx: &shutdown_rx,
     };
-
-    // Create a per-segment store via the provider. Each partition gets its own
-    // store instance with an independent cache, sharing the underlying session.
-    let trigger_store = config.trigger_provider.create_store(segment);
-
-    let (timer_stream, timer_manager) = loop {
-        if *shutdown_rx.borrow() {
-            return;
-        }
-
-        match TimerManager::new(
-            &name,
-            trigger_store.clone(),
-            heartbeats.clone(),
-            shutdown_rx.clone(),
-            config.timer_semaphore.clone(),
-        )
-        .await
-        {
-            Ok(result) => break result,
-            Err(error) => {
-                error!("failed to initialize timer manager: {error:#}; retrying");
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
+    let Some((timer_stream, timer_manager)) = init_timer_manager(trigger_store, timer_ctx).await
+    else {
+        return;
     };
 
     let timer_events = stream! {
-        let timer_stream = timer_stream;
         pin_mut!(timer_stream);
-
         while let Some(timer) = cooperative(timer_stream.next()).await {
             yield UncommittedEvent::Timer(timer);
         }
     };
-    let combined_stream = select(message_events, timer_events);
 
-    // Define how to process each message
-    let process = |event: UncommittedEvent<P::Store>| async {
-        // Process message with handler
+    let process = |event: UncommittedEvent<S>| async {
         debug!(?event, "calling handler");
+        process_event(event, &handler, &shutdown_rx, &timer_manager).await;
+    };
 
-        match event {
-            UncommittedEvent::Message(message) => {
+    KeyManager::<UncommittedEvent<S>, _, _>::new(process)
+        .process_messages(
+            select(message_events, timer_events),
+            heartbeats.register("event processor"),
+            shutdown_rx.clone(),
+            shutdown_timeout,
+        )
+        .await;
+
+    handler.shutdown().await;
+}
+
+/// Processes a single event (message or timer) through the handler.
+async fn process_event<T, S>(
+    event: UncommittedEvent<S>,
+    handler: &T,
+    shutdown_rx: &watch::Receiver<bool>,
+    timer_manager: &TimerManager<S>,
+) where
+    T: EventHandler,
+    S: TriggerStore,
+{
+    match event {
+        UncommittedEvent::Message(message) => {
+            let context = TimerContext::new(
+                message.key().clone(),
+                shutdown_rx.clone(),
+                timer_manager.clone(),
+            );
+            let cloned_context = context.clone();
+            let _guard = message.process_scope();
+            handler
+                .on_message(context, message, DemandType::Normal)
+                .await;
+            cloned_context.invalidate();
+        }
+        UncommittedEvent::Timer(timer) => {
+            if let Some(firing) = timer.fire().await {
                 let context = TimerContext::new(
-                    message.key().clone(),
+                    firing.key().clone(),
                     shutdown_rx.clone(),
                     timer_manager.clone(),
                 );
                 let cloned_context = context.clone();
-
-                let _guard = message.process_scope();
-                handler
-                    .on_message(context, message, DemandType::Normal)
-                    .await;
-
-                // Prevent the context from being used outside of processing
+                let _guard = firing.process_scope();
+                handler.on_timer(context, firing, DemandType::Normal).await;
                 cloned_context.invalidate();
             }
-            UncommittedEvent::Timer(timer) => {
-                if let Some(firing) = timer.fire().await {
-                    let context = TimerContext::new(
-                        firing.key().clone(),
-                        shutdown_rx.clone(),
-                        timer_manager.clone(),
-                    );
-                    let cloned_context = context.clone();
-
-                    let _guard = firing.process_scope();
-                    handler.on_timer(context, firing, DemandType::Normal).await;
-
-                    // Prevent the context from being used outside of processing
-                    cloned_context.invalidate();
-                }
-            }
         }
-    };
-
-    // Create key manager to handle concurrent processing while maintaining key
-    // order
-    KeyManager::<UncommittedEvent<P::Store>, _, _>::new(process)
-        .process_messages(
-            combined_stream,
-            heartbeats.register("event processor"),
-            shutdown_rx.clone(),
-            config.shutdown_timeout,
-        )
-        .await;
-
-    // Clean up handler resources after processing completes
-    handler.shutdown().await;
+    }
 }
 
 /// Builds a message processing stream with filtering and deduplication.

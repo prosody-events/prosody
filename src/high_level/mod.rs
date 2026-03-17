@@ -12,7 +12,10 @@ use crate::consumer::middleware::retry::RetryConfigurationBuilder;
 use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, SchedulerInitError};
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
-use crate::consumer::{ConsumerConfigurationBuilder, ConsumerError, ProsodyConsumer};
+use crate::consumer::{
+    ConsumerConfigurationBuilder, ConsumerError, LowLatencyMiddlewareConfiguration,
+    PipelineMiddlewareConfiguration, ProsodyConsumer,
+};
 use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams};
 use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
@@ -21,6 +24,8 @@ use crate::producer::{
     ProducerError, ProsodyProducer,
 };
 use crate::propagator::new_propagator;
+use crate::telemetry::emitter::TelemetryEmitterConfiguration;
+use crate::telemetry::{EmitterError, Telemetry, spawn_telemetry_emitter};
 use crate::{Payload, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
@@ -56,6 +61,8 @@ pub struct ConsumerBuilders {
     pub defer: DeferConfigurationBuilder,
     /// Timeout middleware configuration builder.
     pub timeout: TimeoutConfigurationBuilder,
+    /// Telemetry emitter configuration.
+    pub emitter: TelemetryEmitterConfiguration,
 }
 
 /// A combined client that manages both producer and consumer operations.
@@ -65,6 +72,7 @@ pub struct HighLevelClient<T> {
     producer_config: ProducerConfiguration,
     consumer: Mutex<ConsumerState<T>>,
     propagator: TextMapCompositePropagator,
+    telemetry: Telemetry,
 }
 
 impl<T> HighLevelClient<T> {
@@ -102,6 +110,11 @@ impl<T> HighLevelClient<T> {
         &self.producer_config.source_system
     }
 
+    /// Returns a reference to the shared telemetry instance.
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.telemetry
+    }
+
     /// Creates a new `HighLevelClient` with the specified configurations.
     ///
     /// # Arguments
@@ -118,6 +131,7 @@ impl<T> HighLevelClient<T> {
     /// - Any of the configuration builds fail.
     /// - Producer initialization fails.
     /// - Required topics are not found.
+    /// - The telemetry emitter cannot be started.
     pub fn new(
         mode: Mode,
         producer_builder: &mut ProducerConfigurationBuilder,
@@ -134,11 +148,22 @@ impl<T> HighLevelClient<T> {
 
         let producer_config = producer_builder.build()?;
         let cloned_config = producer_config.clone();
+        let telemetry = Telemetry::new();
         let producer = match mode {
-            Mode::Pipeline => ProsodyProducer::pipeline_producer(cloned_config),
-            Mode::LowLatency => ProsodyProducer::low_latency_producer(cloned_config),
-            Mode::BestEffort => ProsodyProducer::best_effort_producer(cloned_config),
+            Mode::Pipeline => ProsodyProducer::pipeline_producer(cloned_config, telemetry.sender()),
+            Mode::LowLatency => {
+                ProsodyProducer::low_latency_producer(cloned_config, telemetry.sender())
+            }
+            Mode::BestEffort => {
+                ProsodyProducer::best_effort_producer(cloned_config, telemetry.sender())
+            }
         }?;
+
+        spawn_telemetry_emitter(
+            &consumer_builders.emitter,
+            &producer_config.bootstrap_servers,
+            &telemetry,
+        )?;
 
         let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
             mode,
@@ -164,6 +189,7 @@ impl<T> HighLevelClient<T> {
             producer_config,
             consumer,
             propagator: new_propagator(),
+            telemetry,
         })
     }
 
@@ -229,10 +255,13 @@ impl<T> HighLevelClient<T> {
                 ProsodyConsumer::pipeline_consumer(
                     consumer,
                     trigger_store,
-                    retry.clone(),
-                    monopolization.clone(),
-                    defer.clone(),
+                    PipelineMiddlewareConfiguration {
+                        retry: retry.clone(),
+                        monopolization: monopolization.clone(),
+                        defer: defer.clone(),
+                    },
                     common,
+                    self.telemetry.clone(),
                     handler.clone(),
                 )
                 .await?
@@ -248,10 +277,13 @@ impl<T> HighLevelClient<T> {
                 ProsodyConsumer::low_latency_consumer(
                     consumer,
                     trigger_store,
-                    retry.clone(),
-                    failure_topic.clone(),
+                    LowLatencyMiddlewareConfiguration {
+                        retry: retry.clone(),
+                        failure_topic: failure_topic.clone(),
+                    },
                     common,
                     self.producer.clone(),
+                    self.telemetry.clone(),
                     handler.clone(),
                 )
                 .await?
@@ -266,6 +298,7 @@ impl<T> HighLevelClient<T> {
                     consumer,
                     trigger_store,
                     common,
+                    self.telemetry.clone(),
                     handler.clone(),
                 )
                 .await?
@@ -436,4 +469,8 @@ pub enum HighLevelClientError {
     /// Error when required topics are not found in the Kafka cluster.
     #[error("topics not found: {}", .0.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(", "))]
     TopicsNotFound(Vec<Topic>),
+
+    /// Error when the telemetry emitter cannot be started.
+    #[error("failed to start telemetry emitter: {0:#}")]
+    TelemetryEmitter(#[from] EmitterError),
 }

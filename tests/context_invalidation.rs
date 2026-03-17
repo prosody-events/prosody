@@ -136,7 +136,7 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
         .source_system("test-producer")
         .build()?;
 
-    let producer = ProsodyProducer::new(&producer_config)?;
+    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
 
     // Send a test message
     let test_payload = json!({ "test": "context_invalidation" });

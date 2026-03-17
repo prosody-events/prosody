@@ -13,6 +13,7 @@ use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
@@ -370,6 +371,9 @@ impl TestHarness {
 
         let cached_store = CachedTimerDeferStore::new(store.clone(), config.cache_size);
 
+        let telemetry = Telemetry::new();
+        let sender = telemetry.partition_sender(topic, partition);
+
         let handler = TimerDeferHandler {
             handler: inner_handler.clone(),
             store: cached_store,
@@ -377,6 +381,8 @@ impl TestHarness {
             config,
             topic,
             partition,
+            sender,
+            source: Arc::from("test"),
         };
 
         Ok(Self {

@@ -107,7 +107,7 @@ async fn run_scenario(
         Telemetry::new(),
     )
     .await?;
-    let producer = ProsodyProducer::new(&producer_config)?;
+    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
 
     // Send a test message and an end-of-stream marker.
     let key = "test-key";

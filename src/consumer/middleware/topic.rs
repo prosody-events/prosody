@@ -57,7 +57,7 @@
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let topic_config = FailureTopicConfiguration::builder().build().unwrap();
 //! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
-//! # let producer = ProsodyProducer::new(&producer_config).unwrap();
+//! # let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
 //! # let telemetry = Telemetry::default();
 //! # let handler = MyHandler;
 //!
@@ -253,7 +253,7 @@ where
 
         let timestamp = message
             .timestamp()
-            .to_rfc3339_opts(SecondsFormat::AutoSi, true);
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
 
         // Attempt to process the message with the wrapped handler
         let Err(error) = self
@@ -342,7 +342,7 @@ where
 
         // Prepare headers for the failure timer message
         let timestamp: DateTime<Utc> = timer.time.into();
-        let timestamp = timestamp.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        let timestamp = timestamp.to_rfc3339_opts(SecondsFormat::Secs, true);
 
         let headers = [
             ("source-kind", "timer"),

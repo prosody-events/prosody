@@ -9,6 +9,8 @@ use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::high_level::CassandraConfigurationBuilder;
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
+use crate::telemetry::Telemetry;
+use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use color_eyre::Result;
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
@@ -32,7 +34,7 @@ fn create_producer_with_topics(topics: &[&str]) -> Result<(ProsodyProducer, Stri
         .source_system("test")
         .build()?;
 
-    let producer = ProsodyProducer::pipeline_producer(config)?;
+    let producer = ProsodyProducer::pipeline_producer(config, Telemetry::new().sender())?;
     Ok((producer, bootstrap))
 }
 
@@ -202,6 +204,10 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Hig
         monopolization: MonopolizationConfigurationBuilder::default(),
         defer: DeferConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
+        emitter: TelemetryEmitterConfiguration {
+            enabled: false,
+            ..Default::default()
+        },
     };
     let cassandra_builder = CassandraConfigurationBuilder::default();
 

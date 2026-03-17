@@ -275,6 +275,15 @@ Persistent storage for scheduled retries (not needed if `PROSODY_MOCK=true`):
 | `PROSODY_CASSANDRA_RACK`       | Prefer this rack for queries       | -       |
 | `PROSODY_CASSANDRA_RETENTION`  | Delete data older than this        | 1y      |
 
+### Telemetry Emitter
+
+Publishes message and timer lifecycle events to a Kafka topic:
+
+| Environment Variable        | Description                                | Default                  |
+|-----------------------------|--------------------------------------------|--------------------------|
+| `PROSODY_TELEMETRY_ENABLED` | Enable the telemetry event emitter         | true                     |
+| `PROSODY_TELEMETRY_TOPIC`   | Kafka topic to publish telemetry events to | prosody.telemetry-events |
+
 ### Monopolization Detection (Pipeline Mode)
 
 | Environment Variable                | Description                            | Default |

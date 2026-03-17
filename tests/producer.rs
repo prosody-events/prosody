@@ -283,6 +283,7 @@ async fn test_producer_deduplication() -> Result<()> {
             .source_system("test-producer")
             .idempotence_cache_size(2usize)
             .build()?,
+        Telemetry::new().sender(),
     )?;
 
     // Set up consumer with test handler

@@ -107,6 +107,7 @@ where
             trigger_provider,
             timer_slab_size,
             timer_semaphore,
+            telemetry_sender: telemetry.clone(),
         };
 
         Self {

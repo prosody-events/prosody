@@ -1,19 +1,31 @@
 //! Telemetry system for monitoring consumer lifecycle events.
 
+use crate::propagator::new_propagator;
 use crate::telemetry::event::TelemetryEvent;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::telemetry::sender::TelemetrySender;
 use crate::{Partition, Topic};
 use educe::Educe;
+use opentelemetry::propagation::TextMapCompositePropagator;
 use quanta::Clock;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
+/// Background Kafka emitter for telemetry events.
+pub mod emitter;
 /// Telemetry event definitions.
 pub mod event;
+/// Trace context extractor for telemetry events.
+pub(crate) mod injector;
 /// Partition-scoped telemetry sender.
 pub mod partition;
 /// Global telemetry sender.
 pub mod sender;
+
+pub use emitter::{
+    EmitterError, TelemetryEmitterConfiguration, TelemetryEmitterConfigurationBuilder,
+    spawn_telemetry_emitter,
+};
 
 const TELEMETRY_CHANNEL_CAPACITY: usize = 8096;
 
@@ -29,6 +41,9 @@ pub struct Telemetry {
 
     #[educe(Debug(ignore))]
     clock: Clock,
+
+    #[educe(Debug(ignore))]
+    propagator: Arc<TextMapCompositePropagator>,
 }
 
 impl Default for Telemetry {
@@ -44,8 +59,13 @@ impl Telemetry {
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(TELEMETRY_CHANNEL_CAPACITY);
         let clock = Clock::new();
+        let propagator = Arc::new(new_propagator());
 
-        Self { tx, clock }
+        Self {
+            tx,
+            clock,
+            propagator,
+        }
     }
 
     /// Subscribes to telemetry events.
@@ -62,7 +82,7 @@ impl Telemetry {
     /// Returns a sender that can emit telemetry events for any partition.
     #[must_use]
     pub fn sender(&self) -> TelemetrySender {
-        TelemetrySender::new(self.tx.clone(), self.clock.clone())
+        TelemetrySender::new(self.tx.clone(), self.clock.clone(), self.propagator.clone())
     }
 
     /// Creates a partition-scoped telemetry sender.
@@ -70,7 +90,13 @@ impl Telemetry {
     /// Returns a sender pre-configured for a specific topic and partition.
     #[must_use]
     pub fn partition_sender(&self, topic: Topic, partition: Partition) -> TelemetryPartitionSender {
-        TelemetryPartitionSender::new(topic, partition, self.tx.clone(), self.clock.clone())
+        TelemetryPartitionSender::new(
+            topic,
+            partition,
+            self.tx.clone(),
+            self.clock.clone(),
+            self.propagator.clone(),
+        )
     }
 
     /// Emits a raw telemetry event with custom timestamp.

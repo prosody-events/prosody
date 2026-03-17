@@ -223,7 +223,7 @@ impl TestEnvironment {
             .bootstrap_servers(bootstrap.clone())
             .source_system("test-producer")
             .build()?;
-        let producer = ProsodyProducer::new(&producer_config)?;
+        let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
 
         // Give consumer time to start and subscribe
         sleep(Duration::from_secs(5)).await;

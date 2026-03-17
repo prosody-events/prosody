@@ -216,7 +216,7 @@ pub fn spawn_producers(
         let topic = *topic;
 
         tasks.spawn(async move {
-            let producer = ProsodyProducer::new(&producer_config)?;
+            let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
             for (key, messages) in producer_messages {
                 let key = key.to_string();
                 for message in messages {

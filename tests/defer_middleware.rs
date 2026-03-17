@@ -274,6 +274,7 @@ impl DeferTestEnvironment {
             message_provider,
             failure_tracker,
             &heartbeats,
+            &telemetry,
         )?;
 
         let handler_provider = defer_middleware
@@ -293,6 +294,7 @@ impl DeferTestEnvironment {
                 .bootstrap_servers(vec!["localhost:9094".to_owned()])
                 .source_system("defer-integration-test".to_owned())
                 .build()?,
+            Telemetry::new().sender(),
         )?;
 
         Ok(Self {
@@ -362,6 +364,7 @@ impl DeferTestEnvironment {
             message_provider,
             failure_tracker,
             &heartbeats,
+            &telemetry,
         )?;
 
         let handler_provider = defer_middleware
@@ -381,6 +384,7 @@ impl DeferTestEnvironment {
                 .bootstrap_servers(vec!["localhost:9094".to_owned()])
                 .source_system("defer-integration-test".to_owned())
                 .build()?,
+            Telemetry::new().sender(),
         )?;
 
         Ok(Self {

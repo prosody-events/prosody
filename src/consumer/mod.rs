@@ -176,6 +176,7 @@ use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
+use serde::Serialize;
 use std::env::var;
 use std::fmt::Debug;
 use std::future::Future;
@@ -230,7 +231,8 @@ const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
 /// Demand types allow the system to distinguish between normal processing
 /// and failure handling scenarios, enabling different processing behaviors
 /// for the same event type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DemandType {
     /// Normal demand represents the initial processing attempt of an event.
     Normal,
@@ -633,6 +635,32 @@ pub struct CommonMiddlewareConfiguration {
     pub timeout: TimeoutConfiguration,
 }
 
+/// Configuration for middleware specific to pipeline consumers.
+///
+/// Bundles the retry, monopolization, and defer configurations that are
+/// only used by the pipeline processing mode.
+#[derive(Clone, Debug)]
+pub struct PipelineMiddlewareConfiguration {
+    /// Retry configuration for failed messages.
+    pub retry: RetryConfiguration,
+    /// Monopolization detection configuration.
+    pub monopolization: MonopolizationConfiguration,
+    /// Defer middleware configuration.
+    pub defer: DeferConfiguration,
+}
+
+/// Configuration for middleware specific to low-latency consumers.
+///
+/// Bundles the retry and failure-topic configurations that are only
+/// used by the low-latency processing mode.
+#[derive(Clone, Debug)]
+pub struct LowLatencyMiddlewareConfiguration {
+    /// Retry configuration for failed messages.
+    pub retry: RetryConfiguration,
+    /// Failure topic configuration for routing unrecoverable messages.
+    pub failure_topic: FailureTopicConfiguration,
+}
+
 /// High-level Kafka consumer implementation.
 ///
 /// `ProsodyConsumer` is the main entry point for consuming messages from Kafka
@@ -693,10 +721,11 @@ fn build_common_middleware(
     config: &CommonMiddlewareConfiguration,
     stall_threshold: Duration,
     telemetry: &Telemetry,
+    source: Arc<str>,
 ) -> Result<impl HandlerMiddleware, ConsumerError> {
     let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, telemetry)?;
     let timeout_middleware = TimeoutMiddleware::new(&config.timeout, stall_threshold)?;
-    let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone());
+    let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone(), source);
 
     // Layer common middleware: telemetry -> timeout -> scheduler -> shutdown
     Ok(telemetry_middleware
@@ -871,10 +900,9 @@ impl ProsodyConsumer {
     ///
     /// * `consumer_config` - The consumer configuration.
     /// * `trigger_store_config` - The trigger store configuration.
-    /// * `retry_config` - The retry configuration.
-    /// * `monopolization_config` - The monopolization detection configuration.
-    /// * `defer_config` - The defer middleware configuration.
+    /// * `pipeline_config` - The pipeline-specific middleware configuration.
     /// * `common_config` - The common middleware configuration.
+    /// * `telemetry` - The shared telemetry instance.
     /// * `handler` - The fallible message handler.
     ///
     /// # Returns
@@ -888,10 +916,9 @@ impl ProsodyConsumer {
     pub async fn pipeline_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
-        retry_config: RetryConfiguration,
-        monopolization_config: MonopolizationConfiguration,
-        defer_config: DeferConfiguration,
+        pipeline_config: PipelineMiddlewareConfiguration,
         common_config: &CommonMiddlewareConfiguration,
+        telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
@@ -899,8 +926,11 @@ impl ProsodyConsumer {
     {
         // Create both stores atomically - ensures trigger and defer stores match
         let stores = StorePair::new(trigger_store_config, consumer_config.mock).await?;
-
-        let telemetry = Telemetry::new();
+        let PipelineMiddlewareConfiguration {
+            retry: retry_config,
+            monopolization: monopolization_config,
+            defer: defer_config,
+        } = pipeline_config;
         let monopolization_middleware =
             MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
         let heartbeats = HeartbeatRegistry::new(
@@ -916,8 +946,12 @@ impl ProsodyConsumer {
             &heartbeats,
         );
 
-        let common_middleware =
-            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
+        let common_middleware = build_common_middleware(
+            common_config,
+            consumer_config.stall_threshold,
+            &telemetry,
+            Arc::from(consumer_config.group_id.as_str()),
+        )?;
 
         // Build middleware stack with concrete provider types (determined by StorePair
         // variant)
@@ -933,6 +967,7 @@ impl ProsodyConsumer {
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
+                    &telemetry,
                 )?;
 
                 let timer_defer_middleware = TimerDeferMiddleware::new(
@@ -940,6 +975,7 @@ impl ProsodyConsumer {
                     timer_provider,
                     failure_tracker,
                     consumer_config,
+                    &telemetry,
                 );
 
                 let provider = common_middleware
@@ -968,6 +1004,7 @@ impl ProsodyConsumer {
                     message_provider,
                     failure_tracker.clone(),
                     &heartbeats,
+                    &telemetry,
                 )?;
 
                 let timer_defer_middleware = TimerDeferMiddleware::new(
@@ -975,6 +1012,7 @@ impl ProsodyConsumer {
                     timer_provider,
                     failure_tracker,
                     consumer_config,
+                    &telemetry,
                 );
 
                 let provider = common_middleware
@@ -1009,10 +1047,12 @@ impl ProsodyConsumer {
     ///
     /// * `consumer_config` - The consumer configuration.
     /// * `trigger_store_config` - The trigger store configuration.
-    /// * `retry_config` - The retry configuration.
-    /// * `topic_config` - The failure topic configuration.
+    /// * `low_latency_config` - The low-latency-specific middleware
+    ///   configuration.
+    /// * `common_config` - The common middleware configuration.
     /// * `producer` - The Prosody producer for sending messages to the failure
     ///   topic.
+    /// * `telemetry` - The shared telemetry instance.
     /// * `handler` - The fallible message handler.
     ///
     /// # Returns
@@ -1026,21 +1066,28 @@ impl ProsodyConsumer {
     pub async fn low_latency_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
-        retry_config: RetryConfiguration,
-        topic_config: FailureTopicConfiguration,
+        low_latency_config: LowLatencyMiddlewareConfiguration,
         common_config: &CommonMiddlewareConfiguration,
         producer: ProsodyProducer,
+        telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let telemetry = Telemetry::new();
+        let LowLatencyMiddlewareConfiguration {
+            retry: retry_config,
+            failure_topic: topic_config,
+        } = low_latency_config;
         let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
-        let common_middleware =
-            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
+        let common_middleware = build_common_middleware(
+            common_config,
+            consumer_config.stall_threshold,
+            &telemetry,
+            Arc::from(consumer_config.group_id.as_str()),
+        )?;
 
         let provider = common_middleware
             .layer(retry_middleware.clone()) // retry the task a fixed number of times
@@ -1077,14 +1124,18 @@ impl ProsodyConsumer {
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         common_config: &CommonMiddlewareConfiguration,
+        telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
-        let telemetry = Telemetry::new();
-        let common_middleware =
-            build_common_middleware(common_config, consumer_config.stall_threshold, &telemetry)?;
+        let common_middleware = build_common_middleware(
+            common_config,
+            consumer_config.stall_threshold,
+            &telemetry,
+            Arc::from(consumer_config.group_id.as_str()),
+        )?;
 
         // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then log
         let provider = common_middleware
