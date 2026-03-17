@@ -183,6 +183,7 @@ fn serialize_timer(
 
     let (type_str, demand_type, error_category, exception) = match &data.event_type {
         TimerEventType::Scheduled => ("prosody.timer.scheduled", None, None, None),
+        TimerEventType::Cancelled => ("prosody.timer.cancelled", None, None, None),
         TimerEventType::Dispatched { demand_type } => {
             ("prosody.timer.dispatched", Some(*demand_type), None, None)
         }
@@ -552,6 +553,33 @@ mod tests {
         assert!(v.get("demandType").is_none());
         assert!(v.get("errorCategory").is_none());
         assert!(v.get("exception").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_timer_cancelled_omits_optional_fields() -> Result<()> {
+        let data = Data::Timer(TimerTelemetryEvent {
+            event_type: TimerEventType::Cancelled,
+            event_time: Utc::now(),
+            scheduled_time: CompactDateTime::from(1_700_000_000_u32),
+            timer_type: TimerType::Application,
+            key: Arc::from("cancel-key"),
+            source: Arc::from("grp"),
+            trace_parent: None,
+            trace_state: None,
+        });
+        let v = parse_serialized(&data)?;
+
+        assert_eq!(v["type"], "prosody.timer.cancelled");
+        assert_eq!(v["timerType"], "application");
+        assert_eq!(v["key"], "cancel-key");
+        assert!(v.get("demandType").is_none());
+        assert!(v.get("errorCategory").is_none());
+        assert!(v.get("exception").is_none());
+        ensure!(
+            chrono::DateTime::parse_from_rfc3339(v["scheduledTime"].as_str().unwrap_or("")).is_ok(),
+            "scheduledTime not RFC 3339"
+        );
         Ok(())
     }
 

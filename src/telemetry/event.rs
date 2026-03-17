@@ -29,7 +29,8 @@ pub enum Data {
     Partition(PartitionEvent),
     /// Key-level event.
     Key(KeyEvent),
-    /// Timer lifecycle event (scheduled, dispatched, succeeded, failed).
+    /// Timer lifecycle event (scheduled, cancelled, dispatched, succeeded,
+    /// failed).
     Timer(TimerTelemetryEvent),
     /// Message lifecycle event (dispatched, succeeded, failed).
     Message(MessageTelemetryEvent),
@@ -109,6 +110,8 @@ pub struct TimerTelemetryEvent {
 pub enum TimerEventType {
     /// Timer was written to store.
     Scheduled,
+    /// Timer was cancelled before firing.
+    Cancelled,
     /// Timer fired, handler about to be called.
     Dispatched {
         /// Demand type (normal or failure).

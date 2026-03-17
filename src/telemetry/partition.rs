@@ -314,6 +314,23 @@ impl TelemetryPartitionSender {
         );
     }
 
+    /// Emits a timer cancelled event.
+    pub fn timer_cancelled(
+        &self,
+        key: Key,
+        scheduled_time: CompactDateTime,
+        timer_type: TimerType,
+        source: Arc<str>,
+    ) {
+        self.emit_timer(
+            TimerEventType::Cancelled,
+            key,
+            scheduled_time,
+            timer_type,
+            source,
+        );
+    }
+
     /// Emits a timer dispatched event.
     pub fn timer_dispatched(
         &self,

@@ -432,7 +432,20 @@ where
                     .store
                     .remove_trigger(&self.0.segment, &slab, key, time, timer_type)
                     .await
-                    .map_err(TimerManagerError::Store)
+                    .map_err(TimerManagerError::Store)?;
+
+                // Emit timer_cancelled telemetry after successful store removal.
+                // NOTE: If clear_and_schedule becomes an atomic store operation
+                // (PR #141) that bypasses individual unschedule() calls, the
+                // emission site will need to move to the new atomic path.
+                self.0.telemetry.timer_cancelled(
+                    key.clone(),
+                    time,
+                    timer_type,
+                    self.0.source.clone(),
+                );
+
+                Ok(())
             }
         }
     }

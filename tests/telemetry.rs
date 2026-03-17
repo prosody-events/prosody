@@ -236,6 +236,116 @@ impl FallibleHandler for TimerFailingHandler {
     async fn shutdown(self) {}
 }
 
+/// Handler that schedules a timer at t+60 then immediately cancels it.
+#[derive(Clone)]
+struct TimerCancellingHandler {
+    msg_tx: Sender<String>,
+}
+
+impl FallibleHandler for TimerCancellingHandler {
+    type Error = TestError;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        msg: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let key = msg.key().to_string();
+        let schedule_time = CompactDateTime::now()
+            .and_then(|now| now.add_duration(CompactDuration::new(60)))
+            .map_err(|_| TestError)?;
+        ctx.schedule(schedule_time, TimerType::Application)
+            .await
+            .map_err(|_| TestError)?;
+        ctx.unschedule(schedule_time, TimerType::Application)
+            .await
+            .map_err(|_| TestError)?;
+        let _ = self.msg_tx.send(key).await;
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        _trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// Handler that schedules a timer on first message, then on second message
+/// calls `clear_and_schedule` with a new time.
+#[derive(Clone)]
+struct ClearAndScheduleHandler {
+    msg_tx: Sender<String>,
+}
+
+impl FallibleHandler for ClearAndScheduleHandler {
+    type Error = TestError;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        msg: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let key = msg.key().to_string();
+        let step = msg
+            .payload()
+            .get("step")
+            .and_then(Value::as_i64)
+            .ok_or(TestError)?;
+
+        if step == 1 {
+            // First message: schedule at t+60
+            let schedule_time = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(60)))
+                .map_err(|_| TestError)?;
+            ctx.schedule(schedule_time, TimerType::Application)
+                .await
+                .map_err(|_| TestError)?;
+        } else {
+            // Second message: clear_and_schedule at t+120
+            let new_time = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(120)))
+                .map_err(|_| TestError)?;
+            ctx.clear_and_schedule(new_time, TimerType::Application)
+                .await
+                .map_err(|_| TestError)?;
+        }
+
+        let _ = self.msg_tx.send(key).await;
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        _trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
 /// Test error type that classifies as transient.
 #[derive(Debug, Clone)]
 struct TransientError;
@@ -480,14 +590,18 @@ fn assert_succeeded_contract(succeeded: &Value, expected_key: &str) -> Result<()
 }
 
 /// Collects all telemetry events whose `key` field matches `key` and whose
-/// `type` starts with `"prosody.timer."` until no new event arrives within
-/// `idle_timeout`.  Returns them in arrival order.
+/// `type` starts with `"prosody.timer."` until every type in `required_types`
+/// has been seen at least once, or no new event arrives within `idle_timeout`.
+/// Returns them in arrival order.
 async fn collect_timer_events_for_key(
     consumer: &StreamConsumer,
     key: &str,
     idle_timeout: Duration,
+    required_types: &[&str],
 ) -> Result<Vec<Value>> {
+    use std::collections::HashSet;
     let mut events = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     loop {
         match timeout(idle_timeout, consumer.recv()).await {
             Ok(Ok(msg)) => {
@@ -503,7 +617,17 @@ async fn collect_timer_events_for_key(
                     .and_then(Value::as_str)
                     .is_some_and(|t| t.starts_with("prosody.timer."));
                 if matches_key && is_timer {
+                    if let Some(t) = value.get("type").and_then(Value::as_str) {
+                        for &req in required_types {
+                            if t == req {
+                                seen.insert(req);
+                            }
+                        }
+                    }
                     events.push(value);
+                    if !required_types.is_empty() && seen.len() == required_types.len() {
+                        break;
+                    }
                 }
             }
             // Idle timeout — no more events arriving.
@@ -588,6 +712,70 @@ fn assert_timer_three_event_invariant(
         );
     }
 
+    Ok(())
+}
+
+/// Validates the JSON field contract for a `prosody.timer.cancelled` event.
+fn assert_timer_cancelled_contract(event: &Value, expected_key: &str) -> Result<()> {
+    assert_eq!(
+        event.get("type").and_then(Value::as_str),
+        Some("prosody.timer.cancelled"),
+        "cancelled type mismatch"
+    );
+    let event_time = event
+        .get("eventTime")
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("cancelled: missing eventTime"))?;
+    ensure!(
+        chrono::DateTime::parse_from_rfc3339(event_time).is_ok(),
+        "cancelled: eventTime not RFC 3339: {event_time}"
+    );
+    let scheduled_time = event
+        .get("scheduledTime")
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("cancelled: missing scheduledTime"))?;
+    ensure!(
+        chrono::DateTime::parse_from_rfc3339(scheduled_time).is_ok(),
+        "cancelled: scheduledTime not RFC 3339: {scheduled_time}"
+    );
+    ensure!(
+        event
+            .get("timerType")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "cancelled: timerType should be non-empty"
+    );
+    assert_eq!(
+        event.get("key").and_then(Value::as_str),
+        Some(expected_key),
+        "cancelled: key mismatch"
+    );
+    ensure!(
+        event
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "cancelled: source should be non-empty"
+    );
+    ensure!(
+        event
+            .get("hostname")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "cancelled: hostname should be non-empty"
+    );
+    ensure!(
+        event.get("demandType").is_none(),
+        "cancelled: demandType should be absent"
+    );
+    ensure!(
+        event.get("errorCategory").is_none(),
+        "cancelled: errorCategory should be absent"
+    );
+    ensure!(
+        event.get("exception").is_none(),
+        "cancelled: exception should be absent"
+    );
     Ok(())
 }
 
@@ -1076,8 +1264,17 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
         // Wait for timer handler to fire (~3 s delay)
         let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
 
-        let events =
-            collect_timer_events_for_key(&telemetry_consumer, "timer-key", RECEIVE_TIMEOUT).await?;
+        let events = collect_timer_events_for_key(
+            &telemetry_consumer,
+            "timer-key",
+            RECEIVE_TIMEOUT,
+            &[
+                "prosody.timer.scheduled",
+                "prosody.timer.dispatched",
+                "prosody.timer.succeeded",
+            ],
+        )
+        .await?;
         assert_timer_three_event_invariant(&events, "application", true)?;
 
         client.unsubscribe().await?;
@@ -1123,9 +1320,17 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
         // Wait for timer handler to fire (~3 s delay)
         let _ = timeout(Duration::from_secs(15), timer_rx.recv()).await?;
 
-        let events =
-            collect_timer_events_for_key(&telemetry_consumer, "timer-fail-key", RECEIVE_TIMEOUT)
-                .await?;
+        let events = collect_timer_events_for_key(
+            &telemetry_consumer,
+            "timer-fail-key",
+            RECEIVE_TIMEOUT,
+            &[
+                "prosody.timer.scheduled",
+                "prosody.timer.dispatched",
+                "prosody.timer.failed",
+            ],
+        )
+        .await?;
         assert_timer_three_event_invariant(&events, "application", false)?;
 
         client.unsubscribe().await?;
@@ -1180,9 +1385,17 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
 
         // Collect all timer events — there must be a full scheduled → dispatched
         // → succeeded lifecycle for the deferredMessage timer.
-        let events =
-            collect_timer_events_for_key(&telemetry_consumer, "defer-msg-key", RECEIVE_TIMEOUT)
-                .await?;
+        let events = collect_timer_events_for_key(
+            &telemetry_consumer,
+            "defer-msg-key",
+            RECEIVE_TIMEOUT,
+            &[
+                "prosody.timer.scheduled",
+                "prosody.timer.dispatched",
+                "prosody.timer.succeeded",
+            ],
+        )
+        .await?;
         assert_timer_three_event_invariant(&events, "deferredMessage", true)?;
 
         client.unsubscribe().await?;
@@ -1241,9 +1454,16 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
         let _ = timeout(Duration::from_secs(30), done_rx.recv()).await?;
 
         // The application timer must have its three events.
-        let app_events =
-            collect_timer_events_for_key(&telemetry_consumer, "defer-timer-key", RECEIVE_TIMEOUT)
-                .await?;
+        // Both application and deferredTimer share the same type strings, so
+        // we cannot use required_types to break early — use a short idle
+        // timeout since done_rx guarantees all events have been emitted.
+        let app_events = collect_timer_events_for_key(
+            &telemetry_consumer,
+            "defer-timer-key",
+            Duration::from_secs(5),
+            &[],
+        )
+        .await?;
         assert_timer_three_event_invariant(&app_events, "application", true)?;
 
         // The deferredTimer retry timer must also have its three events.
@@ -1256,4 +1476,150 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
     })
     .await
     .map_err(|_| eyre!("test timed out after {DEFER_TEST_TIMEOUT:?}"))?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timer_cancelled_event_on_kafka() -> Result<()> {
+    timeout(TIMER_TEST_TIMEOUT, async {
+        init_test_logging();
+
+        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
+        let telemetry_topic = Uuid::new_v4().to_string();
+        let source_topic = Uuid::new_v4().to_string();
+        let source: Topic = source_topic.as_str().into();
+
+        create_topic(admin, &telemetry_topic).await?;
+        create_topic(admin, &source_topic).await?;
+
+        let client: HighLevelClient<TimerCancellingHandler> =
+            build_typed_client(&source_topic, &telemetry_topic)?;
+
+        let (msg_tx, mut msg_rx) = channel(16);
+        client.subscribe(TimerCancellingHandler { msg_tx }).await?;
+
+        let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
+
+        client
+            .send(source, "cancel-key", &json!({"v": 1_i32}))
+            .await?;
+
+        // Wait for message handler to complete (schedule + cancel inside)
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        let events = collect_timer_events_for_key(
+            &telemetry_consumer,
+            "cancel-key",
+            RECEIVE_TIMEOUT,
+            &["prosody.timer.scheduled", "prosody.timer.cancelled"],
+        )
+        .await?;
+
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.get("type").and_then(Value::as_str))
+            .collect();
+
+        ensure!(
+            types.contains(&"prosody.timer.scheduled"),
+            "missing prosody.timer.scheduled; got: {types:?}"
+        );
+        ensure!(
+            types.contains(&"prosody.timer.cancelled"),
+            "missing prosody.timer.cancelled; got: {types:?}"
+        );
+        ensure!(
+            !types.contains(&"prosody.timer.dispatched"),
+            "prosody.timer.dispatched should NOT be present (timer was cancelled); got: {types:?}"
+        );
+
+        // Validate field contract on the cancelled event
+        let cancelled = events
+            .iter()
+            .find(|e| e.get("type").and_then(Value::as_str) == Some("prosody.timer.cancelled"))
+            .ok_or_else(|| eyre!("cancelled event not found"))?;
+        assert_timer_cancelled_contract(cancelled, "cancel-key")?;
+
+        client.unsubscribe().await?;
+        admin.delete_topic(&source_topic).await?;
+        admin.delete_topic(&telemetry_topic).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
+    timeout(TIMER_TEST_TIMEOUT, async {
+        init_test_logging();
+
+        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
+        let telemetry_topic = Uuid::new_v4().to_string();
+        let source_topic = Uuid::new_v4().to_string();
+        let source: Topic = source_topic.as_str().into();
+
+        create_topic(admin, &telemetry_topic).await?;
+        create_topic(admin, &source_topic).await?;
+
+        let client: HighLevelClient<ClearAndScheduleHandler> =
+            build_typed_client(&source_topic, &telemetry_topic)?;
+
+        let (msg_tx, mut msg_rx) = channel(16);
+        client.subscribe(ClearAndScheduleHandler { msg_tx }).await?;
+
+        let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
+
+        // First message: schedule a timer at t+60
+        client
+            .send(source, "cas-key", &json!({"step": 1_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Second message (same key): clear_and_schedule at t+120
+        client
+            .send(source, "cas-key", &json!({"step": 2_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        let events = collect_timer_events_for_key(
+            &telemetry_consumer,
+            "cas-key",
+            RECEIVE_TIMEOUT,
+            &["prosody.timer.scheduled", "prosody.timer.cancelled"],
+        )
+        .await?;
+
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.get("type").and_then(Value::as_str))
+            .collect();
+
+        // Should have: scheduled (first), cancelled (from clear), scheduled (new)
+        let scheduled_count = types
+            .iter()
+            .filter(|&&t| t == "prosody.timer.scheduled")
+            .count();
+        let cancelled_count = types
+            .iter()
+            .filter(|&&t| t == "prosody.timer.cancelled")
+            .count();
+
+        ensure!(
+            scheduled_count >= 2,
+            "expected at least 2 scheduled events (original + new); got {scheduled_count}; types: \
+             {types:?}"
+        );
+        ensure!(
+            cancelled_count >= 1,
+            "expected at least 1 cancelled event (old timer cleared); got {cancelled_count}; \
+             types: {types:?}"
+        );
+
+        client.unsubscribe().await?;
+        admin.delete_topic(&source_topic).await?;
+        admin.delete_topic(&telemetry_topic).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
 }
