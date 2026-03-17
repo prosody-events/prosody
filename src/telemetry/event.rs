@@ -18,8 +18,8 @@ pub struct TelemetryEvent {
     pub topic: Topic,
     /// Partition associated with the event.
     pub partition: Partition,
-    /// Event-specific data.
-    pub data: Data,
+    /// Event-specific data (Arc-wrapped for cheap broadcast clones).
+    pub data: Arc<Data>,
 }
 
 /// Event data payload.
@@ -29,7 +29,8 @@ pub enum Data {
     Partition(PartitionEvent),
     /// Key-level event.
     Key(KeyEvent),
-    /// Timer lifecycle event (scheduled, dispatched, succeeded, failed).
+    /// Timer lifecycle event (scheduled, cancelled, dispatched, succeeded,
+    /// failed).
     Timer(TimerTelemetryEvent),
     /// Message lifecycle event (dispatched, succeeded, failed).
     Message(MessageTelemetryEvent),
@@ -109,6 +110,8 @@ pub struct TimerTelemetryEvent {
 pub enum TimerEventType {
     /// Timer was written to store.
     Scheduled,
+    /// Timer was cancelled before firing.
+    Cancelled,
     /// Timer fired, handler about to be called.
     Dispatched {
         /// Demand type (normal or failure).

@@ -248,7 +248,7 @@ async fn run_event_loop(
 
         tokio::select! {
             result = telemetry_rx.recv() => match result {
-                Ok(event) => match event.data {
+                Ok(event) => match &*event.data {
                     Data::Key(KeyEvent { state: KeyState::HandlerSucceeded, .. }) => {
                         successes.push_back(event.timestamp);
                     }

@@ -1,7 +1,6 @@
 //! Global telemetry sender for consumer lifecycle events.
 
 use crate::consumer::DemandType;
-use crate::propagator::new_propagator;
 use crate::telemetry::event::{
     Data, KeyEvent, KeyState, MessageSentEvent, PartitionEvent, PartitionState, TelemetryEvent,
 };
@@ -33,11 +32,15 @@ pub struct TelemetrySender {
 }
 
 impl TelemetrySender {
-    pub(crate) fn new(tx: broadcast::Sender<TelemetryEvent>, clock: Clock) -> Self {
+    pub(crate) fn new(
+        tx: broadcast::Sender<TelemetryEvent>,
+        clock: Clock,
+        propagator: Arc<TextMapCompositePropagator>,
+    ) -> Self {
         Self {
             tx,
             clock,
-            propagator: Arc::new(new_propagator()),
+            propagator,
         }
     }
 
@@ -48,9 +51,9 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Partition(PartitionEvent {
+            data: Arc::new(Data::Partition(PartitionEvent {
                 state: PartitionState::Paused,
-            }),
+            })),
         });
     }
 
@@ -61,9 +64,9 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Partition(PartitionEvent {
+            data: Arc::new(Data::Partition(PartitionEvent {
                 state: PartitionState::Resumed,
-            }),
+            })),
         });
     }
 
@@ -74,9 +77,9 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Partition(PartitionEvent {
+            data: Arc::new(Data::Partition(PartitionEvent {
                 state: PartitionState::Assigned,
-            }),
+            })),
         });
     }
 
@@ -87,9 +90,9 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Partition(PartitionEvent {
+            data: Arc::new(Data::Partition(PartitionEvent {
                 state: PartitionState::Revoked,
-            }),
+            })),
         });
     }
 
@@ -106,11 +109,11 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type,
                 state: KeyState::MiddlewareEntered,
-            }),
+            })),
         });
     }
 
@@ -127,11 +130,11 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type,
                 state: KeyState::HandlerInvoked,
-            }),
+            })),
         });
     }
 
@@ -148,11 +151,11 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type,
                 state: KeyState::HandlerSucceeded,
-            }),
+            })),
         });
     }
 
@@ -169,11 +172,11 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type,
                 state: KeyState::HandlerFailed,
-            }),
+            })),
         });
     }
 
@@ -190,11 +193,11 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type,
                 state: KeyState::MiddlewareExited,
-            }),
+            })),
         });
     }
 
@@ -214,7 +217,7 @@ impl TelemetrySender {
             timestamp,
             topic,
             partition,
-            data: Data::MessageSent(MessageSentEvent {
+            data: Arc::new(Data::MessageSent(MessageSentEvent {
                 event_time: Utc::now(),
                 topic,
                 partition,
@@ -223,7 +226,7 @@ impl TelemetrySender {
                 source,
                 trace_parent,
                 trace_state,
-            }),
+            })),
         });
     }
 
@@ -232,7 +235,13 @@ impl TelemetrySender {
     /// Returns a sender pre-configured for a specific topic and partition.
     #[must_use]
     pub fn for_partition(&self, topic: Topic, partition: Partition) -> TelemetryPartitionSender {
-        TelemetryPartitionSender::new(topic, partition, self.tx.clone(), self.clock.clone())
+        TelemetryPartitionSender::new(
+            topic,
+            partition,
+            self.tx.clone(),
+            self.clock.clone(),
+            self.propagator.clone(),
+        )
     }
 }
 
@@ -262,7 +271,7 @@ mod tests {
         assert_eq!(event.topic, topic);
         assert_eq!(event.partition, partition);
 
-        let Data::MessageSent(msg) = event.data else {
+        let Data::MessageSent(msg) = &*event.data else {
             bail!("expected Data::MessageSent variant");
         };
         assert_eq!(msg.topic, topic);
@@ -288,7 +297,7 @@ mod tests {
         let after = Utc::now();
 
         let event = rx.try_recv()?;
-        let Data::MessageSent(msg) = event.data else {
+        let Data::MessageSent(msg) = &*event.data else {
             bail!("expected Data::MessageSent variant");
         };
 

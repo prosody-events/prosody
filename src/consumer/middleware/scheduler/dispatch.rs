@@ -210,14 +210,14 @@ impl Selector {
             key,
             demand_type,
             state,
-        }) = data
+        }) = &*data
         else {
             return;
         };
 
-        let tp_key = TopicPartitionKey::new(topic, partition, key);
+        let tp_key = TopicPartitionKey::new(topic, partition, key.clone());
 
-        match state {
+        match *state {
             KeyState::HandlerInvoked => {
                 debug!(
                     topic = %tp_key.topic,
@@ -1510,11 +1510,11 @@ mod tests {
             timestamp: now,
             topic: TEST_TOPIC.into(),
             partition: TEST_PARTITION,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type: DemandType::Normal,
                 state: KeyState::HandlerInvoked,
-            }),
+            })),
         };
 
         selector.process_telemetry(event);
@@ -1537,11 +1537,11 @@ mod tests {
             timestamp: invoke_time,
             topic: TEST_TOPIC.into(),
             partition: TEST_PARTITION,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key: key.clone(),
                 demand_type: DemandType::Normal,
                 state: KeyState::HandlerInvoked,
-            }),
+            })),
         });
 
         let initial_success_time = selector.success_time.at(complete_time);
@@ -1551,11 +1551,11 @@ mod tests {
             timestamp: complete_time,
             topic: TEST_TOPIC.into(),
             partition: TEST_PARTITION,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type: DemandType::Normal,
                 state: KeyState::HandlerSucceeded,
-            }),
+            })),
         });
 
         // Verify success_time increased
@@ -1585,11 +1585,11 @@ mod tests {
             timestamp: invoke_time,
             topic: TEST_TOPIC.into(),
             partition: TEST_PARTITION,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key: key.clone(),
                 demand_type: DemandType::Failure,
                 state: KeyState::HandlerInvoked,
-            }),
+            })),
         });
 
         let initial_failure_time = selector.failure_time.at(complete_time);
@@ -1599,11 +1599,11 @@ mod tests {
             timestamp: complete_time,
             topic: TEST_TOPIC.into(),
             partition: TEST_PARTITION,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type: DemandType::Failure,
                 state: KeyState::HandlerFailed,
-            }),
+            })),
         });
 
         let final_failure_time = selector.failure_time.at(complete_time);
@@ -1628,22 +1628,22 @@ mod tests {
             timestamp: now,
             topic: TEST_TOPIC.into(),
             partition: TEST_PARTITION,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key: key1.clone(),
                 demand_type: DemandType::Normal,
                 state: KeyState::HandlerInvoked,
-            }),
+            })),
         });
 
         selector.process_telemetry(TelemetryEvent {
             timestamp: now + Duration::from_secs(1),
             topic: TEST_TOPIC.into(),
             partition: TEST_PARTITION,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key: key1,
                 demand_type: DemandType::Normal,
                 state: KeyState::HandlerSucceeded,
-            }),
+            })),
         });
 
         // Enqueue tasks for both keys
