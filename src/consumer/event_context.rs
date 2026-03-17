@@ -403,11 +403,7 @@ where
     ) -> Result<(), TimerManagerError<T::Error>> {
         self.run_cancellable(async |inner| {
             let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
-            // Box::pin breaks the coroutine state-machine chain: without it,
-            // the large `clear_and_schedule` future is inlined into every
-            // middleware layer's state machine, causing combinatorial stack
-            // growth that overflows under deep Pipeline nesting.
-            Box::pin(inner.timers.clear_and_schedule(trigger)).await
+            inner.timers.clear_and_schedule(trigger).await
         })
         .await
     }
