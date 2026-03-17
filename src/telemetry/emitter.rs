@@ -307,8 +307,11 @@ fn serialize_event(data: &Data, topic: &str, partition: i32, hostname: &str) -> 
     })
 }
 
-/// Returns the Kafka record key from a `Data` variant, borrowing from
-/// the inner event struct.
+/// Returns the Kafka record key from a serializable `Data` variant,
+/// borrowing from the inner event struct.
+///
+/// Must cover the same variants as [`serialize_event`]; see the test
+/// `serialize_and_event_key_cover_same_variants` for enforcement.
 fn event_key(data: &Data) -> Option<&str> {
     match data {
         Data::Timer(t) => Some(t.key.as_ref()),
@@ -388,7 +391,8 @@ pub fn spawn_telemetry_emitter(
                 let topic = telemetry_topic.clone();
                 async move {
                     // Key borrows from the Arc<Data> which stays alive for
-                    // the duration of the produce call.
+                    // the duration of the produce call. serialize_event
+                    // already filtered to variants that have a key.
                     let key = event_key(&data).unwrap_or_default();
                     let record = FutureRecord::to(&topic).key(key).payload(bytes.as_ref());
                     if let Err((e, _)) = producer.send(record, Timeout::Never).await {
@@ -843,5 +847,29 @@ mod tests {
             .ok_or_else(|| eyre!("eventTime missing"))?;
         assert_millis_format(event_time, "eventTime")?;
         Ok(())
+    }
+
+    #[test]
+    fn serialize_and_event_key_cover_same_variants() {
+        let variants: Vec<Data> = vec![
+            timer_event("k"),
+            message_event("k"),
+            message_sent_event("k"),
+            Data::Partition(PartitionEvent {
+                state: PartitionState::Assigned,
+            }),
+            Data::Key(KeyEvent {
+                key: Arc::from("k"),
+                demand_type: DemandType::Normal,
+                state: KeyState::HandlerInvoked,
+            }),
+        ];
+        for data in &variants {
+            assert_eq!(
+                serialize_event(data, "t", 0, "h").is_some(),
+                event_key(data).is_some(),
+                "serialize_event and event_key disagree on {data:?}",
+            );
+        }
     }
 }
