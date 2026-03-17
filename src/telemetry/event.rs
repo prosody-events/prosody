@@ -18,8 +18,8 @@ pub struct TelemetryEvent {
     pub topic: Topic,
     /// Partition associated with the event.
     pub partition: Partition,
-    /// Event-specific data.
-    pub data: Data,
+    /// Event-specific data (Arc-wrapped for cheap broadcast clones).
+    pub data: Arc<Data>,
 }
 
 /// Event data payload.

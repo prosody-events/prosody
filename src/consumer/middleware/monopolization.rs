@@ -371,18 +371,18 @@ async fn run_event_loop(
             }
         };
 
-        let Data::Key(KeyEvent { key, state, .. }) = event.data else {
+        let Data::Key(KeyEvent { key, state, .. }) = &*event.data else {
             continue;
         };
 
-        let tp_key = TopicPartitionKey::new(event.topic, event.partition, key);
+        let tp_key = TopicPartitionKey::new(event.topic, event.partition, key.clone());
 
         let elapsed_nanos = event
             .timestamp
             .saturating_duration_since(reference_instant)
             .as_nanos() as u64;
 
-        match state {
+        match *state {
             KeyState::HandlerInvoked => {
                 const MAX_NANOS: u64 = u64::MAX - 1;
                 let open_interval_set = [(elapsed_nanos, MAX_NANOS)].to_interval_set();
@@ -593,11 +593,11 @@ mod tests {
             timestamp,
             topic,
             partition,
-            data: Data::Key(KeyEvent {
+            data: Arc::new(Data::Key(KeyEvent {
                 key,
                 demand_type: DemandType::Normal,
                 state,
-            }),
+            })),
         }
     }
 

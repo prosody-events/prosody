@@ -4,7 +4,6 @@
 //! and produces them concurrently to a configured Kafka topic using
 //! `buffer_unordered`.
 
-use crate::Key;
 use crate::consumer::DemandType;
 use crate::error::ErrorCategory;
 use crate::telemetry::Telemetry;
@@ -288,35 +287,35 @@ fn serialize_message_sent(buf: &mut Vec<u8>, data: &MessageSentEvent, hostname: 
     json::to_writer(buf as &mut Vec<u8>, &payload).is_ok()
 }
 
-/// Serializes a `Data` variant into a thread-local buffer and returns the
-/// record key alongside owned bytes.
+/// Serializes a `Data` variant into a thread-local buffer and returns
+/// the serialized bytes.
 ///
-/// Returns `Some((key, Bytes))` for `Timer`, `Message`, and `MessageSent`
+/// Returns `Some(Bytes)` for `Timer`, `Message`, and `MessageSent`
 /// variants; `None` for internal-only variants (`Partition`, `Key`).
-fn serialize_event(
-    data: &Data,
-    topic: &str,
-    partition: i32,
-    hostname: &str,
-) -> Option<(Key, Bytes)> {
+fn serialize_event(data: &Data, topic: &str, partition: i32, hostname: &str) -> Option<Bytes> {
     SERIALIZE_BUF.with_borrow_mut(|buf| {
         buf.clear();
 
-        let (wrote, key) = match data {
-            Data::Timer(t) => (
-                serialize_timer(buf, t, topic, partition, hostname),
-                t.key.clone(),
-            ),
-            Data::Message(m) => (
-                serialize_message(buf, m, topic, partition, hostname),
-                m.key.clone(),
-            ),
-            Data::MessageSent(s) => (serialize_message_sent(buf, s, hostname), s.key.clone()),
+        let wrote = match data {
+            Data::Timer(t) => serialize_timer(buf, t, topic, partition, hostname),
+            Data::Message(m) => serialize_message(buf, m, topic, partition, hostname),
+            Data::MessageSent(s) => serialize_message_sent(buf, s, hostname),
             Data::Partition(_) | Data::Key(_) => return None,
         };
 
-        wrote.then(|| (key, Bytes::copy_from_slice(buf)))
+        wrote.then(|| Bytes::copy_from_slice(buf))
     })
+}
+
+/// Returns the Kafka record key from a `Data` variant, borrowing from
+/// the inner event struct.
+fn event_key(data: &Data) -> Option<&str> {
+    match data {
+        Data::Timer(t) => Some(t.key.as_ref()),
+        Data::Message(m) => Some(m.key.as_ref()),
+        Data::MessageSent(s) => Some(s.key.as_ref()),
+        Data::Partition(_) | Data::Key(_) => None,
+    }
 }
 
 // ── Emitter entry point
@@ -368,12 +367,15 @@ pub fn spawn_telemetry_emitter(
                 let hostname = hostname.clone();
                 async move {
                     match result {
-                        Ok(event) => serialize_event(
-                            &event.data,
-                            event.topic.as_ref(),
-                            event.partition,
-                            &hostname,
-                        ),
+                        Ok(event) => {
+                            let bytes = serialize_event(
+                                &event.data,
+                                event.topic.as_ref(),
+                                event.partition,
+                                &hostname,
+                            )?;
+                            Some((event.data, bytes))
+                        }
                         Err(BroadcastStreamRecvError::Lagged(n)) => {
                             warn!("telemetry emitter lagged, dropped {n} events");
                             None
@@ -381,13 +383,14 @@ pub fn spawn_telemetry_emitter(
                     }
                 }
             })
-            .map(|(key, bytes)| {
+            .map(|(data, bytes)| {
                 let producer = producer.clone();
                 let topic = telemetry_topic.clone();
                 async move {
-                    let record = FutureRecord::to(&topic)
-                        .key(key.as_ref())
-                        .payload(bytes.as_ref());
+                    // Key borrows from the Arc<Data> which stays alive for
+                    // the duration of the produce call.
+                    let key = event_key(&data).unwrap_or_default();
+                    let record = FutureRecord::to(&topic).key(key).payload(bytes.as_ref());
                     if let Err((e, _)) = producer.send(record, Timeout::Never).await {
                         warn!("telemetry produce error: {e}");
                     }
@@ -428,7 +431,7 @@ mod tests {
     use crate::timers::TimerType;
     use crate::timers::datetime::CompactDateTime;
     use chrono::Utc;
-    use color_eyre::eyre::{Result, bail, ensure, eyre};
+    use color_eyre::eyre::{Result, ensure, eyre};
     use std::sync::Arc;
 
     fn timer_event(key: &str) -> Data {
@@ -474,30 +477,24 @@ mod tests {
     #[test]
     fn serialize_event_timer_uses_payload_key() -> Result<()> {
         let data = timer_event("my-timer-key");
-        let Some((key, _)) = serialize_event(&data, "topic", 0, "host") else {
-            bail!("timer event should serialize");
-        };
-        ensure!(key.as_ref() == "my-timer-key");
+        ensure!(serialize_event(&data, "topic", 0, "host").is_some());
+        ensure!(event_key(&data) == Some("my-timer-key"));
         Ok(())
     }
 
     #[test]
     fn serialize_event_message_uses_payload_key() -> Result<()> {
         let data = message_event("my-message-key");
-        let Some((key, _)) = serialize_event(&data, "topic", 0, "host") else {
-            bail!("message event should serialize");
-        };
-        ensure!(key.as_ref() == "my-message-key");
+        ensure!(serialize_event(&data, "topic", 0, "host").is_some());
+        ensure!(event_key(&data) == Some("my-message-key"));
         Ok(())
     }
 
     #[test]
     fn serialize_event_message_sent_uses_payload_key() -> Result<()> {
         let data = message_sent_event("my-sent-key");
-        let Some((key, _)) = serialize_event(&data, "topic", 0, "host") else {
-            bail!("message sent event should serialize");
-        };
-        ensure!(key.as_ref() == "my-sent-key");
+        ensure!(serialize_event(&data, "topic", 0, "host").is_some());
+        ensure!(event_key(&data) == Some("my-sent-key"));
         Ok(())
     }
 
@@ -517,7 +514,7 @@ mod tests {
     }
 
     fn parse_serialized(data: &Data) -> Result<serde_json::Value> {
-        let (_, bytes) = serialize_event(data, "src-topic", 7, "test-host")
+        let bytes = serialize_event(data, "src-topic", 7, "test-host")
             .ok_or_else(|| eyre!("serialize_event returned None"))?;
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         Ok(value)

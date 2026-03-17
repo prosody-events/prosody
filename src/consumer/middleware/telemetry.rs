@@ -528,10 +528,10 @@ mod tests {
 
         // Should have invoked and succeeded events
         let has_invoked = events.iter().any(
-            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
+            |e| matches!(&*e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
         );
         let has_succeeded = events.iter().any(
-            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerSucceeded)),
+            |e| matches!(&*e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerSucceeded)),
         );
 
         assert!(has_invoked, "Should emit HandlerInvoked event");
@@ -568,10 +568,10 @@ mod tests {
 
         // Should have invoked and failed events
         let has_invoked = events.iter().any(
-            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
+            |e| matches!(&*e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
         );
         let has_failed = events.iter().any(
-            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerFailed)),
+            |e| matches!(&*e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerFailed)),
         );
 
         assert!(has_invoked, "Should emit HandlerInvoked event");
@@ -603,10 +603,10 @@ mod tests {
         }
 
         let has_invoked = events.iter().any(
-            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
+            |e| matches!(&*e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked)),
         );
         let has_succeeded = events.iter().any(
-            |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerSucceeded)),
+            |e| matches!(&*e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerSucceeded)),
         );
 
         assert!(has_invoked, "Should emit HandlerInvoked event");
@@ -669,7 +669,7 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        let dispatched = events.iter().find_map(|e| match &e.data {
+        let dispatched = events.iter().find_map(|e| match &*e.data {
             Data::Message(
                 m @ MessageTelemetryEvent {
                     event_type: MessageEventType::Dispatched { .. },
@@ -678,7 +678,7 @@ mod tests {
             ) => Some(m),
             _ => None,
         });
-        let succeeded = events.iter().find_map(|e| match &e.data {
+        let succeeded = events.iter().find_map(|e| match &*e.data {
             Data::Message(
                 m @ MessageTelemetryEvent {
                     event_type: MessageEventType::Succeeded { .. },
@@ -726,7 +726,7 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        let failed = events.iter().find_map(|e| match &e.data {
+        let failed = events.iter().find_map(|e| match &*e.data {
             Data::Message(
                 m @ MessageTelemetryEvent {
                     event_type: MessageEventType::Failed { .. },
@@ -777,7 +777,7 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        let failed = events.iter().find_map(|e| match &e.data {
+        let failed = events.iter().find_map(|e| match &*e.data {
             Data::Message(
                 m @ MessageTelemetryEvent {
                     event_type: MessageEventType::Failed { .. },
@@ -824,7 +824,7 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        let dispatched = events.iter().find_map(|e| match &e.data {
+        let dispatched = events.iter().find_map(|e| match &*e.data {
             Data::Timer(
                 t @ TimerTelemetryEvent {
                     event_type: TimerEventType::Dispatched { .. },
@@ -833,7 +833,7 @@ mod tests {
             ) => Some(t),
             _ => None,
         });
-        let succeeded = events.iter().find_map(|e| match &e.data {
+        let succeeded = events.iter().find_map(|e| match &*e.data {
             Data::Timer(
                 t @ TimerTelemetryEvent {
                     event_type: TimerEventType::Succeeded { .. },
@@ -875,7 +875,7 @@ mod tests {
 
         let events = collect_events(&mut rx);
 
-        let failed = events.iter().find_map(|e| match &e.data {
+        let failed = events.iter().find_map(|e| match &*e.data {
             Data::Timer(
                 t @ TimerTelemetryEvent {
                     event_type: TimerEventType::Failed { .. },
@@ -932,11 +932,11 @@ mod tests {
 
         let key_events: Vec<_> = events
             .iter()
-            .filter(|e| matches!(&e.data, Data::Key(_)))
+            .filter(|e| matches!(&*e.data, Data::Key(_)))
             .collect();
         let message_events: Vec<_> = events
             .iter()
-            .filter(|e| matches!(&e.data, Data::Message(_)))
+            .filter(|e| matches!(&*e.data, Data::Message(_)))
             .collect();
 
         assert_eq!(key_events.len(), 2, "Should emit 2 Key events");
@@ -945,13 +945,13 @@ mod tests {
         // Verify Key event states
         assert!(
             key_events.iter().any(
-                |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked))
+                |e| matches!(&*e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerInvoked))
             ),
             "Should have Key(HandlerInvoked)"
         );
         assert!(
             key_events.iter().any(
-                |e| matches!(&e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerSucceeded))
+                |e| matches!(&*e.data, Data::Key(ke) if matches!(ke.state, KeyState::HandlerSucceeded))
             ),
             "Should have Key(HandlerSucceeded)"
         );
@@ -959,13 +959,13 @@ mod tests {
         // Verify Message event types
         assert!(
             message_events.iter().any(
-                |e| matches!(&e.data, Data::Message(m) if matches!(m.event_type, MessageEventType::Dispatched { .. }))
+                |e| matches!(&*e.data, Data::Message(m) if matches!(m.event_type, MessageEventType::Dispatched { .. }))
             ),
             "Should have Message(Dispatched)"
         );
         assert!(
             message_events.iter().any(
-                |e| matches!(&e.data, Data::Message(m) if matches!(m.event_type, MessageEventType::Succeeded { .. }))
+                |e| matches!(&*e.data, Data::Message(m) if matches!(m.event_type, MessageEventType::Succeeded { .. }))
             ),
             "Should have Message(Succeeded)"
         );
