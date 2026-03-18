@@ -809,38 +809,44 @@ async fn filter_duplicate(
         return Some(message);
     };
 
-    match idempotence_cache.get_mut_or_guard(message.key()) {
+    // Resolve the cache lookup synchronously so the !Send RefMut is dropped
+    // before any .await (quick_cache 0.6.20 made unsync::RefMut !Send).
+    let is_duplicate = match idempotence_cache.get_mut_or_guard(message.key()) {
         // Item is not in the cache; insert it
         Err(guard) => {
             guard.insert(event_id.into());
-            Some(message)
+            false
         }
 
-        // Existing item could not be retrieved; skip it
-        Ok(None) => Some(message),
+        // Existing item could not be retrieved; not a duplicate
+        Ok(None) => false,
 
         // Item is in the cache
         Ok(Some(mut value)) => {
-            // Check if the event ID in the cache matches the message's event ID
             if value.as_str() == event_id {
-                // Record a span and skip the message
-                info_span!(
-                    parent: message.span(),
-                    "message.filtered",
-                    reason = "duplicate-event-id",
-                    event_id
-                )
-                .in_scope(|| {
-                    info!("message with id {event_id} already processed; skipping");
-                });
-
-                message.commit().await;
-                None
+                true
             } else {
                 // Update the cache with the new event ID
                 *value = event_id.into();
-                Some(message)
+                false
             }
         }
+    };
+
+    if is_duplicate {
+        info_span!(
+            parent: message.span(),
+            "message.filtered",
+            reason = "duplicate-event-id",
+            event_id
+        )
+        .in_scope(|| {
+            info!("message with id {event_id} already processed; skipping");
+        });
+
+        message.commit().await;
+        None
+    } else {
+        Some(message)
     }
 }
