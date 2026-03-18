@@ -16,7 +16,9 @@ use crate::consumer::{
     ConsumerConfigurationBuilder, ConsumerError, LowLatencyMiddlewareConfiguration,
     PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
-use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams};
+use crate::high_level::config::{
+    ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
+};
 use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::producer::{
@@ -235,6 +237,9 @@ impl<T> HighLevelClient<T> {
 
         let config = match take(consumer_ref) {
             ConsumerState::Unconfigured => return Err(HighLevelClientError::UnconfiguredConsumer),
+            ConsumerState::ConfigurationFailed(error) => {
+                return Err(HighLevelClientError::ConsumerConfiguration(error));
+            }
             ConsumerState::Configured(config) => config,
             running @ ConsumerState::Running { .. } => {
                 *consumer_ref = running;
@@ -326,7 +331,9 @@ impl<T> HighLevelClient<T> {
             let consumer_ref = &mut *guard;
 
             match take(consumer_ref) {
-                state @ (ConsumerState::Unconfigured | ConsumerState::Configured(_)) => {
+                state @ (ConsumerState::Unconfigured
+                | ConsumerState::ConfigurationFailed(_)
+                | ConsumerState::Configured(_)) => {
                     *consumer_ref = state;
                     return Err(HighLevelClientError::NotSubscribed);
                 }
@@ -457,6 +464,10 @@ pub enum HighLevelClientError {
     /// Error when attempting to use an unconfigured consumer.
     #[error("unconfigured consumer; client does not have a valid consumer configuration")]
     UnconfiguredConsumer,
+
+    /// Error when the consumer configuration failed during build.
+    #[error("consumer configuration failed: {0:#}")]
+    ConsumerConfiguration(ModeConfigurationError),
 
     /// Error when attempting to subscribe an already subscribed consumer.
     #[error("consumer is already subscribed")]
