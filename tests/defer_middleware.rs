@@ -9,13 +9,11 @@
 //!
 //! # Running Tests
 //!
-//! These tests use real Kafka and Cassandra instances. While each test uses
-//! unique resources (topics, keyspaces), Kafka consumer group coordination can
-//! cause race conditions when tests run in parallel. For reliable results, run
-//! sequentially:
+//! These tests use real Kafka and Cassandra instances. Each test uses unique
+//! resources (topics, keyspaces) so they can run in parallel:
 //!
 //! ```bash
-//! cargo test --test defer_middleware -- --test-threads=1
+//! cargo test --test defer_middleware
 //! ```
 
 use color_eyre::eyre::{Result, ensure, eyre};

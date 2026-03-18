@@ -1779,10 +1779,7 @@ async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
 
         // Verify no second timer fires (the original t+3s was replaced)
         let second = timeout(Duration::from_secs(5), timer_rx.recv()).await;
-        ensure!(
-            second.is_err(),
-            "expected no second timer but received one"
-        );
+        ensure!(second.is_err(), "expected no second timer but received one");
 
         client.unsubscribe().await?;
         admin.delete_topic(&source_topic).await?;
