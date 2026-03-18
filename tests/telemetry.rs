@@ -714,6 +714,18 @@ fn has_at_least(events: &[Value], event_type: &str, n: usize) -> bool {
     count_type(events, event_type) >= n
 }
 
+/// Returns `true` when `events` contains the two-event message invariant:
+/// dispatched + succeeded (or dispatched + failed).
+fn has_message_lifecycle(events: &[Value], expect_success: bool) -> bool {
+    let has_dispatched = has_at_least(events, "prosody.message.dispatched", 1);
+    let has_outcome = if expect_success {
+        has_at_least(events, "prosody.message.succeeded", 1)
+    } else {
+        has_at_least(events, "prosody.message.failed", 1)
+    };
+    has_dispatched && has_outcome
+}
+
 /// Returns `true` when `events` contains the three-event invariant
 /// (scheduled, dispatched, succeeded/failed) for `timer_type`.
 fn has_timer_lifecycle(events: &[Value], timer_type: &str) -> bool {
@@ -728,34 +740,44 @@ fn has_timer_lifecycle(events: &[Value], timer_type: &str) -> bool {
             || matching.contains(&"prosody.timer.failed"))
 }
 
-/// Collects all telemetry events whose `key` matches and whose `type` starts
-/// with `"prosody.message."` until idle.
+/// Collects telemetry events whose `key` matches and whose `type` starts
+/// with `"prosody.message."` until `done` returns `true` for the accumulated
+/// set.
+///
+/// Each individual `recv` is guarded by `per_event_timeout`.
 async fn collect_message_events_for_key(
     consumer: &StreamConsumer,
     key: &str,
-    idle_timeout: Duration,
+    per_event_timeout: Duration,
+    done: impl Fn(&[Value]) -> bool,
 ) -> Result<Vec<Value>> {
     let mut events = Vec::new();
     loop {
-        match timeout(idle_timeout, consumer.recv()).await {
-            Ok(Ok(msg)) => {
-                let Some(payload) = msg.payload() else {
-                    continue;
-                };
-                let Ok(value) = serde_json::from_slice::<Value>(payload) else {
-                    continue;
-                };
-                let matches_key = value.get("key").and_then(Value::as_str) == Some(key);
-                let is_message = value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t.starts_with("prosody.message."));
-                if matches_key && is_message {
-                    events.push(value);
-                }
-            }
-            Err(_) => break,
-            Ok(Err(e)) => return Err(e.into()),
+        if done(&events) {
+            break;
+        }
+        let msg = timeout(per_event_timeout, consumer.recv())
+            .await
+            .map_err(|_| {
+                eyre!(
+                    "timed out waiting for message events for key {key:?}; collected so far: \
+                     {events:?}",
+                )
+            })?
+            .map_err(|e| eyre!("consumer error: {e}"))?;
+        let Some(payload) = msg.payload() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+            continue;
+        };
+        let matches_key = value.get("key").and_then(Value::as_str) == Some(key);
+        let is_message = value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with("prosody.message."));
+        if matches_key && is_message {
+            events.push(value);
         }
     }
     Ok(events)
@@ -1032,9 +1054,13 @@ async fn message_lifecycle_events_on_kafka() -> Result<()> {
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
-        let events =
-            collect_message_events_for_key(&telemetry_consumer, "test-key", RECEIVE_TIMEOUT)
-                .await?;
+        let events = collect_message_events_for_key(
+            &telemetry_consumer,
+            "test-key",
+            RECEIVE_TIMEOUT,
+            |evts| has_message_lifecycle(evts, true),
+        )
+        .await?;
         assert_message_two_event_invariant(&events, true)?;
 
         client.unsubscribe().await?;
@@ -1306,9 +1332,13 @@ async fn message_failed_event_on_kafka() -> Result<()> {
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, fail_rx.recv()).await?;
 
-        let events =
-            collect_message_events_for_key(&telemetry_consumer, "fail-key", RECEIVE_TIMEOUT)
-                .await?;
+        let events = collect_message_events_for_key(
+            &telemetry_consumer,
+            "fail-key",
+            RECEIVE_TIMEOUT,
+            |evts| has_message_lifecycle(evts, false),
+        )
+        .await?;
         assert_message_two_event_invariant(&events, false)?;
 
         client.unsubscribe().await?;
