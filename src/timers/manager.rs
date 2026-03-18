@@ -7,9 +7,11 @@
 //! - **Background Slab Loader**: Preloads upcoming timer slabs.
 //! - **In-Memory Scheduler**: Precise, delay-queue based timer dispatch.
 //! - **Application**: Delivers timers as an async stream of [`PendingTimer`].
-//! - **Global Backpressure**: A shared [`tokio::sync::Semaphore`] bounds
-//!   in-flight timer events across all partitions; the stream blocks when all
-//!   permits are held and terminates if the semaphore is closed.
+//! - **Per-Type Backpressure**: A [`TimerSemaphores`] array provides one
+//!   [`tokio::sync::Semaphore`] per [`TimerType`] variant, bounding in-flight
+//!   timer events independently so retry timers cannot starve application
+//!   timers; the stream blocks when all permits for a type are held and
+//!   terminates if the semaphore is closed.
 //!
 //! The manager ensures timers survive restarts, supports distributed ownership,
 //! and provides at-least-once delivery semantics for timer events.
@@ -26,13 +28,13 @@ use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
 use crate::timers::store::{Segment, TriggerStore};
-use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerType, Trigger};
+use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerSemaphores, TimerType, Trigger};
 use async_stream::stream;
 use educe::Educe;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::sync::Arc;
 use tokio::spawn;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span, debug};
 
@@ -102,9 +104,9 @@ where
     ///   liveness.
     /// * `shutdown_rx` - Watch channel signaling partition shutdown; the slab
     ///   loader exits when this becomes `true`.
-    /// * `semaphore` - Global semaphore bounding in-flight timer events across
-    ///   all partitions; the timer stream blocks when all permits are held and
-    ///   terminates if the semaphore is closed.
+    /// * `semaphores` - Per-type semaphores bounding in-flight timer events
+    ///   across all partitions; the timer stream blocks when all permits for
+    ///   the trigger's type are held and terminates if the semaphore is closed.
     ///
     /// # Returns
     ///
@@ -121,7 +123,7 @@ where
         config: TimerManagerConfig<T>,
         heartbeats: HeartbeatRegistry,
         shutdown_rx: watch::Receiver<bool>,
-        semaphore: Arc<Semaphore>,
+        semaphores: Arc<TimerSemaphores>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
         let segment = get_or_create_segment(&config.store, &config.name).await?;
@@ -150,13 +152,14 @@ where
         let cloned_manager = manager.clone();
 
         // Wrap the scheduler receiver into a PendingTimer stream, acquiring a
-        // semaphore permit per timer to bound global in-flight timer events.
+        // per-type semaphore permit per timer to bound in-flight timer events.
         // If the semaphore is closed the stream terminates rather than
         // silently dropping timers.
         let timer_stream = stream! {
             let mut receiver = ReceiverStream::new(trigger_rx);
             while let Some(trigger) = receiver.next().await {
-                let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                let semaphore = semaphores[trigger.timer_type as usize].clone();
+                let Ok(permit) = semaphore.acquire_owned().await else {
                     break;
                 };
                 yield PendingTimer::new(trigger, cloned_manager.clone(), permit);
@@ -830,6 +833,7 @@ mod tests {
     use crate::Topic;
     use crate::consumer::{Keyed, Uncommitted};
     use crate::telemetry::Telemetry;
+    use crate::timers::TimerSemaphores;
     use crate::timers::UncommittedTimer;
     use crate::timers::duration::CompactDuration;
     use crate::timers::store::SegmentVersion;
@@ -838,11 +842,18 @@ mod tests {
     use crate::timers::uncommitted::UncommittedTriggerGuard;
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, pin_mut};
+    use std::array::from_fn;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Semaphore, watch};
 
     const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+
+    fn test_semaphores() -> Arc<TimerSemaphores> {
+        Arc::new(from_fn(|_| {
+            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE))
+        }))
+    }
 
     use tokio::task;
     use tokio::time::{self, advance, timeout};
@@ -898,7 +909,7 @@ mod tests {
             config,
             HeartbeatRegistry::test(),
             shutdown_rx,
-            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
+            test_semaphores(),
         )
         .await
         .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
@@ -950,7 +961,7 @@ mod tests {
             config,
             HeartbeatRegistry::test(),
             shutdown_rx,
-            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
+            test_semaphores(),
         )
         .await;
 

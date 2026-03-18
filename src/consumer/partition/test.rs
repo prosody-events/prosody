@@ -12,6 +12,7 @@ use crate::tracing::init_test_logging;
 use aho_corasick::StartKind;
 use crossbeam_utils::CachePadded;
 use serde_json::json;
+use std::array::from_fn;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -39,7 +40,7 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider> {
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
         trigger_provider: InMemoryTriggerStoreProvider::new(),
         timer_slab_size: CompactDuration::new(30),
-        timer_semaphore: Arc::new(Semaphore::new(10)),
+        timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(10)))),
         telemetry_sender: Telemetry::new().sender(),
     }
 }

@@ -419,6 +419,7 @@ mod tests {
     use crate::consumer::Uncommitted;
     use crate::heartbeat::HeartbeatRegistry;
     use crate::telemetry::Telemetry;
+    use crate::timers::TimerSemaphores;
     use crate::timers::duration::CompactDuration;
     use crate::timers::manager::{TimerManager, TimerManagerConfig};
     use crate::timers::store::adapter::TableAdapter;
@@ -426,11 +427,18 @@ mod tests {
     use crate::timers::store::{Segment, SegmentVersion};
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, pin_mut};
+    use std::array::from_fn;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Semaphore, watch};
 
     const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+
+    fn test_semaphores() -> Arc<TimerSemaphores> {
+        Arc::new(from_fn(|_| {
+            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE))
+        }))
+    }
 
     use tokio::task;
     use tokio::time::{self, advance};
@@ -469,7 +477,7 @@ mod tests {
             config,
             HeartbeatRegistry::test(),
             shutdown_rx,
-            Arc::new(Semaphore::new(TEST_TIMER_SEMAPHORE_SIZE)),
+            test_semaphores(),
         )
         .await
         .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;

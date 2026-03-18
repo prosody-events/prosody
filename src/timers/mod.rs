@@ -58,6 +58,8 @@ use arc_swap::ArcSwap;
 use educe::Educe;
 use serde::Serialize;
 use std::sync::Arc;
+use strum::EnumCount;
+use tokio::sync::Semaphore;
 use tracing::Span;
 
 mod active;
@@ -88,6 +90,7 @@ pub mod uncommitted;
     Ord,
     PartialOrd,
     Serialize,
+    strum::EnumCount,
     strum::VariantArray,
 )]
 #[serde(rename_all = "camelCase")]
@@ -120,6 +123,9 @@ impl TryFrom<i8> for TimerType {
         }
     }
 }
+
+/// One semaphore per [`TimerType`] variant, indexed by `timer_type as usize`.
+pub type TimerSemaphores = [Arc<Semaphore>; TimerType::COUNT];
 
 /// Scheduled timer event containing execution metadata.
 ///
