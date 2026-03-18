@@ -1,7 +1,7 @@
 //! Internal trait for primitive storage operations.
 //!
 //! This module defines the `TriggerOperations` trait used by Cassandra and
-//! Memory implementations. It provides 20 primitive methods that operate on
+//! Memory implementations. It provides 22 primitive methods that operate on
 //! individual tables without coordinating across tables.
 //!
 //! **Not part of the public API.** Use `TriggerStore` instead.
@@ -20,7 +20,7 @@ use std::ops::RangeInclusive;
 
 /// Internal trait for primitive storage operations.
 ///
-/// This trait provides 20 primitive methods that operate on individual
+/// This trait provides 22 primitive methods that operate on individual
 /// tables without coordinating across tables. It is the trait bound for
 /// `TableAdapter<T>`, which is part of the public API.
 ///

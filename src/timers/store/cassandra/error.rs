@@ -41,15 +41,6 @@ pub enum CassandraTriggerStoreError {
         configured_slab_size: CompactDuration,
     },
 
-    /// Segment disappeared during data migration.
-    #[error("Segment {segment_id} disappeared during {operation}")]
-    SegmentDisappeared {
-        /// The ID of the segment that disappeared.
-        segment_id: SegmentId,
-        /// The operation that was being performed when the segment disappeared.
-        operation: &'static str,
-    },
-
     /// Invalid timer type value in database.
     #[error("Invalid timer type: {0:#}")]
     Parse(#[from] ParseError),
@@ -73,10 +64,6 @@ impl ClassifyError for CassandraTriggerStoreError {
             Self::SlabSizeMismatch { .. } | Self::AbsentStateNotSerializable => {
                 ErrorCategory::Terminal
             }
-
-            // Segment disappeared during data migration, likely due to concurrent deletion or
-            // race condition. Retrying might succeed if segment reappears or operation completes.
-            Self::SegmentDisappeared { .. } => ErrorCategory::Transient,
 
             Self::Parse(e) => e.classify_error(),
         }

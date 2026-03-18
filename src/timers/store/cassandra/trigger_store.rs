@@ -765,14 +765,15 @@ impl TriggerOperations for CassandraTriggerStore {
                             span: span_map,
                         });
 
-                        // Concurrent: set inline state + delete remaining clustering row.
-                        tokio::try_join!(
-                            self.set_state_inline(&segment_id, key, timer_type, &new_state),
-                            self.execute_unpaged_discard(
-                                &self.queries().delete_key_trigger,
-                                (&segment_id, key.as_ref(), timer_type, confirmed_time),
-                            )
-                        )?;
+                        // Atomic batch: set inline state + delete remaining clustering row.
+                        self.batch_demote_to_inline(
+                            &segment_id,
+                            key,
+                            timer_type,
+                            confirmed_time,
+                            &new_state,
+                        )
+                        .await?;
 
                         *guard = new_state;
                     }

@@ -300,6 +300,12 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
+        /// Sets overflow state marker (static column only) with TTL
+        set_state_overflow_with_ttl: (
+            "UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
         /// Reads up to 2 remaining trigger times for a key/type (demotion check)
         count_key_triggers: (
             "SELECT time FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 2",
@@ -330,13 +336,35 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
+        /// BATCH: Delete a single clustering row and set inline state with TTL.
+        /// Used for Overflow→Inline demotion when exactly 1 clustering row remains.
+        batch_demote_to_inline: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Delete a single clustering row and set inline state without TTL.
+        /// Used for Overflow→Inline demotion when exactly 1 clustering row remains.
+        batch_demote_to_inline_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
         /// BATCH: Insert two clustering rows (promoted + new) and set overflow state with TTL.
-        /// Per-statement USING TTL applies to each INSERT; the UPDATE has no TTL.
+        /// Per-statement USING TTL on each INSERT and the UPDATE so all three expire together,
+        /// preventing zombie markers if those rows expire via TTL without explicit deletion.
+        /// Uses named markers because the 17 bind values exceed the 16-element tuple limit.
         batch_promote_and_set_overflow: (
             "BEGIN UNLOGGED BATCH \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?; \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?; \
-             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (:p_segment_id, :p_key, :p_timer_type, :p_time, :p_span) USING TTL :p_ttl; \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (:n_segment_id, :n_key, :n_timer_type, :n_time, :n_span) USING TTL :n_ttl; \
+             UPDATE $keyspace.{} USING TTL :s_ttl SET state[:s_timer_type] = :s_state WHERE segment_id = :s_segment_id AND key = :s_key; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),

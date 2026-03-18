@@ -39,7 +39,7 @@ use uuid::Uuid;
 pub mod cassandra;
 pub mod memory;
 
-/// Internal primitive operations trait (20 methods).
+/// Internal primitive operations trait (22 methods).
 ///
 /// The trait itself is `pub` to satisfy Rust's visibility rules (used in public
 /// `TableAdapter`), but is not re-exported, keeping it effectively internal.
@@ -201,12 +201,12 @@ pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
 /// Storage backends can implement this trait in two ways:
 ///
 /// 1. **Via `TableAdapter`** (recommended for most backends):
-///    - Implement internal `TriggerOperations` trait (20 primitive methods)
+///    - Implement internal `TriggerOperations` trait (22 primitive methods)
 ///    - Wrap in `TableAdapter<T>` which implements `TriggerStore`
 ///    - Best-effort consistency using parallel execution
 ///
 /// 2. **Direct implementation** (for transactional backends):
-///    - Implement `TriggerStore` directly (9 methods)
+///    - Implement `TriggerStore` directly (13 methods)
 ///    - Use database transactions for atomic dual-table operations
 ///    - Provides ACID guarantees
 ///

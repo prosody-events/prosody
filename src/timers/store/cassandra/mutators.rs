@@ -29,11 +29,40 @@ use crate::timers::store::cassandra::state::{
 };
 use crate::timers::store::cassandra::trigger_store::extract_span_map;
 use crate::timers::{TimerType, Trigger};
+use scylla::SerializeRow;
 use scylla::errors::MaybeFirstRowError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::instrument;
+
+/// Bind values for `batch_promote_and_set_overflow` (TTL variant).
+///
+/// The TTL variant requires 17 bind values which exceeds the 16-element
+/// `SerializeRow` tuple limit, so a named-marker struct is used instead.
+#[derive(SerializeRow)]
+struct PromoteOverflowParams<'a> {
+    // INSERT 1: promoted timer
+    p_segment_id: &'a SegmentId,
+    p_key: &'a str,
+    p_timer_type: TimerType,
+    p_time: CompactDateTime,
+    p_span: &'a HashMap<String, String>,
+    p_ttl: i32,
+    // INSERT 2: new timer
+    n_segment_id: &'a SegmentId,
+    n_key: &'a str,
+    n_timer_type: TimerType,
+    n_time: CompactDateTime,
+    n_span: &'a HashMap<String, String>,
+    n_ttl: i32,
+    // UPDATE: state
+    s_ttl: i32,
+    s_timer_type: TimerType,
+    s_state: &'a TimerState,
+    s_segment_id: &'a SegmentId,
+    s_key: &'a str,
+}
 
 impl CassandraTriggerStore {
     /// Fetches the `state` map from the database.
@@ -186,6 +215,65 @@ impl CassandraTriggerStore {
         .await
     }
 
+    /// Atomically deletes a single clustering row and sets inline state.
+    ///
+    /// Uses a Cassandra BATCH to:
+    /// 1. DELETE the specific clustering row identified by `time_to_delete`
+    /// 2. UPDATE the `state[type]` with the new inline timer data
+    ///
+    /// Both statements target the same `(segment_id, key)` partition, so an
+    /// unlogged batch is correct and carries no cross-partition overhead.
+    /// This is the Overflow→Inline demotion path when exactly 1 clustering
+    /// row remains after a delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the database batch execution fails.
+    #[instrument(level = "debug", skip(self), err)]
+    pub(super) async fn batch_demote_to_inline(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+        time_to_delete: CompactDateTime,
+        state: &TimerState,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        let TimerState::Inline(timer) = state else {
+            return Err(CassandraTriggerStoreError::AbsentStateNotSerializable);
+        };
+        self.execute_with_optional_ttl(
+            timer.time,
+            &self.queries().batch_demote_to_inline,
+            &self.queries().batch_demote_to_inline_no_ttl,
+            |ttl| {
+                (
+                    segment_id,
+                    key.as_ref(),
+                    timer_type,
+                    time_to_delete,
+                    ttl,
+                    timer_type,
+                    state,
+                    segment_id,
+                    key.as_ref(),
+                )
+            },
+            || {
+                (
+                    segment_id,
+                    key.as_ref(),
+                    timer_type,
+                    time_to_delete,
+                    timer_type,
+                    state,
+                    segment_id,
+                    key.as_ref(),
+                )
+            },
+        )
+        .await
+    }
+
     /// Sets inline timer state (static column only) without touching clustering
     /// rows.
     ///
@@ -220,6 +308,9 @@ impl CassandraTriggerStore {
     /// Sets overflow state marker for a key/type.
     ///
     /// Writes `{inline: false, time: null, span: null}` to the state column.
+    /// A TTL is applied (derived from `ttl_time`) so the marker expires no
+    /// later than the clustering rows it describes, preventing zombie Overflow
+    /// entries if those rows expire via TTL without an explicit deletion.
     ///
     /// # Errors
     ///
@@ -230,16 +321,24 @@ impl CassandraTriggerStore {
         segment_id: &SegmentId,
         key: &Key,
         timer_type: TimerType,
+        ttl_time: CompactDateTime,
     ) -> Result<(), CassandraTriggerStoreError> {
-        self.session()
-            .execute_unpaged(
-                &self.queries().set_state_overflow,
-                (timer_type, &TimerState::Overflow, segment_id, key.as_ref()),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?;
-
-        Ok(())
+        self.execute_with_optional_ttl(
+            ttl_time,
+            &self.queries().set_state_overflow_with_ttl,
+            &self.queries().set_state_overflow,
+            |ttl| {
+                (
+                    ttl,
+                    timer_type,
+                    &TimerState::Overflow,
+                    segment_id,
+                    key.as_ref(),
+                )
+            },
+            || (timer_type, &TimerState::Overflow, segment_id, key.as_ref()),
+        )
+        .await
     }
 
     /// Removes a state entry for a single timer type (returns to Absent).
@@ -393,18 +492,16 @@ impl CassandraTriggerStore {
                     span: span_map,
                 });
 
-                // Concurrent: write inline state + delete clustering row.
-                tokio::try_join!(
-                    self.set_state_inline(segment_id, key, timer_type, &state),
-                    self.execute_unpaged_discard(
-                        &self.queries().delete_key_trigger,
-                        (segment_id, key.as_ref(), timer_type, confirmed_time),
-                    )
-                )?;
+                // Atomic batch: write inline state + delete clustering row.
+                self.batch_demote_to_inline(segment_id, key, timer_type, confirmed_time, &state)
+                    .await?;
             }
             _ => {
-                // ≥2 rows: mark as overflow.
-                self.set_state_overflow(segment_id, key, timer_type).await?;
+                // ≥2 rows: mark as overflow, anchoring TTL to the latest
+                // clustering row so the marker expires with the data it describes.
+                let ttl_time = times.iter().copied().max().unwrap_or(times[0]);
+                self.set_state_overflow(segment_id, key, timer_type, ttl_time)
+                    .await?;
             }
         }
 
@@ -423,9 +520,11 @@ impl CassandraTriggerStore {
     /// overhead. This is the safe path for the Inline→Overflow transition.
     ///
     /// TTL is computed from the later of the two trigger times so that neither
-    /// clustering row expires before the other timer fires. The batch-level
-    /// `USING TTL` applies to both INSERTs; the state UPDATE carries no TTL,
-    /// matching the behaviour of the standalone `set_state_overflow` call.
+    /// clustering row expires before the other timer fires. The same TTL is
+    /// applied to both INSERTs and to the state UPDATE, so the Overflow marker
+    /// expires together with the last clustering row it describes — preventing
+    /// zombie markers if those rows later expire via TTL without explicit
+    /// deletion.
     ///
     /// # Errors
     ///
@@ -441,50 +540,60 @@ impl CassandraTriggerStore {
     ) -> Result<(), CassandraTriggerStoreError> {
         let overflow_state = TimerState::Overflow;
         let ttl_time = promoted.time.max(new.time);
-        self.execute_with_optional_ttl(
-            ttl_time,
-            &self.queries().batch_promote_and_set_overflow,
-            &self.queries().batch_promote_and_set_overflow_no_ttl,
-            |ttl| {
-                (
-                    segment_id,
-                    key.as_ref(),
-                    timer_type,
-                    promoted.time,
-                    promoted.span,
-                    ttl,
-                    segment_id,
-                    key.as_ref(),
-                    timer_type,
-                    new.time,
-                    new.span,
-                    ttl,
-                    timer_type,
-                    &overflow_state,
-                    segment_id,
-                    key.as_ref(),
+        let key_ref = key.as_ref();
+
+        // The TTL variant has 17 bind values which exceeds the 16-element
+        // `SerializeRow` tuple limit, so `PromoteOverflowParams` is used
+        // instead of `execute_with_optional_ttl`.
+        match self.calculate_ttl(ttl_time) {
+            Some(ttl) => {
+                self.execute_unpaged_discard(
+                    &self.queries().batch_promote_and_set_overflow,
+                    PromoteOverflowParams {
+                        p_segment_id: segment_id,
+                        p_key: key_ref,
+                        p_timer_type: timer_type,
+                        p_time: promoted.time,
+                        p_span: promoted.span,
+                        p_ttl: ttl,
+                        n_segment_id: segment_id,
+                        n_key: key_ref,
+                        n_timer_type: timer_type,
+                        n_time: new.time,
+                        n_span: new.span,
+                        n_ttl: ttl,
+                        s_ttl: ttl,
+                        s_timer_type: timer_type,
+                        s_state: &overflow_state,
+                        s_segment_id: segment_id,
+                        s_key: key_ref,
+                    },
                 )
-            },
-            || {
-                (
-                    segment_id,
-                    key.as_ref(),
-                    timer_type,
-                    promoted.time,
-                    promoted.span,
-                    segment_id,
-                    key.as_ref(),
-                    timer_type,
-                    new.time,
-                    new.span,
-                    timer_type,
-                    &overflow_state,
-                    segment_id,
-                    key.as_ref(),
+                .await
+            }
+            None => {
+                self.execute_unpaged_discard(
+                    &self.queries().batch_promote_and_set_overflow_no_ttl,
+                    (
+                        segment_id,
+                        key_ref,
+                        timer_type,
+                        promoted.time,
+                        promoted.span,
+                        segment_id,
+                        key_ref,
+                        timer_type,
+                        new.time,
+                        new.span,
+                        timer_type,
+                        &overflow_state,
+                        segment_id,
+                        key_ref,
+                    ),
                 )
-            },
-        )
-        .await
+                .await
+            }
+        }
     }
 
     /// Inserts a trigger into clustering columns only.

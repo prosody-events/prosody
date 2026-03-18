@@ -1,8 +1,8 @@
 //! Adapts `TriggerOperations` to implement `TriggerStore`.
 //!
 //! This module provides the `TableAdapter` struct that wraps a type
-//! implementing `TriggerOperations` (20 primitive methods) and provides the
-//! public `TriggerStore` interface (9 methods) with coordinated dual-table
+//! implementing `TriggerOperations` (22 primitive methods) and provides the
+//! public `TriggerStore` interface (13 methods) with coordinated dual-table
 //! operations.
 
 use crate::Key;
@@ -23,8 +23,8 @@ use tracing::{debug, instrument};
 
 /// Adapts `TriggerOperations` to implement `TriggerStore`.
 ///
-/// This struct wraps a type implementing `TriggerOperations` (20 primitive
-/// methods) and provides the public `TriggerStore` interface (9 methods)
+/// This struct wraps a type implementing `TriggerOperations` (22 primitive
+/// methods) and provides the public `TriggerStore` interface (13 methods)
 /// with coordinated dual-table operations.
 ///
 /// Uses `Arc` for cheap cloning and best-effort consistency via `try_join!`.
