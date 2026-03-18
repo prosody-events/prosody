@@ -60,7 +60,7 @@ simd-json = { version = "0.17", features = ["serde_impl"], optional = true }
 smallvec = { version = "1.15", features = ["const_generics", "union"] }
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["macros", "parking_lot", "sync"] }
+tokio = { version = "1.50", features = ["macros", "parking_lot", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["time"] }
 tracing = "0.1"
@@ -69,7 +69,7 @@ tracing-subscriber = { version = "0.3", features = [
     "env-filter",
     "parking_lot",
 ] }
-uuid = { version = "1.21", features = ["v5"] }
+uuid = { version = "1.22", features = ["v5"] }
 validator = { version = "0.20", features = ["derive"] }
 whoami = "2.1"
 
@@ -134,11 +134,11 @@ empty_structs_with_brackets = "warn"
 error_impl_error = "warn"
 exit = "warn"
 expect_used = "deny"
-large_futures = "warn"
 format_push_string = "warn"
 if_then_some_else_none = "warn"
 impl_trait_in_params = "warn"
 implicit_clone = "warn"
+large_futures = "warn"
 missing_assert_message = "warn"
 module_name_repetitions = "allow"
 multiple_inherent_impl = "warn"
