@@ -448,6 +448,10 @@ pub struct HighLevelModel {
     slab_index: HashMap<(SegmentId, SlabId, TimerType), BTreeSet<TriggerTuple>>,
     /// Triggers indexed by (`segment_id`, key, `timer_type`).
     key_index: HashMap<(SegmentId, Key, TimerType), BTreeSet<TriggerTuple>>,
+    /// Slab metadata registry — tracks which slab IDs have been registered
+    /// via `insert_slab`. `delete_slab` removes entries here, mirroring the
+    /// real store where slab metadata is separate from trigger data.
+    slab_registry: HashMap<SegmentId, BTreeSet<SlabId>>,
 }
 
 impl Default for HighLevelModel {
@@ -463,6 +467,7 @@ impl HighLevelModel {
         Self {
             slab_index: HashMap::default(),
             key_index: HashMap::default(),
+            slab_registry: HashMap::default(),
         }
     }
 
@@ -487,6 +492,12 @@ impl HighLevelModel {
                     .entry((segment.id, trigger.key.clone(), trigger.timer_type))
                     .or_default()
                     .insert(tuple);
+
+                // Register slab metadata
+                self.slab_registry
+                    .entry(segment.id)
+                    .or_default()
+                    .insert(slab.id());
             }
             HighLevelOperation::RemoveTrigger {
                 segment,
@@ -552,19 +563,29 @@ impl HighLevelModel {
                     .entry((segment.id, key.clone(), timer_type))
                     .or_default()
                     .insert(tuple);
+
+                // Register new slab metadata
+                self.slab_registry
+                    .entry(segment.id)
+                    .or_default()
+                    .insert(new_slab.id());
             }
-            HighLevelOperation::DeleteSlab { .. }
-            | HighLevelOperation::GetSlabTriggersAllTypes { .. }
+            HighLevelOperation::DeleteSlab {
+                segment_id,
+                slab_id,
+            } => {
+                // delete_slab only removes slab metadata, NOT triggers.
+                // Triggers remain in both slab_triggers and key_triggers tables
+                // until explicitly removed with remove_trigger.
+                if let Some(slabs) = self.slab_registry.get_mut(segment_id) {
+                    slabs.remove(slab_id);
+                }
+            }
+            HighLevelOperation::GetSlabTriggersAllTypes { .. }
             | HighLevelOperation::GetKeyTimes { .. }
             | HighLevelOperation::GetKeyTriggers { .. }
             | HighLevelOperation::GetSlabRange { .. } => {
-                // delete_slab only removes slab metadata, NOT triggers
-                // Triggers remain in both slab_triggers and key_triggers tables
-                // until explicitly removed with remove_trigger
-                // The model tracks trigger data, not metadata, so this is a
-                // no-op
-                //
-                // Query operations also don't modify state
+                // Query operations don't modify state
             }
         }
     }
@@ -728,10 +749,12 @@ where
     S::Error: Debug,
 {
     let expected: BTreeSet<SlabId> = model
-        .slab_index
-        .keys()
-        .filter(|(seg_id, slab_id, _)| *seg_id == *segment_id && range.contains(slab_id))
-        .map(|(_, slab_id, _)| *slab_id)
+        .slab_registry
+        .get(segment_id)
+        .into_iter()
+        .flatten()
+        .filter(|slab_id| range.contains(slab_id))
+        .copied()
         .collect();
 
     let actual: Vec<SlabId> = store
