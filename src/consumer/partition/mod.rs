@@ -23,7 +23,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerStoreProvider};
-use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig};
+use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores};
 use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
 use ahash::RandomState;
 use aho_corasick::{AhoCorasick, Anchored, Input};
@@ -43,7 +43,7 @@ use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
@@ -120,8 +120,9 @@ pub struct PartitionConfiguration<P> {
     /// Timer slab size
     pub timer_slab_size: CompactDuration,
 
-    /// Global semaphore bounding in-flight timer events across all partitions
-    pub timer_semaphore: Arc<Semaphore>,
+    /// Per-type semaphores bounding in-flight timer events across all
+    /// partitions
+    pub timer_semaphores: Arc<TimerSemaphores>,
 
     /// Telemetry sender for creating partition-scoped telemetry senders
     pub telemetry_sender: TelemetrySender,
@@ -340,7 +341,7 @@ struct TimerInitContext<'a> {
     name: &'a str,
     telemetry_sender: &'a TelemetrySender,
     group_id: &'a Arc<str>,
-    timer_semaphore: &'a Arc<Semaphore>,
+    timer_semaphores: &'a Arc<TimerSemaphores>,
     partition_info: &'a PartitionInfo,
     heartbeats: &'a HeartbeatRegistry,
     shutdown_rx: &'a watch::Receiver<bool>,
@@ -371,7 +372,7 @@ where
             timer_config,
             ctx.heartbeats.clone(),
             ctx.shutdown_rx.clone(),
-            ctx.timer_semaphore.clone(),
+            ctx.timer_semaphores.clone(),
         )
         .await
         {
@@ -392,7 +393,7 @@ struct PartitionParams {
     idempotence_cache_size: usize,
     allowed_events: Option<AhoCorasick>,
     shutdown_timeout: Duration,
-    timer_semaphore: Arc<Semaphore>,
+    timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     name: String,
 }
@@ -417,7 +418,7 @@ async fn handle_messages<T, P>(
         shutdown_timeout,
         trigger_provider,
         timer_slab_size,
-        timer_semaphore,
+        timer_semaphores,
         telemetry_sender,
         ..
     } = config;
@@ -438,7 +439,7 @@ async fn handle_messages<T, P>(
         idempotence_cache_size,
         allowed_events,
         shutdown_timeout,
-        timer_semaphore,
+        timer_semaphores,
         telemetry_sender,
         name,
     };
@@ -462,7 +463,7 @@ async fn run_partition<T, S>(
         idempotence_cache_size,
         allowed_events,
         shutdown_timeout,
-        timer_semaphore,
+        timer_semaphores,
         telemetry_sender,
         name,
     } = params;
@@ -490,7 +491,7 @@ async fn run_partition<T, S>(
         name: &name,
         telemetry_sender: &telemetry_sender,
         group_id: &group_id,
-        timer_semaphore: &timer_semaphore,
+        timer_semaphores: &timer_semaphores,
         partition_info: &partition_info,
         heartbeats: &heartbeats,
         shutdown_rx: &shutdown_rx,

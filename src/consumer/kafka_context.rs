@@ -17,6 +17,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rdkafka::ClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
+use std::array::from_fn;
 use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use crate::Topic;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
 use crate::telemetry::sender::TelemetrySender;
+use crate::timers::TimerSemaphores;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStoreProvider;
 
@@ -93,7 +95,9 @@ where
             CompactDuration::new(10 * 60)
         });
 
-        let timer_semaphore = Arc::new(Semaphore::new(config.max_uncommitted));
+        let timer_semaphores: Arc<TimerSemaphores> = Arc::new(from_fn(|_| {
+            Arc::new(Semaphore::new(config.max_uncommitted))
+        }));
 
         let config = PartitionConfiguration {
             group_id: Arc::from(config.group_id.as_str()),
@@ -106,7 +110,7 @@ where
             watermark_version,
             trigger_provider,
             timer_slab_size,
-            timer_semaphore,
+            timer_semaphores,
             telemetry_sender: telemetry.clone(),
         };
 
