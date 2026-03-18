@@ -347,6 +347,73 @@ impl FallibleHandler for ClearAndScheduleHandler {
     async fn shutdown(self) {}
 }
 
+/// Handler that schedules a timer on first message, then calls
+/// `clear_and_schedule` on second message and reports both the replacement
+/// time and the actual trigger time so the test can verify the inline
+/// replacement path.
+#[derive(Clone)]
+struct InlineReplacementHandler {
+    messages: Sender<String>,
+    replacement_time: Sender<CompactDateTime>,
+    timer_fired: Sender<CompactDateTime>,
+}
+
+impl FallibleHandler for InlineReplacementHandler {
+    type Error = TestError;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        msg: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let key = msg.key().to_string();
+        let step = msg
+            .payload()
+            .get("step")
+            .and_then(Value::as_i64)
+            .ok_or(TestError)?;
+
+        if step == 1 {
+            let schedule_time = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(3)))
+                .map_err(|_| TestError)?;
+            ctx.schedule(schedule_time, TimerType::Application)
+                .await
+                .map_err(|_| TestError)?;
+        } else {
+            let new_time = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(5)))
+                .map_err(|_| TestError)?;
+            ctx.clear_and_schedule(new_time, TimerType::Application)
+                .await
+                .map_err(|_| TestError)?;
+            let _ = self.replacement_time.send(new_time).await;
+        }
+
+        let _ = self.messages.send(key).await;
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let _ = self.timer_fired.send(trigger.time).await;
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
 /// Test error type that classifies as transient.
 #[derive(Debug, Clone)]
 struct TransientError;
@@ -1639,6 +1706,82 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
             cancelled_count >= 1,
             "expected at least 1 cancelled event (old timer cleared); got {cancelled_count}; \
              types: {types:?}"
+        );
+
+        client.unsubscribe().await?;
+        admin.delete_topic(&source_topic).await?;
+        admin.delete_topic(&telemetry_topic).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
+}
+
+/// Verifies the Inline→Inline tombstone-free timer replacement path:
+/// `schedule` followed by `clear_and_schedule` on the same key results in
+/// exactly one timer firing at the replacement time.
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
+    timeout(TIMER_TEST_TIMEOUT, async {
+        init_test_logging();
+
+        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
+        let telemetry_topic = Uuid::new_v4().to_string();
+        let source_topic = Uuid::new_v4().to_string();
+        let source: Topic = source_topic.as_str().into();
+
+        create_topic(admin, &telemetry_topic).await?;
+        create_topic(admin, &source_topic).await?;
+
+        let client: HighLevelClient<InlineReplacementHandler> =
+            build_typed_client(&source_topic, &telemetry_topic)?;
+
+        let (messages, mut msg_rx) = channel(16);
+        let (replacement_time, mut replacement_time_rx) = channel(16);
+        let (timer_fired, mut timer_rx) = channel(16);
+        client
+            .subscribe(InlineReplacementHandler {
+                messages,
+                replacement_time,
+                timer_fired,
+            })
+            .await?;
+
+        // Step 1: schedule at t+3s
+        client
+            .send(source, "replace-key", &json!({"step": 1_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Step 2: clear_and_schedule at t+5s (replaces the original)
+        client
+            .send(source, "replace-key", &json!({"step": 2_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Capture the replacement time the handler recorded
+        let replacement_time = timeout(RECEIVE_TIMEOUT, replacement_time_rx.recv())
+            .await
+            .map_err(|_| eyre!("timeout waiting for replacement time"))?
+            .ok_or_else(|| eyre!("replacement_time channel closed"))?;
+
+        // Wait for the timer to fire (should be ~5s from step 2)
+        let trigger_time = timeout(Duration::from_secs(15), timer_rx.recv())
+            .await
+            .map_err(|_| eyre!("timeout waiting for on_timer — timer never fired"))?
+            .ok_or_else(|| eyre!("timer_fired channel closed"))?;
+
+        // The timer must fire at the replacement time, not the original
+        ensure!(
+            trigger_time == replacement_time,
+            "timer fired at {trigger_time:?} but expected replacement time {replacement_time:?}"
+        );
+
+        // Verify no second timer fires (the original t+3s was replaced)
+        let second = timeout(Duration::from_secs(5), timer_rx.recv()).await;
+        ensure!(
+            second.is_err(),
+            "expected no second timer but received one"
         );
 
         client.unsubscribe().await?;
