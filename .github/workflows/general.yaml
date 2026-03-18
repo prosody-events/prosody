@@ -54,8 +54,13 @@ jobs:
           packages: cmake libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
       - name: Run tests
-        run: cargo test
+        run: cargo nextest run
         env:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
 
