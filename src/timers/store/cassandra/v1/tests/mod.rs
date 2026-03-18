@@ -254,7 +254,8 @@ mod test_runner {
             };
 
             match runtime.block_on(
-                async { prop_migration_invariants(&operations, input).await }.instrument(span),
+                async { Box::pin(prop_migration_invariants(&operations, input)).await }
+                    .instrument(span),
             ) {
                 Ok(()) => TestResult::passed(),
                 Err(e) => TestResult::error(format!("{e:?}")),

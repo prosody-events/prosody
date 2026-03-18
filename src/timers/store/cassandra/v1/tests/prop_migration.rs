@@ -1,7 +1,7 @@
 //! Property-based tests for timer store migration.
 //!
-//! Tests V1→V2 schema migration and V2→V2 slab size migration using
-//! random scenarios to verify all migration invariants.
+//! Tests V1→V2 schema migration, V2→V3 key state backfill, and slab size
+//! migration using random scenarios to verify all migration invariants.
 
 use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
@@ -9,14 +9,15 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::adapter::TableAdapter;
-use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::v1::V1Operations;
+use crate::timers::store::cassandra::{CassandraTriggerStore, TimerState};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore, TriggerV1};
 use crate::timers::{TimerType, Trigger};
 use ahash::{HashMap, HashSet};
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
+use strum::VariantArray;
 use tracing::Span;
 use uuid::Uuid;
 
@@ -58,11 +59,11 @@ impl Arbitrary for MigrationTestInput {
         // Generate random segment name
         let segment_name = format!("segment-{}", u8::arbitrary(g) % 100);
 
-        // Randomly choose initial version (50% V1, 50% V2)
-        let initial_version = if bool::arbitrary(g) {
-            SegmentVersion::V1
-        } else {
-            SegmentVersion::V2
+        // Randomly choose initial version (33% V1, 33% V2, 33% V3)
+        let initial_version = match u8::arbitrary(g) % 3 {
+            0 => SegmentVersion::V1,
+            1 => SegmentVersion::V2,
+            _ => SegmentVersion::V3,
         };
 
         // Generate slab sizes (1 second to 7 days to avoid TTL overflow)
@@ -116,7 +117,7 @@ pub struct MigrationModel {
     pub segment: Segment,
     /// Expected triggers after migration: (key, time, `timer_type`).
     /// V1→V2: All triggers become Application type.
-    /// V2→V2: Timer types preserved.
+    /// V2→V2/V3: Timer types preserved.
     pub triggers: HashSet<(Key, CompactDateTime, TimerType)>,
 }
 
@@ -125,13 +126,17 @@ impl MigrationModel {
     ///
     /// Applies migration transformation rules:
     /// - V1→V2: All triggers become Application type
-    /// - V2→V2: Timer types preserved
+    /// - V2→V3: Timer types preserved, segment version bumped to V3
     #[must_use]
     pub fn from_input(input: &MigrationTestInput) -> Self {
+        // V1 goes V1→V2→V3 (both phases run sequentially).
+        // V2 goes V2→V3. V3 stays V3 (no migration needed).
+        let expected_version = SegmentVersion::V3;
+
         let segment = Segment {
             id: input.segment_id,
             name: input.segment_name.clone(),
-            version: SegmentVersion::V2,
+            version: expected_version,
             slab_size: input.target_slab_size,
         };
 
@@ -141,7 +146,7 @@ impl MigrationModel {
             // Apply timer type transformation based on initial version
             let timer_type = match input.initial_version {
                 SegmentVersion::V1 => TimerType::Application, // V1 has no timer_type
-                SegmentVersion::V2 => trigger_data.timer_type, // V2 preserves timer_type
+                SegmentVersion::V2 | SegmentVersion::V3 => trigger_data.timer_type, /* V2/V3 preserve timer_type */
             };
 
             triggers.insert((trigger_data.key.clone(), trigger_data.time, timer_type));
@@ -156,9 +161,7 @@ impl MigrationModel {
         let mut slab_ids: Vec<SlabId> = self
             .triggers
             .iter()
-            .map(|(_, time, _)| {
-                Slab::from_time(self.segment.id, self.segment.slab_size, *time).id()
-            })
+            .map(|(_, time, _)| Slab::from_time(self.segment.slab_size, *time).id())
             .collect();
         slab_ids.sort_unstable();
         slab_ids.dedup();
@@ -194,8 +197,7 @@ async fn setup_v1_state(
     // Step 2: Calculate unique slab IDs from triggers
     let mut slab_ids = HashSet::default();
     for trigger_data in &input.triggers {
-        let slab_id =
-            Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time).id();
+        let slab_id = Slab::from_time(input.initial_slab_size, trigger_data.time).id();
         slab_ids.insert(slab_id);
     }
 
@@ -218,7 +220,7 @@ async fn setup_v1_state(
         operations
             .add_trigger(
                 &input.segment_id,
-                Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time).id(),
+                Slab::from_time(input.initial_slab_size, trigger_data.time).id(),
                 v1_trigger,
             )
             .await
@@ -228,34 +230,43 @@ async fn setup_v1_state(
     Ok(())
 }
 
-/// Sets up V2 initial state using `TableAdapter`.
+/// Sets up V2 initial state: segment row + slab entries + clustering key rows,
+/// with **no state MAP entries**.
 ///
-/// V2 setup:
-/// 1. Create segment with full metadata
-/// 2. Use `add_trigger()` for coordinated writes
+/// This faithfully reproduces the on-disk layout of a real V2 segment before
+/// V2→V3 migration runs. The state column is left absent so that
+/// `migrate_key_states` / `backfill_key_state` must populate it from scratch.
 ///
 /// # Errors
 ///
-/// Returns error if V2 operations fail.
+/// Returns error if any write fails.
 async fn setup_v2_state(
-    store: &TableAdapter<CassandraTriggerStore>,
+    store: &CassandraTriggerStore,
     input: &MigrationTestInput,
 ) -> color_eyre::Result<()> {
-    // Create segment with full metadata
-    let segment = Segment {
-        id: input.segment_id,
-        name: input.segment_name.clone(),
-        version: SegmentVersion::V2,
-        slab_size: input.initial_slab_size,
-    };
-
+    // Insert segment metadata at version V2.
     store
-        .insert_segment(segment.clone())
+        .insert_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V2 segment: {e:?}"))?;
 
-    // Add triggers with timer_type
+    // Register each unique slab in the slab index.
+    let mut registered_slabs = HashSet::default();
     for trigger_data in &input.triggers {
+        let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
+        if registered_slabs.insert(slab.id()) {
+            store
+                .insert_slab(slab)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("Failed to insert slab: {e:?}"))?;
+        }
+    }
+
+    // Write each trigger to the slab index and the key clustering index, but
+    // deliberately omit any write to the state MAP column. This is the exact
+    // layout produced by old V2 write paths before state backfill existed.
+    for trigger_data in &input.triggers {
+        let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
         let trigger = Trigger::new(
             trigger_data.key.clone(),
             trigger_data.time,
@@ -263,12 +274,47 @@ async fn setup_v2_state(
             Span::current(),
         );
 
-        let slab = Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time);
+        store
+            .insert_slab_trigger(slab, trigger.clone())
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to insert slab trigger: {e:?}"))?;
 
         store
-            .add_trigger(&segment, slab, trigger)
+            .add_key_trigger_clustering(&input.segment_id, trigger)
             .await
-            .map_err(|e| color_eyre::eyre::eyre!("Failed to add V2 trigger: {e:?}"))?;
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to add key trigger clustering: {e:?}"))?;
+    }
+
+    Ok(())
+}
+
+/// Sets up V3 initial state: segment row + triggers written through the full
+/// state-aware path so that state MAP entries are populated on creation.
+///
+/// # Errors
+///
+/// Returns error if any write fails.
+async fn setup_v3_state(
+    store: &TableAdapter<CassandraTriggerStore>,
+    input: &MigrationTestInput,
+) -> color_eyre::Result<()> {
+    store
+        .insert_segment()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 segment: {e:?}"))?;
+
+    for trigger_data in &input.triggers {
+        let trigger = Trigger::new(
+            trigger_data.key.clone(),
+            trigger_data.time,
+            trigger_data.timer_type,
+            Span::current(),
+        );
+        let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
+
+        Box::pin(store.add_trigger(slab, trigger))
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to add V3 trigger: {e:?}"))?;
     }
 
     Ok(())
@@ -288,14 +334,15 @@ async fn verify_segment_metadata(
     initial_version: SegmentVersion,
 ) -> color_eyre::Result<()> {
     let segment = store
-        .get_segment(&model.segment.id)
+        .get_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to get segment: {e:?}"))?
         .ok_or_else(|| color_eyre::eyre::eyre!("Segment {} not found", model.segment.id))?;
 
-    if segment.version != SegmentVersion::V2 {
+    if segment.version != model.segment.version {
         return Err(color_eyre::eyre::eyre!(
-            "Segment version mismatch: expected V2, got {:?}",
+            "Segment version mismatch: expected {:?}, got {:?}",
+            model.segment.version,
             segment.version
         ));
     }
@@ -308,11 +355,11 @@ async fn verify_segment_metadata(
         ));
     }
 
-    // Only check name preservation for V2→V2 migrations
-    // V1→V2 migrations don't preserve name (V1 segments have NULL name)
-    if initial_version == SegmentVersion::V2 && segment.name != model.segment.name {
+    // Only check name preservation for V2→V3 migrations (and V2→V2 slab-size).
+    // V1→V2 migrations don't preserve name (V1 segments have NULL name).
+    if initial_version != SegmentVersion::V1 && segment.name != model.segment.name {
         return Err(color_eyre::eyre::eyre!(
-            "Segment name mismatch for V2→V2 migration: expected {:?}, got {:?}",
+            "Segment name mismatch for V2→V3 migration: expected {:?}, got {:?}",
             model.segment.name,
             segment.name
         ));
@@ -344,9 +391,9 @@ async fn verify_data_preservation(
         seen_keys.insert(key.clone());
 
         // Get triggers for all timer types
-        for timer_type in TimerType::ALL {
+        for &timer_type in TimerType::VARIANTS {
             let triggers: Vec<Trigger> = store
-                .get_key_triggers(&model.segment.id, timer_type, key)
+                .get_key_triggers(timer_type, key)
                 .try_collect()
                 .await
                 .map_err(|e| {
@@ -390,7 +437,7 @@ async fn verify_correct_indexing(
         HashMap::default();
 
     for (key, time, timer_type) in &model.triggers {
-        let slab = Slab::from_time(model.segment.id, model.segment.slab_size, *time);
+        let slab = Slab::from_time(model.segment.slab_size, *time);
         expected_by_slab
             .entry(slab.id())
             .or_default()
@@ -399,7 +446,7 @@ async fn verify_correct_indexing(
 
     // Verify each slab has correct triggers
     for (slab_id, expected) in &expected_by_slab {
-        let slab = Slab::new(model.segment.id, *slab_id, model.segment.slab_size);
+        let slab = Slab::new(*slab_id, model.segment.slab_size);
 
         let actual_triggers: Vec<Trigger> = store
             .get_slab_triggers_all_types(&slab)
@@ -443,7 +490,7 @@ async fn verify_dual_index_consistency(
     let slab_ids = model.expected_slab_ids();
 
     for slab_id in slab_ids {
-        let slab = Slab::new(model.segment.id, slab_id, model.segment.slab_size);
+        let slab = Slab::new(slab_id, model.segment.slab_size);
         let triggers: Vec<Trigger> = store
             .get_slab_triggers_all_types(&slab)
             .try_collect()
@@ -467,9 +514,9 @@ async fn verify_dual_index_consistency(
         }
         seen_keys.insert(key.clone());
 
-        for timer_type in TimerType::ALL {
+        for &timer_type in TimerType::VARIANTS {
             let triggers: Vec<Trigger> = store
-                .get_key_triggers(&model.segment.id, timer_type, key)
+                .get_key_triggers(timer_type, key)
                 .try_collect()
                 .await
                 .map_err(|e| {
@@ -508,7 +555,7 @@ async fn verify_no_extra_slabs(
 ) -> color_eyre::Result<()> {
     // Get ALL slabs for this segment
     let all_slabs: Vec<SlabId> = operations
-        .get_slabs(&model.segment.id)
+        .get_slabs()
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to get all slabs: {e:?}"))?;
@@ -579,8 +626,7 @@ async fn verify_cleanup(
         // Calculate old slab IDs
         let mut old_slab_ids = HashSet::default();
         for trigger_data in &input.triggers {
-            let old_slab_id =
-                Slab::from_time(input.segment_id, input.initial_slab_size, trigger_data.time).id();
+            let old_slab_id = Slab::from_time(input.initial_slab_size, trigger_data.time).id();
             old_slab_ids.insert(old_slab_id);
         }
 
@@ -593,7 +639,7 @@ async fn verify_cleanup(
         for old_slab_id in obsolete_slabs {
             // Check if old slab still exists in metadata
             let all_slabs: Vec<SlabId> = operations
-                .get_slabs(&input.segment_id)
+                .get_slabs()
                 .try_collect()
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("Failed to check slab cleanup: {e:?}"))?;
@@ -604,6 +650,92 @@ async fn verify_cleanup(
                     old_slab_id
                 ));
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Verifies invariant 6: After migration to V3, all keys with triggers have
+/// correct state entries and correct clustering row counts.
+///
+/// For each `(key, timer_type)` pair:
+/// - 1 trigger → state is `Inline`, and the clustering row has been deleted
+///   (data moved into the state MAP column).
+/// - ≥2 triggers → state is `Overflow`, and clustering rows remain.
+///
+/// Applies to both V1-initial (V1→V2→V3) and V2-initial (V2→V3) segments.
+/// V3-initial segments already have correct state; they are skipped here since
+/// the state column was populated by the original write path, not by backfill.
+///
+/// # Errors
+///
+/// Returns error if key state invariant is violated.
+async fn verify_key_state_invariant(
+    store: &TableAdapter<CassandraTriggerStore>,
+    model: &MigrationModel,
+    initial_version: SegmentVersion,
+) -> color_eyre::Result<()> {
+    // Only verify for segments that went through backfill (V1 and V2 initials).
+    if initial_version == SegmentVersion::V3 {
+        return Ok(());
+    }
+
+    // Count expected timers per (key, timer_type).
+    let mut counts: HashMap<(Key, TimerType), usize> = HashMap::default();
+    for (key, _, timer_type) in &model.triggers {
+        *counts.entry((key.clone(), *timer_type)).or_default() += 1;
+    }
+
+    for ((key, timer_type), count) in &counts {
+        let state = store
+            .operations()
+            .fetch_state(&model.segment.id, key, *timer_type)
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to get timer state: {e:?}"))?;
+
+        match count {
+            1 => {
+                if !matches!(state, TimerState::Inline(_)) {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Key state invariant violated: ({}, {:?}) has 1 trigger but state is \
+                         {state:?}, expected Inline",
+                        key,
+                        timer_type
+                    ));
+                }
+
+                // For singleton normalization: the clustering row must have been
+                // deleted — the trigger lives exclusively in the state MAP now.
+                let clustering_rows = store
+                    .operations()
+                    .peek_trigger_times(&model.segment.id, key, *timer_type)
+                    .await
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("Failed to count clustering rows: {e:?}")
+                    })?;
+
+                if !clustering_rows.is_empty() {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Singleton normalization incomplete: ({}, {:?}) has Inline state but {} \
+                         clustering row(s) still exist",
+                        key,
+                        timer_type,
+                        clustering_rows.len()
+                    ));
+                }
+            }
+            n if *n >= 2 => {
+                if !matches!(state, TimerState::Overflow) {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Key state invariant violated: ({}, {:?}) has {n} triggers but state is \
+                         {state:?}, expected Overflow",
+                        key,
+                        timer_type
+                    ));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -648,31 +780,56 @@ pub async fn prop_migration_invariants(
             setup_v1_state(v1_operations, &input).await?;
         }
         SegmentVersion::V2 => {
+            // Write true V2 layout: clustering rows + slab entries, no state
+            // MAP entries.  backfill_key_state must populate state from scratch.
             let config = test_cassandra_config("prosody_test");
             let cassandra_base = CassandraStore::new(&config).await?;
-            let cassandra_store = CassandraTriggerStore::with_store(
-                cassandra_base,
-                &config.keyspace,
-                input.initial_slab_size,
-            )
-            .await?;
+            let segment = Segment {
+                id: input.segment_id,
+                name: input.segment_name.clone(),
+                slab_size: input.initial_slab_size,
+                version: SegmentVersion::V2,
+            };
+            let cassandra_store =
+                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
+                    .await?;
+            setup_v2_state(&cassandra_store, &input).await?;
+        }
+        SegmentVersion::V3 => {
+            // Write V3 layout: triggers go through the full state-aware path.
+            let config = test_cassandra_config("prosody_test");
+            let cassandra_base = CassandraStore::new(&config).await?;
+            let segment = Segment {
+                id: input.segment_id,
+                name: input.segment_name.clone(),
+                slab_size: input.initial_slab_size,
+                version: SegmentVersion::V3,
+            };
+            let cassandra_store =
+                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
+                    .await?;
             let store = TableAdapter::new(cassandra_store);
-            setup_v2_state(&store, &input).await?;
+            setup_v3_state(&store, &input).await?;
         }
     }
 
     // Migration phase: Create store with target_slab_size
     let config = test_cassandra_config("prosody_test");
     let cassandra_base = CassandraStore::new(&config).await?;
+    let segment = Segment {
+        id: input.segment_id,
+        name: String::new(),
+        slab_size: input.target_slab_size,
+        version: SegmentVersion::V3,
+    };
     let cassandra_store =
-        CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, input.target_slab_size)
-            .await?;
+        CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment).await?;
     let store = TableAdapter::new(cassandra_store);
 
     // Trigger migration by calling get_segment()
     // Note: Empty V1 segments (no triggers) don't exist in the database
     let segment_opt = store
-        .get_segment(&input.segment_id)
+        .get_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to trigger migration: {e:?}"))?;
 
@@ -680,8 +837,11 @@ pub async fn prop_migration_invariants(
     let model = MigrationModel::from_input(&input);
 
     // Empty V1 segments don't exist - skip verification if no segment and no
-    // triggers
-    if segment_opt.is_none() && input.triggers.is_empty() {
+    // triggers. V2/V3 segments always have a row (inserted in setup).
+    if segment_opt.is_none()
+        && input.triggers.is_empty()
+        && input.initial_version == SegmentVersion::V1
+    {
         // This is expected for empty V1 segments - no segment row was created
         return Ok(());
     }
@@ -693,11 +853,12 @@ pub async fn prop_migration_invariants(
     verify_dual_index_consistency(&store, &model).await?;
     verify_no_extra_slabs(store.operations(), &model).await?;
     verify_cleanup(v1_operations, store.operations(), &input, &model).await?;
+    verify_key_state_invariant(&store, &model, input.initial_version).await?;
 
     // Cleanup phase: Delete segment (success or failure)
     store
         .operations()
-        .delete_segment(&input.segment_id)
+        .delete_segment()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to cleanup segment: {e:?}"))?;
 

@@ -5,8 +5,10 @@
 //! a single session and unified migration system.
 
 use crate::propagator::new_propagator;
+use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
+use crate::timers::store::SegmentVersion;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use scylla::_macro_internal::{
     CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
@@ -256,5 +258,59 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDateTime 
         v: Option<FrameSlice<'frame>>,
     ) -> Result<Self, DeserializationError> {
         Ok(CompactDateTime::from(i32::deserialize(typ, v)?))
+    }
+}
+
+impl SerializeValue for TimerType {
+    fn serialize<'b>(
+        &self,
+        typ: &ColumnType,
+        writer: CellWriter<'b>,
+    ) -> Result<WrittenCellProof<'b>, SerializationError> {
+        i8::from(*self).serialize(typ, writer)
+    }
+}
+
+impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for TimerType {
+    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
+        match typ {
+            ColumnType::Native(NativeType::TinyInt) => Ok(()),
+            _ => Err(TypeCheckError::new(CassandraStoreError::TinyIntExpected)),
+        }
+    }
+
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        let value = i8::deserialize(typ, v)?;
+        TimerType::try_from(value).map_err(DeserializationError::new)
+    }
+}
+
+impl SerializeValue for SegmentVersion {
+    fn serialize<'b>(
+        &self,
+        typ: &ColumnType,
+        writer: CellWriter<'b>,
+    ) -> Result<WrittenCellProof<'b>, SerializationError> {
+        i8::from(*self).serialize(typ, writer)
+    }
+}
+
+impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for SegmentVersion {
+    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
+        match typ {
+            ColumnType::Native(NativeType::TinyInt) => Ok(()),
+            _ => Err(TypeCheckError::new(CassandraStoreError::TinyIntExpected)),
+        }
+    }
+
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        let value = i8::deserialize(typ, v)?;
+        SegmentVersion::try_from(value).map_err(DeserializationError::new)
     }
 }

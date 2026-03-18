@@ -58,6 +58,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 simd-json = { version = "0.17", features = ["serde_impl"], optional = true }
 smallvec = { version = "1.15", features = ["const_generics", "union"] }
+strum = { version = "0.28", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "parking_lot", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -133,6 +134,7 @@ empty_structs_with_brackets = "warn"
 error_impl_error = "warn"
 exit = "warn"
 expect_used = "deny"
+large_futures = "warn"
 format_push_string = "warn"
 if_then_some_else_none = "warn"
 impl_trait_in_params = "warn"

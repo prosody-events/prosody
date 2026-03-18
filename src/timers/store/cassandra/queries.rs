@@ -241,5 +241,163 @@ cassandra_queries! {
             "INSERT INTO $keyspace.{} (id, name, slab_size) VALUES (?, ?, ?)",
             TABLE_SEGMENTS
         ),
+
+        // =========================================================================
+        // State Column Operations (Inline/Overflow Timer State)
+        // =========================================================================
+
+        /// Gets the `state` static map column for a key partition
+        get_state: (
+            "SELECT state FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Gets a single entry from the `state` static map column for a key partition
+        get_state_entry: (
+            "SELECT state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Inserts a trigger into clustering columns with TTL
+        insert_key_trigger_clustering: (
+            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Inserts a trigger into clustering columns without TTL
+        insert_key_trigger_clustering_no_ttl: (
+            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?)",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Removes a state entry for a single timer type (returns to Absent for that type)
+        remove_state_entry: (
+            "DELETE state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Clears the entire `state` static column (all timer types at once)
+        clear_state: (
+            "DELETE state FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Sets inline timer state (static column only) with TTL — no DELETE, no BATCH
+        set_state_inline: (
+            "UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Sets inline timer state (static column only) without TTL — no DELETE, no BATCH
+        set_state_inline_no_ttl: (
+            "UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Sets overflow state marker (static column only) without TTL
+        set_state_overflow: (
+            "UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Sets overflow state marker (static column only) with TTL
+        set_state_overflow_with_ttl: (
+            "UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Reads up to 2 remaining trigger times for a key/type (demotion check)
+        count_key_triggers: (
+            "SELECT time FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 2",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Reads the first remaining trigger (time + span) for a key/type (inline demotion)
+        peek_first_key_trigger: (
+            "SELECT time, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 1",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Clear clustering rows and set inline state with TTL
+        batch_clear_and_set_inline: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Clear clustering rows and set inline state without TTL
+        batch_clear_and_set_inline_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?; \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Delete a single clustering row and set inline state with TTL.
+        /// Used for Overflow→Inline demotion when exactly 1 clustering row remains.
+        batch_demote_to_inline: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Delete a single clustering row and set inline state without TTL.
+        /// Used for Overflow→Inline demotion when exactly 1 clustering row remains.
+        batch_demote_to_inline_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Insert two clustering rows (promoted + new) and set overflow state with TTL.
+        /// Per-statement USING TTL on each INSERT and the UPDATE so all three expire together,
+        /// preventing zombie markers if those rows expire via TTL without explicit deletion.
+        /// Uses named markers because the 17 bind values exceed the 16-element tuple limit.
+        batch_promote_and_set_overflow: (
+            "BEGIN UNLOGGED BATCH \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (:p_segment_id, :p_key, :p_timer_type, :p_time, :p_span) USING TTL :p_ttl; \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (:n_segment_id, :n_key, :n_timer_type, :n_time, :n_span) USING TTL :n_ttl; \
+             UPDATE $keyspace.{} USING TTL :s_ttl SET state[:s_timer_type] = :s_state WHERE segment_id = :s_segment_id AND key = :s_key; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Insert two clustering rows (promoted + new) and set overflow state without TTL
+        batch_promote_and_set_overflow_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Clear clustering rows for a single timer type + remove state entry.
+        /// Same partition — no cross-partition overhead.
+        batch_clear_key_triggers: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?; \
+             DELETE state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: Clear all clustering rows + clear entire state column.
+        /// Same partition — no cross-partition overhead.
+        batch_clear_key_triggers_all_types: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
+             DELETE state FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
     }
 }

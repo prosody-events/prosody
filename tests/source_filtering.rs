@@ -28,21 +28,12 @@ mod common;
 #[tokio::test]
 async fn test_source_system_filtering() -> Result<()> {
     init_test_logging();
-    let timeout_duration = Duration::from_secs(30);
-
     // Scenario 1: Both source system and group ID are the same, so no messages
     // should be expected.
-    run_scenario("filter-test", "filter-test", false, "1", timeout_duration).await?;
+    run_scenario("filter-test", "filter-test", false, "1").await?;
 
     // Scenario 2: Consumer group is different, so messages should be delivered.
-    run_scenario(
-        "filter-test",
-        "different-group",
-        true,
-        "2",
-        timeout_duration,
-    )
-    .await?;
+    run_scenario("filter-test", "different-group", true, "2").await?;
 
     Ok(())
 }
@@ -63,12 +54,16 @@ async fn test_source_system_filtering() -> Result<()> {
 ///
 /// This function returns an error if the test setup, execution, or verification
 /// fails.
+/// Per-event receive ceiling.
+const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Shorter window for confirming no messages arrive.
+const SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn run_scenario(
     source_system: &'static str,
     group_id: &'static str,
     expect_messages: bool,
     event_suffix: &'static str,
-    timeout_duration: Duration,
 ) -> Result<()> {
     // Create a unique Kafka topic for the test.
     let topic_string = Uuid::new_v4().to_string();
@@ -120,7 +115,7 @@ async fn run_scenario(
     // Check whether the messages are received or not, based on `expect_messages`.
     if expect_messages {
         // Ensure that the message is received.
-        let recv_result = timeout(timeout_duration, rx.recv()).await?;
+        let recv_result = timeout(RECEIVE_TIMEOUT, rx.recv()).await?;
         let (recv_key, recv_payload) =
             recv_result.ok_or_else(|| eyre!("Did not receive the regular message"))?;
 
@@ -128,14 +123,14 @@ async fn run_scenario(
         ensure!(recv_payload == payload, "payloads did not match");
 
         // Verify the reception of the end-of-stream marker.
-        let end_mark_result = timeout(timeout_duration, rx.recv()).await?;
+        let end_mark_result = timeout(RECEIVE_TIMEOUT, rx.recv()).await?;
         match end_mark_result {
             Some((_k, Value::Null)) => {} // Expected outcome.
             _ => return Err(eyre!("Did not receive expected end-of-stream marker")),
         }
     } else {
         // Validate that no message was received.
-        let recv = timeout(timeout_duration, rx.recv()).await;
+        let recv = timeout(SILENCE_TIMEOUT, rx.recv()).await;
         if let Ok(Some((k, v))) = recv {
             consumer.shutdown().await;
             admin_client.delete_topic(&topic).await?;

@@ -39,7 +39,7 @@ use uuid::Uuid;
 pub mod cassandra;
 pub mod memory;
 
-/// Internal primitive operations trait (20 methods).
+/// Internal primitive operations trait (22 methods).
 ///
 /// The trait itself is `pub` to satisfy Rust's visibility rules (used in public
 /// `TableAdapter`), but is not re-exported, keeping it effectively internal.
@@ -59,8 +59,10 @@ pub mod tests;
 ///
 /// Determines which Cassandra table schema is used for storing triggers.
 /// - V1: Legacy schema without `timer_type` field
-/// - V2: Current schema with `timer_type` field for Application vs
-///   `DeferredMessage`
+/// - V2: Schema with `timer_type` field; `state` MAP may be absent for
+///   pre-migration keys (ambiguous: 0 timers or clustering-only data)
+/// - V3: Post-migration schema; `state` MAP is always populated, so NULL
+///   unambiguously means 0 timers
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SegmentVersion {
@@ -68,6 +70,8 @@ pub enum SegmentVersion {
     V1 = 1,
     /// V2 schema with `timer_type` field.
     V2 = 2,
+    /// V3 schema: all keys have state entries backfilled; NULL = new key.
+    V3 = 3,
 }
 
 impl From<SegmentVersion> for i8 {
@@ -83,6 +87,7 @@ impl TryFrom<i8> for SegmentVersion {
         match value {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
+            3 => Ok(Self::V3),
             _ => Err(InvalidSegmentVersionError(value)),
         }
     }
@@ -97,7 +102,7 @@ impl fmt::Display for InvalidSegmentVersionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Invalid segment version: {}. Expected 1 (V1) or 2 (V2)",
+            "Invalid segment version: {}. Expected 1 (V1), 2 (V2), or 3 (V3)",
             self.0
         )
     }
@@ -107,7 +112,7 @@ impl Error for InvalidSegmentVersionError {}
 
 impl ClassifyError for InvalidSegmentVersionError {
     fn classify_error(&self) -> ErrorCategory {
-        // Invalid segment version value (not 1 or 2). Indicates data corruption or
+        // Invalid segment version value (not 1, 2, or 3). Indicates data corruption or
         // incompatible schema version in database. Not recoverable by retry.
         ErrorCategory::Permanent
     }
@@ -174,6 +179,18 @@ pub struct Segment {
     pub version: SegmentVersion,
 }
 
+/// Factory for segment-scoped [`TriggerStore`] instances.
+///
+/// Holds shared resources (Cassandra session, prepared statements) and creates
+/// per-segment stores with independent caches. Store creation is synchronous.
+pub trait TriggerStoreProvider: Clone + Send + Sync + 'static {
+    /// The store type created by this provider.
+    type Store: TriggerStore;
+
+    /// Creates a store scoped to the specified segment (synchronous, no I/O).
+    fn create_store(&self, segment: Segment) -> Self::Store;
+}
+
 /// Public trigger storage interface.
 ///
 /// Provides both primitive read operations and coordinated write operations
@@ -184,12 +201,12 @@ pub struct Segment {
 /// Storage backends can implement this trait in two ways:
 ///
 /// 1. **Via `TableAdapter`** (recommended for most backends):
-///    - Implement internal `TriggerOperations` trait (20 primitive methods)
+///    - Implement internal `TriggerOperations` trait (22 primitive methods)
 ///    - Wrap in `TableAdapter<T>` which implements `TriggerStore`
 ///    - Best-effort consistency using parallel execution
 ///
 /// 2. **Direct implementation** (for transactional backends):
-///    - Implement `TriggerStore` directly (9 methods)
+///    - Implement `TriggerStore` directly (13 methods)
 ///    - Use database transactions for atomic dual-table operations
 ///    - Provides ACID guarantees
 ///
@@ -202,29 +219,35 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
     // ===================================================================
+    // Segment Accessors
+    // ===================================================================
+
+    /// Returns the segment this store is scoped to.
+    fn segment(&self) -> Segment;
+
+    /// Returns the segment ID this store is scoped to.
+    fn segment_id(&self) -> SegmentId;
+
+    /// Returns the slab size for this store's segment.
+    fn slab_size(&self) -> CompactDuration;
+
+    // ===================================================================
     // Segment Operations (2 methods) - Used by Loader
     // ===================================================================
 
-    /// Retrieves segment metadata by ID.
-    fn get_segment(
-        &self,
-        segment_id: &SegmentId,
-    ) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
+    /// Retrieves this store's segment metadata from persistent storage.
+    fn get_segment(&self) -> impl Future<Output = Result<Option<Segment>, Self::Error>> + Send;
 
-    /// Creates a new segment with metadata.
-    fn insert_segment(
-        &self,
-        segment: Segment,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// Persists this store's segment metadata.
+    fn insert_segment(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
     // Slab Query Operations (2 methods) - Used by Loader
     // ===================================================================
 
-    /// Streams slab IDs within a time range for a segment.
+    /// Streams slab IDs within a time range for this store's segment.
     fn get_slab_range(
         &self,
-        segment_id: &SegmentId,
         range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<SlabId, Self::Error>> + Send;
 
@@ -239,11 +262,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     // ===================================================================
 
     /// Deletes slab metadata (does not delete triggers).
-    fn delete_slab(
-        &self,
-        segment_id: &SegmentId,
-        slab_id: SlabId,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
     // Key Query Operations (2 methods) - Used by TimerManager
@@ -255,7 +274,6 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// More efficient than `get_key_triggers` when span data not needed.
     fn get_key_times(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send;
@@ -265,13 +283,12 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Includes all metadata (key, time, `timer_type`, span).
     fn get_key_triggers(
         &self,
-        segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     // ===================================================================
-    // Coordinated Write Operations (2 methods) - Used by TimerManager
+    // Coordinated Write Operations (3 methods) - Used by TimerManager
     // ===================================================================
 
     /// Adds a trigger to both slab and key tables.
@@ -280,7 +297,6 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Transactional backends can provide ACID guarantees.
     fn add_trigger(
         &self,
-        segment: &Segment,
         slab: Slab,
         trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -288,10 +304,37 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Removes a trigger from both slab and key tables.
     fn remove_trigger(
         &self,
-        segment: &Segment,
         slab: &Slab,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Atomically clears existing timers and schedules a new one.
+    ///
+    /// This is the core primitive for tombstone-free singleton timer
+    /// overwrites. It performs the following operations atomically:
+    ///
+    /// 1. Writes the new timer to the slab index
+    /// 2. Writes the new timer to the singleton slot (static column)
+    /// 3. Deletes any existing clustering rows for this key/type
+    /// 4. Cleans up old slab index entries
+    ///
+    /// # Write Ordering
+    ///
+    /// New timer is written FIRST, then old entries are deleted. This ensures
+    /// at-least-once delivery: if a crash occurs, both timers may exist
+    /// temporarily, but the timer will never be lost.
+    ///
+    /// # Parameters
+    ///
+    /// * `new_slab` - The slab for the new timer
+    /// * `new_trigger` - The new timer to schedule
+    /// * `old_slabs` - Slabs containing old timers to remove from slab index
+    fn clear_and_schedule(
+        &self,
+        new_slab: Slab,
+        new_trigger: Trigger,
+        old_slabs: Vec<Slab>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

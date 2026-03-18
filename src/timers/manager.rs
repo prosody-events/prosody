@@ -19,24 +19,22 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::active::TimerState;
 use crate::timers::datetime::CompactDateTime;
-use crate::timers::duration::CompactDuration;
 
 pub use crate::timers::error::TimerManagerError;
 use crate::timers::loader::{State, get_or_create_segment, slab_loader};
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::Slab;
 use crate::timers::slab_lock::SlabLock;
-use crate::timers::store::{Segment, SegmentId, TriggerStore};
+use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerType, Trigger};
-use async_stream::{stream, try_stream};
+use async_stream::stream;
 use educe::Educe;
-use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::sync::Arc;
 use tokio::spawn;
 use tokio::sync::{Semaphore, watch};
-use tokio::task::coop::cooperative;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{Instrument, Span};
+use tracing::{Instrument, Span, debug};
 
 /// Configuration for a [`TimerManager`] instance.
 ///
@@ -49,10 +47,6 @@ use tracing::{Instrument, Span};
 /// * `T`: The [`TriggerStore`] backend for persistent timer data.
 #[derive(Clone)]
 pub struct TimerManagerConfig<T> {
-    /// Unique identifier for the timer segment.
-    pub segment_id: SegmentId,
-    /// Duration of each time-based slab.
-    pub slab_size: CompactDuration,
     /// Human-readable name for the segment.
     pub name: String,
     /// Persistent storage backend for timer triggers.
@@ -130,13 +124,7 @@ where
         semaphore: Arc<Semaphore>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
-        let segment = get_or_create_segment(
-            &config.store,
-            config.segment_id,
-            config.slab_size,
-            &config.name,
-        )
-        .await?;
+        let segment = get_or_create_segment(&config.store, &config.name).await?;
 
         // Initialize the in-memory scheduler.
         let (trigger_rx, scheduler) = TriggerScheduler::new(&heartbeats);
@@ -165,7 +153,7 @@ where
         // semaphore permit per timer to bound global in-flight timer events.
         // If the semaphore is closed the stream terminates rather than
         // silently dropping timers.
-        let stream = stream! {
+        let timer_stream = stream! {
             let mut receiver = ReceiverStream::new(trigger_rx);
             while let Some(trigger) = receiver.next().await {
                 let Ok(permit) = semaphore.clone().acquire_owned().await else {
@@ -175,7 +163,7 @@ where
             }
         };
 
-        Ok((stream, manager))
+        Ok((timer_stream, manager))
     }
 
     /// Retrieves all scheduled execution times for a given key.
@@ -194,79 +182,45 @@ where
     ///
     /// # Returns
     ///
-    /// A [`Stream`] of scheduled times for `key` that will fire in the future.
+    /// A `Vec` of scheduled times for `key` that will fire in the future.
     ///
     /// # Errors
     ///
     /// Returns [`TimerManagerError::Store`] if the underlying storage query
     /// fails.
-    pub fn scheduled_times(
+    pub async fn scheduled_times(
         &self,
         key: &Key,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<CompactDateTime, TimerManagerError<T::Error>>> + Send + 'static
-    {
-        let slab_lock = self.0.state.clone();
-        let key = key.clone();
-        let segment_id = self.0.segment.id;
+    ) -> Result<Vec<CompactDateTime>, TimerManagerError<T::Error>> {
+        let state = self.0.state.trigger_lock().await;
 
-        try_stream! {
-            let state = slab_lock.trigger_lock().await;
+        let active_triggers = state.scheduler.active_triggers();
 
-            let stream = state
-                .store
-                .get_key_times(&segment_id, timer_type, &key)
-                .map_err(TimerManagerError::Store);
-
-            pin_mut!(stream);
-            while let Some(time) = cooperative(stream.try_next()).await? {
-                // Filter by state: exclude Firing (being processed), include
-                // Scheduled and FiringRescheduled (will fire).
-                //
-                // Include if:
-                // - Not in ActiveTriggers (timer not loaded yet, will fire when
-                //   loaded)
-                // - In Scheduled state (waiting to fire)
-                // - In FiringRescheduled state (will fire again after commit)
-                // Exclude if:
-                // - In Firing state (currently being processed, won't fire again
-                //   unless rescheduled)
-                //
-                // is_scheduled: returns true for Scheduled or FiringRescheduled
-                // not active: timer not loaded yet, will fire when slab loads
-                let active_triggers = state.scheduler.active_triggers();
-                let is_scheduled = active_triggers.is_scheduled(&key, time, timer_type).await;
-                let not_active = !active_triggers.contains(&key, time, timer_type).await;
-
-                if is_scheduled || not_active {
-                    yield time;
-                }
-            }
-        }
-    }
-
-    /// Retrieves all scheduled triggers for a given key.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The entity key whose full [`Trigger`] records to list.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TimerManagerError::Store`] if the underlying storage query
-    /// fails.
-    pub(crate) async fn scheduled_triggers(
-        &self,
-        key: &Key,
-        timer_type: TimerType,
-    ) -> Result<Vec<Trigger>, TimerManagerError<T::Error>> {
-        self.0
-            .state
-            .trigger_lock()
-            .await
+        // Stream from storage and filter in a single pass — no intermediate Vec.
+        //
+        // Include if:
+        // - Not in ActiveTriggers (timer not loaded yet, will fire when slab loads)
+        // - In Scheduled state (waiting to fire)
+        // - In FiringRescheduled state (will fire again after commit)
+        // Exclude if:
+        // - In Firing state (currently being processed, won't fire again unless
+        //   rescheduled)
+        let stream = state
             .store
-            .get_key_triggers(&self.0.segment.id, timer_type, key)
-            .map_err(TimerManagerError::Store)
+            .get_key_times(timer_type, key)
+            .map_err(TimerManagerError::Store);
+
+        stream
+            .try_filter(|&time| {
+                let is_scheduled = active_triggers.is_scheduled(key, time, timer_type);
+                let not_active = active_triggers.contains(key, time, timer_type);
+                async move {
+                    let is_scheduled = is_scheduled.await;
+                    let not_active = !not_active.await;
+                    is_scheduled || not_active
+                }
+            })
             .try_collect()
             .await
     }
@@ -283,6 +237,13 @@ where
     ///   (no-op).
     /// - Otherwise, performs normal scheduling with DB write.
     ///
+    /// **Singleton vs Overflow routing:**
+    /// - First timer for a key/type → written to singleton slot (via store
+    ///   layer)
+    /// - Second+ timer → promotes to overflow (clustering columns)
+    /// - Use [`clear_and_schedule`](Self::clear_and_schedule) for
+    ///   tombstone-free singleton overwrites
+    ///
     /// # Arguments
     ///
     /// * `trigger` - The [`Trigger`] to schedule (key, time, span).
@@ -295,7 +256,7 @@ where
     /// - The scheduler enqueue fails.
     pub async fn schedule(&self, trigger: Trigger) -> Result<(), TimerManagerError<T::Error>> {
         // Determine the slab for this trigger time.
-        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, trigger.time);
+        let slab = Slab::from_time(self.0.segment.slab_size, trigger.time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -332,10 +293,20 @@ where
 
             // SCHEDULED or UNSCHEDULED: normal scheduling path
             _ => {
+                // Singleton detection: Check if this key/type already has timers.
+                // If no existing timers, this is a singleton case and the store
+                // layer will write to the static slot. If existing timers, this
+                // triggers singleton→overflow promotion in the store layer.
+                //
+                // NOTE: The actual singleton vs overflow routing is handled by
+                // the store's add_trigger implementation which checks slot state.
+                // This comment documents the expected behavior for clarity.
+
                 // Persist the trigger in both slab and key indices.
+                // The store layer handles singleton/overflow routing internally.
                 state
                     .store
-                    .add_trigger(&self.0.segment, slab, trigger.clone())
+                    .add_trigger(slab, trigger.clone())
                     .await
                     .map_err(TimerManagerError::Store)?;
 
@@ -387,7 +358,7 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         // Identify the slab containing this time.
-        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
+        let slab = Slab::from_time(self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -430,14 +401,11 @@ where
                 // Remove from persistent storage.
                 state
                     .store
-                    .remove_trigger(&self.0.segment, &slab, key, time, timer_type)
+                    .remove_trigger(&slab, key, time, timer_type)
                     .await
                     .map_err(TimerManagerError::Store)?;
 
                 // Emit timer_cancelled telemetry after successful store removal.
-                // NOTE: If clear_and_schedule becomes an atomic store operation
-                // (PR #141) that bypasses individual unschedule() calls, the
-                // emission site will need to move to the new atomic path.
                 self.0.telemetry.timer_cancelled(
                     key.clone(),
                     time,
@@ -470,15 +438,172 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         let span = Span::current();
+        let times = self.scheduled_times(key, timer_type).await?;
 
-        self.scheduled_times(key, timer_type)
-            .map_ok(|time| {
+        stream::iter(times)
+            .map(|time| {
                 self.unschedule(key, time, timer_type)
                     .instrument(span.clone())
             })
-            .try_buffer_unordered(DELETE_CONCURRENCY)
+            .buffer_unordered(DELETE_CONCURRENCY)
             .try_collect::<()>()
             .await
+    }
+
+    /// Atomically clears existing timers and schedules a new one.
+    ///
+    /// This is the optimized path for singleton timer overwrites. It:
+    /// 1. Reads existing triggers to determine which slabs need cleanup
+    /// 2. Updates the in-memory scheduler state (unschedule old, schedule new)
+    /// 3. Calls the store's `clear_and_schedule` for atomic persistence
+    ///
+    /// # State-aware behavior
+    ///
+    /// For each existing timer at a different time:
+    /// - `Firing` → no-op (timer is being processed)
+    /// - `FiringRescheduled` → transitions to `Firing` (cancels reschedule)
+    /// - `Scheduled` → unscheduled from `DelayQueue`
+    ///
+    /// For the new timer:
+    /// - If same time as existing `Firing` → transitions to `FiringRescheduled`
+    /// - Otherwise → schedules in `DelayQueue`
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger` - The new timer to schedule (replaces all existing)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerManagerError`] if:
+    /// - Storage operations fail
+    /// - Scheduler operations fail
+    pub async fn clear_and_schedule(
+        &self,
+        trigger: Trigger,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let new_slab = Slab::from_time(self.0.segment.slab_size, trigger.time);
+        let new_slab_id = new_slab.id();
+        let state = self.0.state.trigger_lock().await;
+
+        // Get all existing triggers for this key/type
+        let existing_triggers: Vec<Trigger> = state
+            .store
+            .get_key_triggers(trigger.timer_type, &trigger.key)
+            .map_err(TimerManagerError::Store)
+            .try_collect()
+            .await?;
+
+        // Collect slabs that contain old triggers (for cleanup)
+        let old_slabs: Vec<Slab> = existing_triggers
+            .iter()
+            .filter(|t| t.time != trigger.time)
+            .map(|t| Slab::from_time(self.0.segment.slab_size, t.time))
+            .collect();
+
+        debug!(
+            key = %trigger.key,
+            timer_type = ?trigger.timer_type,
+            new_time = ?trigger.time,
+            existing_count = existing_triggers.len(),
+            old_slab_count = old_slabs.len(),
+            "clear_and_schedule: read existing triggers, preparing state transitions"
+        );
+
+        // Step 1: Handle scheduler state for the new timer.
+        // STATE MACHINE PRESERVATION: Reuses the same Firing/FiringRescheduled/
+        // Scheduled transitions as schedule() and unschedule(). No new states
+        // are introduced; clear_and_schedule composes existing transitions.
+        let new_timer_state = state
+            .scheduler
+            .active_triggers()
+            .get_state(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+
+        match new_timer_state {
+            Some(TimerState::Firing) => {
+                // Reuses schedule()'s Firing → FiringRescheduled transition
+                debug!(
+                    key = %trigger.key,
+                    timer_type = ?trigger.timer_type,
+                    time = ?trigger.time,
+                    "clear_and_schedule: new timer is Firing, transitioning to FiringRescheduled"
+                );
+                state
+                    .scheduler
+                    .active_triggers()
+                    .set_state(
+                        &trigger.key,
+                        trigger.time,
+                        trigger.timer_type,
+                        TimerState::FiringRescheduled,
+                    )
+                    .await;
+                // Add to DelayQueue for re-firing
+                state.scheduler.add_to_queue(trigger.clone()).await?;
+            }
+            Some(TimerState::FiringRescheduled) => {
+                // Reuses schedule()'s idempotent FiringRescheduled no-op
+                debug!(
+                    key = %trigger.key,
+                    timer_type = ?trigger.timer_type,
+                    time = ?trigger.time,
+                    "clear_and_schedule: new timer already FiringRescheduled, no-op"
+                );
+            }
+            _ => {
+                // Reuses schedule()'s normal scheduling path
+                if state.is_owned(new_slab_id) {
+                    debug!(
+                        key = %trigger.key,
+                        timer_type = ?trigger.timer_type,
+                        time = ?trigger.time,
+                        state = ?new_timer_state,
+                        "clear_and_schedule: scheduling new timer in DelayQueue"
+                    );
+                    state.scheduler.schedule(trigger.clone()).await?;
+                }
+            }
+        }
+
+        // Step 2: Unschedule old timers from in-memory scheduler.
+        // STATE MACHINE PRESERVATION: Reuses the same state-aware transitions
+        // as unschedule(). Each old timer is handled according to its current
+        // state without introducing new transition paths.
+        unschedule_replaced_timers(&state, &self.0.segment, &trigger, &existing_triggers).await?;
+
+        // Step 3: Persist via store's clear_and_schedule
+        debug!(
+            key = %trigger.key,
+            timer_type = ?trigger.timer_type,
+            new_time = ?trigger.time,
+            old_slab_count = old_slabs.len(),
+            "clear_and_schedule: persisting to store"
+        );
+        state
+            .store
+            .clear_and_schedule(new_slab, trigger.clone(), old_slabs)
+            .await
+            .map_err(TimerManagerError::Store)?;
+
+        // Emit telemetry after successful atomic persistence.
+        for old in &existing_triggers {
+            if old.time != trigger.time {
+                self.0.telemetry.timer_cancelled(
+                    old.key.clone(),
+                    old.time,
+                    old.timer_type,
+                    self.0.source.clone(),
+                );
+            }
+        }
+        self.0.telemetry.timer_scheduled(
+            trigger.key.clone(),
+            trigger.time,
+            trigger.timer_type,
+            self.0.source.clone(),
+        );
+
+        Ok(())
     }
 
     /// Transitions a timer from `Scheduled` to `Firing` state.
@@ -536,7 +661,7 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         // Derive the slab and lock state.
-        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
+        let slab = Slab::from_time(self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -566,7 +691,7 @@ where
         // Remove from storage.
         state
             .store
-            .remove_trigger(&self.0.segment, &slab, key, time, timer_type)
+            .remove_trigger(&slab, key, time, timer_type)
             .await
             .map_err(TimerManagerError::Store)?;
 
@@ -592,7 +717,7 @@ where
     /// * `time` - The scheduled execution time to abort.
     /// * `timer_type` - The timer type classification.
     pub async fn abort(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) {
-        let slab = Slab::from_time(self.0.segment.id, self.0.segment.slab_size, time);
+        let slab = Slab::from_time(self.0.segment.slab_size, time);
         let slab_id = slab.id();
         let state = self.0.state.trigger_lock().await;
 
@@ -623,6 +748,82 @@ where
     }
 }
 
+/// Unschedules old timers from the in-memory scheduler during a
+/// `clear_and_schedule` operation.
+///
+/// STATE MACHINE PRESERVATION: Reuses the same state-aware transitions as
+/// `TimerManager::unschedule()`. Each old timer is handled according to its
+/// current state without introducing new transition paths:
+/// - `Firing` → no-op (being processed)
+/// - `FiringRescheduled` → `Firing` (cancels reschedule)
+/// - `Scheduled`/absent → removed from `DelayQueue`
+async fn unschedule_replaced_timers<T: TriggerStore>(
+    state: &State<T>,
+    segment: &Segment,
+    new_trigger: &Trigger,
+    existing_triggers: &[Trigger],
+) -> Result<(), TimerManagerError<T::Error>> {
+    for old_trigger in existing_triggers {
+        if old_trigger.time == new_trigger.time {
+            continue; // Same time as new - already handled by caller
+        }
+
+        let old_slab_id = Slab::from_time(segment.slab_size, old_trigger.time).id();
+
+        let old_state = state
+            .scheduler
+            .active_triggers()
+            .get_state(&old_trigger.key, old_trigger.time, old_trigger.timer_type)
+            .await;
+
+        match old_state {
+            Some(TimerState::Firing) => {
+                debug!(
+                    key = %old_trigger.key,
+                    timer_type = ?old_trigger.timer_type,
+                    old_time = ?old_trigger.time,
+                    "clear_and_schedule: old timer is Firing, skipping (no-op)"
+                );
+            }
+            Some(TimerState::FiringRescheduled) => {
+                debug!(
+                    key = %old_trigger.key,
+                    timer_type = ?old_trigger.timer_type,
+                    old_time = ?old_trigger.time,
+                    "clear_and_schedule: old timer FiringRescheduled, cancelling reschedule"
+                );
+                state
+                    .scheduler
+                    .active_triggers()
+                    .set_state(
+                        &old_trigger.key,
+                        old_trigger.time,
+                        old_trigger.timer_type,
+                        TimerState::Firing,
+                    )
+                    .await;
+                state
+                    .scheduler
+                    .remove_from_queue(old_trigger.clone())
+                    .await?;
+            }
+            _ => {
+                if state.is_owned(old_slab_id) {
+                    debug!(
+                        key = %old_trigger.key,
+                        timer_type = ?old_trigger.timer_type,
+                        old_time = ?old_trigger.time,
+                        state = ?old_state,
+                        "clear_and_schedule: unscheduling old timer from DelayQueue"
+                    );
+                    state.scheduler.unschedule(old_trigger.clone()).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,21 +831,32 @@ mod tests {
     use crate::consumer::{Keyed, Uncommitted};
     use crate::telemetry::Telemetry;
     use crate::timers::UncommittedTimer;
+    use crate::timers::duration::CompactDuration;
+    use crate::timers::store::SegmentVersion;
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use crate::timers::uncommitted::UncommittedTriggerGuard;
     use color_eyre::eyre::{Result, eyre};
-    use futures::StreamExt;
+    use futures::{StreamExt, pin_mut};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Semaphore;
-    use tokio::sync::watch;
+    use tokio::sync::{Semaphore, watch};
 
     const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+
     use tokio::task;
     use tokio::time::{self, advance, timeout};
     use tracing::Span;
     use uuid::Uuid;
+
+    fn test_segment() -> Segment {
+        Segment {
+            id: Uuid::new_v4(),
+            name: "test-segment".to_owned(),
+            slab_size: CompactDuration::new(300),
+            version: SegmentVersion::V3,
+        }
+    }
 
     /// Helper function to create a test trigger
     fn create_test_trigger(
@@ -671,14 +883,11 @@ mod tests {
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
         watch::Sender<bool>,
     )> {
-        let store = memory_store();
-        let segment_id = Uuid::new_v4();
+        let store = memory_store(test_segment());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let telemetry = Telemetry::new();
 
         let config = TimerManagerConfig {
-            segment_id,
-            slab_size: CompactDuration::new(300),
             name: "test-manager".to_owned(),
             store,
             telemetry: telemetry.partition_sender(Topic::from("test"), 0),
@@ -693,7 +902,6 @@ mod tests {
         )
         .await
         .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
-
         Ok((stream, manager, shutdown_tx))
     }
 
@@ -703,11 +911,7 @@ mod tests {
         key: &Key,
         timer_type: TimerType,
     ) -> Result<usize> {
-        Ok(manager
-            .scheduled_times(key, timer_type)
-            .try_collect::<Vec<_>>()
-            .await?
-            .len())
+        Ok(manager.scheduled_times(key, timer_type).await?.len())
     }
 
     /// Helper: wait for timer and fire it
@@ -731,14 +935,12 @@ mod tests {
     async fn test_new_timer_manager_creation() -> Result<()> {
         time::pause();
 
-        let store = memory_store();
-        let segment_id = Uuid::new_v4();
+        let segment = test_segment();
+        let store = memory_store(segment.clone());
         let telemetry = Telemetry::new();
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let config = TimerManagerConfig {
-            segment_id,
-            slab_size: CompactDuration::new(300),
             name: "test-creation".to_owned(),
             store,
             telemetry: telemetry.partition_sender(Topic::from("test"), 0),
@@ -755,9 +957,9 @@ mod tests {
         assert!(result.is_ok(), "Timer manager creation should succeed");
 
         let (_stream, manager) = result?;
-        assert_eq!(manager.0.segment.id, segment_id);
-        assert_eq!(manager.0.segment.slab_size, CompactDuration::new(300));
-        assert_eq!(manager.0.segment.name, "test-creation");
+        assert_eq!(manager.0.segment.id, segment.id);
+        assert_eq!(manager.0.segment.name, segment.name);
+        assert_eq!(manager.0.segment.slab_size, segment.slab_size);
         Ok(())
     }
 
@@ -774,7 +976,6 @@ mod tests {
         // Verify the timer is stored
         let scheduled_times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(scheduled_times.len(), 1);
         assert!(scheduled_times.contains(&trigger.time));
@@ -801,7 +1002,6 @@ mod tests {
 
         let scheduled_times = manager
             .scheduled_times(&key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(scheduled_times.len(), 3);
 
@@ -826,11 +1026,9 @@ mod tests {
         // Verify each key has its timer
         let times1 = manager
             .scheduled_times(&trigger1.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         let times2 = manager
             .scheduled_times(&trigger2.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
 
         assert_eq!(times1.len(), 1);
@@ -849,7 +1047,6 @@ mod tests {
 
         let scheduled_times = manager
             .scheduled_times(&nonexistent_key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(scheduled_times.is_empty());
         Ok(())
@@ -872,7 +1069,6 @@ mod tests {
         // Verify timer is removed
         let scheduled_times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(scheduled_times.is_empty());
         Ok(())
@@ -916,7 +1112,6 @@ mod tests {
         // Verify all are scheduled
         let scheduled_times = manager
             .scheduled_times(&key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(scheduled_times.len(), 3);
 
@@ -927,7 +1122,6 @@ mod tests {
         // Verify all are removed
         let scheduled_times = manager
             .scheduled_times(&key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(scheduled_times.is_empty());
         Ok(())
@@ -967,7 +1161,6 @@ mod tests {
         // Verify timer is removed from storage
         let scheduled_times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(scheduled_times.is_empty());
         Ok(())
@@ -1005,7 +1198,6 @@ mod tests {
         // Timer should still be in storage after abort
         let scheduled_times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(scheduled_times.len(), 1);
         assert!(scheduled_times.contains(&trigger.time));
@@ -1098,7 +1290,6 @@ mod tests {
             let key = Key::from(format!("concurrent-{i}"));
             let times = manager
                 .scheduled_times(&key, TimerType::Application)
-                .try_collect::<Vec<_>>()
                 .await?;
             assert_eq!(times.len(), 1, "Timer {i} should be scheduled");
         }
@@ -1116,7 +1307,6 @@ mod tests {
         manager.schedule(trigger.clone()).await?;
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(times.len(), 1);
 
@@ -1129,7 +1319,6 @@ mod tests {
             .await?;
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(times.is_empty());
         Ok(())
@@ -1172,7 +1361,6 @@ mod tests {
         for trigger in &triggers {
             let times = manager
                 .scheduled_times(&trigger.key, TimerType::Application)
-                .try_collect::<Vec<_>>()
                 .await?;
             assert_eq!(times.len(), 1);
             assert!(times.contains(&base_time));
@@ -1213,12 +1401,10 @@ mod tests {
         // Verify both timers are stored
         let times_now = manager
             .scheduled_times(&trigger_now.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
 
         let times_future = manager
             .scheduled_times(&trigger_future.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
 
         assert_eq!(times_now.len(), 1);
@@ -1232,7 +1418,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let key = Key::from("isolation-key");
         let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?;
 
@@ -1327,7 +1512,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let key = Key::from("unschedule-isolation-key");
         let time = CompactDateTime::now()?.add_duration(CompactDuration::new(1))?;
 
@@ -1403,7 +1587,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("reschedule-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1438,7 +1621,6 @@ mod tests {
 
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(
             times.len(),
@@ -1456,7 +1638,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("idempotent-key", 1, TimerType::Application)?;
 
         // Schedule and fire
@@ -1512,7 +1693,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("delete-key", 1, TimerType::Application)?;
 
         // Schedule and fire
@@ -1530,7 +1710,6 @@ mod tests {
         // Verify timer is completely removed
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(times.is_empty(), "Timer should be deleted from DB");
 
@@ -1554,7 +1733,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("keep-key", 1, TimerType::Application)?;
 
         // Schedule, fire, and reschedule
@@ -1573,7 +1751,6 @@ mod tests {
         // Verify timer is still scheduled
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(times.len(), 1, "Timer should remain in DB");
         assert!(times.contains(&trigger.time));
@@ -1588,7 +1765,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("abort-reschedule-key", 1, TimerType::Application)?;
 
         // Schedule, fire, and reschedule
@@ -1625,7 +1801,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("e2e-key", 1, TimerType::Application)?;
 
         // 1. Schedule timer
@@ -1691,7 +1866,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("unschedule-firing-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1732,7 +1906,6 @@ mod tests {
         // Verify timer is completely removed
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(times.is_empty(), "Timer should be deleted after commit");
 
@@ -1756,7 +1929,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("cancel-reschedule-key", 1, TimerType::Application)?;
 
         // Schedule and wait for timer to fire
@@ -1816,7 +1988,6 @@ mod tests {
         // Verify timer is completely removed
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(times.is_empty(), "Timer should be deleted after commit");
 
@@ -1844,7 +2015,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("exclude-firing-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1853,7 +2023,6 @@ mod tests {
         // Verify timer is in scheduled_times before firing
         let times_before = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(
             times_before.len(),
@@ -1872,7 +2041,6 @@ mod tests {
         // Verify timer is NOT in scheduled_times while firing
         let times_during = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(
             times_during.is_empty(),
@@ -1885,7 +2053,6 @@ mod tests {
 
         let times_after = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(times_after.is_empty(), "Timer should be gone after commit");
 
@@ -1899,7 +2066,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("include-rescheduled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -1915,7 +2081,6 @@ mod tests {
         // While firing, timer should NOT be in scheduled_times
         let times_firing = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(
             times_firing.is_empty(),
@@ -1928,7 +2093,6 @@ mod tests {
         // Now timer SHOULD be in scheduled_times (FiringRescheduled includes it)
         let times_rescheduled = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(
             times_rescheduled.len(),
@@ -1943,7 +2107,6 @@ mod tests {
 
         let times_after_commit = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(
             times_after_commit.len(),
@@ -1966,7 +2129,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("fire-scheduled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -2008,7 +2170,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("fire-cancelled-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -2047,7 +2208,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("reschedule-abort-key", 1, TimerType::Application)?;
 
         // 1. Schedule timer
@@ -2115,7 +2275,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("abort-firing-key", 1, TimerType::Application)?;
 
         // Schedule timer
@@ -2134,7 +2293,6 @@ mod tests {
         // Verify timer is in Firing state - scheduled_times() excludes Firing timers
         let times_while_firing = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(
             times_while_firing.is_empty(),
@@ -2150,7 +2308,6 @@ mod tests {
         // returns it (DB-only timers are included).
         let times_after_abort = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(
             times_after_abort.len(),
@@ -2158,6 +2315,87 @@ mod tests {
             "Timer should still be in DB after abort (preserved for recovery)"
         );
         assert!(times_after_abort.contains(&trigger.time));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clear_and_schedule_firing_same_time() -> Result<()> {
+        // Issue #7: clear_and_schedule with Firing state at same time as new timer.
+        // Schedule T at time X → fire → clear_and_schedule at same time X →
+        // verify FiringRescheduled → commit → verify timer fires again.
+        time::pause();
+
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+        let trigger = create_test_trigger("cas-firing-key", 1, TimerType::Application)?;
+
+        // Step 1: Schedule timer T at time X
+        manager.schedule(trigger.clone()).await?;
+        time::advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        // Step 2: Timer fires, enters Firing state
+        let pending = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("Expected pending timer"))?;
+        let firing = pending
+            .fire()
+            .await
+            .ok_or_else(|| eyre!("Expected active timer"))?;
+
+        // Step 3: clear_and_schedule with a new timer at the SAME time X.
+        // This exercises the Firing → FiringRescheduled path in clear_and_schedule
+        // (manager.rs line 507) and the skip in unschedule_replaced_timers (line 731).
+        manager.clear_and_schedule(trigger.clone()).await?;
+
+        // Step 4: Verify transition to FiringRescheduled
+        let is_scheduled = manager
+            .0
+            .state
+            .trigger_lock()
+            .await
+            .scheduler
+            .active_triggers()
+            .is_scheduled(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+        assert!(
+            is_scheduled,
+            "Timer should be scheduled (FiringRescheduled) after clear_and_schedule"
+        );
+
+        // Step 5: Commit the first firing. FiringRescheduled → re-queued.
+        let (_, guard) = firing.into_inner();
+        guard.commit().await;
+
+        // The timer should still be scheduled after commit
+        let times = manager
+            .scheduled_times(&trigger.key, TimerType::Application)
+            .await?;
+        assert_eq!(
+            times.len(),
+            1,
+            "Timer should be scheduled for re-firing after commit"
+        );
+        assert!(times.contains(&trigger.time));
+
+        // Advance time again and verify the timer fires a second time
+        time::advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        let pending2 = timeout(Duration::from_secs(5), stream.next())
+            .await?
+            .ok_or_else(|| eyre!("Expected timer to fire again after FiringRescheduled commit"))?;
+        let firing2 = pending2
+            .fire()
+            .await
+            .ok_or_else(|| eyre!("Second firing not active"))?;
+
+        let (refired_trigger, guard2) = firing2.into_inner();
+        assert_eq!(refired_trigger.key, trigger.key);
+        assert_eq!(refired_trigger.time, trigger.time);
+        guard2.commit().await;
 
         Ok(())
     }

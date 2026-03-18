@@ -11,7 +11,6 @@ use crate::consumer::event_context::EventContext;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use ahash::RandomState;
-use futures::stream::{self, Stream};
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::{self, Future, ready};
@@ -278,8 +277,8 @@ impl EventContext for KeyedCapturingContext {
     fn scheduled(
         &self,
         _timer_type: TimerType,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        stream::empty()
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
+        ready(Ok(Vec::new()))
     }
 }
 

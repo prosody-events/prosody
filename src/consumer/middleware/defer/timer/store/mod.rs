@@ -15,7 +15,6 @@ use crate::Key;
 use crate::error::ClassifyError;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use futures::Stream;
 use opentelemetry::Context;
 use std::error::Error;
 use std::future::Future;
@@ -139,11 +138,11 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Streams all deferred times for a key (ascending order).
+    /// Returns all deferred times for a key (ascending order).
     fn deferred_times(
         &self,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static;
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static;
 
     /// Low-level: appends timer without touching retry count.
     fn append_deferred_timer(

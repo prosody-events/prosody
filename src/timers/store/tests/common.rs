@@ -39,13 +39,13 @@ use crate::timers::{TimerType, Trigger};
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn insert_segment<S>(store: &S, segment: &Segment) -> TestStoreResult
+pub async fn insert_segment<S>(store: &S, _segment: &Segment) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
     store
-        .insert_segment(segment.clone())
+        .insert_segment()
         .await
         .map_err(|e| format!("Failed to insert segment: {e:?}"))?;
     Ok(())
@@ -56,13 +56,13 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn delete_slab<S>(store: &S, segment_id: &SegmentId, slab_id: SlabId) -> TestStoreResult
+pub async fn delete_slab<S>(store: &S, slab_id: SlabId) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
     store
-        .delete_slab(segment_id, slab_id)
+        .delete_slab(slab_id)
         .await
         .map_err(|e| format!("Failed to delete slab: {e:?}"))?;
     Ok(())
@@ -78,9 +78,9 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let slab = Slab::from_time(segment.id, segment.slab_size, trigger.time);
+    let slab = Slab::from_time(segment.slab_size, trigger.time);
     store
-        .add_trigger(segment, slab, trigger.clone())
+        .add_trigger(slab, trigger.clone())
         .await
         .map_err(|e| format!("Failed to add trigger: {e:?}"))?;
     Ok(())
@@ -93,14 +93,14 @@ where
 /// Returns an error if the store operation fails.
 pub async fn get_key_triggers<S>(
     store: &S,
-    segment_id: &SegmentId,
+    _segment_id: &SegmentId,
     key: &Key,
 ) -> Result<HashSet<CompactDateTime>, String>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    get_key_triggers_by_type(store, segment_id, key, TimerType::Application).await
+    get_key_triggers_by_type(store, key, TimerType::Application).await
 }
 
 /// Helper function to get triggers by key for a specific timer type
@@ -110,7 +110,6 @@ where
 /// Returns an error if the store operation fails.
 pub async fn get_key_triggers_by_type<S>(
     store: &S,
-    segment_id: &SegmentId,
     key: &Key,
     timer_type: TimerType,
 ) -> Result<HashSet<CompactDateTime>, String>
@@ -119,7 +118,7 @@ where
     S::Error: Debug,
 {
     store
-        .get_key_times(segment_id, timer_type, key)
+        .get_key_times(timer_type, key)
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -183,9 +182,9 @@ where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let slab = Slab::from_time(segment.id, segment.slab_size, time);
+    let slab = Slab::from_time(segment.slab_size, time);
     store
-        .remove_trigger(segment, &slab, key, time, TimerType::Application)
+        .remove_trigger(&slab, key, time, TimerType::Application)
         .await
         .map_err(|e| format!("Failed to remove trigger: {e:?}"))?;
     Ok(())
@@ -210,7 +209,7 @@ where
 {
     // Get all trigger times for this key
     let times: Vec<CompactDateTime> = store
-        .get_key_times(&segment.id, timer_type, key)
+        .get_key_times(timer_type, key)
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -219,9 +218,9 @@ where
 
     // Remove each trigger
     for time in times {
-        let slab = Slab::from_time(segment.id, segment.slab_size, time);
+        let slab = Slab::from_time(segment.slab_size, time);
         store
-            .remove_trigger(segment, &slab, key, time, timer_type)
+            .remove_trigger(&slab, key, time, timer_type)
             .await
             .map_err(|e| format!("Failed to remove trigger: {e:?}"))?;
     }
@@ -266,7 +265,7 @@ where
 
         // Verify slab consistency for each time
         for &time in expected_times {
-            let slab = Slab::from_time(segment.id, segment.slab_size, time);
+            let slab = Slab::from_time(segment.slab_size, time);
             let slab_triggers = get_slab_triggers_all_types(store, &slab).await?;
 
             // Check if this trigger is in the correct slab

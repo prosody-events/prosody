@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Integration tests for telemetry event emission via Kafka.
 //!
 //! Validates that telemetry events (message lifecycle, producer message sent)
@@ -346,6 +347,73 @@ impl FallibleHandler for ClearAndScheduleHandler {
     async fn shutdown(self) {}
 }
 
+/// Handler that schedules a timer on first message, then calls
+/// `clear_and_schedule` on second message and reports both the replacement
+/// time and the actual trigger time so the test can verify the inline
+/// replacement path.
+#[derive(Clone)]
+struct InlineReplacementHandler {
+    messages: Sender<String>,
+    replacement_time: Sender<CompactDateTime>,
+    timer_fired: Sender<CompactDateTime>,
+}
+
+impl FallibleHandler for InlineReplacementHandler {
+    type Error = TestError;
+
+    async fn on_message<C>(
+        &self,
+        ctx: C,
+        msg: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let key = msg.key().to_string();
+        let step = msg
+            .payload()
+            .get("step")
+            .and_then(Value::as_i64)
+            .ok_or(TestError)?;
+
+        if step == 1 {
+            let schedule_time = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(3)))
+                .map_err(|_| TestError)?;
+            ctx.schedule(schedule_time, TimerType::Application)
+                .await
+                .map_err(|_| TestError)?;
+        } else {
+            let new_time = CompactDateTime::now()
+                .and_then(|now| now.add_duration(CompactDuration::new(5)))
+                .map_err(|_| TestError)?;
+            ctx.clear_and_schedule(new_time, TimerType::Application)
+                .await
+                .map_err(|_| TestError)?;
+            let _ = self.replacement_time.send(new_time).await;
+        }
+
+        let _ = self.messages.send(key).await;
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        let _ = self.timer_fired.send(trigger.time).await;
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
 /// Test error type that classifies as transient.
 #[derive(Debug, Clone)]
 struct TransientError;
@@ -646,6 +714,18 @@ fn has_at_least(events: &[Value], event_type: &str, n: usize) -> bool {
     count_type(events, event_type) >= n
 }
 
+/// Returns `true` when `events` contains the two-event message invariant:
+/// dispatched + succeeded (or dispatched + failed).
+fn has_message_lifecycle(events: &[Value], expect_success: bool) -> bool {
+    let has_dispatched = has_at_least(events, "prosody.message.dispatched", 1);
+    let has_outcome = if expect_success {
+        has_at_least(events, "prosody.message.succeeded", 1)
+    } else {
+        has_at_least(events, "prosody.message.failed", 1)
+    };
+    has_dispatched && has_outcome
+}
+
 /// Returns `true` when `events` contains the three-event invariant
 /// (scheduled, dispatched, succeeded/failed) for `timer_type`.
 fn has_timer_lifecycle(events: &[Value], timer_type: &str) -> bool {
@@ -660,34 +740,44 @@ fn has_timer_lifecycle(events: &[Value], timer_type: &str) -> bool {
             || matching.contains(&"prosody.timer.failed"))
 }
 
-/// Collects all telemetry events whose `key` matches and whose `type` starts
-/// with `"prosody.message."` until idle.
+/// Collects telemetry events whose `key` matches and whose `type` starts
+/// with `"prosody.message."` until `done` returns `true` for the accumulated
+/// set.
+///
+/// Each individual `recv` is guarded by `per_event_timeout`.
 async fn collect_message_events_for_key(
     consumer: &StreamConsumer,
     key: &str,
-    idle_timeout: Duration,
+    per_event_timeout: Duration,
+    done: impl Fn(&[Value]) -> bool,
 ) -> Result<Vec<Value>> {
     let mut events = Vec::new();
     loop {
-        match timeout(idle_timeout, consumer.recv()).await {
-            Ok(Ok(msg)) => {
-                let Some(payload) = msg.payload() else {
-                    continue;
-                };
-                let Ok(value) = serde_json::from_slice::<Value>(payload) else {
-                    continue;
-                };
-                let matches_key = value.get("key").and_then(Value::as_str) == Some(key);
-                let is_message = value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t.starts_with("prosody.message."));
-                if matches_key && is_message {
-                    events.push(value);
-                }
-            }
-            Err(_) => break,
-            Ok(Err(e)) => return Err(e.into()),
+        if done(&events) {
+            break;
+        }
+        let msg = timeout(per_event_timeout, consumer.recv())
+            .await
+            .map_err(|_| {
+                eyre!(
+                    "timed out waiting for message events for key {key:?}; collected so far: \
+                     {events:?}",
+                )
+            })?
+            .map_err(|e| eyre!("consumer error: {e}"))?;
+        let Some(payload) = msg.payload() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+            continue;
+        };
+        let matches_key = value.get("key").and_then(Value::as_str) == Some(key);
+        let is_message = value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with("prosody.message."));
+        if matches_key && is_message {
+            events.push(value);
         }
     }
     Ok(events)
@@ -964,9 +1054,13 @@ async fn message_lifecycle_events_on_kafka() -> Result<()> {
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
-        let events =
-            collect_message_events_for_key(&telemetry_consumer, "test-key", RECEIVE_TIMEOUT)
-                .await?;
+        let events = collect_message_events_for_key(
+            &telemetry_consumer,
+            "test-key",
+            RECEIVE_TIMEOUT,
+            |evts| has_message_lifecycle(evts, true),
+        )
+        .await?;
         assert_message_two_event_invariant(&events, true)?;
 
         client.unsubscribe().await?;
@@ -1238,9 +1332,13 @@ async fn message_failed_event_on_kafka() -> Result<()> {
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, fail_rx.recv()).await?;
 
-        let events =
-            collect_message_events_for_key(&telemetry_consumer, "fail-key", RECEIVE_TIMEOUT)
-                .await?;
+        let events = collect_message_events_for_key(
+            &telemetry_consumer,
+            "fail-key",
+            RECEIVE_TIMEOUT,
+            |evts| has_message_lifecycle(evts, false),
+        )
+        .await?;
         assert_message_two_event_invariant(&events, false)?;
 
         client.unsubscribe().await?;
@@ -1639,6 +1737,79 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
             "expected at least 1 cancelled event (old timer cleared); got {cancelled_count}; \
              types: {types:?}"
         );
+
+        client.unsubscribe().await?;
+        admin.delete_topic(&source_topic).await?;
+        admin.delete_topic(&telemetry_topic).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| eyre!("test timed out after {TIMER_TEST_TIMEOUT:?}"))?
+}
+
+/// Verifies the Inline→Inline tombstone-free timer replacement path:
+/// `schedule` followed by `clear_and_schedule` on the same key results in
+/// exactly one timer firing at the replacement time.
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
+    timeout(TIMER_TEST_TIMEOUT, async {
+        init_test_logging();
+
+        let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap_servers())?)?;
+        let telemetry_topic = Uuid::new_v4().to_string();
+        let source_topic = Uuid::new_v4().to_string();
+        let source: Topic = source_topic.as_str().into();
+
+        create_topic(admin, &telemetry_topic).await?;
+        create_topic(admin, &source_topic).await?;
+
+        let client: HighLevelClient<InlineReplacementHandler> =
+            build_typed_client(&source_topic, &telemetry_topic)?;
+
+        let (messages, mut msg_rx) = channel(16);
+        let (replacement_time, mut replacement_time_rx) = channel(16);
+        let (timer_fired, mut timer_rx) = channel(16);
+        client
+            .subscribe(InlineReplacementHandler {
+                messages,
+                replacement_time,
+                timer_fired,
+            })
+            .await?;
+
+        // Step 1: schedule at t+3s
+        client
+            .send(source, "replace-key", &json!({"step": 1_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Step 2: clear_and_schedule at t+5s (replaces the original)
+        client
+            .send(source, "replace-key", &json!({"step": 2_i32}))
+            .await?;
+        let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
+
+        // Capture the replacement time the handler recorded
+        let replacement_time = timeout(RECEIVE_TIMEOUT, replacement_time_rx.recv())
+            .await
+            .map_err(|_| eyre!("timeout waiting for replacement time"))?
+            .ok_or_else(|| eyre!("replacement_time channel closed"))?;
+
+        // Wait for the timer to fire (should be ~5s from step 2)
+        let trigger_time = timeout(Duration::from_secs(15), timer_rx.recv())
+            .await
+            .map_err(|_| eyre!("timeout waiting for on_timer — timer never fired"))?
+            .ok_or_else(|| eyre!("timer_fired channel closed"))?;
+
+        // The timer must fire at the replacement time, not the original
+        ensure!(
+            trigger_time == replacement_time,
+            "timer fired at {trigger_time:?} but expected replacement time {replacement_time:?}"
+        );
+
+        // Verify no second timer fires (the original t+3s was replaced)
+        let second = timeout(Duration::from_secs(5), timer_rx.recv()).await;
+        ensure!(second.is_err(), "expected no second timer but received one");
 
         client.unsubscribe().await?;
         admin.delete_topic(&source_topic).await?;

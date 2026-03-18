@@ -45,7 +45,7 @@ where
     }
 
     // Check it exists in slab index
-    let slab = Slab::from_time(input.segment.id, input.segment.slab_size, trigger.time);
+    let slab = Slab::from_time(input.segment.slab_size, trigger.time);
 
     let slab_triggers = get_slab_triggers(store, &slab).await?;
 

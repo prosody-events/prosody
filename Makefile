@@ -1,7 +1,7 @@
 # Install Rust and necessary tools
 bootstrap:
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-	cargo install cargo-udeps cargo-tarpaulin taplo-cli bacon
+	cargo install cargo-udeps cargo-tarpaulin taplo-cli bacon cargo-nextest
 
 # Start Kafka and related services using Docker Compose
 up:
@@ -42,7 +42,7 @@ lint-watch:
 
 # Run tests (starts Kafka services first)
 test: up
-	cargo test
+	cargo nextest run
 
 # Watch for changes and run tests
 test-watch: up

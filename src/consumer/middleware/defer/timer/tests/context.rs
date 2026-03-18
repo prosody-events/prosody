@@ -12,9 +12,8 @@ use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, Ti
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
-use futures::TryStreamExt;
-use futures::stream;
 use std::convert::Infallible;
+use std::future::{Future, ready};
 use std::sync::Arc;
 
 // ============================================================================
@@ -154,7 +153,7 @@ impl EventContext for KeyedMockContext {
     fn scheduled(
         &self,
         timer_type: TimerType,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
         let times: Vec<CompactDateTime> = self
             .active_timers
             .lock()
@@ -162,7 +161,7 @@ impl EventContext for KeyedMockContext {
             .filter(|(_, t)| *t == timer_type)
             .map(|(time, _)| *time)
             .collect();
-        stream::iter(times.into_iter().map(Ok))
+        ready(Ok(times))
     }
 }
 
@@ -227,10 +226,7 @@ impl ContextTestHarness {
 
     /// Returns all deferred times for this key, sorted ascending.
     async fn deferred_times(&self) -> color_eyre::Result<Vec<CompactDateTime>> {
-        use futures::TryStreamExt;
-        let times: Vec<CompactDateTime> =
-            self.store.deferred_times(self.key()).try_collect().await?;
-        Ok(times)
+        Ok(self.store.deferred_times(self.key()).await?)
     }
 }
 
@@ -300,10 +296,7 @@ fn schedule_when_deferred_appends_to_store() -> color_eyre::Result<()> {
 
         // CLIENT INVARIANT: Timer must appear in scheduled() regardless of internal
         // storage
-        let scheduled: Vec<CompactDateTime> = context
-            .scheduled(TimerType::Application)
-            .try_collect()
-            .await?;
+        let scheduled: Vec<CompactDateTime> = context.scheduled(TimerType::Application).await?;
         assert!(
             scheduled.contains(&time),
             "Timer scheduled while deferred must appear in scheduled(); got: {scheduled:?}"
@@ -362,10 +355,7 @@ fn unschedule_removes_from_both_stores() -> color_eyre::Result<()> {
         );
 
         // CLIENT INVARIANT: scheduled() must reflect unschedule operations
-        let scheduled: Vec<CompactDateTime> = context
-            .scheduled(TimerType::Application)
-            .try_collect()
-            .await?;
+        let scheduled: Vec<CompactDateTime> = context.scheduled(TimerType::Application).await?;
         assert!(
             !scheduled.contains(&CompactDateTime::from(500_u32)),
             "Unscheduled timer must not appear in scheduled()"
@@ -467,10 +457,7 @@ fn scheduled_merges_both_stores_sorted_deduplicated() -> color_eyre::Result<()> 
         let context = harness.create_wrapped_context();
 
         // Get scheduled times - should be merged and sorted
-        let times: Vec<CompactDateTime> = context
-            .scheduled(TimerType::Application)
-            .try_collect()
-            .await?;
+        let times: Vec<CompactDateTime> = context.scheduled(TimerType::Application).await?;
 
         // Should be sorted: 500, 1000, 2000, 3000
         assert_eq!(
@@ -508,10 +495,7 @@ fn scheduled_deduplicates_when_same_time_in_both_stores() -> color_eyre::Result<
         let context = harness.create_wrapped_context();
 
         // Get scheduled times - should be deduplicated
-        let times: Vec<CompactDateTime> = context
-            .scheduled(TimerType::Application)
-            .try_collect()
-            .await?;
+        let times: Vec<CompactDateTime> = context.scheduled(TimerType::Application).await?;
 
         // Should have only ONE entry at 1000
         assert_eq!(times.len(), 1, "Duplicate time should appear only once");
@@ -593,10 +577,7 @@ fn client_operations_work_identically_when_deferred() -> color_eyre::Result<()> 
             .await?;
 
         // CLIENT INVARIANT: Scheduled timer must be visible
-        let scheduled: Vec<CompactDateTime> = context
-            .scheduled(TimerType::Application)
-            .try_collect()
-            .await?;
+        let scheduled: Vec<CompactDateTime> = context.scheduled(TimerType::Application).await?;
         assert!(
             scheduled.contains(&client_timer),
             "schedule() while deferred: timer must appear in scheduled()"
@@ -608,10 +589,7 @@ fn client_operations_work_identically_when_deferred() -> color_eyre::Result<()> 
             .await?;
 
         // CLIENT INVARIANT: Unscheduled timer must be gone
-        let scheduled: Vec<CompactDateTime> = context
-            .scheduled(TimerType::Application)
-            .try_collect()
-            .await?;
+        let scheduled: Vec<CompactDateTime> = context.scheduled(TimerType::Application).await?;
         assert!(
             !scheduled.contains(&client_timer),
             "unschedule() while deferred: timer must not appear in scheduled()"
@@ -633,10 +611,7 @@ fn client_operations_work_identically_when_deferred() -> color_eyre::Result<()> 
             .await?;
 
         // CLIENT INVARIANT: Only the replacement timer should exist
-        let scheduled: Vec<CompactDateTime> = context
-            .scheduled(TimerType::Application)
-            .try_collect()
-            .await?;
+        let scheduled: Vec<CompactDateTime> = context.scheduled(TimerType::Application).await?;
         assert_eq!(
             scheduled,
             vec![replacement],
@@ -727,12 +702,16 @@ mod error_handling {
         }
     }
 
-    /// Store wrapper that injects an error after yielding N items from
-    /// `deferred_times`.
+    /// Store wrapper that injects an error from `deferred_times` when the
+    /// total item count exceeds `fail_after`.
+    ///
+    /// With Vec semantics errors are all-or-nothing: if the count exceeds the
+    /// threshold the entire call returns `Err` with no partial results.
     #[derive(Clone)]
     struct FailAfterNStore {
         inner: CachedTimerDeferStore<MemoryTimerDeferStore>,
-        /// Error after this many items (0 = error immediately on first poll)
+        /// Inject an error when `deferred_times` returns more than this many
+        /// items. Set to `usize::MAX` (or any value ≥ item count) for success.
         fail_after: usize,
     }
 
@@ -784,22 +763,17 @@ mod error_handling {
         fn deferred_times(
             &self,
             key: &Key,
-        ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-            let inner_stream = self.inner.deferred_times(key);
+        ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static
+        {
+            let inner_fut = self.inner.deferred_times(key);
             let fail_after = self.fail_after;
 
-            async_stream::try_stream! {
-                use futures::StreamExt;
-                futures::pin_mut!(inner_stream);
-
-                let mut yielded = 0;
-                while let Some(result) = inner_stream.next().await {
-                    if yielded >= fail_after {
-                        // Inject error before yielding this item
-                        Err(TestStoreError::transient())?;
-                    }
-                    yielded += 1;
-                    yield result.map_err(|_| TestStoreError::transient())?;
+            async move {
+                let times = inner_fut.await.map_err(|_| TestStoreError::transient())?;
+                if fail_after < times.len() {
+                    Err(TestStoreError::transient())
+                } else {
+                    Ok(times)
                 }
             }
         }
@@ -870,102 +844,26 @@ mod error_handling {
         Ok((inner_context, failing_store, key))
     }
 
-    /// Collects items from the scheduled stream until error or completion.
-    async fn collect_until_error<C, S>(
-        context: &TimerDeferContext<C, S>,
-    ) -> (
-        Vec<CompactDateTime>,
-        Option<TimerDeferContextError<C::Error, S::Error>>,
-    )
-    where
-        C: EventContext + Clone + Send + Sync,
-        S: TimerDeferStore + Clone + Send + Sync,
-    {
-        let mut collected = Vec::new();
-        let stream = context.scheduled(TimerType::Application);
-        futures::pin_mut!(stream);
-
-        loop {
-            match stream.try_next().await {
-                Ok(Some(time)) => collected.push(time),
-                Ok(None) => return (collected, None),
-                Err(e) => return (collected, Some(e)),
-            }
-        }
-    }
-
     /// `scheduled()` propagates store error on immediate failure.
     ///
-    /// Tests that when the deferred store fails on the very first poll,
-    /// the error is correctly propagated as `TimerDeferContextError::Store`.
+    /// Tests that when the deferred store fails (`fail_after=0` means any count
+    /// triggers an error), the error is correctly propagated as
+    /// `TimerDeferContextError::Store`.
     #[test]
     fn scheduled_propagates_immediate_store_error() -> color_eyre::Result<()> {
         init_test_logging();
 
         TEST_RUNTIME.block_on(async {
-            // Set up store with 3 timers that fails on first poll (fail_after=0)
+            // Set up store with 3 timers that fails (fail_after=0 < 3)
             let (inner_context, failing_store, key) = setup_failing_store(3, 0).await?;
             let context = TimerDeferContext::new(inner_context, failing_store, key);
 
-            let (collected, error) = collect_until_error(&context).await;
+            let result = context.scheduled(TimerType::Application).await;
 
-            // Should get error immediately with no items collected
-            assert!(error.is_some(), "Should have received a Store error");
             assert!(
-                matches!(error, Some(TimerDeferContextError::Store(_))),
-                "Error should be Store variant"
+                matches!(result, Err(TimerDeferContextError::Store(_))),
+                "Error should be Store variant; got: {result:?}"
             );
-            assert!(
-                collected.is_empty(),
-                "Should not yield any items before immediate error; got: {collected:?}"
-            );
-
-            Ok(())
-        })
-    }
-
-    /// `scheduled()` propagates store error after yielding some items.
-    ///
-    /// Tests that when the deferred store fails mid-iteration, previously
-    /// yielded items are preserved and the error is correctly wrapped.
-    #[test]
-    fn scheduled_propagates_mid_iteration_store_error() -> color_eyre::Result<()> {
-        init_test_logging();
-
-        TEST_RUNTIME.block_on(async {
-            // Set up store with 5 timers that fails after yielding 2 (fail_after=2)
-            let (inner_context, failing_store, key) = setup_failing_store(5, 2).await?;
-            let context = TimerDeferContext::new(inner_context, failing_store, key);
-
-            let (collected, error) = collect_until_error(&context).await;
-
-            // Should get error after some items
-            assert!(error.is_some(), "Should have received a Store error");
-            assert!(
-                matches!(error, Some(TimerDeferContextError::Store(_))),
-                "Error should be Store variant"
-            );
-
-            // The merge algorithm looks ahead, so the number of items yielded
-            // depends on timing. But we should have at least 1 item (first was
-            // fetched successfully) and fewer than all 5.
-            assert!(
-                !collected.is_empty(),
-                "Should yield at least one item before error"
-            );
-            assert!(
-                collected.len() < 5,
-                "Should not yield all items; got {} items",
-                collected.len()
-            );
-
-            // Items should be in sorted order
-            for window in collected.windows(2) {
-                assert!(
-                    window[0] <= window[1],
-                    "Items should be sorted; got: {collected:?}"
-                );
-            }
 
             Ok(())
         })
@@ -983,14 +881,11 @@ mod error_handling {
             let (inner_context, failing_store, key) = setup_failing_store(4, 100).await?;
             let context = TimerDeferContext::new(inner_context, failing_store, key);
 
-            let (collected, error) = collect_until_error(&context).await;
-
-            // Should complete without error
-            assert!(error.is_none(), "Should not have error; got: {error:?}");
+            let times = context.scheduled(TimerType::Application).await?;
 
             // Should have all 4 items in sorted order
             assert_eq!(
-                collected,
+                times,
                 vec![
                     CompactDateTime::from(1000_u32),
                     CompactDateTime::from(2000_u32),

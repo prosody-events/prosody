@@ -12,13 +12,13 @@ use crate::timers::error::TimerManagerError;
 use crate::timers::scheduler::TriggerScheduler;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::slab_lock::SlabLock;
-use crate::timers::store::{Segment, SegmentId, SegmentVersion, TriggerStore};
+use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::{DELETE_CONCURRENCY, LOAD_CONCURRENCY};
 use ahash::{HashSet, HashSetExt};
 use futures::stream::iter;
 use futures::{StreamExt, TryStreamExt};
 use rand::RngExt;
-use std::ops::{ControlFlow, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::watch;
@@ -88,23 +88,6 @@ impl<T> State<T> {
     }
 }
 
-/// Mutable per-iteration state for [`slab_loader`].
-struct LoaderContext {
-    preload_window: CompactDuration,
-    loaded_slab_ids: HashSet<SlabId>,
-    highest_loaded_slab_id: Option<SlabId>,
-}
-
-impl LoaderContext {
-    fn new(slab_size: CompactDuration) -> Self {
-        Self {
-            preload_window: calculate_preload(slab_size),
-            loaded_slab_ids: HashSet::new(),
-            highest_loaded_slab_id: None,
-        }
-    }
-}
-
 /// Background task that continuously loads upcoming slabs and cleans up old
 /// ones.
 ///
@@ -115,8 +98,6 @@ impl LoaderContext {
 /// 4. Extends ownership for loaded slabs.
 /// 5. Removes slabs whose triggers have all completed.
 /// 6. Waits until it's time to load the next slab.
-///
-/// The loop exits cleanly when `shutdown_rx` receives `true`.
 ///
 /// # Type Parameters
 ///
@@ -136,111 +117,97 @@ pub async fn slab_loader<T>(
 ) where
     T: TriggerStore,
 {
-    let mut ctx = LoaderContext::new(segment.slab_size);
-
-    loop {
-        select! {
-            result = slab_loader_iteration(&segment, &state, &heartbeat, &mut ctx) => {
-                if result.is_break() {
-                    return;
-                }
-            },
-            _ = shutdown_rx.wait_for(|&v| v) => {
-                debug!("Slab loader shutting down");
-                return;
-            },
-        }
-    }
-}
-
-/// Runs one iteration of the slab-loader loop.
-///
-/// Returns [`ControlFlow::Break`] when the loader has reached the maximum slab
-/// ID and should stop permanently. Returns [`ControlFlow::Continue`] otherwise.
-async fn slab_loader_iteration<T>(
-    segment: &Segment,
-    state: &SlabLock<State<T>>,
-    heartbeat: &Heartbeat,
-    ctx: &mut LoaderContext,
-) -> ControlFlow<()>
-where
-    T: TriggerStore,
-{
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-    // Signal that the loader is active
-    heartbeat.beat();
+    // Initialize jittered preload window
+    let mut preload_window = calculate_preload(segment.slab_size);
+    let mut loaded_slab_ids = HashSet::new();
+    let mut highest_loaded_slab_id: Option<SlabId> = None;
 
-    // Compute the target time to preload (current time + preload window)
-    let now = match CompactDateTime::now() {
-        Ok(now) => now,
-        Err(error) => {
-            error!("Failed to get current time: {error:#}; retrying");
-            sleep(RETRY_DELAY).await;
-            return ControlFlow::Continue(());
+    loop {
+        if *shutdown_rx.borrow() {
+            debug!("Slab loader shutting down");
+            return;
         }
-    };
 
-    let target_time = match now.add_duration(ctx.preload_window) {
-        Ok(time) => time,
-        Err(error) => {
-            error!("Failed to calculate target time: {error:#}; retrying");
-            sleep(RETRY_DELAY).await;
-            return ControlFlow::Continue(());
-        }
-    };
+        // Signal that the loader is active
+        heartbeat.beat();
 
-    // Map target time to its slab ID
-    let target_slab = Slab::from_time(segment.id, segment.slab_size, target_time);
-    let target_slab_id = target_slab.id();
-
-    // Determine the next slab ID to load
-    let start_slab_id = ctx.highest_loaded_slab_id.map_or(0, |id| id + 1);
-
-    if start_slab_id <= target_slab_id {
-        let load_range = start_slab_id..=target_slab_id;
-        debug!("Loading slabs {start_slab_id}..={target_slab_id}");
-
-        // Load the slabs in parallel and update ownership
-        match load_slabs(state, segment, load_range).await {
-            Ok(loaded) => {
-                ctx.loaded_slab_ids.extend(loaded);
-                ctx.highest_loaded_slab_id = Some(target_slab_id);
-                debug!("Successfully loaded slabs up to {target_slab_id}");
-
-                // Re-jitter preload window for next cycle
-                ctx.preload_window = calculate_preload(segment.slab_size);
-            }
+        // Compute the target time to preload (current time + preload window)
+        let now = match CompactDateTime::now() {
+            Ok(now) => now,
             Err(error) => {
-                error!("Failed to load slabs: {error:#}; retrying in {RETRY_DELAY:?}");
+                error!("Failed to get current time: {error:#}; retrying");
                 sleep(RETRY_DELAY).await;
-                return ControlFlow::Continue(());
+                continue;
+            }
+        };
+
+        let target_time = match now.add_duration(preload_window) {
+            Ok(time) => time,
+            Err(error) => {
+                error!("Failed to calculate target time: {error:#}; retrying");
+                sleep(RETRY_DELAY).await;
+                continue;
+            }
+        };
+
+        // Map target time to its slab ID
+        let target_slab = Slab::from_time(segment.slab_size, target_time);
+        let target_slab_id = target_slab.id();
+
+        // Determine the next slab ID to load
+        let start_slab_id = highest_loaded_slab_id.map_or(0, |id| id + 1);
+
+        if start_slab_id <= target_slab_id {
+            let load_range = start_slab_id..=target_slab_id;
+            debug!("Loading slabs {start_slab_id}..={target_slab_id}");
+
+            // Load the slabs in parallel and update ownership
+            match load_slabs(&state, &segment, load_range).await {
+                Ok(loaded) => {
+                    loaded_slab_ids.extend(loaded);
+                    highest_loaded_slab_id = Some(target_slab_id);
+                    debug!("Successfully loaded slabs up to {target_slab_id}");
+
+                    // Re-jitter preload window for next cycle
+                    preload_window = calculate_preload(segment.slab_size);
+                }
+                Err(error) => {
+                    error!("Failed to load slabs: {error:#}; retrying in {RETRY_DELAY:?}");
+                    sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            }
+        }
+
+        // Determine the next slab chronologically
+        let Some(next_slab) = target_slab.next() else {
+            error!("Out of slab range - reached maximum slab ID");
+            return;
+        };
+
+        // Remove any slabs whose triggers have completed
+        if let Err(error) = remove_completed_slabs(&state, &segment, &mut loaded_slab_ids).await {
+            error!("Failed to remove completed slabs: {error:#}");
+        }
+
+        // Calculate wait time until next slab needs loading
+        let wait_time = calculate_wait_time(next_slab.range().start, preload_window);
+        if !wait_time.is_zero() {
+            debug!("Waiting {wait_time} before next load cycle");
+            select! {
+                () = sleep(wait_time.into()) => {},
+                () = heartbeat.next() => {},
+                result = shutdown_rx.wait_for(|&v| v) => {
+                    if result.is_ok() {
+                        debug!("Slab loader shutting down");
+                        return;
+                    }
+                },
             }
         }
     }
-
-    // Determine the next slab chronologically
-    let Some(next_slab) = target_slab.next() else {
-        error!("Out of slab range - reached maximum slab ID");
-        return ControlFlow::Break(());
-    };
-
-    // Remove any slabs whose triggers have completed
-    if let Err(error) = remove_completed_slabs(state, segment, &mut ctx.loaded_slab_ids).await {
-        error!("Failed to remove completed slabs: {error:#}");
-    }
-
-    // Calculate wait time until next slab needs loading
-    let wait_time = calculate_wait_time(next_slab.range().start, ctx.preload_window);
-    if !wait_time.is_zero() {
-        debug!("Waiting {wait_time} before next load cycle");
-        select! {
-            () = sleep(wait_time.into()) => {},
-            () = heartbeat.next() => {},
-        }
-    }
-
-    ControlFlow::Continue(())
 }
 
 /// Computes how long to wait before loading a slab that begins at `load_time`.
@@ -298,10 +265,10 @@ where
 
     let loaded = state
         .store
-        .get_slab_range(&segment.id, slab_range)
+        .get_slab_range(slab_range)
         .map_err(TimerManagerError::Store)
         .map_ok(|slab_id| async move {
-            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            let slab = Slab::new(slab_id, segment.slab_size);
             load_triggers(store_ref, scheduler_ref, slab).await?;
             Ok(slab_id)
         })
@@ -343,7 +310,7 @@ where
 
     let deleted_slab_ids = iter(completed_slab_ids)
         .map(|slab_id| async move {
-            store_ref.delete_slab(&segment.id, slab_id).await?;
+            store_ref.delete_slab(slab_id).await?;
             Ok(slab_id)
         })
         .buffer_unordered(DELETE_CONCURRENCY)
@@ -410,7 +377,7 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
     scheduler
         .active_triggers()
         .scan_active_times(|time, _timer_type| {
-            active_slab_ids.insert(Slab::from_time(segment.id, segment.slab_size, time).id());
+            active_slab_ids.insert(Slab::from_time(segment.slab_size, time).id());
         })
         .await;
 
@@ -419,14 +386,13 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
 
 /// Retrieves or creates a [`Segment`] in the store.
 ///
-/// If a segment with `segment_id` exists, it is returned. Otherwise, a new
-/// segment is inserted with the given `slab_size` and `name`.
+/// If a segment already exists in the store, it is returned. Otherwise, a new
+/// segment is inserted using the store's segment identity with the given
+/// `name`.
 ///
 /// # Arguments
 ///
 /// * `store` - The persistent trigger store.
-/// * `segment_id` - Unique identifier for the segment.
-/// * `slab_size` - Slab duration for time partitioning.
 /// * `name` - Human-readable name for the segment.
 ///
 /// # Errors
@@ -438,35 +404,25 @@ async fn active_slab_ids(segment: &Segment, scheduler: &TriggerScheduler) -> Has
 /// The existing or newly created [`Segment`] object.
 pub async fn get_or_create_segment<T>(
     store: &T,
-    segment_id: SegmentId,
-    slab_size: CompactDuration,
-    name: &str,
+    _name: &str,
 ) -> Result<Segment, TimerManagerError<T::Error>>
 where
     T: TriggerStore,
 {
     if let Some(segment) = store
-        .get_segment(&segment_id)
+        .get_segment()
         .await
         .map_err(TimerManagerError::Store)?
     {
         return Ok(segment);
     }
 
-    // Create new segment as v2
-    let segment = Segment {
-        id: segment_id,
-        name: name.to_owned(),
-        slab_size,
-        version: SegmentVersion::V2,
-    };
-
     store
-        .insert_segment(segment.clone())
+        .insert_segment()
         .await
         .map_err(TimerManagerError::Store)?;
 
-    Ok(segment)
+    Ok(store.segment())
 }
 
 /// Calculates a jittered preload duration between the minimum and slab size.
@@ -495,13 +451,12 @@ mod tests {
     use crate::Key;
     use crate::heartbeat::HeartbeatRegistry;
     use crate::timers::duration::CompactDuration;
-    use crate::timers::store::Segment;
     use crate::timers::store::memory::memory_store;
+    use crate::timers::store::{Segment, SegmentVersion};
     use crate::timers::{TimerType, Trigger};
-    use color_eyre::eyre::{Result, eyre};
+    use color_eyre::eyre::{self as eyre, Result};
     use futures::future;
     use std::time::Duration;
-    use tokio::sync::watch;
     use tokio::task;
     use tokio::time::{advance, pause};
     use tracing::Span;
@@ -527,7 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_new() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
 
@@ -537,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_is_owned_when_none() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
 
@@ -548,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_is_owned_with_ownership() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -564,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_extend_ownership() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -634,47 +589,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_new() -> Result<()> {
-        let store = memory_store();
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(60);
-        let name = "test-segment";
+        let test_segment = create_test_segment();
+        let store = memory_store(test_segment.clone());
 
-        let segment = get_or_create_segment(&store, segment_id, slab_size, name).await?;
-        assert_eq!(segment.id, segment_id);
-        assert_eq!(segment.name, name);
-        assert_eq!(segment.slab_size, slab_size);
+        let segment = get_or_create_segment(&store, "test-segment").await?;
+        assert_eq!(segment.id, test_segment.id);
+        assert_eq!(segment.name, test_segment.name);
+        assert_eq!(segment.slab_size, test_segment.slab_size);
 
         // Check that it was stored
-        let retrieved = store.get_segment(&segment_id).await?;
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.ok_or_else(|| eyre!("Expected segment to be stored"))?;
-        assert_eq!(retrieved.name, name);
+        let retrieved = store.get_segment().await?;
+        let retrieved = retrieved.ok_or_else(|| eyre::eyre!("Expected segment to be stored"))?;
+        assert_eq!(retrieved.id, test_segment.id);
+        assert_eq!(retrieved.name, test_segment.name);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_get_or_create_segment_existing() -> Result<()> {
-        let store = memory_store();
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(60);
-        let name1 = "first-segment";
-        let name2 = "second-segment";
+        let test_segment = create_test_segment();
+        let store = memory_store(test_segment.clone());
 
-        // Create first segment
-        let segment1 = get_or_create_segment(&store, segment_id, slab_size, name1).await?;
+        // Create the segment
+        let segment1 = get_or_create_segment(&store, "first-segment").await?;
 
-        // Try to create second segment with same ID but different name
-        let segment2 = get_or_create_segment(&store, segment_id, slab_size, name2).await?;
+        // Second call should return the same (already persisted) segment
+        let segment2 = get_or_create_segment(&store, "second-segment").await?;
 
-        // Should return the first segment (existing one)
-        assert_eq!(segment1.name, segment2.name);
+        // Should return the first segment (existing one — name unchanged)
         assert_eq!(segment1.id, segment2.id);
+        assert_eq!(segment1.name, segment2.name);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_load_slabs_empty_range() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store, scheduler);
         let slab_lock = SlabLock::new(state);
@@ -688,21 +638,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_single_slab() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert the segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create a slab by adding a trigger at an appropriate time
         let slab_id = 1;
         let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
-        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, segment.slab_size);
         let trigger = create_test_trigger(1, time);
-        store.add_trigger(&segment, slab, trigger).await?;
+        store.add_trigger(slab, trigger).await?;
 
         let loaded = load_slabs(&slab_lock, &segment, 1..=1).await?;
         assert_eq!(loaded, vec![1]);
@@ -715,21 +665,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_multiple_slabs() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert the segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create multiple slabs by adding triggers at appropriate times
         for slab_id in 1..=3 {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            let slab = Slab::new(slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         let mut loaded = load_slabs(&slab_lock, &segment, 1..=3).await?;
@@ -744,10 +694,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_triggers_empty_slab() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
-        let slab = Slab::new(segment.id, 1, segment.slab_size);
+        let slab = Slab::new(1, segment.slab_size);
 
         load_triggers(&store, &scheduler, slab).await?;
         Ok(())
@@ -755,22 +705,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_triggers_with_triggers() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let segment = create_test_segment();
         let slab_id = 1;
-        let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, segment.slab_size);
 
         // Insert segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Add some triggers to the slab
         let now = CompactDateTime::now()?;
         let trigger1 = create_test_trigger(1, now);
         let trigger2 = create_test_trigger(2, now);
 
-        store.add_trigger(&segment, slab.clone(), trigger1).await?;
-        store.add_trigger(&segment, slab.clone(), trigger2).await?;
+        store.add_trigger(slab.clone(), trigger1).await?;
+        store.add_trigger(slab.clone(), trigger2).await?;
 
         load_triggers(&store, &scheduler, slab).await?;
         Ok(())
@@ -778,14 +728,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_completed_slabs_no_active() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create a loaded_slab_ids set with some slabs
         let mut loaded_slab_ids = HashSet::new();
@@ -796,9 +746,9 @@ mod tests {
         // Create slabs in store by adding triggers
         for slab_id in &loaded_slab_ids {
             let time = CompactDateTime::from(*slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
+            let slab = Slab::new(*slab_id, segment.slab_size);
             let trigger = create_test_trigger((*slab_id).into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         remove_completed_slabs(&slab_lock, &segment, &mut loaded_slab_ids).await?;
@@ -823,14 +773,14 @@ mod tests {
     async fn test_slab_loader_basic_operation() -> Result<()> {
         pause();
 
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert the segment
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create test heartbeat
         let test_heartbeat = Heartbeat::new("test-slab-loader", Duration::from_secs(30));
@@ -862,14 +812,14 @@ mod tests {
     async fn test_slab_loader_time_advancement() -> Result<()> {
         pause();
 
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert the segment
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create test heartbeat
         let test_heartbeat =
@@ -929,14 +879,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_completed_slabs_with_active_triggers() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler.clone());
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create some loaded slabs
         let mut loaded_slab_ids = HashSet::new();
@@ -947,15 +897,15 @@ mod tests {
         // Create slabs by adding triggers
         for slab_id in &loaded_slab_ids {
             let time = CompactDateTime::from(*slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, *slab_id, segment.slab_size);
+            let slab = Slab::new(*slab_id, segment.slab_size);
             let trigger = create_test_trigger((*slab_id).into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         // Add an active trigger to slab 2
         let now = CompactDateTime::now()?;
         let trigger = create_test_trigger(1, now);
-        let _slab = Slab::from_time(segment.id, segment.slab_size, now);
+        let _slab = Slab::from_time(segment.slab_size, now);
 
         // Schedule the trigger to make it active
         scheduler.schedule(trigger.clone()).await?;
@@ -970,14 +920,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_extends_ownership_correctly() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert the segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Set initial ownership
         {
@@ -988,9 +938,9 @@ mod tests {
         // Create slabs beyond current ownership by adding triggers
         for slab_id in 6..=10 {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            let slab = Slab::new(slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         let result = load_slabs(&slab_lock, &segment, 6..=10).await;
@@ -1005,14 +955,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_slabs_preserves_higher_ownership() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert the segment first
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Set high initial ownership
         {
@@ -1023,9 +973,9 @@ mod tests {
         // Create and load lower range slabs by adding triggers
         for slab_id in 1..=5 {
             let time = CompactDateTime::from(slab_id * segment.slab_size.seconds());
-            let slab = Slab::new(segment.id, slab_id, segment.slab_size);
+            let slab = Slab::new(slab_id, segment.slab_size);
             let trigger = create_test_trigger(slab_id.into(), time);
-            store.add_trigger(&segment, slab, trigger).await?;
+            store.add_trigger(slab, trigger).await?;
         }
 
         let loaded = load_slabs(&slab_lock, &segment, 1..=5).await?;
@@ -1039,7 +989,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_ownership_edge_cases() -> Result<()> {
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let mut state = State::new(store, scheduler);
 
@@ -1074,8 +1024,8 @@ mod tests {
         // Should include slabs for both triggers
         assert!(!active_ids.is_empty());
 
-        let expected_slab1 = Slab::from_time(segment.id, segment.slab_size, now);
-        let expected_slab2 = Slab::from_time(segment.id, segment.slab_size, future);
+        let expected_slab1 = Slab::from_time(segment.slab_size, now);
+        let expected_slab2 = Slab::from_time(segment.slab_size, future);
 
         assert!(active_ids.contains(&expected_slab1.id()));
         assert!(active_ids.contains(&expected_slab2.id()));
@@ -1084,18 +1034,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_segment_concurrent() -> Result<()> {
-        let store = memory_store();
-        let segment_id = Uuid::new_v4();
-        let slab_size = CompactDuration::new(60);
-        let name = "concurrent-test";
+        let test_segment = create_test_segment();
+        let store = memory_store(test_segment.clone());
 
         // Create multiple concurrent futures trying to create the same segment
         let futures: Vec<_> = (0_i32..10_i32)
             .map(|_| {
                 let store_clone = store.clone();
-                async move {
-                    get_or_create_segment(&store_clone, segment_id, slab_size, name).await
-                }
+                async move { get_or_create_segment(&store_clone, "concurrent-test").await }
             })
             .collect();
 
@@ -1105,17 +1051,16 @@ mod tests {
         // All should succeed and return the same segment
         for result in results {
             let segment = result?;
-            assert_eq!(segment.id, segment_id);
-            assert_eq!(segment.name, name);
-            assert_eq!(segment.slab_size, slab_size);
+            assert_eq!(segment.id, test_segment.id);
+            assert_eq!(segment.name, test_segment.name);
+            assert_eq!(segment.slab_size, test_segment.slab_size);
         }
 
-        // Verify only one segment exists in the store
-        let stored_segment = store.get_segment(&segment_id).await?;
+        // Verify the segment was stored
+        let stored_segment = store.get_segment().await?;
         let stored_segment =
-            stored_segment.ok_or_else(|| eyre!("Expected segment to be stored"))?;
-        assert_eq!(stored_segment.id, segment_id);
-        assert_eq!(stored_segment.name, name);
+            stored_segment.ok_or_else(|| eyre::eyre!("Expected segment to be stored"))?;
+        assert_eq!(stored_segment.id, test_segment.id);
         Ok(())
     }
 
@@ -1123,14 +1068,14 @@ mod tests {
     async fn test_slab_loader_handles_time_errors() -> Result<()> {
         pause();
 
-        let store = memory_store();
+        let store = memory_store(create_test_segment());
         let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
         let state = State::new(store.clone(), scheduler);
         let slab_lock = SlabLock::new(state);
         let segment = create_test_segment();
 
         // Insert the segment
-        store.insert_segment(segment.clone()).await?;
+        store.insert_segment().await?;
 
         // Create test heartbeat
         let test_heartbeat = Heartbeat::new("test-slab-loader-errors", Duration::from_secs(30));
@@ -1153,37 +1098,6 @@ mod tests {
 
         // Cancel the loader
         loader_handle.abort();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_slab_loader_shutdown() -> Result<()> {
-        pause();
-
-        let store = memory_store();
-        let (_triggers_rx, scheduler) = TriggerScheduler::new(&HeartbeatRegistry::test());
-        let state = State::new(store.clone(), scheduler);
-        let slab_lock = SlabLock::new(state);
-        let segment = create_test_segment();
-
-        store.insert_segment(segment.clone()).await?;
-
-        let test_heartbeat = Heartbeat::new("test-shutdown", Duration::from_secs(30));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        let loader_handle =
-            tokio::spawn(slab_loader(segment, slab_lock, test_heartbeat, shutdown_rx));
-
-        advance(Duration::from_millis(100)).await;
-        task::yield_now().await;
-        assert!(!loader_handle.is_finished());
-
-        shutdown_tx.send(true)?;
-        advance(Duration::from_millis(100)).await;
-        task::yield_now().await;
-
-        assert!(loader_handle.is_finished());
-        loader_handle.await?;
         Ok(())
     }
 

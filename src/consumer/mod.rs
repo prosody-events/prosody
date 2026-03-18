@@ -122,6 +122,7 @@
 //! - `heartbeat`: Monitoring for stalled processes
 //! - `probes`: HTTP endpoints for health and readiness checking
 
+use crate::cassandra::CassandraStore;
 use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::Context;
@@ -156,10 +157,9 @@ use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDurationError;
-use crate::timers::store::TriggerStore;
-use crate::timers::store::cassandra::CassandraTriggerStoreError;
-use crate::timers::store::cassandra::cassandra_store;
-use crate::timers::store::memory::memory_store;
+use crate::timers::store::TriggerStoreProvider;
+use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
+use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
@@ -734,19 +734,19 @@ fn build_common_middleware(
         .layer(CancellationMiddleware))
 }
 
-/// Helper function to initialize a consumer with a pre-built trigger store.
+/// Helper function to initialize a consumer with a trigger store provider.
 ///
-/// Used when sharing a `CassandraStore` between trigger and defer stores.
-fn initialize_consumer_with_store<T, S>(
+/// The provider creates per-partition stores with independent caches.
+fn initialize_consumer_with_provider<T, P>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
-    trigger_store: S,
+    trigger_provider: P,
     telemetry: &Telemetry,
     heartbeats: HeartbeatRegistry,
 ) -> Result<ProsodyConsumer, ConsumerError>
 where
     T: HandlerProvider,
-    S: TriggerStore,
+    P: TriggerStoreProvider,
 {
     // Validate the configuration
     consumer_config.validate()?;
@@ -771,7 +771,7 @@ where
     let (managers, runtime_state) = initialize_consumer(ConsumerInitParams {
         config: consumer_config.clone(),
         handler_provider,
-        trigger_store,
+        trigger_provider,
         watermark_version: watermark_version.clone(),
         managers: managers.clone(),
         allowed_events,
@@ -851,7 +851,7 @@ impl ProsodyConsumer {
             TriggerStoreConfiguration::InMemory => initialize_consumer(ConsumerInitParams {
                 config: consumer_config.clone(),
                 handler_provider,
-                trigger_store: memory_store(),
+                trigger_provider: InMemoryTriggerStoreProvider::new(),
                 watermark_version: watermark_version.clone(),
                 managers: managers.clone(),
                 allowed_events,
@@ -860,12 +860,16 @@ impl ProsodyConsumer {
                 heartbeats: heartbeats.clone(),
             })?,
             TriggerStoreConfiguration::Cassandra(cassandra_config) => {
-                let slab_size = consumer_config.slab_size.try_into()?;
-                let trigger_store = cassandra_store(cassandra_config, slab_size).await?;
+                let store = CassandraStore::new(cassandra_config)
+                    .await
+                    .map_err(CassandraTriggerStoreError::from)?;
+                let trigger_provider =
+                    CassandraTriggerStoreProvider::with_store(store, &cassandra_config.keyspace)
+                        .await?;
                 initialize_consumer(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
-                    trigger_store,
+                    trigger_provider,
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,
@@ -921,8 +925,7 @@ impl ProsodyConsumer {
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         // Create both stores atomically - ensures trigger and defer stores match
-        let slab_size = consumer_config.slab_size.try_into()?;
-        let stores = StorePair::new(trigger_store_config, slab_size, consumer_config.mock).await?;
+        let stores = StorePair::new(trigger_store_config, consumer_config.mock).await?;
         let PipelineMiddlewareConfiguration {
             retry: retry_config,
             monopolization: monopolization_config,
@@ -954,7 +957,7 @@ impl ProsodyConsumer {
         // variant)
         match stores {
             StorePair::Memory {
-                trigger,
+                trigger_provider,
                 message_provider,
                 timer_provider,
             } => {
@@ -982,16 +985,16 @@ impl ProsodyConsumer {
                     .layer(RetryMiddleware::new(retry_config)?)
                     .into_provider(handler);
 
-                initialize_consumer_with_store(
+                initialize_consumer_with_provider(
                     consumer_config,
                     provider,
-                    trigger,
+                    trigger_provider,
                     &telemetry,
                     heartbeats,
                 )
             }
             StorePair::Cassandra {
-                trigger,
+                trigger_provider,
                 message_provider,
                 timer_provider,
             } => {
@@ -1019,10 +1022,10 @@ impl ProsodyConsumer {
                     .layer(RetryMiddleware::new(retry_config)?)
                     .into_provider(handler);
 
-                initialize_consumer_with_store(
+                initialize_consumer_with_provider(
                     consumer_config,
                     provider,
-                    trigger,
+                    trigger_provider,
                     &telemetry,
                     heartbeats,
                 )
@@ -1232,17 +1235,17 @@ fn get_assigned_partition_count(managers: &Managers) -> u32 {
 }
 
 /// Parameters passed to [`initialize_consumer`] to create a consumer instance.
-struct ConsumerInitParams<T, S>
+struct ConsumerInitParams<T, P>
 where
     T: HandlerProvider,
-    S: TriggerStore,
+    P: TriggerStoreProvider,
 {
     /// Consumer configuration (Kafka settings, buffer sizes, timeouts).
     config: ConsumerConfiguration,
     /// Factory for creating per-partition message handlers.
     handler_provider: T,
     /// Persistent storage backend for timer triggers.
-    trigger_store: S,
+    trigger_provider: P,
     /// Shared atomic counter for tracking watermark changes.
     watermark_version: Arc<WatermarkVersion>,
     /// Thread-safe map of active partition managers.
@@ -1275,18 +1278,18 @@ where
 /// - The Kafka consumer cannot be created with the provided configuration
 /// - Topic subscription fails
 /// - The probe server cannot be started (if enabled)
-fn initialize_consumer<T, S>(
-    params: ConsumerInitParams<T, S>,
+fn initialize_consumer<T, P>(
+    params: ConsumerInitParams<T, P>,
 ) -> Result<ConsumerComponents, ConsumerError>
 where
     T: HandlerProvider,
-    S: TriggerStore,
+    P: TriggerStoreProvider,
 {
     // Create the consumer context with the message handler and shared state
     let context = Context::new(
         &params.config,
         params.handler_provider,
-        params.trigger_store,
+        params.trigger_provider,
         params.watermark_version.clone(),
         params.managers.clone(),
         params.allowed_events,

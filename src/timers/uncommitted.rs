@@ -423,16 +423,27 @@ mod tests {
     use crate::timers::manager::{TimerManager, TimerManagerConfig};
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
+    use crate::timers::store::{Segment, SegmentVersion};
     use color_eyre::eyre::{Result, eyre};
-    use futures::{StreamExt, TryStreamExt, pin_mut};
+    use futures::{StreamExt, pin_mut};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Semaphore, watch};
 
     const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+
     use tokio::task;
     use tokio::time::{self, advance};
     use uuid::Uuid;
+
+    fn test_segment() -> Segment {
+        Segment {
+            id: Uuid::new_v4(),
+            name: "test-segment".to_owned(),
+            slab_size: CompactDuration::new(300),
+            version: SegmentVersion::V3,
+        }
+    }
 
     /// Helper function to set up a timer manager for testing.
     ///
@@ -443,14 +454,11 @@ mod tests {
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
         watch::Sender<bool>,
     )> {
-        let store = memory_store();
-        let segment_id = Uuid::new_v4();
+        let store = memory_store(test_segment());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let telemetry = Telemetry::new();
 
         let config = TimerManagerConfig {
-            segment_id,
-            slab_size: CompactDuration::new(300),
             name: "test-manager".to_owned(),
             store,
             telemetry: telemetry.partition_sender(Topic::from("test"), 0),
@@ -465,7 +473,6 @@ mod tests {
         )
         .await
         .map_err(|e| eyre!("Failed to create timer manager: {}", e))?;
-
         Ok((stream, manager, shutdown_tx))
     }
 
@@ -491,7 +498,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("fire-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -529,7 +535,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("commit-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -554,7 +559,6 @@ mod tests {
         // Verify the timer was removed from storage
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert!(times.is_empty(), "Timer should be removed after commit");
 
@@ -567,7 +571,6 @@ mod tests {
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
         pin_mut!(stream);
-
         let trigger = create_test_trigger("abort-test", 1, TimerType::Application)?;
 
         manager.schedule(trigger.clone()).await?;
@@ -592,7 +595,6 @@ mod tests {
         // Verify the timer is still in storage (abort preserves DB state)
         let times = manager
             .scheduled_times(&trigger.key, TimerType::Application)
-            .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(times.len(), 1, "Timer should remain in storage after abort");
         assert!(times.contains(&trigger.time));

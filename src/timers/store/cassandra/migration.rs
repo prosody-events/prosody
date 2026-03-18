@@ -48,6 +48,7 @@
 //!    slabs (cleanup, can fail safely)
 //! 3. If same: No slab size migration needed
 
+use crate::Key;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::Slab;
 use crate::timers::store::operations::TriggerOperations;
@@ -73,12 +74,13 @@ use tokio::task::coop::cooperative;
 use tokio::try_join;
 use tracing::{debug, info, instrument, warn};
 
-/// Migrates a segment if necessary, performing both version and slab size
+/// Migrates a segment if necessary, performing version and slab size
 /// migrations.
 ///
-/// This function orchestrates the two-phase migration process:
+/// This function orchestrates the three-phase migration process:
 /// 1. **Phase 1**: V1→V2 schema migration (if needed)
 /// 2. **Phase 2**: Slab size migration (if needed)
+/// 3. **Phase 3**: V2→V3 key state backfill (if needed)
 ///
 /// Each phase is performed atomically and independently. If no migrations are
 /// needed, the segment is returned unchanged.
@@ -113,6 +115,11 @@ pub(crate) async fn migrate_segment_if_needed(
         segment = migrate_slab_size(store, segment, desired_slab_size).await?;
     }
 
+    // Phase 3: V2→V3 key state backfill
+    if needs_key_state_migration(&segment) {
+        segment = migrate_key_states(store, segment).await?;
+    }
+
     Ok(segment)
 }
 
@@ -128,6 +135,24 @@ pub(crate) async fn migrate_segment_if_needed(
 #[must_use]
 pub(crate) fn needs_migration(segment: &Segment) -> bool {
     matches!(segment.version, SegmentVersion::V1)
+}
+
+/// Checks if a segment needs V2→V3 key state backfill.
+///
+/// V3 guarantees that all keys with clustering rows have a state MAP entry,
+/// making NULL state unambiguously mean "new key, 0 timers."
+///
+/// # Arguments
+///
+/// * `segment` - The segment to check
+///
+/// # Returns
+///
+/// `true` if the segment is V2 and needs key state backfill, `false`
+/// otherwise.
+#[must_use]
+pub(crate) fn needs_key_state_migration(segment: &Segment) -> bool {
+    matches!(segment.version, SegmentVersion::V2)
 }
 
 /// Migrates a segment from v1 to v2 schema.
@@ -201,12 +226,17 @@ pub(crate) async fn migrate_segment_version(
                         // Recalculate slab based on trigger time and segment slab_size.
                         // Since slab_size is unchanged during version migration, this produces
                         // the same slab_id as V1, so slab metadata row already exists.
-                        let target_slab = Slab::from_time(segment_id, slab_size, v2_trigger.time);
+                        let target_slab = Slab::from_time(slab_size, v2_trigger.time);
 
-                        // Write to V2 tables (slab and key indices)
+                        // Write to V2 tables (slab and key indices).
+                        // Use add_key_trigger_clustering (not insert_key_trigger) to
+                        // write directly to clustering rows without touching the state
+                        // column. V2→V3 migration (migrate_key_states) will backfill
+                        // the state column afterward, which handles the case of multiple
+                        // concurrent writes for the same (key, timer_type).
                         try_join!(
                             store.insert_slab_trigger(target_slab, v2_trigger.clone()),
-                            store.insert_key_trigger(&segment_id, v2_trigger),
+                            store.add_key_trigger_clustering(&segment_id, v2_trigger),
                         )?;
 
                         Ok(())
@@ -223,7 +253,7 @@ pub(crate) async fn migrate_segment_version(
     // Phase 3: Update segment version (atomic marker indicating migration complete)
     // This is the critical point - after this, the system uses v2 tables
     store
-        .update_segment_version(&segment_id, SegmentVersion::V2, segment.slab_size)
+        .update_segment_version(SegmentVersion::V2, segment.slab_size)
         .await?;
 
     info!("Successfully migrated segment {segment_id} from V1 to V2");
@@ -304,6 +334,90 @@ async fn cleanup_v1_data(
     Ok(())
 }
 
+/// Migrates a V2 segment to V3 by backfilling the key state MAP column.
+///
+/// For each `(key, timer_type)` pair that has clustering rows but no state
+/// entry, this function writes the appropriate state:
+/// - 1 clustering row → move data to inline state + delete clustering row
+/// - ≥2 clustering rows → set overflow marker
+///
+/// The version is bumped to V3 only after all backfills complete (commit
+/// point). If migration crashes before the version bump, the next access
+/// will re-run it — all writes are idempotent.
+///
+/// # Errors
+///
+/// Returns error if DB reads or writes fail.
+#[instrument(level = "info", skip(store), err)]
+pub(crate) async fn migrate_key_states(
+    store: &CassandraTriggerStore,
+    mut segment: Segment,
+) -> Result<Segment, CassandraTriggerStoreError> {
+    let segment_id = segment.id;
+    info!("Starting V2→V3 key state migration for segment {segment_id}");
+
+    // Collect all slab IDs.
+    let slab_ids: Vec<SlabId> = store.get_slabs().try_collect().await?;
+    debug!(
+        "Found {} slabs to scan for key state migration",
+        slab_ids.len()
+    );
+
+    // Collect unique (key, timer_type) pairs from all slabs.
+    let pairs: HashSet<(Key, TimerType)> = stream::iter(slab_ids.iter().copied())
+        .map(|slab_id| {
+            let store = store.clone();
+            let slab_size = segment.slab_size;
+
+            async move {
+                let slab = Slab::new(slab_id, slab_size);
+                let triggers: Vec<_> = store
+                    .get_slab_triggers_all_types(&slab)
+                    .try_collect()
+                    .await?;
+                let pairs: HashSet<(Key, TimerType)> = triggers
+                    .into_iter()
+                    .map(|t| (t.key, t.timer_type))
+                    .collect();
+                Ok::<_, CassandraTriggerStoreError>(pairs)
+            }
+        })
+        .buffer_unordered(MIGRATION_SLAB_CONCURRENCY)
+        .try_fold(HashSet::default(), |mut acc, pairs| async move {
+            acc.extend(pairs);
+            Ok(acc)
+        })
+        .await?;
+
+    debug!(
+        "Found {} unique (key, timer_type) pairs to backfill",
+        pairs.len()
+    );
+
+    // Backfill state for each pair concurrently.
+    stream::iter(pairs.into_iter().map(Ok::<_, CassandraTriggerStoreError>))
+        .try_for_each_concurrent(MIGRATION_WRITE_CONCURRENCY, |(key, timer_type)| {
+            let store = store.clone();
+
+            async move {
+                store
+                    .backfill_key_state(&segment_id, &key, timer_type)
+                    .await
+            }
+        })
+        .await?;
+
+    // Commit point: bump version to V3.
+    store
+        .update_segment_version(SegmentVersion::V3, segment.slab_size)
+        .await?;
+
+    info!("Successfully migrated segment {segment_id} from V2 to V3");
+
+    segment.version = SegmentVersion::V3;
+    Ok(segment)
+}
+
 /// Checks if a segment needs slab size migration.
 ///
 /// # Arguments
@@ -355,19 +469,18 @@ async fn migrate_triggers_to_new_slabs(
             let store = store.clone();
 
             async move {
-                let segment_id = segment.id;
                 let old_slab_size = segment.slab_size;
-                let old_slab = Slab::new(segment_id, old_slab_id, old_slab_size);
+                let old_slab = Slab::new(old_slab_id, old_slab_size);
                 let mut new_slab_ids = HashSet::default();
                 let trigger_stream = store.get_slab_triggers_all_types(&old_slab);
                 tokio::pin!(trigger_stream);
 
                 while let Some(trigger) = cooperative(trigger_stream.try_next()).await? {
-                    let new_slab = Slab::from_time(segment_id, desired_slab_size, trigger.time);
+                    let new_slab = Slab::from_time(desired_slab_size, trigger.time);
 
                     // Register new slab metadata if first time seeing this ID
                     if new_slab_ids.insert(new_slab.id()) {
-                        store.insert_slab(&segment_id, new_slab.clone()).await?;
+                        store.insert_slab(new_slab.clone()).await?;
                     }
 
                     // Write trigger to new slab (key table unchanged)
@@ -457,7 +570,7 @@ async fn cleanup_old_slabs_with_overlap_protection(
                 let segment_id = segment.id;
 
                 // Delete metadata ONLY if slab_id is not reused (shared row in timer_segments)
-                if !is_reused && let Err(error) = store.delete_slab(&segment_id, slab_id).await {
+                if !is_reused && let Err(error) = store.delete_slab(slab_id).await {
                     warn!(
                         "Failed to delete metadata for old slab {slab_id} (segment {segment_id}): \
                          {error:#}"
@@ -469,7 +582,7 @@ async fn cleanup_old_slabs_with_overlap_protection(
                 // ALWAYS clear old triggers - they're in a separate partition due to slab_size
                 // in partition key: (segment_id, OLD_slab_size, id) != (segment_id,
                 // NEW_slab_size, id)
-                let old_slab = Slab::new(segment_id, slab_id, old_slab_size);
+                let old_slab = Slab::new(slab_id, old_slab_size);
                 if let Err(error) = store.clear_slab_triggers(&old_slab).await {
                     warn!(
                         "Failed to clear triggers for old slab {slab_id} (segment {segment_id}): \
@@ -521,10 +634,10 @@ pub(crate) async fn migrate_slab_size(
     let segment_id = segment.id;
     let old_slab_size = segment.slab_size;
 
-    // Verify segment is v2
-    if segment.version != SegmentVersion::V2 {
+    // Verify segment is v2 or v3 (V3 is a superset of V2 — schema-compatible)
+    if !matches!(segment.version, SegmentVersion::V2 | SegmentVersion::V3) {
         warn!(
-            "Cannot migrate slab_size for segment {segment_id}: segment is not v2 (version = \
+            "Cannot migrate slab_size for segment {segment_id}: segment is not v2/v3 (version = \
              {:?}). Run version migration first.",
             segment.version
         );
@@ -537,7 +650,7 @@ pub(crate) async fn migrate_slab_size(
     );
 
     // Phase 1: Collect all slabs with old slab_size (non-destructive)
-    let old_slab_ids: Vec<_> = store.get_slabs(&segment_id).try_collect().await?;
+    let old_slab_ids: Vec<_> = store.get_slabs().try_collect().await?;
 
     debug!(
         "Found {} slabs to migrate for segment {segment_id}",
@@ -549,9 +662,9 @@ pub(crate) async fn migrate_slab_size(
         migrate_triggers_to_new_slabs(store, &segment, &old_slab_ids, desired_slab_size).await?;
 
     // Phase 3: Update segment slab_size (atomic marker indicating migration
-    // complete)
+    // complete). Preserve the existing version so V3 stays V3.
     store
-        .update_segment_version(&segment_id, SegmentVersion::V2, desired_slab_size)
+        .update_segment_version(segment.version, desired_slab_size)
         .await?;
 
     info!(

@@ -16,15 +16,13 @@ use crate::consumer::middleware::defer::timer::store::provider::TimerDeferStoreP
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Partition, Topic};
-use async_stream::try_stream;
-use futures::{Stream, TryStreamExt, pin_mut};
+use futures::TryStreamExt;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use scylla::client::session::Session;
-use scylla::statement::prepared::PreparedStatement;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
-use tokio::task::coop::cooperative;
 use tracing::{debug, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -193,13 +191,29 @@ impl TimerDeferStore for CassandraTimerDeferStore {
     fn deferred_times(
         &self,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        deferred_times_stream(
-            self.store.clone(),
-            self.queries.get_deferred_times.clone(),
-            self.segment.clone(),
-            key.clone(),
-        )
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
+        let store = self.store.clone();
+        let query = self.queries.get_deferred_times.clone();
+        let segment = self.segment.clone();
+        let key = key.clone();
+
+        async move {
+            let seg = segment.get().await?;
+            let segment_id = seg.id();
+
+            store
+                .session()
+                .execute_iter(query, (&segment_id, key.as_ref()))
+                .await
+                .map_err(CassandraStoreError::from)?
+                .rows_stream::<(Option<CompactDateTime>,)>()
+                .map_err(CassandraStoreError::from)?
+                .try_filter_map(|(time_opt,)| async move { Ok(time_opt) })
+                .try_collect()
+                .await
+                .map_err(CassandraStoreError::from)
+                .map_err(Self::Error::from)
+        }
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -295,36 +309,6 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         );
 
         Ok(())
-    }
-}
-
-/// Helper to create deferred times stream without capturing `&self`.
-fn deferred_times_stream(
-    store: CassandraStore,
-    query: PreparedStatement,
-    segment: LazySegment<CassandraSegmentStore>,
-    key: Key,
-) -> impl Stream<Item = Result<CompactDateTime, CassandraDeferStoreError>> + Send + 'static {
-    try_stream! {
-        let seg = segment.get().await?;
-        let segment_id = seg.id();
-
-        let stream = store.session()
-            .execute_iter(query, (&segment_id, key.as_ref()))
-            .await
-            .map_err(CassandraStoreError::from)?
-            .rows_stream::<(Option<CompactDateTime>,)>()
-            .map_err(CassandraStoreError::from)?;
-
-        pin_mut!(stream);
-        while let Some((time_opt,)) = cooperative(stream.try_next())
-            .await
-            .map_err(CassandraStoreError::from)?
-        {
-            if let Some(time) = time_opt {
-                yield time;
-            }
-        }
     }
 }
 

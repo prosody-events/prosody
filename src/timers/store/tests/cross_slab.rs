@@ -77,7 +77,7 @@ where
 
     // Check that each trigger is in its correct slab
     for &time in &test_times {
-        let slab = Slab::from_time(segment.id, segment.slab_size, time);
+        let slab = Slab::from_time(segment.slab_size, time);
         let slab_triggers = get_slab_triggers(store, &slab).await?;
 
         // Find our trigger in this slab
@@ -95,8 +95,8 @@ where
         let time1 = test_times[0]; // At boundary
         let time2 = test_times[4]; // Middle of next slab
 
-        let slab1 = Slab::from_time(segment.id, segment.slab_size, time1);
-        let slab2 = Slab::from_time(segment.id, segment.slab_size, time2);
+        let slab1 = Slab::from_time(segment.slab_size, time1);
+        let slab2 = Slab::from_time(segment.slab_size, time2);
 
         if slab1.id() == slab2.id() {
             return Err("Expected different slab IDs for widely separated times".to_owned());

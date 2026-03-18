@@ -5,9 +5,9 @@ use crate::Key;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use futures::Stream;
 use opentelemetry::Context;
 use quick_cache::sync::Cache;
+use std::future::Future;
 use std::sync::Arc;
 use tracing::{Span, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -221,7 +221,7 @@ where
     fn deferred_times(
         &self,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
         // Cache only holds the minimum time, not all times - delegate to store
         self.store.deferred_times(key)
     }

@@ -8,12 +8,11 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
 use ahash::RandomState;
-use futures::stream;
-use futures::{Stream, StreamExt};
 use opentelemetry::Context;
 use scc::HashMap;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -134,13 +133,12 @@ impl TimerDeferStore for MemoryTimerDeferStore {
     fn deferred_times(
         &self,
         key: &Key,
-    ) -> impl Stream<Item = Result<CompactDateTime, Self::Error>> + Send + 'static {
-        // scc::HashMap guard can't span yields, so copy times (4 bytes each) out
+    ) -> impl Future<Output = Result<Vec<CompactDateTime>, Self::Error>> + Send + 'static {
         let inner = Arc::clone(&self.inner);
         let key = key.clone();
 
-        stream::once(async move {
-            inner
+        async move {
+            Ok(inner
                 .deferred
                 .get_async(key.as_ref())
                 .await
@@ -148,9 +146,8 @@ impl TimerDeferStore for MemoryTimerDeferStore {
                     let (timers, _) = entry.get();
                     timers.keys().copied().collect::<Vec<_>>()
                 })
-                .unwrap_or_default()
-        })
-        .flat_map(|times| stream::iter(times).map(Ok))
+                .unwrap_or_default())
+        }
     }
 
     async fn append_deferred_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
