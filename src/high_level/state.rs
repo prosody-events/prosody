@@ -5,7 +5,9 @@
 //! It also includes a custom error type for handling state-related errors.
 
 use crate::consumer::ProsodyConsumer;
-use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams};
+use crate::high_level::config::{
+    ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
+};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
@@ -32,6 +34,8 @@ pub enum ConsumerState<T> {
     /// The consumer is not yet configured.
     #[default]
     Unconfigured,
+    /// The consumer configuration failed during build.
+    ConfigurationFailed(ModeConfigurationError),
     /// The consumer is configured but not running.
     Configured(ModeConfiguration),
     /// The consumer is actively running.
@@ -56,13 +60,13 @@ impl<T> ConsumerState<T> {
     /// # Returns
     ///
     /// Returns a `ConsumerState::Configured` if the build is successful,
-    /// otherwise returns `ConsumerState::Unconfigured`.
+    /// otherwise returns `ConsumerState::ConfigurationFailed` with the error.
     pub(crate) fn build(params: &ModeConfigurationBuildParams) -> Self {
         match ModeConfiguration::build(params) {
             Ok(configuration) => Self::Configured(configuration),
             Err(error) => {
                 info!("disabling consumer (safe to ignore if you're only producing): {error:#}");
-                Self::default()
+                Self::ConfigurationFailed(error)
             }
         }
     }
@@ -72,6 +76,7 @@ impl<T> Display for ConsumerState<T> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let state = match self {
             ConsumerState::Unconfigured => "unconfigured",
+            ConsumerState::ConfigurationFailed(_) => "configuration failed",
             ConsumerState::Configured(_) => "configured",
             ConsumerState::Running { .. } => "running",
         };
