@@ -838,8 +838,8 @@ impl TriggerOperations for CassandraTriggerStore {
     ///   delete.
     /// - **Overflow**: BATCH (DELETE clustering + UPDATE state).
     ///
-    /// Per-key lock (`lock_key`) guarantees the state is stable between the
-    /// read and the write.
+    /// `resolve_state` returns a per-key `Arc<AsyncMutex<TimerState>>`; holding
+    /// the `handle.lock().await` guard serializes the read-decide-write sequence.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn clear_and_schedule_key(&self, trigger: Trigger) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
