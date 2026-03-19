@@ -60,7 +60,7 @@ async fn expect_message(
 ) -> Result<()> {
     let (key, payload) = timeout(timeout_dur, rx.recv())
         .await?
-        .ok_or_else(|| eyre::eyre!("Timed out waiting for message for key {}", expected_key))?;
+        .ok_or_else(|| eyre::eyre!("Channel closed waiting for key {}", expected_key))?;
     ensure!(
         key == expected_key,
         "expected key {}, got {}",
@@ -82,17 +82,19 @@ async fn case_duplicate_id_same_key(
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
-    no_message_timeout: Duration,
 ) -> Result<()> {
     let key = "dup-key";
     let event_id = "E";
     let first = Payload::from(json!({"id": event_id, "value": "first"}));
     let second = Payload::from(json!({"id": event_id, "value": "second"}));
+    let eof = Payload::from(json!({"eof": true}));
 
     producer.send([], *topic, key, &first).await?;
     producer.send([], *topic, key, &second).await?;
+    producer.send([], *topic, key, &eof).await?;
 
-    // Only the first should be emitted
+    // Only the first should be emitted; second is deduped; EOF proves it was
+    // skipped
     expect_message(
         rx,
         receive_timeout,
@@ -100,10 +102,7 @@ async fn case_duplicate_id_same_key(
         &json!({"id": event_id, "value": "first"}),
     )
     .await?;
-    ensure!(
-        timeout(no_message_timeout, rx.recv()).await.is_err(),
-        "duplicate message was unexpectedly received"
-    );
+    expect_message(rx, receive_timeout, key, &json!({"eof": true})).await?;
     Ok(())
 }
 
@@ -179,17 +178,18 @@ async fn case_reset_after_none(
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
-    no_message_timeout: Duration,
 ) -> Result<()> {
     let key = "reset-key";
     let event_id = "X";
     let a = Payload::from(json!({"id": event_id, "value": "first"}));
     let none = Payload::from(json!({"value": "second"}));
     let b = Payload::from(json!({"id": event_id, "value": "third"}));
+    let eof = Payload::from(json!({"eof": true}));
 
     producer.send([], *topic, key, &a).await?;
     producer.send([], *topic, key, &none).await?;
     producer.send([], *topic, key, &b).await?;
+    producer.send([], *topic, key, &eof).await?;
 
     // First message delivered
     expect_message(
@@ -201,11 +201,8 @@ async fn case_reset_after_none(
     .await?;
     // No-ID message delivered (skips cache entirely)
     expect_message(rx, receive_timeout, key, &json!({"value": "second"})).await?;
-    // Third message (same id=X) is deduplicated — not delivered
-    ensure!(
-        timeout(no_message_timeout, rx.recv()).await.is_err(),
-        "third message with duplicate id should have been deduplicated"
-    );
+    // Third message (same id=X) is deduplicated; EOF proves it was skipped
+    expect_message(rx, receive_timeout, key, &json!({"eof": true})).await?;
     Ok(())
 }
 
@@ -217,7 +214,6 @@ async fn case_return_to_original_id(
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
-    no_message_timeout: Duration,
 ) -> Result<()> {
     let key = "return-key";
     let id1 = "first_id";
@@ -225,10 +221,12 @@ async fn case_return_to_original_id(
     let m1 = Payload::from(json!({"id": id1, "value": "one"}));
     let m2 = Payload::from(json!({"id": id2, "value": "two"}));
     let m3 = Payload::from(json!({"id": id1, "value": "three"}));
+    let eof = Payload::from(json!({"eof": true}));
 
     producer.send([], *topic, key, &m1).await?;
     producer.send([], *topic, key, &m2).await?;
     producer.send([], *topic, key, &m3).await?;
+    producer.send([], *topic, key, &eof).await?;
 
     // First two delivered (distinct IDs)
     expect_message(
@@ -245,21 +243,16 @@ async fn case_return_to_original_id(
         &json!({"id": id2, "value": "two"}),
     )
     .await?;
-    // Third (id1 again) is deduplicated
-    ensure!(
-        timeout(no_message_timeout, rx.recv()).await.is_err(),
-        "third message with duplicate id1 should have been deduplicated"
-    );
+    // Third (id1 again) is deduplicated; EOF proves it was skipped
+    expect_message(rx, receive_timeout, key, &json!({"eof": true})).await?;
     Ok(())
 }
 
 /// Tests the message deduplication behavior of the Prosody producer.
 #[tokio::test]
 async fn test_producer_deduplication() -> Result<()> {
-    // Initialize tracing for easier debugging
     init_test_logging();
 
-    // Setup test environment with Kafka broker
     let brokers = vec!["localhost:9094".to_owned()];
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(brokers.clone())?)?;
@@ -273,18 +266,16 @@ async fn test_producer_deduplication() -> Result<()> {
         )
         .await?;
 
-    // Configure producer with idempotence cache
     let producer = ProsodyProducer::new(
         &ProducerConfiguration::builder()
             .bootstrap_servers(brokers.clone())
             .source_system("test-producer")
-            .idempotence_cache_size(2usize)
+            .idempotence_cache_size(20usize)
             .build()?,
         Telemetry::new().sender(),
     )?;
 
-    // Set up consumer with test handler
-    let consumer = {
+    let (consumer_client, mut rx) = {
         let cfg = ConsumerConfiguration::builder()
             .bootstrap_servers(brokers.clone())
             .group_id("test-dedup-consumer")
@@ -294,54 +285,33 @@ async fn test_producer_deduplication() -> Result<()> {
             .probe_port(None)
             .build()?;
         let (tx, rx) = channel(16);
-        let handler = TestHandler { tx };
-        (
-            ProsodyConsumer::new(
-                &cfg,
-                &common::create_cassandra_trigger_store_config(),
-                CloneProvider::new(handler),
-                Telemetry::new(),
-            )
-            .await?,
-            rx,
+        let consumer = ProsodyConsumer::new(
+            &cfg,
+            &common::create_cassandra_trigger_store_config(),
+            CloneProvider::new(TestHandler { tx }),
+            Telemetry::new(),
         )
+        .await?;
+        (consumer, rx)
     };
-    let (consumer_client, mut rx) = consumer;
 
-    // Common timeouts for test cases
-    let receive_timeout = Duration::from_secs(30);
-    let no_message_timeout = Duration::from_secs(10);
+    let receive_timeout = Duration::from_secs(10);
 
-    // Execute test cases
-    case_duplicate_id_same_key(
-        &producer,
-        &topic,
-        &mut rx,
-        receive_timeout,
-        no_message_timeout,
-    )
-    .await?;
-    case_same_id_different_keys(&producer, &topic, &mut rx, receive_timeout).await?;
-    case_distinct_ids_same_key(&producer, &topic, &mut rx, receive_timeout).await?;
-    case_reset_after_none(
-        &producer,
-        &topic,
-        &mut rx,
-        receive_timeout,
-        no_message_timeout,
-    )
-    .await?;
-    case_return_to_original_id(
-        &producer,
-        &topic,
-        &mut rx,
-        receive_timeout,
-        no_message_timeout,
-    )
-    .await?;
+    // Capture result so consumer is always shut down, even on failure.
+    // Dropping the consumer without shutdown causes a blocking hang in Drop.
+    let result = timeout(Duration::from_secs(20), async {
+        case_duplicate_id_same_key(&producer, &topic, &mut rx, receive_timeout).await?;
+        case_same_id_different_keys(&producer, &topic, &mut rx, receive_timeout).await?;
+        case_distinct_ids_same_key(&producer, &topic, &mut rx, receive_timeout).await?;
+        case_reset_after_none(&producer, &topic, &mut rx, receive_timeout).await?;
+        case_return_to_original_id(&producer, &topic, &mut rx, receive_timeout).await?;
+        Ok::<(), eyre::Report>(())
+    })
+    .await
+    .map_err(|_| eyre::eyre!("test timed out after 20 seconds"))
+    .and_then(|r| r);
 
-    // Teardown
     consumer_client.shutdown().await;
     admin.delete_topic(&topic).await?;
-    Ok(())
+    result
 }
