@@ -170,12 +170,13 @@ with a transient error, routing them through defer.
 All messages must be processed. Retries indefinitely. Uses defer and monopolization detection.
 
 ```
-Kafka → Retry → Defer → Monopolization → Shutdown → Scheduler → Timeout → Telemetry → Handler
+Kafka → Retry → Deduplication → Defer → Monopolization → Shutdown → Scheduler → Timeout → Telemetry → Handler
 ```
 
 | Layer          | Purpose                                                  |
 |----------------|----------------------------------------------------------|
 | Retry          | Retries transient errors indefinitely                    |
+| Deduplication  | Filters duplicate messages via local cache + Cassandra   |
 | Defer          | Stores failing messages for timer-based retry            |
 | Monopolization | Rejects keys exceeding execution time threshold          |
 | Shutdown       | Drains in-flight work on partition revocation            |
@@ -229,7 +230,6 @@ fields, so you can mix both approaches.
 | `PROSODY_STALL_THRESHOLD`        | Report unhealthy if no progress for this long        | 5m                     |
 | `PROSODY_PROBE_PORT`             | HTTP port for health checks ('none' to disable)      | 8000                   |
 | `PROSODY_FAILURE_TOPIC`          | Send unprocessable messages here (dead letter queue) | -                      |
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Track this many message IDs to skip duplicates       | 4096                   |
 | `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1h                     |
 
 ### Producer
@@ -261,9 +261,17 @@ When a handler fails, retry with exponential backoff:
 | `PROSODY_DEFER_SEEK_TIMEOUT`      | Timeout when loading deferred messages            | 30s     |
 | `PROSODY_DEFER_DISCARD_THRESHOLD` | Read optimization (rarely needs changing)         | 100     |
 
+### Deduplication (Pipeline Mode)
+
+| Environment Variable             | Description                                         | Default |
+|----------------------------------|-----------------------------------------------------|---------|
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Per-partition local cache capacity (0 to disable)   | 4096    |
+| `PROSODY_IDEMPOTENCE_VERSION`    | Version string for cache-busting dedup hashes       | 1       |
+| `PROSODY_IDEMPOTENCE_TTL`        | TTL for dedup records in Cassandra                  | 7d      |
+
 ### Cassandra
 
-Persistent storage for scheduled retries (not needed if `PROSODY_MOCK=true`):
+Persistent storage for scheduled retries and deduplication (not needed if `PROSODY_MOCK=true`):
 
 | Environment Variable           | Description                        | Default |
 |--------------------------------|------------------------------------|---------|
@@ -394,20 +402,26 @@ to set the source system. To explicitly set the producer's source system identif
 export PROSODY_SOURCE_SYSTEM="my-service"
 ```
 
-### Idempotence Deduplication
+### Idempotence Deduplication (Pipeline Mode)
 
-Prosody also supports deduplication based on unique message identifiers. When a message contains an `id` field in its
-JSON payload, Prosody tracks the last seen ID for each key within a partition. If the same ID appears again, the message
-is considered a duplicate and is ignored.
+The pipeline consumer includes a deduplication middleware that filters duplicate messages using a two-tier cache:
 
-This behavior is controlled by `PROSODY_IDEMPOTENCE_CACHE_SIZE`:
+1. **Local cache**: A per-partition in-memory LRU cache for fast lookups.
+2. **Persistent store**: A Cassandra-backed store that survives restarts and rebalances.
 
-- Default: `4096` entries per partition and producer (~400KB memory per partition).
-- Set to `0` to disable deduplication.
-- Oldest entries are evicted when the cache reaches capacity.
+When a message arrives, the middleware computes a deterministic UUID by hashing the version, consumer group, topic,
+partition, key, and either the message's `id` field or its Kafka offset. It checks the local cache first, then
+Cassandra. If found in either, the message is skipped. Otherwise, the message is processed and the UUID is recorded in
+both tiers.
 
-This approach ensures exactly-once semantics within the limits of the configured cache size, reducing unnecessary
-processing and network overhead.
+- **Best-effort persistence**: Cassandra read failures are treated as cache misses; write failures are logged but do not
+  fail the message. The local cache still provides deduplication within a single process lifetime.
+- **Cache-busting**: Changing `PROSODY_IDEMPOTENCE_VERSION` invalidates all previously recorded entries, causing
+  messages to be reprocessed.
+- **TTL expiry**: Dedup records in Cassandra expire after `PROSODY_IDEMPOTENCE_TTL` (default: 7 days).
+- **Disabling**: Set `PROSODY_IDEMPOTENCE_CACHE_SIZE` to `0` to disable the middleware entirely.
+
+The producer also maintains a separate local deduplication cache to avoid sending duplicate messages.
 
 ## Liveness and Readiness Probes
 
@@ -612,13 +626,13 @@ flowchart TD
         PMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/mod.rs'>Partition Manager</a>"]
         PMgr --> KeyMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/keyed/mod.rs'>Key Manager</a>"]
         PMgr --> OTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Offset Tracker</a>"]
-        PMgr --> ICache2["<a href='https://github.com/cincpro/prosody/tree/main/src/deduplication.rs'>Idempotence Cache</a>"]
         KeyMgr --> EHandler["Event Handler"]
         OTracker --> WTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Watermark Tracker</a>"]
     end
 
     subgraph MiddlewareHandling["Middleware Components"]
         RetryS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/retry.rs'>Retry Middleware</a>"]
+        DedupS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/deduplication/mod.rs'>Deduplication Middleware</a>"]
         DeferS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/defer/mod.rs'>Defer Middleware</a>"]
         MonoS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/monopolization.rs'>Monopolization Middleware</a>"]
         SchedS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/scheduler/mod.rs'>Scheduler Middleware</a>"]

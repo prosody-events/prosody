@@ -66,6 +66,9 @@ pub const TABLE_DEFERRED_OFFSETS: &str = "deferred_offsets";
 /// Table name for storing deferred timers awaiting retry.
 pub const TABLE_DEFERRED_TIMERS: &str = "deferred_timers";
 
+/// Table name for message deduplication records.
+pub const TABLE_DEDUPLICATION: &str = "deduplication";
+
 /// Unified Cassandra store providing session and infrastructure for all
 /// components.
 ///

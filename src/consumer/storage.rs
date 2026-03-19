@@ -7,6 +7,9 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::consumer::middleware::deduplication::cassandra::CassandraDeduplicationStoreProvider;
+use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStoreProvider;
+use crate::consumer::middleware::deduplication::queries::DeduplicationQueries;
 use crate::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use crate::consumer::middleware::defer::message::store::{
     CassandraMessageDeferStoreProvider, MemoryMessageDeferStoreProvider,
@@ -22,6 +25,7 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Unified storage backend that ensures trigger and defer stores use the same
@@ -155,6 +159,8 @@ pub enum StorePair {
         message_provider: MemoryMessageDeferStoreProvider,
         /// Timer defer store provider (Memory).
         timer_provider: MemoryTimerDeferStoreProvider,
+        /// Deduplication store provider (Memory).
+        dedup_provider: MemoryDeduplicationStoreProvider,
     },
     /// All stores use Cassandra storage with a shared session.
     Cassandra {
@@ -165,6 +171,8 @@ pub enum StorePair {
         message_provider: CassandraMessageDeferStoreProvider,
         /// Timer defer store provider (Cassandra with resources).
         timer_provider: CassandraTimerDeferStoreProvider,
+        /// Deduplication store provider (Cassandra).
+        dedup_provider: CassandraDeduplicationStoreProvider,
     },
 }
 
@@ -230,6 +238,7 @@ impl StorePair {
     pub async fn new(
         config: &TriggerStoreConfiguration,
         mock: bool,
+        dedup_ttl: Duration,
     ) -> Result<Self, StoreCreationError> {
         let backend = StorageBackend::new(config, mock).await?;
         match &backend {
@@ -237,6 +246,7 @@ impl StorePair {
                 trigger_provider: InMemoryTriggerStoreProvider::new(),
                 message_provider: MemoryMessageDeferStoreProvider::new(),
                 timer_provider: MemoryTimerDeferStoreProvider::new(),
+                dedup_provider: MemoryDeduplicationStoreProvider::new(),
             }),
 
             StorageBackend::Cassandra { store, keyspace } => {
@@ -255,6 +265,19 @@ impl StorePair {
                 // Prepare queries for timer defer stores
                 let timer_queries = Arc::new(TimerQueries::new(store.session(), keyspace).await?);
 
+                // Prepare queries for deduplication stores
+                let dedup_queries = Arc::new(
+                    DeduplicationQueries::new(store.session(), keyspace)
+                        .await?
+                        .with_local_one_consistency(),
+                );
+
+                let dedup_ttl_secs: i32 = dedup_ttl
+                    .as_secs()
+                    .try_into()
+                    .unwrap_or(630_720_000_i32)
+                    .min(630_720_000_i32);
+
                 let message_provider = CassandraMessageDeferStoreProvider::new(
                     store.clone(),
                     message_queries,
@@ -267,10 +290,17 @@ impl StorePair {
                     segment_store,
                 );
 
+                let dedup_provider = CassandraDeduplicationStoreProvider::new(
+                    store.clone(),
+                    dedup_queries,
+                    dedup_ttl_secs,
+                );
+
                 Ok(Self::Cassandra {
                     trigger_provider,
                     message_provider,
                     timer_provider,
+                    dedup_provider,
                 })
             }
         }

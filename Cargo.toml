@@ -69,9 +69,10 @@ tracing-subscriber = { version = "0.3", features = [
     "env-filter",
     "parking_lot",
 ] }
-uuid = { version = "1.22", features = ["v5"] }
+uuid = { version = "1.22", features = ["v5", "v8"] }
 validator = { version = "0.20", features = ["derive"] }
 whoami = "2.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [features]
 default = ["cmake-build"]

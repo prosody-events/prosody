@@ -33,7 +33,6 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider> {
         group_id: Arc::from("test-group"),
         buffer_size: 10,
         max_uncommitted: 10,
-        idempotence_cache_size: 0,
         allowed_events: None,
         shutdown_timeout: Duration::from_secs(1),
         stall_threshold: Duration::from_secs(1),
@@ -354,60 +353,6 @@ async fn test_partition_manager_event_type_filtering() {
         &[Offset::from(1_u8)],
         "Only offset 1 should have been processed"
     );
-
-    partition_manager.shutdown().await;
-}
-
-#[tokio::test]
-async fn test_partition_manager_deduplication() {
-    init_test_logging();
-
-    let handler = TestHandler::new();
-    let mut config = default_config();
-    config.idempotence_cache_size = 100;
-    let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
-
-    // Send messages with the same key and event ID
-    let key = "key";
-    let event_id = "event1";
-    let offsets = vec![0, 1, 2];
-    for &offset in &offsets {
-        let message = create_test_message_with_event_id(offset, key, Some(event_id));
-        assert!(
-            partition_manager.try_send(message).is_ok(),
-            "Message send should succeed"
-        );
-    }
-
-    wait_for_processed_offsets(&handler, 1, Duration::from_secs(1))
-        .await
-        .expect("At least one message should be processed");
-
-    {
-        let processed = handler.processed_offsets.lock().await;
-        assert_eq!(processed.len(), 1);
-        assert_eq!(processed[0], 0);
-    };
-
-    // Send messages with different event IDs
-    for (i, id) in ["event2", "event3"].iter().enumerate() {
-        let message = create_test_message_with_event_id(i as Offset + 3, key, Some(id));
-        assert!(
-            partition_manager.try_send(message).is_ok(),
-            "Message send should succeed"
-        );
-    }
-
-    wait_for_processed_offsets(&handler, 3, Duration::from_secs(1))
-        .await
-        .expect("Messages should be processed");
-
-    {
-        let processed = handler.processed_offsets.lock().await;
-        assert!(processed.contains(&0));
-        assert!(processed.contains(&3));
-        assert!(processed.contains(&4));
-    };
 
     partition_manager.shutdown().await;
 }
