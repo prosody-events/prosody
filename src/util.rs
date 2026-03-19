@@ -4,6 +4,13 @@
 //! types, including vectors and durations. It also includes functions for
 //! handling fallback values and optional durations.
 
+/// Default capacity for idempotence caches (producer and consumer
+/// deduplication).
+///
+/// Both sides read `PROSODY_IDEMPOTENCE_CACHE_SIZE` and share this default so
+/// they stay in sync when the env var is unset.
+pub const DEFAULT_IDEMPOTENCE_CACHE_SIZE: usize = 8192;
+
 use std::env;
 use std::fmt::Display;
 use std::str::FromStr;

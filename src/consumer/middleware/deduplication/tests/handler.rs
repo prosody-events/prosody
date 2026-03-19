@@ -13,7 +13,6 @@ use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler}
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use quick_cache::UnitWeighter;
 use quick_cache::sync::Cache;
 use serde_json::json;
 use std::error::Error;
@@ -108,7 +107,7 @@ fn create_handler_with(
 ) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
     DeduplicationHandler {
         inner,
-        cache: Cache::with_weighter(100, 100, UnitWeighter),
+        cache: Arc::new(Cache::new(100)),
         store: MemoryDeduplicationStore::new(),
         version: version.to_owned(),
         group_id: Arc::from(group_id),

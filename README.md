@@ -265,7 +265,7 @@ When a handler fails, retry with exponential backoff:
 
 | Environment Variable             | Description                                         | Default |
 |----------------------------------|-----------------------------------------------------|---------|
-| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Per-partition local cache capacity (0 to disable)   | 4096    |
+| `PROSODY_IDEMPOTENCE_CACHE_SIZE` | Global shared cache capacity (0 to disable)         | 8192    |
 | `PROSODY_IDEMPOTENCE_VERSION`    | Version string for cache-busting dedup hashes       | 1       |
 | `PROSODY_IDEMPOTENCE_TTL`        | TTL for dedup records in Cassandra                  | 7d      |
 
@@ -406,7 +406,7 @@ export PROSODY_SOURCE_SYSTEM="my-service"
 
 The pipeline consumer includes a deduplication middleware that filters duplicate messages using a two-tier cache:
 
-1. **Local cache**: A per-partition in-memory LRU cache for fast lookups.
+1. **Global cache**: A shared in-memory cache across all partitions for fast lookups. Survives partition reassignments within the same consumer instance.
 2. **Persistent store**: A Cassandra-backed store that survives restarts and rebalances.
 
 When a message arrives, the middleware computes a deterministic UUID by hashing the version, consumer group, topic,
@@ -415,7 +415,7 @@ Cassandra. If found in either, the message is skipped. Otherwise, the message is
 both tiers.
 
 - **Best-effort persistence**: Cassandra read failures are treated as cache misses; write failures are logged but do not
-  fail the message. The local cache still provides deduplication within a single process lifetime.
+  fail the message. The global cache still provides deduplication within a single process lifetime.
 - **Cache-busting**: Changing `PROSODY_IDEMPOTENCE_VERSION` invalidates all previously recorded entries, causing
   messages to be reprocessed.
 - **TTL expiry**: Dedup records in Cassandra expire after `PROSODY_IDEMPOTENCE_TTL` (default: 7 days).

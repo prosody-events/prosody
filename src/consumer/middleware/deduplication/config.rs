@@ -5,7 +5,9 @@ use std::time::Duration;
 use validator::{Validate, ValidationError};
 
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
-use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
+use crate::util::{
+    DEFAULT_IDEMPOTENCE_CACHE_SIZE, from_duration_env_with_fallback, from_env_with_fallback,
+};
 
 /// Configuration for the deduplication middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -22,12 +24,15 @@ pub struct DeduplicationConfiguration {
     )]
     pub version: String,
 
-    /// Per-partition local cache capacity. Set to 0 to disable the
-    /// deduplication middleware entirely.
+    /// Global shared cache capacity across all partitions. Set to 0 to disable
+    /// the deduplication middleware entirely.
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
-    /// Default: 4096
-    #[builder(default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", 4096_usize)?")]
+    /// Default: 8192
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", \
+                   DEFAULT_IDEMPOTENCE_CACHE_SIZE)?"
+    )]
     pub cache_capacity: usize,
 
     /// Cassandra TTL for deduplication records. Must be at least 1 minute
