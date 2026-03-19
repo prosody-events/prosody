@@ -171,7 +171,9 @@ async fn case_distinct_ids_same_key(
     Ok(())
 }
 
-/// Tests that the deduplication state resets after a message without an ID.
+/// Tests that a no-ID message does not clear dedup state.
+/// Sending id=X, no-id, id=X delivers only the first two; the third is
+/// deduplicated because the hash of (topic, key, X) is still in the cache.
 async fn case_reset_after_none(
     producer: &ProsodyProducer,
     topic: &Topic,
@@ -189,6 +191,7 @@ async fn case_reset_after_none(
     producer.send([], *topic, key, &none).await?;
     producer.send([], *topic, key, &b).await?;
 
+    // First message delivered
     expect_message(
         rx,
         receive_timeout,
@@ -196,30 +199,25 @@ async fn case_reset_after_none(
         &json!({"id": event_id, "value": "first"}),
     )
     .await?;
+    // No-ID message delivered (skips cache entirely)
     expect_message(rx, receive_timeout, key, &json!({"value": "second"})).await?;
-    expect_message(
-        rx,
-        receive_timeout,
-        key,
-        &json!({"id": event_id, "value": "third"}),
-    )
-    .await?;
-
+    // Third message (same id=X) is deduplicated — not delivered
     ensure!(
         timeout(no_message_timeout, rx.recv()).await.is_err(),
-        "unexpected extra message after reset"
+        "third message with duplicate id should have been deduplicated"
     );
     Ok(())
 }
 
-/// Tests that after switching IDs, a subsequent message with the original ID
-/// is delivered (i.e., cache updated on different ID). This catches the bug
-/// where the cache wasn’t updated when encountering a new event ID.
+/// Tests that sending id1→id2→id1 on the same key deduplicates the third
+/// message, because the hash-based cache remembers all seen (topic, key, id)
+/// triples — not just the most recent.
 async fn case_return_to_original_id(
     producer: &ProsodyProducer,
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
+    no_message_timeout: Duration,
 ) -> Result<()> {
     let key = "return-key";
     let id1 = "first_id";
@@ -232,6 +230,7 @@ async fn case_return_to_original_id(
     producer.send([], *topic, key, &m2).await?;
     producer.send([], *topic, key, &m3).await?;
 
+    // First two delivered (distinct IDs)
     expect_message(
         rx,
         receive_timeout,
@@ -246,13 +245,11 @@ async fn case_return_to_original_id(
         &json!({"id": id2, "value": "two"}),
     )
     .await?;
-    expect_message(
-        rx,
-        receive_timeout,
-        key,
-        &json!({"id": id1, "value": "three"}),
-    )
-    .await?;
+    // Third (id1 again) is deduplicated
+    ensure!(
+        timeout(no_message_timeout, rx.recv()).await.is_err(),
+        "third message with duplicate id1 should have been deduplicated"
+    );
     Ok(())
 }
 
@@ -334,7 +331,14 @@ async fn test_producer_deduplication() -> Result<()> {
         no_message_timeout,
     )
     .await?;
-    case_return_to_original_id(&producer, &topic, &mut rx, receive_timeout).await?;
+    case_return_to_original_id(
+        &producer,
+        &topic,
+        &mut rx,
+        receive_timeout,
+        no_message_timeout,
+    )
+    .await?;
 
     // Teardown
     consumer_client.shutdown().await;

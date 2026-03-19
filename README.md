@@ -421,7 +421,9 @@ both tiers.
 - **TTL expiry**: Dedup records in Cassandra expire after `PROSODY_IDEMPOTENCE_TTL` (default: 7 days).
 - **Disabling**: Set `PROSODY_IDEMPOTENCE_CACHE_SIZE` to `0` to disable the middleware entirely.
 
-The producer also maintains a separate local deduplication cache to avoid sending duplicate messages.
+The producer also maintains a separate local deduplication cache to avoid sending duplicate messages. It hashes the
+`(topic, key, id)` triple into a 128-bit key and stores it in a bounded in-memory set. Messages without an `id` field
+bypass the cache entirely. Once a triple is seen, it stays in the cache until evicted by capacity.
 
 ## Liveness and Readiness Probes
 
