@@ -648,6 +648,9 @@ impl TriggerOperations for CassandraTriggerStore {
 
         let mut guard = handle.lock().await;
         match &*guard {
+            TimerState::Inline(old_timer) if old_timer.time == trigger.time => {
+                // Same time already stored inline — no-op.
+            }
             TimerState::Inline(old_timer) => {
                 // Promote: old inline → clustering, new → clustering, state → Overflow.
                 // All three writes are issued as a single UNLOGGED BATCH so the
