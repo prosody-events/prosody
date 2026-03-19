@@ -1,9 +1,12 @@
 //! Cassandra-backed deduplication middleware.
 //!
 //! Replaces the previous local-only LRU deduplication cache with a two-tier
-//! approach: a per-partition local write-through cache backed by persistent
+//! approach: a global shared write-through cache backed by persistent
 //! Cassandra storage. This ensures duplicates are detected even after restarts
 //! or rebalances.
+//!
+//! The cache is shared across all partitions so it survives partition
+//! reassignments without cold-start penalties.
 //!
 //! The middleware sits just inside the retry layer on the pipeline consumer.
 //! It is optional — setting `cache_capacity = 0` disables it via the
@@ -20,10 +23,10 @@ pub mod tests;
 use std::hash::Hasher;
 use std::sync::Arc;
 
-use ahash::RandomState;
-use quick_cache::UnitWeighter;
 use quick_cache::sync::Cache;
 use thiserror::Error;
+
+type DeduplicationCache = Cache<Uuid, ()>;
 use tracing::{debug, info_span, warn};
 use uuid::Uuid;
 use validator::Validate;
@@ -53,6 +56,7 @@ struct DeduplicationShared<P> {
     config: DeduplicationConfiguration,
     group_id: Arc<str>,
     store_provider: P,
+    cache: Arc<DeduplicationCache>,
 }
 
 /// Deduplication middleware.
@@ -82,11 +86,13 @@ impl<P: DeduplicationStoreProvider> DeduplicationMiddleware<P> {
             return Ok(None);
         }
 
+        let cache = Arc::new(Cache::new(config.cache_capacity));
         Ok(Some(Self {
             shared: Arc::new(DeduplicationShared {
                 config,
                 group_id: Arc::from(group_id),
                 store_provider,
+                cache,
             }),
         }))
     }
@@ -122,11 +128,7 @@ where
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let inner = self.inner.handler_for_partition(topic, partition);
-        let cache = Cache::with_weighter(
-            self.shared.config.cache_capacity,
-            self.shared.config.cache_capacity as u64,
-            UnitWeighter,
-        );
+        let cache = self.shared.cache.clone();
         let store =
             self.shared
                 .store_provider
@@ -144,10 +146,10 @@ where
     }
 }
 
-/// Per-partition handler that checks messages against the dedup cache.
+/// Handler that checks messages against the shared dedup cache.
 pub struct DeduplicationHandler<T, S: DeduplicationStore> {
     inner: T,
-    cache: Cache<Uuid, (), UnitWeighter, RandomState>,
+    cache: Arc<DeduplicationCache>,
     store: S,
     version: String,
     group_id: Arc<str>,
