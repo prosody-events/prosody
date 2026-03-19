@@ -69,6 +69,9 @@ pub const TABLE_DEFERRED_TIMERS: &str = "deferred_timers";
 /// Table name for message deduplication records.
 pub const TABLE_DEDUPLICATION: &str = "deduplication";
 
+/// Cassandra's maximum TTL in seconds (~20 years).
+pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;
+
 /// Unified Cassandra store providing session and infrastructure for all
 /// components.
 ///
@@ -162,8 +165,6 @@ impl CassandraStore {
     /// * `None` if the TTL would exceed Cassandra's limits or calculation fails
     #[must_use]
     pub fn calculate_ttl(&self, target_time: CompactDateTime) -> Option<i32> {
-        const MAX_TTL: i32 = 630_720_000; // Cassandra's maximum TTL
-
         let Ok(duration) = target_time.compact_duration_from_now() else {
             // Return the base TTL if the time is in the past
             return self.base_ttl().seconds().try_into().ok();
@@ -175,7 +176,7 @@ impl CassandraStore {
             .seconds()
             .try_into()
             .ok()
-            .filter(|&ttl| ttl < MAX_TTL)
+            .filter(|&ttl: &i32| i64::from(ttl) < MAX_CASSANDRA_TTL_SECS)
     }
 }
 

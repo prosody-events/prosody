@@ -4,10 +4,8 @@ use derive_builder::Builder;
 use std::time::Duration;
 use validator::{Validate, ValidationError};
 
+use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
-
-/// Maximum Cassandra TTL in seconds (≈20 years).
-const MAX_CASSANDRA_TTL: u64 = 630_720_000;
 
 /// Configuration for the deduplication middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -54,7 +52,7 @@ impl DeduplicationConfiguration {
 }
 
 fn validate_dedup_ttl(ttl: &Duration) -> Result<(), ValidationError> {
-    if ttl.as_secs() > MAX_CASSANDRA_TTL {
+    if ttl.as_secs() > MAX_CASSANDRA_TTL_SECS as u64 {
         return Err(ValidationError::new("ttl_exceeds_cassandra_max"));
     }
     Ok(())

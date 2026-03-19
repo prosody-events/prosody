@@ -296,22 +296,12 @@ fn cache_capacity_zero_returns_none() {
 
 #[test]
 fn ttl_exceeding_max_rejected() {
-    let config = DeduplicationConfiguration::builder()
-        .ttl(Duration::from_secs(700_000_000))
-        .build();
-    assert!(config.is_ok());
-    let result = DeduplicationMiddleware::new(
-        config
-            .as_ref()
-            .ok()
-            .cloned()
-            .unwrap_or_else(|| DeduplicationConfiguration {
-                version: "1".to_owned(),
-                cache_capacity: 100,
-                ttl: Duration::from_secs(700_000_000),
-            }),
-        "group",
-        MemoryDeduplicationStoreProvider::new(),
-    );
+    let config = DeduplicationConfiguration {
+        version: "1".to_owned(),
+        cache_capacity: 100,
+        ttl: Duration::from_secs(700_000_000),
+    };
+    let result =
+        DeduplicationMiddleware::new(config, "group", MemoryDeduplicationStoreProvider::new());
     assert!(result.is_err());
 }

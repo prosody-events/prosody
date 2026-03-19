@@ -27,6 +27,9 @@ use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::debug;
+
+use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 
 /// Unified storage backend that ensures trigger and defer stores use the same
 /// underlying storage infrastructure.
@@ -125,9 +128,10 @@ impl StorageBackend {
 /// ```no_run
 /// # use prosody::consumer::storage::{StorageBackend, StorePair};
 /// # use prosody::high_level::config::TriggerStoreConfiguration;
+/// # use std::time::Duration;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = TriggerStoreConfiguration::InMemory;
-/// let stores = StorePair::new(&config, false).await?;
+/// let stores = StorePair::new(&config, false, Duration::from_secs(7 * 24 * 3600)).await?;
 ///
 /// // Pattern match to get all providers - they're guaranteed to match storage types
 /// match stores {
@@ -135,6 +139,7 @@ impl StorageBackend {
 ///         trigger_provider,
 ///         message_provider,
 ///         timer_provider,
+///         dedup_provider,
 ///     } => {
 ///         // All are in-memory
 ///     }
@@ -142,6 +147,7 @@ impl StorageBackend {
 ///         trigger_provider,
 ///         message_provider,
 ///         timer_provider,
+///         dedup_provider,
 ///     } => {
 ///         // All are Cassandra
 ///     }
@@ -190,6 +196,10 @@ pub enum StoreCreationError {
     /// Failed to create segment store.
     #[error("failed to create segment store: {0:#}")]
     SegmentStore(Box<CassandraSegmentStoreError>),
+
+    /// Deduplication TTL exceeds Cassandra's maximum.
+    #[error("deduplication TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]
+    DeduplicationTtl(u64),
 }
 
 impl From<CassandraTriggerStoreError> for StoreCreationError {
@@ -230,8 +240,14 @@ impl StorePair {
     /// ```no_run
     /// # use prosody::consumer::storage::StorePair;
     /// # use prosody::high_level::config::TriggerStoreConfiguration;
+    /// # use std::time::Duration;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let stores = StorePair::new(&TriggerStoreConfiguration::InMemory, false).await?;
+    /// let stores = StorePair::new(
+    ///     &TriggerStoreConfiguration::InMemory,
+    ///     false,
+    ///     Duration::from_secs(7 * 24 * 3600),
+    /// )
+    /// .await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -275,8 +291,11 @@ impl StorePair {
                 let dedup_ttl_secs: i32 = dedup_ttl
                     .as_secs()
                     .try_into()
-                    .unwrap_or(630_720_000_i32)
-                    .min(630_720_000_i32);
+                    .map_err(|_| StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()))?;
+                if i64::from(dedup_ttl_secs) > MAX_CASSANDRA_TTL_SECS {
+                    return Err(StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()));
+                }
+                debug!(ttl_secs = dedup_ttl_secs, "deduplication store TTL");
 
                 let message_provider = CassandraMessageDeferStoreProvider::new(
                     store.clone(),
