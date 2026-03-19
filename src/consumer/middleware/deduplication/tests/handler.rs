@@ -305,3 +305,15 @@ fn ttl_exceeding_max_rejected() {
         DeduplicationMiddleware::new(config, "group", MemoryDeduplicationStoreProvider::new());
     assert!(result.is_err());
 }
+
+#[test]
+fn ttl_below_minimum_rejected() {
+    let config = DeduplicationConfiguration {
+        version: "1".to_owned(),
+        cache_capacity: 100,
+        ttl: Duration::from_secs(30),
+    };
+    let result =
+        DeduplicationMiddleware::new(config, "group", MemoryDeduplicationStoreProvider::new());
+    assert!(result.is_err());
+}

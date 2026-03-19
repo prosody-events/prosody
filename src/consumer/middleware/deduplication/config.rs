@@ -30,8 +30,8 @@ pub struct DeduplicationConfiguration {
     #[builder(default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", 4096_usize)?")]
     pub cache_capacity: usize,
 
-    /// Cassandra TTL for deduplication records. Must not exceed
-    /// Cassandra's maximum TTL of 630,720,000 seconds.
+    /// Cassandra TTL for deduplication records. Must be at least 1 minute
+    /// and must not exceed Cassandra's maximum TTL of 630,720,000 seconds.
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_TTL`
     /// Default: 7 days
@@ -51,7 +51,14 @@ impl DeduplicationConfiguration {
     }
 }
 
+/// Minimum deduplication TTL (1 minute). Shorter TTLs risk records expiring
+/// before a consumer rebalance completes.
+const MIN_DEDUP_TTL: Duration = Duration::from_secs(60);
+
 fn validate_dedup_ttl(ttl: &Duration) -> Result<(), ValidationError> {
+    if *ttl < MIN_DEDUP_TTL {
+        return Err(ValidationError::new("ttl_below_minimum"));
+    }
     if ttl.as_secs() > MAX_CASSANDRA_TTL_SECS as u64 {
         return Err(ValidationError::new("ttl_exceeds_cassandra_max"));
     }

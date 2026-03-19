@@ -1,3 +1,7 @@
+-- Migration: create_deduplication
+-- Timestamp: 20260319
+-- Description: Creates the deduplication table for pipeline consumer message dedup
+
 create table {{KEYSPACE}}.{{TABLE_DEDUPLICATION}}
 (
     id uuid,

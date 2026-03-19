@@ -66,7 +66,6 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         .group_id(Uuid::new_v4().to_string())
         .probe_port(None)
         .subscribed_topics(&[topic.to_string()])
-        .mock(true)
         .build()?;
 
     let (messages_tx, mut messages_rx) = channel(10);
