@@ -30,7 +30,8 @@ use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::telemetry::sender::TelemetrySender;
 use crate::util::{
-    from_env, from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env,
+    DEFAULT_IDEMPOTENCE_CACHE_SIZE, from_env, from_env_with_fallback,
+    from_option_duration_env_with_fallback, from_vec_env,
 };
 use crate::{EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, Payload, SOURCE_SYSTEM_HEADER, Topic};
 
@@ -82,11 +83,12 @@ pub struct ProducerConfiguration {
     /// Idempotence cache size.
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
-    /// Default: 4096
+    /// Default: 8192
     ///
     /// Set to 0 to disable the producer idempotence cache.
     #[builder(
-        default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", 4096)?",
+        default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", \
+                   DEFAULT_IDEMPOTENCE_CACHE_SIZE)?",
         setter(into)
     )]
     pub idempotence_cache_size: usize,
