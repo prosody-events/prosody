@@ -107,11 +107,9 @@ zstd-pkg-config = ["rdkafka/zstd-pkg-config"]
 simd-json = { version = "0.17", features = ["serde_impl"] }
 
 [dev-dependencies]
-ahash = "0.8"
 color-eyre = "0.6"
 derive-quickcheck-arbitrary = "0.1"
 itertools = "0.14"
-quick_cache = "0.6"
 quickcheck = "1.0"
 quickcheck_macros = "1.1"
 reqwest = "0.13"

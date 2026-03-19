@@ -25,12 +25,12 @@ use std::sync::Arc;
 
 use quick_cache::sync::Cache;
 use thiserror::Error;
-
-type DeduplicationCache = Cache<Uuid, ()>;
 use tracing::{debug, info_span, warn};
 use uuid::Uuid;
 use validator::Validate;
 use xxhash_rust::xxh3::Xxh3Default;
+
+type DeduplicationCache = Cache<Uuid, ()>;
 
 use crate::consumer::DemandType;
 use crate::consumer::Keyed;
