@@ -203,6 +203,7 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Hig
         scheduler: SchedulerConfigurationBuilder::default(),
         monopolization: MonopolizationConfigurationBuilder::default(),
         defer: DeferConfigurationBuilder::default(),
+        dedup: DeduplicationConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
         emitter: TelemetryEmitterConfiguration {
             enabled: false,

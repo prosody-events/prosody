@@ -161,6 +161,7 @@ use crate::{Partition, Topic};
 pub mod cancellation;
 /// Message retry mechanism that loads failed messages from specific Kafka
 /// offsets.
+pub mod deduplication;
 pub mod defer;
 pub mod log;
 pub mod monopolization;

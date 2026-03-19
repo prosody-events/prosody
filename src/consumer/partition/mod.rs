@@ -9,7 +9,6 @@
 //! - Tracks and commits message offsets for exactly-once processing
 //! - Manages graceful shutdown of partition processing
 //! - Implements backpressure through the bounded message channel
-//! - Deduplicates messages using event IDs
 //!
 //! The core component is `PartitionManager`, which coordinates all aspects
 //! of partition-level message processing.
@@ -24,19 +23,15 @@ use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerStoreProvider};
 use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores};
-use crate::{EventId, EventIdentity, Key, Offset, Partition, ProcessScope, Topic};
-use ahash::RandomState;
+use crate::{Offset, Partition, ProcessScope, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::stream::select;
 use futures::{Stream, StreamExt, pin_mut};
-use quick_cache::UnitWeighter;
-use quick_cache::unsync::Cache;
 use serde_json::Value;
 use std::future::{Ready, ready};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -47,7 +42,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
 use tokio::time::sleep;
-use tracing::{debug, debug_span, error, info, info_span, instrument};
+use tracing::{debug, debug_span, error, info_span, instrument};
 use uuid::Uuid;
 
 mod keyed;
@@ -97,9 +92,6 @@ pub struct PartitionConfiguration<P> {
 
     /// Maximum number of uncommitted messages allowed
     pub max_uncommitted: usize,
-
-    /// Size of idempotence cache for message deduplication
-    pub idempotence_cache_size: usize,
 
     /// Optional automaton for filtering messages by event type
     pub allowed_events: Option<AhoCorasick>,
@@ -390,7 +382,6 @@ where
 /// [`run_partition`].
 struct PartitionParams {
     group_id: Arc<str>,
-    idempotence_cache_size: usize,
     allowed_events: Option<AhoCorasick>,
     shutdown_timeout: Duration,
     timer_semaphores: Arc<TimerSemaphores>,
@@ -413,7 +404,6 @@ async fn handle_messages<T, P>(
 {
     let PartitionConfiguration {
         group_id,
-        idempotence_cache_size,
         allowed_events,
         shutdown_timeout,
         trigger_provider,
@@ -436,7 +426,6 @@ async fn handle_messages<T, P>(
 
     let params = PartitionParams {
         group_id,
-        idempotence_cache_size,
         allowed_events,
         shutdown_timeout,
         timer_semaphores,
@@ -460,7 +449,6 @@ async fn run_partition<T, S>(
 {
     let PartitionParams {
         group_id,
-        idempotence_cache_size,
         allowed_events,
         shutdown_timeout,
         timer_semaphores,
@@ -475,15 +463,12 @@ async fn run_partition<T, S>(
     } = context;
 
     let mut highest_offset_seen = -1;
-    let mut idempotence_cache =
-        NonZeroUsize::new(idempotence_cache_size).map(|size| Cache::new(size.into()));
 
     let message_events = build_message_stream::<S>(
         &offsets,
         message_rx,
         &group_id,
         &mut highest_offset_seen,
-        &mut idempotence_cache,
         allowed_events.as_ref(),
     );
 
@@ -565,14 +550,13 @@ async fn process_event<T, S>(
     }
 }
 
-/// Builds a message processing stream with filtering and deduplication.
+/// Builds a message processing stream with filtering.
 ///
 /// Creates a stream that:
 /// - Filters out duplicate messages based on offsets
 /// - Reserves offsets for processing
 /// - Prevents consumer group loops by filtering messages from the same group
 /// - Filters messages based on their event type (if filtering is configured)
-/// - Deduplicates messages based on their event IDs
 ///
 /// # Arguments
 ///
@@ -580,7 +564,6 @@ async fn process_event<T, S>(
 /// * `message_rx` - Receiver channel for incoming messages
 /// * `group_id` - Consumer group identifier
 /// * `highest_offset_seen` - Tracks the highest offset processed
-/// * `idempotence_cache` - Cache for detecting duplicate event IDs
 /// * `allowed_events` - Optional filter for permitted event types
 ///
 /// # Returns
@@ -592,7 +575,6 @@ fn build_message_stream<T>(
     mut message_rx: Receiver<ConsumerMessage>,
     group_id: &str,
     highest_offset_seen: &mut i64,
-    idempotence_cache: &mut Option<Cache<Key, EventId, UnitWeighter, RandomState>>,
     allowed_events: Option<&AhoCorasick>,
 ) -> impl Stream<Item = UncommittedEvent<T>>
 where
@@ -617,11 +599,6 @@ where
 
             // Apply filter_event_type - filter based on allowed event types
             let Some(uncommitted) = filter_event_type(allowed_events, uncommitted).await else {
-                continue;
-            };
-
-            // Apply filter_duplicate - filter duplicate messages based on event IDs
-            let Some(uncommitted) = filter_duplicate(idempotence_cache, uncommitted).await else {
                 continue;
             };
 
@@ -778,75 +755,4 @@ async fn filter_event_type(
     }
 
     Some(message)
-}
-
-/// Filters out duplicate messages based on their event IDs.
-///
-/// Uses the idempotence cache to detect and filter messages that have already
-/// been processed, ensuring exactly-once processing semantics.
-///
-/// # Arguments
-///
-/// * `idempotence_cache` - Cache for detecting duplicate event IDs
-/// * `message` - The message to check
-///
-/// # Returns
-///
-/// `Some(message)` if the message should be processed,
-/// `None` if it should be filtered out as a duplicate
-async fn filter_duplicate(
-    idempotence_cache: &mut Option<Cache<Key, EventId, UnitWeighter, RandomState>>,
-    message: UncommittedMessage,
-) -> Option<UncommittedMessage> {
-    // Skip deduplication if no cache is configured
-    let Some(idempotence_cache) = idempotence_cache else {
-        return Some(message);
-    };
-
-    // If the message has no event ID, remove any existing entry for this key
-    let Some(event_id) = message.payload().event_id() else {
-        idempotence_cache.remove(message.key());
-        return Some(message);
-    };
-
-    // Resolve the cache lookup synchronously so the !Send RefMut is dropped
-    // before any .await (quick_cache 0.6.20 made unsync::RefMut !Send).
-    let is_duplicate = match idempotence_cache.get_mut_or_guard(message.key()) {
-        // Item is not in the cache; insert it
-        Err(guard) => {
-            guard.insert(event_id.into());
-            false
-        }
-
-        // Existing item could not be retrieved; not a duplicate
-        Ok(None) => false,
-
-        // Item is in the cache
-        Ok(Some(mut value)) => {
-            if value.as_str() == event_id {
-                true
-            } else {
-                // Update the cache with the new event ID
-                *value = event_id.into();
-                false
-            }
-        }
-    };
-
-    if is_duplicate {
-        info_span!(
-            parent: message.span(),
-            "message.filtered",
-            reason = "duplicate-event-id",
-            event_id
-        )
-        .in_scope(|| {
-            info!("message with id {event_id} already processed; skipping");
-        });
-
-        message.commit().await;
-        None
-    } else {
-        Some(message)
-    }
 }

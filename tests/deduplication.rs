@@ -1,50 +1,51 @@
-//! This module provides tests to verify the deduplication functionality of the
-//! Prosody system. The tests ensure messages with identical event IDs are
-//! deduplicated correctly, so only one is processed.
+//! Integration tests for the deduplication middleware.
+//!
+//! Verifies that messages with identical event IDs are deduplicated when
+//! processed through the pipeline consumer with the deduplication middleware.
 
-use crate::common::TestHandler;
+use crate::common::{FallibleTestHandler, collect_messages_with_timeout};
 use color_eyre::eyre::{Result, ensure};
+use prosody::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
+use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
+use prosody::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
+use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
+use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
+use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
+use prosody::consumer::{
+    CommonMiddlewareConfiguration, ConsumerConfiguration, PipelineMiddlewareConfiguration,
+    ProsodyConsumer,
+};
+use prosody::producer::{ProducerConfiguration, ProsodyProducer};
+use prosody::telemetry::Telemetry;
 use prosody::tracing::init_test_logging;
 use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
-    consumer::middleware::CloneProvider,
-    consumer::{ConsumerConfiguration, ProsodyConsumer},
-    producer::{ProducerConfiguration, ProsodyProducer},
-    telemetry::Telemetry,
 };
 use serde_json::json;
 use tokio::sync::mpsc::channel;
-use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod common;
 
-/// Tests the deduplication of messages with identical event IDs.
+/// Tests that two messages with the same event ID are deduplicated.
 ///
-/// This test verifies that when two messages with the same event ID
-/// are sent, only one is received by the consumer, ensuring proper
-/// deduplication functionality.
+/// Sends two messages with the same key and `"id"` field through a pipeline
+/// consumer with the deduplication middleware enabled. Only the first message
+/// should be delivered to the handler.
 ///
 /// # Errors
 ///
-/// This function will return an error if setting up the Kafka topic,
-/// producer, or consumer fails, or if deduplication does not work
-/// as expected.
-///
-/// # Panics
-///
-/// Panics if initializing the tracing subscriber fails.
+/// Returns an error if topic setup, producer/consumer initialization, or
+/// message verification fails.
 #[tokio::test]
-async fn test_deduplication_of_same_event_id() -> Result<()> {
+async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     init_test_logging();
 
-    // Create a unique Kafka topic for isolated testing
     let topic: Topic = Uuid::new_v4().to_string().as_str().into();
     let bootstrap = vec!["localhost:9094".to_owned()];
     let admin_client = ProsodyAdminClient::cached(&AdminConfiguration::new(bootstrap.clone())?)?;
 
-    // Create the Kafka topic with a single partition and replica
     admin_client
         .create_topic(
             &TopicConfiguration::builder()
@@ -55,70 +56,70 @@ async fn test_deduplication_of_same_event_id() -> Result<()> {
         )
         .await?;
 
-    // Configure the producer and consumer for communication with the Kafka broker
     let producer_config = ProducerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
         .source_system("test-producer")
         .build()?;
 
     let consumer_config = ConsumerConfiguration::builder()
-        .bootstrap_servers(bootstrap.clone())
-        .group_id("test-deduplication-consumer")
+        .bootstrap_servers(bootstrap)
+        .group_id(Uuid::new_v4().to_string())
         .probe_port(None)
         .subscribed_topics(&[topic.to_string()])
         .build()?;
 
-    // Set up a channel to collect messages from the consumer
     let (messages_tx, mut messages_rx) = channel(10);
-    let handler = TestHandler { messages_tx };
+    let handler = FallibleTestHandler { messages_tx };
 
-    // Initialize the producer and consumer
-    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
-    let consumer = ProsodyConsumer::new(
+    let telemetry = Telemetry::new();
+    let producer = ProsodyProducer::new(&producer_config, telemetry.sender())?;
+
+    let pipeline_config = PipelineMiddlewareConfiguration {
+        retry: RetryConfigurationBuilder::default().build()?,
+        monopolization: MonopolizationConfigurationBuilder::default().build()?,
+        defer: DeferConfigurationBuilder::default().build()?,
+        dedup: DeduplicationConfigurationBuilder::default().build()?,
+    };
+
+    let common_config = CommonMiddlewareConfiguration {
+        scheduler: SchedulerConfigurationBuilder::default().build()?,
+        timeout: TimeoutConfigurationBuilder::default().build()?,
+    };
+
+    let consumer = ProsodyConsumer::pipeline_consumer(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        CloneProvider::new(handler.clone()),
-        Telemetry::new(),
+        pipeline_config,
+        &common_config,
+        telemetry,
+        handler,
     )
     .await?;
 
-    // Define two messages with identical event IDs for the deduplication test
+    // Send two messages with the same event ID
     let key = "test-key";
     let event_id = "event-123";
     let payload = json!({ "id": event_id, "value": "first message" });
     let payload_duplicate = json!({ "id": event_id, "value": "duplicate message" });
 
-    // Send both the original and duplicate messages
     producer.send([], topic, key, &payload).await?;
     producer.send([], topic, key, &payload_duplicate).await?;
 
-    // Collect received messages with a predefined timeout
-    let mut received_messages = Vec::new();
-    let start = Instant::now();
-    let timeout = Duration::from_secs(30);
+    // Only the first message should be processed
+    let received = collect_messages_with_timeout(&mut messages_rx, 1_usize, 30_u64).await?;
 
-    while start.elapsed() < timeout {
-        if let Some((recv_key, recv_payload)) = messages_rx.recv().await {
-            received_messages.push((recv_key, recv_payload));
-            break; // Stop after receiving the first message
-        }
-    }
-
-    // Shutdown the consumer once messages are collected
     consumer.shutdown().await;
 
-    // Verify that successful deduplication results in only the first message being
-    // received
     ensure!(
-        received_messages.len() == 1,
-        "Expected one message due to deduplication"
+        received.len() == 1,
+        "Expected one message due to deduplication, got {}",
+        received.len()
     );
 
-    let (recv_key, recv_payload) = &received_messages[0];
+    let (recv_key, recv_payload) = &received[0];
     ensure!(recv_key == key);
     ensure!(recv_payload == &payload);
 
-    // Clean up the test topic after verifying deduplication
     admin_client.delete_topic(&topic).await?;
     Ok(())
 }
