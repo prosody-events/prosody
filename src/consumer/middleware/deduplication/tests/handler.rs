@@ -1,5 +1,6 @@
 //! Unit tests for the deduplication handler.
 
+use crate::Topic;
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
@@ -12,20 +13,16 @@ use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler}
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use crate::{Partition, Topic};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::Cache;
 use serde_json::json;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::Span;
-use uuid::Uuid;
-use xxhash_rust::xxh3::Xxh3Default;
 
 #[derive(Debug, Clone)]
 struct TestError;
@@ -102,18 +99,28 @@ impl FallibleHandler for MockHandler {
     async fn shutdown(self) {}
 }
 
-fn create_handler(
+fn create_handler_with(
     inner: MockHandler,
+    version: &str,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
 ) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
     DeduplicationHandler {
         inner,
         cache: Cache::with_weighter(100, 100, UnitWeighter),
         store: MemoryDeduplicationStore::new(),
-        version: "1".to_owned(),
-        group_id: Arc::from("test-group"),
-        topic: Topic::from("test-topic"),
-        partition: Partition::from(0_i32),
+        version: version.to_owned(),
+        group_id: Arc::from(group_id),
+        topic: Topic::from(topic),
+        partition,
     }
+}
+
+fn create_handler(
+    inner: MockHandler,
+) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
+    create_handler_with(inner, "1", "test-group", "test-topic", 0)
 }
 
 fn create_test_message(key: &str, event_id: Option<&str>) -> Option<ConsumerMessage> {
@@ -227,58 +234,65 @@ async fn failed_handler_does_not_cache() {
     assert_eq!(handler.inner.call_count(), 2);
 }
 
-/// Test helper that computes a dedup UUID from individual components.
-fn compute_dedup_uuid(
-    version: &str,
-    group_id: &str,
-    topic: Topic,
-    partition: Partition,
-    key: &str,
-) -> Uuid {
-    let mut hasher = Xxh3Default::new();
-    hasher.write_u32(version.len() as u32);
-    hasher.write(version.as_bytes());
-    hasher.write_u32(group_id.len() as u32);
-    hasher.write(group_id.as_bytes());
-    hasher.write_u32(topic.len() as u32);
-    hasher.write(topic.as_bytes());
-    hasher.write_i32(partition);
-    hasher.write_u32(key.len() as u32);
-    hasher.write(key.as_bytes());
-    let hash = hasher.digest128();
-    uuid::Builder::from_custom_bytes(hash.to_le_bytes()).into_uuid()
+#[test]
+fn dedup_uuid_is_deterministic() -> color_eyre::Result<()> {
+    let handler = create_handler(MockHandler::success());
+    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
+        color_eyre::eyre::bail!("could not create test message");
+    };
+    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
+        color_eyre::eyre::bail!("could not create test message");
+    };
+    assert_eq!(
+        handler.dedup_uuid_for_message(&msg1),
+        handler.dedup_uuid_for_message(&msg2),
+    );
+    Ok(())
 }
 
 #[test]
-fn compute_dedup_uuid_is_deterministic() {
-    let uuid1 = compute_dedup_uuid("1", "group", Topic::from("topic"), 0_i32, "key");
-    let uuid2 = compute_dedup_uuid("1", "group", Topic::from("topic"), 0_i32, "key");
-    assert_eq!(uuid1, uuid2);
-}
-
-#[test]
-fn compute_dedup_uuid_differs_by_dimension() {
-    let base = compute_dedup_uuid("1", "group", Topic::from("topic"), 0_i32, "key");
+fn dedup_uuid_differs_by_dimension() -> color_eyre::Result<()> {
+    let handler = create_handler(MockHandler::success());
+    let Some(base_msg) = create_test_message("key1", Some("evt1")) else {
+        color_eyre::eyre::bail!("could not create test message");
+    };
+    let base = handler.dedup_uuid_for_message(&base_msg);
 
     // Different version
-    let diff_version = compute_dedup_uuid("2", "group", Topic::from("topic"), 0_i32, "key");
-    assert_ne!(base, diff_version);
+    let h = create_handler_with(MockHandler::success(), "2", "test-group", "test-topic", 0);
+    assert_ne!(base, h.dedup_uuid_for_message(&base_msg));
 
     // Different group
-    let diff_group = compute_dedup_uuid("1", "other", Topic::from("topic"), 0_i32, "key");
-    assert_ne!(base, diff_group);
+    let h = create_handler_with(MockHandler::success(), "1", "other-group", "test-topic", 0);
+    assert_ne!(base, h.dedup_uuid_for_message(&base_msg));
 
     // Different topic
-    let diff_topic = compute_dedup_uuid("1", "group", Topic::from("other"), 0_i32, "key");
-    assert_ne!(base, diff_topic);
+    let h = create_handler_with(MockHandler::success(), "1", "test-group", "other-topic", 0);
+    assert_ne!(base, h.dedup_uuid_for_message(&base_msg));
 
     // Different partition
-    let diff_partition = compute_dedup_uuid("1", "group", Topic::from("topic"), 1_i32, "key");
-    assert_ne!(base, diff_partition);
+    let h = create_handler_with(MockHandler::success(), "1", "test-group", "test-topic", 1);
+    assert_ne!(base, h.dedup_uuid_for_message(&base_msg));
 
     // Different key
-    let diff_key = compute_dedup_uuid("1", "group", Topic::from("topic"), 0_i32, "other");
-    assert_ne!(base, diff_key);
+    let Some(diff_key_msg) = create_test_message("key2", Some("evt1")) else {
+        color_eyre::eyre::bail!("could not create test message");
+    };
+    assert_ne!(base, handler.dedup_uuid_for_message(&diff_key_msg));
+
+    // Different event_id
+    let Some(diff_evt_msg) = create_test_message("key1", Some("evt2")) else {
+        color_eyre::eyre::bail!("could not create test message");
+    };
+    assert_ne!(base, handler.dedup_uuid_for_message(&diff_evt_msg));
+
+    // Offset fallback (no event_id) differs from event_id path
+    let Some(offset_msg) = create_test_message("key1", None) else {
+        color_eyre::eyre::bail!("could not create test message");
+    };
+    assert_ne!(base, handler.dedup_uuid_for_message(&offset_msg));
+
+    Ok(())
 }
 
 #[test]
