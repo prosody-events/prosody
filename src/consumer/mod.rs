@@ -11,7 +11,6 @@
 //! - Backpressure handling and flow control
 //! - Error handling with configurable retry strategies
 //! - Distributed tracing integration
-//! - Message deduplication
 //! - Health and readiness probes
 //!
 //! # Architecture
@@ -128,6 +127,11 @@ pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
+use crate::consumer::middleware::deduplication::{
+    DeduplicationConfiguration, DeduplicationMiddleware, DeduplicationStoreProvider,
+};
+use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
+use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
 use crate::consumer::middleware::defer::{
     DeferConfiguration, FailureTracker, MessageDeferMiddleware, TimerDeferMiddleware,
 };
@@ -459,19 +463,6 @@ pub struct ConsumerConfiguration {
     #[validate(range(min = 1_usize))]
     pub max_uncommitted: usize,
 
-    /// Partition idempotence cache size.
-    ///
-    /// Environment variable: `PROSODY_IDEMPOTENCE_CACHE_SIZE`
-    /// Default: 4096
-    ///
-    /// Size of the cache used to deduplicate messages with the same event ID.
-    /// Set to 0 to disable message deduplication.
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_CACHE_SIZE\", 4096)?",
-        setter(into)
-    )]
-    pub idempotence_cache_size: usize,
-
     /// Duration of inactivity allowed before considering a partition stalled.
     ///
     /// Environment variable: `PROSODY_STALL_THRESHOLD`
@@ -637,8 +628,8 @@ pub struct CommonMiddlewareConfiguration {
 
 /// Configuration for middleware specific to pipeline consumers.
 ///
-/// Bundles the retry, monopolization, and defer configurations that are
-/// only used by the pipeline processing mode.
+/// Bundles the retry, monopolization, defer, and deduplication configurations
+/// that are only used by the pipeline processing mode.
 #[derive(Clone, Debug)]
 pub struct PipelineMiddlewareConfiguration {
     /// Retry configuration for failed messages.
@@ -647,6 +638,8 @@ pub struct PipelineMiddlewareConfiguration {
     pub monopolization: MonopolizationConfiguration,
     /// Defer middleware configuration.
     pub defer: DeferConfiguration,
+    /// Deduplication middleware configuration.
+    pub dedup: DeduplicationConfiguration,
 }
 
 /// Configuration for middleware specific to low-latency consumers.
@@ -717,15 +710,89 @@ pub struct ProsodyConsumer {
 /// # Errors
 ///
 /// Returns a `ConsumerError` if middleware initialization fails
+/// Shared middleware components for pipeline consumer construction.
+///
+/// Groups the middleware and configuration that are common to both memory
+/// and Cassandra storage backends, reducing parameter counts.
+struct PipelineMiddlewareStack<CM> {
+    consumer_config: ConsumerConfiguration,
+    defer_config: DeferConfiguration,
+    dedup_config: DeduplicationConfiguration,
+    failure_tracker: FailureTracker,
+    common_middleware: CM,
+    monopolization_middleware: Option<MonopolizationMiddleware>,
+    retry_middleware: RetryMiddleware,
+    heartbeats: HeartbeatRegistry,
+    telemetry: Telemetry,
+}
+
+impl<CM: HandlerMiddleware> PipelineMiddlewareStack<CM> {
+    fn build<T, MP, TP, DP, PP>(
+        self,
+        message_provider: MP,
+        timer_provider: TP,
+        dedup_provider: DP,
+        trigger_provider: PP,
+        handler: T,
+    ) -> Result<ProsodyConsumer, ConsumerError>
+    where
+        T: FallibleHandler + Clone + Send + Sync + 'static,
+        MP: MessageDeferStoreProvider,
+        TP: TimerDeferStoreProvider,
+        DP: DeduplicationStoreProvider,
+        PP: TriggerStoreProvider,
+    {
+        let message_defer_middleware = MessageDeferMiddleware::new(
+            self.defer_config.clone(),
+            &self.consumer_config,
+            message_provider,
+            self.failure_tracker.clone(),
+            &self.heartbeats,
+            &self.telemetry,
+        )?;
+
+        let timer_defer_middleware = TimerDeferMiddleware::new(
+            self.defer_config,
+            timer_provider,
+            self.failure_tracker,
+            &self.consumer_config,
+            &self.telemetry,
+        );
+
+        let dedup_middleware = DeduplicationMiddleware::new(
+            self.dedup_config,
+            self.consumer_config.group_id.as_str(),
+            dedup_provider,
+        )?;
+
+        let provider = self
+            .common_middleware
+            .layer(self.monopolization_middleware)
+            .layer(timer_defer_middleware)
+            .layer(message_defer_middleware)
+            .layer(dedup_middleware)
+            .layer(self.retry_middleware)
+            .into_provider(handler);
+
+        initialize_consumer_with_provider(
+            &self.consumer_config,
+            provider,
+            trigger_provider,
+            &self.telemetry,
+            self.heartbeats,
+        )
+    }
+}
+
 fn build_common_middleware(
     config: &CommonMiddlewareConfiguration,
     stall_threshold: Duration,
-    telemetry: &Telemetry,
+    telemetry: Telemetry,
     source: Arc<str>,
 ) -> Result<impl HandlerMiddleware, ConsumerError> {
-    let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, telemetry)?;
+    let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, &telemetry)?;
     let timeout_middleware = TimeoutMiddleware::new(&config.timeout, stall_threshold)?;
-    let telemetry_middleware = TelemetryMiddleware::new(telemetry.clone(), source);
+    let telemetry_middleware = TelemetryMiddleware::new(telemetry, source);
 
     // Layer common middleware: telemetry -> timeout -> scheduler -> shutdown
     Ok(telemetry_middleware
@@ -925,11 +992,17 @@ impl ProsodyConsumer {
         T: FallibleHandler + Clone + Send + Sync + 'static,
     {
         // Create both stores atomically - ensures trigger and defer stores match
-        let stores = StorePair::new(trigger_store_config, consumer_config.mock).await?;
+        let stores = StorePair::new(
+            trigger_store_config,
+            consumer_config.mock,
+            pipeline_config.dedup.ttl,
+        )
+        .await?;
         let PipelineMiddlewareConfiguration {
             retry: retry_config,
             monopolization: monopolization_config,
             defer: defer_config,
+            dedup: dedup_config,
         } = pipeline_config;
         let monopolization_middleware =
             MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
@@ -938,7 +1011,6 @@ impl ProsodyConsumer {
             consumer_config.stall_threshold,
         );
 
-        // Build middleware stack (shared logic)
         let failure_tracker = FailureTracker::new(
             defer_config.failure_window,
             defer_config.failure_threshold,
@@ -946,90 +1018,48 @@ impl ProsodyConsumer {
             &heartbeats,
         );
 
-        let common_middleware = build_common_middleware(
-            common_config,
-            consumer_config.stall_threshold,
-            &telemetry,
-            Arc::from(consumer_config.group_id.as_str()),
-        )?;
+        let stack = PipelineMiddlewareStack {
+            consumer_config: consumer_config.clone(),
+            defer_config,
+            dedup_config,
+            failure_tracker,
+            common_middleware: build_common_middleware(
+                common_config,
+                consumer_config.stall_threshold,
+                telemetry.clone(),
+                Arc::from(consumer_config.group_id.as_str()),
+            )?,
+            monopolization_middleware,
+            retry_middleware: RetryMiddleware::new(retry_config)?,
+            heartbeats,
+            telemetry,
+        };
 
-        // Build middleware stack with concrete provider types (determined by StorePair
-        // variant)
         match stores {
             StorePair::Memory {
                 trigger_provider,
                 message_provider,
                 timer_provider,
-            } => {
-                let message_defer_middleware = MessageDeferMiddleware::new(
-                    defer_config.clone(),
-                    consumer_config,
-                    message_provider,
-                    failure_tracker.clone(),
-                    &heartbeats,
-                    &telemetry,
-                )?;
-
-                let timer_defer_middleware = TimerDeferMiddleware::new(
-                    defer_config,
-                    timer_provider,
-                    failure_tracker,
-                    consumer_config,
-                    &telemetry,
-                );
-
-                let provider = common_middleware
-                    .layer(monopolization_middleware)
-                    .layer(timer_defer_middleware)
-                    .layer(message_defer_middleware)
-                    .layer(RetryMiddleware::new(retry_config)?)
-                    .into_provider(handler);
-
-                initialize_consumer_with_provider(
-                    consumer_config,
-                    provider,
-                    trigger_provider,
-                    &telemetry,
-                    heartbeats,
-                )
-            }
+                dedup_provider,
+            } => stack.build(
+                message_provider,
+                timer_provider,
+                dedup_provider,
+                trigger_provider,
+                handler,
+            ),
             StorePair::Cassandra {
                 trigger_provider,
                 message_provider,
                 timer_provider,
-            } => {
-                let message_defer_middleware = MessageDeferMiddleware::new(
-                    defer_config.clone(),
-                    consumer_config,
-                    message_provider,
-                    failure_tracker.clone(),
-                    &heartbeats,
-                    &telemetry,
-                )?;
-
-                let timer_defer_middleware = TimerDeferMiddleware::new(
-                    defer_config,
-                    timer_provider,
-                    failure_tracker,
-                    consumer_config,
-                    &telemetry,
-                );
-
-                let provider = common_middleware
-                    .layer(monopolization_middleware)
-                    .layer(timer_defer_middleware)
-                    .layer(message_defer_middleware)
-                    .layer(RetryMiddleware::new(retry_config)?)
-                    .into_provider(handler);
-
-                initialize_consumer_with_provider(
-                    consumer_config,
-                    provider,
-                    trigger_provider,
-                    &telemetry,
-                    heartbeats,
-                )
-            }
+                dedup_provider,
+            } => stack.build(
+                message_provider,
+                timer_provider,
+                dedup_provider,
+                trigger_provider,
+                handler,
+            ),
         }
     }
 
@@ -1085,7 +1115,7 @@ impl ProsodyConsumer {
         let common_middleware = build_common_middleware(
             common_config,
             consumer_config.stall_threshold,
-            &telemetry,
+            telemetry.clone(),
             Arc::from(consumer_config.group_id.as_str()),
         )?;
 
@@ -1133,7 +1163,7 @@ impl ProsodyConsumer {
         let common_middleware = build_common_middleware(
             common_config,
             consumer_config.stall_threshold,
-            &telemetry,
+            telemetry.clone(),
             Arc::from(consumer_config.group_id.as_str()),
         )?;
 

@@ -88,12 +88,9 @@ pub struct CassandraConfiguration {
     pub retention: Duration,
 }
 
-/// Cassandra's maximum TTL in seconds (~20 years).
-const MAX_CASSANDRA_TTL_SECS: u64 = 630_720_000;
-
 fn validate_retention_ttl(retention: &Duration) -> Result<(), validator::ValidationError> {
-    if retention.as_secs() > MAX_CASSANDRA_TTL_SECS {
-        let max_ttl = Duration::from_secs(MAX_CASSANDRA_TTL_SECS);
+    if retention.as_secs() > super::MAX_CASSANDRA_TTL_SECS as u64 {
+        let max_ttl = Duration::from_secs(super::MAX_CASSANDRA_TTL_SECS as u64);
         let mut err = validator::ValidationError::new("retention_exceeds_max_ttl");
         err.message = Some(
             format!(

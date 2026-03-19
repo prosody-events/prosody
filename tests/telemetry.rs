@@ -11,6 +11,7 @@ use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
 use prosody::consumer::middleware::FallibleHandler;
+use prosody::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
 use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
 use prosody::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
 use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
@@ -954,6 +955,7 @@ fn build_client(
         scheduler: SchedulerConfigurationBuilder::default(),
         monopolization: MonopolizationConfigurationBuilder::default(),
         defer: DeferConfigurationBuilder::default(),
+        dedup: DeduplicationConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
         emitter: TelemetryEmitterConfiguration {
             topic: telemetry_topic.to_owned(),
@@ -1008,6 +1010,7 @@ fn build_typed_client_with_defer<T: FallibleHandler>(
         scheduler: SchedulerConfigurationBuilder::default(),
         monopolization: MonopolizationConfigurationBuilder::default(),
         defer,
+        dedup: DeduplicationConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
         emitter: TelemetryEmitterConfiguration {
             topic: telemetry_topic.to_owned(),

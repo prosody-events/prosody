@@ -6,6 +6,7 @@
 
 use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
 use crate::consumer::middleware::defer::DeferConfigurationBuilder;
 use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
 use crate::consumer::middleware::retry::RetryConfigurationBuilder;
@@ -61,6 +62,8 @@ pub struct ConsumerBuilders {
     pub monopolization: MonopolizationConfigurationBuilder,
     /// Defer middleware configuration builder.
     pub defer: DeferConfigurationBuilder,
+    /// Deduplication middleware configuration builder.
+    pub dedup: DeduplicationConfigurationBuilder,
     /// Timeout middleware configuration builder.
     pub timeout: TimeoutConfigurationBuilder,
     /// Telemetry emitter configuration.
@@ -175,6 +178,7 @@ impl<T> HighLevelClient<T> {
             scheduler_builder: &consumer_builders.scheduler,
             monopolization_builder: &consumer_builders.monopolization,
             defer_builder: &consumer_builders.defer,
+            dedup_builder: &consumer_builders.dedup,
             timeout_builder: &consumer_builders.timeout,
             cassandra_builder,
         });
@@ -254,6 +258,7 @@ impl<T> HighLevelClient<T> {
                 retry,
                 monopolization,
                 defer,
+                dedup,
                 common,
                 trigger_store,
             } => {
@@ -264,6 +269,7 @@ impl<T> HighLevelClient<T> {
                         retry: retry.clone(),
                         monopolization: monopolization.clone(),
                         defer: defer.clone(),
+                        dedup: dedup.clone(),
                     },
                     common,
                     self.telemetry.clone(),

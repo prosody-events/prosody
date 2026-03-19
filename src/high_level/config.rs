@@ -10,6 +10,10 @@ use crate::cassandra::{
     CassandraConfiguration,
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
+use crate::consumer::middleware::deduplication::{
+    DeduplicationConfiguration, DeduplicationConfigurationBuilder,
+    DeduplicationConfigurationBuilderError,
+};
 use crate::consumer::middleware::defer::{
     DeferConfigError, DeferConfiguration, DeferConfigurationBuilder,
 };
@@ -53,6 +57,8 @@ pub(crate) struct ModeConfigurationBuildParams<'a> {
     pub monopolization_builder: &'a MonopolizationConfigurationBuilder,
     /// Builder for the defer configuration.
     pub defer_builder: &'a DeferConfigurationBuilder,
+    /// Builder for the deduplication configuration.
+    pub dedup_builder: &'a DeduplicationConfigurationBuilder,
     /// Builder for the timeout configuration.
     pub timeout_builder: &'a TimeoutConfigurationBuilder,
     /// Builder for the Cassandra configuration.
@@ -81,6 +87,8 @@ pub enum ModeConfiguration {
         monopolization: MonopolizationConfiguration,
         /// Defer middleware configuration.
         defer: DeferConfiguration,
+        /// Deduplication middleware configuration.
+        dedup: DeduplicationConfiguration,
         /// Common middleware configuration (scheduler, timeout).
         common: CommonMiddlewareConfiguration,
         /// The trigger store configuration.
@@ -149,11 +157,13 @@ impl ModeConfiguration {
             Mode::Pipeline => {
                 let monopolization = params.monopolization_builder.build()?;
                 let defer = params.defer_builder.clone().build()?;
+                let dedup = params.dedup_builder.build()?;
                 Self::Pipeline {
                     consumer,
                     retry,
                     monopolization,
                     defer,
+                    dedup,
                     common,
                     trigger_store,
                 }
@@ -259,6 +269,10 @@ pub enum ModeConfigurationError {
     /// Error when the defer configuration builder fails.
     #[error("invalid defer configuration: {0:#}")]
     DeferConfiguration(#[from] DeferConfigError),
+
+    /// Error when the deduplication configuration builder fails.
+    #[error("invalid deduplication configuration: {0:#}")]
+    DeduplicationConfiguration(#[from] DeduplicationConfigurationBuilderError),
 
     /// Error when the timeout configuration builder fails.
     #[error("invalid timeout configuration: {0:#}")]

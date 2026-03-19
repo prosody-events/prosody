@@ -13,9 +13,10 @@ use prosody::{
     cassandra::config::CassandraConfigurationBuilder,
     consumer::ConsumerConfigurationBuilder,
     consumer::middleware::{
-        defer::DeferConfigurationBuilder, monopolization::MonopolizationConfigurationBuilder,
-        retry::RetryConfigurationBuilder, scheduler::SchedulerConfigurationBuilder,
-        timeout::TimeoutConfigurationBuilder, topic::FailureTopicConfigurationBuilder,
+        deduplication::DeduplicationConfigurationBuilder, defer::DeferConfigurationBuilder,
+        monopolization::MonopolizationConfigurationBuilder, retry::RetryConfigurationBuilder,
+        scheduler::SchedulerConfigurationBuilder, timeout::TimeoutConfigurationBuilder,
+        topic::FailureTopicConfigurationBuilder,
     },
     high_level::{ConsumerBuilders, HighLevelClient, HighLevelClientError, mode::Mode},
     producer::ProducerConfigurationBuilder,
@@ -119,6 +120,7 @@ fn create_high_level_client(
         scheduler: SchedulerConfigurationBuilder::default(),
         monopolization: MonopolizationConfigurationBuilder::default(),
         defer: DeferConfigurationBuilder::default(),
+        dedup: DeduplicationConfigurationBuilder::default(),
         timeout: TimeoutConfigurationBuilder::default(),
         emitter: TelemetryEmitterConfiguration {
             enabled: false,

@@ -4,11 +4,9 @@
 //! Kafka topics. It handles configuration, message serialization, and injection
 //! of OpenTelemetry context for distributed tracing.
 
-use ahash::RandomState;
 use derive_builder::Builder;
 use educe::Educe;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
-use quick_cache::UnitWeighter;
 use quick_cache::sync::Cache;
 use rdkafka::ClientConfig;
 use rdkafka::client::{Client, DefaultClientContext};
@@ -18,6 +16,7 @@ use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use std::env::var;
+use std::hash::Hasher;
 use std::mem::take;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -25,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{Span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
+use xxhash_rust::xxh3::Xxh3Default;
 
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
@@ -32,9 +32,7 @@ use crate::telemetry::sender::TelemetrySender;
 use crate::util::{
     from_env, from_env_with_fallback, from_option_duration_env_with_fallback, from_vec_env,
 };
-use crate::{
-    EventId, EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, Payload, SOURCE_SYSTEM_HEADER, Topic,
-};
+use crate::{EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, Payload, SOURCE_SYSTEM_HEADER, Topic};
 
 #[cfg(target_arch = "arm")]
 use serde_json as json;
@@ -162,7 +160,7 @@ pub struct ProsodyProducer {
     producer: FutureProducer,
 
     /// Idempotence cache for deduplicating messages.
-    idempotence_cache: Option<Arc<Cache<Key, EventId, UnitWeighter, RandomState>>>,
+    idempotence_cache: Option<Arc<Cache<u128, ()>>>,
 
     /// OpenTelemetry context propagator.
     #[educe(Debug(ignore))]
@@ -357,18 +355,21 @@ impl ProsodyProducer {
         let key: Key = key.into();
 
         // Handle idempotence cache logic if enabled
-        if let (Some(cache), Some(event_id)) = (&self.idempotence_cache, maybe_event_id)
-            && matches!(
-                cache.get(&key),
-                Some(previous_event_id) if previous_event_id == event_id
-            )
-        {
-            let span = info_span!("message.filtered", reason = "duplicate-event-id", event_id);
-            span.in_scope(|| {
-                info!("message with id {event_id} already produced; skipping");
-            });
-            return Ok(());
-        }
+        let dedup_hash = match (&self.idempotence_cache, maybe_event_id) {
+            (Some(cache), Some(event_id)) => {
+                let hash = compute_dedup_hash(&topic, key.as_ref(), event_id);
+                if cache.get(&hash).is_some() {
+                    let span =
+                        info_span!("message.filtered", reason = "duplicate-event-id", event_id);
+                    span.in_scope(|| {
+                        info!("message with id {event_id} already produced; skipping");
+                    });
+                    return Ok(());
+                }
+                Some(hash)
+            }
+            _ => None,
+        };
 
         // Serialize the payload to JSON
         let serialized = json::to_vec(&payload)?;
@@ -429,18 +430,9 @@ impl ProsodyProducer {
         );
 
         // Update the idempotence cache if needed
-        let Some(cache) = &self.idempotence_cache else {
-            return Ok(());
-        };
-
-        let Some(event_id) = maybe_event_id else {
-            // If no event ID exists, remove it from the cache
-            cache.remove(&key);
-            return Ok(());
-        };
-
-        // Insert the new event ID into the cache
-        cache.insert(key, event_id.into());
+        if let (Some(cache), Some(hash)) = (&self.idempotence_cache, dedup_hash) {
+            cache.insert(hash, ());
+        }
         Ok(())
     }
 
@@ -455,4 +447,15 @@ impl ProsodyProducer {
     pub(crate) fn kafka_client(&self) -> &Client<FutureProducerContext<DefaultClientContext>> {
         self.producer.client()
     }
+}
+
+fn compute_dedup_hash(topic: &Topic, key: &str, event_id: &str) -> u128 {
+    let mut hasher = Xxh3Default::new();
+    hasher.write_u32(topic.len() as u32);
+    hasher.write(topic.as_bytes());
+    hasher.write_u32(key.len() as u32);
+    hasher.write(key.as_bytes());
+    hasher.write_u32(event_id.len() as u32);
+    hasher.write(event_id.as_bytes());
+    hasher.digest128()
 }
