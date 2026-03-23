@@ -8,6 +8,7 @@ use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::test_support::MockEventContext;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::Trigger;
 use crate::{Key, Offset};
@@ -127,6 +128,11 @@ pub struct OutcomeHandler {
     next_outcome: Arc<Mutex<Option<HandlerOutcome>>>,
     /// Record of all messages processed by this handler (in order).
     processed: Arc<scc::Queue<ProcessedMessage>>,
+    /// When set, triggers partition shutdown before returning the outcome.
+    ///
+    /// Used to simulate shutdown occurring mid-handler-execution, exercising
+    /// post-call cancellation promotion paths.
+    shutdown_trigger: Arc<Mutex<Option<MockEventContext>>>,
 }
 
 impl OutcomeHandler {
@@ -136,6 +142,7 @@ impl OutcomeHandler {
         Self {
             next_outcome: Arc::new(Mutex::new(None)),
             processed: Arc::new(scc::Queue::default()),
+            shutdown_trigger: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -144,6 +151,22 @@ impl OutcomeHandler {
     /// Must be called before each `on_message()` or `on_timer()` invocation.
     pub fn set_outcome(&self, outcome: HandlerOutcome) {
         *self.next_outcome.lock() = Some(outcome);
+    }
+
+    /// Configures shutdown to be signaled when this handler is next called.
+    ///
+    /// The provided context shares its shutdown channel with any clones, so
+    /// contexts passed to outer middleware layers will also observe shutdown
+    /// after the handler fires.
+    pub fn set_shutdown_trigger(&self, ctx: MockEventContext) {
+        *self.shutdown_trigger.lock() = Some(ctx);
+    }
+
+    /// Fires the shutdown trigger if one is configured.
+    fn maybe_trigger_shutdown(&self) {
+        if let Some(ctx) = self.shutdown_trigger.lock().as_ref() {
+            ctx.request_shutdown();
+        }
     }
 
     /// Returns all processed messages in order (drains the queue).
@@ -184,6 +207,7 @@ impl Debug for OutcomeHandler {
         f.debug_struct("OutcomeHandler")
             .field("next_outcome", &self.next_outcome.lock())
             .field("processed_count", &self.processed.len())
+            .field("shutdown_trigger", &self.shutdown_trigger.lock().is_some())
             .finish()
     }
 }
@@ -214,6 +238,7 @@ impl FallibleHandler for OutcomeHandler {
         // Record this message as processed (for order verification)
         self.record_processed(key, offset);
 
+        self.maybe_trigger_shutdown();
         match outcome {
             HandlerOutcome::Success => Ok(()),
             HandlerOutcome::Permanent => Err(OutcomeError::permanent()),
@@ -236,6 +261,7 @@ impl FallibleHandler for OutcomeHandler {
             trigger.key,
             outcome
         );
+        self.maybe_trigger_shutdown();
         match outcome {
             HandlerOutcome::Success => Ok(()),
             HandlerOutcome::Permanent => Err(OutcomeError::permanent()),
