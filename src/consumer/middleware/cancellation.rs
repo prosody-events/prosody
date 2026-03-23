@@ -91,6 +91,12 @@ pub struct CancellationHandler<T> {
     handler: T,
 }
 
+impl<T> CancellationHandler<T> {
+    pub(crate) fn new(handler: T) -> Self {
+        Self { handler }
+    }
+}
+
 impl HandlerMiddleware for CancellationMiddleware {
     type Provider<T: FallibleHandlerProvider> = CancellationProvider<T>;
 
@@ -109,9 +115,7 @@ where
     type Handler = CancellationHandler<T::Handler>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        CancellationHandler {
-            handler: self.provider.handler_for_partition(topic, partition),
-        }
+        CancellationHandler::new(self.provider.handler_for_partition(topic, partition))
     }
 }
 
@@ -122,6 +126,11 @@ where
     type Error = CancellationError<T::Error>;
 
     /// Checks cancellation state, then delegates to inner handler if clear.
+    ///
+    /// Post-call: Transient errors are promoted to
+    /// [`CancellationError::Shutdown`] (Terminal) if shutdown is active
+    /// when the handler returns, ensuring outer middleware layers treat the
+    /// failure as unrecoverable rather than retrying or deferring.
     async fn on_message<C>(
         &self,
         context: C,
@@ -131,19 +140,25 @@ where
     where
         C: EventContext,
     {
-        // Check shutdown first (Terminal) - must release partition immediately
         if context.is_shutdown() {
             return Err(CancellationError::Shutdown);
         }
-        // Check message cancellation (Transient) - retry will continue
         if context.is_message_cancelled() {
             return Err(CancellationError::MessageCancelled);
         }
 
         self.handler
-            .on_message(context, message, demand_type)
+            .on_message(context.clone(), message, demand_type)
             .await
-            .map_err(CancellationError::Handler)
+            .map_err(|error| {
+                if context.is_shutdown()
+                    && matches!(error.classify_error(), ErrorCategory::Transient)
+                {
+                    CancellationError::Shutdown
+                } else {
+                    CancellationError::Handler(error)
+                }
+            })
     }
 
     async fn on_timer<C>(
@@ -155,19 +170,25 @@ where
     where
         C: EventContext,
     {
-        // Check shutdown first (Terminal) - must release partition immediately
         if context.is_shutdown() {
             return Err(CancellationError::Shutdown);
         }
-        // Check message cancellation (Transient) - retry will continue
         if context.is_message_cancelled() {
             return Err(CancellationError::MessageCancelled);
         }
 
         self.handler
-            .on_timer(context, timer, demand_type)
+            .on_timer(context.clone(), timer, demand_type)
             .await
-            .map_err(CancellationError::Handler)
+            .map_err(|error| {
+                if context.is_shutdown()
+                    && matches!(error.classify_error(), ErrorCategory::Transient)
+                {
+                    CancellationError::Shutdown
+                } else {
+                    CancellationError::Handler(error)
+                }
+            })
     }
 
     async fn shutdown(self) {
@@ -349,9 +370,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_returns_terminal_error() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationHandler {
-            handler: handler.clone(),
-        };
+        let guard_handler = CancellationHandler::new(handler.clone());
         let context = MockEventContext::new().with_shutdown();
         let Some(message) = create_test_message() else {
             return;
@@ -372,9 +391,7 @@ mod tests {
     #[tokio::test]
     async fn message_cancelled_returns_transient_error() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationHandler {
-            handler: handler.clone(),
-        };
+        let guard_handler = CancellationHandler::new(handler.clone());
         let context = MockEventContext::new();
         context.request_cancellation();
         let Some(message) = create_test_message() else {
@@ -396,9 +413,7 @@ mod tests {
     #[tokio::test]
     async fn not_cancelled_passes_through_to_handler() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationHandler {
-            handler: handler.clone(),
-        };
+        let guard_handler = CancellationHandler::new(handler.clone());
         let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
@@ -415,9 +430,7 @@ mod tests {
     #[tokio::test]
     async fn handler_error_wrapped_in_guard_error() {
         let handler = MockHandler::failing(ErrorCategory::Transient);
-        let guard_handler = CancellationHandler {
-            handler: handler.clone(),
-        };
+        let guard_handler = CancellationHandler::new(handler.clone());
         let context = MockEventContext::new();
         let Some(message) = create_test_message() else {
             return;
@@ -434,9 +447,7 @@ mod tests {
     #[tokio::test]
     async fn timer_shutdown_returns_terminal_error() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationHandler {
-            handler: handler.clone(),
-        };
+        let guard_handler = CancellationHandler::new(handler.clone());
         let context = MockEventContext::new().with_shutdown();
         let trigger = create_test_trigger();
 
@@ -451,9 +462,7 @@ mod tests {
     #[tokio::test]
     async fn timer_message_cancelled_returns_transient_error() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationHandler {
-            handler: handler.clone(),
-        };
+        let guard_handler = CancellationHandler::new(handler.clone());
         let context = MockEventContext::new();
         context.request_cancellation();
         let trigger = create_test_trigger();
@@ -469,9 +478,7 @@ mod tests {
     #[tokio::test]
     async fn timer_not_cancelled_passes_through() {
         let handler = MockHandler::success();
-        let guard_handler = CancellationHandler {
-            handler: handler.clone(),
-        };
+        let guard_handler = CancellationHandler::new(handler.clone());
         let context = MockEventContext::new();
         let trigger = create_test_trigger();
 
@@ -481,5 +488,134 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(handler.call_count(), 1);
+    }
+
+    /// Mock handler that triggers shutdown mid-execution and returns a
+    /// configurable result. Used to simulate a handler that fails while
+    /// shutdown is concurrently signaled.
+    #[derive(Clone)]
+    struct ShutdownTriggerHandler {
+        ctx: MockEventContext,
+        result: Result<(), TestError>,
+    }
+
+    impl ShutdownTriggerHandler {
+        fn new(ctx: MockEventContext, result: Result<(), TestError>) -> Self {
+            Self { ctx, result }
+        }
+    }
+
+    impl FallibleHandler for ShutdownTriggerHandler {
+        type Error = TestError;
+
+        async fn on_message<C>(
+            &self,
+            _context: C,
+            _message: ConsumerMessage,
+            _demand_type: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext,
+        {
+            self.ctx.request_shutdown();
+            self.result.clone()
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext,
+        {
+            self.ctx.request_shutdown();
+            self.result.clone()
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_message_converts_transient_to_terminal() {
+        let context = MockEventContext::new();
+        let handler =
+            ShutdownTriggerHandler::new(context.clone(), Err(TestError(ErrorCategory::Transient)));
+        let guard_handler = CancellationHandler::new(handler);
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result = guard_handler
+            .on_message(context, message, DemandType::Normal)
+            .await;
+
+        assert!(matches!(result, Err(CancellationError::Shutdown)));
+        assert!(matches!(
+            result.as_ref().err().map(ClassifyError::classify_error),
+            Some(ErrorCategory::Terminal)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_message_preserves_non_transient_error() {
+        let context = MockEventContext::new();
+        let handler =
+            ShutdownTriggerHandler::new(context.clone(), Err(TestError(ErrorCategory::Permanent)));
+        let guard_handler = CancellationHandler::new(handler);
+        let Some(message) = create_test_message() else {
+            return;
+        };
+
+        let result = guard_handler
+            .on_message(context, message, DemandType::Normal)
+            .await;
+
+        // Permanent errors are NOT promoted to Shutdown even during shutdown
+        assert!(matches!(result, Err(CancellationError::Handler(_))));
+        assert!(matches!(
+            result.as_ref().err().map(ClassifyError::classify_error),
+            Some(ErrorCategory::Permanent)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_timer_converts_transient_to_terminal() {
+        let context = MockEventContext::new();
+        let handler =
+            ShutdownTriggerHandler::new(context.clone(), Err(TestError(ErrorCategory::Transient)));
+        let guard_handler = CancellationHandler::new(handler);
+        let trigger = create_test_trigger();
+
+        let result = guard_handler
+            .on_timer(context, trigger, DemandType::Normal)
+            .await;
+
+        assert!(matches!(result, Err(CancellationError::Shutdown)));
+        assert!(matches!(
+            result.as_ref().err().map(ClassifyError::classify_error),
+            Some(ErrorCategory::Terminal)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_timer_preserves_non_transient_error() {
+        let context = MockEventContext::new();
+        let handler =
+            ShutdownTriggerHandler::new(context.clone(), Err(TestError(ErrorCategory::Permanent)));
+        let guard_handler = CancellationHandler::new(handler);
+        let trigger = create_test_trigger();
+
+        let result = guard_handler
+            .on_timer(context, trigger, DemandType::Normal)
+            .await;
+
+        // Permanent errors are NOT promoted to Shutdown even during shutdown
+        assert!(matches!(result, Err(CancellationError::Handler(_))));
+        assert!(matches!(
+            result.as_ref().err().map(ClassifyError::classify_error),
+            Some(ErrorCategory::Permanent)
+        ));
     }
 }

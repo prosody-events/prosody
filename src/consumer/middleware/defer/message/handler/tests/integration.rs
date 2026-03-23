@@ -4,17 +4,32 @@
 //! `MessageDeferHandler` middleware using deterministic traces, complementing
 //! the property-based tests in `properties.rs`.
 
+use super::MockEventContext;
 use super::TEST_RUNTIME;
+use super::context::{KeyedCapturingContext, TimerCapture};
+use super::handler::{HandlerOutcome, OutcomeHandler};
 use super::harness::TestHarness;
 use super::types::{MessageEvent, MessageOutcome, TimerEvent, TimerOutcome};
 use crate::Offset;
 use crate::consumer::DemandType;
+use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::middleware::defer::message::handler::tests::context::KeyedCapturingContext;
+use crate::consumer::middleware::cancellation::CancellationHandler;
+use crate::consumer::middleware::defer::DeferConfiguration;
+use crate::consumer::middleware::defer::decider::TraceBasedDecider;
+use crate::consumer::middleware::defer::message::handler::MessageDeferHandler;
+use crate::consumer::middleware::defer::message::loader::MemoryLoader;
+use crate::consumer::middleware::defer::message::store::CachedDeferStore;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
+use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::telemetry::Telemetry;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
+use crate::{Key, Partition, Topic};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn simple_defer_and_retry_succeeds() {
@@ -284,6 +299,222 @@ fn permanent_error_schedules_timer_for_next_message() {
             next_state,
             Some((Offset::from(2_i64), 0)),
             "Next message should be offset 2 with retry_count reset to 0"
+        );
+
+        Some(())
+    });
+}
+
+// ============================================================================
+// Shutdown proof tests
+//
+// These tests verify the composition: cancellation middleware (inside) +
+// defer middleware (outside). On shutdown, cancellation converts Transient
+// errors to Terminal so defer's existing guard prevents any store write.
+// ============================================================================
+
+/// The stacked handler type used in shutdown proof tests:
+/// defer(cancellation(inner)), mirroring production middleware ordering.
+type ShutdownProofHandler = MessageDeferHandler<
+    CancellationHandler<OutcomeHandler>,
+    CachedDeferStore<MemoryMessageDeferStore>,
+    MemoryLoader,
+    TraceBasedDecider,
+>;
+
+/// Builds a [`ShutdownProofHandler`] for shutdown proof tests.
+///
+/// Returns `(handler, store, loader, inner_handler, capture, decider)` so
+/// callers can control outcomes and inspect store state after each call.
+fn build_shutdown_proof_stack(
+    topic: Topic,
+    partition: Partition,
+) -> Option<(
+    ShutdownProofHandler,
+    MemoryMessageDeferStore,
+    MemoryLoader,
+    OutcomeHandler,
+    TimerCapture,
+    TraceBasedDecider,
+)> {
+    let inner = OutcomeHandler::new();
+    let cancellation = CancellationHandler::new(inner.clone());
+    let store = MemoryMessageDeferStore::new();
+    let loader = MemoryLoader::new();
+    let capture = TimerCapture::new();
+    let decider = TraceBasedDecider::new();
+
+    let config = DeferConfiguration::builder()
+        .base(Duration::from_secs(1))
+        .max_delay(Duration::from_secs(3600))
+        .failure_threshold(0.9_f64)
+        .build()
+        .ok()?;
+
+    let cached_store = CachedDeferStore::new(store.clone(), config.cache_size);
+    let telemetry = Telemetry::new();
+    let sender = telemetry.partition_sender(topic, partition);
+
+    let handler = MessageDeferHandler {
+        handler: cancellation,
+        loader: loader.clone(),
+        store: cached_store,
+        decider: decider.clone(),
+        config,
+        topic,
+        partition,
+        sender,
+        source: Arc::from("test"),
+    };
+
+    Some((handler, store, loader, inner, capture, decider))
+}
+
+/// Proves that a transient handler error is NOT deferred when the partition
+/// is shutting down.
+///
+/// The cancellation middleware (inside defer) converts Transient → Terminal on
+/// shutdown. Defer's existing guard (`if !Transient { return Err }`) then
+/// propagates the error without writing to the store, preventing tombstones.
+#[test]
+fn transient_error_not_deferred_on_shutdown() {
+    init_test_logging();
+
+    TEST_RUNTIME.block_on(async {
+        let topic = Topic::from("test-topic");
+        let partition = Partition::from(0_i32);
+        let key: Key = Arc::from("test-key");
+
+        let (handler, store, loader, inner, _capture, decider) =
+            build_shutdown_proof_stack(topic, partition)?;
+
+        loader.store_message(
+            topic,
+            partition,
+            Offset::from(1_i64),
+            key.clone(),
+            serde_json::json!({"test": true}),
+        );
+
+        inner.set_outcome(HandlerOutcome::Transient);
+        decider.set_next(true); // decider would allow deferral if not for shutdown
+
+        // Shutdown is signaled by the inner handler mid-execution, not before
+        // the call. This exercises the post-call promotion path in
+        // CancellationHandler rather than the pre-call short-circuit.
+        let ctx = MockEventContext::new();
+        inner.set_shutdown_trigger(ctx.clone());
+
+        let message = ConsumerMessage::for_testing(
+            topic,
+            partition,
+            Offset::from(1_i64),
+            key.clone(),
+            serde_json::json!({"test": true}),
+        )
+        .ok()?;
+
+        let result = handler.on_message(ctx, message, DemandType::Normal).await;
+
+        // Error must propagate; the middleware must not absorb it.
+        let err = result.err()?;
+
+        // Must classify as Terminal so FallibleEventHandler aborts the offset,
+        // letting the incoming consumer replay the message after rebalance.
+        assert!(
+            matches!(err.classify_error(), ErrorCategory::Terminal),
+            "Shutdown-aborted deferral must be Terminal so the offset is aborted"
+        );
+
+        // No row must appear in the defer store.
+        let deferred = store.is_deferred(&key).await.ok()?;
+        assert!(
+            deferred.is_none(),
+            "Key must not be deferred when shutdown is in progress"
+        );
+
+        Some(())
+    });
+}
+
+/// Proves that a transient handler error during timer retry is NOT re-deferred
+/// when the partition is shutting down.
+///
+/// The message is already committed to the defer store from a prior deferral.
+/// On retry, if the handler fails transiently while shutdown is active, the
+/// cancellation middleware converts the error to Terminal. Defer's retry path
+/// propagates Terminal errors without modifying the store, so `retry_count` is
+/// unchanged and no timer is rescheduled — the existing row stays in place for
+/// the new consumer to pick up after rebalance.
+#[test]
+fn transient_retry_not_redeferred_on_shutdown() {
+    init_test_logging();
+
+    TEST_RUNTIME.block_on(async {
+        let topic = Topic::from("test-topic");
+        let partition = Partition::from(0_i32);
+        let key: Key = Arc::from("test-key");
+
+        let (handler, store, loader, inner, capture, decider) =
+            build_shutdown_proof_stack(topic, partition)?;
+
+        // Pre-store message so the loader can serve it during timer retry.
+        loader.store_message(
+            topic,
+            partition,
+            Offset::from(1_i64),
+            key.clone(),
+            serde_json::json!({"test": true}),
+        );
+
+        // --- Step 1: Defer normally (no shutdown) ---
+        inner.set_outcome(HandlerOutcome::Transient);
+        decider.set_next(true);
+
+        let message = ConsumerMessage::for_testing(
+            topic,
+            partition,
+            Offset::from(1_i64),
+            key.clone(),
+            serde_json::json!({"test": true}),
+        )
+        .ok()?;
+
+        let key_ctx = KeyedCapturingContext::new(key.clone(), capture.clone());
+        handler
+            .on_message(key_ctx, message, DemandType::Normal)
+            .await
+            .ok()?;
+
+        // Confirm deferred with retry_count == 0.
+        let retry_count_before = store.is_deferred(&key).await.ok()??;
+        assert_eq!(retry_count_before, 0);
+
+        // --- Step 2: Fire timer, triggering shutdown mid-execution ---
+        // Shutdown is signaled by the inner handler during the retry call,
+        // exercising the post-call promotion path in CancellationHandler.
+        let trigger_time = capture.get_timer_time(&key)?;
+        inner.set_outcome(HandlerOutcome::Transient);
+
+        let ctx = MockEventContext::new();
+        inner.set_shutdown_trigger(ctx.clone());
+
+        let trigger = Trigger::for_testing(key.clone(), trigger_time, TimerType::DeferredMessage);
+        let result = handler.on_timer(ctx, trigger, DemandType::Normal).await;
+
+        // Error must propagate as Terminal; no re-deferral must happen.
+        let err = result.err()?;
+        assert!(
+            matches!(err.classify_error(), ErrorCategory::Terminal),
+            "Shutdown-aborted re-deferral must be Terminal so the timer is aborted"
+        );
+
+        // Retry count must be unchanged — no increment_retry_count call.
+        let state_after = store.get_next_deferred_message(&key).await.ok()?;
+        assert_eq!(
+            state_after,
+            Some((Offset::from(1_i64), 0)),
+            "Retry count must not be incremented during shutdown"
         );
 
         Some(())
