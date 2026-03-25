@@ -201,6 +201,14 @@ impl Trigger {
         let span = self.span.load();
         span.as_ref().clone()
     }
+
+    /// Replaces the tracing span on this trigger.
+    ///
+    /// Used to refresh context when a duplicate trigger is inserted, ensuring
+    /// the most recent caller's trace context is preserved.
+    pub fn set_span(&self, span: Span) {
+        self.span.store(Arc::new(span));
+    }
 }
 
 /// Maximum concurrent slab loading operations.

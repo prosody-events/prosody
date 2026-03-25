@@ -44,27 +44,17 @@ impl TriggerQueue {
 
     /// Inserts a [`Trigger`] into the queue for delayed firing.
     ///
-    /// If the same [`Trigger`] (same key and time) is already scheduled,
-    /// this call has no effect.
+    /// If the same [`Trigger`] (same key, time, and type) is already
+    /// scheduled, refreshes its tracing span to the new trigger's span so
+    /// that `onTimer` fires under the most recent caller's trace context.
     ///
     /// # Arguments
     ///
     /// * `trigger` - The timer event to schedule.
     pub async fn insert(&mut self, trigger: Trigger) {
-        // Skip scheduling if the trigger is already present.
-        let Entry::Vacant(vacant) = self.queue_keys.entry(trigger.clone()) else {
-            return;
-        };
-
-        // Compute delay until trigger time, defaulting to zero if in the past.
-        let delay = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
-
-        // Schedule the trigger and record its key in the map.
-        let queue_key = self.queue.insert(trigger.clone(), delay);
-        vacant.insert(queue_key);
-
-        // Mark the trigger as active for fast membership checks.
-        self.active.insert(trigger).await;
+        if self.enqueue(trigger.clone()) {
+            self.active.insert(trigger).await;
+        }
     }
 
     /// Waits for and returns the next expired [`Trigger`], if any.
@@ -118,23 +108,34 @@ impl TriggerQueue {
     ///
     /// Used for rescheduling: the caller has already set the state to
     /// `FiringRescheduled` and only needs the timer re-added to the queue.
-    /// If the same [`Trigger`] is already in the queue, this is a no-op.
+    /// If the same [`Trigger`] is already in the queue, refreshes its
+    /// tracing span to the new trigger's span.
     ///
     /// # Arguments
     ///
     /// * `trigger` - The timer event to add to the queue.
     pub(crate) fn insert_queue_only(&mut self, trigger: Trigger) {
-        // Skip if the trigger is already in the queue.
-        let Entry::Vacant(vacant) = self.queue_keys.entry(trigger.clone()) else {
-            return;
+        self.enqueue(trigger);
+    }
+
+    /// Adds a trigger to the delay queue, returning `true` if newly inserted.
+    ///
+    /// If the trigger already exists (same key, time, and type), refreshes
+    /// the span so `onTimer` fires under the most recent caller's trace
+    /// context and returns `false`.
+    fn enqueue(&mut self, trigger: Trigger) -> bool {
+        let vacant = match self.queue_keys.entry(trigger.clone()) {
+            Entry::Occupied(occupied) => {
+                occupied.key().set_span(trigger.span());
+                return false;
+            }
+            Entry::Vacant(vacant) => vacant,
         };
 
-        // Compute delay until trigger time, defaulting to zero if in the past.
         let delay = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
-
-        // Schedule the trigger and record its key in the map.
         let queue_key = self.queue.insert(trigger, delay);
         vacant.insert(queue_key);
+        true
     }
 
     /// Removes a [`Trigger`] from the `DelayQueue` without modifying
@@ -310,6 +311,39 @@ mod tests {
                 .contains(&key, time, TimerType::Application)
                 .await
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_insert_duplicate_refreshes_span() -> Result<()> {
+        pause();
+
+        let mut triggers = TriggerQueue::new();
+
+        let key = Key::from("dedup-key");
+        let time = CompactDateTime::now()?.add_duration(CompactDuration::new(5))?;
+
+        let span_a = tracing::info_span!("span_a");
+        let span_b = tracing::info_span!("span_b");
+
+        let trigger_a = Trigger::new(key.clone(), time, TimerType::Application, span_a);
+        let trigger_b = Trigger::new(key.clone(), time, TimerType::Application, span_b.clone());
+
+        // Insert first trigger with span_a
+        triggers.insert(trigger_a).await;
+
+        // Insert duplicate with span_b — should refresh span
+        triggers.insert(trigger_b).await;
+
+        // Expire and pop the trigger
+        advance(Duration::from_secs(5)).await;
+        let Some(expired) = cooperative(triggers.next()).await else {
+            bail!("No expired trigger found");
+        };
+
+        // The expired trigger should carry span_b's identity
+        assert_eq!(expired.span().id(), span_b.id());
 
         Ok(())
     }
