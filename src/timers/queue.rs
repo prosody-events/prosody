@@ -51,20 +51,9 @@ impl TriggerQueue {
     ///
     /// * `trigger` - The timer event to schedule.
     pub async fn insert(&mut self, trigger: Trigger) {
-        // Skip scheduling if the trigger is already present.
-        let Entry::Vacant(vacant) = self.queue_keys.entry(trigger.clone()) else {
-            return;
-        };
-
-        // Compute delay until trigger time, defaulting to zero if in the past.
-        let delay = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
-
-        // Schedule the trigger and record its key in the map.
-        let queue_key = self.queue.insert(trigger.clone(), delay);
-        vacant.insert(queue_key);
-
-        // Mark the trigger as active for fast membership checks.
-        self.active.insert(trigger).await;
+        if self.enqueue(trigger.clone()) {
+            self.active.insert(trigger).await;
+        }
     }
 
     /// Waits for and returns the next expired [`Trigger`], if any.
@@ -124,17 +113,27 @@ impl TriggerQueue {
     ///
     /// * `trigger` - The timer event to add to the queue.
     pub(crate) fn insert_queue_only(&mut self, trigger: Trigger) {
-        // Skip if the trigger is already in the queue.
-        let Entry::Vacant(vacant) = self.queue_keys.entry(trigger.clone()) else {
-            return;
+        self.enqueue(trigger);
+    }
+
+    /// Adds a trigger to the delay queue, returning `true` if newly inserted.
+    ///
+    /// If the trigger already exists (same key, time, and type), refreshes
+    /// the span so `onTimer` fires under the most recent caller's trace
+    /// context and returns `false`.
+    fn enqueue(&mut self, trigger: Trigger) -> bool {
+        let vacant = match self.queue_keys.entry(trigger.clone()) {
+            Entry::Occupied(occupied) => {
+                occupied.key().set_span(trigger.span());
+                return false;
+            }
+            Entry::Vacant(vacant) => vacant,
         };
 
-        // Compute delay until trigger time, defaulting to zero if in the past.
         let delay = trigger.time.duration_from_now().unwrap_or(Duration::ZERO);
-
-        // Schedule the trigger and record its key in the map.
         let queue_key = self.queue.insert(trigger, delay);
         vacant.insert(queue_key);
+        true
     }
 
     /// Removes a [`Trigger`] from the `DelayQueue` without modifying
