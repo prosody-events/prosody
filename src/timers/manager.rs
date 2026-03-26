@@ -104,7 +104,7 @@ where
     /// * `heartbeats` - Registry for monitoring timer loader and scheduler
     ///   liveness.
     /// * `shutdown_rx` - Watch channel signaling partition shutdown; the slab
-    ///   loader exits when this becomes `true`.
+    ///   loader exits at `>= ShutdownPhase::Draining`.
     /// * `semaphores` - Per-type semaphores bounding in-flight timer events
     ///   across all partitions; the timer stream blocks when all permits for
     ///   the trigger's type are held and terminates if the semaphore is closed.
@@ -888,8 +888,9 @@ mod tests {
 
     /// Helper function to set up a timer manager for testing.
     ///
-    /// Returns `(stream, manager, _shutdown_tx)`. The caller holds
-    /// `_shutdown_tx` and can send `true` to stop the background slab loader.
+    /// Returns `(stream, manager, shutdown_tx)`. The caller holds
+    /// `shutdown_tx` and can send `ShutdownPhase::Draining` to stop the
+    /// background slab loader.
     async fn setup_timer_manager() -> Result<(
         impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,

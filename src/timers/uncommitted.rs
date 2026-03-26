@@ -456,8 +456,9 @@ mod tests {
 
     /// Helper function to set up a timer manager for testing.
     ///
-    /// Returns `(stream, manager, _shutdown_tx)`. The caller holds
-    /// `_shutdown_tx` and can send `true` to stop the background slab loader.
+    /// Returns `(stream, manager, shutdown_tx)`. The caller holds
+    /// `shutdown_tx` and can send `ShutdownPhase::Draining` to stop the
+    /// background slab loader.
     async fn setup_timer_manager() -> Result<(
         impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,

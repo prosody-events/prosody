@@ -275,8 +275,8 @@ where
     /// # Arguments
     ///
     /// * `key` – The message key for affinity and timer scoping.
-    /// * `shutdown_rx` – A `watch::Receiver<bool>` that signals shutdown when
-    ///   set.
+    /// * `shutdown_rx` – Watch channel signaling partition shutdown; operations
+    ///   short-circuit at `>= ShutdownPhase::Cancelling`.
     /// * `timers` – The `TimerManager<T>` instance.
     pub(crate) fn new(
         key: Key,

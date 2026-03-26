@@ -343,26 +343,29 @@ impl PartitionManager {
         // Terminating at 80% and 100% of shutdown_timeout respectively.
         // If send returns Err, all receivers have dropped (partition already
         // exited) — no point spawning the phase task.
-        let _ = self.shutdown_tx.send(ShutdownPhase::Draining);
-        debug!(topic = %self.topic, partition = self.partition, phase = "draining", "shutdown phase transition");
-        let now = Instant::now();
-        let grace = self.shutdown_timeout * GRACE_PERIOD_NUMERATOR / GRACE_PERIOD_DENOMINATOR;
-        let cancelling_at = now + grace;
-        let terminating_at = now + self.shutdown_timeout;
-        let topic = self.topic;
-        let partition = self.partition;
-        let shutdown_tx = self.shutdown_tx;
+        if self.shutdown_tx.send(ShutdownPhase::Draining).is_ok() {
+            debug!(topic = %self.topic, partition = self.partition, phase = "draining", "shutdown phase transition");
 
-        spawn(async move {
-            sleep_until(cancelling_at).await;
-            if shutdown_tx.send(ShutdownPhase::Cancelling).is_err() {
-                return;
-            }
-            debug!(topic = %topic, partition, phase = "cancelling", "shutdown phase transition");
-            sleep_until(terminating_at).await;
-            let _ = shutdown_tx.send(ShutdownPhase::Terminating);
-            debug!(topic = %topic, partition, phase = "terminating", "shutdown phase transition");
-        });
+            let now = Instant::now();
+            let grace = self.shutdown_timeout * GRACE_PERIOD_NUMERATOR / GRACE_PERIOD_DENOMINATOR;
+            let cancelling_at = now + grace;
+            let terminating_at = now + self.shutdown_timeout;
+            let topic = self.topic;
+            let partition = self.partition;
+            let shutdown_tx = self.shutdown_tx;
+
+            spawn(async move {
+                sleep_until(cancelling_at).await;
+                if shutdown_tx.send(ShutdownPhase::Cancelling).is_err() {
+                    return;
+                }
+                debug!(topic = %topic, partition, phase = "cancelling", "shutdown phase transition");
+
+                sleep_until(terminating_at).await;
+                let _ = shutdown_tx.send(ShutdownPhase::Terminating);
+                debug!(topic = %topic, partition, phase = "terminating", "shutdown phase transition");
+            });
+        }
 
         // Wait for message processing to complete
         if let Err(error) = self.handle.await {
