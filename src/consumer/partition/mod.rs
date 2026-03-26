@@ -41,7 +41,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
-use tokio::time::sleep;
+use tokio::time::{sleep, sleep_until, Instant};
 use tracing::{debug, debug_span, error, info_span, instrument};
 use uuid::Uuid;
 
@@ -341,15 +341,17 @@ impl PartitionManager {
         // If send returns Err, all receivers have dropped (partition already
         // exited) — no point spawning the phase task.
         let _ = self.shutdown_tx.send(ShutdownPhase::Draining);
+        let now = Instant::now();
         let grace = self.shutdown_timeout * GRACE_PERIOD_NUMERATOR / GRACE_PERIOD_DENOMINATOR;
-        let remaining = self.shutdown_timeout.saturating_sub(grace);
+        let cancelling_at = now + grace;
+        let terminating_at = now + self.shutdown_timeout;
         let shutdown_tx = self.shutdown_tx;
         spawn(async move {
-            sleep(grace).await;
+            sleep_until(cancelling_at).await;
             if shutdown_tx.send(ShutdownPhase::Cancelling).is_err() {
                 return;
             }
-            sleep(remaining).await;
+            sleep_until(terminating_at).await;
             let _ = shutdown_tx.send(ShutdownPhase::Terminating);
         });
 

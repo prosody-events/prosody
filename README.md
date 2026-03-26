@@ -226,7 +226,7 @@ fields, so you can mix both approaches.
 | `PROSODY_TIMEOUT`                | Cancel handler if it runs longer than this           | 80% of stall threshold |
 | `PROSODY_COMMIT_INTERVAL`        | How often to save progress to Kafka                  | 1s                     |
 | `PROSODY_POLL_INTERVAL`          | How often to fetch new messages from Kafka           | 100ms                  |
-| `PROSODY_SHUTDOWN_TIMEOUT`       | Wait this long for in-flight work before force-quit  | 30s                    |
+| `PROSODY_SHUTDOWN_TIMEOUT`       | Shutdown budget; handlers complete freely before cancellation fires near the deadline | 30s |
 | `PROSODY_STALL_THRESHOLD`        | Report unhealthy if no progress for this long        | 5m                     |
 | `PROSODY_PROBE_PORT`             | HTTP port for health checks ('none' to disable)      | 8000                   |
 | `PROSODY_FAILURE_TOPIC`          | Send unprocessable messages here (dead letter queue) | -                      |
