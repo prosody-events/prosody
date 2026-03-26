@@ -137,7 +137,7 @@ impl StorageBackend {
 ///     &config,
 ///     false,
 ///     Duration::from_secs(7 * 24 * 3600),
-///     SpanLink::default(),
+///     SpanLink::AddLink,
 /// )
 /// .await?;
 ///
@@ -255,7 +255,7 @@ impl StorePair {
     ///     &TriggerStoreConfiguration::InMemory,
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
-    ///     SpanLink::default(),
+    ///     SpanLink::AddLink,
     /// )
     /// .await?;
     /// # Ok(())

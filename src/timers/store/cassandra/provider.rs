@@ -45,7 +45,7 @@ use std::sync::Arc;
 ///
 /// ```rust,ignore
 /// let config = CassandraConfiguration { ... };
-/// let store = cassandra_store(&config, segment, SpanLink::default()).await?;
+/// let store = cassandra_store(&config, segment, SpanLink::AddLink).await?;
 /// let manager = TimerManager::new(..., store);
 /// ```
 pub async fn cassandra_store(
