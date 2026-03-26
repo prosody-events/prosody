@@ -603,7 +603,6 @@ pub struct ConsumerConfiguration {
     /// Controls how the `receive` span connects to the `OTel` context
     /// propagated from the Kafka message producer.
     ///
-    /// Environment variable: `PROSODY_MESSAGE_LINKING`
     /// Default: `SetParent` (child-of relationship)
     #[builder(default)]
     pub message_linking: SpanLink,
@@ -613,7 +612,6 @@ pub struct ConsumerConfiguration {
     /// Controls how timer spans connect to the `OTel` context stored when the
     /// timer was scheduled.
     ///
-    /// Environment variable: `PROSODY_TIMER_LINKING`
     /// Default: `AddLink` (follows-from relationship via span link)
     #[builder(default = "SpanLink::AddLink")]
     pub timer_linking: SpanLink,

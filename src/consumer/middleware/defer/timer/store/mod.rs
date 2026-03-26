@@ -48,7 +48,8 @@ pub enum TimerRetryCompletionResult {
 /// # Key Differences from `MessageDeferStore`
 ///
 /// - Stores `Trigger` with serialized span context (W3C trace format)
-/// - Reconstructs spans on read via `span.set_parent(context)`
+/// - Reconstructs spans on read via
+///   [`SpanLink::apply`](crate::consumer::SpanLink::apply)
 ///
 /// # Invariants
 ///
@@ -172,7 +173,7 @@ pub trait TimerDeferStore: Clone + Send + Sync + 'static {
 ///
 /// Caches `Context` rather than `Trigger` because spans get replaced with
 /// `Span::none()` after processing. Fresh spans are created at read time via
-/// `span.set_parent(context)`.
+/// [`SpanLink::apply`](crate::consumer::SpanLink::apply).
 #[derive(Clone, Debug)]
 pub struct CachedTimerEntry {
     /// Earliest timer's fire time.
