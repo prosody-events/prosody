@@ -5,6 +5,7 @@
 //! cleanup of completed slabs and dynamically adjusts its preload window
 //! based on current time.
 
+use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -108,12 +109,12 @@ impl<T> State<T> {
 /// * `segment` - The timer segment to manage slab loading for
 /// * `state` - Shared state containing the trigger store and scheduler
 /// * `heartbeat` - Heartbeat monitor for detecting stalled loader operations
-/// * `shutdown_rx` - Watch receiver; loop exits when the value becomes `true`
+/// * `shutdown_rx` - Watch receiver; loop exits at `ShutdownPhase::Draining`
 pub async fn slab_loader<T>(
     segment: Segment,
     state: SlabLock<State<T>>,
     heartbeat: Heartbeat,
-    mut shutdown_rx: watch::Receiver<bool>,
+    mut shutdown_rx: watch::Receiver<ShutdownPhase>,
 ) where
     T: TriggerStore,
 {
@@ -125,7 +126,7 @@ pub async fn slab_loader<T>(
     let mut highest_loaded_slab_id: Option<SlabId> = None;
 
     loop {
-        if *shutdown_rx.borrow() {
+        if *shutdown_rx.borrow() >= ShutdownPhase::Draining {
             debug!("Slab loader shutting down");
             return;
         }
@@ -199,11 +200,9 @@ pub async fn slab_loader<T>(
             select! {
                 () = sleep(wait_time.into()) => {},
                 () = heartbeat.next() => {},
-                result = shutdown_rx.wait_for(|&v| v) => {
-                    if result.is_ok() {
-                        debug!("Slab loader shutting down");
-                        return;
-                    }
+                _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Draining) => {
+                    debug!("Slab loader shutting down");
+                    return;
                 },
             }
         }
@@ -787,7 +786,7 @@ mod tests {
 
         // We need to spawn the slab_loader in a separate task since it runs
         // indefinitely
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let loader_handle = tokio::spawn(slab_loader(
             segment.clone(),
             slab_lock.clone(),
@@ -826,7 +825,7 @@ mod tests {
             Heartbeat::new("test-slab-loader-advancement", Duration::from_secs(30));
 
         // Spawn the loader
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let loader_handle = tokio::spawn(slab_loader(
             segment.clone(),
             slab_lock.clone(),
@@ -1081,7 +1080,7 @@ mod tests {
         let test_heartbeat = Heartbeat::new("test-slab-loader-errors", Duration::from_secs(30));
 
         // Spawn the loader
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let loader_handle = tokio::spawn(slab_loader(
             segment.clone(),
             slab_lock.clone(),

@@ -17,6 +17,7 @@
 //! and provides at-least-once delivery semantics for timer events.
 
 use crate::Key;
+use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::active::TimerState;
@@ -122,7 +123,7 @@ where
     pub async fn new(
         config: TimerManagerConfig<T>,
         heartbeats: HeartbeatRegistry,
-        shutdown_rx: watch::Receiver<bool>,
+        shutdown_rx: watch::Receiver<ShutdownPhase>,
         semaphores: Arc<TimerSemaphores>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
@@ -892,10 +893,10 @@ mod tests {
     async fn setup_timer_manager() -> Result<(
         impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
-        watch::Sender<bool>,
+        watch::Sender<ShutdownPhase>,
     )> {
         let store = memory_store(test_segment());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let telemetry = Telemetry::new();
 
         let config = TimerManagerConfig {
@@ -950,7 +951,7 @@ mod tests {
         let store = memory_store(segment.clone());
         let telemetry = Telemetry::new();
 
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let config = TimerManagerConfig {
             name: "test-creation".to_owned(),
             store,

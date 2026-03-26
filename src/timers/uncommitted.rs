@@ -417,6 +417,7 @@ mod tests {
     use super::*;
     use crate::Topic;
     use crate::consumer::Uncommitted;
+    use crate::consumer::partition::ShutdownPhase;
     use crate::heartbeat::HeartbeatRegistry;
     use crate::telemetry::Telemetry;
     use crate::timers::TimerSemaphores;
@@ -460,10 +461,10 @@ mod tests {
     async fn setup_timer_manager() -> Result<(
         impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
-        watch::Sender<bool>,
+        watch::Sender<ShutdownPhase>,
     )> {
         let store = memory_store(test_segment());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let telemetry = Telemetry::new();
 
         let config = TimerManagerConfig {
