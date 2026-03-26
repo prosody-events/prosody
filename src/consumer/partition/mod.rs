@@ -41,7 +41,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
-use tokio::time::{sleep, sleep_until, Instant};
+use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, debug_span, error, info_span, instrument};
 use uuid::Uuid;
 
