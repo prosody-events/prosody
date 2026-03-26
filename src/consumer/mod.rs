@@ -269,7 +269,10 @@ impl SpanLink {
                 }
             }
             Self::AddLink => {
-                span.add_link(context.span().span_context().clone());
+                let span_context = context.span().span_context().clone();
+                if span_context.is_valid() {
+                    span.add_link(span_context);
+                }
             }
         }
     }

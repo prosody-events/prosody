@@ -32,6 +32,7 @@ use std::sync::Arc;
 ///
 /// * `config` - Cassandra connection and TTL configuration
 /// * `segment` - Segment this store is scoped to
+/// * `timer_linking` - Span linking strategy for timer execution spans
 ///
 /// # Errors
 ///
@@ -44,7 +45,7 @@ use std::sync::Arc;
 ///
 /// ```rust,ignore
 /// let config = CassandraConfiguration { ... };
-/// let store = cassandra_store(&config, segment).await?;
+/// let store = cassandra_store(&config, segment, SpanLink::default()).await?;
 /// let manager = TimerManager::new(..., store);
 /// ```
 pub async fn cassandra_store(

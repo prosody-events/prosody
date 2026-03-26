@@ -128,11 +128,18 @@ impl StorageBackend {
 ///
 /// ```no_run
 /// # use prosody::consumer::storage::{StorageBackend, StorePair};
+/// # use prosody::consumer::SpanLink;
 /// # use prosody::high_level::config::TriggerStoreConfiguration;
 /// # use std::time::Duration;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = TriggerStoreConfiguration::InMemory;
-/// let stores = StorePair::new(&config, false, Duration::from_secs(7 * 24 * 3600)).await?;
+/// let stores = StorePair::new(
+///     &config,
+///     false,
+///     Duration::from_secs(7 * 24 * 3600),
+///     SpanLink::default(),
+/// )
+/// .await?;
 ///
 /// // Pattern match to get all providers - they're guaranteed to match storage types
 /// match stores {
@@ -240,6 +247,7 @@ impl StorePair {
     ///
     /// ```no_run
     /// # use prosody::consumer::storage::StorePair;
+    /// # use prosody::consumer::SpanLink;
     /// # use prosody::high_level::config::TriggerStoreConfiguration;
     /// # use std::time::Duration;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -247,6 +255,7 @@ impl StorePair {
     ///     &TriggerStoreConfiguration::InMemory,
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
+    ///     SpanLink::default(),
     /// )
     /// .await?;
     /// # Ok(())
