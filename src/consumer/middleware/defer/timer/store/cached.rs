@@ -2,6 +2,7 @@
 
 use super::{CachedTimerEntry, TimerDeferStore, TimerRetryCompletionResult};
 use crate::Key;
+use crate::consumer::SpanLink;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -16,9 +17,14 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 type TimerDeferCache = Cache<Key, Option<CachedTimerEntry>>;
 
 /// Creates a span for a cached timer load, linked to the stored parent context.
-fn create_span_from_context(key: &Key, time: CompactDateTime, context: &Context) -> Span {
+fn create_span_from_context(
+    key: &Key,
+    time: CompactDateTime,
+    context: &Context,
+    linking: SpanLink,
+) -> Span {
     let span = info_span!("timer_defer.load", key = %key, time = %time, cached = true);
-    let _ = span.set_parent(context.clone());
+    linking.apply(&span, context.clone());
     span
 }
 
@@ -35,6 +41,7 @@ fn create_span_from_context(key: &Key, time: CompactDateTime, context: &Context)
 pub struct CachedTimerDeferStore<S> {
     store: S,
     cache: Arc<TimerDeferCache>,
+    timer_linking: SpanLink,
 }
 
 impl<S> CachedTimerDeferStore<S>
@@ -43,10 +50,11 @@ where
 {
     /// Wraps a store with a cache of the given capacity.
     #[must_use]
-    pub fn new(store: S, capacity: usize) -> Self {
+    pub fn new(store: S, capacity: usize, timer_linking: SpanLink) -> Self {
         Self {
             store,
             cache: Arc::new(Cache::new(capacity)),
+            timer_linking,
         }
     }
 
@@ -195,7 +203,8 @@ where
         // Check cache first
         if let Some(cached) = self.cache.get(key.as_ref()) {
             return Ok(cached.map(|entry| {
-                let span = create_span_from_context(key, entry.time, &entry.context);
+                let span =
+                    create_span_from_context(key, entry.time, &entry.context, self.timer_linking);
                 let trigger = Trigger::new(key.clone(), entry.time, TimerType::Application, span);
                 (trigger, entry.retry_count)
             }));
@@ -305,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_hit_on_repeated_get() -> color_eyre::Result<()> {
         let store = create_test_store();
-        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let cached_store = CachedTimerDeferStore::new(store, 100, SpanLink::default());
         let trigger = test_trigger("test-key-1", 1000);
 
         // First defer
@@ -332,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_update_on_increment() -> color_eyre::Result<()> {
         let store = create_test_store();
-        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let cached_store = CachedTimerDeferStore::new(store, 100, SpanLink::default());
         let trigger = test_trigger("test-key-1", 1000);
 
         // Defer and populate cache
@@ -354,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_cleared_on_complete_last_timer() -> color_eyre::Result<()> {
         let store = create_test_store();
-        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let cached_store = CachedTimerDeferStore::new(store, 100, SpanLink::default());
         let trigger = test_trigger("test-key-1", 1000);
 
         // Defer one timer
@@ -377,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_update_on_complete_success() -> color_eyre::Result<()> {
         let store = create_test_store();
-        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let cached_store = CachedTimerDeferStore::new(store, 100, SpanLink::default());
         let key = "test-key-1";
 
         // Defer two timers
@@ -413,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn test_defer_additional_out_of_order() -> color_eyre::Result<()> {
         let store = create_test_store();
-        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let cached_store = CachedTimerDeferStore::new(store, 100, SpanLink::default());
         let key = "test-key-1";
 
         // Defer first timer at time 1000
@@ -439,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn test_defer_additional_monotonic() -> color_eyre::Result<()> {
         let store = create_test_store();
-        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let cached_store = CachedTimerDeferStore::new(store, 100, SpanLink::default());
         let key = "test-key-1";
 
         // Defer first timer - cache pre-populated
@@ -464,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_negative_results() -> color_eyre::Result<()> {
         let store = create_test_store();
-        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let cached_store = CachedTimerDeferStore::new(store, 100, SpanLink::default());
         let key: Key = Arc::from("test-key-1");
 
         // Query non-existent key (should cache None)
@@ -481,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_key_updates_cache() -> color_eyre::Result<()> {
         let store = create_test_store();
-        let cached_store = CachedTimerDeferStore::new(store, 100);
+        let cached_store = CachedTimerDeferStore::new(store, 100, SpanLink::default());
         let trigger = test_trigger("test-key-1", 1000);
 
         // Defer timer and populate cache

@@ -30,6 +30,7 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
+use crate::consumer::SpanLink;
 
 /// Unified storage backend that ensures trigger and defer stores use the same
 /// underlying storage infrastructure.
@@ -255,21 +256,26 @@ impl StorePair {
         config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
+        timer_linking: SpanLink,
     ) -> Result<Self, StoreCreationError> {
         let backend = StorageBackend::new(config, mock).await?;
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
                 trigger_provider: InMemoryTriggerStoreProvider::new(),
                 message_provider: MemoryMessageDeferStoreProvider::new(),
-                timer_provider: MemoryTimerDeferStoreProvider::new(),
+                timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_linking),
                 dedup_provider: MemoryDeduplicationStoreProvider::new(),
             }),
 
             StorageBackend::Cassandra { store, keyspace } => {
                 // Create trigger store provider (prepares queries once, creates
                 // per-partition stores with independent caches on demand)
-                let trigger_provider =
-                    CassandraTriggerStoreProvider::with_store(store.clone(), keyspace).await?;
+                let trigger_provider = CassandraTriggerStoreProvider::with_store(
+                    store.clone(),
+                    keyspace,
+                    timer_linking,
+                )
+                .await?;
 
                 // Create segment store for defer stores (shared across message and timer)
                 let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;
@@ -307,6 +313,7 @@ impl StorePair {
                     store.clone(),
                     timer_queries,
                     segment_store,
+                    timer_linking,
                 );
 
                 let dedup_provider = CassandraDeduplicationStoreProvider::new(

@@ -5,6 +5,7 @@
 
 use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
+use crate::consumer::SpanLink;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -790,9 +791,13 @@ pub async fn prop_migration_invariants(
                 slab_size: input.initial_slab_size,
                 version: SegmentVersion::V2,
             };
-            let cassandra_store =
-                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
-                    .await?;
+            let cassandra_store = CassandraTriggerStore::with_store(
+                cassandra_base,
+                &config.keyspace,
+                segment,
+                SpanLink::default(),
+            )
+            .await?;
             setup_v2_state(&cassandra_store, &input).await?;
         }
         SegmentVersion::V3 => {
@@ -805,9 +810,13 @@ pub async fn prop_migration_invariants(
                 slab_size: input.initial_slab_size,
                 version: SegmentVersion::V3,
             };
-            let cassandra_store =
-                CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment)
-                    .await?;
+            let cassandra_store = CassandraTriggerStore::with_store(
+                cassandra_base,
+                &config.keyspace,
+                segment,
+                SpanLink::default(),
+            )
+            .await?;
             let store = TableAdapter::new(cassandra_store);
             setup_v3_state(&store, &input).await?;
         }
@@ -822,8 +831,13 @@ pub async fn prop_migration_invariants(
         slab_size: input.target_slab_size,
         version: SegmentVersion::V3,
     };
-    let cassandra_store =
-        CassandraTriggerStore::with_store(cassandra_base, &config.keyspace, segment).await?;
+    let cassandra_store = CassandraTriggerStore::with_store(
+        cassandra_base,
+        &config.keyspace,
+        segment,
+        SpanLink::default(),
+    )
+    .await?;
     let store = TableAdapter::new(cassandra_store);
 
     // Trigger migration by calling get_segment()

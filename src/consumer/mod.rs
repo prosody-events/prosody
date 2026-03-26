@@ -175,6 +175,7 @@ use crossbeam_utils::CachePadded;
 use derive_builder::Builder;
 use educe::Educe;
 use futures::executor::block_on;
+use opentelemetry::trace::TraceContextExt;
 use parking_lot::{Mutex, RwLock};
 use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
@@ -191,6 +192,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::error;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::hostname;
 
@@ -245,6 +247,32 @@ pub enum DemandType {
     /// This is typically created by retry middleware when an event fails
     /// and needs to be reprocessed.
     Failure,
+}
+
+/// Controls how a span links to a propagated OpenTelemetry context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpanLink {
+    /// Sets the context as the span's parent (child-of relationship).
+    #[default]
+    SetParent,
+    /// Adds the context as a span link (follows-from relationship).
+    AddLink,
+}
+
+impl SpanLink {
+    /// Applies this linking strategy to connect a span to a propagated context.
+    pub fn apply(self, span: &tracing::Span, context: opentelemetry::Context) {
+        match self {
+            Self::SetParent => {
+                if let Err(error) = span.set_parent(context) {
+                    tracing::debug!("failed to set parent span: {error:#}");
+                }
+            }
+            Self::AddLink => {
+                span.add_link(context.span().span_context().clone());
+            }
+        }
+    }
 }
 
 /// This trait is implemented by message types that have a key field,
@@ -569,6 +597,26 @@ pub struct ConsumerConfiguration {
     /// Defaults to 1 hour if not specified or if parsing from environment
     /// fails.
     pub slab_size: Duration,
+
+    /// Span linking strategy for message execution spans.
+    ///
+    /// Controls how the `receive` span connects to the `OTel` context
+    /// propagated from the Kafka message producer.
+    ///
+    /// Environment variable: `PROSODY_MESSAGE_LINKING`
+    /// Default: `SetParent` (child-of relationship)
+    #[builder(default)]
+    pub message_linking: SpanLink,
+
+    /// Span linking strategy for timer execution spans.
+    ///
+    /// Controls how timer spans connect to the `OTel` context stored when the
+    /// timer was scheduled.
+    ///
+    /// Environment variable: `PROSODY_TIMER_LINKING`
+    /// Default: `AddLink` (follows-from relationship via span link)
+    #[builder(default = "SpanLink::AddLink")]
+    pub timer_linking: SpanLink,
 }
 
 impl ConsumerConfiguration {
@@ -930,9 +978,12 @@ impl ProsodyConsumer {
                 let store = CassandraStore::new(cassandra_config)
                     .await
                     .map_err(CassandraTriggerStoreError::from)?;
-                let trigger_provider =
-                    CassandraTriggerStoreProvider::with_store(store, &cassandra_config.keyspace)
-                        .await?;
+                let trigger_provider = CassandraTriggerStoreProvider::with_store(
+                    store,
+                    &cassandra_config.keyspace,
+                    consumer_config.timer_linking,
+                )
+                .await?;
                 initialize_consumer(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
@@ -996,6 +1047,7 @@ impl ProsodyConsumer {
             trigger_store_config,
             consumer_config.mock,
             pipeline_config.dedup.ttl,
+            consumer_config.timer_linking,
         )
         .await?;
         let PipelineMiddlewareConfiguration {
@@ -1367,6 +1419,7 @@ where
     let cloned_managers = params.managers.clone();
     let cloned_heartbeat = heartbeat.clone();
     let max_message_count = params.config.max_uncommitted;
+    let message_linking = params.config.message_linking;
     let poll_handle = spawn_blocking(move || {
         poll(PollConfig {
             poll_interval,
@@ -1376,6 +1429,7 @@ where
             managers: &cloned_managers,
             heartbeat: &cloned_heartbeat,
             shutdown: &params.shutdown,
+            message_linking,
         });
     });
 

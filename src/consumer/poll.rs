@@ -22,9 +22,9 @@ use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info_span, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::Topic;
+use crate::consumer::SpanLink;
 use crate::consumer::decode::decode_message;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::ConsumerMessage;
@@ -73,6 +73,9 @@ where
 
     /// Flag for signaling polling loop shutdown
     pub shutdown: &'a AtomicBool,
+
+    /// Span linking strategy for message execution spans
+    pub message_linking: SpanLink,
 }
 
 /// Runs the main Kafka message polling and processing loop.
@@ -109,6 +112,7 @@ where
         managers,
         heartbeat,
         shutdown,
+        message_linking,
     } = config;
 
     // Initialize distributed tracing propagator for context extraction
@@ -180,9 +184,7 @@ where
                 topic = %decoded.value.topic,
                 key = %decoded.value.key,
             );
-            if let Err(error) = receive_span.set_parent(decoded.parent_context.clone()) {
-                debug!("failed to set parent span: {error:#}");
-            }
+            message_linking.apply(&receive_span, decoded.parent_context.clone());
 
             let consumer_message =
                 ConsumerMessage::from_decoded(decoded.value, receive_span, permit);

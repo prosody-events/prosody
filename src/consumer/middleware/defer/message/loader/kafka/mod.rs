@@ -71,7 +71,8 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tracing::field::Empty;
 use tracing::{Span, debug, error, info_span, instrument, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+use crate::consumer::SpanLink;
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
@@ -162,6 +163,9 @@ pub struct LoaderConfiguration {
     /// - Reading 100 messages: ~1-10ms (sequential, already buffered)
     /// - Bandwidth cost: ~10-100KB per 100 messages
     pub discard_threshold: i64,
+
+    /// Span linking strategy for loaded message spans.
+    pub message_linking: SpanLink,
 }
 
 /// Kafka message loader for retrieving messages by exact offset.
@@ -176,6 +180,7 @@ pub struct KafkaLoader {
     tx: mpsc::Sender<Request>,
     semaphore: Arc<Semaphore>,
     cache: Arc<Cache<(Topic, Partition, Offset), DecodedMessage>>,
+    message_linking: SpanLink,
 }
 
 impl MessageLoader for KafkaLoader {
@@ -248,6 +253,7 @@ impl KafkaLoader {
         let semaphore = Arc::new(Semaphore::new(config.max_permits));
         let cache = Arc::new(Cache::new(config.cache_size));
 
+        let message_linking = config.message_linking;
         let heartbeat = heartbeats.register("kafka loader");
         spawn_blocking(move || poll_loop(rx, &consumer, &config, &heartbeat));
 
@@ -255,6 +261,7 @@ impl KafkaLoader {
             tx,
             semaphore,
             cache,
+            message_linking,
         })
     }
 
@@ -323,7 +330,7 @@ impl KafkaLoader {
         };
 
         // Create span linked to parent context (independent of cache lifetime)
-        let load_span = create_load_span(&decoded_message, cached);
+        let load_span = create_load_span(&decoded_message, cached, self.message_linking);
 
         // Create consumer message from decoded message with new load span
         Ok(ConsumerMessage::from_decoded(
@@ -995,7 +1002,7 @@ fn unassign_partition(
 /// # Returns
 ///
 /// A tracing span linked to the parent context with message metadata recorded.
-fn create_load_span(decoded: &DecodedMessage, cached: bool) -> Span {
+fn create_load_span(decoded: &DecodedMessage, cached: bool, linking: SpanLink) -> Span {
     let span = info_span!(
         "load",
         partition = decoded.value.partition,
@@ -1005,9 +1012,7 @@ fn create_load_span(decoded: &DecodedMessage, cached: bool) -> Span {
         cached = cached,
     );
 
-    if let Err(error) = span.set_parent(decoded.parent_context.clone()) {
-        debug!("failed to set parent span: {error:#}");
-    }
+    linking.apply(&span, decoded.parent_context.clone());
 
     span
 }

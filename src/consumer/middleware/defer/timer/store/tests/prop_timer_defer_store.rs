@@ -832,12 +832,13 @@ mod memory_store_tests {
 
 #[cfg(test)]
 mod cached_store_tests {
+    use crate::consumer::SpanLink;
     use crate::consumer::middleware::defer::timer::store::CachedTimerDeferStore;
     use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
     use std::convert::Infallible;
 
     crate::timer_defer_store_tests!(async {
         let store = MemoryTimerDeferStore::new();
-        Ok::<_, Infallible>(CachedTimerDeferStore::new(store, 100))
+        Ok::<_, Infallible>(CachedTimerDeferStore::new(store, 100, SpanLink::default()))
     });
 }

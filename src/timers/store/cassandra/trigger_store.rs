@@ -17,6 +17,7 @@
 
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::consumer::SpanLink;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -37,7 +38,7 @@ use strum::VariantArray;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::coop::cooperative;
 use tracing::field::Empty;
-use tracing::{Span, debug, info_span, instrument};
+use tracing::{Span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 impl TriggerOperations for CassandraTriggerStore {
@@ -289,9 +290,7 @@ impl TriggerOperations for CassandraTriggerStore {
             {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger");
-                if let Err(error) = span.set_parent(context) {
-                    debug!("failed to set parent span: {error:#}");
-                }
+                self.timer_linking.apply(&span, context);
 
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
@@ -327,9 +326,7 @@ impl TriggerOperations for CassandraTriggerStore {
             {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger_all_types");
-                if let Err(error) = span.set_parent(context) {
-                    debug!("failed to set parent span: {error:#}");
-                }
+                self.timer_linking.apply(&span, context);
 
                 yield Trigger::new(key.into(), time, timer_type, span);
             }
@@ -477,9 +474,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     // Inline: yield trigger from cache (0 clustering query).
                     let context = self.propagator().extract(&timer.span);
                     let span = info_span!("fetch_key_trigger_inline");
-                    if let Err(error) = span.set_parent(context) {
-                        debug!("failed to set parent span: {error:#}");
-                    }
+                    self.timer_linking.apply(&span, context);
                     yield Trigger::new(key_clone.clone(), timer.time, timer_type, span);
                 }
                 TimerState::Overflow => {
@@ -503,9 +498,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     {
                         let context = self.propagator().extract(&span_map);
                         let span = info_span!("fetch_key_trigger");
-                        if let Err(error) = span.set_parent(context) {
-                            debug!("failed to set parent span: {error:#}");
-                        }
+                        self.timer_linking.apply(&span, context);
                         yield Trigger::new(key_clone.clone(), time, timer_type, span);
                     }
                 }
@@ -584,18 +577,21 @@ impl TriggerOperations for CassandraTriggerStore {
                 let mut variants_iter = TimerType::VARIANTS.iter();
                 let mut inline_next = advance_inline(
                     &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                    self.timer_linking,
                 );
 
                 // For each clustering row, flush any inline entries that
                 // sort before it.
                 while let Some(clustering) = advance_clustering(
                     &key_clone, &mut clustering_stream, self.propagator(),
+                    self.timer_linking,
                 ).await? {
                     while let Some(s) = inline_next.take() {
                         if (s.timer_type, s.time) <= (clustering.timer_type, clustering.time) {
                             yield s;
                             inline_next = advance_inline(
                                 &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                                self.timer_linking,
                             );
                         } else {
                             inline_next = Some(s);
@@ -610,6 +606,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     yield trigger;
                     inline_next = advance_inline(
                         &key_clone, &state_map, &mut variants_iter, self.propagator(),
+                        self.timer_linking,
                     );
                 }
             } else {
@@ -619,9 +616,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
                         let context = self.propagator().extract(&timer.span);
                         let span = info_span!("fetch_key_trigger_inline");
-                        if let Err(error) = span.set_parent(context) {
-                            debug!("failed to set parent span: {error:#}");
-                        }
+                        self.timer_linking.apply(&span, context);
                         yield Trigger::new(key_clone.clone(), timer.time, tt, span);
                     }
                 }
@@ -959,6 +954,7 @@ fn advance_inline<'a>(
     state_map: &HashMap<TimerType, TimerState>,
     variants_iter: &mut impl Iterator<Item = &'a TimerType>,
     propagator: &TextMapCompositePropagator,
+    linking: SpanLink,
 ) -> Option<Trigger> {
     let (&timer_type, timer) = variants_iter.find_map(|tt| {
         if let Some(TimerState::Inline(timer)) = state_map.get(tt) {
@@ -970,9 +966,7 @@ fn advance_inline<'a>(
 
     let context = propagator.extract(&timer.span);
     let span = info_span!("fetch_key_trigger_all_types_inline");
-    if let Err(error) = span.set_parent(context) {
-        debug!("failed to set parent span: {error:#}");
-    }
+    linking.apply(&span, context);
     Some(Trigger::new(key.clone(), timer.time, timer_type, span))
 }
 
@@ -993,6 +987,7 @@ pub(super) async fn advance_clustering(
     > + Unpin
          ),
     propagator: &TextMapCompositePropagator,
+    linking: SpanLink,
 ) -> Result<Option<Trigger>, CassandraTriggerStoreError> {
     while let Some((_key, time_opt, type_opt, span_opt)) =
         cooperative(stream.try_next()).await.map_err(Into::into)?
@@ -1004,9 +999,7 @@ pub(super) async fn advance_clustering(
 
         let context = propagator.extract(&span_map);
         let span = info_span!("fetch_key_trigger_all_types");
-        if let Err(error) = span.set_parent(context) {
-            debug!("failed to set parent span: {error:#}");
-        }
+        linking.apply(&span, context);
 
         return Ok(Some(Trigger::new(key.clone(), time, timer_type, span)));
     }

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::consumer::Keyed;
+use crate::consumer::SpanLink;
 use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
@@ -176,7 +177,8 @@ struct ContextTestHarness {
 
 impl ContextTestHarness {
     fn new(key: &str) -> Self {
-        let store = CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100);
+        let store =
+            CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100, SpanLink::default());
         let inner_context = KeyedMockContext::new(key);
         Self {
             store,
@@ -816,7 +818,8 @@ mod error_handling {
         timer_count: usize,
         fail_after: usize,
     ) -> color_eyre::Result<(KeyedMockContext, FailAfterNStore, Key)> {
-        let inner_store = CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100);
+        let inner_store =
+            CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100, SpanLink::default());
         let inner_context = KeyedMockContext::new("test-key");
         let key: Key = Arc::from("test-key");
 

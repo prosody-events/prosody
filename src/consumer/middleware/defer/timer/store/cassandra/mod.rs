@@ -8,6 +8,7 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::consumer::SpanLink;
 use crate::consumer::middleware::defer::error::CassandraDeferStoreError;
 use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, LazySegment};
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
@@ -47,6 +48,7 @@ pub struct CassandraTimerDeferStore {
     store: CassandraStore,
     queries: Arc<Queries>,
     segment: LazySegment<CassandraSegmentStore>,
+    timer_linking: SpanLink,
 }
 
 impl CassandraTimerDeferStore {
@@ -59,12 +61,14 @@ impl CassandraTimerDeferStore {
         topic: Topic,
         partition: Partition,
         consumer_group: ConsumerGroup,
+        timer_linking: SpanLink,
     ) -> Self {
         let segment = LazySegment::new(segment_store, topic, partition, consumer_group);
         Self {
             store,
             queries,
             segment,
+            timer_linking,
         }
     }
 
@@ -99,7 +103,7 @@ impl CassandraTimerDeferStore {
     ) -> tracing::Span {
         let context = self.propagator().extract(span_map);
         let span = info_span!("timer_defer.load", key = %key, time = %time, cached = false);
-        let _ = span.set_parent(context);
+        self.timer_linking.apply(&span, context);
         span
     }
 }
@@ -321,6 +325,7 @@ pub struct CassandraTimerDeferStoreProvider {
     store: CassandraStore,
     queries: Arc<Queries>,
     segment_store: CassandraSegmentStore,
+    timer_linking: SpanLink,
 }
 
 impl CassandraTimerDeferStoreProvider {
@@ -330,11 +335,13 @@ impl CassandraTimerDeferStoreProvider {
         store: CassandraStore,
         queries: Arc<Queries>,
         segment_store: CassandraSegmentStore,
+        timer_linking: SpanLink,
     ) -> Self {
         Self {
             store,
             queries,
             segment_store,
+            timer_linking,
         }
     }
 }
@@ -355,6 +362,7 @@ impl TimerDeferStoreProvider for CassandraTimerDeferStoreProvider {
             topic,
             partition,
             Arc::from(consumer_group),
+            self.timer_linking,
         )
     }
 }
@@ -386,6 +394,7 @@ mod tests {
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from("test-consumer-group") as ConsumerGroup,
+            SpanLink::default(),
         );
 
         // Test basic operations

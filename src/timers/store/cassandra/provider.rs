@@ -14,6 +14,7 @@
 //! [`TriggerStoreProvider`]: crate::timers::store::TriggerStoreProvider
 
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
+use crate::consumer::SpanLink;
 use crate::timers::store::Segment;
 use crate::timers::store::TriggerStoreProvider;
 use crate::timers::store::adapter::TableAdapter;
@@ -49,9 +50,11 @@ use std::sync::Arc;
 pub async fn cassandra_store(
     config: &CassandraConfiguration,
     segment: Segment,
+    timer_linking: SpanLink,
 ) -> Result<TableAdapter<CassandraTriggerStore>, CassandraTriggerStoreError> {
     let store = CassandraStore::new(config).await?;
-    let cassandra = CassandraTriggerStore::with_store(store, &config.keyspace, segment).await?;
+    let cassandra =
+        CassandraTriggerStore::with_store(store, &config.keyspace, segment, timer_linking).await?;
     Ok(TableAdapter::new(cassandra))
 }
 
@@ -64,6 +67,7 @@ pub async fn cassandra_store(
 pub struct CassandraTriggerStoreProvider {
     store: CassandraStore,
     queries: Arc<Queries>,
+    timer_linking: SpanLink,
 }
 
 impl CassandraTriggerStoreProvider {
@@ -73,9 +77,14 @@ impl CassandraTriggerStoreProvider {
     ///
     /// * `store` - Shared Cassandra session
     /// * `queries` - Shared prepared statements
+    /// * `timer_linking` - Span linking strategy for timer execution spans
     #[must_use]
-    pub fn new(store: CassandraStore, queries: Arc<Queries>) -> Self {
-        Self { store, queries }
+    pub fn new(store: CassandraStore, queries: Arc<Queries>, timer_linking: SpanLink) -> Self {
+        Self {
+            store,
+            queries,
+            timer_linking,
+        }
     }
 
     /// Creates a new provider by preparing queries against an existing
@@ -91,9 +100,14 @@ impl CassandraTriggerStoreProvider {
     pub async fn with_store(
         store: CassandraStore,
         keyspace: &str,
+        timer_linking: SpanLink,
     ) -> Result<Self, CassandraTriggerStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
-        Ok(Self { store, queries })
+        Ok(Self {
+            store,
+            queries,
+            timer_linking,
+        })
     }
 }
 
@@ -105,6 +119,7 @@ impl TriggerStoreProvider for CassandraTriggerStoreProvider {
             self.store.clone(),
             Arc::clone(&self.queries),
             segment,
+            self.timer_linking,
         ))
     }
 }

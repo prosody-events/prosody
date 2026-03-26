@@ -13,6 +13,7 @@ use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
+use crate::consumer::SpanLink;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -79,9 +80,13 @@ async fn setup_test_store_with_version(
     };
     let config = test_cassandra_config("prosody_test");
     let cassandra_store = CassandraStore::new(&config).await?;
-    let store =
-        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
-            .await?;
+    let store = CassandraTriggerStore::with_store(
+        cassandra_store,
+        &config.keyspace,
+        segment.clone(),
+        SpanLink::default(),
+    )
+    .await?;
     store.insert_segment().await?;
     Ok((store, segment_id))
 }
@@ -100,7 +105,8 @@ trigger_store_tests!(
             slab_size,
             version: SegmentVersion::V3,
         };
-        CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
+        CassandraTriggerStore::with_store(store, &config.keyspace, segment, SpanLink::default())
+            .await
     },
     crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
     |slab_size| async move {
@@ -111,7 +117,7 @@ trigger_store_tests!(
             slab_size,
             version: SegmentVersion::V3,
         };
-        cassandra_store(&config, segment).await
+        cassandra_store(&config, segment, SpanLink::default()).await
     },
     get_test_count()
 );
@@ -130,9 +136,13 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
     };
     let config = test_cassandra_config("prosody_test");
     let cassandra_store = CassandraStore::new(&config).await?;
-    let store =
-        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
-            .await?;
+    let store = CassandraTriggerStore::with_store(
+        cassandra_store,
+        &config.keyspace,
+        segment.clone(),
+        SpanLink::default(),
+    )
+    .await?;
 
     // Insert the test segment
     store.insert_segment().await?;
@@ -220,9 +230,13 @@ async fn test_simple_wrap_around() -> Result<()> {
     };
     let config = test_cassandra_config("prosody_test");
     let cassandra_store = CassandraStore::new(&config).await?;
-    let store =
-        CassandraTriggerStore::with_store(cassandra_store, &config.keyspace, segment.clone())
-            .await?;
+    let store = CassandraTriggerStore::with_store(
+        cassandra_store,
+        &config.keyspace,
+        segment.clone(),
+        SpanLink::default(),
+    )
+    .await?;
 
     store.insert_segment().await?;
 
@@ -990,7 +1004,13 @@ fn test_prop_timer_state_invariant() {
                     slab_size,
                     version: SegmentVersion::V3,
                 };
-                CassandraTriggerStore::with_store(store, &config.keyspace, segment).await
+                CassandraTriggerStore::with_store(
+                    store,
+                    &config.keyspace,
+                    segment,
+                    SpanLink::default(),
+                )
+                .await
             }
             .instrument(span.clone()),
         ) {
@@ -1037,15 +1057,25 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
 
     // Build store A with the chosen segment.
     let base_a = CassandraStore::new(&config).await?;
-    let ops_a =
-        CassandraTriggerStore::with_store(base_a, &config.keyspace, segment.clone()).await?;
+    let ops_a = CassandraTriggerStore::with_store(
+        base_a,
+        &config.keyspace,
+        segment.clone(),
+        SpanLink::default(),
+    )
+    .await?;
     ops_a.insert_segment().await?;
 
     // Build store B with the same segment but a fresh (cold) cache, sharing
     // the same prepared queries.
     let base_b = CassandraStore::new(&config).await?;
-    let ops_b =
-        CassandraTriggerStore::with_store(base_b, &config.keyspace, segment.clone()).await?;
+    let ops_b = CassandraTriggerStore::with_store(
+        base_b,
+        &config.keyspace,
+        segment.clone(),
+        SpanLink::default(),
+    )
+    .await?;
 
     let key: Key = format!("provider-test-{}", Uuid::new_v4()).into();
     let tt = TimerType::Application;

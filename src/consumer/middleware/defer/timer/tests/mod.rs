@@ -4,6 +4,7 @@
 //! verifying [`TimerDeferHandler`](super::TimerDeferHandler) behavior.
 
 use crate::consumer::DemandType;
+use crate::consumer::SpanLink;
 use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
@@ -369,7 +370,8 @@ impl TestHarness {
             .build()
             .map_err(|e| eyre!("config error: {e}"))?;
 
-        let cached_store = CachedTimerDeferStore::new(store.clone(), config.cache_size);
+        let cached_store =
+            CachedTimerDeferStore::new(store.clone(), config.cache_size, SpanLink::default());
 
         let telemetry = Telemetry::new();
         let sender = telemetry.partition_sender(topic, partition);
