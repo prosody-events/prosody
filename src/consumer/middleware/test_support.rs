@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use crate::consumer::event_context::{EventContext, TerminationSignals};
+use crate::consumer::partition::ShutdownPhase;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 
@@ -50,9 +51,9 @@ pub enum TimerOperation {
 #[derive(Clone)]
 pub struct MockEventContext {
     /// Partition/consumer shutdown signal (sender for mutations).
-    shutdown_tx: Arc<watch::Sender<bool>>,
+    shutdown_tx: Arc<watch::Sender<ShutdownPhase>>,
     /// Partition/consumer shutdown signal (receiver for queries).
-    shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<ShutdownPhase>,
 
     /// Message-level cancellation signal (sender for mutations).
     cancel_tx: Arc<watch::Sender<bool>>,
@@ -73,7 +74,7 @@ impl MockEventContext {
     /// Create a new mock context with default state (no signals active).
     #[must_use]
     pub fn new() -> Self {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         Self {
             shutdown_tx: Arc::new(shutdown_tx),
@@ -89,7 +90,7 @@ impl MockEventContext {
     /// Used for testing early-exit behavior in middleware.
     #[must_use]
     pub fn with_shutdown(self) -> Self {
-        self.shutdown_tx.send_replace(true);
+        self.shutdown_tx.send_replace(ShutdownPhase::Cancelling);
         self
     }
 
@@ -106,7 +107,7 @@ impl MockEventContext {
 
     /// Trigger partition/consumer shutdown signal.
     pub fn request_shutdown(&self) {
-        self.shutdown_tx.send_replace(true);
+        self.shutdown_tx.send_replace(ShutdownPhase::Cancelling);
     }
 
     /// Trigger message-level cancellation signal.
@@ -168,7 +169,7 @@ impl MockEventContext {
 
 impl TerminationSignals for MockEventContext {
     fn is_shutdown(&self) -> bool {
-        *self.shutdown_rx.borrow()
+        *self.shutdown_rx.borrow() >= ShutdownPhase::Cancelling
     }
 
     fn is_message_cancelled(&self) -> bool {
@@ -178,7 +179,7 @@ impl TerminationSignals for MockEventContext {
     fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
         let mut rx = self.shutdown_rx.clone();
         async move {
-            let _ = rx.wait_for(|&v| v).await;
+            let _ = rx.wait_for(|v| *v >= ShutdownPhase::Cancelling).await;
         }
     }
 
@@ -194,7 +195,7 @@ impl EventContext for MockEventContext {
     type Error = Infallible;
 
     fn should_cancel(&self) -> bool {
-        *self.shutdown_rx.borrow() || *self.cancel_rx.borrow()
+        *self.shutdown_rx.borrow() >= ShutdownPhase::Cancelling || *self.cancel_rx.borrow()
     }
 
     fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -202,7 +203,7 @@ impl EventContext for MockEventContext {
         let mut cancel_rx = self.cancel_rx.clone();
         async move {
             tokio::select! {
-                _ = shutdown_rx.wait_for(|&v| v) => {}
+                _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Cancelling) => {}
                 _ = cancel_rx.wait_for(|&v| v) => {}
             }
         }

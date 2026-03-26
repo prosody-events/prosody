@@ -17,6 +17,7 @@
 //! and provides at-least-once delivery semantics for timer events.
 
 use crate::Key;
+use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::active::TimerState;
@@ -103,7 +104,7 @@ where
     /// * `heartbeats` - Registry for monitoring timer loader and scheduler
     ///   liveness.
     /// * `shutdown_rx` - Watch channel signaling partition shutdown; the slab
-    ///   loader exits when this becomes `true`.
+    ///   loader exits at `>= ShutdownPhase::Draining`.
     /// * `semaphores` - Per-type semaphores bounding in-flight timer events
     ///   across all partitions; the timer stream blocks when all permits for
     ///   the trigger's type are held and terminates if the semaphore is closed.
@@ -122,7 +123,7 @@ where
     pub async fn new(
         config: TimerManagerConfig<T>,
         heartbeats: HeartbeatRegistry,
-        shutdown_rx: watch::Receiver<bool>,
+        shutdown_rx: watch::Receiver<ShutdownPhase>,
         semaphores: Arc<TimerSemaphores>,
     ) -> Result<(impl Stream<Item = PendingTimer<T>>, Self), TimerManagerError<T::Error>> {
         // Ensure the segment exists in persistent storage.
@@ -887,15 +888,16 @@ mod tests {
 
     /// Helper function to set up a timer manager for testing.
     ///
-    /// Returns `(stream, manager, _shutdown_tx)`. The caller holds
-    /// `_shutdown_tx` and can send `true` to stop the background slab loader.
+    /// Returns `(stream, manager, shutdown_tx)`. The caller holds
+    /// `shutdown_tx` and can send `ShutdownPhase::Draining` to stop the
+    /// background slab loader.
     async fn setup_timer_manager() -> Result<(
         impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
-        watch::Sender<bool>,
+        watch::Sender<ShutdownPhase>,
     )> {
         let store = memory_store(test_segment());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let telemetry = Telemetry::new();
 
         let config = TimerManagerConfig {
@@ -950,7 +952,7 @@ mod tests {
         let store = memory_store(segment.clone());
         let telemetry = Telemetry::new();
 
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let config = TimerManagerConfig {
             name: "test-creation".to_owned(),
             store,

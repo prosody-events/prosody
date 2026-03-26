@@ -41,7 +41,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task::coop::cooperative;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, debug_span, error, info_span, instrument};
 use uuid::Uuid;
 
@@ -51,6 +51,35 @@ mod util;
 
 #[cfg(test)]
 mod test;
+
+/// Grace period numerator: handlers run uninterrupted for this fraction of
+/// `shutdown_timeout` before the abort signal fires.
+const GRACE_PERIOD_NUMERATOR: u32 = 4;
+/// Grace period denominator.
+const GRACE_PERIOD_DENOMINATOR: u32 = 5;
+
+/// Lifecycle phase of a partition, used to coordinate shutdown across all
+/// partition subsystems.
+///
+/// Phases advance monotonically in declaration order, which also defines their
+/// [`PartialOrd`] / [`Ord`] ordering. Consumers react at different thresholds:
+///
+/// - `>= Draining` — stop accepting new work
+/// - `>= Cancelling` — abort in-flight handlers
+/// - `>= Terminating` — hard stop, drop everything
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ShutdownPhase {
+    /// Normal operation.
+    #[default]
+    Running,
+    /// Dispatch halted; in-flight handlers continue uninterrupted.
+    Draining,
+    /// Abort signal sent to handlers; operations short-circuit with a
+    /// `Shutdown` error.
+    Cancelling,
+    /// Hard stop — drain loop exits, remaining queued work is dropped.
+    Terminating,
+}
 
 /// Information about the Kafka partition being processed.
 struct PartitionInfo {
@@ -71,8 +100,8 @@ struct PartitionContext {
     message_rx: Receiver<ConsumerMessage>,
     /// Registry for monitoring processing and timer heartbeats.
     heartbeats: HeartbeatRegistry,
-    /// Channel receiving shutdown signal.
-    shutdown_rx: watch::Receiver<bool>,
+    /// Channel receiving shutdown phase transitions.
+    shutdown_rx: watch::Receiver<ShutdownPhase>,
 }
 
 /// Configuration settings for a partition manager.
@@ -131,6 +160,8 @@ pub struct PartitionConfiguration<P> {
 #[derive(Educe)]
 #[educe(Debug)]
 pub struct PartitionManager {
+    /// The Kafka topic this partition belongs to
+    topic: Topic,
     /// The partition number this manager handles
     partition: Partition,
 
@@ -146,9 +177,12 @@ pub struct PartitionManager {
     #[educe(Debug(ignore))]
     heartbeats: HeartbeatRegistry,
 
-    /// Signals shutdown to message handlers
+    /// Drives partition shutdown phase transitions
     #[educe(Debug(ignore))]
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: watch::Sender<ShutdownPhase>,
+
+    /// Total time budget for shutdown phase transitions
+    shutdown_timeout: Duration,
 
     /// Handle for the message processing task
     #[educe(Debug(ignore))]
@@ -191,7 +225,8 @@ impl PartitionManager {
         let heartbeats =
             HeartbeatRegistry::new(format!("{topic}:{partition}"), config.stall_threshold);
         let (message_tx, message_rx) = channel(config.buffer_size);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+        let shutdown_timeout = config.shutdown_timeout;
 
         // Spawn the background task for message handling
         let partition_info = PartitionInfo { topic, partition };
@@ -204,11 +239,13 @@ impl PartitionManager {
         let handle = spawn(handle_messages(config, partition_info, handler, context));
 
         Self {
+            topic,
             partition,
             offsets,
             message_tx,
             heartbeats,
             shutdown_tx,
+            shutdown_timeout,
             handle,
         }
     }
@@ -302,17 +339,38 @@ impl PartitionManager {
         // Close the message channel to stop accepting new messages
         drop(self.message_tx);
 
-        // Signal handlers to shut down
-        if let Err(error) = self.shutdown_tx.send(true) {
-            debug!(
-                partition = self.partition,
-                "did not send shutdown signal to handlers: {error:#}"
-            );
+        // Advance to Draining immediately, then schedule Cancelling and
+        // Terminating at 80% and 100% of shutdown_timeout respectively.
+        // If send returns Err, all receivers have dropped (partition already
+        // exited) — no point spawning the phase task.
+        if self.shutdown_tx.send(ShutdownPhase::Draining).is_ok() {
+            debug!(topic = %self.topic, partition = self.partition, phase = "draining", "shutdown phase transition");
+
+            let now = Instant::now();
+            let grace = self.shutdown_timeout * GRACE_PERIOD_NUMERATOR / GRACE_PERIOD_DENOMINATOR;
+            let cancelling_at = now + grace;
+            let terminating_at = now + self.shutdown_timeout;
+            let topic = self.topic;
+            let partition = self.partition;
+            let shutdown_tx = self.shutdown_tx;
+
+            spawn(async move {
+                sleep_until(cancelling_at).await;
+                if shutdown_tx.send(ShutdownPhase::Cancelling).is_err() {
+                    return;
+                }
+                debug!(topic = %topic, partition, phase = "cancelling", "shutdown phase transition");
+
+                sleep_until(terminating_at).await;
+                let _ = shutdown_tx.send(ShutdownPhase::Terminating);
+                debug!(topic = %topic, partition, phase = "terminating", "shutdown phase transition");
+            });
         }
 
         // Wait for message processing to complete
         if let Err(error) = self.handle.await {
             error!(
+                topic = %self.topic,
                 partition = self.partition,
                 "error occurred while shutting down partition: {error:#}"
             );
@@ -336,7 +394,7 @@ struct TimerInitContext<'a> {
     timer_semaphores: &'a Arc<TimerSemaphores>,
     partition_info: &'a PartitionInfo,
     heartbeats: &'a HeartbeatRegistry,
-    shutdown_rx: &'a watch::Receiver<bool>,
+    shutdown_rx: &'a watch::Receiver<ShutdownPhase>,
 }
 
 async fn init_timer_manager<S>(
@@ -347,7 +405,7 @@ where
     S: TriggerStore,
 {
     loop {
-        if *ctx.shutdown_rx.borrow() {
+        if *ctx.shutdown_rx.borrow() >= ShutdownPhase::Draining {
             return None;
         }
 
@@ -383,7 +441,6 @@ where
 struct PartitionParams {
     group_id: Arc<str>,
     allowed_events: Option<AhoCorasick>,
-    shutdown_timeout: Duration,
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     name: String,
@@ -405,7 +462,6 @@ async fn handle_messages<T, P>(
     let PartitionConfiguration {
         group_id,
         allowed_events,
-        shutdown_timeout,
         trigger_provider,
         timer_slab_size,
         timer_semaphores,
@@ -427,7 +483,6 @@ async fn handle_messages<T, P>(
     let params = PartitionParams {
         group_id,
         allowed_events,
-        shutdown_timeout,
         timer_semaphores,
         telemetry_sender,
         name,
@@ -450,7 +505,6 @@ async fn run_partition<T, S>(
     let PartitionParams {
         group_id,
         allowed_events,
-        shutdown_timeout,
         timer_semaphores,
         telemetry_sender,
         name,
@@ -503,7 +557,6 @@ async fn run_partition<T, S>(
             select(message_events, timer_events),
             heartbeats.register("event processor"),
             shutdown_rx.clone(),
-            shutdown_timeout,
         )
         .await;
 
@@ -514,7 +567,7 @@ async fn run_partition<T, S>(
 async fn process_event<T, S>(
     event: UncommittedEvent<S>,
     handler: &T,
-    shutdown_rx: &watch::Receiver<bool>,
+    shutdown_rx: &watch::Receiver<ShutdownPhase>,
     timer_manager: &TimerManager<S>,
 ) where
     T: EventHandler,

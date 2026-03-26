@@ -6,18 +6,22 @@
 //! and complete message processing.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::consumer::Keyed;
+use crate::consumer::partition::ShutdownPhase;
 use crate::consumer::partition::keyed::KeyManager;
 use crate::heartbeat::Heartbeat;
 use crate::test_util::TEST_RUNTIME;
 use ahash::HashMapExt;
+use futures::StreamExt;
 use futures::stream::iter;
+use futures::stream::pending;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use scc::{HashMap, HashSet};
+use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
@@ -73,7 +77,7 @@ async fn prevents_concurrent_key_execution_impl(
 ) -> TestResult {
     let failed = Arc::new(AtomicBool::new(false));
     let active_keys = Arc::new(HashSet::with_capacity(messages.len()));
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
 
     // Define the message processing function
     let process_fn = |key: u8| {
@@ -99,7 +103,6 @@ async fn prevents_concurrent_key_execution_impl(
             iter(messages),
             Heartbeat::new("test", Duration::from_secs(30)),
             shutdown_rx,
-            Duration::from_millis(100),
         )
         .await;
 
@@ -123,7 +126,7 @@ async fn prevents_concurrent_key_execution_impl(
 /// A `TestResult` indicating whether the test passed or failed.
 async fn processes_messages_in_order_impl(Messages(messages): Messages) -> TestResult {
     let processed: Arc<HashMap<u8, Vec<u16>>> = Arc::new(HashMap::new());
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
 
     KeyManager::new(|(key, value)| {
         let processed = processed.clone();
@@ -135,7 +138,6 @@ async fn processes_messages_in_order_impl(Messages(messages): Messages) -> TestR
         iter(messages.clone()),
         Heartbeat::new("test", Duration::from_secs(30)),
         shutdown_rx,
-        Duration::from_millis(100),
     )
     .await;
 
@@ -160,6 +162,99 @@ async fn processes_messages_in_order_impl(Messages(messages): Messages) -> TestR
     }
 
     TestResult::passed()
+}
+
+/// Verifies that in-flight handlers are allowed to complete during the grace
+/// period between `Draining` and `Terminating`.
+#[tokio::test]
+async fn grace_period_allows_inflight_to_complete() {
+    let started = Arc::new(Notify::new());
+    let completed = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+
+    let started_clone = started.clone();
+    let completed_clone = completed.clone();
+
+    let manager = KeyManager::new(move |_key: u8| {
+        let started = started_clone.clone();
+        let completed = completed_clone.clone();
+        async move {
+            started.notify_one();
+            sleep(Duration::from_millis(50)).await;
+            completed.store(true, Ordering::Release);
+        }
+    });
+
+    // Stream yields one message then stays pending (simulates a live stream)
+    let messages = iter([1u8]).chain(pending::<u8>());
+
+    let started_wait = started.clone();
+    tokio::spawn(async move {
+        started_wait.notified().await;
+        let _ = shutdown_tx.send(ShutdownPhase::Draining);
+        sleep(Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(ShutdownPhase::Terminating);
+    });
+
+    manager
+        .process_messages(
+            messages,
+            Heartbeat::new("test", Duration::from_secs(30)),
+            shutdown_rx,
+        )
+        .await;
+
+    assert!(
+        completed.load(Ordering::Acquire),
+        "in-flight handler should complete during grace period"
+    );
+}
+
+/// Verifies that queued messages for a busy key are not started after draining
+/// begins.
+#[tokio::test]
+async fn drain_prevents_queued_work_from_starting() {
+    let started = Arc::new(Notify::new());
+    let count = Arc::new(AtomicUsize::new(0));
+    let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+
+    let started_clone = started.clone();
+    let count_clone = count.clone();
+
+    let manager = KeyManager::new(move |_key: u8| {
+        let started = started_clone.clone();
+        let count = count_clone.clone();
+        async move {
+            count.fetch_add(1, Ordering::AcqRel);
+            started.notify_one();
+            sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // Two messages with the same key — second will be queued while first runs
+    let messages = iter([1u8, 1u8]).chain(pending::<u8>());
+
+    let started_wait = started.clone();
+    tokio::spawn(async move {
+        started_wait.notified().await;
+        let _ = shutdown_tx.send(ShutdownPhase::Draining);
+        sleep(Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(ShutdownPhase::Terminating);
+    });
+
+    manager
+        .process_messages(
+            messages,
+            Heartbeat::new("test", Duration::from_secs(30)),
+            shutdown_rx,
+        )
+        .await;
+
+    assert_eq!(
+        count.load(Ordering::Acquire),
+        1,
+        "queued message should not start after draining begins"
+    );
 }
 
 impl Arbitrary for Messages {

@@ -417,6 +417,7 @@ mod tests {
     use super::*;
     use crate::Topic;
     use crate::consumer::Uncommitted;
+    use crate::consumer::partition::ShutdownPhase;
     use crate::heartbeat::HeartbeatRegistry;
     use crate::telemetry::Telemetry;
     use crate::timers::TimerSemaphores;
@@ -455,15 +456,16 @@ mod tests {
 
     /// Helper function to set up a timer manager for testing.
     ///
-    /// Returns `(stream, manager, _shutdown_tx)`. The caller holds
-    /// `_shutdown_tx` and can send `true` to stop the background slab loader.
+    /// Returns `(stream, manager, shutdown_tx)`. The caller holds
+    /// `shutdown_tx` and can send `ShutdownPhase::Draining` to stop the
+    /// background slab loader.
     async fn setup_timer_manager() -> Result<(
         impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,
-        watch::Sender<bool>,
+        watch::Sender<ShutdownPhase>,
     )> {
         let store = memory_store(test_segment());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let telemetry = Telemetry::new();
 
         let config = TimerManagerConfig {

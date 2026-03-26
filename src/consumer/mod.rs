@@ -200,7 +200,7 @@ mod extractor;
 mod kafka_context;
 pub mod message;
 pub mod middleware;
-mod partition;
+pub(crate) mod partition;
 mod poll;
 mod probes;
 pub mod storage;

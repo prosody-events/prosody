@@ -11,6 +11,7 @@
 //! - `DynEventContext`: Object-safe wrapper around any `EventContext`.
 
 use crate::Key;
+use crate::consumer::partition::ShutdownPhase;
 use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
@@ -253,7 +254,7 @@ struct Inner<T> {
     key: Key,
 
     #[educe(Debug(ignore))]
-    shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<ShutdownPhase>,
 
     #[educe(Debug(ignore))]
     message_cancel_tx: watch::Sender<bool>,
@@ -274,12 +275,12 @@ where
     /// # Arguments
     ///
     /// * `key` – The message key for affinity and timer scoping.
-    /// * `shutdown_rx` – A `watch::Receiver<bool>` that signals shutdown when
-    ///   set.
+    /// * `shutdown_rx` – Watch channel signaling partition shutdown; operations
+    ///   short-circuit at `>= ShutdownPhase::Cancelling`.
     /// * `timers` – The `TimerManager<T>` instance.
     pub(crate) fn new(
         key: Key,
-        shutdown_rx: watch::Receiver<bool>,
+        shutdown_rx: watch::Receiver<ShutdownPhase>,
         timers: TimerManager<T>,
     ) -> Self {
         let (message_cancel_tx, message_cancel_rx) = watch::channel(false);
@@ -317,7 +318,7 @@ where
         };
 
         // Short-circuit before constructing the future
-        if *inner.shutdown_rx.borrow() {
+        if *inner.shutdown_rx.borrow() >= ShutdownPhase::Cancelling {
             return Err(TimerManagerError::Shutdown);
         }
         if *inner.message_cancel_rx.borrow() {
@@ -331,7 +332,7 @@ where
 
         select! {
             biased;
-            _ = shutdown_rx.wait_for(|v| *v) => Err(TimerManagerError::Shutdown),
+            _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Cancelling) => Err(TimerManagerError::Shutdown),
             _ = cancel_rx.wait_for(|v| *v) => Err(TimerManagerError::Cancelled),
             result = operation(inner) => result,
         }
@@ -350,7 +351,8 @@ where
             return true;
         };
 
-        *inner.message_cancel_rx.borrow() | *inner.shutdown_rx.borrow()
+        *inner.message_cancel_rx.borrow()
+            || *inner.shutdown_rx.borrow() >= ShutdownPhase::Cancelling
     }
 
     fn on_cancel(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -365,7 +367,7 @@ where
         async move {
             select! {
                 biased;
-                _ = shutdown_rx.wait_for(|is_shutdown| *is_shutdown) => {}
+                _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Cancelling) => {}
                 _ = message_cancel_rx.wait_for(|is_cancelled| *is_cancelled) => {}
             }
         }
@@ -455,7 +457,7 @@ where
             return ready(Err(TimerManagerError::InvalidContext)).left_future();
         };
 
-        if *inner.shutdown_rx.borrow() {
+        if *inner.shutdown_rx.borrow() >= ShutdownPhase::Cancelling {
             return ready(Err(TimerManagerError::Shutdown)).left_future();
         }
         if *inner.message_cancel_rx.borrow() {
@@ -469,7 +471,7 @@ where
         async move {
             select! {
                 biased;
-                _ = shutdown_rx.wait_for(|v| *v) => Err(TimerManagerError::Shutdown),
+                _ = shutdown_rx.wait_for(|v| *v >= ShutdownPhase::Cancelling) => Err(TimerManagerError::Shutdown),
                 _ = cancel_rx.wait_for(|v| *v) => Err(TimerManagerError::Cancelled),
                 result = inner.timers.scheduled_times(&inner.key, timer_type) => result,
             }
@@ -487,7 +489,7 @@ where
         let Some(inner) = inner.as_ref() else {
             return true;
         };
-        *inner.shutdown_rx.borrow()
+        *inner.shutdown_rx.borrow() >= ShutdownPhase::Cancelling
     }
 
     fn is_message_cancelled(&self) -> bool {
@@ -506,7 +508,9 @@ where
 
         let mut shutdown_rx = inner.shutdown_rx.clone();
         async move {
-            let _ = shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await;
+            let _ = shutdown_rx
+                .wait_for(|v| *v >= ShutdownPhase::Cancelling)
+                .await;
         }
         .right_future()
     }
