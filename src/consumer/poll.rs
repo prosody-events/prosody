@@ -187,7 +187,9 @@ where
             message_linking.apply(&receive_span, decoded.parent_context.clone());
 
             let consumer_message =
-                ConsumerMessage::from_decoded(decoded.value, receive_span, permit);
+                ConsumerMessage::from_decoded(decoded.value, receive_span, permit)
+                    .with_message_linking(message_linking)
+                    .with_link_context(decoded.parent_context.clone());
             dispatch_with_retry(consumer_message, poll_interval, managers);
         }
 

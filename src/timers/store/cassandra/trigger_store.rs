@@ -18,6 +18,7 @@
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::SpanLink;
+use crate::timers::TriggerLinking;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -290,9 +291,11 @@ impl TriggerOperations for CassandraTriggerStore {
             {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger");
-                self.timer_linking.apply(&span, context);
+                self.timer_linking.apply(&span, context.clone());
 
-                yield Trigger::new(key.into(), time, timer_type, span);
+                yield Trigger::new(key.into(), time, timer_type, span)
+                    .with_linking(TriggerLinking::from(self.timer_linking))
+                    .with_link_context(context);
             }
         }
     }
@@ -326,9 +329,11 @@ impl TriggerOperations for CassandraTriggerStore {
             {
                 let context = self.propagator().extract(&span_map);
                 let span = info_span!("fetch_slab_trigger_all_types");
-                self.timer_linking.apply(&span, context);
+                self.timer_linking.apply(&span, context.clone());
 
-                yield Trigger::new(key.into(), time, timer_type, span);
+                yield Trigger::new(key.into(), time, timer_type, span)
+                    .with_linking(TriggerLinking::from(self.timer_linking))
+                    .with_link_context(context);
             }
         }
     }
@@ -474,8 +479,10 @@ impl TriggerOperations for CassandraTriggerStore {
                     // Inline: yield trigger from cache (0 clustering query).
                     let context = self.propagator().extract(&timer.span);
                     let span = info_span!("fetch_key_trigger_inline");
-                    self.timer_linking.apply(&span, context);
-                    yield Trigger::new(key_clone.clone(), timer.time, timer_type, span);
+                    self.timer_linking.apply(&span, context.clone());
+                    yield Trigger::new(key_clone.clone(), timer.time, timer_type, span)
+                        .with_linking(TriggerLinking::from(self.timer_linking))
+                        .with_link_context(context);
                 }
                 TimerState::Overflow => {
                     // Overflow: scan clustering rows.
@@ -498,8 +505,10 @@ impl TriggerOperations for CassandraTriggerStore {
                     {
                         let context = self.propagator().extract(&span_map);
                         let span = info_span!("fetch_key_trigger");
-                        self.timer_linking.apply(&span, context);
-                        yield Trigger::new(key_clone.clone(), time, timer_type, span);
+                        self.timer_linking.apply(&span, context.clone());
+                        yield Trigger::new(key_clone.clone(), time, timer_type, span)
+                            .with_linking(TriggerLinking::from(self.timer_linking))
+                            .with_link_context(context);
                     }
                 }
                 TimerState::Absent => {
@@ -616,8 +625,10 @@ impl TriggerOperations for CassandraTriggerStore {
                     if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
                         let context = self.propagator().extract(&timer.span);
                         let span = info_span!("fetch_key_trigger_inline");
-                        self.timer_linking.apply(&span, context);
-                        yield Trigger::new(key_clone.clone(), timer.time, tt, span);
+                        self.timer_linking.apply(&span, context.clone());
+                        yield Trigger::new(key_clone.clone(), timer.time, tt, span)
+                            .with_linking(TriggerLinking::from(self.timer_linking))
+                            .with_link_context(context);
                     }
                 }
             }
@@ -966,8 +977,12 @@ fn advance_inline<'a>(
 
     let context = propagator.extract(&timer.span);
     let span = info_span!("fetch_key_trigger_all_types_inline");
-    linking.apply(&span, context);
-    Some(Trigger::new(key.clone(), timer.time, timer_type, span))
+    linking.apply(&span, context.clone());
+    Some(
+        Trigger::new(key.clone(), timer.time, timer_type, span)
+            .with_linking(TriggerLinking::from(linking))
+            .with_link_context(context),
+    )
 }
 
 /// Returns the next clustering trigger, skipping NULL static-only rows.
@@ -999,9 +1014,22 @@ pub(super) async fn advance_clustering(
 
         let context = propagator.extract(&span_map);
         let span = info_span!("fetch_key_trigger_all_types");
-        linking.apply(&span, context);
+        linking.apply(&span, context.clone());
 
-        return Ok(Some(Trigger::new(key.clone(), time, timer_type, span)));
+        return Ok(Some(
+            Trigger::new(key.clone(), time, timer_type, span)
+                .with_linking(TriggerLinking::from(linking))
+                .with_link_context(context),
+        ));
     }
     Ok(None)
+}
+
+impl From<SpanLink> for TriggerLinking {
+    fn from(linking: SpanLink) -> Self {
+        match linking {
+            SpanLink::SetParent => Self::SetParent,
+            SpanLink::AddLink => Self::AddLink,
+        }
+    }
 }

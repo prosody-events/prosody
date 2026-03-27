@@ -56,11 +56,13 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::ParseError;
 use arc_swap::ArcSwap;
 use educe::Educe;
+use opentelemetry::Context as OtelContext;
 use serde::Serialize;
 use std::sync::Arc;
 use strum::EnumCount;
 use tokio::sync::Semaphore;
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 mod active;
 pub mod datetime;
@@ -127,12 +129,23 @@ impl TryFrom<i8> for TimerType {
 /// One semaphore per [`TimerType`] variant, indexed by `timer_type as usize`.
 pub type TimerSemaphores = [Arc<Semaphore>; TimerType::COUNT];
 
+/// Controls how a language-client execution span relates to the `OTel` context
+/// that caused the timer to be scheduled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriggerLinking {
+    /// The execution span is a direct child of the schedule span.
+    #[default]
+    SetParent,
+    /// The execution span starts a new trace linked to the schedule span.
+    AddLink,
+}
+
 /// Scheduled timer event containing execution metadata.
 ///
 /// Contains the key, execution time, timer type, and tracing context for a
-/// timer that will fire at a specific moment. The `span` field is excluded from
-/// equality and ordering comparisons to ensure consistent behavior across
-/// different tracing contexts.
+/// timer that will fire at a specific moment. The `span` and `OTel` context
+/// fields are excluded from equality and ordering comparisons to ensure
+/// consistent behavior across different tracing contexts.
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {
@@ -148,6 +161,17 @@ pub struct Trigger {
     /// Tracing span for distributed observability context.
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
     span: Arc<ArcSwap<Span>>,
+
+    /// How execution spans should relate to the schedule context.
+    #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
+    linking: TriggerLinking,
+
+    /// The `OTel` context of the span that scheduled this timer. Used by
+    /// language-client handlers to build the carrier with the correct parent
+    /// or link target. `None` for in-memory triggers where `span()` already
+    /// IS the schedule span.
+    #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
+    link_context: Option<OtelContext>,
 }
 
 impl Trigger {
@@ -174,7 +198,39 @@ impl Trigger {
             time,
             timer_type,
             span: ArcSwap::from_pointee(span).into(),
+            linking: TriggerLinking::default(),
+            link_context: None,
         }
+    }
+
+    /// Sets the span linking mode for this trigger (builder pattern).
+    #[must_use]
+    pub fn with_linking(mut self, linking: TriggerLinking) -> Self {
+        self.linking = linking;
+        self
+    }
+
+    /// Sets the schedule `OTel` context used to build the carrier (builder
+    /// pattern).
+    #[must_use]
+    pub fn with_link_context(mut self, context: OtelContext) -> Self {
+        self.link_context = Some(context);
+        self
+    }
+
+    /// Returns the span linking mode.
+    #[must_use]
+    pub fn linking(&self) -> TriggerLinking {
+        self.linking
+    }
+
+    /// Returns the schedule `OTel` context, falling back to `span().context()`
+    /// for in-memory triggers where the trigger span IS the schedule span.
+    #[must_use]
+    pub fn link_context_or_span_context(&self) -> OtelContext {
+        self.link_context
+            .clone()
+            .unwrap_or_else(|| self.span().context())
     }
 
     /// Create a test trigger with minimal dependencies.
