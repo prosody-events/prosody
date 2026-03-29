@@ -14,12 +14,10 @@
 use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
 use educe::Educe;
-use opentelemetry::Context as OtelContext;
 use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Span, debug};
 
-use crate::consumer::SpanLink;
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::PendingTimer;
@@ -231,11 +229,6 @@ impl ProcessScope for UncommittedMessage {
 pub struct ConsumerMessage {
     value: Arc<ConsumerMessageValue>,
     processing_state: Arc<ArcSwapOption<ProcessingState>>,
-    /// How execution spans should relate to the incoming message context.
-    message_linking: SpanLink,
-    /// The producer's `OTel` context, injected by the caller via the JS
-    /// carrier.
-    link_context: OtelContext,
 }
 
 #[derive(Educe)]
@@ -311,8 +304,6 @@ impl ConsumerMessage {
         Self {
             value,
             processing_state,
-            message_linking: SpanLink::default(),
-            link_context: OtelContext::default(),
         }
     }
 
@@ -337,36 +328,7 @@ impl ConsumerMessage {
         Self {
             value,
             processing_state,
-            message_linking: SpanLink::default(),
-            link_context: OtelContext::default(),
         }
-    }
-
-    /// Sets the span linking mode (builder pattern).
-    #[must_use]
-    pub fn with_message_linking(mut self, linking: SpanLink) -> Self {
-        self.message_linking = linking;
-        self
-    }
-
-    /// Sets the producer `OTel` context used to build the carrier (builder
-    /// pattern).
-    #[must_use]
-    pub fn with_link_context(mut self, context: OtelContext) -> Self {
-        self.link_context = context;
-        self
-    }
-
-    /// Returns the span linking mode for this message.
-    #[must_use]
-    pub fn message_linking(&self) -> SpanLink {
-        self.message_linking
-    }
-
-    /// Returns the producer's `OTel` context.
-    #[must_use]
-    pub fn link_context(&self) -> &OtelContext {
-        &self.link_context
     }
 
     /// Returns the optional source system identifier.

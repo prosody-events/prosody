@@ -5,11 +5,11 @@
 
 use super::*;
 use crate::consumer::Keyed;
-use crate::consumer::SpanLink;
 use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
+use crate::otel::SpanRelation;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::tracing::init_test_logging;
@@ -178,7 +178,7 @@ struct ContextTestHarness {
 impl ContextTestHarness {
     fn new(key: &str) -> Self {
         let store =
-            CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100, SpanLink::default());
+            CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100, SpanRelation::default());
         let inner_context = KeyedMockContext::new(key);
         Self {
             store,
@@ -819,7 +819,7 @@ mod error_handling {
         fail_after: usize,
     ) -> color_eyre::Result<(KeyedMockContext, FailAfterNStore, Key)> {
         let inner_store =
-            CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100, SpanLink::default());
+            CachedTimerDeferStore::new(MemoryTimerDeferStore::new(), 100, SpanRelation::default());
         let inner_context = KeyedMockContext::new("test-key");
         let key: Key = Arc::from("test-key");
 

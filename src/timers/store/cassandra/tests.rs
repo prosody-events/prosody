@@ -13,7 +13,7 @@ use super::{CassandraConfiguration, CassandraTriggerStore, cassandra_store};
 use super::{InlineTimer, TimerState};
 use crate::Key;
 use crate::cassandra::CassandraStore;
-use crate::consumer::SpanLink;
+use crate::otel::SpanRelation;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -84,7 +84,7 @@ async fn setup_test_store_with_version(
         cassandra_store,
         &config.keyspace,
         segment.clone(),
-        SpanLink::default(),
+        SpanRelation::default(),
     )
     .await?;
     store.insert_segment().await?;
@@ -105,7 +105,7 @@ trigger_store_tests!(
             slab_size,
             version: SegmentVersion::V3,
         };
-        CassandraTriggerStore::with_store(store, &config.keyspace, segment, SpanLink::default())
+        CassandraTriggerStore::with_store(store, &config.keyspace, segment, SpanRelation::default())
             .await
     },
     crate::timers::store::adapter::TableAdapter<CassandraTriggerStore>,
@@ -117,7 +117,7 @@ trigger_store_tests!(
             slab_size,
             version: SegmentVersion::V3,
         };
-        cassandra_store(&config, segment, SpanLink::default()).await
+        cassandra_store(&config, segment, SpanRelation::default()).await
     },
     get_test_count()
 );
@@ -140,7 +140,7 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
         cassandra_store,
         &config.keyspace,
         segment.clone(),
-        SpanLink::default(),
+        SpanRelation::default(),
     )
     .await?;
 
@@ -234,7 +234,7 @@ async fn test_simple_wrap_around() -> Result<()> {
         cassandra_store,
         &config.keyspace,
         segment.clone(),
-        SpanLink::default(),
+        SpanRelation::default(),
     )
     .await?;
 
@@ -1008,7 +1008,7 @@ fn test_prop_timer_state_invariant() {
                     store,
                     &config.keyspace,
                     segment,
-                    SpanLink::default(),
+                    SpanRelation::default(),
                 )
                 .await
             }
@@ -1061,7 +1061,7 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
         base_a,
         &config.keyspace,
         segment.clone(),
-        SpanLink::default(),
+        SpanRelation::default(),
     )
     .await?;
     ops_a.insert_segment().await?;
@@ -1073,7 +1073,7 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
         base_b,
         &config.keyspace,
         segment.clone(),
-        SpanLink::default(),
+        SpanRelation::default(),
     )
     .await?;
 

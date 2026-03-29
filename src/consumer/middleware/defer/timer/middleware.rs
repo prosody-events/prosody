@@ -6,10 +6,10 @@
 use super::handler::TimerDeferHandler;
 use super::store::{CachedTimerDeferStore, TimerDeferStoreProvider};
 use crate::consumer::ConsumerConfiguration;
-use crate::consumer::SpanLink;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
+use crate::otel::SpanRelation;
 use crate::telemetry::Telemetry;
 use crate::{ConsumerGroup, Partition, Topic};
 use std::sync::Arc;
@@ -34,7 +34,7 @@ where
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
-    timer_linking: SpanLink,
+    timer_relation: SpanRelation,
 }
 
 impl<P, D> TimerDeferMiddleware<P, D>
@@ -57,7 +57,7 @@ where
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
             telemetry: telemetry.clone(),
-            timer_linking: consumer_config.timer_linking,
+            timer_relation: consumer_config.timer_relation,
         }
     }
 }
@@ -75,7 +75,7 @@ where
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
-    timer_linking: SpanLink,
+    timer_relation: SpanRelation,
 }
 
 impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
@@ -96,7 +96,7 @@ where
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
             telemetry: self.telemetry.clone(),
-            timer_linking: self.timer_linking,
+            timer_relation: self.timer_relation,
         }
     }
 }
@@ -117,7 +117,7 @@ where
             .store_provider
             .create_store(topic, partition, &self.consumer_group);
         let cached_store =
-            CachedTimerDeferStore::new(store, self.config.cache_size, self.timer_linking);
+            CachedTimerDeferStore::new(store, self.config.cache_size, self.timer_relation);
 
         // Inner handler first
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);

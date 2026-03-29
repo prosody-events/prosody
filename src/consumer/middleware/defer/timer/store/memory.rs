@@ -4,7 +4,8 @@
 
 use super::TimerDeferStore;
 use super::provider::TimerDeferStoreProvider;
-use crate::consumer::SpanLink;
+use crate::otel::SpanRelation;
+use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{Key, Partition, Topic};
@@ -15,7 +16,6 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
-use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Timer entry with span context for reconstruction.
@@ -37,10 +37,8 @@ impl StoredTimer {
     }
 
     /// Reconstructs trigger with fresh span linked to stored context.
-    fn to_trigger(&self, linking: SpanLink) -> Trigger {
-        let span =
-            info_span!("timer_defer.load", key = %self.key, time = %self.time, cached = false);
-        linking.apply(&span, self.context.clone());
+    fn to_trigger(&self, linking: SpanRelation) -> Trigger {
+        let span = related_span!(linking, self.context.clone(), "timer_defer.load", key = %self.key, time = %self.time, cached = false);
         Trigger::new(self.key.clone(), self.time, TimerType::Application, span)
     }
 }
@@ -56,7 +54,7 @@ impl StoredTimer {
 #[derive(Clone, Debug)]
 pub struct MemoryTimerDeferStore {
     inner: Arc<Inner>,
-    timer_linking: SpanLink,
+    timer_relation: SpanRelation,
 }
 
 impl MemoryTimerDeferStore {
@@ -65,7 +63,7 @@ impl MemoryTimerDeferStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner::default()),
-            timer_linking: SpanLink::default(),
+            timer_relation: SpanRelation::default(),
         }
     }
 }
@@ -118,7 +116,7 @@ impl TimerDeferStore for MemoryTimerDeferStore {
         &self,
         key: &Key,
     ) -> Result<Option<(Trigger, u32)>, Self::Error> {
-        let linking = self.timer_linking;
+        let linking = self.timer_relation;
         let result = self
             .inner
             .deferred
@@ -215,7 +213,7 @@ impl TimerDeferStore for MemoryTimerDeferStore {
 /// Creates isolated in-memory stores per partition.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemoryTimerDeferStoreProvider {
-    timer_linking: SpanLink,
+    timer_relation: SpanRelation,
 }
 
 impl MemoryTimerDeferStoreProvider {
@@ -227,8 +225,8 @@ impl MemoryTimerDeferStoreProvider {
 
     /// Creates a provider with a specific span linking strategy.
     #[must_use]
-    pub fn with_linking(timer_linking: SpanLink) -> Self {
-        Self { timer_linking }
+    pub fn with_linking(timer_relation: SpanRelation) -> Self {
+        Self { timer_relation }
     }
 }
 
@@ -243,7 +241,7 @@ impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
     ) -> Self::Store {
         MemoryTimerDeferStore {
             inner: Arc::new(Inner::default()),
-            timer_linking: self.timer_linking,
+            timer_relation: self.timer_relation,
         }
     }
 }

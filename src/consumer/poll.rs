@@ -21,17 +21,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info_span, warn};
+use tracing::{debug, error, warn};
 
 use crate::Topic;
-use crate::consumer::SpanLink;
 use crate::consumer::decode::decode_message;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
+use crate::otel::SpanRelation;
 use crate::propagator::new_propagator;
+use crate::related_span;
 
 use crate::timers::store::TriggerStoreProvider;
 #[cfg(not(target_arch = "arm"))]
@@ -74,8 +75,8 @@ where
     /// Flag for signaling polling loop shutdown
     pub shutdown: &'a AtomicBool,
 
-    /// Span linking strategy for message execution spans
-    pub message_linking: SpanLink,
+    /// Span relation for message execution spans
+    pub message_relation: SpanRelation,
 }
 
 /// Runs the main Kafka message polling and processing loop.
@@ -112,7 +113,7 @@ where
         managers,
         heartbeat,
         shutdown,
-        message_linking,
+        message_relation,
     } = config;
 
     // Initialize distributed tracing propagator for context extraction
@@ -176,20 +177,19 @@ where
 
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {
-            // Create receive span linked to parent trace context
-            let receive_span = info_span!(
+            // Create receive span connected to parent trace context
+            let receive_span = related_span!(
+                message_relation,
+                decoded.parent_context.clone(),
                 "receive",
                 partition = decoded.value.partition,
                 offset = decoded.value.offset,
                 topic = %decoded.value.topic,
                 key = %decoded.value.key,
             );
-            message_linking.apply(&receive_span, decoded.parent_context.clone());
 
             let consumer_message =
-                ConsumerMessage::from_decoded(decoded.value, receive_span, permit)
-                    .with_message_linking(message_linking)
-                    .with_link_context(decoded.parent_context.clone());
+                ConsumerMessage::from_decoded(decoded.value, receive_span, permit);
             dispatch_with_retry(consumer_message, poll_interval, managers);
         }
 

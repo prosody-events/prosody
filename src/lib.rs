@@ -259,6 +259,7 @@ pub mod consumer;
 pub mod error;
 pub mod heartbeat;
 pub mod high_level;
+pub mod otel;
 pub mod producer;
 pub mod propagator;
 pub mod telemetry;

@@ -4,7 +4,6 @@
 //! verifying [`TimerDeferHandler`](super::TimerDeferHandler) behavior.
 
 use crate::consumer::DemandType;
-use crate::consumer::SpanLink;
 use crate::consumer::event_context::{EventContext, TerminationSignals};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
@@ -14,6 +13,7 @@ use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::otel::SpanRelation;
 use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::datetime::CompactDateTime;
@@ -371,7 +371,7 @@ impl TestHarness {
             .map_err(|e| eyre!("config error: {e}"))?;
 
         let cached_store =
-            CachedTimerDeferStore::new(store.clone(), config.cache_size, SpanLink::default());
+            CachedTimerDeferStore::new(store.clone(), config.cache_size, SpanRelation::default());
 
         let telemetry = Telemetry::new();
         let sender = telemetry.partition_sender(topic, partition);

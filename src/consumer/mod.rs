@@ -156,6 +156,7 @@ use crate::consumer::probes::ProbeServer;
 use crate::consumer::storage::StorePair;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
+pub use crate::otel::SpanRelation;
 use crate::producer::ProsodyProducer;
 use crate::telemetry::Telemetry;
 use crate::telemetry::sender::TelemetrySender;
@@ -175,7 +176,6 @@ use crossbeam_utils::CachePadded;
 use derive_builder::Builder;
 use educe::Educe;
 use futures::executor::block_on;
-use opentelemetry::trace::TraceContextExt;
 use parking_lot::{Mutex, RwLock};
 use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
@@ -192,7 +192,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::error;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::{Validate, ValidationErrors};
 use whoami::hostname;
 
@@ -247,35 +246,6 @@ pub enum DemandType {
     /// This is typically created by retry middleware when an event fails
     /// and needs to be reprocessed.
     Failure,
-}
-
-/// Controls how a span links to a propagated OpenTelemetry context.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SpanLink {
-    /// Sets the context as the span's parent (child-of relationship).
-    #[default]
-    SetParent,
-    /// Adds the context as a span link (follows-from relationship).
-    AddLink,
-}
-
-impl SpanLink {
-    /// Applies this linking strategy to connect a span to a propagated context.
-    pub fn apply(self, span: &tracing::Span, context: opentelemetry::Context) {
-        match self {
-            Self::SetParent => {
-                if let Err(error) = span.set_parent(context) {
-                    tracing::debug!("failed to set parent span: {error:#}");
-                }
-            }
-            Self::AddLink => {
-                let span_context = context.span().span_context().clone();
-                if span_context.is_valid() {
-                    span.add_link(span_context);
-                }
-            }
-        }
-    }
 }
 
 /// This trait is implemented by message types that have a key field,
@@ -601,23 +571,27 @@ pub struct ConsumerConfiguration {
     /// fails.
     pub slab_size: Duration,
 
-    /// Span linking strategy for message execution spans.
+    /// Span relation for message execution spans.
     ///
     /// Controls how the `receive` span connects to the `OTel` context
     /// propagated from the Kafka message producer.
     ///
-    /// Default: `SetParent` (child-of relationship)
-    #[builder(default)]
-    pub message_linking: SpanLink,
+    /// Environment variable: `PROSODY_MESSAGE_LINKING`
+    /// Default: `child` (child-of relationship)
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_MESSAGE_LINKING\", SpanRelation::Child)?"
+    )]
+    pub message_relation: SpanRelation,
 
-    /// Span linking strategy for timer execution spans.
+    /// Span relation for timer execution spans.
     ///
     /// Controls how timer spans connect to the `OTel` context stored when the
     /// timer was scheduled.
     ///
-    /// Default: `AddLink` (follows-from relationship via span link)
-    #[builder(default = "SpanLink::AddLink")]
-    pub timer_linking: SpanLink,
+    /// Environment variable: `PROSODY_TIMER_LINKING`
+    /// Default: `link` (follows-from relationship via span link)
+    #[builder(default = "from_env_with_fallback(\"PROSODY_TIMER_LINKING\", SpanRelation::Link)?")]
+    pub timer_relation: SpanRelation,
 }
 
 impl ConsumerConfiguration {
@@ -982,7 +956,7 @@ impl ProsodyConsumer {
                 let trigger_provider = CassandraTriggerStoreProvider::with_store(
                     store,
                     &cassandra_config.keyspace,
-                    consumer_config.timer_linking,
+                    consumer_config.timer_relation,
                 )
                 .await?;
                 initialize_consumer(ConsumerInitParams {
@@ -1048,7 +1022,7 @@ impl ProsodyConsumer {
             trigger_store_config,
             consumer_config.mock,
             pipeline_config.dedup.ttl,
-            consumer_config.timer_linking,
+            consumer_config.timer_relation,
         )
         .await?;
         let PipelineMiddlewareConfiguration {
@@ -1420,7 +1394,7 @@ where
     let cloned_managers = params.managers.clone();
     let cloned_heartbeat = heartbeat.clone();
     let max_message_count = params.config.max_uncommitted;
-    let message_linking = params.config.message_linking;
+    let message_relation = params.config.message_relation;
     let poll_handle = spawn_blocking(move || {
         poll(PollConfig {
             poll_interval,
@@ -1430,7 +1404,7 @@ where
             managers: &cloned_managers,
             heartbeat: &cloned_heartbeat,
             shutdown: &params.shutdown,
-            message_linking,
+            message_relation,
         });
     });
 

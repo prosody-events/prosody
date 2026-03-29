@@ -14,7 +14,7 @@
 //! [`TriggerStoreProvider`]: crate::timers::store::TriggerStoreProvider
 
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
-use crate::consumer::SpanLink;
+use crate::otel::SpanRelation;
 use crate::timers::store::Segment;
 use crate::timers::store::TriggerStoreProvider;
 use crate::timers::store::adapter::TableAdapter;
@@ -32,7 +32,7 @@ use std::sync::Arc;
 ///
 /// * `config` - Cassandra connection and TTL configuration
 /// * `segment` - Segment this store is scoped to
-/// * `timer_linking` - Span linking strategy for timer execution spans
+/// * `timer_relation` - Span relation for timer execution spans
 ///
 /// # Errors
 ///
@@ -45,17 +45,17 @@ use std::sync::Arc;
 ///
 /// ```rust,ignore
 /// let config = CassandraConfiguration { ... };
-/// let store = cassandra_store(&config, segment, SpanLink::AddLink).await?;
+/// let store = cassandra_store(&config, segment, SpanRelation::Link).await?;
 /// let manager = TimerManager::new(..., store);
 /// ```
 pub async fn cassandra_store(
     config: &CassandraConfiguration,
     segment: Segment,
-    timer_linking: SpanLink,
+    timer_relation: SpanRelation,
 ) -> Result<TableAdapter<CassandraTriggerStore>, CassandraTriggerStoreError> {
     let store = CassandraStore::new(config).await?;
     let cassandra =
-        CassandraTriggerStore::with_store(store, &config.keyspace, segment, timer_linking).await?;
+        CassandraTriggerStore::with_store(store, &config.keyspace, segment, timer_relation).await?;
     Ok(TableAdapter::new(cassandra))
 }
 
@@ -68,7 +68,7 @@ pub async fn cassandra_store(
 pub struct CassandraTriggerStoreProvider {
     store: CassandraStore,
     queries: Arc<Queries>,
-    timer_linking: SpanLink,
+    timer_relation: SpanRelation,
 }
 
 impl CassandraTriggerStoreProvider {
@@ -78,13 +78,13 @@ impl CassandraTriggerStoreProvider {
     ///
     /// * `store` - Shared Cassandra session
     /// * `queries` - Shared prepared statements
-    /// * `timer_linking` - Span linking strategy for timer execution spans
+    /// * `timer_relation` - Span relation for timer execution spans
     #[must_use]
-    pub fn new(store: CassandraStore, queries: Arc<Queries>, timer_linking: SpanLink) -> Self {
+    pub fn new(store: CassandraStore, queries: Arc<Queries>, timer_relation: SpanRelation) -> Self {
         Self {
             store,
             queries,
-            timer_linking,
+            timer_relation,
         }
     }
 
@@ -101,13 +101,13 @@ impl CassandraTriggerStoreProvider {
     pub async fn with_store(
         store: CassandraStore,
         keyspace: &str,
-        timer_linking: SpanLink,
+        timer_relation: SpanRelation,
     ) -> Result<Self, CassandraTriggerStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
         Ok(Self {
             store,
             queries,
-            timer_linking,
+            timer_relation,
         })
     }
 }
@@ -120,7 +120,7 @@ impl TriggerStoreProvider for CassandraTriggerStoreProvider {
             self.store.clone(),
             Arc::clone(&self.queries),
             segment,
-            self.timer_linking,
+            self.timer_relation,
         ))
     }
 }

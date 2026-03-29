@@ -5,7 +5,7 @@
 
 use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
-use crate::consumer::SpanLink;
+use crate::otel::SpanRelation;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
@@ -795,7 +795,7 @@ pub async fn prop_migration_invariants(
                 cassandra_base,
                 &config.keyspace,
                 segment,
-                SpanLink::default(),
+                SpanRelation::default(),
             )
             .await?;
             setup_v2_state(&cassandra_store, &input).await?;
@@ -814,7 +814,7 @@ pub async fn prop_migration_invariants(
                 cassandra_base,
                 &config.keyspace,
                 segment,
-                SpanLink::default(),
+                SpanRelation::default(),
             )
             .await?;
             let store = TableAdapter::new(cassandra_store);
@@ -835,7 +835,7 @@ pub async fn prop_migration_invariants(
         cassandra_base,
         &config.keyspace,
         segment,
-        SpanLink::default(),
+        SpanRelation::default(),
     )
     .await?;
     let store = TableAdapter::new(cassandra_store);
