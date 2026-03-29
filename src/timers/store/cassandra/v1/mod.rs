@@ -205,8 +205,6 @@ impl V1Operations {
         let slab_id = i32::from_le_bytes(slab_id.to_le_bytes());
         let store = self.store.clone();
         let queries = Arc::clone(&self.queries);
-        let timer_relation = self.timer_relation;
-
         try_stream! {
             let stream = store
                 .session()
@@ -222,7 +220,7 @@ impl V1Operations {
                 .map_err(CassandraStoreError::from)?
             {
                 let context = store.propagator().extract(&span_map);
-                let span = related_span!(timer_relation, context, "fetch_slab_trigger_v1");
+                let span = related_span!(SpanRelation::Child, context, "fetch_slab_trigger_v1");
 
                 yield TriggerV1 {
                     key: key.into(),
@@ -343,7 +341,6 @@ impl V1Operations {
         let key = key.clone();
         let store = self.store.clone();
         let queries = Arc::clone(&self.queries);
-        let timer_relation = self.timer_relation;
 
         try_stream! {
             let stream = store
@@ -363,7 +360,7 @@ impl V1Operations {
                 .map_err(CassandraStoreError::from)?
             {
                 let context = store.propagator().extract(&span_map);
-                let span = related_span!(timer_relation, context, "fetch_key_trigger_v1");
+                let span = related_span!(SpanRelation::Child, context, "fetch_key_trigger_v1");
 
                 yield TriggerV1 {
                     key: key.into(),

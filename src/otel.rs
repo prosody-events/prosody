@@ -69,15 +69,19 @@ macro_rules! related_span {
             }
             $crate::otel::SpanRelation::Link => {
                 let __span =
-                    ::tracing::info_span!(parent: None, $name $(, $($fields)*)?);
+                    ::tracing::info_span!(parent: None, $name, otel.kind = "consumer" $(, $($fields)*)?);
                 let __span_ctx =
                     ::opentelemetry::trace::TraceContextExt::span(&__context)
                         .span_context()
                         .clone();
                 if __span_ctx.is_valid() {
-                    ::tracing_opentelemetry::OpenTelemetrySpanExt::add_link(
+                    ::tracing_opentelemetry::OpenTelemetrySpanExt::add_link_with_attributes(
                         &__span,
                         __span_ctx,
+                        vec![::opentelemetry::KeyValue::new(
+                            "opentracing.ref_type",
+                            "follows_from",
+                        )],
                     );
                 }
                 __span
