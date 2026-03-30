@@ -150,7 +150,7 @@ pub struct PartitionConfiguration<P> {
     pub telemetry_sender: TelemetrySender,
 
     /// How timer dispatch spans relate to the propagated `OTel` context.
-    pub timer_relation: SpanRelation,
+    pub timer_spans: SpanRelation,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -448,7 +448,7 @@ struct PartitionParams {
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     name: String,
-    timer_relation: SpanRelation,
+    timer_spans: SpanRelation,
 }
 
 /// Extracts the store from the provider `P` then delegates to
@@ -471,7 +471,7 @@ async fn handle_messages<T, P>(
         timer_slab_size,
         timer_semaphores,
         telemetry_sender,
-        timer_relation,
+        timer_spans,
         ..
     } = config;
 
@@ -492,7 +492,7 @@ async fn handle_messages<T, P>(
         timer_semaphores,
         telemetry_sender,
         name,
-        timer_relation,
+        timer_spans,
     };
 
     run_partition(trigger_store, partition_info, handler, context, params).await;
@@ -515,7 +515,7 @@ async fn run_partition<T, S>(
         timer_semaphores,
         telemetry_sender,
         name,
-        timer_relation,
+        timer_spans,
     } = params;
     let PartitionContext {
         offsets,
@@ -557,7 +557,7 @@ async fn run_partition<T, S>(
 
     let process = |event: UncommittedEvent<S>| async {
         debug!(?event, "calling handler");
-        process_event(event, &handler, &shutdown_rx, &timer_manager, timer_relation).await;
+        process_event(event, &handler, &shutdown_rx, &timer_manager, timer_spans).await;
     };
 
     KeyManager::<UncommittedEvent<S>, _, _>::new(process)
@@ -577,7 +577,7 @@ async fn process_event<T, S>(
     handler: &T,
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
     timer_manager: &TimerManager<S>,
-    timer_relation: SpanRelation,
+    timer_spans: SpanRelation,
 ) where
     T: EventHandler,
     S: TriggerStore,
@@ -598,7 +598,7 @@ async fn process_event<T, S>(
         }
         UncommittedEvent::Timer(timer) => {
             if let Some(firing) = timer.fire().await {
-                firing.set_dispatch_span(timer_relation);
+                firing.set_dispatch_span(timer_spans);
                 let context = TimerContext::new(
                     firing.key().clone(),
                     shutdown_rx.clone(),

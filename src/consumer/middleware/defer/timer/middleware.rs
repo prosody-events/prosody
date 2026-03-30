@@ -34,7 +34,7 @@ where
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
-    timer_relation: SpanRelation,
+    timer_spans: SpanRelation,
 }
 
 impl<P, D> TimerDeferMiddleware<P, D>
@@ -57,7 +57,7 @@ where
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
             telemetry: telemetry.clone(),
-            timer_relation: consumer_config.timer_relation,
+            timer_spans: consumer_config.timer_spans,
         }
     }
 }
@@ -75,7 +75,7 @@ where
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
-    timer_relation: SpanRelation,
+    timer_spans: SpanRelation,
 }
 
 impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
@@ -96,7 +96,7 @@ where
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
             telemetry: self.telemetry.clone(),
-            timer_relation: self.timer_relation,
+            timer_spans: self.timer_spans,
         }
     }
 }
@@ -117,7 +117,7 @@ where
             .store_provider
             .create_store(topic, partition, &self.consumer_group);
         let cached_store =
-            CachedTimerDeferStore::new(store, self.config.cache_size, self.timer_relation);
+            CachedTimerDeferStore::new(store, self.config.cache_size, self.timer_spans);
 
         // Inner handler first
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);

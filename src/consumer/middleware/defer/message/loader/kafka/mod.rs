@@ -166,7 +166,7 @@ pub struct LoaderConfiguration {
     pub discard_threshold: i64,
 
     /// Span relation for loaded message spans.
-    pub message_relation: SpanRelation,
+    pub message_spans: SpanRelation,
 }
 
 /// Kafka message loader for retrieving messages by exact offset.
@@ -181,7 +181,7 @@ pub struct KafkaLoader {
     tx: mpsc::Sender<Request>,
     semaphore: Arc<Semaphore>,
     cache: Arc<Cache<(Topic, Partition, Offset), DecodedMessage>>,
-    message_relation: SpanRelation,
+    message_spans: SpanRelation,
 }
 
 impl MessageLoader for KafkaLoader {
@@ -254,7 +254,7 @@ impl KafkaLoader {
         let semaphore = Arc::new(Semaphore::new(config.max_permits));
         let cache = Arc::new(Cache::new(config.cache_size));
 
-        let message_relation = config.message_relation;
+        let message_spans = config.message_spans;
         let heartbeat = heartbeats.register("kafka loader");
         spawn_blocking(move || poll_loop(rx, &consumer, &config, &heartbeat));
 
@@ -262,7 +262,7 @@ impl KafkaLoader {
             tx,
             semaphore,
             cache,
-            message_relation,
+            message_spans,
         })
     }
 
@@ -331,7 +331,7 @@ impl KafkaLoader {
         };
 
         // Create span linked to parent context (independent of cache lifetime)
-        let load_span = create_load_span(&decoded_message, cached, self.message_relation);
+        let load_span = create_load_span(&decoded_message, cached, self.message_spans);
 
         // Create consumer message from decoded message with new load span
         Ok(ConsumerMessage::from_decoded(

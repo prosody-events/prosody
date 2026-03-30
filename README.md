@@ -231,8 +231,8 @@ fields, so you can mix both approaches.
 | `PROSODY_PROBE_PORT`             | HTTP port for health checks ('none' to disable)      | 8000                   |
 | `PROSODY_FAILURE_TOPIC`          | Send unprocessable messages here (dead letter queue) | -                      |
 | `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1h                     |
-| `PROSODY_MESSAGE_LINKING`        | Span linking for message execution: `parent` (child-of) or `link` (follows-from) | `parent` |
-| `PROSODY_TIMER_LINKING`          | Span linking for timer execution: `parent` (child-of) or `link` (follows-from)   | `link`   |
+| `PROSODY_MESSAGE_SPANS`          | Span linking for message execution: `child` (child-of) or `follows_from`         | `child`       |
+| `PROSODY_TIMER_SPANS`            | Span linking for timer execution: `child` (child-of) or `follows_from`           | `follows_from` |
 
 ### Producer
 
@@ -600,13 +600,13 @@ visibility of message processing across different services.
 
 #### Span Linking
 
-By default, message execution spans use **`parent`** (child-of relationship — the execution span is part of
-the same trace as the producer). Timer execution spans use **`link`** (follows-from — the execution span starts a
+By default, message execution spans use **`child`** (child-of relationship — the execution span is part of
+the same trace as the producer). Timer execution spans use **`follows_from`** (the execution span starts a
 new trace with a span link back to the scheduling span, since timer execution is causally related but not part of
 the same operation).
 
-Both strategies are configurable via `PROSODY_MESSAGE_LINKING` and `PROSODY_TIMER_LINKING` (or the builder fields
-`message_linking` and `timer_linking`). Accepted values: `parent`, `link`.
+Both strategies are configurable via `PROSODY_MESSAGE_SPANS` and `PROSODY_TIMER_SPANS` (or the builder fields
+`message_spans` and `timer_spans`). Accepted values: `child`, `follows_from`.
 
 This architecture allows Prosody to achieve high throughput by processing different partitions and keys concurrently,
 while still maintaining strict ordering for messages with the same key. It also provides backpressure management by

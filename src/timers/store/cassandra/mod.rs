@@ -68,7 +68,7 @@ pub struct CassandraTriggerStore {
     pub(super) store: CassandraStore,
     pub(super) queries: Arc<Queries>,
     pub(super) segment: Segment,
-    pub(super) timer_relation: SpanRelation,
+    pub(super) timer_spans: SpanRelation,
     /// Per-partition cache of `(Key, TimerType) → TimerState`.
     ///
     /// Tracks the current state of each key/type pair:
@@ -108,7 +108,7 @@ impl CassandraTriggerStore {
         store: CassandraStore,
         keyspace: &str,
         segment: Segment,
-        timer_relation: SpanRelation,
+        timer_spans: SpanRelation,
     ) -> Result<Self, CassandraTriggerStoreError> {
         let queries = Arc::new(Queries::new(store.session(), keyspace).await?);
 
@@ -117,7 +117,7 @@ impl CassandraTriggerStore {
             queries,
             segment,
             state_cache: state::new_state_cache(),
-            timer_relation,
+            timer_spans,
         })
     }
 
@@ -129,14 +129,14 @@ impl CassandraTriggerStore {
         store: CassandraStore,
         queries: Arc<Queries>,
         segment: Segment,
-        timer_relation: SpanRelation,
+        timer_spans: SpanRelation,
     ) -> Self {
         Self {
             store,
             queries,
             segment,
             state_cache: state::new_state_cache(),
-            timer_relation,
+            timer_spans,
         }
     }
 
@@ -211,11 +211,7 @@ impl CassandraTriggerStore {
     /// to V1 schema operations (reading/writing data without `timer_type`).
     /// Only used during V1→V2 migration.
     pub(crate) fn v1(&self) -> v1::V1Operations {
-        v1::V1Operations::new(
-            self.store.clone(),
-            Arc::clone(&self.queries),
-            self.timer_relation,
-        )
+        v1::V1Operations::new(self.store.clone(), Arc::clone(&self.queries))
     }
 
     /// Reads a segment from the database without applying any migrations.

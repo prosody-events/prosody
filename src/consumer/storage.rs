@@ -137,7 +137,7 @@ impl StorageBackend {
 ///     &config,
 ///     false,
 ///     Duration::from_secs(7 * 24 * 3600),
-///     SpanRelation::Link,
+///     SpanRelation::FollowsFrom,
 /// )
 /// .await?;
 ///
@@ -255,7 +255,7 @@ impl StorePair {
     ///     &TriggerStoreConfiguration::InMemory,
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
-    ///     SpanRelation::Link,
+    ///     SpanRelation::FollowsFrom,
     /// )
     /// .await?;
     /// # Ok(())
@@ -265,14 +265,14 @@ impl StorePair {
         config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
-        timer_relation: SpanRelation,
+        timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
         let backend = StorageBackend::new(config, mock).await?;
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
                 trigger_provider: InMemoryTriggerStoreProvider::new(),
                 message_provider: MemoryMessageDeferStoreProvider::new(),
-                timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_relation),
+                timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
                 dedup_provider: MemoryDeduplicationStoreProvider::new(),
             }),
 
@@ -282,7 +282,7 @@ impl StorePair {
                 let trigger_provider = CassandraTriggerStoreProvider::with_store(
                     store.clone(),
                     keyspace,
-                    timer_relation,
+                    timer_spans,
                 )
                 .await?;
 
@@ -322,7 +322,7 @@ impl StorePair {
                     store.clone(),
                     timer_queries,
                     segment_store,
-                    timer_relation,
+                    timer_spans,
                 );
 
                 let dedup_provider = CassandraDeduplicationStoreProvider::new(

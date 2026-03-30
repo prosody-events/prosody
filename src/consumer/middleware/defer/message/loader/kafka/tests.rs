@@ -32,7 +32,7 @@ fn loader_config() -> LoaderConfiguration {
         poll_interval: Duration::from_millis(50),
         seek_timeout: Duration::from_secs(5),
         discard_threshold: 10,
-        message_relation: SpanRelation::default(),
+        message_spans: SpanRelation::default(),
     }
 }
 
@@ -316,7 +316,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
             poll_interval: Duration::from_millis(50),
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 5, // Small threshold for testing
-            message_relation: SpanRelation::default(),
+            message_spans: SpanRelation::default(),
         };
         let loader = KafkaLoader::new(config, &HeartbeatRegistry::test())?;
 
@@ -536,7 +536,7 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
             poll_interval: Duration::from_millis(50),
             seek_timeout: Duration::from_secs(5),
             discard_threshold: 10,
-            message_relation: SpanRelation::default(),
+            message_spans: SpanRelation::default(),
         };
         let loader = Arc::new(KafkaLoader::new(config, &HeartbeatRegistry::test())?);
 

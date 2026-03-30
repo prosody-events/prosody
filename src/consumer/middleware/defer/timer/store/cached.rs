@@ -40,7 +40,7 @@ fn create_span_from_context(
 pub struct CachedTimerDeferStore<S> {
     store: S,
     cache: Arc<TimerDeferCache>,
-    timer_relation: SpanRelation,
+    timer_spans: SpanRelation,
 }
 
 impl<S> CachedTimerDeferStore<S>
@@ -49,11 +49,11 @@ where
 {
     /// Wraps a store with a cache of the given capacity.
     #[must_use]
-    pub fn new(store: S, capacity: usize, timer_relation: SpanRelation) -> Self {
+    pub fn new(store: S, capacity: usize, timer_spans: SpanRelation) -> Self {
         Self {
             store,
             cache: Arc::new(Cache::new(capacity)),
-            timer_relation,
+            timer_spans,
         }
     }
 
@@ -203,7 +203,7 @@ where
         if let Some(cached) = self.cache.get(key.as_ref()) {
             return Ok(cached.map(|entry| {
                 let span =
-                    create_span_from_context(key, entry.time, &entry.context, self.timer_relation);
+                    create_span_from_context(key, entry.time, &entry.context, self.timer_spans);
                 let trigger = Trigger::new(key.clone(), entry.time, TimerType::Application, span);
                 (trigger, entry.retry_count)
             }));
@@ -301,7 +301,7 @@ mod tests {
     use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 
     fn create_test_store() -> MemoryTimerDeferStore {
-        MemoryTimerDeferStore::new()
+        MemoryTimerDeferStore::new(SpanRelation::default())
     }
 
     fn test_trigger(key: &str, time_secs: u32) -> Trigger {

@@ -42,7 +42,6 @@ pub mod tests;
 pub(crate) struct V1Operations {
     store: CassandraStore,
     queries: Arc<Queries>,
-    timer_relation: SpanRelation,
 }
 
 impl V1Operations {
@@ -52,17 +51,8 @@ impl V1Operations {
     ///
     /// * `store` - Cassandra store providing session and propagator access
     /// * `queries` - Shared prepared CQL queries
-    /// * `timer_relation` - Span relation for timer execution spans contexts
-    pub(crate) fn new(
-        store: CassandraStore,
-        queries: Arc<Queries>,
-        timer_relation: SpanRelation,
-    ) -> Self {
-        Self {
-            store,
-            queries,
-            timer_relation,
-        }
+    pub(crate) fn new(store: CassandraStore, queries: Arc<Queries>) -> Self {
+        Self { store, queries }
     }
 
     // ========================================================================

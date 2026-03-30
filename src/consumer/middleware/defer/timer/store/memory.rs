@@ -54,23 +54,23 @@ impl StoredTimer {
 #[derive(Clone, Debug)]
 pub struct MemoryTimerDeferStore {
     inner: Arc<Inner>,
-    timer_relation: SpanRelation,
+    timer_spans: SpanRelation,
 }
 
 impl MemoryTimerDeferStore {
-    /// Creates an empty store.
+    /// Creates an empty store with the given span relation.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(timer_spans: SpanRelation) -> Self {
         Self {
             inner: Arc::new(Inner::default()),
-            timer_relation: SpanRelation::default(),
+            timer_spans,
         }
     }
 }
 
 impl Default for MemoryTimerDeferStore {
     fn default() -> Self {
-        Self::new()
+        Self::new(SpanRelation::default())
     }
 }
 
@@ -116,7 +116,7 @@ impl TimerDeferStore for MemoryTimerDeferStore {
         &self,
         key: &Key,
     ) -> Result<Option<(Trigger, u32)>, Self::Error> {
-        let linking = self.timer_relation;
+        let linking = self.timer_spans;
         let result = self
             .inner
             .deferred
@@ -213,7 +213,7 @@ impl TimerDeferStore for MemoryTimerDeferStore {
 /// Creates isolated in-memory stores per partition.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemoryTimerDeferStoreProvider {
-    timer_relation: SpanRelation,
+    timer_spans: SpanRelation,
 }
 
 impl MemoryTimerDeferStoreProvider {
@@ -225,8 +225,8 @@ impl MemoryTimerDeferStoreProvider {
 
     /// Creates a provider with a specific span linking strategy.
     #[must_use]
-    pub fn with_linking(timer_relation: SpanRelation) -> Self {
-        Self { timer_relation }
+    pub fn with_linking(timer_spans: SpanRelation) -> Self {
+        Self { timer_spans }
     }
 }
 
@@ -241,7 +241,7 @@ impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
     ) -> Self::Store {
         MemoryTimerDeferStore {
             inner: Arc::new(Inner::default()),
-            timer_relation: self.timer_relation,
+            timer_spans: self.timer_spans,
         }
     }
 }
@@ -252,7 +252,7 @@ mod tests {
     use tracing::Span;
 
     fn create_test_store() -> MemoryTimerDeferStore {
-        MemoryTimerDeferStore::new()
+        MemoryTimerDeferStore::new(SpanRelation::default())
     }
 
     fn test_trigger(key: &str, time_secs: u32) -> Trigger {

@@ -9,15 +9,15 @@ use thiserror::Error;
 
 /// Controls how a new span relates to a propagated OpenTelemetry context.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SpanRelation {
     /// The propagated span becomes this span's `OTel` parent (child-of
     /// relationship).
     #[default]
     Child,
     /// The propagated span is added as an `OTel` link; this span starts a new
-    /// trace root.
-    Link,
+    /// trace root (follows-from relationship).
+    FollowsFrom,
 }
 
 impl FromStr for SpanRelation {
@@ -26,7 +26,7 @@ impl FromStr for SpanRelation {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "child" => Ok(Self::Child),
-            "link" => Ok(Self::Link),
+            "follows_from" => Ok(Self::FollowsFrom),
             _ => Err(ParseSpanRelationError(s.to_owned())),
         }
     }
@@ -38,9 +38,9 @@ impl FromStr for SpanRelation {
 /// - [`SpanRelation::Child`]: inherits the ambient tracing parent; `OTel`
 ///   parent is overridden to `context` via `set_parent` (child-of
 ///   relationship).
-/// - [`SpanRelation::Link`]: root span in both tracing and `OTel` (`parent:
-///   None`); `context`'s span is added as an `OTel` link (follows-from
-///   relationship).
+/// - [`SpanRelation::FollowsFrom`]: root span in both tracing and `OTel`
+///   (`parent: None`); `context`'s span is added as an `OTel` link
+///   (follows-from relationship).
 ///
 /// Span name and fields are macro-expanded at the call site, preserving source
 /// location.
@@ -48,7 +48,7 @@ impl FromStr for SpanRelation {
 /// # Example
 /// ```rust
 /// use prosody::related_span;
-/// let span = related_span!(self.timer_relation, context, "fetch_trigger", key = %key);
+/// let span = related_span!(self.timer_spans, context, "fetch_trigger", key = %key);
 /// ```
 #[macro_export]
 macro_rules! related_span {
@@ -67,7 +67,7 @@ macro_rules! related_span {
                 }
                 __span
             }
-            $crate::otel::SpanRelation::Link => {
+            $crate::otel::SpanRelation::FollowsFrom => {
                 let __span =
                     ::tracing::info_span!(parent: None, $name, otel.kind = "consumer" $(, $($fields)*)?);
                 let __span_ctx =
@@ -92,5 +92,5 @@ macro_rules! related_span {
 
 /// Error returned when parsing a [`SpanRelation`] from a string fails.
 #[derive(Debug, Error)]
-#[error("unknown span relation value '{0}'; expected 'child' or 'link'")]
+#[error("unknown span relation value '{0}'; expected 'child' or 'follows_from'")]
 pub struct ParseSpanRelationError(String);

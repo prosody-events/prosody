@@ -576,22 +576,22 @@ pub struct ConsumerConfiguration {
     /// Controls how the `receive` span connects to the `OTel` context
     /// propagated from the Kafka message producer.
     ///
-    /// Environment variable: `PROSODY_MESSAGE_LINKING`
+    /// Environment variable: `PROSODY_MESSAGE_SPANS`
     /// Default: `child` (child-of relationship)
     #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MESSAGE_LINKING\", SpanRelation::Child)?"
+        default = "from_env_with_fallback(\"PROSODY_MESSAGE_SPANS\", SpanRelation::Child)?"
     )]
-    pub message_relation: SpanRelation,
+    pub message_spans: SpanRelation,
 
     /// Span relation for timer execution spans.
     ///
     /// Controls how timer spans connect to the `OTel` context stored when the
     /// timer was scheduled.
     ///
-    /// Environment variable: `PROSODY_TIMER_LINKING`
-    /// Default: `link` (follows-from relationship via span link)
-    #[builder(default = "from_env_with_fallback(\"PROSODY_TIMER_LINKING\", SpanRelation::Link)?")]
-    pub timer_relation: SpanRelation,
+    /// Environment variable: `PROSODY_TIMER_SPANS`
+    /// Default: `follows_from`
+    #[builder(default = "from_env_with_fallback(\"PROSODY_TIMER_SPANS\", SpanRelation::FollowsFrom)?")]
+    pub timer_spans: SpanRelation,
 }
 
 impl ConsumerConfiguration {
@@ -956,7 +956,7 @@ impl ProsodyConsumer {
                 let trigger_provider = CassandraTriggerStoreProvider::with_store(
                     store,
                     &cassandra_config.keyspace,
-                    consumer_config.timer_relation,
+                    consumer_config.timer_spans,
                 )
                 .await?;
                 initialize_consumer(ConsumerInitParams {
@@ -1022,7 +1022,7 @@ impl ProsodyConsumer {
             trigger_store_config,
             consumer_config.mock,
             pipeline_config.dedup.ttl,
-            consumer_config.timer_relation,
+            consumer_config.timer_spans,
         )
         .await?;
         let PipelineMiddlewareConfiguration {
@@ -1394,7 +1394,7 @@ where
     let cloned_managers = params.managers.clone();
     let cloned_heartbeat = heartbeat.clone();
     let max_message_count = params.config.max_uncommitted;
-    let message_relation = params.config.message_relation;
+    let message_spans = params.config.message_spans;
     let poll_handle = spawn_blocking(move || {
         poll(PollConfig {
             poll_interval,
@@ -1404,7 +1404,7 @@ where
             managers: &cloned_managers,
             heartbeat: &cloned_heartbeat,
             shutdown: &params.shutdown,
-            message_relation,
+            message_spans,
         });
     });
 

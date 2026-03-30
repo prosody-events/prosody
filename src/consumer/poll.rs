@@ -76,7 +76,7 @@ where
     pub shutdown: &'a AtomicBool,
 
     /// Span relation for message execution spans
-    pub message_relation: SpanRelation,
+    pub message_spans: SpanRelation,
 }
 
 /// Runs the main Kafka message polling and processing loop.
@@ -113,7 +113,7 @@ where
         managers,
         heartbeat,
         shutdown,
-        message_relation,
+        message_spans,
     } = config;
 
     // Initialize distributed tracing propagator for context extraction
@@ -179,7 +179,7 @@ where
         if let Some(decoded) = maybe_decoded {
             // Create receive span connected to parent trace context
             let receive_span = related_span!(
-                message_relation,
+                message_spans,
                 decoded.parent_context.clone(),
                 "receive",
                 partition = decoded.value.partition,

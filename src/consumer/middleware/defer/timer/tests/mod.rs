@@ -359,7 +359,7 @@ impl TestHarness {
 
         let inner_handler = OutcomeHandler::new();
         let decider = TraceBasedDecider::new();
-        let store = MemoryTimerDeferStore::new();
+        let store = MemoryTimerDeferStore::new(SpanRelation::default());
         let context = MockContext::new();
 
         let config = DeferConfiguration::builder()

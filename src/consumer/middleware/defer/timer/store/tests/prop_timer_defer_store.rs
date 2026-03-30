@@ -7,6 +7,7 @@ use crate::Key;
 use crate::consumer::middleware::defer::timer::store::{
     TimerDeferStore, TimerRetryCompletionResult,
 };
+use crate::otel::SpanRelation;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -823,7 +824,7 @@ mod memory_store_tests {
     use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
     use std::convert::Infallible;
 
-    crate::timer_defer_store_tests!(async { Ok::<_, Infallible>(MemoryTimerDeferStore::new()) });
+    crate::timer_defer_store_tests!(async { Ok::<_, Infallible>(MemoryTimerDeferStore::new(SpanRelation::default())) });
 }
 
 // ============================================================================
@@ -838,7 +839,7 @@ mod cached_store_tests {
     use std::convert::Infallible;
 
     crate::timer_defer_store_tests!(async {
-        let store = MemoryTimerDeferStore::new();
+        let store = MemoryTimerDeferStore::new(SpanRelation::default());
         Ok::<_, Infallible>(CachedTimerDeferStore::new(
             store,
             100,

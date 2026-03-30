@@ -111,7 +111,7 @@ where
             timer_slab_size,
             timer_semaphores,
             telemetry_sender: telemetry.clone(),
-            timer_relation: config.timer_relation,
+            timer_spans: config.timer_spans,
         };
 
         Self {

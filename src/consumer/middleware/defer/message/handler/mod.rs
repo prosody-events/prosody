@@ -102,7 +102,7 @@ where
             poll_interval: consumer_config.poll_interval,
             seek_timeout: config.seek_timeout,
             discard_threshold: config.discard_threshold,
-            message_relation: consumer_config.message_relation,
+            message_spans: consumer_config.message_spans,
         };
         let loader = KafkaLoader::new(loader_config, heartbeats)?;
 
