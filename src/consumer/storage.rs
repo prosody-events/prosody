@@ -30,6 +30,7 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
+use crate::otel::SpanRelation;
 
 /// Unified storage backend that ensures trigger and defer stores use the same
 /// underlying storage infrastructure.
@@ -127,11 +128,18 @@ impl StorageBackend {
 ///
 /// ```no_run
 /// # use prosody::consumer::storage::{StorageBackend, StorePair};
+/// # use prosody::otel::SpanRelation;
 /// # use prosody::high_level::config::TriggerStoreConfiguration;
 /// # use std::time::Duration;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = TriggerStoreConfiguration::InMemory;
-/// let stores = StorePair::new(&config, false, Duration::from_secs(7 * 24 * 3600)).await?;
+/// let stores = StorePair::new(
+///     &config,
+///     false,
+///     Duration::from_secs(7 * 24 * 3600),
+///     SpanRelation::FollowsFrom,
+/// )
+/// .await?;
 ///
 /// // Pattern match to get all providers - they're guaranteed to match storage types
 /// match stores {
@@ -239,6 +247,7 @@ impl StorePair {
     ///
     /// ```no_run
     /// # use prosody::consumer::storage::StorePair;
+    /// # use prosody::otel::SpanRelation;
     /// # use prosody::high_level::config::TriggerStoreConfiguration;
     /// # use std::time::Duration;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -246,6 +255,7 @@ impl StorePair {
     ///     &TriggerStoreConfiguration::InMemory,
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
+    ///     SpanRelation::FollowsFrom,
     /// )
     /// .await?;
     /// # Ok(())
@@ -255,13 +265,14 @@ impl StorePair {
         config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
+        timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
         let backend = StorageBackend::new(config, mock).await?;
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
                 trigger_provider: InMemoryTriggerStoreProvider::new(),
                 message_provider: MemoryMessageDeferStoreProvider::new(),
-                timer_provider: MemoryTimerDeferStoreProvider::new(),
+                timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
                 dedup_provider: MemoryDeduplicationStoreProvider::new(),
             }),
 
@@ -269,7 +280,8 @@ impl StorePair {
                 // Create trigger store provider (prepares queries once, creates
                 // per-partition stores with independent caches on demand)
                 let trigger_provider =
-                    CassandraTriggerStoreProvider::with_store(store.clone(), keyspace).await?;
+                    CassandraTriggerStoreProvider::with_store(store.clone(), keyspace, timer_spans)
+                        .await?;
 
                 // Create segment store for defer stores (shared across message and timer)
                 let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;
@@ -307,6 +319,7 @@ impl StorePair {
                     store.clone(),
                     timer_queries,
                     segment_store,
+                    timer_spans,
                 );
 
                 let dedup_provider = CassandraDeduplicationStoreProvider::new(

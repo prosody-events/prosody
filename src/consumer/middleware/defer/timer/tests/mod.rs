@@ -13,6 +13,7 @@ use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::otel::SpanRelation;
 use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::datetime::CompactDateTime;
@@ -358,7 +359,7 @@ impl TestHarness {
 
         let inner_handler = OutcomeHandler::new();
         let decider = TraceBasedDecider::new();
-        let store = MemoryTimerDeferStore::new();
+        let store = MemoryTimerDeferStore::new(SpanRelation::default());
         let context = MockContext::new();
 
         let config = DeferConfiguration::builder()
@@ -369,7 +370,8 @@ impl TestHarness {
             .build()
             .map_err(|e| eyre!("config error: {e}"))?;
 
-        let cached_store = CachedTimerDeferStore::new(store.clone(), config.cache_size);
+        let cached_store =
+            CachedTimerDeferStore::new(store.clone(), config.cache_size, SpanRelation::default());
 
         let telemetry = Telemetry::new();
         let sender = telemetry.partition_sender(topic, partition);

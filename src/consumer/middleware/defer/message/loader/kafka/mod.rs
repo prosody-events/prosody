@@ -70,8 +70,10 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tracing::field::Empty;
-use tracing::{Span, debug, error, info_span, instrument, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing::{Span, debug, error, instrument, warn};
+
+use crate::otel::SpanRelation;
+use crate::related_span;
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::Buffers;
@@ -162,6 +164,9 @@ pub struct LoaderConfiguration {
     /// - Reading 100 messages: ~1-10ms (sequential, already buffered)
     /// - Bandwidth cost: ~10-100KB per 100 messages
     pub discard_threshold: i64,
+
+    /// Span relation for loaded message spans.
+    pub message_spans: SpanRelation,
 }
 
 /// Kafka message loader for retrieving messages by exact offset.
@@ -176,6 +181,7 @@ pub struct KafkaLoader {
     tx: mpsc::Sender<Request>,
     semaphore: Arc<Semaphore>,
     cache: Arc<Cache<(Topic, Partition, Offset), DecodedMessage>>,
+    message_spans: SpanRelation,
 }
 
 impl MessageLoader for KafkaLoader {
@@ -248,6 +254,7 @@ impl KafkaLoader {
         let semaphore = Arc::new(Semaphore::new(config.max_permits));
         let cache = Arc::new(Cache::new(config.cache_size));
 
+        let message_spans = config.message_spans;
         let heartbeat = heartbeats.register("kafka loader");
         spawn_blocking(move || poll_loop(rx, &consumer, &config, &heartbeat));
 
@@ -255,6 +262,7 @@ impl KafkaLoader {
             tx,
             semaphore,
             cache,
+            message_spans,
         })
     }
 
@@ -323,7 +331,7 @@ impl KafkaLoader {
         };
 
         // Create span linked to parent context (independent of cache lifetime)
-        let load_span = create_load_span(&decoded_message, cached);
+        let load_span = create_load_span(&decoded_message, cached, self.message_spans);
 
         // Create consumer message from decoded message with new load span
         Ok(ConsumerMessage::from_decoded(
@@ -979,12 +987,12 @@ fn unassign_partition(
     Ok(())
 }
 
-/// Creates a tracing span for a loaded message with parent context linking.
+/// Creates a tracing span for a loaded message connected to its upstream
+/// context.
 ///
-/// Creates an `info_span!` named "load" with message metadata attributes and
-/// links it to the upstream trace using the parent context from the cached
-/// `DecodedMessage`. This ensures proper distributed tracing across services
-/// while keeping span lifecycles independent of cache eviction.
+/// Creates a span named "load" with message metadata attributes and connects
+/// it to the upstream trace via the configured [`SpanRelation`]. Span
+/// lifecycles are independent of cache eviction.
 ///
 /// # Arguments
 ///
@@ -995,21 +1003,17 @@ fn unassign_partition(
 /// # Returns
 ///
 /// A tracing span linked to the parent context with message metadata recorded.
-fn create_load_span(decoded: &DecodedMessage, cached: bool) -> Span {
-    let span = info_span!(
+fn create_load_span(decoded: &DecodedMessage, cached: bool, relation: SpanRelation) -> Span {
+    related_span!(
+        relation,
+        decoded.parent_context.clone(),
         "load",
         partition = decoded.value.partition,
         offset = decoded.value.offset,
         topic = %decoded.value.topic,
         key = %decoded.value.key,
         cached = cached,
-    );
-
-    if let Err(error) = span.set_parent(decoded.parent_context.clone()) {
-        debug!("failed to set parent span: {error:#}");
-    }
-
-    span
+    )
 }
 
 /// Errors that can occur during Kafka message loading.

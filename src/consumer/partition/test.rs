@@ -41,6 +41,7 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider> {
         timer_slab_size: CompactDuration::new(30),
         timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(10)))),
         telemetry_sender: Telemetry::new().sender(),
+        timer_spans: SpanRelation::default(),
     }
 }
 

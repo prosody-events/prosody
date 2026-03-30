@@ -23,6 +23,8 @@
 //! persistent state for potential reloading.
 
 use crate::consumer::{Keyed, Uncommitted};
+use crate::otel::SpanRelation;
+use crate::related_span;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -36,6 +38,7 @@ use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
 use tracing::{Span, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
@@ -207,6 +210,29 @@ where
             trigger: self.trigger,
             uncommitted: self.uncommitted,
         })
+    }
+}
+
+impl<T> FiringTimer<T>
+where
+    T: TriggerStore,
+{
+    /// Replaces the trigger's tracing span with a `"trigger"` dispatch span.
+    ///
+    /// Creates the dispatch span from the trigger's current span context,
+    /// connecting it per `relation`. Called at fire time so that
+    /// `trigger.span()` returns the dispatch span when the handler reads it.
+    pub fn set_dispatch_span(&self, relation: SpanRelation) {
+        let context = self.trigger.span().context();
+        let span = related_span!(
+            relation,
+            context,
+            "trigger",
+            key = %self.trigger.key,
+            time = %self.trigger.time,
+            timer_type = ?self.trigger.timer_type,
+        );
+        self.trigger.set_span(span);
     }
 }
 

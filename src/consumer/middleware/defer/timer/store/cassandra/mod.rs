@@ -13,6 +13,8 @@ use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, LazySeg
 use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::cassandra::queries::Queries;
 use crate::consumer::middleware::defer::timer::store::provider::TimerDeferStoreProvider;
+use crate::otel::SpanRelation;
+use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
 use crate::{ConsumerGroup, Key, Partition, Topic};
@@ -23,7 +25,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use tracing::{debug, info_span, instrument};
+use tracing::{debug, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub mod queries;
@@ -47,6 +49,7 @@ pub struct CassandraTimerDeferStore {
     store: CassandraStore,
     queries: Arc<Queries>,
     segment: LazySegment<CassandraSegmentStore>,
+    timer_spans: SpanRelation,
 }
 
 impl CassandraTimerDeferStore {
@@ -59,12 +62,14 @@ impl CassandraTimerDeferStore {
         topic: Topic,
         partition: Partition,
         consumer_group: ConsumerGroup,
+        timer_spans: SpanRelation,
     ) -> Self {
         let segment = LazySegment::new(segment_store, topic, partition, consumer_group);
         Self {
             store,
             queries,
             segment,
+            timer_spans,
         }
     }
 
@@ -98,9 +103,7 @@ impl CassandraTimerDeferStore {
         span_map: &HashMap<String, String>,
     ) -> tracing::Span {
         let context = self.propagator().extract(span_map);
-        let span = info_span!("timer_defer.load", key = %key, time = %time, cached = false);
-        let _ = span.set_parent(context);
-        span
+        related_span!(self.timer_spans, context, "timer_defer.load", key = %key, time = %time, cached = false)
     }
 }
 
@@ -321,6 +324,7 @@ pub struct CassandraTimerDeferStoreProvider {
     store: CassandraStore,
     queries: Arc<Queries>,
     segment_store: CassandraSegmentStore,
+    timer_spans: SpanRelation,
 }
 
 impl CassandraTimerDeferStoreProvider {
@@ -330,11 +334,13 @@ impl CassandraTimerDeferStoreProvider {
         store: CassandraStore,
         queries: Arc<Queries>,
         segment_store: CassandraSegmentStore,
+        timer_spans: SpanRelation,
     ) -> Self {
         Self {
             store,
             queries,
             segment_store,
+            timer_spans,
         }
     }
 }
@@ -355,6 +361,7 @@ impl TimerDeferStoreProvider for CassandraTimerDeferStoreProvider {
             topic,
             partition,
             Arc::from(consumer_group),
+            self.timer_spans,
         )
     }
 }
@@ -386,6 +393,7 @@ mod tests {
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from("test-consumer-group") as ConsumerGroup,
+            SpanRelation::default(),
         );
 
         // Test basic operations

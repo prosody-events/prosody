@@ -11,6 +11,8 @@
 use crate::Key;
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::otel::SpanRelation;
+use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::SlabId;
@@ -23,7 +25,7 @@ use opentelemetry::propagation::TextMapPropagator;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::coop::cooperative;
-use tracing::{debug, info_span, instrument};
+use tracing::instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(test)]
@@ -193,7 +195,6 @@ impl V1Operations {
         let slab_id = i32::from_le_bytes(slab_id.to_le_bytes());
         let store = self.store.clone();
         let queries = Arc::clone(&self.queries);
-
         try_stream! {
             let stream = store
                 .session()
@@ -209,10 +210,7 @@ impl V1Operations {
                 .map_err(CassandraStoreError::from)?
             {
                 let context = store.propagator().extract(&span_map);
-                let span = info_span!("fetch_slab_trigger_v1");
-                if let Err(error) = span.set_parent(context) {
-                    debug!("failed to set parent span: {error:#}");
-                }
+                let span = related_span!(SpanRelation::Child, context, "fetch_slab_trigger_v1");
 
                 yield TriggerV1 {
                     key: key.into(),
@@ -333,7 +331,6 @@ impl V1Operations {
         let key = key.clone();
         let store = self.store.clone();
         let queries = Arc::clone(&self.queries);
-        // store already cloned above
 
         try_stream! {
             let stream = store
@@ -353,10 +350,7 @@ impl V1Operations {
                 .map_err(CassandraStoreError::from)?
             {
                 let context = store.propagator().extract(&span_map);
-                let span = info_span!("fetch_key_trigger_v1");
-                if let Err(error) = span.set_parent(context) {
-                    debug!("failed to set parent span: {error:#}");
-                }
+                let span = related_span!(SpanRelation::Child, context, "fetch_key_trigger_v1");
 
                 yield TriggerV1 {
                     key: key.into(),

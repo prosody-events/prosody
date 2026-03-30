@@ -37,8 +37,8 @@ use crate::{Payload, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 /// Contains the immutable message data and the parent trace context extracted
 /// from Kafka headers. The context contains only the upstream service's trace
 /// identifiers (`trace_id`, `span_id`, flags) and baggage - no active span
-/// reference. Callers construct their own spans using `context.clone()` and
-/// `span.set_parent()`.
+/// reference. Callers construct their own spans and link them to the context
+/// via the [`related_span!`](crate::related_span) macro.
 ///
 /// This design ensures spans have independent lifecycles from cache entries:
 /// - Context is safely cached (contains only remote trace identifiers)
