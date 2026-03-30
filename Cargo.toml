@@ -17,6 +17,7 @@ version = "0.12.0"
 
 [dependencies]
 ahash = "0.8"
+base16ct = "0.2"
 aho-corasick = "1.1"
 arc-swap = "1.8"
 async-stream = "0.3"
