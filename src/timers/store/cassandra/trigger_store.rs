@@ -991,7 +991,11 @@ pub(super) async fn advance_clustering(
         };
 
         let context = propagator.extract(&span_map);
-        let span = related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_all_types");
+        let span = related_span!(
+            SpanRelation::Child,
+            context.clone(),
+            "fetch_key_trigger_all_types"
+        );
 
         return Ok(Some(Trigger::new(key.clone(), time, timer_type, span)));
     }

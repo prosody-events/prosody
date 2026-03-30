@@ -279,12 +279,9 @@ impl StorePair {
             StorageBackend::Cassandra { store, keyspace } => {
                 // Create trigger store provider (prepares queries once, creates
                 // per-partition stores with independent caches on demand)
-                let trigger_provider = CassandraTriggerStoreProvider::with_store(
-                    store.clone(),
-                    keyspace,
-                    timer_spans,
-                )
-                .await?;
+                let trigger_provider =
+                    CassandraTriggerStoreProvider::with_store(store.clone(), keyspace, timer_spans)
+                        .await?;
 
                 // Create segment store for defer stores (shared across message and timer)
                 let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;

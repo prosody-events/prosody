@@ -5,8 +5,10 @@ services:
       - "3000:3000" # Grafana UI
       - "4317:4317" # OTLP gRPC ingest
       - "4318:4318" # OTLP HTTP ingest
+      - "3200:3200" # Tempo API
     volumes:
       - lgtm_data:/data
+      - ./configs/tempo-config.yaml:/otel-lgtm/tempo-config.yaml
     environment:
       GF_PATHS_DATA: /data/grafana
 

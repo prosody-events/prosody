@@ -578,9 +578,7 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_MESSAGE_SPANS`
     /// Default: `child` (child-of relationship)
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_MESSAGE_SPANS\", SpanRelation::Child)?"
-    )]
+    #[builder(default = "from_env_with_fallback(\"PROSODY_MESSAGE_SPANS\", SpanRelation::Child)?")]
     pub message_spans: SpanRelation,
 
     /// Span relation for timer execution spans.
@@ -590,7 +588,9 @@ pub struct ConsumerConfiguration {
     ///
     /// Environment variable: `PROSODY_TIMER_SPANS`
     /// Default: `follows_from`
-    #[builder(default = "from_env_with_fallback(\"PROSODY_TIMER_SPANS\", SpanRelation::FollowsFrom)?")]
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_TIMER_SPANS\", SpanRelation::FollowsFrom)?"
+    )]
     pub timer_spans: SpanRelation,
 }
 

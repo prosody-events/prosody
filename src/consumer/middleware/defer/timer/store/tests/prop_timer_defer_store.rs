@@ -824,7 +824,9 @@ mod memory_store_tests {
     use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
     use std::convert::Infallible;
 
-    crate::timer_defer_store_tests!(async { Ok::<_, Infallible>(MemoryTimerDeferStore::new(SpanRelation::default())) });
+    crate::timer_defer_store_tests!(async {
+        Ok::<_, Infallible>(MemoryTimerDeferStore::new(SpanRelation::default()))
+    });
 }
 
 // ============================================================================
