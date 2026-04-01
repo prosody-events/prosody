@@ -24,11 +24,19 @@ use tokio::sync::Semaphore;
 use tracing::Span;
 
 #[derive(Debug, Clone)]
-struct TestError;
+enum TestError {
+    Permanent,
+    Transient,
+    Terminal,
+}
 
 impl Display for TestError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "test error")
+        match self {
+            Self::Permanent => write!(f, "permanent test error"),
+            Self::Transient => write!(f, "transient test error"),
+            Self::Terminal => write!(f, "terminal test error"),
+        }
     }
 }
 
@@ -36,28 +44,46 @@ impl Error for TestError {}
 
 impl ClassifyError for TestError {
     fn classify_error(&self) -> ErrorCategory {
-        ErrorCategory::Permanent
+        match self {
+            Self::Permanent => ErrorCategory::Permanent,
+            Self::Transient => ErrorCategory::Transient,
+            Self::Terminal => ErrorCategory::Terminal,
+        }
     }
 }
 
 #[derive(Clone)]
 struct MockHandler {
     call_count: Arc<AtomicUsize>,
-    fail: bool,
+    error: Option<TestError>,
 }
 
 impl MockHandler {
     fn success() -> Self {
         Self {
             call_count: Arc::new(AtomicUsize::new(0)),
-            fail: false,
+            error: None,
         }
     }
 
-    fn failing() -> Self {
+    fn failing_permanent() -> Self {
         Self {
             call_count: Arc::new(AtomicUsize::new(0)),
-            fail: true,
+            error: Some(TestError::Permanent),
+        }
+    }
+
+    fn failing_transient() -> Self {
+        Self {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            error: Some(TestError::Transient),
+        }
+    }
+
+    fn failing_terminal() -> Self {
+        Self {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            error: Some(TestError::Terminal),
         }
     }
 
@@ -79,7 +105,11 @@ impl FallibleHandler for MockHandler {
         C: EventContext,
     {
         self.call_count.fetch_add(1, Ordering::Relaxed);
-        if self.fail { Err(TestError) } else { Ok(()) }
+        if let Some(ref e) = self.error {
+            Err(e.clone())
+        } else {
+            Ok(())
+        }
     }
 
     async fn on_timer<C>(
@@ -211,8 +241,8 @@ async fn timer_passthrough() {
 }
 
 #[tokio::test]
-async fn failed_handler_does_not_cache() {
-    let handler = create_handler(MockHandler::failing());
+async fn permanent_error_is_deduplicated() {
+    let handler = create_handler(MockHandler::failing_permanent());
     let context = MockEventContext::new();
 
     let Some(msg1) = create_test_message("key1", Some("evt1")) else {
@@ -222,12 +252,59 @@ async fn failed_handler_does_not_cache() {
         return;
     };
 
-    // First call fails
+    // First call: permanent failure, should still write to dedup store
+    let result =
+        FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
+    assert!(result.is_err());
+    assert_eq!(handler.inner.call_count(), 1);
+
+    // Second call with same message: deduplicated — handler not called again
+    let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
+    assert!(result.is_ok());
+    assert_eq!(handler.inner.call_count(), 1);
+}
+
+#[tokio::test]
+async fn transient_error_does_not_deduplicate() {
+    let handler = create_handler(MockHandler::failing_transient());
+    let context = MockEventContext::new();
+
+    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
+        return;
+    };
+    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
+        return;
+    };
+
+    // First call: transient failure, must NOT write to dedup store
     let result =
         FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
     assert!(result.is_err());
 
-    // Second call should retry (not cached)
+    // Second call: not deduplicated — retry reaches handler again
+    let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
+    assert!(result.is_err());
+    assert_eq!(handler.inner.call_count(), 2);
+}
+
+#[tokio::test]
+async fn terminal_error_does_not_deduplicate() {
+    let handler = create_handler(MockHandler::failing_terminal());
+    let context = MockEventContext::new();
+
+    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
+        return;
+    };
+    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
+        return;
+    };
+
+    // First call: terminal failure, must NOT write to dedup store
+    let result =
+        FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
+    assert!(result.is_err());
+
+    // Second call: not deduplicated — handler reached again
     let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
     assert!(result.is_err());
     assert_eq!(handler.inner.call_count(), 2);
