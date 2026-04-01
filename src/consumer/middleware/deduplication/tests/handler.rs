@@ -95,7 +95,11 @@ impl FallibleHandler for MockHandler {
         C: EventContext,
     {
         self.call_count.fetch_add(1, Ordering::Relaxed);
-        if let Some(ref e) = self.error { Err(e.clone()) } else { Ok(()) }
+        if let Some(ref e) = self.error {
+            Err(e.clone())
+        } else {
+            Ok(())
+        }
     }
 
     async fn on_timer<C>(
