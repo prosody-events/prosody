@@ -249,9 +249,11 @@ where
             .map_err(DeduplicationError::Inner);
 
         // 4. Record in local cache and persistent store on success or permanent error.
-        // Permanent errors are non-retryable business rejections; deduplicating them
-        // prevents repeated processing of provably bad messages. Transient errors are
-        // left un-deduplicated so the retry layer can reattempt.
+        // Permanent errors are any message-level failures that won't succeed on retry
+        // (e.g., corruption, serialization/invalid data, non-retryable business
+        // rejections). Transient and terminal errors are left un-deduplicated:
+        // transient so the retry layer can reattempt, terminal because
+        // processing is being aborted.
         let should_dedup = match &result {
             Ok(()) => true,
             Err(e) => matches!(e.classify_error(), ErrorCategory::Permanent),

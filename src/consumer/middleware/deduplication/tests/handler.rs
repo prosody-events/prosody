@@ -27,6 +27,7 @@ use tracing::Span;
 enum TestError {
     Permanent,
     Transient,
+    Terminal,
 }
 
 impl Display for TestError {
@@ -34,6 +35,7 @@ impl Display for TestError {
         match self {
             Self::Permanent => write!(f, "permanent test error"),
             Self::Transient => write!(f, "transient test error"),
+            Self::Terminal => write!(f, "terminal test error"),
         }
     }
 }
@@ -45,6 +47,7 @@ impl ClassifyError for TestError {
         match self {
             Self::Permanent => ErrorCategory::Permanent,
             Self::Transient => ErrorCategory::Transient,
+            Self::Terminal => ErrorCategory::Terminal,
         }
     }
 }
@@ -74,6 +77,13 @@ impl MockHandler {
         Self {
             call_count: Arc::new(AtomicUsize::new(0)),
             error: Some(TestError::Transient),
+        }
+    }
+
+    fn failing_terminal() -> Self {
+        Self {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            error: Some(TestError::Terminal),
         }
     }
 
@@ -272,6 +282,29 @@ async fn transient_error_does_not_deduplicate() {
     assert!(result.is_err());
 
     // Second call: not deduplicated — retry reaches handler again
+    let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
+    assert!(result.is_err());
+    assert_eq!(handler.inner.call_count(), 2);
+}
+
+#[tokio::test]
+async fn terminal_error_does_not_deduplicate() {
+    let handler = create_handler(MockHandler::failing_terminal());
+    let context = MockEventContext::new();
+
+    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
+        return;
+    };
+    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
+        return;
+    };
+
+    // First call: terminal failure, must NOT write to dedup store
+    let result =
+        FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
+    assert!(result.is_err());
+
+    // Second call: not deduplicated — handler reached again
     let result = FallibleHandler::on_message(&handler, context, msg2, DemandType::Normal).await;
     assert!(result.is_err());
     assert_eq!(handler.inner.call_count(), 2);
