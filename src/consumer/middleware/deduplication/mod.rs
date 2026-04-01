@@ -242,18 +242,29 @@ where
         }
 
         // 3. Process message
-        self.inner
+        let result = self
+            .inner
             .on_message(context, message, demand_type)
             .await
-            .map_err(DeduplicationError::Inner)?;
+            .map_err(DeduplicationError::Inner);
 
-        // 4. Record in local cache and persistent store
-        self.cache.insert(dedup_uuid, ());
-        if let Err(error) = self.store.insert(dedup_uuid).await {
-            warn!("deduplication store write failed: {error:#}; continuing");
+        // 4. Record in local cache and persistent store on success or permanent error.
+        // Permanent errors are non-retryable business rejections; deduplicating them
+        // prevents repeated processing of provably bad messages. Transient errors are
+        // left un-deduplicated so the retry layer can reattempt.
+        let should_dedup = match &result {
+            Ok(()) => true,
+            Err(e) => matches!(e.classify_error(), ErrorCategory::Permanent),
+        };
+
+        if should_dedup {
+            self.cache.insert(dedup_uuid, ());
+            if let Err(error) = self.store.insert(dedup_uuid).await {
+                warn!("deduplication store write failed: {error:#}; continuing");
+            }
         }
 
-        Ok(())
+        result
     }
 
     async fn on_timer<C>(
