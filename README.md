@@ -35,20 +35,18 @@ prosody = { git = "https://github.com/cincpro/prosody.git" }
 ### High-Level Client Example
 
 ```rust
+use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::ConsumerConfiguration;
-use prosody::consumer::failure::retry::RetryConfiguration;
-use prosody::consumer::failure::topic::FailureTopicConfigurationBuilder;
-use prosody::consumer::failure::{FallibleHandler, ClassifyError};
-use prosody::consumer::message::ConsumerMessage;
+use prosody::consumer::DemandType;
 use prosody::consumer::event_context::EventContext;
-use prosody::timers::{Trigger, store::TriggerStore};
-use prosody::timers::store::cassandra::CassandraConfigurationBuilder;
+use prosody::consumer::message::ConsumerMessage;
+use prosody::consumer::middleware::FallibleHandler;
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{HighLevelClient};
+use prosody::high_level::{ConsumerBuilders, HighLevelClient};
 use prosody::producer::ProducerConfiguration;
+use prosody::timers::Trigger;
 use serde_json::json;
 use std::convert::Infallible;
-use std::error::Error;
 
 #[derive(Clone)]
 struct MyHandler;
@@ -59,7 +57,8 @@ impl FallibleHandler for MyHandler {
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage
+        message: ConsumerMessage,
+        _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
         C: EventContext,
@@ -72,6 +71,7 @@ impl FallibleHandler for MyHandler {
         &self,
         context: C,
         trigger: Trigger,
+        _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
         C: EventContext,
@@ -79,6 +79,8 @@ impl FallibleHandler for MyHandler {
         println!("Timer triggered: {trigger:?}");
         Ok(())
     }
+
+    async fn shutdown(self) {}
 }
 
 #[tokio::main]
@@ -87,29 +89,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The group identifier is the name of your Kafka consumer group. It should be set to the name of your application.
     let mut consumer_config = ConsumerConfiguration::builder();
-    consumer_config.bootstrap_servers(bootstrap_servers)
+    consumer_config
+        .bootstrap_servers(bootstrap_servers.clone())
         .group_id("my-group")
         .subscribed_topics(["my-topic".to_owned()]);
 
-
     // To allow loopbacks, the source_system must be different from the group_id.
-    // Normally, the source_system would be left unspecified and would default to the group_id if a consumer is 
+    // Normally, the source_system would be left unspecified and would default to the group_id if a consumer is
     // configured.
     let mut producer_config = ProducerConfiguration::builder();
     producer_config
-        .bootstrap_servers(bootstrap_servers.clone())
+        .bootstrap_servers(bootstrap_servers)
         .source_system("my-source");
 
-    let retry_config = RetryConfiguration::builder();
-    let cassandra_config = CassandraConfigurationBuilder::default();
+    let consumer_builders = ConsumerBuilders {
+        consumer: consumer_config,
+        ..ConsumerBuilders::default()
+    };
 
     let client = HighLevelClient::new(
         Mode::Pipeline,
         &mut producer_config,
-        &consumer_config,
-        &retry_config,
-        &FailureTopicConfigurationBuilder::default(),
-        &cassandra_config,
+        &consumer_builders,
+        &CassandraConfigurationBuilder::default(),
     )?;
 
     client.subscribe(MyHandler).await?;

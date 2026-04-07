@@ -20,7 +20,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
@@ -39,13 +39,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Linting
         run: cargo clippy -- -D warnings
-#          cargo clippy --all-features --message-format=json -- -D warnings
-#          | clippy-sarif
-#          | tee results.sarif
-#          | sarif-fmt
-#        continue-on-error: true
-#      - name: Upload analysis results to GitHub
-#        uses: github/codeql-action/upload-sarif@v3
-#        with:
-#          sarif_file: results.sarif
-#          wait-for-processing: true
+      - name: Linting (tests)
+        run: cargo clippy --tests -- -D warnings
