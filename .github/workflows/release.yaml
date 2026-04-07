@@ -35,7 +35,7 @@ jobs:
         with:
           release-type: rust
           package-name: prosody
-          token: ${{ secrets.TEMP_GH_ALL_REPOS_RW }}
+          token: ${{ secrets.GH_PAT }}
           release-as: ${{ github.event.inputs.release_as }}
 
   publish:
