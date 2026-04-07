@@ -3,12 +3,12 @@
 Prosody is a high-level Kafka client library for Rust, featuring robust consumer and producer implementations with
 integrated OpenTelemetry support for distributed tracing.
 
-[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://studious-enigma-6k896qq.pages.github.io/prosody)
-[![Build Status](https://github.com/cincpro/prosody/actions/workflows/general.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/general.yaml?query=branch%3Amain)
-[![Docs Status](https://github.com/cincpro/prosody/actions/workflows/documentation.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/documentation.yaml?query=branch%3Amain)
-[![Quality Status](https://github.com/cincpro/prosody/actions/workflows/quality.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/quality.yaml?query=branch%3Amain)
-[![Coverage Status](https://github.com/cincpro/prosody/actions/workflows/coverage.yaml/badge.svg?branch=main)](https://github.com/cincpro/prosody/actions/workflows/coverage.yaml?query=branch%3Amain)
-![Test Coverage](../../raw/badges/main/coverage-badge.svg)
+[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://prosody-events.github.io/prosody)
+[![Build Status](https://github.com/prosody-events/prosody/actions/workflows/general.yaml/badge.svg?branch=main)](https://github.com/prosody-events/prosody/actions/workflows/general.yaml?query=branch%3Amain)
+[![Docs Status](https://github.com/prosody-events/prosody/actions/workflows/documentation.yaml/badge.svg?branch=main)](https://github.com/prosody-events/prosody/actions/workflows/documentation.yaml?query=branch%3Amain)
+[![Quality Status](https://github.com/prosody-events/prosody/actions/workflows/quality.yaml/badge.svg?branch=main)](https://github.com/prosody-events/prosody/actions/workflows/quality.yaml?query=branch%3Amain)
+[![Coverage Status](https://github.com/prosody-events/prosody/actions/workflows/coverage.yaml/badge.svg?branch=main)](https://github.com/prosody-events/prosody/actions/workflows/coverage.yaml?query=branch%3Amain)
+![Test Coverage](https://raw.githubusercontent.com/prosody-events/prosody/badges/main/coverage-badge.svg)
 
 ## Features
 
