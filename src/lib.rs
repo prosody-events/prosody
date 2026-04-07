@@ -26,22 +26,16 @@
 //! ## High-Level Client Example
 //!
 //! ```no_run
-//! use prosody::consumer::ConsumerConfiguration;
-//! use prosody::consumer::middleware::retry::RetryConfiguration;
-//! use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
-//! use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
-//! use prosody::consumer::middleware::topic::FailureTopicConfigurationBuilder;
-//! use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
-//! use prosody::consumer::middleware::FallibleHandler;
-//! use prosody::error::ClassifyError;
-//! use prosody::consumer::DemandType;
-//! use prosody::consumer::message::ConsumerMessage;
-//! use prosody::consumer::event_context::EventContext;
-//! use prosody::timers::{Trigger, store::TriggerStore};
 //! use prosody::cassandra::config::CassandraConfigurationBuilder;
+//! use prosody::consumer::ConsumerConfiguration;
+//! use prosody::consumer::DemandType;
+//! use prosody::consumer::event_context::EventContext;
+//! use prosody::consumer::message::ConsumerMessage;
+//! use prosody::consumer::middleware::FallibleHandler;
 //! use prosody::high_level::mode::Mode;
 //! use prosody::high_level::{ConsumerBuilders, HighLevelClient};
 //! use prosody::producer::ProducerConfiguration;
+//! use prosody::timers::Trigger;
 //! use serde_json::json;
 //! use std::convert::Infallible;
 //! use std::error::Error;
@@ -101,13 +95,7 @@
 //!
 //!     let consumer_builders = ConsumerBuilders {
 //!         consumer: consumer_config,
-//!         retry: RetryConfiguration::builder(),
-//!         failure_topic: FailureTopicConfigurationBuilder::default(),
-//!         scheduler: SchedulerConfigurationBuilder::default(),
-//!         monopolization: Default::default(),
-//!         defer: DeferConfigurationBuilder::default(),
-//!         timeout: TimeoutConfigurationBuilder::default(),
-//!         emitter: Default::default(),
+//!         ..ConsumerBuilders::default()
 //!     };
 //!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
