@@ -31,11 +31,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Release Please Action
         id: release
-        uses: google-github-actions/release-please-action@v3
+        uses: googleapis/release-please-action@v4
         with:
-          release-type: rust
-          package-name: prosody
           token: ${{ secrets.GH_PAT }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
           release-as: ${{ github.event.inputs.release_as }}
 
   publish:
