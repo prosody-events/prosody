@@ -26,19 +26,9 @@
 //! ## High-Level Client Example
 //!
 //! ```no_run
-//! use prosody::cassandra::config::CassandraConfigurationBuilder;
-//! use prosody::consumer::ConsumerConfiguration;
-//! use prosody::consumer::DemandType;
-//! use prosody::consumer::event_context::EventContext;
-//! use prosody::consumer::message::ConsumerMessage;
-//! use prosody::consumer::middleware::FallibleHandler;
-//! use prosody::high_level::mode::Mode;
-//! use prosody::high_level::{ConsumerBuilders, HighLevelClient};
-//! use prosody::producer::ProducerConfiguration;
-//! use prosody::timers::Trigger;
+//! use prosody::prelude::*;
 //! use serde_json::json;
 //! use std::convert::Infallible;
-//! use std::error::Error;
 //!
 //! #[derive(Clone)]
 //! struct MyHandler;
@@ -48,9 +38,9 @@
 //!
 //!     async fn on_message<C>(
 //!         &self,
-//!         context: C,
+//!         _context: C,
 //!         message: ConsumerMessage,
-//!         _demand_type: DemandType
+//!         _demand_type: DemandType,
 //!     ) -> Result<(), Self::Error>
 //!     where
 //!         C: EventContext,
@@ -61,43 +51,42 @@
 //!
 //!     async fn on_timer<C>(
 //!         &self,
-//!         context: C,
+//!         _context: C,
 //!         trigger: Trigger,
 //!         _demand_type: DemandType,
 //!     ) -> Result<(), Self::Error>
 //!     where
 //!         C: EventContext,
 //!     {
-//!         println!("Timer triggered: {trigger:?}");
+//!         println!("Timer fired for key: {}", trigger.key);
 //!         Ok(())
 //!     }
 //!
-//!     async fn shutdown(self) {
-//!         println!("Handler shutting down");
-//!     }
+//!     async fn shutdown(self) {}
 //! }
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn Error>> {
-//!     let bootstrap_servers = ["localhost:9092".to_owned()];
-//!
-//!     // To allow loopbacks, the source_system must be different from the group_id.
-//!     // Normally, the source_system would be left unspecified, which would default to the group_id.
-//!     let mut producer_config = ProducerConfiguration::builder();
-//!     producer_config
-//!         .bootstrap_servers(bootstrap_servers.clone())
-//!         .source_system("my-source");
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let bootstrap_servers = vec!["localhost:9094".to_owned()];
 //!
 //!     let mut consumer_config = ConsumerConfiguration::builder();
-//!     consumer_config.bootstrap_servers(bootstrap_servers)
+//!     consumer_config
+//!         .bootstrap_servers(bootstrap_servers.clone())
 //!         .group_id("my-group")
 //!         .subscribed_topics(["my-topic".to_owned()]);
+//!
+//!     let mut producer_config = ProducerConfiguration::builder();
+//!     producer_config
+//!         .bootstrap_servers(bootstrap_servers)
+//!         .source_system("my-source");
+//!
+//!     let mut cassandra_config = CassandraConfigurationBuilder::default();
+//!     cassandra_config.nodes(vec!["localhost:9042".to_owned()]);
 //!
 //!     let consumer_builders = ConsumerBuilders {
 //!         consumer: consumer_config,
 //!         ..ConsumerBuilders::default()
 //!     };
-//!     let cassandra_config = CassandraConfigurationBuilder::default();
 //!
 //!     let client = HighLevelClient::new(
 //!         Mode::Pipeline,
@@ -108,8 +97,7 @@
 //!
 //!     client.subscribe(MyHandler).await?;
 //!
-//!     let topic = "my-topic".into();
-//!     client.send(topic, "message-key", &json!({"value": "Hello, Kafka!"})).await?;
+//!     client.send("my-topic".into(), "message-key", &json!({"value": "Hello, Kafka!"})).await?;
 //!
 //!     // Run your application logic here
 //!
@@ -248,12 +236,15 @@ pub mod error;
 pub mod heartbeat;
 pub mod high_level;
 pub mod otel;
+pub mod prelude;
 pub mod producer;
 pub mod propagator;
 pub mod telemetry;
 pub mod timers;
 pub mod tracing;
 mod util;
+
+pub use crate::error::{ClassifyError, ErrorCategory};
 
 /// A lazily initialized mock Kafka cluster for testing.
 ///

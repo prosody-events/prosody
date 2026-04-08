@@ -20,7 +20,7 @@ use crate::consumer::{
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
 };
-use crate::high_level::mode::Mode;
+pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::producer::{
     ProducerConfiguration, ProducerConfigurationBuilder, ProducerConfigurationBuilderError,

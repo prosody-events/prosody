@@ -122,10 +122,13 @@
 //! - `probes`: HTTP endpoints for health and readiness checking
 
 use crate::cassandra::CassandraStore;
-use crate::consumer::event_context::EventContext;
+pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::kafka_context::Context;
+pub use crate::consumer::message::ConsumerMessage;
 use crate::consumer::message::UncommittedMessage;
+pub use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::HandlerMiddleware;
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::deduplication::{
     DeduplicationConfiguration, DeduplicationMiddleware, DeduplicationStoreProvider,
@@ -148,7 +151,6 @@ use crate::consumer::middleware::timeout::{
     TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
 };
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
-use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::PollConfig;
 use crate::consumer::poll::poll;
