@@ -29,7 +29,7 @@ Add Prosody to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-prosody = { git = "https://github.com/cincpro/prosody.git" }
+prosody = { git = "https://github.com/prosody-events/prosody.git" }
 ```
 
 ### High-Level Client Example
@@ -620,42 +620,42 @@ limiting the total number of in-flight messages across all keys within a partiti
 flowchart TD
     classDef subgraphStyle fill:#f5f5f5,stroke:#666
 
-    HLC["<a href='https://github.com/cincpro/prosody/tree/main/src/high_level/mod.rs'>HighLevelClient</a>"]
-    HLC --> Producer["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/mod.rs'>ProsodyProducer</a>"]
-    HLC --> ConsumerMain["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/mod.rs'>ProsodyConsumer</a>"]
+    HLC["<a href='https://github.com/prosody-events/prosody/tree/main/src/high_level/mod.rs'>HighLevelClient</a>"]
+    HLC --> Producer["<a href='https://github.com/prosody-events/prosody/tree/main/src/producer/mod.rs'>ProsodyProducer</a>"]
+    HLC --> ConsumerMain["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/mod.rs'>ProsodyConsumer</a>"]
 
     subgraph ProducerComponents["Producer Components"]
-        Producer --> KafkaProducer["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/mod.rs'>Kafka Producer</a>"]
-        Producer --> ICache["<a href='https://github.com/cincpro/prosody/tree/main/src/deduplication.rs'>Idempotence Cache</a>"]
-        Producer --> PropP["<a href='https://github.com/cincpro/prosody/tree/main/src/propagator.rs'>OpenTelemetry Propagator</a>"]
+        Producer --> KafkaProducer["<a href='https://github.com/prosody-events/prosody/tree/main/src/producer/mod.rs'>Kafka Producer</a>"]
+        Producer --> ICache["<a href='https://github.com/prosody-events/prosody/tree/main/src/deduplication.rs'>Idempotence Cache</a>"]
+        Producer --> PropP["<a href='https://github.com/prosody-events/prosody/tree/main/src/propagator.rs'>OpenTelemetry Propagator</a>"]
     end
 
     subgraph ConsumerComponents["Consumer Components"]
-        ConsumerMain --> Context["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/kafka_context.rs'>ConsumerContext</a>"]
-        ConsumerMain --> PollLoop["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/poll.rs'>Poll Loop</a>"]
-        ConsumerMain --> ProbeServer["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/probes.rs'>Probe Server</a>"]
+        ConsumerMain --> Context["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/kafka_context.rs'>ConsumerContext</a>"]
+        ConsumerMain --> PollLoop["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/poll.rs'>Poll Loop</a>"]
+        ConsumerMain --> ProbeServer["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/probes.rs'>Probe Server</a>"]
         Context --> PMgr
         PollLoop --> PMgr
     end
 
     subgraph PartitionComponents["Partition Processing"]
-        PMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/mod.rs'>Partition Manager</a>"]
-        PMgr --> KeyMgr["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/keyed/mod.rs'>Key Manager</a>"]
-        PMgr --> OTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Offset Tracker</a>"]
+        PMgr["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/partition/mod.rs'>Partition Manager</a>"]
+        PMgr --> KeyMgr["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/partition/keyed/mod.rs'>Key Manager</a>"]
+        PMgr --> OTracker["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Offset Tracker</a>"]
         KeyMgr --> EHandler["Event Handler"]
-        OTracker --> WTracker["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Watermark Tracker</a>"]
+        OTracker --> WTracker["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/partition/offsets/mod.rs'>Watermark Tracker</a>"]
     end
 
     subgraph MiddlewareHandling["Middleware Components"]
-        RetryS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/retry.rs'>Retry Middleware</a>"]
-        DedupS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/deduplication/mod.rs'>Deduplication Middleware</a>"]
-        DeferS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/defer/mod.rs'>Defer Middleware</a>"]
-        MonoS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/monopolization.rs'>Monopolization Middleware</a>"]
-        SchedS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/scheduler/mod.rs'>Scheduler Middleware</a>"]
-        TelS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/telemetry.rs'>Telemetry Middleware</a>"]
-        LogS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/log.rs'>Log Middleware</a>"]
-        ShutdownS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/shutdown.rs'>Shutdown Middleware</a>"]
-        TopicS["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/middleware/topic.rs'>Failure Topic Middleware</a>"]
+        RetryS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/retry.rs'>Retry Middleware</a>"]
+        DedupS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/deduplication/mod.rs'>Deduplication Middleware</a>"]
+        DeferS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/defer/mod.rs'>Defer Middleware</a>"]
+        MonoS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/monopolization.rs'>Monopolization Middleware</a>"]
+        SchedS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/scheduler/mod.rs'>Scheduler Middleware</a>"]
+        TelS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/telemetry.rs'>Telemetry Middleware</a>"]
+        LogS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/log.rs'>Log Middleware</a>"]
+        ShutdownS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/shutdown.rs'>Shutdown Middleware</a>"]
+        TopicS["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/middleware/topic.rs'>Failure Topic Middleware</a>"]
     end
 
     KeyMgr -.-> MiddlewareHandling
@@ -663,10 +663,10 @@ flowchart TD
     Producer --> FTopic
 
     subgraph TracingSystem["OpenTelemetry Integration"]
-        OTel["<a href='https://github.com/cincpro/prosody/tree/main/src/telemetry/mod.rs'>Telemetry</a>"]
-        Prop["<a href='https://github.com/cincpro/prosody/tree/main/src/propagator.rs'>Propagator</a>"]
-        MExtract["<a href='https://github.com/cincpro/prosody/tree/main/src/consumer/extractor.rs'>Message Extractor</a>"]
-        RInject["<a href='https://github.com/cincpro/prosody/tree/main/src/producer/injector.rs'>Record Injector</a>"]
+        OTel["<a href='https://github.com/prosody-events/prosody/tree/main/src/telemetry/mod.rs'>Telemetry</a>"]
+        Prop["<a href='https://github.com/prosody-events/prosody/tree/main/src/propagator.rs'>Propagator</a>"]
+        MExtract["<a href='https://github.com/prosody-events/prosody/tree/main/src/consumer/extractor.rs'>Message Extractor</a>"]
+        RInject["<a href='https://github.com/prosody-events/prosody/tree/main/src/producer/injector.rs'>Record Injector</a>"]
         OTel --> Prop
         Prop --> MExtract
         Prop --> RInject
