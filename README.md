@@ -22,9 +22,9 @@ action across multiple downstream consumers requires explicit trace context prop
 Prosody is a Kafka client library for Rust that addresses these constraints, backed by Cassandra for persistent state.
 Deferred retry stores failing message offsets in Cassandra and schedules a timer, so a key can fail and recover without
 blocking other keys or violating ordering. Fair scheduling prevents any single key from monopolizing partition capacity.
-Idempotence records and source-system filtering handle at-least-once delivery, with deduplication state persisted to
-Cassandra across restarts and rebalances. OpenTelemetry integration propagates trace context through the full event
-chain. Handler timeouts and stall detection cover the remaining operational surface.
+Idempotence records and source-system filtering reduce duplicate processing on a best-effort basis; deduplication state
+is persisted to Cassandra across restarts and rebalances, but handlers must still be designed to be idempotent. OpenTelemetry integration propagates trace context through the full event
+chain. Handler timeouts cancel handlers that exceed their deadline, preventing a single slow or hung handler from blocking concurrency for other keys indefinitely; stall detection identifies partitions that have stopped making progress so the orchestrator can restart the process before the lag becomes irrecoverable.
 
 ## Features
 
@@ -35,8 +35,8 @@ chain. Handler timeouts and stall detection cover the remaining operational surf
   mode adds deferred retry and monopolization detection.
 - **Deferred Retry**: Moves transiently-failing keys to timer-based retry, unblocking the partition to continue
   processing other keys (Pipeline mode).
-- **Message Deduplication**: Two-tier cache (in-memory + Cassandra) prevents duplicate processing. Source-system headers
-  prevent producer/consumer loops.
+- **Message Deduplication**: Two-tier cache (in-memory + Cassandra) reduces duplicate processing on a best-effort basis. Source-system headers
+  reduce producer/consumer loops. Handlers must still be designed to be idempotent.
 - **Event Filtering**: Filters messages by event type prefix; unmatched events are committed without processing.
 - **Health Probes**: Built-in `/readyz` and `/livez` HTTP endpoints for Kubernetes liveness and readiness checks.
 - **Distributed Tracing**: OpenTelemetry integration for tracing message flow across services.
@@ -279,8 +279,8 @@ If no prefixes are configured, all messages are processed. Messages without a `t
 
 ## Message Deduplication
 
-Prosody prevents duplicate message processing using two mechanisms: **source system deduplication** and **idempotence
-deduplication**.
+Prosody reduces duplicate message processing on a best-effort basis using two mechanisms: **source system deduplication**
+and **idempotence deduplication**. Deduplication is not guaranteed — handlers must still be designed to be idempotent.
 
 ### Source System Deduplication
 

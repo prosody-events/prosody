@@ -1,6 +1,6 @@
 [package]
 categories = ["asynchronous", "network-programming"]
-description = "Event sourcing library that isolates per-key failures so they cannot block the partition or starve other keys, with persistent distributed timers"
+description = "Event sourcing library with persistent timers that isolates per-key failures"
 edition = "2024"
 keywords = [
     "distributed-systems",
@@ -13,7 +13,7 @@ license = "MIT"
 name = "prosody"
 readme = "README.md"
 repository = "https://github.com/prosody-events/prosody"
-version = "0.0.0"
+version = "0.1.0"
 
 [dependencies]
 ahash = "0.8"
