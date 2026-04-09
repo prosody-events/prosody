@@ -79,7 +79,8 @@ pub mod uncommitted;
 /// separately across concurrent timer pools.
 ///
 /// Application code should use [`TimerType::Application`] when scheduling
-/// timers via [`EventContext::schedule`] or [`EventContext::clear_and_schedule`].
+/// timers via [`crate::consumer::event_context::EventContext::schedule`] or
+/// [`crate::consumer::event_context::EventContext::clear_and_schedule`].
 /// The `DeferredMessage` and `DeferredTimer` variants are reserved for internal
 /// middleware use.
 #[derive(
@@ -100,7 +101,7 @@ pub mod uncommitted;
 #[repr(i8)]
 pub enum TimerType {
     /// Application-scheduled timer. Use this when scheduling timers from a
-    /// handler via [`EventContext`].
+    /// handler via [`crate::consumer::event_context::EventContext`].
     #[default]
     Application = 0,
     /// Internal: timer scheduled by defer middleware to retry a failed message.
