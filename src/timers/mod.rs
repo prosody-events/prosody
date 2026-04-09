@@ -52,7 +52,7 @@
 //! ```
 
 use crate::Key;
-use crate::timers::datetime::CompactDateTime;
+pub use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::ParseError;
 use arc_swap::ArcSwap;
 use educe::Educe;
@@ -75,10 +75,14 @@ mod slab_lock;
 pub mod store;
 pub mod uncommitted;
 
-/// Timer type identifier for distinguishing concurrent timer types.
+/// Classifies a timer by its origin, used to route and account for execution
+/// separately across concurrent timer pools.
 ///
-/// Timers can have different types that determine their purpose and routing.
-/// This is an internal classification not exposed to applications.
+/// Application code should use [`TimerType::Application`] when scheduling
+/// timers via [`crate::consumer::event_context::EventContext::schedule`] or
+/// [`crate::consumer::event_context::EventContext::clear_and_schedule`].
+/// The `DeferredMessage` and `DeferredTimer` variants are reserved for internal
+/// middleware use.
 #[derive(
     Copy,
     Clone,
@@ -96,12 +100,13 @@ pub mod uncommitted;
 #[serde(rename_all = "camelCase")]
 #[repr(i8)]
 pub enum TimerType {
-    /// User-scheduled application timers (default).
+    /// Application-scheduled timer. Use this when scheduling timers from a
+    /// handler via [`crate::consumer::event_context::EventContext`].
     #[default]
     Application = 0,
-    /// Defer middleware message retry timers.
+    /// Internal: timer scheduled by defer middleware to retry a failed message.
     DeferredMessage = 1,
-    /// Defer middleware timer retry timers.
+    /// Internal: timer scheduled by defer middleware to retry a failed timer.
     DeferredTimer = 2,
 }
 
