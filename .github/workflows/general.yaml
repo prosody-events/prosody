@@ -11,10 +11,6 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-permissions:
-  contents: write
-  pages: write
-  id-token: write
 jobs:
   test:
     name: Tests
