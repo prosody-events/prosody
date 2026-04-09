@@ -1,6 +1,6 @@
 [package]
 categories = ["asynchronous", "network-programming"]
-description = "A high-level Kafka client library with OpenTelemetry integration for distributed tracing"
+description = "Event sourcing library that isolates per-key failures so they cannot block the partition or starve other keys, with persistent distributed timers"
 edition = "2024"
 keywords = [
     "distributed-systems",
