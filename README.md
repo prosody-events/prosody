@@ -24,7 +24,7 @@ Deferred retry stores failing message offsets in Cassandra and schedules a timer
 blocking other keys or violating ordering. Fair scheduling prevents any single key from monopolizing partition capacity.
 Idempotence records and source-system filtering reduce duplicate processing on a best-effort basis; deduplication state
 is persisted to Cassandra across restarts and rebalances, but handlers must still be designed to be idempotent. OpenTelemetry integration propagates trace context through the full event
-chain. Handler timeouts and stall detection cover the remaining operational surface.
+chain. Handler timeouts cancel handlers that exceed their deadline, preventing a single slow or hung handler from blocking concurrency for other keys indefinitely; stall detection identifies partitions that have stopped making progress so the orchestrator can restart the process before the lag becomes irrecoverable.
 
 ## Features
 
