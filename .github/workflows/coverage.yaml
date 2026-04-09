@@ -6,6 +6,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_TEST_DEBUG: 0
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 permissions:
   contents: write
   pages: write
@@ -47,9 +48,9 @@ jobs:
           --health-retries 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install system dependencies
-        uses: awalsh128/cache-apt-pkgs-action@latest
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
           packages: cmake libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@stable
@@ -73,7 +74,7 @@ jobs:
           echo "BADGE_PATH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}/coverage-badge.svg" >> $GITHUB_ENV
         env:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: badges
 
@@ -85,7 +86,7 @@ jobs:
 
       # Use the output from the `environment` step
       - name: Generate the badge SVG image
-        uses: emibcn/badge-action@v2.0.3
+        uses: emibcn/badge-action@v2.0.4
         id: badge
         with:
           label: 'Coverage'
@@ -94,7 +95,7 @@ jobs:
           path: ${{ env.BADGE_PATH }}
 
       - name: Upload badge as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: badge
           path: ${{ env.BADGE_PATH }}
@@ -110,7 +111,7 @@ jobs:
           git add "${BADGE}"
           git commit -m "Add/Update badge"
       - name: Push badge commit
-        uses: ad-m/github-push-action@master
+        uses: ad-m/github-push-action@v1.0.0
         if: ${{ success() }}
         with:
           branch: badges
