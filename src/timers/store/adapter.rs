@@ -195,14 +195,11 @@ where
         // - Atomically DELETEs all clustering rows for this key/type
         // - UPDATEs the static singleton slot with the new timer
         // For singleton→singleton replacement, no tombstones are created.
-        // Box clear_and_schedule_key to keep its (Overflow-inflated) state
-        // machine on the heap rather than embedding it inline in the try_join!
-        // combined future, which would overflow the worker stack.
         let ((), (), old_times) = try_join!(
             self.operations.insert_slab(new_slab.clone()),
             self.operations
                 .insert_slab_trigger(new_slab, trigger.clone()),
-            Box::pin(self.operations.clear_and_schedule_key(trigger)),
+            self.operations.clear_and_schedule_key(trigger),
         )?;
 
         debug!(
