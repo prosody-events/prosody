@@ -32,8 +32,7 @@ use crate::telemetry::{EmitterError, Telemetry, spawn_telemetry_emitter};
 use crate::{Payload, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -422,8 +421,8 @@ fn missing_topics(
     producer: &ProsodyProducer,
     mut topics: Vec<Topic>,
 ) -> Result<Vec<Topic>, ProducerError> {
-    const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
-    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    const TIMEOUT: Duration = Duration::from_secs(60);
+    let metadata = producer.kafka_client().fetch_metadata(None, TIMEOUT)?;
 
     topics.sort_unstable();
     topics.dedup();
@@ -431,39 +430,22 @@ fn missing_topics(
     // Filter out topics that start with '^' as they are pattern-based subscriptions
     topics.retain(|topic| !topic.starts_with('^'));
 
-    // Retry until all topics appear or the total timeout elapses. A single
-    // fetch_metadata call can return stale cached metadata that predates a
-    // freshly-created topic, causing spurious "topics not found" failures under
-    // high concurrency. Polling until the topics appear (or timeout) is robust
-    // against metadata propagation lag.
-    let deadline = Instant::now() + TOTAL_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let metadata = producer
-            .kafka_client()
-            .fetch_metadata(None, remaining.max(POLL_INTERVAL))?;
+    for metadata_topic in metadata.topics() {
+        let topic_name = metadata_topic.name();
+        let Some(position) = topics
+            .iter()
+            .position(|&topic| topic.as_ref() == topic_name)
+        else {
+            continue;
+        };
 
-        let mut remaining_topics = topics.clone();
-        for metadata_topic in metadata.topics() {
-            let topic_name = metadata_topic.name();
-            let Some(position) = remaining_topics
-                .iter()
-                .position(|&topic| topic.as_ref() == topic_name)
-            else {
-                continue;
-            };
-            remaining_topics.swap_remove(position);
-            if remaining_topics.is_empty() {
-                return Ok(remaining_topics);
-            }
+        topics.swap_remove(position);
+        if topics.is_empty() {
+            return Ok(topics);
         }
-
-        if Instant::now() >= deadline {
-            return Ok(remaining_topics);
-        }
-
-        sleep(POLL_INTERVAL);
     }
+
+    Ok(topics)
 }
 
 /// Errors that can occur in the `HighLevelClient` operations.
