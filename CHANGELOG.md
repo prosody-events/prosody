@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/prosody-events/prosody/compare/prosody-v0.1.0...prosody-v0.1.1) (2026-04-10)
+
+
+### Performance Improvements
+
+* eliminate slab scans from clear_and_schedule ([#13](https://github.com/prosody-events/prosody/issues/13)) ([23e7c26](https://github.com/prosody-events/prosody/commit/23e7c26af2453dbadaa4ed9ea92371294bd23936))
+
 ## 0.1.0 (2026-04-09)
 
 
