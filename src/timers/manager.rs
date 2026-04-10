@@ -310,7 +310,7 @@ where
                 // The store layer handles singleton/overflow routing internally.
                 state
                     .store
-                    .add_trigger(slab, trigger.clone())
+                    .add_trigger(trigger.clone())
                     .await
                     .map_err(TimerManagerError::Store)?;
 
@@ -405,7 +405,7 @@ where
                 // Remove from persistent storage.
                 state
                     .store
-                    .remove_trigger(&slab, key, time, timer_type)
+                    .remove_trigger(key, time, timer_type)
                     .await
                     .map_err(TimerManagerError::Store)?;
 
@@ -497,19 +497,11 @@ where
             .try_collect()
             .await?;
 
-        // Collect slabs that contain old triggers (for cleanup)
-        let old_slabs: Vec<Slab> = existing_triggers
-            .iter()
-            .filter(|t| t.time != trigger.time)
-            .map(|t| Slab::from_time(self.0.segment.slab_size, t.time))
-            .collect();
-
         debug!(
             key = %trigger.key,
             timer_type = ?trigger.timer_type,
             new_time = ?trigger.time,
             existing_count = existing_triggers.len(),
-            old_slab_count = old_slabs.len(),
             "clear_and_schedule: read existing triggers, preparing state transitions"
         );
 
@@ -580,12 +572,11 @@ where
             key = %trigger.key,
             timer_type = ?trigger.timer_type,
             new_time = ?trigger.time,
-            old_slab_count = old_slabs.len(),
             "clear_and_schedule: persisting to store"
         );
         state
             .store
-            .clear_and_schedule(new_slab, trigger.clone(), old_slabs)
+            .clear_and_schedule(trigger.clone())
             .await
             .map_err(TimerManagerError::Store)?;
 
@@ -695,7 +686,7 @@ where
         // Remove from storage.
         state
             .store
-            .remove_trigger(&slab, key, time, timer_type)
+            .remove_trigger(key, time, timer_type)
             .await
             .map_err(TimerManagerError::Store)?;
 

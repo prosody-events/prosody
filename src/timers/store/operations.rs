@@ -92,7 +92,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     /// Streams ALL triggers within a slab across all timer types.
     fn get_slab_triggers_all_types(
         &self,
-        slab: &Slab,
+        slab: Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     /// Inserts a trigger into the slab index.

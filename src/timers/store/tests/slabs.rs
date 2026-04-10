@@ -45,7 +45,7 @@ where
             TimerType::Application,
             tracing::Span::current(),
         );
-        add_trigger(store, segment, &trigger).await?;
+        add_trigger(store, &trigger).await?;
     }
 
     // Test range 5..=15 should return [5, 10, 15]

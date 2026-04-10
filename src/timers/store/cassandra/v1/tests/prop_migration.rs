@@ -311,9 +311,7 @@ async fn setup_v3_state(
             trigger_data.timer_type,
             Span::current(),
         );
-        let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
-
-        Box::pin(store.add_trigger(slab, trigger))
+        Box::pin(store.add_trigger(trigger))
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to add V3 trigger: {e:?}"))?;
     }
@@ -447,10 +445,8 @@ async fn verify_correct_indexing(
 
     // Verify each slab has correct triggers
     for (slab_id, expected) in &expected_by_slab {
-        let slab = Slab::new(*slab_id, model.segment.slab_size);
-
         let actual_triggers: Vec<Trigger> = store
-            .get_slab_triggers_all_types(&slab)
+            .get_slab_triggers_all_types(*slab_id)
             .try_collect()
             .await
             .map_err(|e| {
@@ -491,9 +487,8 @@ async fn verify_dual_index_consistency(
     let slab_ids = model.expected_slab_ids();
 
     for slab_id in slab_ids {
-        let slab = Slab::new(slab_id, model.segment.slab_size);
         let triggers: Vec<Trigger> = store
-            .get_slab_triggers_all_types(&slab)
+            .get_slab_triggers_all_types(slab_id)
             .try_collect()
             .await
             .map_err(|e| {

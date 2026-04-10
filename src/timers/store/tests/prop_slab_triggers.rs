@@ -269,7 +269,7 @@ where
     let slab_id = slab.id();
     let expected = model.get_all_types(slab_id);
     let actual: Vec<Trigger> = operations
-        .get_slab_triggers_all_types(slab)
+        .get_slab_triggers_all_types(slab.clone())
         .try_collect()
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} GetAllTypes failed: {e:?}"))?;
@@ -319,7 +319,7 @@ where
         // Verify get_slab_triggers_all_types
         let expected_all = model.get_all_types(slab_id);
         let store_all: Vec<Trigger> = operations
-            .get_slab_triggers_all_types(&slab)
+            .get_slab_triggers_all_types(slab)
             .try_collect()
             .await
             .map_err(|e| {

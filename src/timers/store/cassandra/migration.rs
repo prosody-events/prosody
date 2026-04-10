@@ -372,7 +372,7 @@ pub(crate) async fn migrate_key_states(
             async move {
                 let slab = Slab::new(slab_id, slab_size);
                 let triggers: Vec<_> = store
-                    .get_slab_triggers_all_types(&slab)
+                    .get_slab_triggers_all_types(slab)
                     .try_collect()
                     .await?;
                 let pairs: HashSet<(Key, TimerType)> = triggers
@@ -472,7 +472,7 @@ async fn migrate_triggers_to_new_slabs(
                 let old_slab_size = segment.slab_size;
                 let old_slab = Slab::new(old_slab_id, old_slab_size);
                 let mut new_slab_ids = HashSet::default();
-                let trigger_stream = store.get_slab_triggers_all_types(&old_slab);
+                let trigger_stream = store.get_slab_triggers_all_types(old_slab);
                 tokio::pin!(trigger_stream);
 
                 while let Some(trigger) = cooperative(trigger_stream.try_next()).await? {

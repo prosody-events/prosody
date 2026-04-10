@@ -300,7 +300,7 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self))]
     fn get_slab_triggers_all_types(
         &self,
-        slab: &Slab,
+        slab: Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let segment_id = self.segment.id;
         let slab_size = slab.size().seconds() as i32;

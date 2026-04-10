@@ -271,7 +271,7 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// A stream of all `Trigger`s in the slab, regardless of timer type.
     fn get_slab_triggers_all_types(
         &self,
-        slab: &Slab,
+        slab: Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> {
         let segment_id = self.segment.id;
         let slab_size = slab.size();

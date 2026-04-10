@@ -48,22 +48,22 @@ where
         match i % 4 {
             // Insert new or re-insert (idempotent operation)
             0 | 2 => {
-                add_trigger(store, &input.segment, trigger).await?;
+                add_trigger(store, trigger).await?;
                 key_times.insert(trigger.time);
             }
             // Delete if exists (or insert if doesn't)
             1 => {
                 if time_exists {
-                    remove_trigger(store, &input.segment, &trigger.key, trigger.time).await?;
+                    remove_trigger(store, &trigger.key, trigger.time, trigger.timer_type).await?;
                     key_times.remove(&trigger.time);
                 } else {
-                    add_trigger(store, &input.segment, trigger).await?;
+                    add_trigger(store, trigger).await?;
                     key_times.insert(trigger.time);
                 }
             }
             // Delete regardless of existence
             _ => {
-                remove_trigger(store, &input.segment, &trigger.key, trigger.time).await?;
+                remove_trigger(store, &trigger.key, trigger.time, trigger.timer_type).await?;
                 key_times.remove(&trigger.time);
             }
         }

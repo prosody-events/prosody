@@ -39,7 +39,7 @@ where
 
         let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
-        add_trigger(store, segment, &trigger).await?;
+        add_trigger(store, &trigger).await?;
     }
 
     // Verify all triggers were added
@@ -56,7 +56,7 @@ where
     // Test selective removal - remove every other trigger
     for (i, &time) in all_times.iter().enumerate() {
         if i % 2 == 0 {
-            remove_trigger(store, segment, &key, time).await?;
+            remove_trigger(store, &key, time, TimerType::Application).await?;
         }
     }
 
@@ -80,7 +80,7 @@ where
     if let Some(&time) = all_times.first() {
         let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
-        add_trigger(store, segment, &trigger).await?;
+        add_trigger(store, &trigger).await?;
 
         // Verify it was added back
         let updated_times = get_key_triggers(store, &segment.id, &key).await?;
