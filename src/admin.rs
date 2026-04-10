@@ -10,6 +10,7 @@ use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, Top
 use rdkafka::client::DefaultClientContext;
 use rdkafka::error::KafkaError;
 use thiserror::Error;
+use tokio::time::sleep;
 use validator::Validate;
 pub use validator::ValidationErrors;
 
@@ -156,6 +157,8 @@ impl TopicConfiguration {
 const TOPIC_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-attempt timeout for each `describe_configs` poll.
 const TOPIC_READY_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+/// Sleep between poll attempts to avoid spinning on fast-failing calls.
+const TOPIC_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A client for performing administrative operations on Kafka topics.
 pub struct ProsodyAdminClient {
@@ -282,6 +285,8 @@ impl ProsodyAdminClient {
             if Instant::now() >= deadline {
                 return Err(ProsodyAdminClientError::TopicNotReady(config.name.clone()));
             }
+
+            sleep(TOPIC_READY_POLL_INTERVAL).await;
         }
     }
 
