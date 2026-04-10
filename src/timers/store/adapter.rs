@@ -221,7 +221,8 @@ where
         // For singleton→singleton replacement, no tombstones are created.
         try_join!(
             self.operations.insert_slab(new_slab.clone()),
-            self.operations.insert_slab_trigger(new_slab, trigger.clone()),
+            self.operations
+                .insert_slab_trigger(new_slab, trigger.clone()),
             self.operations.clear_and_schedule_key(trigger),
         )?;
 

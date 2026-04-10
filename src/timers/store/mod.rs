@@ -295,10 +295,8 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// Implementations should attempt to keep both tables in sync.
     /// Transactional backends can provide ACID guarantees.
-    fn add_trigger(
-        &self,
-        trigger: Trigger,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn add_trigger(&self, trigger: Trigger)
+    -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Removes a trigger from both slab and key tables.
     fn remove_trigger(
@@ -308,12 +306,13 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Atomically clears existing timers for a key/type and schedules a new one.
+    /// Atomically clears existing timers for a key/type and schedules a new
+    /// one.
     ///
-    /// This is the core primitive for tombstone-free singleton timer overwrites.
-    /// Reads existing trigger times from the key index, writes the new timer to
-    /// both indexes (new slab + singleton key slot), then deletes old slab
-    /// entries.
+    /// This is the core primitive for tombstone-free singleton timer
+    /// overwrites. Reads existing trigger times from the key index, writes
+    /// the new timer to both indexes (new slab + singleton key slot), then
+    /// deletes old slab entries.
     ///
     /// # Write Ordering
     ///

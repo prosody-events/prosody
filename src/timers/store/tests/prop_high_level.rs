@@ -348,9 +348,7 @@ impl Arbitrary for HighLevelTestInput {
                         let has_time = existing_triggers.iter().any(|(seg, _, k, t, tt)| {
                             *seg == segment.id && k == key && *tt == timer_type && *t == time
                         });
-                        if !has_time
-                            && let Some(time_set) = key_trigger_times.get_mut(&map_key)
-                        {
+                        if !has_time && let Some(time_set) = key_trigger_times.get_mut(&map_key) {
                             time_set.remove(&time);
                         }
                     }
@@ -445,8 +443,7 @@ impl HighLevelModel {
                 let tuple = (key.clone(), *time, *timer_type);
 
                 // Remove from slab index
-                if let Some(triggers) =
-                    self.slab_index.get_mut(&(segment.id, slab_id, *timer_type))
+                if let Some(triggers) = self.slab_index.get_mut(&(segment.id, slab_id, *timer_type))
                 {
                     triggers.remove(&tuple);
                 }
@@ -459,7 +456,10 @@ impl HighLevelModel {
                     triggers.remove(&tuple);
                 }
             }
-            HighLevelOperation::ClearAndSchedule { segment, new_trigger } => {
+            HighLevelOperation::ClearAndSchedule {
+                segment,
+                new_trigger,
+            } => {
                 let key = &new_trigger.key;
                 let timer_type = new_trigger.timer_type;
                 let new_slab_id = Slab::from_time(segment.slab_size, new_trigger.time).id();
@@ -477,8 +477,7 @@ impl HighLevelModel {
                     .entry((segment.id, new_slab_id, timer_type))
                     .or_default()
                     .insert(tuple.clone());
-                self.key_index
-                    .insert(index_key, BTreeSet::from([tuple]));
+                self.key_index.insert(index_key, BTreeSet::from([tuple]));
                 self.slab_registry
                     .entry(segment.id)
                     .or_default()
@@ -488,7 +487,8 @@ impl HighLevelModel {
                 for (_, old_time, _) in old_entry {
                     let old_slab_id = Slab::from_time(segment.slab_size, old_time).id();
                     if let Some(set) =
-                        self.slab_index.get_mut(&(segment.id, old_slab_id, timer_type))
+                        self.slab_index
+                            .get_mut(&(segment.id, old_slab_id, timer_type))
                     {
                         set.retain(|(k, t, _)| k != key || *t != old_time);
                     }
@@ -710,14 +710,16 @@ where
         match op {
             HighLevelOperation::AddTrigger { trigger, .. } => {
                 model.apply(op);
-                store
-                    .add_trigger(trigger.clone())
-                    .await
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger failed: {e:?}")
-                    })?;
+                store.add_trigger(trigger.clone()).await.map_err(|e| {
+                    color_eyre::eyre::eyre!("Op #{op_idx} AddTrigger failed: {e:?}")
+                })?;
             }
-            HighLevelOperation::RemoveTrigger { key, time, timer_type, .. } => {
+            HighLevelOperation::RemoveTrigger {
+                key,
+                time,
+                timer_type,
+                ..
+            } => {
                 model.apply(op);
                 store
                     .remove_trigger(key, *time, *timer_type)
@@ -767,10 +769,7 @@ where
 }
 
 /// Cleans up all test data using only public `TriggerStore` API.
-async fn cleanup_test_data<S>(
-    store: &S,
-    model: &HighLevelModel,
-) -> color_eyre::Result<()>
+async fn cleanup_test_data<S>(store: &S, model: &HighLevelModel) -> color_eyre::Result<()>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
