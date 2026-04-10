@@ -30,6 +30,7 @@ use async_stream::try_stream;
 use futures::TryStreamExt;
 use futures::stream::Stream;
 use scc::HashMap;
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::ops::RangeInclusive;
@@ -517,7 +518,10 @@ impl TriggerOperations for InMemoryTriggerStore {
     /// # Errors
     ///
     /// Never returns an error.
-    async fn clear_and_schedule_key(&self, trigger: Trigger) -> Result<(), Self::Error> {
+    async fn clear_and_schedule_key(
+        &self,
+        trigger: Trigger,
+    ) -> Result<SmallVec<[CompactDateTime; 1]>, Self::Error> {
         let segment_id = self.segment.id;
         let partition_key = (segment_id, trigger.key.clone());
         let clustering_key = (trigger.timer_type, trigger.time);
@@ -530,15 +534,21 @@ impl TriggerOperations for InMemoryTriggerStore {
             .await
             .or_default();
 
-        // Clear all existing triggers for this timer_type
+        // Collect old times before clearing (exclude the new trigger's own time).
+        let old_times: SmallVec<[CompactDateTime; 1]> = entry
+            .get()
+            .keys()
+            .filter(|(t_type, time)| *t_type == trigger.timer_type && *time != trigger.time)
+            .map(|(_, time)| *time)
+            .collect();
+
+        // Clear all existing triggers for this timer_type, then insert the new one.
         entry
             .get_mut()
             .retain(|(t_type, _time), _| *t_type != trigger.timer_type);
-
-        // Insert the new trigger
         entry.get_mut().insert(clustering_key, trigger);
 
-        Ok(())
+        Ok(old_times)
     }
 
     /// Remove all triggers for a key across ALL timer types from the key index.

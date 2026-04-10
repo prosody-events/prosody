@@ -14,7 +14,7 @@ use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
 use futures::future::try_join_all;
-use std::future::{Future, ready};
+use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::try_join;
@@ -180,7 +180,7 @@ where
         // delete old entries. If crash occurs after writing new but before
         // deleting old, both timers exist (may fire twice). If we deleted
         // first and crashed, timer would be lost (never fires). The ordering
-        // below enforces: Step 2 (write new) completes before Step 3 (delete
+        // below enforces: Step 1 (write new) completes before Step 2 (delete
         // old).
 
         let slab_size = self.slab_size();
@@ -188,53 +188,33 @@ where
         let key = trigger.key.clone();
         let timer_type = trigger.timer_type;
 
-        // Step 1: Collect old trigger times from key index before any writes.
-        // The key index is partitioned by key — no client-side filtering needed.
-        // Slab derivation is deferred to Step 3.
-        let old_times: Vec<CompactDateTime> = {
-            use futures::TryStreamExt;
-            self.operations
-                .get_key_triggers(timer_type, &key)
-                .try_filter(|t| ready(t.time != trigger.time))
-                .map_ok(|t| t.time)
-                .try_collect()
-                .await?
-        };
-
-        debug!(
-            key = %key,
-            timer_type = ?timer_type,
-            new_time = ?trigger.time,
-            new_slab_id = ?new_slab.id(),
-            old_entry_count = old_times.len(),
-            "clear_and_schedule: writing new timer to both indices before deleting old entries"
-        );
-
-        // Step 2 (DUAL-INDEX WRITE): Write new timer to slab index AND
-        // atomically clear+schedule in key index. Both indices are written
-        // concurrently via try_join!, ensuring the new timer exists in BOTH
-        // timer_typed_slabs and timer_typed_keys before any old data is
-        // removed. The key index operation uses singleton slot optimization
-        // (for Cassandra):
+        // Step 1 (DUAL-INDEX WRITE): Write new timer to both indices concurrently.
+        // `clear_and_schedule_key` atomically clears the key index entry and
+        // returns the old trigger times it replaced — no separate pre-read needed.
+        // The key index operation uses singleton slot optimization (for Cassandra):
         // - Atomically DELETEs all clustering rows for this key/type
         // - UPDATEs the static singleton slot with the new timer
         // For singleton→singleton replacement, no tombstones are created.
-        try_join!(
+        // Box clear_and_schedule_key to keep its (Overflow-inflated) state
+        // machine on the heap rather than embedding it inline in the try_join!
+        // combined future, which would overflow the worker stack.
+        let ((), (), old_times) = try_join!(
             self.operations.insert_slab(new_slab.clone()),
             self.operations
                 .insert_slab_trigger(new_slab, trigger.clone()),
-            self.operations.clear_and_schedule_key(trigger),
+            Box::pin(self.operations.clear_and_schedule_key(trigger)),
         )?;
 
         debug!(
             key = %key,
             timer_type = ?timer_type,
+            old_entry_count = old_times.len(),
             "clear_and_schedule: new timer written to slab + key indices; proceeding to delete old slab entries"
         );
 
-        // Step 3: Delete old entries from slab index only.
-        // Key index was already cleared atomically in Step 2.
-        // INVARIANT (at-least-once): This runs AFTER Step 2 completes, so
+        // Step 2: Delete old entries from slab index only.
+        // Key index was already cleared atomically in Step 1.
+        // INVARIANT (at-least-once): This runs AFTER Step 1 completes, so
         // the new timer is guaranteed to exist before old entries are removed.
         // Each delete targets a different clustering row, so concurrent deletes
         // to the same partition are safe.
