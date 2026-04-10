@@ -23,7 +23,7 @@ use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::slab::{Slab, SlabId};
+use crate::timers::slab::SlabId;
 use crate::timers::{TimerType, Trigger};
 use educe::Educe;
 use futures::Stream;
@@ -254,7 +254,7 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     /// Streams all triggers in a slab across all timer types.
     fn get_slab_triggers_all_types(
         &self,
-        slab: &Slab,
+        slab_id: SlabId,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     // ===================================================================
@@ -295,46 +295,32 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ///
     /// Implementations should attempt to keep both tables in sync.
     /// Transactional backends can provide ACID guarantees.
-    fn add_trigger(
-        &self,
-        slab: Slab,
-        trigger: Trigger,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn add_trigger(&self, trigger: Trigger)
+    -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Removes a trigger from both slab and key tables.
     fn remove_trigger(
         &self,
-        slab: &Slab,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Atomically clears existing timers and schedules a new one.
+    /// Atomically clears existing timers for a key/type and schedules a new
+    /// one.
     ///
     /// This is the core primitive for tombstone-free singleton timer
-    /// overwrites. It performs the following operations atomically:
-    ///
-    /// 1. Writes the new timer to the slab index
-    /// 2. Writes the new timer to the singleton slot (static column)
-    /// 3. Deletes any existing clustering rows for this key/type
-    /// 4. Cleans up old slab index entries
+    /// overwrites. Reads existing trigger times from the key index, writes
+    /// the new timer to both indexes (new slab + singleton key slot), then
+    /// deletes old slab entries.
     ///
     /// # Write Ordering
     ///
     /// New timer is written FIRST, then old entries are deleted. This ensures
     /// at-least-once delivery: if a crash occurs, both timers may exist
     /// temporarily, but the timer will never be lost.
-    ///
-    /// # Parameters
-    ///
-    /// * `new_slab` - The slab for the new timer
-    /// * `new_trigger` - The new timer to schedule
-    /// * `old_slabs` - Slabs containing old timers to remove from slab index
     fn clear_and_schedule(
         &self,
-        new_slab: Slab,
-        new_trigger: Trigger,
-        old_slabs: Vec<Slab>,
+        trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

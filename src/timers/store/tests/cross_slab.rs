@@ -61,7 +61,7 @@ where
     for &time in &test_times {
         let trigger = Trigger::new(key.clone(), time, TimerType::Application, Span::current());
 
-        add_trigger(store, segment, &trigger).await?;
+        add_trigger(store, &trigger).await?;
     }
 
     // Verify all triggers were added correctly
@@ -77,15 +77,15 @@ where
 
     // Check that each trigger is in its correct slab
     for &time in &test_times {
-        let slab = Slab::from_time(segment.slab_size, time);
-        let slab_triggers = get_slab_triggers(store, &slab).await?;
+        let slab_id = Slab::from_time(segment.slab_size, time).id();
+        let slab_triggers = get_slab_triggers(store, slab_id).await?;
 
         // Find our trigger in this slab
         let found = slab_triggers.iter().any(|t| t.key == key && t.time == time);
 
         if !found {
             return Err(format!(
-                "Trigger with time {time:?} not found in expected slab {slab:?}"
+                "Trigger with time {time:?} not found in expected slab {slab_id}"
             ));
         }
     }
@@ -95,15 +95,15 @@ where
         let time1 = test_times[0]; // At boundary
         let time2 = test_times[4]; // Middle of next slab
 
-        let slab1 = Slab::from_time(segment.slab_size, time1);
-        let slab2 = Slab::from_time(segment.slab_size, time2);
+        let slab1_id = Slab::from_time(segment.slab_size, time1).id();
+        let slab2_id = Slab::from_time(segment.slab_size, time2).id();
 
-        if slab1.id() == slab2.id() {
+        if slab1_id == slab2_id {
             return Err("Expected different slab IDs for widely separated times".to_owned());
         }
 
         // Verify each trigger is only in its own slab
-        let slab1_triggers = get_slab_triggers(store, &slab1).await?;
+        let slab1_triggers = get_slab_triggers(store, slab1_id).await?;
         let found_time2_in_slab1 = slab1_triggers
             .iter()
             .any(|t| t.key == key && t.time == time2);
@@ -112,7 +112,7 @@ where
             return Err("Found time2 trigger incorrectly in slab1".to_owned());
         }
 
-        let slab2_triggers = get_slab_triggers(store, &slab2).await?;
+        let slab2_triggers = get_slab_triggers(store, slab2_id).await?;
         let found_time1_in_slab2 = slab2_triggers
             .iter()
             .any(|t| t.key == key && t.time == time1);

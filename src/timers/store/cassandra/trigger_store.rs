@@ -30,8 +30,13 @@ use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
-use futures::{Stream, TryStreamExt, future::join_all, pin_mut};
+use futures::{
+    Stream, TryStreamExt,
+    future::{join_all, ready},
+    pin_mut,
+};
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -300,7 +305,7 @@ impl TriggerOperations for CassandraTriggerStore {
     #[instrument(level = "debug", skip(self))]
     fn get_slab_triggers_all_types(
         &self,
-        slab: &Slab,
+        slab: Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let segment_id = self.segment.id;
         let slab_size = slab.size().seconds() as i32;
@@ -832,7 +837,10 @@ impl TriggerOperations for CassandraTriggerStore {
     /// the `handle.lock().await` guard serializes the read-decide-write
     /// sequence.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
-    async fn clear_and_schedule_key(&self, trigger: Trigger) -> Result<(), Self::Error> {
+    async fn clear_and_schedule_key(
+        &self,
+        trigger: Trigger,
+    ) -> Result<SmallVec<[CompactDateTime; 1]>, Self::Error> {
         let segment_id = self.segment.id;
         // Extract span context for storage.
         let span_map = extract_span_map(self.propagator(), &trigger);
@@ -848,27 +856,64 @@ impl TriggerOperations for CassandraTriggerStore {
         Span::current().record("state_cached", cached);
 
         let mut guard = handle.lock().await;
-        match &*guard {
-            TimerState::Inline(_) | TimerState::Absent => {
-                // Fast path: Inline or Absent → plain UPDATE, no tombstone.
-                // Post-V3 Absent guarantees no clustering rows.
+        let old_times: SmallVec<[CompactDateTime; 1]> = match &*guard {
+            TimerState::Absent => {
+                // Fast path: no prior timer — plain UPDATE, no tombstone, no old times.
                 self.set_state_inline(&segment_id, &trigger.key, trigger.timer_type, &new_state)
                     .await?;
+                SmallVec::new()
+            }
+            TimerState::Inline(t) => {
+                // Fast path: one prior timer already in the state column.
+                // Return its time (if distinct) so the adapter can clean the slab index.
+                let old_time = t.time;
+                self.set_state_inline(&segment_id, &trigger.key, trigger.timer_type, &new_state)
+                    .await?;
+                if old_time == trigger.time {
+                    SmallVec::new()
+                } else {
+                    SmallVec::from_buf([old_time])
+                }
             }
             TimerState::Overflow => {
-                // Overflow: BATCH (DELETE clustering + UPDATE state).
-                self.batch_clear_and_set_inline(
-                    &segment_id,
-                    &trigger.key,
-                    trigger.timer_type,
-                    &new_state,
-                )
-                .await?;
+                Box::pin(async {
+                    // Overflow: fetch clustering times directly (we hold the lock; state is
+                    // known Overflow, so we skip resolve_state to avoid a self-deadlock).
+                    // Reuses the same prepared statement as `get_key_times` Overflow path.
+                    let times = self
+                        .session()
+                        .execute_iter(
+                            self.queries().get_key_times.clone(),
+                            (segment_id, trigger.key.as_ref(), trigger.timer_type),
+                        )
+                        .await
+                        .map_err(CassandraStoreError::from)?
+                        .rows_stream::<(CompactDateTime,)>()
+                        .map_err(CassandraStoreError::from)?
+                        .map_err(CassandraStoreError::from)
+                        .map_ok(|(time,)| time)
+                        .try_filter(|&time| ready(time != trigger.time))
+                        .try_collect()
+                        .await?;
+
+                    // BATCH (DELETE clustering + UPDATE state). Runs after the SELECT
+                    // while the lock is still held — no TOCTOU window.
+                    self.batch_clear_and_set_inline(
+                        &segment_id,
+                        &trigger.key,
+                        trigger.timer_type,
+                        &new_state,
+                    )
+                    .await?;
+
+                    Result::<_, CassandraTriggerStoreError>::Ok(times)
+                })
+                .await?
             }
-        }
+        };
 
         *guard = new_state;
-        Ok(())
+        Ok(old_times)
     }
 
     #[instrument(level = "debug", skip(self), err)]

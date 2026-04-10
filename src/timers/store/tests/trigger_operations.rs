@@ -37,7 +37,7 @@ where
 
     // Add all triggers
     for trigger in &input.triggers {
-        add_trigger(store, &input.segment, trigger).await?;
+        add_trigger(store, trigger).await?;
     }
 
     // Verify triggers by key
@@ -68,18 +68,15 @@ where
 
     // Check slab-based retrieval
     if let Some(trigger) = input.triggers.first() {
-        let slab = Slab::from_time(input.segment.slab_size, trigger.time);
+        let slab_id = Slab::from_time(input.segment.slab_size, trigger.time).id();
 
-        let slab_triggers = get_slab_triggers(store, &slab).await?;
+        let slab_triggers = get_slab_triggers(store, slab_id).await?;
 
         // Filter original triggers for this slab
         let expected_slab_triggers: HashSet<_> = input
             .triggers
             .iter()
-            .filter(|t| {
-                let t_slab = Slab::from_time(input.segment.slab_size, t.time);
-                t_slab.id() == slab.id()
-            })
+            .filter(|t| Slab::from_time(input.segment.slab_size, t.time).id() == slab_id)
             .cloned()
             .collect();
 
@@ -93,7 +90,7 @@ where
 
     // Test remove_trigger
     if let Some(trigger) = input.triggers.first() {
-        remove_trigger(store, &input.segment, &trigger.key, trigger.time).await?;
+        remove_trigger(store, &trigger.key, trigger.time, trigger.timer_type).await?;
 
         let remaining_key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
 
@@ -103,8 +100,8 @@ where
         }
 
         // Check it's also gone from the slab
-        let trigger_slab = Slab::from_time(input.segment.slab_size, trigger.time);
-        let remaining_slab_triggers = get_slab_triggers(store, &trigger_slab).await?;
+        let slab_id = Slab::from_time(input.segment.slab_size, trigger.time).id();
+        let remaining_slab_triggers = get_slab_triggers(store, slab_id).await?;
 
         let trigger_in_slab = remaining_slab_triggers
             .iter()
@@ -117,7 +114,7 @@ where
 
     // Test clear_triggers_for_key
     if let Some(trigger) = input.triggers.first() {
-        clear_triggers_for_key(store, &input.segment, trigger.timer_type, &trigger.key).await?;
+        clear_triggers_for_key(store, trigger.timer_type, &trigger.key).await?;
 
         let remaining_key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
 
@@ -166,16 +163,15 @@ where
                     Span::current(),
                 );
 
-                add_trigger(store, &input.segment, &trigger).await?;
+                add_trigger(store, &trigger).await?;
                 expected_times.insert(time);
             }
             TriggerOperation::Remove => {
-                remove_trigger(store, &input.segment, &input.key, time).await?;
+                remove_trigger(store, &input.key, time, TimerType::Application).await?;
                 expected_times.remove(&time);
             }
             TriggerOperation::Clear => {
-                clear_triggers_for_key(store, &input.segment, TimerType::Application, &input.key)
-                    .await?;
+                clear_triggers_for_key(store, TimerType::Application, &input.key).await?;
                 expected_times.clear();
             }
         }

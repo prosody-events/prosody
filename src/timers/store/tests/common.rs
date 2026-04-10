@@ -73,14 +73,13 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn add_trigger<S>(store: &S, segment: &Segment, trigger: &Trigger) -> TestStoreResult
+pub async fn add_trigger<S>(store: &S, trigger: &Trigger) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let slab = Slab::from_time(segment.slab_size, trigger.time);
     store
-        .add_trigger(slab, trigger.clone())
+        .add_trigger(trigger.clone())
         .await
         .map_err(|e| format!("Failed to add trigger: {e:?}"))?;
     Ok(())
@@ -136,14 +135,14 @@ where
 /// Returns an error if the store operation fails.
 pub async fn get_slab_triggers_all_types<S>(
     store: &S,
-    slab: &Slab,
+    slab_id: SlabId,
 ) -> Result<HashSet<Trigger>, String>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
     store
-        .get_slab_triggers_all_types(slab)
+        .get_slab_triggers_all_types(slab_id)
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -159,12 +158,12 @@ where
 /// # Errors
 ///
 /// Returns an error if the store operation fails.
-pub async fn get_slab_triggers<S>(store: &S, slab: &Slab) -> Result<HashSet<Trigger>, String>
+pub async fn get_slab_triggers<S>(store: &S, slab_id: SlabId) -> Result<HashSet<Trigger>, String>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    get_slab_triggers_all_types(store, slab).await
+    get_slab_triggers_all_types(store, slab_id).await
 }
 
 /// Helper function to remove a trigger
@@ -174,17 +173,16 @@ where
 /// Returns an error if the store operation fails.
 pub async fn remove_trigger<S>(
     store: &S,
-    segment: &Segment,
     key: &Key,
     time: CompactDateTime,
+    timer_type: TimerType,
 ) -> TestStoreResult
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    let slab = Slab::from_time(segment.slab_size, time);
     store
-        .remove_trigger(&slab, key, time, TimerType::Application)
+        .remove_trigger(key, time, timer_type)
         .await
         .map_err(|e| format!("Failed to remove trigger: {e:?}"))?;
     Ok(())
@@ -199,7 +197,6 @@ where
 /// Returns an error if the store operation fails.
 pub async fn clear_triggers_for_key<S>(
     store: &S,
-    segment: &Segment,
     timer_type: TimerType,
     key: &Key,
 ) -> TestStoreResult
@@ -218,9 +215,8 @@ where
 
     // Remove each trigger
     for time in times {
-        let slab = Slab::from_time(segment.slab_size, time);
         store
-            .remove_trigger(&slab, key, time, timer_type)
+            .remove_trigger(key, time, timer_type)
             .await
             .map_err(|e| format!("Failed to remove trigger: {e:?}"))?;
     }
@@ -265,8 +261,8 @@ where
 
         // Verify slab consistency for each time
         for &time in expected_times {
-            let slab = Slab::from_time(segment.slab_size, time);
-            let slab_triggers = get_slab_triggers_all_types(store, &slab).await?;
+            let slab_id = Slab::from_time(segment.slab_size, time).id();
+            let slab_triggers = get_slab_triggers_all_types(store, slab_id).await?;
 
             // Check if this trigger is in the correct slab
             let found_in_slab = slab_triggers

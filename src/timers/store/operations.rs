@@ -14,6 +14,7 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
 use futures::Stream;
+use smallvec::SmallVec;
 use std::error::Error;
 use std::future::Future;
 use std::ops::RangeInclusive;
@@ -92,7 +93,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     /// Streams ALL triggers within a slab across all timer types.
     fn get_slab_triggers_all_types(
         &self,
-        slab: &Slab,
+        slab: Slab,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     /// Inserts a trigger into the slab index.
@@ -170,6 +171,10 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     /// clustering rows and UPDATE the static singleton slot. For in-memory
     /// stores, this clears and inserts.
     ///
+    /// Returns the old trigger times that were cleared (excluding the new
+    /// trigger's own time). Callers use these to clean up the slab index
+    /// without a separate pre-read.
+    ///
     /// # Arguments
     ///
     /// * `trigger` - The new trigger to schedule (replaces all existing for
@@ -177,7 +182,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     fn clear_and_schedule_key(
         &self,
         trigger: Trigger,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<SmallVec<[CompactDateTime; 1]>, Self::Error>> + Send;
 
     /// Clears all triggers from the key index for a given key, across ALL timer
     /// types.

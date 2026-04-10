@@ -35,7 +35,7 @@ where
 
     // Add just one trigger for consistency testing
     let trigger = &input.triggers[0];
-    add_trigger(store, &input.segment, trigger).await?;
+    add_trigger(store, trigger).await?;
 
     // Check it exists in key index
     let key_times = get_key_triggers(store, &input.segment.id, &trigger.key).await?;
@@ -45,9 +45,9 @@ where
     }
 
     // Check it exists in slab index
-    let slab = Slab::from_time(input.segment.slab_size, trigger.time);
+    let slab_id = Slab::from_time(input.segment.slab_size, trigger.time).id();
 
-    let slab_triggers = get_slab_triggers(store, &slab).await?;
+    let slab_triggers = get_slab_triggers(store, slab_id).await?;
 
     let trigger_in_slab = slab_triggers
         .iter()

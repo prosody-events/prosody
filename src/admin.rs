@@ -1,15 +1,16 @@
 //! Provides functionality for administrative operations on Kafka topics.
 
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use derive_builder::Builder;
 use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::error::KafkaError;
 use thiserror::Error;
+use tokio::time::sleep;
 use validator::Validate;
 pub use validator::ValidationErrors;
 
@@ -151,6 +152,14 @@ impl TopicConfiguration {
     }
 }
 
+/// How long `create_topic` will poll for the topic to become visible after
+/// the broker accepts the creation request.
+const TOPIC_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-attempt timeout for each `describe_configs` poll.
+const TOPIC_READY_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+/// Sleep between poll attempts to avoid spinning on fast-failing calls.
+const TOPIC_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// A client for performing administrative operations on Kafka topics.
 pub struct ProsodyAdminClient {
     client: AdminClient<DefaultClientContext>,
@@ -257,7 +266,28 @@ impl ProsodyAdminClient {
             .create_topics([&new_topic], &self.options)
             .await?;
 
-        Ok(())
+        // create_topics returns as soon as the broker accepts the request, but
+        // metadata propagation can lag. Poll describe_configs until the topic
+        // is visible to the controller, or the deadline elapses.
+        let resource = ResourceSpecifier::Topic(&config.name);
+        let poll_opts = AdminOptions::new().operation_timeout(Some(TOPIC_READY_POLL_TIMEOUT));
+        let deadline = Instant::now() + TOPIC_READY_TIMEOUT;
+        loop {
+            let results = self
+                .client
+                .describe_configs([&resource], &poll_opts)
+                .await?;
+
+            if results.first().is_some_and(Result::is_ok) {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return Err(ProsodyAdminClientError::TopicNotReady(config.name.clone()));
+            }
+
+            sleep(TOPIC_READY_POLL_INTERVAL).await;
+        }
     }
 
     /// Deletes a Kafka topic.
@@ -317,4 +347,8 @@ pub enum ProsodyAdminClientError {
     /// Configuration validation error.
     #[error("configuration validation error: {0:#}")]
     Validation(#[from] ValidationErrors),
+
+    /// Topic was created but did not become visible within the deadline.
+    #[error("topic {0:?} was not ready within {TOPIC_READY_TIMEOUT:?} of creation")]
+    TopicNotReady(String),
 }
