@@ -280,9 +280,7 @@ impl ProsodyAdminClient {
             }
 
             if Instant::now() >= deadline {
-                return Err(ProsodyAdminClientError::TopicNotReady(
-                    config.name.clone(),
-                ));
+                return Err(ProsodyAdminClientError::TopicNotReady(config.name.clone()));
             }
         }
     }
