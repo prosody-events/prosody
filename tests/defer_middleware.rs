@@ -20,6 +20,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
+use prosody::consumer::middleware::defer::message::loader::KafkaLoader;
 use prosody::consumer::middleware::defer::message::store::CassandraMessageDeferStoreProvider;
 use prosody::consumer::middleware::defer::message::store::cassandra::MessageQueries;
 use prosody::consumer::middleware::defer::segment::CassandraSegmentStore;
@@ -259,19 +260,20 @@ impl DeferTestEnvironment {
         );
 
         let telemetry = Telemetry::new();
-        let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
+        let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_mins(1));
         let failure_tracker = FailureTracker::new(
             defer_config.failure_window,
             defer_config.failure_threshold,
             &telemetry,
             &heartbeats,
         );
+        let loader = KafkaLoader::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
             message_provider,
             failure_tracker,
-            &heartbeats,
+            loader,
             &telemetry,
         )?;
 
@@ -349,19 +351,20 @@ impl DeferTestEnvironment {
         );
 
         let telemetry = Telemetry::new();
-        let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_secs(60));
+        let heartbeats = HeartbeatRegistry::new("defer-test".to_owned(), Duration::from_mins(1));
         let failure_tracker = FailureTracker::new(
             defer_config.failure_window,
             defer_config.failure_threshold,
             &telemetry,
             &heartbeats,
         );
+        let loader = KafkaLoader::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
             message_provider,
             failure_tracker,
-            &heartbeats,
+            loader,
             &telemetry,
         )?;
 

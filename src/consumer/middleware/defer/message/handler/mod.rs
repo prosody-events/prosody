@@ -28,7 +28,6 @@ use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
 };
 use crate::consumer::{ConsumerConfiguration, DemandType, Keyed};
-use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::Telemetry;
 use crate::telemetry::event::TimerEventType;
 use crate::telemetry::partition::TelemetryPartitionSender;
@@ -67,44 +66,35 @@ where
     telemetry: Telemetry,
 }
 
-impl<P> MessageDeferMiddleware<P, KafkaLoader, FailureTracker>
+impl<P, L> MessageDeferMiddleware<P, L, FailureTracker>
 where
     P: MessageDeferStoreProvider,
+    L: MessageLoader,
 {
-    /// Creates middleware with default [`KafkaLoader`] and provided
-    /// [`FailureTracker`].
+    /// Creates middleware with a caller-supplied loader and a
+    /// [`FailureTracker`] decider.
+    ///
+    /// Callers pick the loader: [`KafkaLoader`] for production (see
+    /// [`KafkaLoader::for_consumer`]) or [`MemoryLoader`] for mock mode,
+    /// where connecting to real Kafka is not permitted.
+    ///
+    /// [`KafkaLoader::for_consumer`]: super::loader::KafkaLoader::for_consumer
+    /// [`MemoryLoader`]: super::loader::MemoryLoader
     ///
     /// # Errors
     ///
-    /// Returns error if config validation or loader construction fails.
+    /// Returns an error if config validation fails.
     pub fn new(
         config: DeferConfiguration,
         consumer_config: &ConsumerConfiguration,
         provider: P,
         decider: FailureTracker,
-        heartbeats: &HeartbeatRegistry,
+        loader: L,
         telemetry: &Telemetry,
     ) -> Result<Self, DeferInitError> {
-        use super::loader::LoaderConfiguration;
         use validator::Validate;
 
         config.validate()?;
-
-        // Create a derived group ID for the loader with .defer-loader suffix
-        let loader_group_id = format!("{}.defer-loader", consumer_config.group_id);
-
-        // Build KafkaLoader with shared consumer configuration
-        let loader_config = LoaderConfiguration {
-            bootstrap_servers: consumer_config.bootstrap_servers.clone(),
-            group_id: loader_group_id,
-            max_permits: consumer_config.max_uncommitted,
-            cache_size: config.cache_size,
-            poll_interval: consumer_config.poll_interval,
-            seek_timeout: config.seek_timeout,
-            discard_threshold: config.discard_threshold,
-            message_spans: consumer_config.message_spans,
-        };
-        let loader = KafkaLoader::new(loader_config, heartbeats)?;
 
         Ok(Self {
             config,

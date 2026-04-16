@@ -133,10 +133,14 @@ use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::deduplication::{
     DeduplicationConfiguration, DeduplicationMiddleware, DeduplicationStoreProvider,
 };
+use crate::consumer::middleware::defer::message::loader::{
+    KafkaLoader, MemoryLoader, MessageLoader,
+};
 use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
 use crate::consumer::middleware::defer::{
-    DeferConfiguration, FailureTracker, MessageDeferMiddleware, TimerDeferMiddleware,
+    DeferConfiguration, DeferInitError, FailureTracker, MessageDeferMiddleware,
+    TimerDeferMiddleware,
 };
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::monopolization::{
@@ -477,7 +481,7 @@ pub struct ConsumerConfiguration {
     /// unhealthy status.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_STALL_THRESHOLD\", \
-                   Duration::from_secs(5 * 60))?",
+                   Duration::from_mins(5))?",
         setter(into)
     )]
     pub stall_threshold: Duration,
@@ -551,7 +555,7 @@ pub struct ConsumerConfiguration {
 
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_SLAB_SIZE\", \
-                   Duration::from_secs(3600))?",
+                   Duration::from_hours(1))?",
         setter(into)
     )]
     /// Duration for timer slab partitioning.
@@ -752,9 +756,9 @@ struct PipelineMiddlewareStack<CM> {
 }
 
 impl<CM: HandlerMiddleware> PipelineMiddlewareStack<CM> {
-    fn build<T, MP, TP, DP, PP>(
+    fn build<T, MP, TP, DP, PP, L>(
         self,
-        message_provider: MP,
+        message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: DP,
         trigger_provider: PP,
@@ -766,16 +770,8 @@ impl<CM: HandlerMiddleware> PipelineMiddlewareStack<CM> {
         TP: TimerDeferStoreProvider,
         DP: DeduplicationStoreProvider,
         PP: TriggerStoreProvider,
+        L: MessageLoader + 'static,
     {
-        let message_defer_middleware = MessageDeferMiddleware::new(
-            self.defer_config.clone(),
-            &self.consumer_config,
-            message_provider,
-            self.failure_tracker.clone(),
-            &self.heartbeats,
-            &self.telemetry,
-        )?;
-
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
             timer_provider,
@@ -1070,25 +1066,53 @@ impl ProsodyConsumer {
                 message_provider,
                 timer_provider,
                 dedup_provider,
-            } => stack.build(
-                message_provider,
-                timer_provider,
-                dedup_provider,
-                trigger_provider,
-                handler,
-            ),
+            } => {
+                // Memory backend is also the mock-mode path, which must not
+                // touch Kafka — pair it with an in-memory loader.
+                let message_defer_middleware = MessageDeferMiddleware::new(
+                    stack.defer_config.clone(),
+                    &stack.consumer_config,
+                    message_provider,
+                    stack.failure_tracker.clone(),
+                    MemoryLoader::new(),
+                    &stack.telemetry,
+                )?;
+                stack.build(
+                    message_defer_middleware,
+                    timer_provider,
+                    dedup_provider,
+                    trigger_provider,
+                    handler,
+                )
+            }
             StorePair::Cassandra {
                 trigger_provider,
                 message_provider,
                 timer_provider,
                 dedup_provider,
-            } => stack.build(
-                message_provider,
-                timer_provider,
-                dedup_provider,
-                trigger_provider,
-                handler,
-            ),
+            } => {
+                let loader = KafkaLoader::for_consumer(
+                    &stack.consumer_config,
+                    &stack.defer_config,
+                    &stack.heartbeats,
+                )
+                .map_err(DeferInitError::from)?;
+                let message_defer_middleware = MessageDeferMiddleware::new(
+                    stack.defer_config.clone(),
+                    &stack.consumer_config,
+                    message_provider,
+                    stack.failure_tracker.clone(),
+                    loader,
+                    &stack.telemetry,
+                )?;
+                stack.build(
+                    message_defer_middleware,
+                    timer_provider,
+                    dedup_provider,
+                    trigger_provider,
+                    handler,
+                )
+            }
         }
     }
 

@@ -44,8 +44,10 @@
 //! queries) and lets rdkafka handle offset recovery automatically.
 
 use super::MessageLoader;
+use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedMessage, decode_message};
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::propagator::new_propagator;
@@ -264,6 +266,33 @@ impl KafkaLoader {
             cache,
             message_spans,
         })
+    }
+
+    /// Builds a [`KafkaLoader`] configured from the surrounding consumer and
+    /// defer settings.
+    ///
+    /// Derives a `{group_id}.defer-loader` consumer group so the loader does
+    /// not conflict with the primary consumer's group coordination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `BaseConsumer` cannot be created.
+    pub fn for_consumer(
+        consumer_config: &ConsumerConfiguration,
+        defer_config: &DeferConfiguration,
+        heartbeats: &HeartbeatRegistry,
+    ) -> Result<Self, KafkaLoaderError> {
+        let loader_config = LoaderConfiguration {
+            bootstrap_servers: consumer_config.bootstrap_servers.clone(),
+            group_id: format!("{}.defer-loader", consumer_config.group_id),
+            max_permits: consumer_config.max_uncommitted,
+            cache_size: defer_config.cache_size,
+            poll_interval: consumer_config.poll_interval,
+            seek_timeout: defer_config.seek_timeout,
+            discard_threshold: defer_config.discard_threshold,
+            message_spans: consumer_config.message_spans,
+        };
+        Self::new(loader_config, heartbeats)
     }
 
     /// Loads a specific message from Kafka by offset.
