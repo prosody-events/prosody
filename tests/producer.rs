@@ -281,7 +281,7 @@ async fn test_producer_deduplication() -> Result<()> {
             .group_id("test-dedup-consumer")
             .subscribed_topics(&[topic.to_string()])
             .commit_interval(Duration::from_secs(1))
-            .stall_threshold(Duration::from_secs(60))
+            .stall_threshold(Duration::from_mins(1))
             .probe_port(None)
             .build()?;
         let (tx, rx) = channel(16);

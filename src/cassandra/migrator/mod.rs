@@ -85,7 +85,7 @@ use utils::{calculate_backoff, ensure_migration_tables_exist, refresh_metadata};
 use validator::{AppliedMigration, get_pending_migrations, validate_applied_migrations};
 
 /// Default timeout for migration lock acquisition.
-const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10 * 60); // 10 minutes
+const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_mins(10); // 10 minutes
 
 /// Maximum number of retry attempts for migration.
 const MAX_MIGRATION_RETRIES: u32 = 10;

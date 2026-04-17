@@ -183,7 +183,7 @@ pub struct RetryConfiguration {
     /// Default: 5 minutes
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_RETRY_MAX_DELAY\", \
-                   Duration::from_secs(5 * 60))?",
+                   Duration::from_mins(5))?",
         setter(into)
     )]
     max_delay: Duration,
@@ -1206,13 +1206,7 @@ mod tests {
 
     fn create_offset_tracker() -> OffsetTracker {
         let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
-        OffsetTracker::new(
-            "test-topic".into(),
-            0,
-            10,
-            Duration::from_secs(300),
-            version,
-        )
+        OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_mins(5), version)
     }
 
     // === Shutdown Tests (should pass - abort is correct behavior) ===

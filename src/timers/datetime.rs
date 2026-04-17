@@ -563,7 +563,7 @@ mod tests {
 
         // Test with sub-second rounding up
         let system_time_round_up =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(12345) + Duration::from_nanos(500_000_000);
+            SystemTime::UNIX_EPOCH + Duration::from_secs(12345) + Duration::from_millis(500);
         let compact_dt = CompactDateTime::try_from(system_time_round_up);
         assert!(compact_dt.is_ok());
         if let Ok(compact_dt) = compact_dt {
@@ -582,7 +582,7 @@ mod tests {
         // Test rounding at maximum value should fail
         let max_with_rounding = SystemTime::UNIX_EPOCH
             + Duration::from_secs(u64::from(u32::MAX))
-            + Duration::from_nanos(500_000_000);
+            + Duration::from_millis(500);
         let result = CompactDateTime::try_from(max_with_rounding);
         assert!(matches!(result, Err(CompactDateTimeError::OutOfRange)));
     }

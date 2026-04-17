@@ -376,7 +376,7 @@ fn cache_capacity_zero_returns_none() {
     let config = DeduplicationConfiguration {
         version: "1".to_owned(),
         cache_capacity: 0,
-        ttl: Duration::from_secs(3600),
+        ttl: Duration::from_hours(1),
     };
     let result =
         DeduplicationMiddleware::new(config, "group", MemoryDeduplicationStoreProvider::new());

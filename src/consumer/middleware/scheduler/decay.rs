@@ -292,7 +292,7 @@ mod tests {
         let duration = Duration::from_secs(100);
         let decaying = TestDecayingDuration::new(duration, now);
 
-        let after_half_life = now + Duration::from_secs(60);
+        let after_half_life = now + Duration::from_mins(1);
         let decayed = decaying.at(after_half_life);
 
         assert!((decayed.as_secs_f64() - 50.0_f64).abs() < 0.1_f64);
@@ -304,7 +304,7 @@ mod tests {
         let duration = Duration::from_secs(100);
         let decaying = TestDecayingDuration::new(duration, now);
 
-        let after_two_half_lives = now + Duration::from_secs(120);
+        let after_two_half_lives = now + Duration::from_mins(2);
         let decayed = decaying.at(after_two_half_lives);
 
         assert!((decayed.as_secs_f64() - 25.0_f64).abs() < 0.1_f64);
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_half_life_constant() {
-        assert_eq!(TestDecayingDuration::HALF_LIFE, Duration::from_secs(60));
+        assert_eq!(TestDecayingDuration::HALF_LIFE, Duration::from_mins(1));
     }
 
     #[test]
@@ -530,7 +530,7 @@ mod tests {
         let duration = Duration::from_secs(1000);
         let decaying = TestDecayingDuration::new(duration, now);
 
-        let far_future = now + Duration::from_secs(60 * 20);
+        let far_future = now + Duration::from_mins(20);
         let decayed = decaying.at(far_future);
 
         assert!(decayed.as_nanos() < 1_000_000);
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn test_add_with_different_measured_at_times() {
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_secs(60);
+        let t1 = t0 + Duration::from_mins(1);
 
         let d1 = TestDecayingDuration::from_secs(100, t0);
         let d2 = TestDecayingDuration::from_secs(100, t1);
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn test_sub_with_different_measured_at_times() {
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_secs(60);
+        let t1 = t0 + Duration::from_mins(1);
 
         let d1 = TestDecayingDuration::from_secs(100, t0);
         let d2 = TestDecayingDuration::from_secs(30, t1);
@@ -592,7 +592,7 @@ mod tests {
     #[test]
     fn test_equality_with_different_measured_at() {
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_secs(60);
+        let t1 = t0 + Duration::from_mins(1);
 
         let d1 = TestDecayingDuration::from_secs(100, t0);
         let d2 = TestDecayingDuration::from_secs(50, t1);
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn test_ordering_with_different_measured_at() {
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_secs(60);
+        let t1 = t0 + Duration::from_mins(1);
 
         let d1 = TestDecayingDuration::from_secs(100, t0);
         let d2 = TestDecayingDuration::from_secs(60, t1);

@@ -32,7 +32,7 @@ mod test_runner {
             rack: None,
             user: None,
             password: None,
-            retention: Duration::from_secs(86400),
+            retention: Duration::from_hours(24),
         }
     }
 

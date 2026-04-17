@@ -124,8 +124,7 @@ async fn test_concurrent_migration_lock_safety() -> Result<()> {
     let lock_rows = remaining_locks.into_rows_result()?;
     let lock_count = lock_rows
         .rows::<(String, Uuid)>()
-        .map(Iterator::count)
-        .unwrap_or(0);
+        .map_or(0, Iterator::count);
 
     assert_eq!(
         lock_count, 0,

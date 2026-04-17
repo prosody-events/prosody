@@ -389,7 +389,7 @@ mod tests {
     async fn test_new_tracker() {
         let telemetry = Telemetry::new();
         let tracker = FailureTracker::new(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0.9_f64,
             &telemetry,
             &HeartbeatRegistry::test(),
@@ -404,7 +404,7 @@ mod tests {
     async fn test_only_successes() {
         let telemetry = Telemetry::new();
         let tracker = FailureTracker::new(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0.9_f64,
             &telemetry,
             &HeartbeatRegistry::test(),
@@ -425,7 +425,7 @@ mod tests {
     async fn test_only_failures() {
         let telemetry = Telemetry::new();
         let tracker = FailureTracker::new(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0.9_f64,
             &telemetry,
             &HeartbeatRegistry::test(),
@@ -446,7 +446,7 @@ mod tests {
     async fn test_below_threshold() {
         let telemetry = Telemetry::new();
         let tracker = FailureTracker::new(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0.5_f64,
             &telemetry,
             &HeartbeatRegistry::test(),
@@ -468,7 +468,7 @@ mod tests {
     async fn test_above_threshold() {
         let telemetry = Telemetry::new();
         let tracker = FailureTracker::new(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0.5_f64,
             &telemetry,
             &HeartbeatRegistry::test(),
@@ -490,7 +490,7 @@ mod tests {
     async fn test_at_threshold() {
         let telemetry = Telemetry::new();
         let tracker = FailureTracker::new(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0.5_f64,
             &telemetry,
             &HeartbeatRegistry::test(),
@@ -542,7 +542,7 @@ mod tests {
     async fn test_concurrent_access() {
         let telemetry = Telemetry::new();
         let tracker = FailureTracker::new(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             0.5_f64,
             &telemetry,
             &HeartbeatRegistry::test(),

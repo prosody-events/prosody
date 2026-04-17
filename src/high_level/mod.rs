@@ -421,7 +421,7 @@ fn missing_topics(
     producer: &ProsodyProducer,
     mut topics: Vec<Topic>,
 ) -> Result<Vec<Topic>, ProducerError> {
-    const TIMEOUT: Duration = Duration::from_secs(60);
+    const TIMEOUT: Duration = Duration::from_mins(1);
     let metadata = producer.kafka_client().fetch_metadata(None, TIMEOUT)?;
 
     topics.sort_unstable();

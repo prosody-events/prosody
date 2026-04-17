@@ -45,7 +45,7 @@ fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
         keyspace: keyspace.to_owned(),
         user: None,
         password: None,
-        retention: Duration::from_secs(10 * 60),
+        retention: Duration::from_mins(10),
     }
 }
 

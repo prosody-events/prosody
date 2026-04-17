@@ -346,7 +346,7 @@ fn build_shutdown_proof_stack(
 
     let config = DeferConfiguration::builder()
         .base(Duration::from_secs(1))
-        .max_delay(Duration::from_secs(3600))
+        .max_delay(Duration::from_hours(1))
         .failure_threshold(0.9_f64)
         .build()
         .ok()?;
