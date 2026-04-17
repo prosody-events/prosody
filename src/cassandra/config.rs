@@ -81,7 +81,7 @@ pub struct CassandraConfiguration {
     /// Maximum: ~20 years (Cassandra's TTL limit of 630,720,000 seconds)
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_CASSANDRA_RETENTION\", \
-                   Duration::from_secs(365 * 24 * 60 * 60))?",
+                   Duration::from_hours(365 * 24))?",
         setter(into)
     )]
     #[validate(custom(function = "validate_retention_ttl"))]

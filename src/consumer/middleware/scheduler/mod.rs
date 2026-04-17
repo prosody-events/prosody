@@ -88,7 +88,7 @@ pub struct SchedulerConfiguration {
     /// Default: 2 minutes
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_SCHEDULER_MAX_WAIT\", \
-                   Duration::from_secs(120))?",
+                   Duration::from_mins(2))?",
         setter(into)
     )]
     pub max_wait: Duration,

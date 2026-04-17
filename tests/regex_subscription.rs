@@ -190,7 +190,7 @@ fn verify_messages(messages: &[(String, Value)], topics: &[TestTopic]) -> Result
                 .as_object()?
                 .get("source")?
                 .as_str()
-                .map(ToString::to_string)
+                .map(str::to_owned)
         })
         .collect();
 

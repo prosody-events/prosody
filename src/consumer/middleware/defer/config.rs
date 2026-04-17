@@ -49,7 +49,7 @@ pub struct DeferConfiguration {
     /// Default: 24 hours
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_DEFER_MAX_DELAY\", \
-                   Duration::from_secs(24 * 60 * 60))?",
+                   Duration::from_hours(24))?",
         setter(into)
     )]
     pub max_delay: Duration,
@@ -77,7 +77,7 @@ pub struct DeferConfiguration {
     /// Default: 5 minutes
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_DEFER_FAILURE_WINDOW\", \
-                   Duration::from_secs(5 * 60))?",
+                   Duration::from_mins(5))?",
         setter(into)
     )]
     pub failure_window: Duration,
@@ -194,10 +194,10 @@ mod tests {
     #[test]
     fn test_custom_configuration() {
         let config = DeferConfiguration::builder()
-            .base(Duration::from_secs(120))
-            .max_delay(Duration::from_secs(3600))
+            .base(Duration::from_mins(2))
+            .max_delay(Duration::from_hours(1))
             .failure_threshold(0.8_f64)
-            .failure_window(Duration::from_secs(600))
+            .failure_window(Duration::from_mins(10))
             .cache_size(5_000_usize)
             .build();
 
@@ -207,8 +207,8 @@ mod tests {
     #[test]
     fn test_max_delay_less_than_base_fails() {
         let result = DeferConfiguration::builder()
-            .base(Duration::from_secs(120))
-            .max_delay(Duration::from_secs(60))
+            .base(Duration::from_mins(2))
+            .max_delay(Duration::from_mins(1))
             .build();
 
         assert!(result.is_err());

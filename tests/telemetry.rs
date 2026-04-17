@@ -48,9 +48,9 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Top-level timeout for any single integration test.
 const TEST_TIMEOUT: Duration = Duration::from_secs(45);
 /// Timeout for tests that involve timer scheduling (3 s delay + startup).
-const TIMER_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+const TIMER_TEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// Timeout for defer tests: warm-up + 3 s timer + backoff + telemetry drain.
-const DEFER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFER_TEST_TIMEOUT: Duration = Duration::from_mins(2);
 
 // ── Test Handlers ────────────────────────────────────────────────────────────
 

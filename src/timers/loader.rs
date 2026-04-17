@@ -67,7 +67,7 @@ impl<T> State<T> {
     /// * `slab_id` - The slab identifier to check.
     #[must_use]
     pub fn is_owned(&self, slab_id: SlabId) -> bool {
-        self.max_owned.filter(|max| slab_id <= *max).is_some()
+        self.max_owned.as_ref().is_some_and(|max| slab_id <= *max)
     }
 
     /// Extends the range of owned slab IDs to include `new_max`.
@@ -571,7 +571,7 @@ mod tests {
 
         let now = CompactDateTime::now()?;
         // Advance time by 1 minute
-        advance(Duration::from_secs(60)).await;
+        advance(Duration::from_mins(1)).await;
         task::yield_now().await;
 
         let past_time = now; // This is now in the past
@@ -833,7 +833,7 @@ mod tests {
         };
 
         // Advance time significantly to trigger more loads
-        advance(Duration::from_secs(120)).await; // Advance by 2 minutes
+        advance(Duration::from_mins(2)).await; // Advance by 2 minutes
         task::yield_now().await;
 
         let final_max = {

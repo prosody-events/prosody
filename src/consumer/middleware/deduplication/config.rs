@@ -42,7 +42,7 @@ pub struct DeduplicationConfiguration {
     /// Default: 7 days
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_IDEMPOTENCE_TTL\", \
-                   Duration::from_secs(7 * 24 * 3600))?"
+                   Duration::from_hours(7 * 24))?"
     )]
     #[validate(custom(function = "validate_dedup_ttl"))]
     pub ttl: Duration,
@@ -58,7 +58,7 @@ impl DeduplicationConfiguration {
 
 /// Minimum deduplication TTL (1 minute). Shorter TTLs risk records expiring
 /// before a consumer rebalance completes.
-const MIN_DEDUP_TTL: Duration = Duration::from_secs(60);
+const MIN_DEDUP_TTL: Duration = Duration::from_mins(1);
 
 fn validate_dedup_ttl(ttl: &Duration) -> Result<(), ValidationError> {
     if *ttl < MIN_DEDUP_TTL {

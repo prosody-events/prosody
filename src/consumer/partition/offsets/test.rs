@@ -59,7 +59,7 @@ async fn tracks_commit_watermark_impl(Actions(actions): Actions) -> TestResult {
         "test-topic".into(),
         0,
         actions.len() + 1,
-        Duration::from_secs(300),
+        Duration::from_mins(5),
         version,
     );
 

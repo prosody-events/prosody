@@ -721,15 +721,13 @@ async fn verify_key_state_invariant(
                     ));
                 }
             }
-            n if *n >= 2 => {
-                if !matches!(state, TimerState::Overflow) {
-                    return Err(color_eyre::eyre::eyre!(
-                        "Key state invariant violated: ({}, {:?}) has {n} triggers but state is \
-                         {state:?}, expected Overflow",
-                        key,
-                        timer_type
-                    ));
-                }
+            n if *n >= 2 && !matches!(state, TimerState::Overflow) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "Key state invariant violated: ({}, {:?}) has {n} triggers but state is \
+                     {state:?}, expected Overflow",
+                    key,
+                    timer_type
+                ));
             }
             _ => {}
         }
@@ -749,7 +747,7 @@ fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
         rack: None,
         user: None,
         password: None,
-        retention: Duration::from_secs(86400),
+        retention: Duration::from_hours(24),
     }
 }
 

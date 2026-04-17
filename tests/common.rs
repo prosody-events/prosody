@@ -180,7 +180,7 @@ pub fn create_configs(topic: &Topic) -> Result<(ProducerConfiguration, ConsumerC
         .group_id("test-consumer")
         .subscribed_topics(&[topic.to_string()])
         .commit_interval(StdDuration::from_secs(1))
-        .stall_threshold(StdDuration::from_secs(60))
+        .stall_threshold(StdDuration::from_mins(1))
         .probe_port(None)
         .build()?;
 
@@ -424,7 +424,7 @@ pub fn create_cassandra_trigger_store_config() -> TriggerStoreConfiguration {
         keyspace: "prosody_test".to_owned(),
         user: None,
         password: None,
-        retention: StdDuration::from_secs(10 * 60),
+        retention: StdDuration::from_mins(10),
     };
 
     TriggerStoreConfiguration::Cassandra(cassandra_config)

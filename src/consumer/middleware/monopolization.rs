@@ -79,7 +79,7 @@ pub struct MonopolizationConfiguration {
     /// Default: 5 minutes
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_MONOPOLIZATION_WINDOW\", \
-                   Duration::from_secs(5 * 60))?",
+                   Duration::from_mins(5))?",
         setter(into)
     )]
     pub window_duration: Duration,
@@ -637,7 +637,7 @@ mod tests {
             key: "test-key".into(),
             percentage: 95.0,
             threshold: 90.0,
-            window: Duration::from_secs(300),
+            window: Duration::from_mins(5),
         };
 
         assert!(
@@ -655,7 +655,7 @@ mod tests {
             key: "user-12345".into(),
             percentage: 95.5,
             threshold: 90.0,
-            window: Duration::from_secs(300),
+            window: Duration::from_mins(5),
         };
 
         let message = error.to_string();
@@ -690,7 +690,7 @@ mod tests {
 
         let config = MonopolizationConfiguration::builder()
             .monopolization_threshold(0.9)
-            .window_duration(Duration::from_secs(300))
+            .window_duration(Duration::from_mins(5))
             .build()?;
 
         let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
@@ -1091,7 +1091,7 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
 
         // Check at time that puts execution_start before the window
-        let check_time = reference_instant + Duration::from_secs(120);
+        let check_time = reference_instant + Duration::from_mins(2);
         let result = handler.check_monopolization(&tp_key, check_time);
         assert!(
             result.is_none(),

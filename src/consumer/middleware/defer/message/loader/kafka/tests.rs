@@ -245,7 +245,7 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
         // NOW request the deleted offset 40
         let offset_40 = offsets[40];
         let result = timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             loader.load_message(topic, 0, offset_40),
         )
         .await?;
@@ -285,7 +285,7 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
 
         // Load valid offset after LSO
         let result = timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             loader.load_message(topic, 0, offsets[50]),
         )
         .await??;
@@ -322,7 +322,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
 
         // Load offset 50 (position will be at 51)
         let msg1 = timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             loader.load_message(topic, 0, offsets[50]),
         )
         .await??;
@@ -331,7 +331,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         // Load offset 55 - partition was unassigned after 50, position is Invalid.
         // We seek to min_offset (55) in this state.
         let msg2 = timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             loader.load_message(topic, 0, offsets[55]),
         )
         .await??;
@@ -340,7 +340,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         // Load offset 70 - partition was unassigned after 55, position is Invalid.
         // We seek to min_offset (70) in this state.
         let msg3 = timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             loader.load_message(topic, 0, offsets[70]),
         )
         .await??;
@@ -375,7 +375,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
 
         // Try to load deleted offset (should trigger seek failure and recovery)
         let result = timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             loader.load_message(topic, 0, offsets[25]),
         )
         .await?;
@@ -391,7 +391,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
 
         // Verify loader recovered and can load valid offsets
         let msg = timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             loader.load_message(topic, 0, offsets[60]),
         )
         .await??;
@@ -431,7 +431,7 @@ async fn test_decode_error() -> color_eyre::Result<()> {
 
         // Try to load the malformed message
         let result = timeout(
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             loader.load_message(topic, 0, bad_offset),
         )
         .await?;
@@ -486,7 +486,7 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
             let loader = Arc::clone(&loader);
             handles.push(tokio::spawn(async move {
                 timeout(
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                     loader.load_message(topic, 0, bad_offset),
                 )
                 .await
@@ -548,7 +548,7 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
             let offset = offsets[i * 4]; // Spread out offsets
             handles.push(tokio::spawn(async move {
                 timeout(
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                     loader.load_message(topic, 0, offset),
                 )
                 .await
@@ -627,7 +627,7 @@ async fn test_cross_partition_lso_contamination() -> color_eyre::Result<()> {
             let loader = Arc::clone(&loader);
             async move {
                 timeout(
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                     loader.load_message(topic, partition, offset),
                 )
                 .await
@@ -1018,7 +1018,7 @@ async fn run_interleaved_async(scenario: InterleavedScenario) -> color_eyre::Res
                         pending.remove(&(topic, partition, offset));
                     }
                     let result = timeout(
-                        Duration::from_secs(60),
+                        Duration::from_mins(1),
                         handles
                             .remove(key)
                             .ok_or_else(|| color_eyre::eyre::eyre!("handle already consumed"))?,
