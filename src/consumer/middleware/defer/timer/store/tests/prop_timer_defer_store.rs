@@ -12,6 +12,7 @@ use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use ahash::{HashMap, HashSet};
+use chrono::Utc;
 use color_eyre::eyre::Report;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
@@ -130,8 +131,13 @@ impl Arbitrary for TimerDeferTestInput {
         for _ in 0..op_count {
             let key_index = usize::arbitrary(g) % key_components.len();
 
-            // Helper to generate time (using u32 for CompactDateTime)
-            let time = CompactDateTime::from(u32::arbitrary(g));
+            // Bounded time generation: current time ± 30 days.
+            // Mirrors timers/store/tests/mod.rs to avoid the Cassandra 2038
+            // expiration limit (CASSANDRA-14092) when running against real Cassandra.
+            let offset_seconds = i64::arbitrary(g) % (30 * 24 * 60 * 60);
+            let now = Utc::now().timestamp() as u32;
+            let unsigned_offset = (offset_seconds.unsigned_abs() % u64::from(u32::MAX)) as u32;
+            let time = CompactDateTime::from(now.saturating_add(unsigned_offset));
 
             let op = match u8::arbitrary(g) % 100 {
                 // Compound operations (60%)
@@ -826,26 +832,5 @@ mod memory_store_tests {
 
     crate::timer_defer_store_tests!(async {
         Ok::<_, Infallible>(MemoryTimerDeferStore::new(SpanRelation::default()))
-    });
-}
-
-// ============================================================================
-// CachedTimerDeferStore tests
-// ============================================================================
-
-#[cfg(test)]
-mod cached_store_tests {
-    use crate::consumer::middleware::defer::timer::store::CachedTimerDeferStore;
-    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
-    use crate::otel::SpanRelation;
-    use std::convert::Infallible;
-
-    crate::timer_defer_store_tests!(async {
-        let store = MemoryTimerDeferStore::new(SpanRelation::default());
-        Ok::<_, Infallible>(CachedTimerDeferStore::new(
-            store,
-            100,
-            SpanRelation::default(),
-        ))
     });
 }

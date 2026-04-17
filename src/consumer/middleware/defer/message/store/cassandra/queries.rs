@@ -1,9 +1,4 @@
 //! Prepared CQL statement management for Cassandra defer storage.
-//!
-//! This module provides the [`Queries`] struct which contains all prepared
-//! Cassandra CQL statements needed for defer store operations. Prepared
-//! statements are created once during initialization and reused for all
-//! database operations, providing better performance and security.
 
 #![allow(dead_code, reason = "fields used in implementation")]
 
@@ -12,51 +7,80 @@ use crate::cassandra_queries;
 
 cassandra_queries! {
     /// Container for all prepared Cassandra CQL statements used by the defer store.
-    ///
-    /// This struct holds the Cassandra session and all prepared statements needed
-    /// for defer message storage operations. Prepared statements provide better
-    /// performance and security compared to ad-hoc query strings.
-    ///
-    /// The struct contains prepared statements for:
-    /// - Getting the next deferred message for a key
-    /// - Appending new deferred messages with TTL
-    /// - Updating retry counts
-    /// - Removing processed messages
-    ///
-    /// Segment metadata is managed separately via
-    /// [`CassandraSegmentStore`](crate::consumer::middleware::defer::segment::CassandraSegmentStore).
     pub struct Queries {
-        /// Gets the next deferred message (oldest offset) and retry count for a key
-        get_next_deferred_message: (
-            "SELECT offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+        /// Static-column read (`next_offset`, `retry_count`) — zero clustering scan.
+        get_next_static: (
+            "SELECT next_offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
             TABLE_DEFERRED_OFFSETS
         ),
 
-        /// Inserts a new deferred message with retry count initialization and TTL
+        /// Successor probe: first clustering row with `offset > ?`.
+        probe_next: (
+            "SELECT offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND offset > ? LIMIT 1",
+            TABLE_DEFERRED_OFFSETS
+        ),
+
+        /// INSERT with `retry_count = 0` and `next_offset = offset` (first deferral).
         insert_deferred_message_with_retry_count: (
-            "INSERT INTO $keyspace.{} (segment_id, key, offset, retry_count) VALUES (?, ?, ?, ?) USING TTL ?",
+            "INSERT INTO $keyspace.{} (segment_id, key, offset, retry_count, next_offset) VALUES (?, ?, ?, ?, ?) USING TTL ?",
             TABLE_DEFERRED_OFFSETS
         ),
 
-        /// Inserts a new deferred message WITHOUT updating retry count (leaves static column unchanged)
+        /// INSERT without touching `retry_count` or `next_offset` (monotonic append).
         insert_deferred_message_without_retry_count: (
             "INSERT INTO $keyspace.{} (segment_id, key, offset) VALUES (?, ?, ?) USING TTL ?",
             TABLE_DEFERRED_OFFSETS
         ),
 
-        /// Updates the retry count for all messages of a key (static column)
+        /// Updates the `retry_count` static column.
         update_retry_count: (
             "UPDATE $keyspace.{} USING TTL ? SET retry_count = ? WHERE segment_id = ? AND key = ?",
             TABLE_DEFERRED_OFFSETS
         ),
 
-        /// Removes a specific deferred message
+        /// UNLOGGED BATCH — FIFO `complete_retry_success`: DELETE + advance `next_offset` + reset `retry_count = 0`.
+        batch_complete_retry: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND offset = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET next_offset = ?, retry_count = 0 WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_DEFERRED_OFFSETS, TABLE_DEFERRED_OFFSETS
+        ),
+
+        /// UNLOGGED BATCH — non-FIFO `complete_retry_success`: DELETE + reset `retry_count = 0`, `next_offset` unchanged.
+        batch_complete_retry_no_advance: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND offset = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET retry_count = 0 WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_DEFERRED_OFFSETS, TABLE_DEFERRED_OFFSETS
+        ),
+
+        /// UNLOGGED BATCH — out-of-order append: INSERT + lower `next_offset`.
+        batch_append_with_next: (
+            "BEGIN UNLOGGED BATCH \
+             INSERT INTO $keyspace.{} (segment_id, key, offset) VALUES (?, ?, ?) USING TTL ?; \
+             UPDATE $keyspace.{} USING TTL ? SET next_offset = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_DEFERRED_OFFSETS, TABLE_DEFERRED_OFFSETS
+        ),
+
+        /// UNLOGGED BATCH — min-removal repair: DELETE + update `next_offset` to successor.
+        batch_remove_and_repair_next: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND offset = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET next_offset = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_DEFERRED_OFFSETS, TABLE_DEFERRED_OFFSETS
+        ),
+
+        /// Removes a specific clustering row (primitive, non-min removal).
         remove_deferred_message: (
             "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND offset = ?",
             TABLE_DEFERRED_OFFSETS
         ),
 
-        /// Deletes all data for a key (entire partition including static columns)
+        /// Deletes the entire partition including static columns.
         delete_key: (
             "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
             TABLE_DEFERRED_OFFSETS

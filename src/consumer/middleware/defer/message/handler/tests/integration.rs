@@ -19,7 +19,6 @@ use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::message::handler::MessageDeferHandler;
 use crate::consumer::middleware::defer::message::loader::MemoryLoader;
-use crate::consumer::middleware::defer::message::store::CachedDeferStore;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -317,7 +316,7 @@ fn permanent_error_schedules_timer_for_next_message() {
 /// defer(cancellation(inner)), mirroring production middleware ordering.
 type ShutdownProofHandler = MessageDeferHandler<
     CancellationHandler<OutcomeHandler>,
-    CachedDeferStore<MemoryMessageDeferStore>,
+    MemoryMessageDeferStore,
     MemoryLoader,
     TraceBasedDecider,
 >;
@@ -351,14 +350,13 @@ fn build_shutdown_proof_stack(
         .build()
         .ok()?;
 
-    let cached_store = CachedDeferStore::new(store.clone(), config.cache_size);
     let telemetry = Telemetry::new();
     let sender = telemetry.partition_sender(topic, partition);
 
     let handler = MessageDeferHandler {
         handler: cancellation,
         loader: loader.clone(),
-        store: cached_store,
+        store: store.clone(),
         decider: decider.clone(),
         config,
         topic,

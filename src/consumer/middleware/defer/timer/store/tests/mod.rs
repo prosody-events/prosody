@@ -57,13 +57,14 @@ macro_rules! timer_defer_store_tests {
                 Err(e) => return TestResult::error(format!("Failed to create store: {e:?}")),
             };
 
+            let input_dbg = format!("{input:#?}");
             // Call the async test function within the same runtime
             match runtime.block_on(
                 async { prop_timer_defer_store_model_equivalence(&store, input).await }
                     .instrument(span),
             ) {
                 Ok(()) => TestResult::passed(),
-                Err(e) => TestResult::error(format!("{e:?}")),
+                Err(e) => TestResult::error(format!("{e:?}\nFailing input:\n{input_dbg}")),
             }
         }
     };

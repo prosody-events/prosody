@@ -4,12 +4,11 @@
 //! timer deferral capability independently of message deferral.
 
 use super::handler::TimerDeferHandler;
-use super::store::{CachedTimerDeferStore, TimerDeferStoreProvider};
+use super::store::TimerDeferStoreProvider;
 use crate::consumer::ConsumerConfiguration;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracker};
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
-use crate::otel::SpanRelation;
 use crate::telemetry::Telemetry;
 use crate::{ConsumerGroup, Partition, Topic};
 use std::sync::Arc;
@@ -34,7 +33,6 @@ where
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
-    timer_spans: SpanRelation,
 }
 
 impl<P, D> TimerDeferMiddleware<P, D>
@@ -57,7 +55,6 @@ where
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
             telemetry: telemetry.clone(),
-            timer_spans: consumer_config.timer_spans,
         }
     }
 }
@@ -75,7 +72,6 @@ where
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
-    timer_spans: SpanRelation,
 }
 
 impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
@@ -96,7 +92,6 @@ where
             decider: self.decider.clone(),
             consumer_group: self.consumer_group.clone(),
             telemetry: self.telemetry.clone(),
-            timer_spans: self.timer_spans,
         }
     }
 }
@@ -108,26 +103,20 @@ where
     P: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
-    type Handler = TimerDeferHandler<T::Handler, CachedTimerDeferStore<P::Store>, D>;
+    type Handler = TimerDeferHandler<T::Handler, P::Store, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        // Create store synchronously - LazySegment handles async initialization
-        // internally
         let store = self
             .store_provider
             .create_store(topic, partition, &self.consumer_group);
-        let cached_store =
-            CachedTimerDeferStore::new(store, self.config.cache_size, self.timer_spans);
 
-        // Inner handler first
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
 
         let sender = self.telemetry.partition_sender(topic, partition);
 
-        // Timer defer wraps inner handler
         TimerDeferHandler {
             handler: inner_handler,
-            store: cached_store,
+            store,
             decider: self.decider.clone(),
             config: self.config.clone(),
             topic,

@@ -10,8 +10,8 @@ use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::config::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::timer::handler::TimerDeferHandler;
+use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
-use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::otel::SpanRelation;
 use crate::telemetry::Telemetry;
@@ -331,11 +331,7 @@ impl FallibleHandler for OutcomeHandler {
 /// Test harness for executing timer defer tests.
 pub struct TestHarness {
     /// The timer defer handler under test.
-    pub handler: TimerDeferHandler<
-        OutcomeHandler,
-        CachedTimerDeferStore<MemoryTimerDeferStore>,
-        TraceBasedDecider,
-    >,
+    pub handler: TimerDeferHandler<OutcomeHandler, MemoryTimerDeferStore, TraceBasedDecider>,
     /// Inner handler for setting outcomes (shared via Arc).
     pub inner_handler: OutcomeHandler,
     /// Decider for setting defer decisions (shared via Arc).
@@ -370,15 +366,12 @@ impl TestHarness {
             .build()
             .map_err(|e| eyre!("config error: {e}"))?;
 
-        let cached_store =
-            CachedTimerDeferStore::new(store.clone(), config.cache_size, SpanRelation::default());
-
         let telemetry = Telemetry::new();
         let sender = telemetry.partition_sender(topic, partition);
 
         let handler = TimerDeferHandler {
             handler: inner_handler.clone(),
-            store: cached_store,
+            store: store.clone(),
             decider: decider.clone(),
             config,
             topic,

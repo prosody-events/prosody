@@ -7,8 +7,8 @@ use super::*;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::TerminationSignals;
 use crate::consumer::middleware::defer::timer::context::TimerDeferContext;
+use crate::consumer::middleware::defer::timer::store::TimerDeferStore;
 use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
-use crate::consumer::middleware::defer::timer::store::{CachedTimerDeferStore, TimerDeferStore};
 use crate::otel::SpanRelation;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
@@ -171,17 +171,13 @@ impl EventContext for KeyedMockContext {
 // ============================================================================
 
 struct ContextTestHarness {
-    store: CachedTimerDeferStore<MemoryTimerDeferStore>,
+    store: MemoryTimerDeferStore,
     inner_context: KeyedMockContext,
 }
 
 impl ContextTestHarness {
     fn new(key: &str) -> Self {
-        let store = CachedTimerDeferStore::new(
-            MemoryTimerDeferStore::new(SpanRelation::default()),
-            100,
-            SpanRelation::default(),
-        );
+        let store = MemoryTimerDeferStore::new(SpanRelation::default());
         let inner_context = KeyedMockContext::new(key);
         Self {
             store,
@@ -189,9 +185,7 @@ impl ContextTestHarness {
         }
     }
 
-    fn create_wrapped_context(
-        &self,
-    ) -> TimerDeferContext<KeyedMockContext, CachedTimerDeferStore<MemoryTimerDeferStore>> {
+    fn create_wrapped_context(&self) -> TimerDeferContext<KeyedMockContext, MemoryTimerDeferStore> {
         TimerDeferContext::new(
             self.inner_context.clone(),
             self.store.clone(),
@@ -714,7 +708,7 @@ mod error_handling {
     /// threshold the entire call returns `Err` with no partial results.
     #[derive(Clone)]
     struct FailAfterNStore {
-        inner: CachedTimerDeferStore<MemoryTimerDeferStore>,
+        inner: MemoryTimerDeferStore,
         /// Inject an error when `deferred_times` returns more than this many
         /// items. Set to `usize::MAX` (or any value ≥ item count) for success.
         fail_after: usize,
@@ -821,11 +815,7 @@ mod error_handling {
         timer_count: usize,
         fail_after: usize,
     ) -> color_eyre::Result<(KeyedMockContext, FailAfterNStore, Key)> {
-        let inner_store = CachedTimerDeferStore::new(
-            MemoryTimerDeferStore::new(SpanRelation::default()),
-            100,
-            SpanRelation::default(),
-        );
+        let inner_store = MemoryTimerDeferStore::new(SpanRelation::default());
         let inner_context = KeyedMockContext::new("test-key");
         let key: Key = Arc::from("test-key");
 

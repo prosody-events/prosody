@@ -3,7 +3,6 @@
 //! Manages per-key FIFO queues of deferred timers with shared retry counters
 //! and OpenTelemetry span context preservation.
 
-pub mod cached;
 pub mod cassandra;
 pub mod memory;
 pub mod provider;
@@ -20,7 +19,6 @@ use std::error::Error;
 use std::future::Future;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-pub use cached::CachedTimerDeferStore;
 pub use cassandra::{CassandraTimerDeferStore, CassandraTimerDeferStoreProvider};
 pub use memory::{MemoryTimerDeferStore, MemoryTimerDeferStoreProvider};
 pub use provider::TimerDeferStoreProvider;
