@@ -37,6 +37,18 @@ cassandra_queries! {
             TABLE_DEFERRED_TIMERS
         ),
 
+        /// Minimum-row probe for legacy on-read repair: lowest clustering row in the partition.
+        probe_min: (
+            "SELECT original_time, span, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            TABLE_DEFERRED_TIMERS
+        ),
+
+        /// Legacy on-read repair: synthesize `next_timer` from probed min (LWW, no LWT).
+        repair_next_timer: (
+            "UPDATE $keyspace.{} USING TTL ? SET next_timer = ? WHERE segment_id = ? AND key = ?",
+            TABLE_DEFERRED_TIMERS
+        ),
+
         /// INSERT with `retry_count = 0` and `next_timer` set (first deferral).
         insert_deferred_timer_with_retry_count: (
             "INSERT INTO $keyspace.{} (segment_id, key, original_time, span, retry_count, next_timer) VALUES (?, ?, ?, ?, ?, ?) USING TTL ?",

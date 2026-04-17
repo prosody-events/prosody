@@ -80,6 +80,13 @@ impl CassandraMessageDeferStore {
 
     /// Reads `(next_offset, retry_count)` static columns from the DB.
     /// Returns `None` if the partition is empty.
+    ///
+    /// Handles legacy partitions (written before the `next_offset` static
+    /// column existed): when `next_offset = NULL` but `retry_count != NULL`,
+    /// the partition is ambiguous — it could be post-migration orphan
+    /// `retry_count` (empty partition) or pre-migration clustering rows with
+    /// no cached hint. A `probe_min` disambiguates, and on a hit we fire a
+    /// `repair_next_offset` UPDATE so subsequent reads take the fast path.
     async fn read_next_static(
         &self,
         segment_id: &uuid::Uuid,
@@ -97,12 +104,56 @@ impl CassandraMessageDeferStore {
             .maybe_first_row::<(Option<Offset>, Option<i32>)>()
             .map_err(CassandraStoreError::from)?;
 
-        Ok(row_opt.and_then(|(offset_opt, retry_opt)| {
-            offset_opt.map(|offset| {
+        match row_opt {
+            None | Some((None, None)) => Ok(None),
+            Some((Some(offset), retry_opt)) => {
                 let retry_count = retry_opt.and_then(|c| c.try_into().ok()).unwrap_or(0);
-                (offset, retry_count)
-            })
-        }))
+                Ok(Some((offset, retry_count)))
+            }
+            Some((None, Some(rc_raw))) => self.repair_legacy_partition(segment_id, key, rc_raw).await,
+        }
+    }
+
+    /// Lazy on-read repair of a legacy partition whose `next_offset` was never
+    /// populated. Probes for the minimum live clustering row; on a hit, writes
+    /// it back to `next_offset` via an LWW UPDATE and returns the synthesized
+    /// entry. On a miss the partition is truly empty (orphan `retry_count`),
+    /// and no repair is issued.
+    async fn repair_legacy_partition(
+        &self,
+        segment_id: &uuid::Uuid,
+        key: &Key,
+        raw_retry_count: i32,
+    ) -> Result<Option<(Offset, u32)>, CassandraDeferStoreError> {
+        let probe = self
+            .session()
+            .execute_unpaged(&self.queries.probe_min, (segment_id, key.as_ref()))
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        let row_opt = probe
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<(Option<Offset>, Option<i32>)>()
+            .map_err(CassandraStoreError::from)?;
+
+        let Some((Some(min_offset), _)) = row_opt else {
+            // No clustering row exists — orphan `retry_count`. `next_offset =
+            // NULL` is already the correct state; do not issue a repair.
+            return Ok(None);
+        };
+
+        let ttl = self.store.base_ttl();
+        self.session()
+            .execute_unpaged(
+                &self.queries.repair_next_offset,
+                (ttl, min_offset, segment_id, key.as_ref()),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        let retry_count: u32 = raw_retry_count.try_into().unwrap_or(0);
+        Ok(Some((min_offset, retry_count)))
     }
 
     /// Probes for the first clustering row strictly after `after_offset`.
@@ -441,6 +492,45 @@ impl CassandraMessageDeferStore {
             .maybe_first_row::<(Option<Offset>, Option<i32>)>()?;
         Ok(row.and_then(|(off_opt, _)| off_opt))
     }
+
+    /// Seeds a pre-migration legacy partition for tests: inserts clustering
+    /// rows without touching `next_offset`, and optionally sets a static
+    /// `retry_count`. Invalidates the cache so subsequent reads hit the DB
+    /// and exercise the lazy on-read repair path.
+    pub(crate) async fn seed_legacy_for_test(
+        &self,
+        key: &Key,
+        clustering_offsets: &[Offset],
+        retry_count: Option<u32>,
+    ) -> color_eyre::Result<()> {
+        let segment_id = self
+            .segment_id()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let ttl = self.store.base_ttl();
+
+        for &offset in clustering_offsets {
+            self.session()
+                .execute_unpaged(
+                    &self.queries.insert_deferred_message_without_retry_count,
+                    (&segment_id, key.as_ref(), offset, ttl),
+                )
+                .await?;
+        }
+
+        if let Some(rc) = retry_count {
+            let rc_i32: i32 = rc.try_into().unwrap_or(i32::MAX);
+            self.session()
+                .execute_unpaged(
+                    &self.queries.update_retry_count,
+                    (ttl, rc_i32, &segment_id, key.as_ref()),
+                )
+                .await?;
+        }
+
+        let _ = self.cache.remove(key.as_ref());
+        Ok(())
+    }
 }
 
 /// Factory for partition-scoped Cassandra message defer stores.
@@ -583,12 +673,38 @@ mod invariant_tests {
         match runtime.block_on(
             async move {
                 let mut model = DeferModel::new();
+                // Keys that were SeedLegacy-written but have not yet had a
+                // read trigger the repair UPDATE. I1 is intentionally
+                // violated for these keys until the next op that reaches
+                // `resolve_cache_or_read` (reads + most mutators). Ops that
+                // bypass the read path (SetRetryCount, IncrementRetryCount)
+                // leave the partition legacy until a future op touches it.
+                let mut pending_legacy: ahash::HashSet<Key> = ahash::HashSet::default();
                 for (op_idx, op) in input.operations.iter().enumerate() {
                     let key_index = key_index_of(op);
                     let key = input.key_components[key_index].key.clone();
 
                     model.apply(op, &input.key_components);
                     apply_op(&store, op, &input.key_components).await;
+
+                    if matches!(op, DeferOperation::SeedLegacy { .. }) {
+                        pending_legacy.insert(key);
+                        continue;
+                    }
+
+                    if pending_legacy.contains(&key) {
+                        if matches!(
+                            op,
+                            DeferOperation::SetRetryCount { .. }
+                                | DeferOperation::IncrementRetryCount { .. }
+                        ) {
+                            // No read path touched; legacy state persists.
+                            continue;
+                        }
+                        // All other ops either trigger `read_next_static`
+                        // (repair) or wipe the partition (DeleteKey).
+                        pending_legacy.remove(&key);
+                    }
 
                     let db_next = store
                         .read_next_offset_for_invariant_check(&key)
@@ -622,7 +738,8 @@ mod invariant_tests {
             | DeferOperation::IncrementRetryCount { key_index, .. }
             | DeferOperation::Append { key_index, .. }
             | DeferOperation::Remove { key_index, .. }
-            | DeferOperation::SetRetryCount { key_index, .. } => *key_index,
+            | DeferOperation::SetRetryCount { key_index, .. }
+            | DeferOperation::SeedLegacy { key_index, .. } => *key_index,
         }
     }
 
@@ -682,6 +799,295 @@ mod invariant_tests {
             DeferOperation::DeleteKey(i) => {
                 let _ = store.delete_key(&kcs[*i].key).await;
             }
+            DeferOperation::SeedLegacy {
+                key_index,
+                clustering_offsets,
+                retry_count,
+            } => {
+                let _ = store
+                    .seed_legacy_for_test(&kcs[*key_index].key, clustering_offsets, *retry_count)
+                    .await;
+            }
         }
+    }
+}
+
+/// Deterministic unit tests for the lazy on-read repair path that fires when
+/// a pre-migration partition (clustering rows, `next_offset = NULL`) is read.
+#[cfg(test)]
+mod legacy_repair_tests {
+    use super::*;
+    use crate::cassandra::{CassandraConfiguration, CassandraStore};
+    use crate::{ConsumerGroup, Partition, Topic};
+
+    async fn build_store() -> color_eyre::Result<CassandraMessageDeferStore> {
+        let config = CassandraConfiguration::builder()
+            .nodes(vec!["localhost:9042".to_owned()])
+            .keyspace("prosody_test".to_owned())
+            .build()
+            .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
+        let cassandra_store = CassandraStore::new(&config).await?;
+        let segment_store =
+            CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
+        let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
+        Ok(CassandraMessageDeferStore::new(
+            cassandra_store,
+            queries,
+            segment_store,
+            Topic::from("test-topic"),
+            Partition::from(0_i32),
+            Arc::from(format!("test-consumer-group-{}", uuid::Uuid::new_v4())) as ConsumerGroup,
+        ))
+    }
+
+    fn key() -> Key {
+        Arc::from(format!("legacy-key-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn test_legacy_get_next_repairs() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(10_i64)], Some(2))
+            .await?;
+
+        let got = store.get_next_deferred_message(&k).await?;
+        assert_eq!(got, Some((Offset::from(10_i64), 2)));
+
+        // Next-offset static column is populated after the repair UPDATE.
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, Some(Offset::from(10_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_is_deferred_repairs() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(7_i64)], Some(1))
+            .await?;
+
+        let rc = store.is_deferred(&k).await?;
+        assert_eq!(rc, Some(1));
+
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, Some(Offset::from(7_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_defer_first_on_legacy_partition() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(5_i64)], Some(3))
+            .await?;
+
+        // A fresh-key precondition is already violated on legacy partitions;
+        // the store must still converge `next_offset` to the true minimum.
+        store.defer_first_message(&k, Offset::from(20_i64)).await?;
+
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, Some(Offset::from(5_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_append_on_legacy_partition() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(9_i64)], Some(0))
+            .await?;
+
+        store.append_deferred_message(&k, Offset::from(3_i64)).await?;
+
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, Some(Offset::from(3_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_complete_retry_at_min() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(5_i64), Offset::from(10_i64)], Some(2))
+            .await?;
+
+        let result = store.complete_retry_success(&k, Offset::from(5_i64)).await?;
+        assert!(matches!(
+            result,
+            MessageRetryCompletionResult::MoreMessages { next_offset } if next_offset == Offset::from(10_i64)
+        ));
+
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, Some(Offset::from(10_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_complete_retry_above_min() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(5_i64), Offset::from(10_i64)], Some(2))
+            .await?;
+
+        let result = store
+            .complete_retry_success(&k, Offset::from(10_i64))
+            .await?;
+        assert!(matches!(
+            result,
+            MessageRetryCompletionResult::MoreMessages { next_offset } if next_offset == Offset::from(5_i64)
+        ));
+
+        // Repair advanced next_offset to 5 on the initial read; completing a
+        // non-min offset leaves next_offset anchored at the true minimum.
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, Some(Offset::from(5_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_orphan_retry_count_only() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        // No clustering rows — only the static retry_count. This matches a
+        // post-migration orphan (`set_retry_count` on a fresh key).
+        store.seed_legacy_for_test(&k, &[], Some(4)).await?;
+
+        let got = store.get_next_deferred_message(&k).await?;
+        assert_eq!(got, None);
+
+        // No bogus repair UPDATE was issued; next_offset remains NULL.
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_repair_idempotent() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(11_i64)], Some(5))
+            .await?;
+
+        let first = store.get_next_deferred_message(&k).await?;
+        assert_eq!(first, Some((Offset::from(11_i64), 5)));
+
+        // Cache is populated after the first call; second call must not
+        // re-probe or re-repair. We verify by asserting the cache now holds
+        // the synthesized entry — a subsequent read served from cache.
+        assert_eq!(
+            store.cache.get(k.as_ref()),
+            Some(Some((Offset::from(11_i64), 5)))
+        );
+
+        let second = store.get_next_deferred_message(&k).await?;
+        assert_eq!(second, Some((Offset::from(11_i64), 5)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_remove_at_min() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(5_i64), Offset::from(10_i64)], Some(1))
+            .await?;
+
+        store.remove_deferred_message(&k, Offset::from(5_i64)).await?;
+
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, Some(Offset::from(10_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_remove_above_min() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(5_i64), Offset::from(10_i64)], Some(1))
+            .await?;
+
+        store.remove_deferred_message(&k, Offset::from(10_i64)).await?;
+
+        // Repair anchored next_offset at the true minimum; removing a
+        // non-min clustering row leaves that anchor unchanged.
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, Some(Offset::from(5_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_delete_key_wipes_partition() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(5_i64), Offset::from(10_i64)], Some(3))
+            .await?;
+
+        // delete_key bypasses resolve_cache_or_read, so repair never fires;
+        // the partition must still be wiped cleanly.
+        store.delete_key(&k).await?;
+
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, None);
+        // A subsequent read must agree: no partition row, not an ambiguous
+        // legacy state the next reader would probe.
+        let got = store.get_next_deferred_message(&k).await?;
+        assert_eq!(got, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_set_retry_count_preserves_legacy_then_repairs() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(7_i64)], Some(2))
+            .await?;
+
+        // set_retry_count does not read next_offset, so the legacy state
+        // survives this op: DB still has next_offset = NULL.
+        store.set_retry_count(&k, 9).await?;
+        let db_next_after_set = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next_after_set, None);
+
+        // The first read path *after* set_retry_count must still trigger
+        // repair, observing the updated retry_count.
+        let got = store.get_next_deferred_message(&k).await?;
+        assert_eq!(got, Some((Offset::from(7_i64), 9)));
+
+        let db_next_after_read = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next_after_read, Some(Offset::from(7_i64)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_none_none_returns_none_without_repair() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k = key();
+        // Seed clustering rows but no static retry_count — produces the
+        // (next_offset=NULL, retry_count=NULL) state the plan deliberately
+        // treats as "truly empty" to avoid probing every empty partition.
+        store
+            .seed_legacy_for_test(&k, &[Offset::from(4_i64)], None)
+            .await?;
+
+        let got = store.get_next_deferred_message(&k).await?;
+        assert_eq!(got, None);
+
+        // No repair UPDATE was issued; next_offset stays NULL. Cache is
+        // populated with Some(None) so subsequent reads stay on the fast path.
+        let db_next = store.read_next_offset_for_invariant_check(&k).await?;
+        assert_eq!(db_next, None);
+        assert_eq!(store.cache.get(k.as_ref()), Some(None));
+        Ok(())
     }
 }

@@ -20,6 +20,18 @@ cassandra_queries! {
             TABLE_DEFERRED_OFFSETS
         ),
 
+        /// Minimum-row probe for legacy on-read repair: lowest clustering row in the partition.
+        probe_min: (
+            "SELECT offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            TABLE_DEFERRED_OFFSETS
+        ),
+
+        /// Legacy on-read repair: synthesize `next_offset` from probed min (LWW, no LWT).
+        repair_next_offset: (
+            "UPDATE $keyspace.{} USING TTL ? SET next_offset = ? WHERE segment_id = ? AND key = ?",
+            TABLE_DEFERRED_OFFSETS
+        ),
+
         /// INSERT with `retry_count = 0` and `next_offset = offset` (first deferral).
         insert_deferred_message_with_retry_count: (
             "INSERT INTO $keyspace.{} (segment_id, key, offset, retry_count, next_offset) VALUES (?, ?, ?, ?, ?) USING TTL ?",

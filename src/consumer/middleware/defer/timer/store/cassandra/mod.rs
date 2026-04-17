@@ -148,6 +148,13 @@ impl CassandraTimerDeferStore {
     }
 
     /// Reads `(next_timer, retry_count)` static columns from the DB.
+    ///
+    /// Handles legacy partitions (written before the `next_timer` static
+    /// column existed): when `next_timer = NULL` but `retry_count != NULL`,
+    /// the partition is ambiguous — it could be post-migration orphan
+    /// `retry_count` (empty partition) or pre-migration clustering rows with
+    /// no cached hint. A `probe_min` disambiguates, and on a hit we fire a
+    /// `repair_next_timer` UPDATE so subsequent reads take the fast path.
     async fn read_next_static(
         &self,
         segment_id: &uuid::Uuid,
@@ -165,16 +172,75 @@ impl CassandraTimerDeferStore {
             .maybe_first_row::<(Option<DeferredNextTimer>, Option<i32>)>()
             .map_err(CassandraStoreError::from)?;
 
-        Ok(row_opt.and_then(|(udt_opt, retry_opt)| {
-            udt_opt.map(|udt| {
+        match row_opt {
+            None | Some((None, None)) => Ok(None),
+            Some((Some(udt), retry_opt)) => {
                 let context = self.extract_context(&udt.span);
                 let retry_count = retry_opt.and_then(|c| c.try_into().ok()).unwrap_or(0);
-                CachedTimerEntry {
+                Ok(Some(CachedTimerEntry {
                     time: udt.time,
                     context,
                     retry_count,
-                }
-            })
+                }))
+            }
+            Some((None, Some(rc_raw))) => self.repair_legacy_partition(segment_id, key, rc_raw).await,
+        }
+    }
+
+    /// Lazy on-read repair of a legacy partition whose `next_timer` was never
+    /// populated. Probes for the minimum live clustering row; on a hit, writes
+    /// a reconstructed `DeferredNextTimer` UDT back via an LWW UPDATE and
+    /// returns the synthesized entry. On a miss the partition is truly empty
+    /// (orphan `retry_count`), and no repair is issued.
+    async fn repair_legacy_partition(
+        &self,
+        segment_id: &uuid::Uuid,
+        key: &Key,
+        raw_retry_count: i32,
+    ) -> Result<Option<CachedTimerEntry>, CassandraDeferStoreError> {
+        let probe = self
+            .session()
+            .execute_unpaged(&self.queries.probe_min, (segment_id, key.as_ref()))
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        let row_opt = probe
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<(
+                Option<CompactDateTime>,
+                Option<HashMap<String, String>>,
+                Option<i32>,
+            )>()
+            .map_err(CassandraStoreError::from)?;
+
+        let Some((Some(min_time), span_opt, _)) = row_opt else {
+            // No clustering row exists — orphan `retry_count`. `next_timer =
+            // NULL` is already the correct state; do not issue a repair.
+            return Ok(None);
+        };
+
+        let span_map = span_opt.unwrap_or_default();
+        let next_udt = DeferredNextTimer {
+            time: min_time,
+            span: span_map.clone(),
+        };
+
+        let ttl = self.store.base_ttl();
+        self.session()
+            .execute_unpaged(
+                &self.queries.repair_next_timer,
+                (ttl, &next_udt, segment_id, key.as_ref()),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        let context = self.extract_context(&span_map);
+        let retry_count: u32 = raw_retry_count.try_into().unwrap_or(0);
+        Ok(Some(CachedTimerEntry {
+            time: min_time,
+            context,
+            retry_count,
         }))
     }
 
@@ -658,6 +724,47 @@ impl CassandraTimerDeferStore {
             .maybe_first_row::<(Option<DeferredNextTimer>, Option<i32>)>()?;
         Ok(row.and_then(|(udt_opt, _)| udt_opt.map(|udt| (udt.time, udt.span))))
     }
+
+    /// Seeds a pre-migration legacy partition for tests: inserts clustering
+    /// rows without touching `next_timer`, and optionally sets a static
+    /// `retry_count`. Invalidates the cache so subsequent reads hit the DB
+    /// and exercise the lazy on-read repair path.
+    pub(crate) async fn seed_legacy_for_test(
+        &self,
+        key: &Key,
+        clustering_times: &[CompactDateTime],
+        retry_count: Option<u32>,
+    ) -> color_eyre::Result<()> {
+        let segment_id = self
+            .segment_id()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let base_ttl = self.store.base_ttl();
+
+        for &time in clustering_times {
+            let ttl = self.store.calculate_ttl(time);
+            let span_map: HashMap<String, String> = HashMap::new();
+            self.session()
+                .execute_unpaged(
+                    &self.queries.insert_deferred_timer_without_retry_count,
+                    (&segment_id, key.as_ref(), time, &span_map, ttl),
+                )
+                .await?;
+        }
+
+        if let Some(rc) = retry_count {
+            let rc_i32: i32 = rc.try_into().unwrap_or(i32::MAX);
+            self.session()
+                .execute_unpaged(
+                    &self.queries.update_retry_count,
+                    (base_ttl, rc_i32, &segment_id, key.as_ref()),
+                )
+                .await?;
+        }
+
+        let _ = self.cache.remove(key.as_ref());
+        Ok(())
+    }
 }
 
 /// Factory for partition-scoped Cassandra timer defer stores.
@@ -831,12 +938,29 @@ mod invariant_tests {
         match runtime.block_on(
             async move {
                 let mut model = TimerDeferModel::new();
+                let mut pending_legacy: ahash::HashSet<Key> = ahash::HashSet::default();
                 for (op_idx, op) in input.operations.iter().enumerate() {
                     let key_index = key_index_of(op);
                     let key = input.key_components[key_index].key.clone();
 
                     model.apply(op, &input.key_components);
                     apply_op(&store, op, &input.key_components).await;
+
+                    if matches!(op, TimerDeferOperation::SeedLegacy { .. }) {
+                        pending_legacy.insert(key);
+                        continue;
+                    }
+
+                    if pending_legacy.contains(&key) {
+                        if matches!(
+                            op,
+                            TimerDeferOperation::SetRetryCount { .. }
+                                | TimerDeferOperation::IncrementRetryCount { .. }
+                        ) {
+                            continue;
+                        }
+                        pending_legacy.remove(&key);
+                    }
 
                     let db_next = store
                         .read_next_timer_for_invariant_check(&key)
@@ -871,7 +995,8 @@ mod invariant_tests {
             | TimerDeferOperation::IncrementRetryCount { key_index, .. }
             | TimerDeferOperation::Append { key_index, .. }
             | TimerDeferOperation::Remove { key_index, .. }
-            | TimerDeferOperation::SetRetryCount { key_index, .. } => *key_index,
+            | TimerDeferOperation::SetRetryCount { key_index, .. }
+            | TimerDeferOperation::SeedLegacy { key_index, .. } => *key_index,
         }
     }
 
@@ -943,6 +1068,326 @@ mod invariant_tests {
             TimerDeferOperation::DeleteKey(i) => {
                 let _ = store.delete_key(&kcs[*i].key).await;
             }
+            TimerDeferOperation::SeedLegacy {
+                key_index,
+                clustering_times,
+                retry_count,
+            } => {
+                let _ = store
+                    .seed_legacy_for_test(&kcs[*key_index].key, clustering_times, *retry_count)
+                    .await;
+            }
         }
+    }
+}
+
+/// Deterministic unit tests for the lazy on-read repair path that fires when
+/// a pre-migration partition (clustering rows, `next_timer = NULL`) is read.
+#[cfg(test)]
+mod legacy_repair_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn key() -> Key {
+        Arc::from(format!("legacy-timer-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn future_time(offset_secs: u32) -> CompactDateTime {
+        let now = Utc::now().timestamp() as u32;
+        CompactDateTime::from(now.saturating_add(offset_secs))
+    }
+
+    #[tokio::test]
+    async fn test_legacy_get_next_repairs() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let t = future_time(60);
+        store.seed_legacy_for_test(&k, &[t], Some(2)).await?;
+
+        let got = store.get_next_deferred_timer(&k).await?;
+        let (trigger, rc) = got.ok_or_else(|| color_eyre::eyre::eyre!("expected timer"))?;
+        assert_eq!(trigger.time, t);
+        assert_eq!(rc, 2);
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next, Some((time, _)) if time == t));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_is_deferred_repairs() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let t = future_time(90);
+        store.seed_legacy_for_test(&k, &[t], Some(1)).await?;
+
+        let rc = store.is_deferred(&k).await?;
+        assert_eq!(rc, Some(1));
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next, Some((time, _)) if time == t));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_defer_first_on_legacy_partition() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let low = future_time(30);
+        let high = future_time(120);
+        store.seed_legacy_for_test(&k, &[low], Some(3)).await?;
+
+        let trigger = Trigger::new(k.clone(), high, TimerType::Application, tracing::Span::current());
+        store.defer_first_timer(&trigger).await?;
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next, Some((time, _)) if time == low));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_append_on_legacy_partition() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let seeded = future_time(120);
+        let earlier = future_time(10);
+        store.seed_legacy_for_test(&k, &[seeded], Some(0)).await?;
+
+        let trigger = Trigger::new(
+            k.clone(),
+            earlier,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
+        store.append_deferred_timer(&trigger).await?;
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next, Some((time, _)) if time == earlier));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_complete_retry_at_min() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let low = future_time(30);
+        let high = future_time(90);
+        store.seed_legacy_for_test(&k, &[low, high], Some(2)).await?;
+
+        let result = store.complete_retry_success(&k, low).await?;
+        let advanced = matches!(
+            result,
+            TimerRetryCompletionResult::MoreTimers { next_time, .. } if next_time == high
+        );
+        assert!(advanced);
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next, Some((time, _)) if time == high));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_complete_retry_above_min() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let low = future_time(30);
+        let high = future_time(90);
+        store.seed_legacy_for_test(&k, &[low, high], Some(2)).await?;
+
+        let result = store.complete_retry_success(&k, high).await?;
+        let anchored = matches!(
+            result,
+            TimerRetryCompletionResult::MoreTimers { next_time, .. } if next_time == low
+        );
+        assert!(anchored);
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next, Some((time, _)) if time == low));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_orphan_retry_count_only() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        store.seed_legacy_for_test(&k, &[], Some(4)).await?;
+
+        let got = store.get_next_deferred_timer(&k).await?;
+        assert!(got.is_none());
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(db_next.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_timer_span_preserved_on_repair() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let t = future_time(45);
+
+        // Seed a clustering row with a distinct span map via the normal
+        // timer defer API (which writes both the span and a next_timer).
+        // Then strip `next_timer` back to NULL to simulate a legacy
+        // partition while preserving the clustering row's span.
+        let span_map = {
+            let mut m: HashMap<String, String> = HashMap::new();
+            m.insert(
+                "traceparent".to_owned(),
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_owned(),
+            );
+            m
+        };
+        let segment_id = store
+            .segment_id()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let ttl = store.store.calculate_ttl(t);
+        // Seed clustering row with the distinct span.
+        store
+            .session()
+            .execute_unpaged(
+                &store.queries.insert_deferred_timer_without_retry_count,
+                (&segment_id, k.as_ref(), t, &span_map, ttl),
+            )
+            .await?;
+        // Orphan retry_count to produce the ambiguous state.
+        store
+            .session()
+            .execute_unpaged(
+                &store.queries.update_retry_count,
+                (store.store.base_ttl(), 0_i32, &segment_id, k.as_ref()),
+            )
+            .await?;
+        let _ = store.cache.remove(k.as_ref());
+
+        let got = store.get_next_deferred_timer(&k).await?;
+        let (trigger, _) = got.ok_or_else(|| color_eyre::eyre::eyre!("expected timer"))?;
+        assert_eq!(trigger.time, t);
+
+        // The repaired next_timer UDT carries the seeded span map verbatim.
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        let (db_time, db_span) = db_next.ok_or_else(|| color_eyre::eyre::eyre!("no next_timer"))?;
+        assert_eq!(db_time, t);
+        assert_eq!(db_span, span_map);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_repair_idempotent() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let t = future_time(60);
+        store.seed_legacy_for_test(&k, &[t], Some(5)).await?;
+
+        let first = store.get_next_deferred_timer(&k).await?;
+        assert!(first.is_some());
+
+        // Cache populated; second call served from cache, no re-probe.
+        let cached = store.cache.get(k.as_ref());
+        assert!(matches!(cached, Some(Some(entry)) if entry.time == t && entry.retry_count == 5));
+
+        let second = store.get_next_deferred_timer(&k).await?;
+        let (trigger, rc) = second.ok_or_else(|| color_eyre::eyre::eyre!("expected timer"))?;
+        assert_eq!(trigger.time, t);
+        assert_eq!(rc, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_remove_at_min() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let low = future_time(30);
+        let high = future_time(90);
+        store.seed_legacy_for_test(&k, &[low, high], Some(1)).await?;
+
+        store.remove_deferred_timer(&k, low).await?;
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next, Some((time, _)) if time == high));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_remove_above_min() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let low = future_time(30);
+        let high = future_time(90);
+        store.seed_legacy_for_test(&k, &[low, high], Some(1)).await?;
+
+        store.remove_deferred_timer(&k, high).await?;
+
+        // Repair anchored next_timer at the true minimum; removing a
+        // non-min clustering row leaves that anchor unchanged.
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next, Some((time, _)) if time == low));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_delete_key_wipes_partition() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let t = future_time(45);
+        store.seed_legacy_for_test(&k, &[t], Some(3)).await?;
+
+        // delete_key bypasses resolve_cache_or_read; repair never fires,
+        // but the partition must still be wiped cleanly.
+        store.delete_key(&k).await?;
+
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(db_next.is_none());
+        let got = store.get_next_deferred_timer(&k).await?;
+        assert!(got.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_set_retry_count_preserves_legacy_then_repairs() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let t = future_time(60);
+        store.seed_legacy_for_test(&k, &[t], Some(2)).await?;
+
+        // set_retry_count does not read next_timer, so the legacy state
+        // survives this op: DB still has next_timer = NULL.
+        store.set_retry_count(&k, 9).await?;
+        let db_next_after_set = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(db_next_after_set.is_none());
+
+        // The first read path *after* set_retry_count must still trigger
+        // repair, observing the updated retry_count.
+        let got = store.get_next_deferred_timer(&k).await?;
+        let (trigger, rc) = got.ok_or_else(|| color_eyre::eyre::eyre!("expected timer"))?;
+        assert_eq!(trigger.time, t);
+        assert_eq!(rc, 9);
+
+        let db_next_after_read = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(matches!(db_next_after_read, Some((time, _)) if time == t));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_none_none_returns_none_without_repair() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let t = future_time(60);
+        // Seed clustering row but no static retry_count — produces the
+        // (next_timer=NULL, retry_count=NULL) state the plan deliberately
+        // treats as "truly empty" to avoid probing every empty partition.
+        store.seed_legacy_for_test(&k, &[t], None).await?;
+
+        let got = store.get_next_deferred_timer(&k).await?;
+        assert!(got.is_none());
+
+        // No repair UPDATE was issued; next_timer stays NULL. Cache is
+        // populated with Some(None) so subsequent reads stay on the fast path.
+        let db_next = store.read_next_timer_for_invariant_check(&k).await?;
+        assert!(db_next.is_none());
+        let cached = store.cache.get(k.as_ref());
+        assert!(matches!(cached, Some(None)));
+        Ok(())
     }
 }
