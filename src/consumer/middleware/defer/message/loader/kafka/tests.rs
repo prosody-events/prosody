@@ -1034,10 +1034,21 @@ async fn run_interleaved_async(scenario: InterleavedScenario) -> color_eyre::Res
     }
     .await;
 
-    for name in &topic_names {
-        let _ = delete_topic(name).await;
+    let cleanup = cleanup_topics(&topic_names).await;
+    // Preserve the test error if both the test and cleanup failed.
+    result.and(cleanup)
+}
+
+async fn cleanup_topics(topic_names: &[String]) -> color_eyre::Result<()> {
+    let mut first_err: Option<color_eyre::Report> = None;
+    for name in topic_names {
+        if let Err(e) = delete_topic(name).await
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
     }
-    result
+    first_err.map_or(Ok(()), Err)
 }
 
 fn run_interleaved_scenario(scenario: InterleavedScenario) -> TestResult {

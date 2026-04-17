@@ -59,6 +59,7 @@ When a handler fails, retry with exponential backoff:
 | `PROSODY_DEFER_FAILURE_THRESHOLD` | Disable deferral when failure rate exceeds this   | 0.9     |
 | `PROSODY_DEFER_FAILURE_WINDOW`    | Measure failure rate over this time window        | 5m      |
 | `PROSODY_DEFER_CACHE_SIZE`        | Decoded Kafka messages cached by the defer loader | 1024    |
+| `PROSODY_DEFER_STORE_CACHE_SIZE`  | `(key → next_offset/next_timer, retry_count)` entries cached per Cassandra defer store | 8192    |
 | `PROSODY_DEFER_SEEK_TIMEOUT`      | Timeout when loading deferred messages            | 30s     |
 | `PROSODY_DEFER_DISCARD_THRESHOLD` | Read optimization (rarely needs changing)         | 100     |
 

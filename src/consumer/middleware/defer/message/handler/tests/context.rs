@@ -294,105 +294,102 @@ mod tests {
     }
 
     #[test]
-    fn timer_capture_records_schedule() {
+    fn timer_capture_records_schedule() -> color_eyre::Result<()> {
         init_test_logging();
 
         let capture = TimerCapture::new();
-        let time = CompactDateTime::now().ok();
+        let time = CompactDateTime::now()?;
 
-        if let Some(time) = time {
-            capture.record_schedule(test_key("k1"), time);
+        capture.record_schedule(test_key("k1"), time);
 
-            assert!(capture.has_active_timer(&test_key("k1")));
-            assert_eq!(capture.get_timer_time(&test_key("k1")), Some(time));
-            assert_eq!(capture.active_timer_count(), 1);
+        assert!(capture.has_active_timer(&test_key("k1")));
+        assert_eq!(capture.get_timer_time(&test_key("k1")), Some(time));
+        assert_eq!(capture.active_timer_count(), 1);
 
-            let event = capture.pop_event();
-            assert!(matches!(
-                event,
-                Some(OutputEvent::Scheduled { key, time: t }) if key == test_key("k1") && t == time
-            ));
-        }
+        let event = capture.pop_event();
+        assert!(matches!(
+            event,
+            Some(OutputEvent::Scheduled { key, time: t }) if key == test_key("k1") && t == time
+        ));
+        Ok(())
     }
 
     #[test]
-    fn timer_capture_records_clear() {
+    fn timer_capture_records_clear() -> color_eyre::Result<()> {
         init_test_logging();
 
         let capture = TimerCapture::new();
-        let time = CompactDateTime::now().ok();
+        let time = CompactDateTime::now()?;
 
-        if let Some(time) = time {
-            capture.record_schedule(test_key("k1"), time);
-            capture.record_clear(&test_key("k1"), time);
+        capture.record_schedule(test_key("k1"), time);
+        capture.record_clear(&test_key("k1"), time);
 
-            assert!(!capture.has_active_timer(&test_key("k1")));
-            assert_eq!(capture.active_timer_count(), 0);
+        assert!(!capture.has_active_timer(&test_key("k1")));
+        assert_eq!(capture.active_timer_count(), 0);
 
-            let events = capture.drain_events();
-            assert_eq!(events.len(), 2);
-            assert!(matches!(&events[0], OutputEvent::Scheduled { .. }));
-            assert!(matches!(&events[1], OutputEvent::Cleared { .. }));
-        }
+        let events = capture.drain_events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], OutputEvent::Scheduled { .. }));
+        assert!(matches!(&events[1], OutputEvent::Cleared { .. }));
+        Ok(())
     }
 
     #[test]
-    fn keyed_context_schedule_records_to_capture() {
+    fn keyed_context_schedule_records_to_capture() -> color_eyre::Result<()> {
         init_test_logging();
 
         let capture = TimerCapture::new();
         let ctx = KeyedCapturingContext::new(test_key("k1"), capture.clone());
 
-        let time = CompactDateTime::now().ok();
-        if let Some(time) = time {
-            TEST_RUNTIME.block_on(async {
-                let _ = ctx.schedule(time, TimerType::DeferredMessage).await;
-            });
+        let time = CompactDateTime::now()?;
+        TEST_RUNTIME.block_on(async {
+            ctx.schedule(time, TimerType::DeferredMessage).await?;
+            Ok::<_, color_eyre::Report>(())
+        })?;
 
-            assert!(capture.has_active_timer(&test_key("k1")));
-        }
+        assert!(capture.has_active_timer(&test_key("k1")));
+        Ok(())
     }
 
     #[test]
-    fn keyed_context_clear_and_schedule_records_both() {
+    fn keyed_context_clear_and_schedule_records_both() -> color_eyre::Result<()> {
         init_test_logging();
 
         let capture = TimerCapture::new();
         let ctx = KeyedCapturingContext::new(test_key("k1"), capture.clone());
 
-        let time = CompactDateTime::now().ok();
-        if let Some(time) = time {
-            // Pre-schedule to have something to clear
-            capture.record_schedule(test_key("k1"), time);
+        let time = CompactDateTime::now()?;
+        // Pre-schedule to have something to clear
+        capture.record_schedule(test_key("k1"), time);
 
-            TEST_RUNTIME.block_on(async {
-                let _ = ctx
-                    .clear_and_schedule(time, TimerType::DeferredMessage)
-                    .await;
-            });
+        TEST_RUNTIME.block_on(async {
+            ctx.clear_and_schedule(time, TimerType::DeferredMessage)
+                .await?;
+            Ok::<_, color_eyre::Report>(())
+        })?;
 
-            // Should have 3 events: initial schedule, clear, new schedule
-            assert_eq!(capture.event_count(), 3);
-            assert!(capture.has_active_timer(&test_key("k1")));
-        }
+        // Should have 3 events: initial schedule, clear, new schedule
+        assert_eq!(capture.event_count(), 3);
+        assert!(capture.has_active_timer(&test_key("k1")));
+        Ok(())
     }
 
     #[test]
-    fn keyed_context_ignores_application_timers() {
+    fn keyed_context_ignores_application_timers() -> color_eyre::Result<()> {
         init_test_logging();
 
         let capture = TimerCapture::new();
         let ctx = KeyedCapturingContext::new(test_key("k1"), capture.clone());
 
-        let time = CompactDateTime::now().ok();
-        if let Some(time) = time {
-            TEST_RUNTIME.block_on(async {
-                let _ = ctx.schedule(time, TimerType::Application).await;
-            });
+        let time = CompactDateTime::now()?;
+        TEST_RUNTIME.block_on(async {
+            ctx.schedule(time, TimerType::Application).await?;
+            Ok::<_, color_eyre::Report>(())
+        })?;
 
-            // Application timers should not be captured
-            assert!(!capture.has_active_timer(&test_key("k1")));
-            assert_eq!(capture.event_count(), 0);
-        }
+        // Application timers should not be captured
+        assert!(!capture.has_active_timer(&test_key("k1")));
+        assert_eq!(capture.event_count(), 0);
+        Ok(())
     }
 }

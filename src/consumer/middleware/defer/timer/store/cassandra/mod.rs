@@ -25,7 +25,7 @@ use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::{TimerType, Trigger};
-use crate::{ConsumerGroup, Key, Partition, Topic};
+use crate::{Key, Partition, Topic};
 use futures::TryStreamExt;
 use opentelemetry::Context;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
@@ -42,8 +42,6 @@ pub mod queries;
 
 pub use queries::DeferredNextTimer as TimerNextHint;
 pub use queries::Queries as TimerQueries;
-
-const TIMER_DEFER_CACHE_CAPACITY: usize = 8_192;
 
 /// Cassandra-backed timer defer store with internal write-through cache.
 ///
@@ -72,23 +70,23 @@ pub struct CassandraTimerDeferStore {
 
 impl CassandraTimerDeferStore {
     /// Creates a store; segment persisted lazily on first access.
+    ///
+    /// `cache_size` sizes the internal write-through
+    /// `quick_cache::sync::Cache`.
     #[must_use]
     pub fn new(
         store: CassandraStore,
         queries: Arc<Queries>,
-        segment_store: CassandraSegmentStore,
-        topic: Topic,
-        partition: Partition,
-        consumer_group: ConsumerGroup,
+        segment: LazySegment<CassandraSegmentStore>,
         timer_spans: SpanRelation,
+        cache_size: usize,
     ) -> Self {
-        let segment = LazySegment::new(segment_store, topic, partition, consumer_group);
         Self {
             store,
             queries,
             segment,
             timer_spans,
-            cache: Arc::new(Cache::new(TIMER_DEFER_CACHE_CAPACITY)),
+            cache: Arc::new(Cache::new(cache_size)),
         }
     }
 
@@ -820,17 +818,22 @@ impl TimerDeferStoreProvider for CassandraTimerDeferStoreProvider {
         topic: Topic,
         partition: Partition,
         consumer_group: &str,
+        cache_size: usize,
     ) -> Self::Store {
         // Each call creates a new store with its own fresh cache.
         // The cache must never outlive or be shared across partition assignments.
-        CassandraTimerDeferStore::new(
-            self.store.clone(),
-            self.queries.clone(),
+        let segment = LazySegment::new(
             self.segment_store.clone(),
             topic,
             partition,
             Arc::from(consumer_group),
+        );
+        CassandraTimerDeferStore::new(
+            self.store.clone(),
+            self.queries.clone(),
+            segment,
             self.timer_spans,
+            cache_size,
         )
     }
 }
@@ -851,14 +854,18 @@ mod tests {
         let segment_store =
             CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
         let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
-        Ok(CassandraTimerDeferStore::new(
-            cassandra_store,
-            queries,
+        let segment = LazySegment::new(
             segment_store,
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from(format!("test-consumer-group-{}", uuid::Uuid::new_v4())) as ConsumerGroup,
+        );
+        Ok(CassandraTimerDeferStore::new(
+            cassandra_store,
+            queries,
+            segment,
             SpanRelation::default(),
+            1_024,
         ))
     }
 
@@ -876,14 +883,18 @@ mod tests {
         let segment_store =
             CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
         let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
-        let defer_store = CassandraTimerDeferStore::new(
-            cassandra_store,
-            queries,
+        let segment = LazySegment::new(
             segment_store,
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from("test-consumer-group") as ConsumerGroup,
+        );
+        let defer_store = CassandraTimerDeferStore::new(
+            cassandra_store,
+            queries,
+            segment,
             SpanRelation::default(),
+            1_024,
         );
 
         let key: Key = Arc::from("test-key");
@@ -955,7 +966,7 @@ mod invariant_tests {
                     let key = input.key_components[key_index].key.clone();
 
                     model.apply(op, &input.key_components);
-                    apply_op(&store, op, &input.key_components).await;
+                    apply_op(&store, op, &input.key_components).await?;
 
                     if matches!(op, TimerDeferOperation::SeedLegacy { .. }) {
                         pending_legacy.insert(key);
@@ -1015,13 +1026,13 @@ mod invariant_tests {
         store: &CassandraTimerDeferStore,
         op: &TimerDeferOperation,
         kcs: &[TestKeyComponents],
-    ) {
+    ) -> color_eyre::Result<()> {
         match op {
             TimerDeferOperation::GetNext(i) => {
-                let _ = store.get_next_deferred_timer(&kcs[*i].key).await;
+                store.get_next_deferred_timer(&kcs[*i].key).await?;
             }
             TimerDeferOperation::IsDeferred(i) => {
-                let _ = store.is_deferred(&kcs[*i].key).await;
+                store.is_deferred(&kcs[*i].key).await?;
             }
             TimerDeferOperation::DeferFirst { key_index, time } => {
                 let trigger = Trigger::new(
@@ -1030,7 +1041,7 @@ mod invariant_tests {
                     TimerType::Application,
                     tracing::Span::current(),
                 );
-                let _ = store.defer_first_timer(&trigger).await;
+                store.defer_first_timer(&trigger).await?;
             }
             TimerDeferOperation::DeferAdditional { key_index, time } => {
                 let trigger = Trigger::new(
@@ -1039,20 +1050,20 @@ mod invariant_tests {
                     TimerType::Application,
                     tracing::Span::current(),
                 );
-                let _ = store.defer_additional_timer(&trigger).await;
+                store.defer_additional_timer(&trigger).await?;
             }
             TimerDeferOperation::CompleteRetrySuccess { key_index, time } => {
-                let _ = store
+                store
                     .complete_retry_success(&kcs[*key_index].key, *time)
-                    .await;
+                    .await?;
             }
             TimerDeferOperation::IncrementRetryCount {
                 key_index,
                 current_retry_count,
             } => {
-                let _ = store
+                store
                     .increment_retry_count(&kcs[*key_index].key, *current_retry_count)
-                    .await;
+                    .await?;
             }
             TimerDeferOperation::Append { key_index, time } => {
                 let trigger = Trigger::new(
@@ -1061,34 +1072,35 @@ mod invariant_tests {
                     TimerType::Application,
                     tracing::Span::current(),
                 );
-                let _ = store.append_deferred_timer(&trigger).await;
+                store.append_deferred_timer(&trigger).await?;
             }
             TimerDeferOperation::Remove { key_index, time } => {
-                let _ = store
+                store
                     .remove_deferred_timer(&kcs[*key_index].key, *time)
-                    .await;
+                    .await?;
             }
             TimerDeferOperation::SetRetryCount {
                 key_index,
                 retry_count,
             } => {
-                let _ = store
+                store
                     .set_retry_count(&kcs[*key_index].key, *retry_count)
-                    .await;
+                    .await?;
             }
             TimerDeferOperation::DeleteKey(i) => {
-                let _ = store.delete_key(&kcs[*i].key).await;
+                store.delete_key(&kcs[*i].key).await?;
             }
             TimerDeferOperation::SeedLegacy {
                 key_index,
                 clustering_times,
                 retry_count,
             } => {
-                let _ = store
+                store
                     .seed_legacy_for_test(&kcs[*key_index].key, clustering_times, *retry_count)
-                    .await;
+                    .await?;
             }
         }
+        Ok(())
     }
 }
 

@@ -13,7 +13,7 @@ use crate::consumer::middleware::defer::message::store::{
     MessageDeferStore, MessageRetryCompletionResult,
 };
 use crate::consumer::middleware::defer::segment::{CassandraSegmentStore, LazySegment};
-use crate::{ConsumerGroup, Key, Offset, Partition, Topic};
+use crate::{Key, Offset, Partition, Topic};
 use quick_cache::sync::Cache;
 use scylla::client::session::Session;
 use std::fmt;
@@ -23,8 +23,6 @@ use tracing::instrument;
 pub mod queries;
 
 pub use queries::Queries as MessageQueries;
-
-const DEFER_CACHE_CAPACITY: usize = 8_192;
 
 /// Cassandra-backed message defer store with internal write-through cache.
 ///
@@ -51,21 +49,21 @@ pub struct CassandraMessageDeferStore {
 
 impl CassandraMessageDeferStore {
     /// Creates a store; segment persisted lazily on first access.
+    ///
+    /// `cache_size` sizes the internal write-through
+    /// `quick_cache::sync::Cache`.
     #[must_use]
     pub fn new(
         store: CassandraStore,
         queries: Arc<Queries>,
-        segment_store: CassandraSegmentStore,
-        topic: Topic,
-        partition: Partition,
-        consumer_group: ConsumerGroup,
+        segment: LazySegment<CassandraSegmentStore>,
+        cache_size: usize,
     ) -> Self {
-        let segment = LazySegment::new(segment_store, topic, partition, consumer_group);
         Self {
             store,
             queries,
             segment,
-            cache: Arc::new(Cache::new(DEFER_CACHE_CAPACITY)),
+            cache: Arc::new(Cache::new(cache_size)),
         }
     }
 
@@ -574,16 +572,21 @@ impl MessageDeferStoreProvider for CassandraMessageDeferStoreProvider {
         topic: Topic,
         partition: Partition,
         consumer_group: &str,
+        cache_size: usize,
     ) -> Self::Store {
         // Each call creates a new store with its own fresh cache.
         // The cache must never outlive or be shared across partition assignments.
-        CassandraMessageDeferStore::new(
-            self.store.clone(),
-            self.queries.clone(),
+        let segment = LazySegment::new(
             self.segment_store.clone(),
             topic,
             partition,
             Arc::from(consumer_group),
+        );
+        CassandraMessageDeferStore::new(
+            self.store.clone(),
+            self.queries.clone(),
+            segment,
+            cache_size,
         )
     }
 }
@@ -606,14 +609,13 @@ mod tests {
         let segment_store =
             CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
         let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
-        let defer_store = CassandraMessageDeferStore::new(
-            cassandra_store,
-            queries,
+        let segment = LazySegment::new(
             segment_store,
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from(format!("test-consumer-group-{}", uuid::Uuid::new_v4())) as ConsumerGroup,
         );
+        let defer_store = CassandraMessageDeferStore::new(cassandra_store, queries, segment, 1_024);
         Ok::<_, color_eyre::Report>(defer_store)
     });
 }
@@ -643,13 +645,17 @@ mod invariant_tests {
         let segment_store =
             CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
         let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
-        Ok(CassandraMessageDeferStore::new(
-            cassandra_store,
-            queries,
+        let segment = LazySegment::new(
             segment_store,
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from(format!("test-consumer-group-{}", uuid::Uuid::new_v4())) as ConsumerGroup,
+        );
+        Ok(CassandraMessageDeferStore::new(
+            cassandra_store,
+            queries,
+            segment,
+            1_024,
         ))
     }
 
@@ -687,7 +693,7 @@ mod invariant_tests {
                     let key = input.key_components[key_index].key.clone();
 
                     model.apply(op, &input.key_components);
-                    apply_op(&store, op, &input.key_components).await;
+                    apply_op(&store, op, &input.key_components).await?;
 
                     if matches!(op, DeferOperation::SeedLegacy { .. }) {
                         pending_legacy.insert(key);
@@ -749,68 +755,69 @@ mod invariant_tests {
         store: &CassandraMessageDeferStore,
         op: &DeferOperation,
         kcs: &[TestKeyComponents],
-    ) {
+    ) -> color_eyre::Result<()> {
         match op {
             DeferOperation::GetNext(i) => {
-                let _ = store.get_next_deferred_message(&kcs[*i].key).await;
+                store.get_next_deferred_message(&kcs[*i].key).await?;
             }
             DeferOperation::IsDeferred(i) => {
-                let _ = store.is_deferred(&kcs[*i].key).await;
+                store.is_deferred(&kcs[*i].key).await?;
             }
             DeferOperation::DeferFirst { key_index, offset } => {
-                let _ = store
+                store
                     .defer_first_message(&kcs[*key_index].key, *offset)
-                    .await;
+                    .await?;
             }
             DeferOperation::DeferAdditional { key_index, offset } => {
-                let _ = store
+                store
                     .defer_additional_message(&kcs[*key_index].key, *offset)
-                    .await;
+                    .await?;
             }
             DeferOperation::CompleteRetrySuccess { key_index, offset } => {
-                let _ = store
+                store
                     .complete_retry_success(&kcs[*key_index].key, *offset)
-                    .await;
+                    .await?;
             }
             DeferOperation::IncrementRetryCount {
                 key_index,
                 current_retry_count,
             } => {
-                let _ = store
+                store
                     .increment_retry_count(&kcs[*key_index].key, *current_retry_count)
-                    .await;
+                    .await?;
             }
             DeferOperation::Append { key_index, offset } => {
-                let _ = store
+                store
                     .append_deferred_message(&kcs[*key_index].key, *offset)
-                    .await;
+                    .await?;
             }
             DeferOperation::Remove { key_index, offset } => {
-                let _ = store
+                store
                     .remove_deferred_message(&kcs[*key_index].key, *offset)
-                    .await;
+                    .await?;
             }
             DeferOperation::SetRetryCount {
                 key_index,
                 retry_count,
             } => {
-                let _ = store
+                store
                     .set_retry_count(&kcs[*key_index].key, *retry_count)
-                    .await;
+                    .await?;
             }
             DeferOperation::DeleteKey(i) => {
-                let _ = store.delete_key(&kcs[*i].key).await;
+                store.delete_key(&kcs[*i].key).await?;
             }
             DeferOperation::SeedLegacy {
                 key_index,
                 clustering_offsets,
                 retry_count,
             } => {
-                let _ = store
+                store
                     .seed_legacy_for_test(&kcs[*key_index].key, clustering_offsets, *retry_count)
-                    .await;
+                    .await?;
             }
         }
+        Ok(())
     }
 }
 
@@ -832,13 +839,17 @@ mod legacy_repair_tests {
         let segment_store =
             CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
         let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
-        Ok(CassandraMessageDeferStore::new(
-            cassandra_store,
-            queries,
+        let segment = LazySegment::new(
             segment_store,
             Topic::from("test-topic"),
             Partition::from(0_i32),
             Arc::from(format!("test-consumer-group-{}", uuid::Uuid::new_v4())) as ConsumerGroup,
+        );
+        Ok(CassandraMessageDeferStore::new(
+            cassandra_store,
+            queries,
+            segment,
+            1_024,
         ))
     }
 

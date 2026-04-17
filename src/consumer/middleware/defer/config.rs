@@ -85,8 +85,8 @@ pub struct DeferConfiguration {
     /// Cache size for the Kafka message loader cache.
     ///
     /// Caches decoded Kafka messages to avoid redundant reads when retrying
-    /// deferred messages. Cassandra store caches are internal-fixed and not
-    /// controlled by this setting.
+    /// deferred messages. Cassandra store caches are controlled separately via
+    /// `store_cache_size` / `PROSODY_DEFER_STORE_CACHE_SIZE`.
     ///
     /// Environment variable: `PROSODY_DEFER_CACHE_SIZE`
     /// Default: 1,024 entries
@@ -96,6 +96,23 @@ pub struct DeferConfiguration {
     )]
     #[validate(range(min = 1_usize))]
     pub cache_size: usize,
+
+    /// Cache size for the per-partition Cassandra defer store cache.
+    ///
+    /// Separate from `cache_size` (which tunes the Kafka message loader cache).
+    /// Controls the `(key → Option<(next_offset, retry_count)>)` cache inside
+    /// each `CassandraMessageDeferStore` / `CassandraTimerDeferStore`. Larger
+    /// values reduce `read_next_static` round-trips for wide-fan-out workloads
+    /// at the cost of memory (~128 B/entry × 2 stores/partition × partitions).
+    ///
+    /// Environment variable: `PROSODY_DEFER_STORE_CACHE_SIZE`
+    /// Default: 8,192 entries
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_DEFER_STORE_CACHE_SIZE\", 8_192)?",
+        setter(into)
+    )]
+    #[validate(range(min = 1_usize))]
+    pub store_cache_size: usize,
 
     /// Timeout for Kafka seek operations in the message loader.
     ///

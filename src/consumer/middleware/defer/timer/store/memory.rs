@@ -238,6 +238,7 @@ impl TimerDeferStoreProvider for MemoryTimerDeferStoreProvider {
         _topic: Topic,
         _partition: Partition,
         _consumer_group: &str,
+        _cache_size: usize,
     ) -> Self::Store {
         MemoryTimerDeferStore {
             inner: Arc::new(Inner::default()),

@@ -6,6 +6,17 @@
 --
 -- For offsets: a scalar next_offset is sufficient (no per-row auxiliary data).
 -- For timers: a UDT bundles time + span atomically so time/span cannot drift.
+--
+-- Rollback compatibility:
+--   This migration is forward-only; the added static column and UDT linger on
+--   rollback. Reverting to pre-PR code is safe **only** because:
+--     (1) the pre-PR `get_next` reader uses
+--         `maybe_first_row::<(Option<i64>, Option<i32>)>()` which explicitly
+--         handles `offset = NULL` (static column present, no clustering rows);
+--     (2) the pre-PR code never reads `next_offset` or `next_timer`, so stale
+--         static hints written by the new code cannot mislead it.
+--   Future changes to either reader must preserve these invariants or ship
+--   their own rollback plan.
 
 CREATE TYPE IF NOT EXISTS {{KEYSPACE}}.deferred_next_timer (
     time int,

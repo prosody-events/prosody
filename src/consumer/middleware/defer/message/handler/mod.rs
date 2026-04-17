@@ -176,9 +176,12 @@ where
     type Handler = MessageDeferHandler<T::Handler, P::Store, L, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        let store = self
-            .store_provider
-            .create_store(topic, partition, &self.consumer_group);
+        let store = self.store_provider.create_store(
+            topic,
+            partition,
+            &self.consumer_group,
+            self.config.store_cache_size,
+        );
 
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
 
