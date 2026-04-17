@@ -183,7 +183,9 @@ impl CassandraTimerDeferStore {
                     retry_count,
                 }))
             }
-            Some((None, Some(rc_raw))) => self.repair_legacy_partition(segment_id, key, rc_raw).await,
+            Some((None, Some(rc_raw))) => {
+                self.repair_legacy_partition(segment_id, key, rc_raw).await
+            }
         }
     }
 
@@ -226,7 +228,9 @@ impl CassandraTimerDeferStore {
             span: span_map.clone(),
         };
 
-        let ttl = self.store.base_ttl();
+        // Match next_timer's TTL to its referenced clustering row so the static
+        // hint cannot expire before the row it points to.
+        let ttl = self.store.calculate_ttl(min_time);
         self.session()
             .execute_unpaged(
                 &self.queries.repair_next_timer,
@@ -426,7 +430,6 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         time: CompactDateTime,
     ) -> Result<TimerRetryCompletionResult, Self::Error> {
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
-        let ttl = self.store.base_ttl();
 
         let cur_next_time = cached.as_ref().map(|e| e.time);
 
@@ -434,6 +437,9 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             // FIFO hot path: probe for the successor before deleting
             let found = self.probe_next(&segment_id, key, time).await?;
             if let Some(next_udt) = found {
+                // Match next_timer's TTL to the referenced successor row so the
+                // static hint cannot expire before the row it points to.
+                let ttl = self.store.calculate_ttl(next_udt.time);
                 self.session()
                     .execute_unpaged(
                         &self.queries.batch_complete_retry,
@@ -463,7 +469,10 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 Ok(TimerRetryCompletionResult::Completed)
             }
         } else {
-            // Non-FIFO path: offset is not the minimum; leave next_timer alone
+            // Non-FIFO path: offset is not the minimum; leave next_timer alone.
+            // Only retry_count is rewritten — base_ttl is safe (read_next_static
+            // defaults retry_opt = None to 0, matching the value being written).
+            let ttl = self.store.base_ttl();
             self.session()
                 .execute_unpaged(
                     &self.queries.batch_complete_retry_no_advance,
@@ -600,7 +609,6 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
-        let ttl = self.store.base_ttl();
 
         let cur_next_time = cached.as_ref().map(|e| e.time);
 
@@ -609,6 +617,9 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             let found = self.probe_next(&segment_id, key, time).await?;
             match found {
                 Some(next_udt) => {
+                    // Match next_timer's TTL to the referenced successor row so
+                    // the static hint cannot expire before the row it points to.
+                    let ttl = self.store.calculate_ttl(next_udt.time);
                     self.session()
                         .execute_unpaged(
                             &self.queries.batch_remove_and_repair_next,
@@ -1137,7 +1148,12 @@ mod legacy_repair_tests {
         let high = future_time(120);
         store.seed_legacy_for_test(&k, &[low], Some(3)).await?;
 
-        let trigger = Trigger::new(k.clone(), high, TimerType::Application, tracing::Span::current());
+        let trigger = Trigger::new(
+            k.clone(),
+            high,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
         store.defer_first_timer(&trigger).await?;
 
         let db_next = store.read_next_timer_for_invariant_check(&k).await?;
@@ -1172,7 +1188,9 @@ mod legacy_repair_tests {
         let k = key();
         let low = future_time(30);
         let high = future_time(90);
-        store.seed_legacy_for_test(&k, &[low, high], Some(2)).await?;
+        store
+            .seed_legacy_for_test(&k, &[low, high], Some(2))
+            .await?;
 
         let result = store.complete_retry_success(&k, low).await?;
         let advanced = matches!(
@@ -1192,7 +1210,9 @@ mod legacy_repair_tests {
         let k = key();
         let low = future_time(30);
         let high = future_time(90);
-        store.seed_legacy_for_test(&k, &[low, high], Some(2)).await?;
+        store
+            .seed_legacy_for_test(&k, &[low, high], Some(2))
+            .await?;
 
         let result = store.complete_retry_success(&k, high).await?;
         let anchored = matches!(
@@ -1300,7 +1320,9 @@ mod legacy_repair_tests {
         let k = key();
         let low = future_time(30);
         let high = future_time(90);
-        store.seed_legacy_for_test(&k, &[low, high], Some(1)).await?;
+        store
+            .seed_legacy_for_test(&k, &[low, high], Some(1))
+            .await?;
 
         store.remove_deferred_timer(&k, low).await?;
 
@@ -1315,7 +1337,9 @@ mod legacy_repair_tests {
         let k = key();
         let low = future_time(30);
         let high = future_time(90);
-        store.seed_legacy_for_test(&k, &[low, high], Some(1)).await?;
+        store
+            .seed_legacy_for_test(&k, &[low, high], Some(1))
+            .await?;
 
         store.remove_deferred_timer(&k, high).await?;
 
@@ -1388,6 +1412,162 @@ mod legacy_repair_tests {
         assert!(db_next.is_none());
         let cached = store.cache.get(k.as_ref());
         assert!(matches!(cached, Some(None)));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ttl_drift_tests {
+    use super::*;
+    use crate::cassandra::TABLE_DEFERRED_TIMERS;
+    use chrono::Utc;
+
+    fn key(prefix: &str) -> Key {
+        Arc::from(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn future_time(offset_secs: u32) -> CompactDateTime {
+        let now = u32::try_from(Utc::now().timestamp()).unwrap_or(u32::MAX);
+        CompactDateTime::from(now.saturating_add(offset_secs))
+    }
+
+    /// Reads `TTL(next_timer)` directly from Cassandra. `Ok(None)` means the
+    /// column is unset (NULL); a present TTL is returned in seconds.
+    async fn read_next_timer_ttl(
+        store: &CassandraTimerDeferStore,
+        key: &Key,
+    ) -> color_eyre::Result<Option<i32>> {
+        let segment_id = store
+            .segment_id()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let cql = format!(
+            "SELECT TTL(next_timer) FROM prosody_test.{TABLE_DEFERRED_TIMERS} WHERE segment_id = \
+             ? AND key = ?"
+        );
+        let row = store
+            .session()
+            .query_unpaged(cql, (segment_id, key.as_ref()))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(Option<i32>,)>()?;
+        Ok(row.and_then(|(ttl_opt,)| ttl_opt))
+    }
+
+    /// Asserts `next_timer`'s TTL was bound from
+    /// `calculate_ttl(time_pointed_at)`, not `base_ttl()`. The drift bug
+    /// surfaces as `ttl == base_ttl_secs`; the fix lifts TTL by the lead
+    /// time of the referenced row.
+    fn assert_ttl_includes_lead_time(
+        ttl: i32,
+        base_ttl_secs: i32,
+        target: CompactDateTime,
+        store: &CassandraTimerDeferStore,
+        site: &str,
+    ) -> color_eyre::Result<()> {
+        let expected = store
+            .store
+            .calculate_ttl(target)
+            .ok_or_else(|| color_eyre::eyre::eyre!("calculate_ttl returned None"))?;
+        // Server may bind TTL ~1s before our local clock reading; tolerate a
+        // small skew while still rejecting a `base_ttl()` regression.
+        let skew: i32 = 60;
+        assert!(
+            ttl >= expected - skew,
+            "{site}: TTL drift — expected ≈ {expected} (calculate_ttl), got {ttl} (base_ttl = \
+             {base_ttl_secs})"
+        );
+        assert!(
+            ttl > base_ttl_secs,
+            "{site}: TTL still equals base_ttl ({base_ttl_secs}); fix did not take effect: ttl = \
+             {ttl}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_complete_retry_success_fifo_ttl_matches_successor() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key("ttl-drift-complete");
+        let low = future_time(30);
+        let high = future_time(7200);
+
+        let trigger_low = Trigger::new(
+            k.clone(),
+            low,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
+        store.defer_first_timer(&trigger_low).await?;
+        let trigger_high = Trigger::new(
+            k.clone(),
+            high,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
+        store.append_deferred_timer(&trigger_high).await?;
+
+        store.complete_retry_success(&k, low).await?;
+
+        let ttl = read_next_timer_ttl(&store, &k)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected TTL on next_timer"))?;
+        let base_ttl_secs: i32 = store.store.base_ttl().seconds().try_into()?;
+        assert_ttl_includes_lead_time(ttl, base_ttl_secs, high, &store, "complete_retry_success")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_deferred_timer_min_ttl_matches_successor() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key("ttl-drift-remove");
+        let low = future_time(30);
+        let high = future_time(7200);
+
+        let trigger_low = Trigger::new(
+            k.clone(),
+            low,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
+        store.defer_first_timer(&trigger_low).await?;
+        let trigger_high = Trigger::new(
+            k.clone(),
+            high,
+            TimerType::Application,
+            tracing::Span::current(),
+        );
+        store.append_deferred_timer(&trigger_high).await?;
+
+        store.remove_deferred_timer(&k, low).await?;
+
+        let ttl = read_next_timer_ttl(&store, &k)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected TTL on next_timer"))?;
+        let base_ttl_secs: i32 = store.store.base_ttl().seconds().try_into()?;
+        assert_ttl_includes_lead_time(ttl, base_ttl_secs, high, &store, "remove_deferred_timer")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_repair_ttl_matches_min_clustering_row() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key("ttl-drift-legacy");
+        let t = future_time(7200);
+        store.seed_legacy_for_test(&k, &[t], Some(0)).await?;
+
+        // First read fires the lazy on-read repair UPDATE on next_timer.
+        let got = store.get_next_deferred_timer(&k).await?;
+        assert!(got.is_some());
+
+        let ttl = read_next_timer_ttl(&store, &k)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected TTL on next_timer"))?;
+        let base_ttl_secs: i32 = store.store.base_ttl().seconds().try_into()?;
+        assert_ttl_includes_lead_time(ttl, base_ttl_secs, t, &store, "repair_legacy_partition")?;
+
         Ok(())
     }
 }

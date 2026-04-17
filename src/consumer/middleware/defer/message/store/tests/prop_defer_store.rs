@@ -152,9 +152,7 @@ impl Arbitrary for DeferTestInput {
                         DeferOperation::DeferAdditional { key_index, offset }
                     } else {
                         deferred_indices.insert(key_index);
-                        if !touched_indices.contains(&key_index)
-                            && u8::arbitrary(g) % 10 == 0
-                        {
+                        if !touched_indices.contains(&key_index) && u8::arbitrary(g) % 10 == 0 {
                             let count = (usize::arbitrary(g) % 3) + 1;
                             let mut seeded = BTreeSet::new();
                             for _ in 0..count {

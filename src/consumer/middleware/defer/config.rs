@@ -82,13 +82,11 @@ pub struct DeferConfiguration {
     )]
     pub failure_window: Duration,
 
-    /// Cache size for defer middleware caches.
+    /// Cache size for the Kafka message loader cache.
     ///
-    /// Controls capacity for two caches:
-    /// - **Store cache**: Caches each key's next deferred message (offset and
-    ///   retry count) to avoid store queries when checking if a key is deferred
-    /// - **Loader cache**: Caches decoded Kafka messages to avoid redundant
-    ///   reads when retrying deferred messages
+    /// Caches decoded Kafka messages to avoid redundant reads when retrying
+    /// deferred messages. Cassandra store caches are internal-fixed and not
+    /// controlled by this setting.
     ///
     /// Environment variable: `PROSODY_DEFER_CACHE_SIZE`
     /// Default: 1,024 entries

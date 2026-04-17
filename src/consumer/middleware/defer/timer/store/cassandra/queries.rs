@@ -5,7 +5,7 @@
 use crate::cassandra::TABLE_DEFERRED_TIMERS;
 use crate::cassandra_queries;
 use crate::timers::datetime::CompactDateTime;
-use scylla::_macro_internal::{DeserializeValue, SerializeValue};
+use scylla::{DeserializeValue, SerializeValue};
 use std::collections::HashMap;
 
 /// Cassandra UDT for the minimum live timer row cached in the `next_timer`

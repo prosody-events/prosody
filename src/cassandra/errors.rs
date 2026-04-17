@@ -14,8 +14,8 @@
 use crate::cassandra::migrator::MigrationError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDurationError;
-use scylla::_macro_internal::TypeCheckError;
 use scylla::client::pager::NextPageError;
+use scylla::deserialize::TypeCheckError;
 use scylla::errors::{
     BadKeyspaceName, BadQuery, BrokenConnectionError, ConnectionPoolError, CqlErrorParseError,
     CqlRequestSerializationError, CqlResultParseError, DbError, DeserializationError,

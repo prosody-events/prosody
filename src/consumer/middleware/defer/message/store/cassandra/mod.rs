@@ -110,7 +110,9 @@ impl CassandraMessageDeferStore {
                 let retry_count = retry_opt.and_then(|c| c.try_into().ok()).unwrap_or(0);
                 Ok(Some((offset, retry_count)))
             }
-            Some((None, Some(rc_raw))) => self.repair_legacy_partition(segment_id, key, rc_raw).await,
+            Some((None, Some(rc_raw))) => {
+                self.repair_legacy_partition(segment_id, key, rc_raw).await
+            }
         }
     }
 
@@ -902,7 +904,9 @@ mod legacy_repair_tests {
             .seed_legacy_for_test(&k, &[Offset::from(9_i64)], Some(0))
             .await?;
 
-        store.append_deferred_message(&k, Offset::from(3_i64)).await?;
+        store
+            .append_deferred_message(&k, Offset::from(3_i64))
+            .await?;
 
         let db_next = store.read_next_offset_for_invariant_check(&k).await?;
         assert_eq!(db_next, Some(Offset::from(3_i64)));
@@ -917,7 +921,9 @@ mod legacy_repair_tests {
             .seed_legacy_for_test(&k, &[Offset::from(5_i64), Offset::from(10_i64)], Some(2))
             .await?;
 
-        let result = store.complete_retry_success(&k, Offset::from(5_i64)).await?;
+        let result = store
+            .complete_retry_success(&k, Offset::from(5_i64))
+            .await?;
         assert!(matches!(
             result,
             MessageRetryCompletionResult::MoreMessages { next_offset } if next_offset == Offset::from(10_i64)
@@ -1000,7 +1006,9 @@ mod legacy_repair_tests {
             .seed_legacy_for_test(&k, &[Offset::from(5_i64), Offset::from(10_i64)], Some(1))
             .await?;
 
-        store.remove_deferred_message(&k, Offset::from(5_i64)).await?;
+        store
+            .remove_deferred_message(&k, Offset::from(5_i64))
+            .await?;
 
         let db_next = store.read_next_offset_for_invariant_check(&k).await?;
         assert_eq!(db_next, Some(Offset::from(10_i64)));
@@ -1015,7 +1023,9 @@ mod legacy_repair_tests {
             .seed_legacy_for_test(&k, &[Offset::from(5_i64), Offset::from(10_i64)], Some(1))
             .await?;
 
-        store.remove_deferred_message(&k, Offset::from(10_i64)).await?;
+        store
+            .remove_deferred_message(&k, Offset::from(10_i64))
+            .await?;
 
         // Repair anchored next_offset at the true minimum; removing a
         // non-min clustering row leaves that anchor unchanged.

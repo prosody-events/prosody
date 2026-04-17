@@ -163,15 +163,12 @@ impl Arbitrary for TimerDeferTestInput {
                         TimerDeferOperation::DeferAdditional { key_index, time }
                     } else {
                         deferred_indices.insert(key_index);
-                        if !touched_indices.contains(&key_index)
-                            && u8::arbitrary(g) % 10 == 0
-                        {
+                        if !touched_indices.contains(&key_index) && u8::arbitrary(g) % 10 == 0 {
                             let count = (usize::arbitrary(g) % 3) + 1;
                             let mut seeded = BTreeSet::new();
                             for _ in 0..count {
                                 let off = i64::arbitrary(g) % (30 * 24 * 60 * 60);
-                                let unsigned =
-                                    (off.unsigned_abs() % u64::from(u32::MAX)) as u32;
+                                let unsigned = (off.unsigned_abs() % u64::from(u32::MAX)) as u32;
                                 seeded.insert(CompactDateTime::from(now.saturating_add(unsigned)));
                             }
                             // Always Some: realistic pre-migration partitions
