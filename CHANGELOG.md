@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.2](https://github.com/prosody-events/prosody/compare/prosody-v0.1.1...prosody-v0.1.2) (2026-04-20)
+
+
+### Bug Fixes
+
+* **consumer:** use MemoryLoader for defer middleware in mock mode ([#16](https://github.com/prosody-events/prosody/issues/16)) ([295dc0c](https://github.com/prosody-events/prosody/commit/295dc0c77af102ba471ebb596855d71ce52df2fd))
+
+
+### Performance Improvements
+
+* **defer:** eliminate get_next tombstone scans with static hints ([#18](https://github.com/prosody-events/prosody/issues/18)) ([f1a9a9b](https://github.com/prosody-events/prosody/commit/f1a9a9be46c21a5f76964969b978900a06fdd0d0))
+
 ## [0.1.1](https://github.com/prosody-events/prosody/compare/prosody-v0.1.0...prosody-v0.1.1) (2026-04-10)
 
 
