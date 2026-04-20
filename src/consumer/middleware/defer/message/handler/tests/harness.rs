@@ -25,7 +25,6 @@ use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
 use crate::consumer::middleware::defer::message::handler::MessageDeferHandler;
 use crate::consumer::middleware::defer::message::loader::{MemoryLoader, MessageLoader};
-use crate::consumer::middleware::defer::message::store::CachedDeferStore;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
 use crate::consumer::middleware::defer::message::store::memory::MemoryMessageDeferStore;
 use crate::telemetry::Telemetry;
@@ -80,12 +79,8 @@ pub async fn verify_timer_coverage(
 // ============================================================================
 
 /// Type alias for the `MessageDeferHandler` used in tests.
-type TestDeferHandler = MessageDeferHandler<
-    OutcomeHandler,
-    CachedDeferStore<MemoryMessageDeferStore>,
-    FailableLoader,
-    TraceBasedDecider,
->;
+type TestDeferHandler =
+    MessageDeferHandler<OutcomeHandler, MemoryMessageDeferStore, FailableLoader, TraceBasedDecider>;
 
 /// Test harness for executing traces against the **real**
 /// `MessageDeferHandler`.
@@ -106,8 +101,7 @@ pub struct TestHarness {
     pub(crate) decider: TraceBasedDecider,
     /// Loader for storing messages and injecting failures (shared via Arc).
     loader: FailableLoader,
-    /// Store for verification (shared via Arc, wrapped in `CachedDeferStore`
-    /// inside handler).
+    /// Store for verification (shared via Arc inside handler).
     store: MemoryMessageDeferStore,
     /// Timer capture for verification.
     capture: TimerCapture,
@@ -154,15 +148,13 @@ impl TestHarness {
         // Create the MessageDeferHandler directly (bypassing middleware/provider
         // pattern) This is simpler for testing since we don't need the full
         // middleware stack
-        let cached_store = CachedDeferStore::new(store.clone(), config.cache_size);
-
         let telemetry = Telemetry::new();
         let sender = telemetry.partition_sender(topic, partition);
 
         let handler = MessageDeferHandler {
             handler: inner_handler.clone(),
             loader: loader.clone(),
-            store: cached_store,
+            store: store.clone(),
             decider: decider.clone(),
             config,
             topic,

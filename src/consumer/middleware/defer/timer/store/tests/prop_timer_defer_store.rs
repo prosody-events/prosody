@@ -12,6 +12,7 @@ use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use ahash::{HashMap, HashSet};
+use chrono::Utc;
 use color_eyre::eyre::Report;
 use quickcheck::{Arbitrary, Gen};
 use std::collections::BTreeSet;
@@ -100,6 +101,17 @@ pub enum TimerDeferOperation {
     },
     /// Delete all data for a key (hidden primitive operation).
     DeleteKey(usize),
+    /// Seed a pre-migration legacy partition: clustering rows written without
+    /// `next_timer`, plus optional static `retry_count`. Generator emits this
+    /// only as the first op for a key. Exercises the lazy on-read repair path.
+    SeedLegacy {
+        /// Index into `key_components`.
+        key_index: usize,
+        /// Clustering times to insert without populating `next_timer`.
+        clustering_times: Vec<CompactDateTime>,
+        /// Optional static `retry_count` to set (orphan legacy state).
+        retry_count: Option<u32>,
+    },
 }
 
 /// Test input containing isolated key components and operations.
@@ -126,23 +138,51 @@ impl Arbitrary for TimerDeferTestInput {
         // Track which key indices have had DeferFirst called to avoid calling it
         // multiple times
         let mut deferred_indices = HashSet::default();
+        // Keys that have been touched by any op; SeedLegacy may only fire
+        // against an untouched key (the plan requires it to be the first op).
+        let mut touched_indices = HashSet::default();
 
         for _ in 0..op_count {
             let key_index = usize::arbitrary(g) % key_components.len();
 
-            // Helper to generate time (using u32 for CompactDateTime)
-            let time = CompactDateTime::from(u32::arbitrary(g));
+            // Bounded time generation: current time ± 30 days.
+            // Mirrors timers/store/tests/mod.rs to avoid the Cassandra 2038
+            // expiration limit (CASSANDRA-14092) when running against real Cassandra.
+            let offset_seconds = i64::arbitrary(g) % (30 * 24 * 60 * 60);
+            let now = Utc::now().timestamp() as u32;
+            let unsigned_offset = (offset_seconds.unsigned_abs() % u64::from(u32::MAX)) as u32;
+            let time = CompactDateTime::from(now.saturating_add(unsigned_offset));
 
             let op = match u8::arbitrary(g) % 100 {
                 // Compound operations (60%)
                 0..=14 => {
-                    // DeferFirst (15%) - only if not already deferred
+                    // DeferFirst (15%) - only if not already deferred; 10% of
+                    // those become SeedLegacy (legacy on-read repair coverage).
                     if deferred_indices.contains(&key_index) {
                         // Use DeferAdditional instead
                         TimerDeferOperation::DeferAdditional { key_index, time }
                     } else {
                         deferred_indices.insert(key_index);
-                        TimerDeferOperation::DeferFirst { key_index, time }
+                        if !touched_indices.contains(&key_index) && u8::arbitrary(g) % 10 == 0 {
+                            let count = (usize::arbitrary(g) % 3) + 1;
+                            let mut seeded = BTreeSet::new();
+                            for _ in 0..count {
+                                let off = i64::arbitrary(g) % (30 * 24 * 60 * 60);
+                                let unsigned = (off.unsigned_abs() % u64::from(u32::MAX)) as u32;
+                                seeded.insert(CompactDateTime::from(now.saturating_add(unsigned)));
+                            }
+                            // Always Some: realistic pre-migration partitions
+                            // had retry_count set by defer_first_timer. The
+                            // plan treats (NULL, NULL) as truly empty.
+                            let retry_count = Some(u32::arbitrary(g) % 20);
+                            TimerDeferOperation::SeedLegacy {
+                                key_index,
+                                clustering_times: seeded.into_iter().collect(),
+                                retry_count,
+                            }
+                        } else {
+                            TimerDeferOperation::DeferFirst { key_index, time }
+                        }
                     }
                 }
                 15..=29 => {
@@ -195,6 +235,7 @@ impl Arbitrary for TimerDeferTestInput {
                     TimerDeferOperation::DeleteKey(key_index)
                 }
             };
+            touched_indices.insert(key_index);
             operations.push(op);
         }
 
@@ -333,6 +374,21 @@ impl TimerDeferModel {
             TimerDeferOperation::DeleteKey(key_index) => {
                 let key = &key_components[*key_index].key;
                 self.keys.remove(key.as_ref());
+            }
+            TimerDeferOperation::SeedLegacy {
+                key_index,
+                clustering_times,
+                retry_count,
+            } => {
+                let key = Arc::clone(&key_components[*key_index].key);
+                let entry = self
+                    .keys
+                    .entry(key)
+                    .or_insert_with(|| (BTreeSet::new(), None));
+                for time in clustering_times {
+                    entry.0.insert(*time);
+                }
+                entry.1 = *retry_count;
             }
         }
     }
@@ -685,6 +741,36 @@ where
             .await
             .map_err(|e| self.err("DeleteKey", e))
     }
+
+    async fn seed_legacy(
+        &self,
+        model: &mut TimerDeferModel,
+        op: &TimerDeferOperation,
+        key_index: usize,
+        clustering_times: &[CompactDateTime],
+        retry_count: Option<u32>,
+    ) -> color_eyre::Result<()> {
+        let key = self.key(key_index);
+        model.apply(op, self.key_components);
+        // Trait-level emulation: memory stores reach the same semantic state
+        // via append + set_retry_count. Cassandra `invariant_tests` overrides
+        // this path with raw CQL that leaves `next_timer = NULL` to exercise
+        // the real legacy state.
+        for &time in clustering_times {
+            let trigger = create_test_trigger(key, time);
+            self.store
+                .append_deferred_timer(&trigger)
+                .await
+                .map_err(|e| self.err("SeedLegacy/Append", e))?;
+        }
+        if let Some(rc) = retry_count {
+            self.store
+                .set_retry_count(key, rc)
+                .await
+                .map_err(|e| self.err("SeedLegacy/SetRetryCount", e))?;
+        }
+        Ok(())
+    }
 }
 
 /// Handles mutation operations by applying to model and executing on store.
@@ -744,6 +830,14 @@ where
                 .await
         }
         TimerDeferOperation::DeleteKey(key_index) => ctx.delete_key(model, op, *key_index).await,
+        TimerDeferOperation::SeedLegacy {
+            key_index,
+            clustering_times,
+            retry_count,
+        } => {
+            ctx.seed_legacy(model, op, *key_index, clustering_times, *retry_count)
+                .await
+        }
         _ => Err(color_eyre::eyre::eyre!(
             "Internal error: mutation operation expected"
         )),
@@ -826,26 +920,5 @@ mod memory_store_tests {
 
     crate::timer_defer_store_tests!(async {
         Ok::<_, Infallible>(MemoryTimerDeferStore::new(SpanRelation::default()))
-    });
-}
-
-// ============================================================================
-// CachedTimerDeferStore tests
-// ============================================================================
-
-#[cfg(test)]
-mod cached_store_tests {
-    use crate::consumer::middleware::defer::timer::store::CachedTimerDeferStore;
-    use crate::consumer::middleware::defer::timer::store::memory::MemoryTimerDeferStore;
-    use crate::otel::SpanRelation;
-    use std::convert::Infallible;
-
-    crate::timer_defer_store_tests!(async {
-        let store = MemoryTimerDeferStore::new(SpanRelation::default());
-        Ok::<_, Infallible>(CachedTimerDeferStore::new(
-            store,
-            100,
-            SpanRelation::default(),
-        ))
     });
 }

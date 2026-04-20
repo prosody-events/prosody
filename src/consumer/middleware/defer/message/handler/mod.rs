@@ -15,9 +15,7 @@
 //!    initial deferral).
 
 use super::loader::{KafkaLoader, MessageLoader};
-use super::store::{
-    CachedDeferStore, MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult,
-};
+use super::store::{MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::calculate_backoff;
@@ -175,26 +173,24 @@ where
     L: MessageLoader + 'static,
     D: DeferralDecider,
 {
-    type Handler = MessageDeferHandler<T::Handler, CachedDeferStore<P::Store>, L, D>;
+    type Handler = MessageDeferHandler<T::Handler, P::Store, L, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
-        // Create store synchronously - LazySegment handles async initialization
-        // internally
-        let store = self
-            .store_provider
-            .create_store(topic, partition, &self.consumer_group);
-        let cached_store = CachedDeferStore::new(store, self.config.cache_size);
+        let store = self.store_provider.create_store(
+            topic,
+            partition,
+            &self.consumer_group,
+            self.config.store_cache_size,
+        );
 
-        // Inner handler
         let inner_handler = self.inner_provider.handler_for_partition(topic, partition);
 
         let sender = self.telemetry.partition_sender(topic, partition);
 
-        // Message defer wraps inner handler
         MessageDeferHandler {
             handler: inner_handler,
             loader: self.loader.clone(),
-            store: cached_store,
+            store,
             decider: self.decider.clone(),
             config: self.config.clone(),
             topic,

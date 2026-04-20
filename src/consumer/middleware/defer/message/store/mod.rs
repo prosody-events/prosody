@@ -11,7 +11,6 @@
 //! - **Segment isolation**: Stores are scoped to
 //!   `{topic}/{partition}:{consumer_group}`
 
-pub mod cached;
 pub mod cassandra;
 pub mod memory;
 pub mod provider;
@@ -24,7 +23,6 @@ use crate::{Key, Offset};
 use std::error::Error;
 use std::future::Future;
 
-pub use cached::CachedDeferStore;
 pub use cassandra::{CassandraMessageDeferStore, CassandraMessageDeferStoreProvider};
 pub use memory::{MemoryMessageDeferStore, MemoryMessageDeferStoreProvider};
 pub use provider::MessageDeferStoreProvider;

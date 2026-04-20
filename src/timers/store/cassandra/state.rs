@@ -19,10 +19,11 @@ use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use quick_cache::sync::Cache;
-use scylla::_macro_internal::{
-    CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
-    SerializeValue, TypeCheckError, WrittenCellProof,
-};
+use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
+use scylla::deserialize::value::DeserializeValue;
+use scylla::deserialize::{DeserializationError, FrameSlice, TypeCheckError};
+use scylla::serialize::SerializationError;
+use scylla::serialize::value::SerializeValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -92,7 +93,7 @@ pub enum TimerState {
 /// Cassandra UDT serde type for `key_timer_state`.
 ///
 /// Private implementation detail of the `TimerState` serde impls.
-#[derive(Clone, Debug, DeserializeValue, SerializeValue)]
+#[derive(Clone, Debug, scylla::DeserializeValue, scylla::SerializeValue)]
 struct RawTimerState {
     /// `true` = inline data present; `false`/`null` = overflow marker.
     inline: Option<bool>,

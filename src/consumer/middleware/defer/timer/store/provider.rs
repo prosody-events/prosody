@@ -13,6 +13,15 @@ pub trait TimerDeferStoreProvider: Clone + Send + Sync + 'static {
     type Store: TimerDeferStore;
 
     /// Creates a store for the specified segment (synchronous, no I/O).
-    fn create_store(&self, topic: Topic, partition: Partition, consumer_group: &str)
-    -> Self::Store;
+    ///
+    /// `cache_size` sizes the store's internal write-through cache. Memory
+    /// providers may ignore it; Cassandra providers forward it to the
+    /// `quick_cache::sync::Cache` inside the store.
+    fn create_store(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        consumer_group: &str,
+        cache_size: usize,
+    ) -> Self::Store;
 }

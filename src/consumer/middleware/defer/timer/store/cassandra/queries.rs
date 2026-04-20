@@ -1,75 +1,121 @@
 //! Prepared CQL statement management for Cassandra timer defer storage.
-//!
-//! This module provides the [`Queries`] struct which contains all prepared
-//! Cassandra CQL statements needed for timer defer store operations. Prepared
-//! statements are created once during initialization and reused for all
-//! database operations, providing better performance and security.
 
 #![allow(dead_code, reason = "fields used in implementation")]
 
 use crate::cassandra::TABLE_DEFERRED_TIMERS;
 use crate::cassandra_queries;
+use crate::timers::datetime::CompactDateTime;
+use scylla::{DeserializeValue, SerializeValue};
+use std::collections::HashMap;
+
+/// Cassandra UDT for the minimum live timer row cached in the `next_timer`
+/// static column. Bundles `time` and `span` atomically so they cannot drift
+/// (invariant I4).
+///
+/// Mirrors the `key_timer_state` UDT pattern from
+/// `20260217_add_singleton_slots.cql`.
+#[derive(Clone, Debug, DeserializeValue, SerializeValue)]
+pub struct DeferredNextTimer {
+    /// `original_time` of the minimum live timer row.
+    pub time: CompactDateTime,
+    /// W3C trace context span map for context reconstruction.
+    pub span: HashMap<String, String>,
+}
 
 cassandra_queries! {
-    /// Container for all prepared Cassandra CQL statements used by the timer
-    /// defer store.
-    ///
-    /// This struct holds the Cassandra session and all prepared statements needed
-    /// for timer defer storage operations. Prepared statements provide better
-    /// performance and security compared to ad-hoc query strings.
-    ///
-    /// The struct contains prepared statements for:
-    /// - Getting the next deferred timer for a key
-    /// - Appending new deferred timers with TTL
-    /// - Updating retry counts
-    /// - Removing processed timers
-    ///
-    /// Segment metadata is managed separately via
-    /// [`CassandraSegmentStore`](crate::consumer::middleware::defer::segment::CassandraSegmentStore).
+    /// Container for all prepared Cassandra CQL statements used by the timer defer store.
     pub struct Queries {
-        /// Gets the next deferred timer (oldest `original_time`) and retry count
-        /// for a key. Returns: (`original_time`, span, `retry_count`)
-        get_next_deferred_timer: (
+        /// Static-column read (`next_timer` UDT, `retry_count`) — zero clustering scan.
+        get_next_static: (
+            "SELECT next_timer, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            TABLE_DEFERRED_TIMERS
+        ),
+
+        /// Successor probe: first clustering row with `original_time > ?`.
+        probe_next: (
+            "SELECT original_time, span, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND original_time > ? LIMIT 1",
+            TABLE_DEFERRED_TIMERS
+        ),
+
+        /// Minimum-row probe for legacy on-read repair: lowest clustering row in the partition.
+        probe_min: (
             "SELECT original_time, span, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
             TABLE_DEFERRED_TIMERS
         ),
 
-        /// Inserts a new deferred timer with retry count initialization and TTL.
-        /// Used for first deferral.
-        insert_deferred_timer_with_retry_count: (
-            "INSERT INTO $keyspace.{} (segment_id, key, original_time, span, retry_count) VALUES (?, ?, ?, ?, ?) USING TTL ?",
+        /// Legacy on-read repair: synthesize `next_timer` from probed min (LWW, no LWT).
+        repair_next_timer: (
+            "UPDATE $keyspace.{} USING TTL ? SET next_timer = ? WHERE segment_id = ? AND key = ?",
             TABLE_DEFERRED_TIMERS
         ),
 
-        /// Inserts a new deferred timer WITHOUT updating retry count.
-        /// Leaves static column unchanged. Used for queueing additional timers.
+        /// INSERT with `retry_count = 0` and `next_timer` set (first deferral).
+        insert_deferred_timer_with_retry_count: (
+            "INSERT INTO $keyspace.{} (segment_id, key, original_time, span, retry_count, next_timer) VALUES (?, ?, ?, ?, ?, ?) USING TTL ?",
+            TABLE_DEFERRED_TIMERS
+        ),
+
+        /// INSERT without touching `retry_count` or `next_timer` (monotonic append).
         insert_deferred_timer_without_retry_count: (
             "INSERT INTO $keyspace.{} (segment_id, key, original_time, span) VALUES (?, ?, ?, ?) USING TTL ?",
             TABLE_DEFERRED_TIMERS
         ),
 
-        /// Updates the retry count for all timers of a key (static column).
+        /// Updates the `retry_count` static column.
         update_retry_count: (
             "UPDATE $keyspace.{} USING TTL ? SET retry_count = ? WHERE segment_id = ? AND key = ?",
             TABLE_DEFERRED_TIMERS
         ),
 
-        /// Removes a specific deferred timer by key and `original_time`.
+        /// UNLOGGED BATCH — FIFO `complete_retry_success`: DELETE + advance `next_timer` + reset `retry_count = 0`.
+        batch_complete_retry: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND original_time = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET next_timer = ?, retry_count = 0 WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_DEFERRED_TIMERS, TABLE_DEFERRED_TIMERS
+        ),
+
+        /// UNLOGGED BATCH — non-FIFO `complete_retry_success`: DELETE + reset `retry_count = 0`, `next_timer` unchanged.
+        batch_complete_retry_no_advance: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND original_time = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET retry_count = 0 WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_DEFERRED_TIMERS, TABLE_DEFERRED_TIMERS
+        ),
+
+        /// UNLOGGED BATCH — out-of-order append: INSERT + lower `next_timer`.
+        batch_append_with_next: (
+            "BEGIN UNLOGGED BATCH \
+             INSERT INTO $keyspace.{} (segment_id, key, original_time, span) VALUES (?, ?, ?, ?) USING TTL ?; \
+             UPDATE $keyspace.{} USING TTL ? SET next_timer = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_DEFERRED_TIMERS, TABLE_DEFERRED_TIMERS
+        ),
+
+        /// UNLOGGED BATCH — min-removal repair: DELETE + update `next_timer` to successor.
+        batch_remove_and_repair_next: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND original_time = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET next_timer = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_DEFERRED_TIMERS, TABLE_DEFERRED_TIMERS
+        ),
+
+        /// Removes a specific clustering row (primitive, non-min removal).
         remove_deferred_timer: (
             "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND original_time = ?",
             TABLE_DEFERRED_TIMERS
         ),
 
-        /// Deletes all data for a key (entire partition including static
-        /// columns).
+        /// Deletes the entire partition including static columns.
         delete_key: (
             "DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
             TABLE_DEFERRED_TIMERS
         ),
 
-        /// Gets all deferred timer times for a key, sorted ascending by
-        /// `original_time` (clustering order). Used by `scheduled()` to
-        /// merge with active timers.
+        /// Full-partition scan of all live timer times (ascending `original_time` order).
         get_deferred_times: (
             "SELECT original_time FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
             TABLE_DEFERRED_TIMERS

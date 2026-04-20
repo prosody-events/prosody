@@ -10,17 +10,18 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentVersion;
 use opentelemetry::propagation::TextMapCompositePropagator;
-use scylla::_macro_internal::{
-    CellWriter, ColumnType, DeserializationError, DeserializeValue, FrameSlice, SerializationError,
-    SerializeValue, TypeCheckError, WrittenCellProof,
-};
+use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::client::Compression;
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::cluster::metadata::NativeType;
+use scylla::deserialize::value::DeserializeValue;
+use scylla::deserialize::{DeserializationError, FrameSlice, TypeCheckError};
 use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
+use scylla::serialize::SerializationError;
+use scylla::serialize::value::SerializeValue;
 use scylla::statement::Consistency;
 use std::sync::Arc;
 

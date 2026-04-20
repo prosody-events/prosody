@@ -95,6 +95,17 @@ pub enum DeferOperation {
     },
     /// Delete all data for a key (hidden primitive operation).
     DeleteKey(usize),
+    /// Seed a pre-migration legacy partition: clustering rows written without
+    /// `next_offset`, plus optional static `retry_count`. Generator emits this
+    /// only as the first op for a key. Exercises the lazy on-read repair path.
+    SeedLegacy {
+        /// Index into `key_components`.
+        key_index: usize,
+        /// Clustering offsets to insert without populating `next_offset`.
+        clustering_offsets: Vec<Offset>,
+        /// Optional static `retry_count` to set (orphan legacy state).
+        retry_count: Option<u32>,
+    },
 }
 
 /// Test input containing isolated key components and operations.
@@ -121,6 +132,9 @@ impl Arbitrary for DeferTestInput {
         // Track which key indices have had DeferFirst called to avoid calling it
         // multiple times
         let mut deferred_indices = HashSet::default();
+        // Keys that have been touched by any op; SeedLegacy may only fire
+        // against an untouched key (the plan requires it to be the first op).
+        let mut touched_indices = HashSet::default();
 
         for _ in 0..op_count {
             let key_index = usize::arbitrary(g) % key_components.len();
@@ -131,13 +145,33 @@ impl Arbitrary for DeferTestInput {
             let op = match u8::arbitrary(g) % 100 {
                 // Compound operations (60%)
                 0..=14 => {
-                    // DeferFirst (15%) - only if not already deferred
+                    // DeferFirst (15%) - only if not already deferred; 10% of
+                    // those become SeedLegacy (legacy on-read repair coverage).
                     if deferred_indices.contains(&key_index) {
                         // Use DeferAdditional instead
                         DeferOperation::DeferAdditional { key_index, offset }
                     } else {
                         deferred_indices.insert(key_index);
-                        DeferOperation::DeferFirst { key_index, offset }
+                        if !touched_indices.contains(&key_index) && u8::arbitrary(g) % 10 == 0 {
+                            let count = (usize::arbitrary(g) % 3) + 1;
+                            let mut seeded = BTreeSet::new();
+                            for _ in 0..count {
+                                seeded.insert(Offset::from(i64::from(u32::arbitrary(g))));
+                            }
+                            // Always Some: a realistic pre-migration partition
+                            // was written via `defer_first_message` (which sets
+                            // retry_count=0) before any `append`, so retry_count
+                            // is always populated. The plan deliberately treats
+                            // (next_*=NULL, retry_count=NULL) as "truly empty".
+                            let retry_count = Some(u32::arbitrary(g) % 20);
+                            DeferOperation::SeedLegacy {
+                                key_index,
+                                clustering_offsets: seeded.into_iter().collect(),
+                                retry_count,
+                            }
+                        } else {
+                            DeferOperation::DeferFirst { key_index, offset }
+                        }
                     }
                 }
                 15..=29 => {
@@ -190,6 +224,7 @@ impl Arbitrary for DeferTestInput {
                     DeferOperation::DeleteKey(key_index)
                 }
             };
+            touched_indices.insert(key_index);
             operations.push(op);
         }
 
@@ -328,6 +363,21 @@ impl DeferModel {
             DeferOperation::DeleteKey(key_index) => {
                 let key = &key_components[*key_index].key;
                 self.keys.remove(key.as_ref());
+            }
+            DeferOperation::SeedLegacy {
+                key_index,
+                clustering_offsets,
+                retry_count,
+            } => {
+                let key = Arc::clone(&key_components[*key_index].key);
+                let entry = self
+                    .keys
+                    .entry(key)
+                    .or_insert_with(|| (BTreeSet::new(), None));
+                for offset in clustering_offsets {
+                    entry.0.insert(*offset);
+                }
+                entry.1 = *retry_count;
             }
         }
     }
@@ -673,6 +723,35 @@ where
             .await
             .map_err(|e| self.err("DeleteKey", e))
     }
+
+    async fn seed_legacy(
+        &self,
+        model: &mut DeferModel,
+        op: &DeferOperation,
+        key_index: usize,
+        clustering_offsets: &[Offset],
+        retry_count: Option<u32>,
+    ) -> color_eyre::Result<()> {
+        let key = self.key(key_index);
+        model.apply(op, self.key_components);
+        // Trait-level emulation: memory stores reach the same semantic state
+        // via append + set_retry_count. Cassandra `invariant_tests` overrides
+        // this path with raw CQL that leaves `next_offset = NULL` to exercise
+        // the real legacy state.
+        for &offset in clustering_offsets {
+            self.store
+                .append_deferred_message(key, offset)
+                .await
+                .map_err(|e| self.err("SeedLegacy/Append", e))?;
+        }
+        if let Some(rc) = retry_count {
+            self.store
+                .set_retry_count(key, rc)
+                .await
+                .map_err(|e| self.err("SeedLegacy/SetRetryCount", e))?;
+        }
+        Ok(())
+    }
 }
 
 /// Handles mutation operations by applying to model and executing on store.
@@ -741,6 +820,14 @@ where
                 .await
         }
         DeferOperation::DeleteKey(key_index) => ctx.delete_key(model, op, *key_index).await,
+        DeferOperation::SeedLegacy {
+            key_index,
+            clustering_offsets,
+            retry_count,
+        } => {
+            ctx.seed_legacy(model, op, *key_index, clustering_offsets, *retry_count)
+                .await
+        }
         _ => Err(color_eyre::eyre::eyre!(
             "Internal error: mutation operation expected"
         )),

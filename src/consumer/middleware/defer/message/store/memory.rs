@@ -165,6 +165,7 @@ impl MessageDeferStoreProvider for MemoryMessageDeferStoreProvider {
         _topic: Topic,
         _partition: Partition,
         _consumer_group: &str,
+        _cache_size: usize,
     ) -> Self::Store {
         MemoryMessageDeferStore::new()
     }

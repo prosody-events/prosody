@@ -242,14 +242,17 @@ fn prop_backoff_bounds(trace: Trace) -> TestResult {
             };
 
             // Capture time before execution
-            let before = CompactDateTime::now().ok();
+            let before_time = match CompactDateTime::now() {
+                Ok(t) => t,
+                Err(e) => return TestResult::error(format!("CompactDateTime::now failed: {e}")),
+            };
 
             if let Err(e) = harness.execute_event(event).await {
                 return TestResult::error(format!("Execution failed: {e}"));
             }
 
             // Verify backoff bounds if this event scheduled a timer
-            if let (Some((key_idx, max_backoff)), Some(before_time)) = (backoff_check, before) {
+            if let Some((key_idx, max_backoff)) = backoff_check {
                 let key = harness.key(key_idx);
                 if let Some(scheduled_time) = harness.capture().get_timer_time(key) {
                     // Scheduled time must be >= before_time (not in the past)
