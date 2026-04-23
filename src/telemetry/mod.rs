@@ -27,7 +27,7 @@ pub use emitter::{
     spawn_telemetry_emitter,
 };
 
-const TELEMETRY_CHANNEL_CAPACITY: usize = 8096;
+const TELEMETRY_CHANNEL_CAPACITY: usize = 32768;
 
 /// Telemetry system for broadcasting consumer lifecycle events.
 ///
