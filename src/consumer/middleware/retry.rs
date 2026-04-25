@@ -79,6 +79,8 @@
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 
 use std::cmp::min;
+use std::fmt::Display;
+use std::future::Future;
 use std::time::Duration;
 
 use derive_builder::Builder;
@@ -97,55 +99,7 @@ use crate::consumer::middleware::{
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
 use crate::timers::{Trigger, UncommittedTimer};
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
-use crate::{Partition, Topic};
-
-// ============================================================================
-// Retry Sleep Helper
-// ============================================================================
-
-/// Result of waiting during retry backoff.
-///
-/// Used by the retry loop to determine the next action after a sleep period.
-/// This centralizes the cancellation handling logic to ensure consistent
-/// behavior across all retry implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryWaitResult {
-    /// Sleep completed normally, continue with retry.
-    Completed,
-    /// Shutdown requested (partition revoked), abort immediately.
-    Shutdown,
-    /// Message cancelled, skip remaining sleep and continue retry.
-    Cancelled,
-}
-
-/// Waits for the specified duration with cancellation support.
-///
-/// This helper encapsulates the critical shutdown vs cancellation distinction:
-/// - **Shutdown**: Partition revoked or consumer stopping. Returns
-///   `RetryWaitResult::Shutdown`.
-/// - **Cancellation**: Message-level cancellation requested. Returns
-///   `RetryWaitResult::Cancelled`.
-/// - **Completed**: Sleep finished normally. Returns
-///   `RetryWaitResult::Completed`.
-///
-/// # Arguments
-///
-/// * `context` - The event context providing termination signals.
-/// * `duration` - How long to sleep before retrying.
-///
-/// # Returns
-///
-/// A `RetryWaitResult` indicating why the wait ended.
-async fn wait_with_cancellation<C: EventContext>(
-    context: &C,
-    duration: Duration,
-) -> RetryWaitResult {
-    select! {
-        () = sleep(duration) => RetryWaitResult::Completed,
-        () = context.on_shutdown() => RetryWaitResult::Shutdown,
-        () = context.on_message_cancelled() => RetryWaitResult::Cancelled,
-    }
-}
+use crate::{Offset, Partition, Topic};
 
 // ============================================================================
 // Configuration
@@ -256,16 +210,67 @@ impl<T> RetryProvider<T> {
     }
 }
 
+// ============================================================================
+// Shared retry loop
+// ============================================================================
+
+/// Why a `wait_with_cancellation` call returned. Distinguishes shutdown
+/// (partition revoked → abort) from message cancellation (treated as a
+/// transient condition → keep retrying).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryWaitResult {
+    Completed,
+    Shutdown,
+    Cancelled,
+}
+
+async fn wait_with_cancellation<C: EventContext>(
+    context: &C,
+    duration: Duration,
+) -> RetryWaitResult {
+    select! {
+        () = sleep(duration) => RetryWaitResult::Completed,
+        () = context.on_shutdown() => RetryWaitResult::Shutdown,
+        () = context.on_message_cancelled() => RetryWaitResult::Cancelled,
+    }
+}
+
+/// How [`RetryHandler::run`] resolved a single dispatch. Mapped at the call
+/// site to either `Result<O, E>` (for the [`FallibleHandler`] impl, which
+/// surfaces the error to an outer middleware) or to `commit`/`abort` plus the
+/// matching apply hook (for the [`EventHandler`] impl, which is the durability
+/// boundary).
+enum Resolution<O, E> {
+    Commit(Result<O, E>),
+    Abort(E),
+}
+
+/// Reason a retry attempt is being logged. Each variant carries the data a
+/// call-site closure needs to emit a structured log with the relevant
+/// per-event fields (topic / partition / key / offset for messages, none for
+/// timers).
+enum LogReason<'a, E> {
+    Retrying {
+        attempt: u32,
+        error: &'a E,
+        sleep: Duration,
+    },
+    MaxRetriesExceeded {
+        attempt: u32,
+        error: &'a E,
+    },
+    Permanent {
+        attempt: u32,
+        error: &'a E,
+    },
+    Terminal {
+        attempt: u32,
+        error: &'a E,
+    },
+}
+
 impl<T> RetryHandler<T> {
     /// Calculates the sleep time for a given retry attempt.
-    ///
-    /// # Arguments
-    ///
-    /// * `attempt` - The current retry attempt number.
-    ///
-    /// # Returns
-    ///
-    /// The duration to sleep before the next retry attempt.
     fn sleep_time(&self, attempt: u32) -> Duration {
         let exp_backoff = min(
             2u64.saturating_pow(attempt)
@@ -275,6 +280,159 @@ impl<T> RetryHandler<T> {
 
         let jitter = rand::rng().random_range(0..exp_backoff);
         Duration::from_millis(jitter)
+    }
+
+    /// Drives a single dispatch (message or timer) through the retry loop and
+    /// returns a [`Resolution`] describing how the durability marker should
+    /// be handled.
+    ///
+    /// `max_retries = None` means retry transient errors forever; used at the
+    /// outermost layer where there is no fallback. `max_retries = Some(n)`
+    /// caps transient retries at `n`, after which the call resolves to
+    /// `Commit(Err)` so an outer DLQ middleware can take over.
+    async fn run<C, E, O, F, Fut>(
+        &self,
+        context: &C,
+        demand_type: DemandType,
+        max_retries: Option<u32>,
+        mut invoke: F,
+        log: impl Fn(LogReason<'_, E>),
+    ) -> Resolution<O, E>
+    where
+        C: EventContext,
+        E: ClassifyError,
+        F: FnMut(DemandType) -> Fut,
+        Fut: Future<Output = Result<O, E>>,
+    {
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+            // First attempt uses the original demand type; retries surface as Failure.
+            let demand = if attempt == 1 {
+                demand_type
+            } else {
+                DemandType::Failure
+            };
+            let error = match invoke(demand).await {
+                Ok(outcome) => return Resolution::Commit(Ok(outcome)),
+                Err(error) => error,
+            };
+
+            // Only abort on shutdown. Message cancellation is treated as transient.
+            if context.is_shutdown() {
+                return Resolution::Abort(error);
+            }
+
+            match error.classify_error() {
+                ErrorCategory::Transient => {
+                    if matches!(max_retries, Some(max) if attempt > max) {
+                        log(LogReason::MaxRetriesExceeded {
+                            attempt,
+                            error: &error,
+                        });
+                        return Resolution::Commit(Err(error));
+                    }
+                    let sleep_time = self.sleep_time(attempt);
+                    log(LogReason::Retrying {
+                        attempt,
+                        error: &error,
+                        sleep: sleep_time,
+                    });
+                    if wait_with_cancellation(context, sleep_time).await
+                        == RetryWaitResult::Shutdown
+                    {
+                        return Resolution::Abort(error);
+                    }
+                }
+                ErrorCategory::Permanent => {
+                    log(LogReason::Permanent {
+                        attempt,
+                        error: &error,
+                    });
+                    return Resolution::Commit(Err(error));
+                }
+                ErrorCategory::Terminal => {
+                    log(LogReason::Terminal {
+                        attempt,
+                        error: &error,
+                    });
+                    return Resolution::Abort(error);
+                }
+            }
+        }
+    }
+}
+
+/// Emits a structured log for a message-path retry event. `discard_suffix` is
+/// `""` in `FallibleHandler` context (the error propagates upward) and
+/// `"; discarding message"` in `EventHandler` context (the marker commits and
+/// the message is dropped from this consumer's perspective).
+fn log_message_failure<E: Display>(
+    topic: &str,
+    partition: Partition,
+    key: &str,
+    offset: Offset,
+    reason: &LogReason<'_, E>,
+    discard_suffix: &str,
+) {
+    match *reason {
+        LogReason::Retrying {
+            attempt,
+            error,
+            sleep,
+        } => error!(
+            partition,
+            key,
+            offset,
+            attempt,
+            topic,
+            "failed to handle message: {error:#}; retrying after {}",
+            format_duration(sleep),
+        ),
+        LogReason::MaxRetriesExceeded { attempt, error } => error!(
+            partition,
+            key,
+            offset,
+            attempt,
+            topic,
+            "failed to handle message: {error:#}; maximum attempts reached",
+        ),
+        LogReason::Permanent { attempt, error } => error!(
+            partition,
+            key,
+            offset,
+            attempt,
+            topic,
+            "permanently failed to handle message: {error:#}{discard_suffix}",
+        ),
+        LogReason::Terminal { attempt, error } => info!(
+            partition,
+            key,
+            offset,
+            attempt,
+            topic,
+            "terminal condition encountered while handling message: {error:#}; aborting",
+        ),
+    }
+}
+
+/// Emits a structured log for a timer-path retry event. See
+/// [`log_message_failure`] for the meaning of `discard_suffix`.
+fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, discard_suffix: &str) {
+    match *reason {
+        LogReason::Retrying { error, sleep, .. } => error!(
+            "failed to handle timer: {error:#}; retrying after {}",
+            format_duration(sleep),
+        ),
+        LogReason::MaxRetriesExceeded { error, .. } => {
+            error!("failed to handle timer: {error:#}; maximum attempts reached");
+        }
+        LogReason::Permanent { error, .. } => {
+            error!("permanently failed to handle timer: {error:#}{discard_suffix}");
+        }
+        LogReason::Terminal { error, .. } => {
+            info!("terminal condition encountered while handling timer: {error:#}; aborting");
+        }
     }
 }
 
@@ -314,6 +472,13 @@ where
     }
 }
 
+// ============================================================================
+// FallibleHandler impl
+// ============================================================================
+//
+// As an inner middleware, transient errors are capped at `max_retries` so an
+// outer DLQ middleware can take over. All error variants collapse to `Err`.
+
 impl<T> FallibleHandler for RetryHandler<T>
 where
     T: FallibleHandler,
@@ -321,21 +486,6 @@ where
     type Error = T::Error;
     type Outcome = T::Outcome;
 
-    /// Handles a message with retry functionality.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The message context.
-    /// * `message` - The consumer message to be processed.
-    /// * `demand_type` - Whether this is normal processing or failure retry.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or failure of message processing.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying handler's error if all retry attempts fail.
     async fn on_message<C>(
         &self,
         context: C,
@@ -349,91 +499,30 @@ where
         let partition = message.partition();
         let key = message.key();
         let offset = message.offset();
-        let mut attempt: u32 = 0;
-
-        loop {
-            attempt = attempt.saturating_add(1);
-            // Use the original demand type for the first attempt, failure demand for
-            // retries
-            let current_demand_type = if attempt == 1 {
-                demand_type
-            } else {
-                DemandType::Failure
-            };
-            let error = match self
-                .handler
-                .on_message(context.clone(), message.clone(), current_demand_type)
-                .await
-            {
-                Ok(outcome) => return Ok(outcome),
-                Err(error) => error,
-            };
-
-            // Only abort on shutdown (partition revoked). Message cancellation is
-            // treated as transient - we continue retrying.
-            if context.is_shutdown() {
-                return Err(error);
-            }
-
-            // Handle different error categories
-            match error.classify_error() {
-                ErrorCategory::Transient => {
-                    if attempt > self.max_retries {
-                        // Log the final failure and return the error
-                        error!(
-                            partition,
-                            key = key.as_ref(),
-                            offset,
-                            attempt,
-                            topic = topic.as_ref(),
-                            "failed to handle message: {error:#}; maximum attempts reached"
-                        );
-                        return Err(error);
-                    }
-
-                    let sleep_time = self.sleep_time(attempt);
-
-                    // Log the failure and retry information
-                    error!(
+        let resolution = self
+            .run(
+                &context,
+                demand_type,
+                Some(self.max_retries),
+                |dt| {
+                    self.handler
+                        .on_message(context.clone(), message.clone(), dt)
+                },
+                |reason| {
+                    log_message_failure(
+                        topic.as_ref(),
                         partition,
-                        key = key.as_ref(),
+                        key.as_ref(),
                         offset,
-                        attempt,
-                        topic = topic.as_ref(),
-                        "failed to handle message: {error:#}; retrying after {}",
-                        format_duration(sleep_time)
+                        &reason,
+                        "",
                     );
-
-                    if wait_with_cancellation(&context, sleep_time).await
-                        == RetryWaitResult::Shutdown
-                    {
-                        return Err(error);
-                    }
-                }
-                ErrorCategory::Permanent => {
-                    error!(
-                        partition,
-                        key = key.as_ref(),
-                        offset,
-                        attempt,
-                        topic = topic.as_ref(),
-                        "permanently failed to handle message: {error:#}"
-                    );
-                    return Err(error);
-                }
-                ErrorCategory::Terminal => {
-                    info!(
-                        partition,
-                        key = key.as_ref(),
-                        offset,
-                        attempt,
-                        topic = topic.as_ref(),
-                        "terminal condition encountered while handling message: {error:#}; \
-                         aborting"
-                    );
-                    return Err(error);
-                }
-            }
+                },
+            )
+            .await;
+        match resolution {
+            Resolution::Commit(result) => result,
+            Resolution::Abort(error) => Err(error),
         }
     }
 
@@ -446,59 +535,18 @@ where
     where
         C: EventContext,
     {
-        // Retry logic for a fired timer
-        let mut attempt: u32 = 0;
-        loop {
-            attempt = attempt.saturating_add(1);
-            // Use the original demand type for the first attempt, failure demand for
-            // retries
-            let current_demand_type = if attempt == 1 {
-                demand_type
-            } else {
-                DemandType::Failure
-            };
-            // Try handling the timer
-            let error = match self
-                .handler
-                .on_timer(context.clone(), timer.clone(), current_demand_type)
-                .await
-            {
-                Ok(outcome) => return Ok(outcome),
-                Err(error) => error,
-            };
-            // Only abort on shutdown (partition revoked). Message cancellation is
-            // treated as transient - we continue retrying.
-            if context.is_shutdown() {
-                return Err(error);
-            }
-            match error.classify_error() {
-                ErrorCategory::Transient => {
-                    if attempt > self.max_retries {
-                        error!("failed to handle timer: {error:#}; maximum attempts reached");
-                        return Err(error);
-                    }
-                    let sleep_time = self.sleep_time(attempt);
-                    error!(
-                        "failed to handle timer: {error:#}; retrying after {}",
-                        format_duration(sleep_time)
-                    );
-                    if wait_with_cancellation(&context, sleep_time).await
-                        == RetryWaitResult::Shutdown
-                    {
-                        return Err(error);
-                    }
-                }
-                ErrorCategory::Permanent => {
-                    error!("permanently failed to handle timer: {error:#}");
-                    return Err(error);
-                }
-                ErrorCategory::Terminal => {
-                    info!(
-                        "terminal condition encountered while handling timer: {error:#}; aborting"
-                    );
-                    return Err(error);
-                }
-            }
+        let resolution = self
+            .run(
+                &context,
+                demand_type,
+                Some(self.max_retries),
+                |dt| self.handler.on_timer(context.clone(), timer.clone(), dt),
+                |reason| log_timer_failure(&reason, ""),
+            )
+            .await;
+        match resolution {
+            Resolution::Commit(result) => result,
+            Resolution::Abort(error) => Err(error),
         }
     }
 
@@ -518,33 +566,22 @@ where
 
     async fn shutdown(self) {
         debug!("shutting down retry handler");
-
-        // No retry-specific state to clean up (timers are handled by tokio)
-        // Cascade shutdown to the inner handler
         self.handler.shutdown().await;
     }
 }
 
-/// How the retry loop in [`RetryHandler::on_message`] /
-/// [`RetryHandler::on_timer`] resolved: commit or abort the marker, with the
-/// `Result` we'll thread into the matching apply hook.
-enum Resolution<O, E> {
-    Commit(Result<O, E>),
-    Abort(Result<O, E>),
-}
+// ============================================================================
+// EventHandler impl
+// ============================================================================
+//
+// As the outermost durability layer, transient errors retry forever (no
+// fallback exists below). The `Resolution` returned by `run` is mapped to
+// commit/abort plus the matching apply hook.
 
 impl<T> EventHandler for RetryHandler<T>
 where
     T: FallibleHandler,
 {
-    /// Handles a message with retry functionality and commits the offset upon
-    /// success.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - The message context.
-    /// * `message` - The uncommitted message to be processed.
-    /// * `demand_type` - Whether this is normal processing or failure retry.
     async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
     where
         C: EventContext,
@@ -555,88 +592,36 @@ where
         let offset = message.offset();
         let (message, uncommitted_offset) = message.into_inner();
 
-        // Run the retry loop and bind the final Result. Every break-out of
-        // the loop yields the result we'll thread into commit+after_commit
-        // or abort+after_abort below.
-        let mut attempt: u32 = 0;
-        let resolution: Resolution<T::Outcome, T::Error> = loop {
-            attempt = attempt.saturating_add(1);
-            // Use the original demand type for the first attempt, failure demand for
-            // retries
-            let current_demand_type = if attempt == 1 {
-                demand_type
-            } else {
-                DemandType::Failure
-            };
-            let error = match self
-                .handler
-                .on_message(context.clone(), message.clone(), current_demand_type)
-                .await
-            {
-                Ok(outcome) => break Resolution::Commit(Ok(outcome)),
-                Err(error) => error,
-            };
-
-            // Only abort on shutdown (partition revoked). Message cancellation is
-            // treated as transient - we continue retrying.
-            if context.is_shutdown() {
-                break Resolution::Abort(Err(error));
-            }
-
-            // Handle different error categories
-            match error.classify_error() {
-                ErrorCategory::Transient => {
-                    let sleep_time = self.sleep_time(attempt);
-                    error!(
+        let resolution = self
+            .run(
+                &context,
+                demand_type,
+                None,
+                |dt| {
+                    self.handler
+                        .on_message(context.clone(), message.clone(), dt)
+                },
+                |reason| {
+                    log_message_failure(
+                        topic.as_ref(),
                         partition,
-                        key = key.as_ref(),
+                        key.as_ref(),
                         offset,
-                        attempt,
-                        topic = topic.as_ref(),
-                        "failed to handle message: {error:#}; retrying after {}",
-                        format_duration(sleep_time)
+                        &reason,
+                        "; discarding message",
                     );
-
-                    if wait_with_cancellation(&context, sleep_time).await
-                        == RetryWaitResult::Shutdown
-                    {
-                        break Resolution::Abort(Err(error));
-                    }
-                }
-                ErrorCategory::Permanent => {
-                    error!(
-                        partition,
-                        key = key.as_ref(),
-                        offset,
-                        attempt,
-                        topic = topic.as_ref(),
-                        "permanently failed to handle message: {error:#}; discarding message"
-                    );
-                    break Resolution::Commit(Err(error));
-                }
-                ErrorCategory::Terminal => {
-                    info!(
-                        partition,
-                        key = key.as_ref(),
-                        offset,
-                        attempt,
-                        topic = topic.as_ref(),
-                        "terminal condition encountered while handling message: {error:#}; \
-                         aborting"
-                    );
-                    break Resolution::Abort(Err(error));
-                }
-            }
-        };
+                },
+            )
+            .await;
 
         match resolution {
             Resolution::Commit(result) => {
                 uncommitted_offset.commit();
                 self.handler.after_commit(context, result).await;
             }
-            Resolution::Abort(result) => {
+            Resolution::Abort(error) => {
                 uncommitted_offset.abort();
-                self.handler.after_abort(context, result).await;
+                self.handler.after_abort(context, Err(error)).await;
             }
         }
     }
@@ -646,77 +631,32 @@ where
         C: EventContext,
         U: UncommittedTimer,
     {
-        // Retry logic for an uncommitted timer
         let (trigger, uncommitted) = timer.into_inner();
 
-        let mut attempt: u32 = 0;
-        let resolution: Resolution<T::Outcome, T::Error> = loop {
-            attempt = attempt.saturating_add(1);
-            // Use the original demand type for the first attempt, failure demand for
-            // retries
-            let current_demand_type = if attempt == 1 {
-                demand_type
-            } else {
-                DemandType::Failure
-            };
-            // Try handling the timer
-            let error = match self
-                .handler
-                .on_timer(context.clone(), trigger.clone(), current_demand_type)
-                .await
-            {
-                Ok(outcome) => break Resolution::Commit(Ok(outcome)),
-                Err(error) => error,
-            };
-            // Only abort on shutdown (partition revoked). Message cancellation is
-            // treated as transient - we continue retrying.
-            if context.is_shutdown() {
-                break Resolution::Abort(Err(error));
-            }
-            match error.classify_error() {
-                ErrorCategory::Transient => {
-                    let sleep_time = self.sleep_time(attempt);
-                    error!(
-                        "failed to handle timer: {error:#}; retrying after {}",
-                        format_duration(sleep_time)
-                    );
-                    if wait_with_cancellation(&context, sleep_time).await
-                        == RetryWaitResult::Shutdown
-                    {
-                        break Resolution::Abort(Err(error));
-                    }
-                }
-                ErrorCategory::Permanent => {
-                    error!("permanently failed to handle timer: {error:#}; discarding timer");
-                    break Resolution::Commit(Err(error));
-                }
-                ErrorCategory::Terminal => {
-                    info!(
-                        "terminal condition encountered while handling timer: {error:#}; aborting"
-                    );
-                    break Resolution::Abort(Err(error));
-                }
-            }
-        };
+        let resolution = self
+            .run(
+                &context,
+                demand_type,
+                None,
+                |dt| self.handler.on_timer(context.clone(), trigger.clone(), dt),
+                |reason| log_timer_failure(&reason, "; discarding timer"),
+            )
+            .await;
 
         match resolution {
             Resolution::Commit(result) => {
                 uncommitted.commit().await;
                 self.handler.after_commit(context, result).await;
             }
-            Resolution::Abort(result) => {
+            Resolution::Abort(error) => {
                 uncommitted.abort().await;
-                self.handler.after_abort(context, result).await;
+                self.handler.after_abort(context, Err(error)).await;
             }
         }
     }
 
-    /// Performs any necessary shutdown operations for the handler.
     async fn shutdown(self) {
         debug!("shutting down retry handler");
-
-        // No retry-specific state to clean up (timers are handled by tokio)
-        // Cascade shutdown to the inner handler
         self.handler.shutdown().await;
     }
 }
