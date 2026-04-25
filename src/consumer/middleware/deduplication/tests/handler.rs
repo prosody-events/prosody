@@ -409,14 +409,11 @@ fn ttl_below_minimum_rejected() {
     assert!(result.is_err());
 }
 
-/// Probe handler that records every work-stage event into a shared log.
+/// Probe handler that records work-stage and apply-hook events.
 ///
-/// Distinguishes whether the inner's `on_message` / `on_timer` actually ran
-/// (`Handler`) from which apply hook the framework chose for that run
-/// (`InnerAfterCommit` for a final dispatch, `InnerAfterAbort` for a dispatch
-/// that will be re-attempted via this consumer). Per the `FallibleHandler`
-/// invariant, exactly one apply event must be logged per `Handler` event,
-/// and zero apply events must be logged when no `Handler` event was logged.
+/// `Handler` records an `on_message`/`on_timer` invocation; `InnerAfterCommit`
+/// / `InnerAfterAbort` record the corresponding apply hook. Tests assert at
+/// most one apply event per `Handler` event, and zero when no `Handler` fired.
 #[derive(Clone, Default)]
 struct ApplyProbe {
     log: Arc<parking_lot::Mutex<Vec<ApplyEvent>>>,

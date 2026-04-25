@@ -17,30 +17,12 @@
 //! 5. **Success/Failure**: On success advance queue, on transient re-defer, on
 //!    permanent skip
 //!
-//! # Apply-hook invariant
+//! # Apply hooks
 //!
-//! Strictly per-invocation: for every individual call to `on_message` /
-//! `on_timer` on this middleware where the inner handler actually ran and
-//! returned, exactly one of `after_commit` / `after_abort` fires on that
-//! inner. If the inner did not run for a given dispatch, neither fires. The
-//! inner is invoked at most once per call to this middleware (no fan-out, no
-//! retry-loop in the call path), so the per-invocation invariant is upheld.
-//!
-//! The [`TimerDeferOutput`] returned by this middleware encodes which case
-//! applies:
-//!
-//! - [`TimerDeferOutput::Inner`]: inner ran and succeeded — forward
-//!   `after_commit(Ok(o))` / `after_abort(Ok(o))` per the surrounding
-//!   commit/abort decision.
-//! - [`TimerDeferOutput::Deferred`]: inner ran and returned a transient error
-//!   that this middleware swallowed by enqueueing a retry. The durability
-//!   marker (the original Application timer) commits at our layer, but the
-//!   inner handler's prior dispatch is being rolled back — a re-dispatch will
-//!   arrive when the `DeferredTimer` fires. Both apply hooks therefore route
-//!   to `after_abort(Err(inner_err))` on the inner.
-//! - [`TimerDeferOutput::NoInner`]: no inner dispatch occurred (orphan
-//!   `DeferredTimer` cleanup, or queue-append for an already-deferred key).
-//!   Suppress: the inner has no apply work to do.
+//! The inner is invoked at most once per dispatch. [`TimerDeferOutput`]
+//! encodes the routing: `Inner` forwards the framework's chosen hook,
+//! `Deferred` always fires `after_abort` (the original timer's retry is
+//! coming even though our marker commits), and `NoInner` suppresses both.
 
 use super::context::TimerDeferContext;
 use super::store::{TimerDeferStore, TimerRetryCompletionResult};
@@ -61,24 +43,19 @@ use crate::{Partition, Topic};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Output of [`TimerDeferHandler`] dispatches.
+/// Output of [`TimerDeferHandler`] dispatches; drives apply-hook routing.
 ///
-/// Encodes the three possible outcomes of running a defer-wrapped dispatch so
-/// that `after_commit` / `after_abort` can route the inner handler's apply
-/// hook correctly (see the module-level apply-hook invariant).
+/// See the module-level apply-hooks section.
 #[derive(Debug)]
 pub enum TimerDeferOutput<O, E> {
-    /// Inner handler ran and produced an output. The inner's apply hook
-    /// should be forwarded with the surrounding commit/abort decision.
+    /// Inner ran and produced an output; forward the surrounding hook.
     Inner(O),
-    /// No inner dispatch occurred for this event (orphan-`DeferredTimer`
-    /// cleanup, or queue-append when the key was already deferred). The
-    /// inner has nothing to apply.
+    /// Inner did not run (orphan `DeferredTimer` or queue-append for an
+    /// already-deferred key) — suppress both apply hooks.
     NoInner,
-    /// Inner ran and returned a transient error that this middleware
-    /// swallowed by enqueueing a retry. Both apply hooks must drive the
-    /// inner with `after_abort(Err(e))`: a retry of the same logical event
-    /// is coming when the corresponding `DeferredTimer` fires.
+    /// Inner ran and returned a transient error captured for retry. Both
+    /// hooks fire `after_abort(Err(e))`: the `DeferredTimer` will
+    /// re-dispatch the same logical event.
     Deferred(E),
 }
 
@@ -117,9 +94,8 @@ where
     D: DeferralDecider,
 {
     type Error = DeferError<S::Error, T::Error>;
-    /// See [`TimerDeferOutput`] for the three cases the apply hooks must
-    /// distinguish: inner ran (success), inner ran but was deferred for
-    /// retry, or no inner dispatch occurred at all.
+    /// Encodes the inner's outcome; drives apply-hook routing. See
+    /// [`TimerDeferOutput`].
     type Output = TimerDeferOutput<T::Output, T::Error>;
 
     async fn on_message<C>(

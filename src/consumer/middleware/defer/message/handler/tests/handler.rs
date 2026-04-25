@@ -6,14 +6,9 @@
 //!
 //! In addition to recording `on_message` / `on_timer` invocations, the mock
 //! also records every `after_commit` / `after_abort` invocation it observes
-//! (via [`OutcomeHandler::applied`]). Tests use those records to verify the
-//! tightened `FallibleHandler` contract: for every `on_message`/`on_timer`
-//! dispatch that runs and returns on this inner handler, **exactly one** of
-//! `after_commit` / `after_abort` must subsequently fire — never both, never
-//! neither — and carry the inner-typed `Result`. In particular, when the
-//! defer middleware returns `MessageDeferOutput::Deferred(e)` (inner ran
-//! and returned a Transient error which was captured for retry), the inner
-//! must observe `after_abort(Err(e))`.
+//! (via [`OutcomeHandler::applied`]). Tests use those records to assert
+//! apply-hook routing: for every dispatch that ran, at most one hook fires,
+//! and `MessageDeferOutput::Deferred(e)` must produce `after_abort(Err(e))`.
 //
 // TODO(apply-hooks): the harness/properties tests in
 // `consumer::middleware::defer::message::handler::tests::{harness,
@@ -59,13 +54,7 @@ pub enum AppliedHook {
     Abort,
 }
 
-/// Record of an apply-hook invocation (`after_commit` / `after_abort`)
-/// observed by the mock inner handler.
-///
-/// Tests use these records to verify the tightened invariant that for every
-/// inner `on_message` / `on_timer` dispatch which runs and returns,
-/// **exactly one** of `after_commit` / `after_abort` fires — never both,
-/// never neither — and carries the inner-typed `Result`.
+/// Record of an apply-hook invocation observed by the mock inner handler.
 #[derive(Clone, Debug)]
 pub struct AppliedRecord {
     /// Which hook fired.
@@ -182,15 +171,7 @@ pub struct OutcomeHandler {
     next_outcome: Arc<Mutex<Option<HandlerOutcome>>>,
     /// Record of all messages processed by this handler (in order).
     processed: Arc<scc::Queue<ProcessedMessage>>,
-    /// Record of every apply-hook invocation observed by this handler
-    /// (in call order). Drained by [`OutcomeHandler::applied`].
-    ///
-    /// Tests inspect this queue to assert the tightened
-    /// `FallibleHandler` invariant: for every `on_message`/`on_timer`
-    /// dispatch that runs and returns, exactly one of `after_commit` /
-    /// `after_abort` fires on this inner handler. In particular, when
-    /// the defer middleware returns `MessageDeferOutput::Deferred(e)`,
-    /// the inner must observe `after_abort(Err(e))`.
+    /// Apply-hook records in call order. Drained by [`OutcomeHandler::applied`].
     applied: Arc<scc::Queue<AppliedRecord>>,
     /// When set, triggers partition shutdown before returning the outcome.
     ///
@@ -245,11 +226,6 @@ impl OutcomeHandler {
     }
 
     /// Returns all apply-hook records in order (drains the queue).
-    ///
-    /// Tests use this to verify the tightened `FallibleHandler` contract:
-    /// for every `on_message`/`on_timer` dispatch on this handler that
-    /// runs and returns, exactly one apply hook (`after_commit` or
-    /// `after_abort`) must have fired carrying the inner-typed `Result`.
     #[must_use]
     pub fn applied(&self) -> Vec<AppliedRecord> {
         let mut result = Vec::with_capacity(self.applied.len());

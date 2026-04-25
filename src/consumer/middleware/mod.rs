@@ -332,31 +332,27 @@ pub trait HandlerMiddleware {
 
 /// Defines a handler that can fail during message processing.
 ///
-/// # Lifecycle and the strictly-per-invocation apply-hook invariant
+/// # Apply hooks: `after_commit` / `after_abort`
 ///
-/// **The invariant is strictly per-invocation, with no exceptions.** For
-/// every individual call to `on_message` / `on_timer` on a handler instance
-/// `H` that runs and returns, the framework MUST call EXACTLY ONE of the
-/// apply hooks on that same `H`, paired with that specific invocation:
+/// For every `on_message` / `on_timer` invocation on a handler instance
+/// `H` that runs and returns, at most one apply hook fires on `H`. Hooks
+/// are best-effort: they may not fire if the process crashes or storage is
+/// unavailable. Handler logic must be robust to a missing hook.
 ///
 /// - [`Self::after_commit`] — this invocation is **final**. The same logical
 ///   message/timer will not be re-dispatched into `H` by this consumer.
-/// - [`Self::after_abort`]  — this invocation is **not final**. The same
+/// - [`Self::after_abort`] — this invocation is **not final**. The same
 ///   logical message/timer **will** be re-dispatched into `H` (a retry is
 ///   coming via this consumer, e.g. through a deferred timer or an
 ///   in-process retry loop that re-invokes the inner).
 ///
-/// If a given `on_message` / `on_timer` invocation did not run (e.g. the
-/// dispatch was short-circuited above `H`), neither apply hook fires for
-/// that non-existent invocation.
+/// If an invocation did not run (e.g. the dispatch was short-circuited
+/// above `H`), neither apply hook fires.
 ///
-/// There is no "session" or "logical-dispatch" exception. A wrapping
-/// middleware that re-invokes the inner — for example, a retry loop that
-/// calls `inner.on_message(...)` multiple times for the same logical
-/// message — MUST fire one apply hook on the inner **between every pair of
-/// invocations**, and one final apply hook after the last invocation. Each
-/// invocation gets its own `after_commit` or `after_abort`; they are never
-/// coalesced across a retry session.
+/// A wrapping middleware that re-invokes the inner must fire one apply
+/// hook on the inner between every pair of invocations, and one final
+/// apply hook after the last invocation. Each invocation gets its own
+/// `after_commit` or `after_abort`; they are never coalesced.
 ///
 /// The choice between `after_commit` and `after_abort` is determined by the
 /// **work outcome for that single invocation** (is `H` going to be invoked

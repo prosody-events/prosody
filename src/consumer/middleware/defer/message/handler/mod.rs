@@ -14,40 +14,18 @@
 //!    deferred, transient errors always re-defer (config/decider only gate
 //!    initial deferral).
 //!
-//! # Inner-handler apply-hook contract
+//! # Apply hooks
 //!
-//! The inner handler is invoked **at most once** per call to this
-//! middleware's `on_message` / `on_timer`; the per-invocation invariant is
-//! upheld. This middleware does NOT run a retry loop — when a retry is
-//! needed, it is scheduled via a `DeferredMessage` timer that produces a
-//! *new* `on_timer` dispatch into this handler, each of which is its own
-//! invocation with its own apply-hook pairing.
+//! The inner is invoked at most once per dispatch; retries arrive as new
+//! `on_timer` dispatches, each with their own apply-hook pairing.
+//! [`MessageDeferOutput`] encodes the routing:
 //!
-//! For every inner `on_message` / `on_timer` invocation that runs and returns,
-//! this middleware MUST cause exactly one of `inner.after_commit(ctx, result)`
-//! or `inner.after_abort(ctx, result)` to fire — and never both. The choice is
-//! *work-centric*, governed by whether the same logical message will be
-//! re-dispatched into the inner handler:
-//!
-//! * If the inner returned `Ok` and we did not enqueue a future retry through
-//!   this consumer, the inner sees `after_commit(Ok(..))` (final).
-//! * If the inner returned a non-Transient `Err` (or a Transient `Err` that
-//!   was *not* deferred), the inner sees the wrapping framework's chosen
-//!   apply hook with `Err(..)` — final from the inner's POV.
-//! * If the inner returned a Transient `Err` and we deferred it (or
-//!   re-deferred it after a retry), the inner sees `after_abort(Err(..))`,
-//!   because the deferred timer will re-dispatch the same logical message
-//!   through the inner. This holds even though the defer marker itself
-//!   commits — the marker commit is "we own the retry now"; from the inner's
-//!   POV the *attempt* is rolled back and will be retried.
-//! * Paths where the inner did not run for a given dispatch (queue-append for
-//!   an already-deferred key, orphan-timer cleanup, loader transient/permanent
-//!   handling, key-mismatch skip, terminal loader error, etc.) suppress both
-//!   apply hooks for the inner — there is no inner work to commit or abort.
-//!
-//! These three cases are encoded by the [`MessageDeferOutput`] variants
-//! returned from `on_message` / `on_timer`; `after_commit` / `after_abort`
-//! dispatch on those variants accordingly.
+//! * `Inner` — inner ran; forward the framework's chosen hook.
+//! * `Deferred` — inner ran and returned a transient error that we captured
+//!   for retry. Both hooks route to `after_abort(Err(..))`: a retry is
+//!   coming even though the defer marker itself commits.
+//! * `NoInner` — inner did not run (queue-append, orphan-timer, loader
+//!   failure, key-mismatch); suppress both hooks.
 
 use super::loader::{KafkaLoader, MessageLoader};
 use super::store::{MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult};
@@ -74,33 +52,20 @@ use tracing::{debug, info, warn};
 #[cfg(test)]
 pub mod tests;
 
-/// Output value of [`MessageDeferHandler::on_message`] / `on_timer`.
+/// Output of [`MessageDeferHandler`] dispatches; drives apply-hook routing.
 ///
-/// Encodes which of the inner handler's apply hooks (if any) must fire for
-/// the dispatch that produced this value. The `after_commit` / `after_abort`
-/// implementations on [`MessageDeferHandler`] dispatch on these variants:
-///
-/// * [`Inner`](Self::Inner) — the inner handler ran and produced `O`. The
-///   wrapping framework's chosen apply hook is forwarded as-is to the inner.
-/// * [`NoInner`](Self::NoInner) — no inner dispatch occurred for this call
-///   (e.g., queue-append for an already-deferred key, orphan-timer cleanup,
-///   loader transient/permanent handling that did not reach the inner, or
-///   key-mismatch skip). Both apply hooks are suppressed for the inner.
-/// * [`Deferred`](Self::Deferred) — the inner ran and returned a Transient
-///   `Err(E)` which we captured and enqueued for retry via a `DeferredMessage`
-///   timer. The defer marker itself commits at the outer layer (we own the
-///   retry), but the inner sees `after_abort(Err(E))` because the same
-///   logical message will be re-dispatched into the inner when the timer
-///   fires.
+/// See the module-level apply-hooks section for how `after_commit` /
+/// `after_abort` dispatch on these variants.
 #[derive(Debug)]
 pub enum MessageDeferOutput<O, E> {
-    /// Inner handler ran and succeeded for this dispatch.
+    /// Inner ran and produced an output.
     Inner(O),
-    /// No inner dispatch occurred for this call — suppress inner apply hooks.
+    /// Inner did not run (queue-append, orphan-timer, loader failure,
+    /// key-mismatch) — suppress both apply hooks.
     NoInner,
-    /// Inner ran and returned a Transient error which we deferred for a
-    /// future retry. The inner needs `after_abort(Err(E))` because the retry
-    /// will re-dispatch the same logical message through this handler.
+    /// Inner ran and returned a transient error captured for retry. Both
+    /// apply hooks fire `after_abort(Err(E))`: the retry will re-dispatch
+    /// the same logical message.
     Deferred(E),
 }
 
@@ -716,22 +681,8 @@ where
     D: DeferralDecider,
 {
     type Error = DeferError<M::Error, T::Error, L::Error>;
-    /// Captures *what happened to the inner handler* on this dispatch so the
-    /// apply-hook routing in `after_commit` / `after_abort` can honor the
-    /// work-centric contract (see crate-level
-    /// "Inner-handler apply-hook contract"):
-    ///
-    /// * [`MessageDeferOutput::Inner`] — inner ran and produced a value.
-    ///   Forward the wrapping framework's apply hook to the inner.
-    /// * [`MessageDeferOutput::NoInner`] — inner did not run for this
-    ///   dispatch (queue-append, orphan-timer cleanup, loader-handled
-    ///   skip / retry, key-mismatch advance). Suppress both inner apply
-    ///   hooks.
-    /// * [`MessageDeferOutput::Deferred`] — inner ran, returned a Transient
-    ///   `Err`, and the message was queued for retry via the deferred timer.
-    ///   The marker commits at the outer layer, but the inner sees
-    ///   `after_abort(Err(_))` because its attempt is being rolled back and
-    ///   will be re-dispatched.
+    /// Encodes the inner's outcome; drives apply-hook routing. See
+    /// [`MessageDeferOutput`] and the module-level apply-hooks section.
     type Output = MessageDeferOutput<T::Output, T::Error>;
 
     async fn on_message<C>(
@@ -765,14 +716,11 @@ where
             .on_message(context.clone(), message, demand_type)
             .await
         {
-            // Inner ran and succeeded -> forward `after_commit(Ok(_))`.
             Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
             Err(error) => error,
         };
 
         if !matches!(error.classify_error(), ErrorCategory::Transient) {
-            // Permanent / Terminal — surface as Handler error so the inner
-            // sees its chosen apply hook with `Err(error)` (final).
             return Err(DeferError::Handler(error));
         }
 
@@ -785,9 +733,6 @@ where
                 partition = self.partition,
                 "Deferral skipped: middleware disabled"
             );
-            // No deferral -> inner sees its chosen apply hook with the
-            // transient `Err(error)` (final from its POV; we are not
-            // arranging a retry).
             return Err(DeferError::Handler(error));
         }
 
@@ -802,9 +747,6 @@ where
             return Err(DeferError::Handler(error));
         }
 
-        // Defer-first transient path: inner ran and failed; we are taking
-        // ownership of the retry. Capture `error` in `Deferred` so the inner
-        // gets `after_abort(Err(error))` — its attempt is being rolled back.
         self.defer_message(context, &message_key, offset, error)
             .await
     }
@@ -819,9 +761,6 @@ where
         C: EventContext,
     {
         if trigger.timer_type != TimerType::DeferredMessage {
-            // Pass-through: inner runs directly. Forward Ok/Err verbatim;
-            // the inner's apply hook will be the wrapping framework's
-            // chosen one.
             return self
                 .handler
                 .on_timer(context, trigger, demand_type)
@@ -887,40 +826,23 @@ where
     where
         C: EventContext,
     {
-        // Routing follows the work-centric contract: pick `after_commit` /
-        // `after_abort` for the inner based on whether the same logical
-        // message will be re-dispatched into the inner — *not* on which
-        // hook the wrapping framework chose for this middleware's marker.
+        // Apply-hook routing (see module docs):
+        // - Inner(o):    inner ran and succeeded           -> after_commit(Ok)
+        // - NoInner:     no inner dispatch happened        -> suppress
+        // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e)) (retry coming)
+        // - Handler(e):  inner ran and surfaced an error   -> after_commit(Err)
+        // - Store/Loader/...: defer-layer error, inner never ran -> suppress
         match result {
-            // Inner ran and produced a value -> final commit for the inner.
             Ok(MessageDeferOutput::Inner(output)) => {
                 self.handler.after_commit(context, Ok(output)).await;
             }
-            // Inner ran but its attempt was deferred. The marker committed
-            // (we own the retry now), but the inner's attempt is being
-            // rolled back; it will be re-dispatched when the deferred timer
-            // fires. Forward `after_abort(Err(_))` to the inner.
             Ok(MessageDeferOutput::Deferred(error)) => {
                 self.handler.after_abort(context, Err(error)).await;
             }
-            // Inner ran and failed with a non-Transient error (or a
-            // Transient error that we declined to defer). Final from the
-            // inner's POV.
             Err(DeferError::Handler(error)) => {
                 self.handler.after_commit(context, Err(error)).await;
             }
-            // Inner did not run: queue-append, orphan-timer cleanup, loader
-            // skip / reschedule, key-mismatch advance, or a defer-layer
-            // store/loader/timer error that the inner never saw. Suppress
-            // both inner apply hooks.
-            Ok(MessageDeferOutput::NoInner)
-            | Err(
-                DeferError::Store(_)
-                | DeferError::Loader(_)
-                | DeferError::Timer(_)
-                | DeferError::Configuration(_)
-                | DeferError::CompactTime(_),
-            ) => {}
+            Ok(MessageDeferOutput::NoInner) | Err(_) => {}
         }
     }
 
@@ -928,32 +850,16 @@ where
     where
         C: EventContext,
     {
+        // Symmetric to after_commit. The only twist: Deferred(e) still routes
+        // to after_abort(Err(e)) regardless of the outer commit/abort decision.
         match result {
-            // Inner ran and produced a value, but the wrapping framework
-            // aborted the marker. Forward `after_abort(Ok(_))` to the inner.
             Ok(MessageDeferOutput::Inner(output)) => {
                 self.handler.after_abort(context, Ok(output)).await;
             }
-            // Two distinct paths that both resolve to `after_abort(Err(_))`:
-            //   - `Ok(Deferred(e))`: inner ran, deferred; retry is coming via
-            //     our timer regardless of whether the outer aborted its
-            //     marker.
-            //   - `Err(Handler(e))`: inner ran with non-Transient error and
-            //     the outer chose to abort the marker (e.g. Terminal); the
-            //     inner sees its dispatch rolled back.
             Ok(MessageDeferOutput::Deferred(error)) | Err(DeferError::Handler(error)) => {
                 self.handler.after_abort(context, Err(error)).await;
             }
-            // Inner did not run: nothing to commit or abort for it. See
-            // `after_commit` for the breakdown of these variants.
-            Ok(MessageDeferOutput::NoInner)
-            | Err(
-                DeferError::Store(_)
-                | DeferError::Loader(_)
-                | DeferError::Timer(_)
-                | DeferError::Configuration(_)
-                | DeferError::CompactTime(_),
-            ) => {}
+            Ok(MessageDeferOutput::NoInner) | Err(_) => {}
         }
     }
 

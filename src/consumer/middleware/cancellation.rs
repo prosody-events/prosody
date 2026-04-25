@@ -32,22 +32,11 @@
 //!   classified as [`ErrorCategory::Transient`]. The retry middleware will
 //!   continue retrying rather than aborting the message.
 //!
-//! # Apply-hook invariant
+//! # Apply hooks
 //!
-//! For every inner `on_message` / `on_timer` invocation that runs and returns,
-//! the framework calls EXACTLY ONE of `after_commit` / `after_abort` on the
-//! inner handler. If the inner did not run (because we short-circuited on
-//! shutdown or message cancellation here), neither hook fires for the inner.
-//!
-//! This middleware invokes the inner at most once per call: the request path
-//! either short-circuits with `Shutdown` / `MessageCancelled` (zero inner
-//! invocations) or awaits the inner exactly once and then inspects (without
-//! re-invoking) its result to decide whether to promote a Transient error to
-//! `ShutdownAfterInner`. The strictly-per-invocation invariant on
-//! [`FallibleHandler`] is therefore upheld trivially: each call to this
-//! handler dispatches at most one call to the wrapped inner, and the
-//! apply-hook routing in `after_commit` / `after_abort` forwards iff that
-//! inner call ran.
+//! Forwards apply hooks to the inner only if the inner ran on this dispatch.
+//! Short-circuiting on `Shutdown` or `MessageCancelled` suppresses both hooks
+//! since the inner never executed.
 //!
 //! # Usage
 //!
@@ -152,14 +141,9 @@ where
     type Output = T::Output;
 
     /// Checks cancellation state, then delegates to inner handler if clear.
-    ///
-    /// Post-call: Transient errors from the inner are promoted to
-    /// [`CancellationError::ShutdownAfterInner`] (Terminal) if shutdown is
-    /// active when the handler returns, ensuring outer middleware layers
-    /// treat the failure as unrecoverable rather than retrying or deferring.
-    /// The inner error is preserved inside the variant so that `after_abort`
-    /// can still fire on the inner handler with the original error when the
-    /// outer layer aborts.
+    /// Transient errors from the inner are promoted to
+    /// [`CancellationError::ShutdownAfterInner`] if shutdown is active on
+    /// return, preserving the inner error for `after_abort` routing.
     async fn on_message<C>(
         &self,
         context: C,
@@ -220,20 +204,8 @@ where
             })
     }
 
-    /// Apply-hook routing for `after_commit` (commit path).
-    ///
-    /// Per the work-centric apply-hook invariant, the inner's `after_commit`
-    /// fires iff the inner actually ran on this dispatch. Variants:
-    ///
-    /// - `Ok(output)` — inner ran and succeeded; forward `Ok(output)`.
-    /// - `Err(Handler(e))` — inner ran and returned `e`; forward `Err(e)`.
-    /// - `Err(ShutdownAfterInner(e))` — inner ran and returned `e`; we
-    ///   promoted it to Terminal mid-flight. Reaching `after_commit` on a
-    ///   Terminal result is rare (the outer would normally `abort()`), but
-    ///   if the framework did commit, we still forward `Err(e)` so the
-    ///   inner sees the dispatch outcome it produced.
-    /// - `Err(Shutdown | MessageCancelled)` — originated at THIS layer
-    ///   before the inner ran; suppress (no apply hook for the inner).
+    /// Forwards `after_commit` to the inner if the inner ran; suppresses if
+    /// the dispatch was short-circuited before the inner.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -243,30 +215,15 @@ where
             Err(
                 CancellationError::Handler(inner) | CancellationError::ShutdownAfterInner(inner),
             ) => {
-                // Inner ran; preserve its original error in the apply hook.
                 self.handler.after_commit(context, Err(inner)).await;
             }
-            // Cancellation/Shutdown originated at this layer; the inner
-            // handler did not run, so there is no inner-typed error to
-            // forward.
+            // Inner did not run — nothing to forward.
             Err(CancellationError::Shutdown | CancellationError::MessageCancelled) => {}
         }
     }
 
-    /// Apply-hook routing for `after_abort` (abort/redelivery path).
-    ///
-    /// Variants:
-    ///
-    /// - `Ok(output)` — inner ran and succeeded but the dispatch is being
-    ///   rolled back upstream; forward `Ok(output)` so the inner observes
-    ///   the redelivery.
-    /// - `Err(Handler(e))` — inner ran and returned `e`; forward `Err(e)`.
-    /// - `Err(ShutdownAfterInner(e))` — inner ran and returned `e`; we
-    ///   promoted it to Terminal so the outer is aborting and the message
-    ///   will be redelivered. Forward `Err(e)` so the inner's `after_abort`
-    ///   sees the original error from its just-completed dispatch.
-    /// - `Err(Shutdown | MessageCancelled)` — originated at THIS layer
-    ///   before the inner ran; suppress (no apply hook for the inner).
+    /// Forwards `after_abort` to the inner if the inner ran; suppresses if
+    /// the dispatch was short-circuited before the inner.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -276,13 +233,9 @@ where
             Err(
                 CancellationError::Handler(inner) | CancellationError::ShutdownAfterInner(inner),
             ) => {
-                // Inner ran and returned `inner`; the outer is aborting due
-                // to our promotion to Terminal, so the dispatch is being
-                // redelivered. Surface the original error to the inner's
-                // apply hook.
                 self.handler.after_abort(context, Err(inner)).await;
             }
-            // Cancellation/Shutdown originated here; nothing to forward.
+            // Inner did not run — nothing to forward.
             Err(CancellationError::Shutdown | CancellationError::MessageCancelled) => {}
         }
     }
@@ -295,45 +248,26 @@ where
 
 /// Errors from the cancellation middleware.
 ///
-/// The variants encode whether the inner handler actually ran on this
-/// dispatch — this is what the apply-hook invariant in
-/// [`FallibleHandler::after_commit`] / [`FallibleHandler::after_abort`]
-/// keys on. `Shutdown` and `MessageCancelled` originate at this layer
-/// *before* the inner runs (so no apply hook fires for the inner).
-/// `ShutdownAfterInner` and `Handler` both mean the inner ran and so
-/// must receive an apply hook with the original inner error.
+/// `Shutdown` and `MessageCancelled` mean the inner did not run (no apply
+/// hook forwarded). `ShutdownAfterInner` and `Handler` mean it did.
 #[derive(Debug, Error)]
 pub enum CancellationError<T> {
-    /// Shutdown was requested (partition revoked) **before** the inner
-    /// handler ran on this dispatch.
-    ///
-    /// Classified as [`ErrorCategory::Terminal`] - processing must stop
-    /// immediately to release the partition. Because the inner did not run,
-    /// neither `after_commit` nor `after_abort` is forwarded to the inner
-    /// for this dispatch.
+    /// Partition revoked before the inner ran. Terminal; inner apply hooks
+    /// suppressed.
     #[error("partition is being revoked")]
     Shutdown,
 
-    /// The inner handler ran and returned a Transient error, but shutdown
-    /// was signaled mid-flight, so we promote the result to Terminal.
-    ///
-    /// Carries the original inner error so the inner's apply hook
-    /// (`after_abort`, when the outer aborts the dispatch and triggers
-    /// redelivery) can be fired with the error the inner actually
-    /// produced. Classified as [`ErrorCategory::Terminal`].
+    /// Inner ran and returned a Transient error while shutdown was signaled;
+    /// promoted to Terminal. Carries the inner error for `after_abort`.
     #[error("partition is being revoked (inner attempt: {0:#})")]
     ShutdownAfterInner(T),
 
-    /// Indicates message processing was cancelled before the inner ran.
-    ///
-    /// Classified as [`ErrorCategory::Transient`] - retry middleware will
-    /// continue retrying rather than aborting the message. Because the
-    /// inner did not run, no apply hook is forwarded for this dispatch.
+    /// Message cancelled before the inner ran. Transient; inner apply hooks
+    /// suppressed.
     #[error("message processing was cancelled")]
     MessageCancelled,
 
-    /// Wraps an error from the underlying handler (inner ran and returned
-    /// an error that we did not promote).
+    /// Inner ran and returned an error that was not promoted.
     #[error("handler error: {0:#}")]
     Handler(T),
 }
@@ -751,8 +685,7 @@ mod tests {
         ));
     }
 
-    /// Recording handler — captures the result that `after_commit` and
-    /// `after_abort` are called with so we can assert apply-hook routing.
+    /// Records results passed to `after_commit` / `after_abort`.
     #[derive(Clone)]
     struct RecordingHandler {
         commit_calls: Arc<parking_lot::Mutex<Vec<Result<(), TestError>>>>,
@@ -819,9 +752,6 @@ mod tests {
         let guard_handler = CancellationHandler::new(recorder.clone());
         let context = MockEventContext::new();
 
-        // Simulate the post-promotion result the framework would deliver
-        // back to `after_abort` after our `on_message` returned
-        // `ShutdownAfterInner`.
         let promoted: Result<(), CancellationError<TestError>> = Err(
             CancellationError::ShutdownAfterInner(TestError(ErrorCategory::Transient)),
         );
@@ -850,7 +780,6 @@ mod tests {
         let guard_handler = CancellationHandler::new(recorder.clone());
         let context = MockEventContext::new();
 
-        // Pre-call shutdown: inner never ran, so neither hook should fire.
         let pre_call: Result<(), CancellationError<TestError>> = Err(CancellationError::Shutdown);
         guard_handler.after_abort(context.clone(), pre_call).await;
 

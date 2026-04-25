@@ -12,25 +12,11 @@
 //! It is optional — setting `cache_capacity = 0` disables it via the
 //! [`Option<M>`](crate::consumer::middleware::optional) pattern.
 //!
-//! # Apply-hook contract
+//! # Apply hooks
 //!
-//! Per the [`FallibleHandler`] invariant, exactly one of `after_commit` or
-//! `after_abort` must fire on the inner handler for every dispatch in which
-//! the inner's `on_message` / `on_timer` actually ran. This middleware honors
-//! that by encoding "did the inner run?" in its `Output` discriminant: a `Some`
-//! variant means the inner ran (and thus its apply hook is forwarded), while a
-//! `None` variant means a dedup hit short-circuited the dispatch before the
-//! inner was ever invoked (so neither apply hook is forwarded to the inner).
-//! This is distinct from forwarding the work outcome — when the inner did run,
-//! both success and inner errors are forwarded faithfully to the same apply
-//! hook the framework invoked here.
-//!
-//! Concretely, the inner is invoked at most once per call: a dedup hit (local
-//! cache or persistent store) short-circuits before the inner runs, while a
-//! dedup miss invokes the inner exactly once. `on_timer` always invokes the
-//! inner exactly once (timers are not deduplicated). Combined with the
-//! suppress-on-`None` / forward-on-`Some`-or-`Inner` apply-hook routing above,
-//! the per-invocation invariant is trivially upheld for the inner handler.
+//! `Output` encodes whether the inner ran: `Some` means the inner ran and
+//! its apply hook is forwarded; `None` means a dedup hit prevented the inner
+//! from running and both hooks are suppressed.
 
 pub mod cassandra;
 pub mod config;
@@ -216,24 +202,8 @@ where
     S: DeduplicationStore,
 {
     type Error = DeduplicationError<T::Error>;
-    /// Marker for whether the inner handler's `on_message` / `on_timer`
-    /// actually ran on this dispatch.
-    ///
-    /// - `Some(inner_output)` — the inner ran to completion and produced
-    ///   `inner_output`. The framework's subsequent `after_commit` /
-    ///   `after_abort` call on this handler must be forwarded to the inner so
-    ///   the `FallibleHandler` invariant (exactly one apply hook per run) is
-    ///   preserved for the inner.
-    /// - `None` — a dedup hit short-circuited the dispatch and the inner's
-    ///   `on_message` / `on_timer` was never invoked. Per the invariant,
-    ///   neither of the inner's apply hooks must fire for this dispatch, so
-    ///   both `after_commit` and `after_abort` on this handler suppress the
-    ///   forward to the inner.
-    ///
-    /// Note: this is purely a "did the inner run?" marker, not a "should the
-    /// inner's work be applied?" gate — when the inner did run, its outcome
-    /// (success or `Err`) flows through to whichever apply hook the framework
-    /// chooses.
+    /// `Some` — inner ran; forward apply hook. `None` — dedup hit; suppress
+    /// both hooks.
     type Output = Option<T::Output>;
 
     async fn on_message<C>(
@@ -329,16 +299,8 @@ where
         C: EventContext,
     {
         match result {
-            // Inner ran and produced a success: forward the final commit so
-            // the inner sees exactly one apply hook for its run.
             Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
-            // Dedup hit — the inner's `on_message` / `on_timer` did not run on
-            // this dispatch, so per the `FallibleHandler` invariant we must
-            // not invoke either of the inner's apply hooks.
-            Ok(None) => {}
-            // Inner ran and returned an error that the framework is treating
-            // as final (terminal / DLQ-bound): forward the final commit so
-            // the inner sees exactly one apply hook for its run.
+            Ok(None) => {} // dedup hit — inner did not run
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_commit(context, Err(error)).await;
             }
@@ -350,18 +312,8 @@ where
         C: EventContext,
     {
         match result {
-            // Inner ran and produced a success, but the framework is aborting
-            // this dispatch (a retry of the same logical event is coming):
-            // forward the abort so the inner sees exactly one apply hook for
-            // its run.
             Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
-            // Dedup hit — the inner's `on_message` / `on_timer` did not run on
-            // this dispatch, so per the `FallibleHandler` invariant we must
-            // not invoke either of the inner's apply hooks.
-            Ok(None) => {}
-            // Inner ran and returned an error that the framework is treating
-            // as retryable: forward the abort so the inner sees exactly one
-            // apply hook for its run.
+            Ok(None) => {} // dedup hit — inner did not run
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_abort(context, Err(error)).await;
             }
