@@ -240,8 +240,9 @@ where
     {
         match result {
             Ok(output) => self.handler.after_commit(context, Ok(output)).await,
-            Err(CancellationError::Handler(inner))
-            | Err(CancellationError::ShutdownAfterInner(inner)) => {
+            Err(
+                CancellationError::Handler(inner) | CancellationError::ShutdownAfterInner(inner),
+            ) => {
                 // Inner ran; preserve its original error in the apply hook.
                 self.handler.after_commit(context, Err(inner)).await;
             }
@@ -272,8 +273,9 @@ where
     {
         match result {
             Ok(output) => self.handler.after_abort(context, Ok(output)).await,
-            Err(CancellationError::Handler(inner))
-            | Err(CancellationError::ShutdownAfterInner(inner)) => {
+            Err(
+                CancellationError::Handler(inner) | CancellationError::ShutdownAfterInner(inner),
+            ) => {
                 // Inner ran and returned `inner`; the outer is aborting due
                 // to our promotion to Terminal, so the dispatch is being
                 // redelivered. Surface the original error to the inner's
