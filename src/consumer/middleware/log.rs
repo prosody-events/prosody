@@ -194,21 +194,15 @@ where
         Err(outcome)
     }
 
-    async fn after_commit<C>(
-        &self,
-        context: C,
-        result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         self.handler.after_commit(context, result).await;
     }
 
-    async fn after_abort<C>(
-        &self,
-        context: C,
-        result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         self.handler.after_abort(context, result).await;

@@ -125,11 +125,8 @@ where
         }
     }
 
-    async fn after_commit<C>(
-        &self,
-        context: C,
-        result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         // `Ok(None)` (deferred / orphan-cleanup) and any error originating
@@ -144,11 +141,8 @@ where
         }
     }
 
-    async fn after_abort<C>(
-        &self,
-        context: C,
-        result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         match result {

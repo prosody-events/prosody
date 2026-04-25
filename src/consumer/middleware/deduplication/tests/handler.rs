@@ -454,21 +454,15 @@ impl FallibleHandler for ApplyProbe {
         Ok(())
     }
 
-    async fn after_commit<C>(
-        &self,
-        _context: C,
-        _result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_commit<C>(&self, _context: C, _result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         self.log.lock().push(ApplyEvent::InnerAfterCommit);
     }
 
-    async fn after_abort<C>(
-        &self,
-        _context: C,
-        _result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_abort<C>(&self, _context: C, _result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         self.log.lock().push(ApplyEvent::InnerAfterAbort);

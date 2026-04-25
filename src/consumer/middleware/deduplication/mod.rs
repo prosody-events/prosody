@@ -289,11 +289,8 @@ where
             .map_err(DeduplicationError::Inner)
     }
 
-    async fn after_commit<C>(
-        &self,
-        context: C,
-        result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         match result {
@@ -307,11 +304,8 @@ where
         }
     }
 
-    async fn after_abort<C>(
-        &self,
-        context: C,
-        result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         match result {

@@ -371,11 +371,8 @@ where
         Ok(None)
     }
 
-    async fn after_commit<C>(
-        &self,
-        context: C,
-        result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         // `Ok(None)` (routed to failure topic) and `Err(Producer(_))`
@@ -390,11 +387,8 @@ where
         }
     }
 
-    async fn after_abort<C>(
-        &self,
-        context: C,
-        result: Result<Self::Outcome, Self::Error>,
-    ) where
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    where
         C: EventContext,
     {
         match result {

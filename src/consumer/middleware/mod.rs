@@ -335,12 +335,12 @@ pub trait HandlerMiddleware {
 /// # Lifecycle and `Outcome`
 ///
 /// Each handler call returns a typed `Self::Outcome` value on success, which
-/// the framework then hands back to one of the apply hooks ([`Self::after_commit`]
-/// or [`Self::after_abort`]) once the durability marker has been resolved. This
-/// gives handlers a 2-phase-commit seam: stage external state inside
-/// `on_message`/`on_timer`, return a handle in the `Ok` value, and finalise
-/// (or unstage) the staged state in the apply hook with ownership of that
-/// handle.
+/// the framework then hands back to one of the apply hooks
+/// ([`Self::after_commit`] or [`Self::after_abort`]) once the durability marker
+/// has been resolved. This gives handlers a 2-phase-commit seam: stage external
+/// state inside `on_message`/`on_timer`, return a handle in the `Ok` value, and
+/// finalise (or unstage) the staged state in the apply hook with ownership of
+/// that handle.
 ///
 /// Most handlers don't need 2PC and set `type Outcome = ();`. The default
 /// `after_commit`/`after_abort` implementations are no-ops that LLVM inlines
@@ -375,12 +375,12 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// durability marker is resolved.
     ///
     /// Most handlers set `type Outcome = ();`. 2PC handlers carry a staging
-    /// handle, a transaction token, or whatever they need to finalise / unstage.
-    /// Wrapping middleware threads `Outcome` through using either the
-    /// pass-through pattern (`type Outcome = Inner::Outcome`) or the extending
-    /// pattern (`type Outcome = (Inner::Outcome, MyHandle)`); never collapse
-    /// to `()` in middleware — that silently discards the inner's value and
-    /// breaks 2PC composition.
+    /// handle, a transaction token, or whatever they need to finalise /
+    /// unstage. Wrapping middleware threads `Outcome` through using either
+    /// the pass-through pattern (`type Outcome = Inner::Outcome`) or the
+    /// extending pattern (`type Outcome = (Inner::Outcome, MyHandle)`);
+    /// never collapse to `()` in middleware — that silently discards the
+    /// inner's value and breaks 2PC composition.
     type Outcome: Send;
 
     /// Handles a message, potentially returning an error.
@@ -615,8 +615,7 @@ where
         let (trigger, uncommitted_timer) = timer.into_inner();
 
         // Attempt to process the timer
-        let result =
-            FallibleHandler::on_timer(self, context.clone(), trigger, demand_type).await;
+        let result = FallibleHandler::on_timer(self, context.clone(), trigger, demand_type).await;
 
         if let Err(error) = &result {
             self.on_timer_error(error);
@@ -676,8 +675,8 @@ mod after_hook_tests {
     use crate::consumer::middleware::test_support::MockEventContext;
     use crate::consumer::partition::offsets::OffsetTracker;
     use crate::error::ErrorCategory;
-    use crate::timers::Trigger;
     use crate::timers::TimerType;
+    use crate::timers::Trigger;
     use crate::timers::datetime::CompactDateTime;
 
     /// Test error with a fixed classification. Equality compares the
@@ -750,7 +749,6 @@ mod after_hook_tests {
                 log: Arc::default(),
             }
         }
-
     }
 
     impl FallibleHandler for ProbeHandler {
@@ -783,21 +781,15 @@ mod after_hook_tests {
             self.result.clone().map(|()| self.sentinel)
         }
 
-        async fn after_commit<C>(
-            &self,
-            _context: C,
-            result: Result<Self::Outcome, Self::Error>,
-        ) where
+        async fn after_commit<C>(&self, _context: C, result: Result<Self::Outcome, Self::Error>)
+        where
             C: EventContext,
         {
             self.log.lock().push(HookEvent::AfterCommit(result));
         }
 
-        async fn after_abort<C>(
-            &self,
-            _context: C,
-            result: Result<Self::Outcome, Self::Error>,
-        ) where
+        async fn after_abort<C>(&self, _context: C, result: Result<Self::Outcome, Self::Error>)
+        where
             C: EventContext,
         {
             self.log.lock().push(HookEvent::AfterAbort(result));
@@ -975,6 +967,7 @@ mod after_hook_tests {
             async fn commit(self) {
                 self.committed.fetch_add(1, Ordering::SeqCst);
             }
+
             async fn abort(self) {
                 self.aborted.fetch_add(1, Ordering::SeqCst);
             }
@@ -982,6 +975,7 @@ mod after_hook_tests {
 
         impl Keyed for MockUncommittedTimer {
             type Key = Key;
+
             fn key(&self) -> &Self::Key {
                 static KEY: OnceLock<Key> = OnceLock::new();
                 KEY.get_or_init(|| "test-key".into())
@@ -992,6 +986,7 @@ mod after_hook_tests {
             async fn commit(self) {
                 self.committed.fetch_add(1, Ordering::SeqCst);
             }
+
             async fn abort(self) {
                 self.aborted.fetch_add(1, Ordering::SeqCst);
             }
@@ -1013,11 +1008,8 @@ mod after_hook_tests {
             }
 
             fn into_inner(self) -> (Trigger, Self::CommitGuard) {
-                let trigger = Trigger::for_testing(
-                    "test-key".into(),
-                    self.time(),
-                    self.timer_type(),
-                );
+                let trigger =
+                    Trigger::for_testing("test-key".into(), self.time(), self.timer_type());
                 let guard = MockGuard {
                     committed: self.committed.clone(),
                     aborted: self.aborted.clone(),
@@ -1085,21 +1077,15 @@ mod after_hook_tests {
             self.inner.on_timer(context, trigger, demand_type).await
         }
 
-        async fn after_commit<C>(
-            &self,
-            context: C,
-            result: Result<Self::Outcome, Self::Error>,
-        ) where
+        async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+        where
             C: EventContext,
         {
             self.inner.after_commit(context, result).await;
         }
 
-        async fn after_abort<C>(
-            &self,
-            context: C,
-            result: Result<Self::Outcome, Self::Error>,
-        ) where
+        async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+        where
             C: EventContext,
         {
             self.inner.after_abort(context, result).await;
