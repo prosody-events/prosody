@@ -294,11 +294,8 @@ impl StorePair {
                 let timer_queries = Arc::new(TimerQueries::new(store.session(), keyspace).await?);
 
                 // Prepare queries for deduplication stores
-                let dedup_queries = Arc::new(
-                    DeduplicationQueries::new(store.session(), keyspace)
-                        .await?
-                        .with_local_one_consistency(),
-                );
+                let dedup_queries =
+                    Arc::new(DeduplicationQueries::new(store.session(), keyspace).await?);
 
                 let dedup_ttl_secs: i32 = dedup_ttl
                     .as_secs()

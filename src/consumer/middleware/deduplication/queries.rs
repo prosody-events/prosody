@@ -2,10 +2,14 @@
 
 use crate::cassandra::TABLE_DEDUPLICATION;
 use crate::cassandra_queries;
-use scylla::statement::Consistency;
 
 cassandra_queries! {
     /// Prepared statements for deduplication operations.
+    ///
+    /// Inherits the session default consistency (`LocalQuorum`). The dedup
+    /// write is the durability anchor for the post-commit apply hook: once
+    /// `insert` returns Ok the framework commits the Kafka offset, so the
+    /// write must be observable by any subsequent reader in the local DC.
     pub struct DeduplicationQueries {
         /// Check if a deduplication ID exists.
         check_exists: (
@@ -17,16 +21,5 @@ cassandra_queries! {
             "INSERT INTO $keyspace.{} (id) VALUES (?) USING TTL ?",
             TABLE_DEDUPLICATION
         ),
-    }
-}
-
-impl DeduplicationQueries {
-    /// Sets both statements to `LocalOne` consistency for best-effort
-    /// reads/writes.
-    #[must_use]
-    pub fn with_local_one_consistency(mut self) -> Self {
-        self.check_exists.set_consistency(Consistency::LocalOne);
-        self.insert_with_ttl.set_consistency(Consistency::LocalOne);
-        self
     }
 }
