@@ -94,14 +94,14 @@ impl MockHandler {
 
 impl FallibleHandler for MockHandler {
     type Error = TestError;
-    type Outcome = ();
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -118,7 +118,7 @@ impl FallibleHandler for MockHandler {
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -426,14 +426,14 @@ enum ApplyEvent {
 
 impl FallibleHandler for ApplyProbe {
     type Error = TestError;
-    type Outcome = ();
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -446,7 +446,7 @@ impl FallibleHandler for ApplyProbe {
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -454,14 +454,14 @@ impl FallibleHandler for ApplyProbe {
         Ok(())
     }
 
-    async fn after_commit<C>(&self, _context: C, _result: Result<Self::Outcome, Self::Error>)
+    async fn after_commit<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         self.log.lock().push(ApplyEvent::InnerAfterCommit);
     }
 
-    async fn after_abort<C>(&self, _context: C, _result: Result<Self::Outcome, Self::Error>)
+    async fn after_abort<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {

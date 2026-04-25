@@ -273,14 +273,14 @@ where
     T: FallibleHandler,
 {
     type Error = SchedulerError<T::Error>;
-    type Outcome = T::Outcome;
+    type Output = T::Output;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -298,7 +298,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -311,12 +311,12 @@ where
             .map_err(SchedulerError::Handler)
     }
 
-    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         match result {
-            Ok(outcome) => self.handler.after_commit(context, Ok(outcome)).await,
+            Ok(output) => self.handler.after_commit(context, Ok(output)).await,
             Err(SchedulerError::Handler(inner)) => {
                 self.handler.after_commit(context, Err(inner)).await;
             }
@@ -326,12 +326,12 @@ where
         }
     }
 
-    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         match result {
-            Ok(outcome) => self.handler.after_abort(context, Ok(outcome)).await,
+            Ok(output) => self.handler.after_abort(context, Ok(output)).await,
             Err(SchedulerError::Handler(inner)) => {
                 self.handler.after_abort(context, Err(inner)).await;
             }

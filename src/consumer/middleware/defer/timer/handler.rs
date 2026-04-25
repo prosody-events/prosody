@@ -71,18 +71,18 @@ where
     D: DeferralDecider,
 {
     type Error = DeferError<S::Error, T::Error>;
-    /// `Some(inner_outcome)` when the inner handler ran and succeeded;
+    /// `Some(inner_output)` when the inner handler ran and succeeded;
     /// `None` for paths where deferral side-effects occurred without the
     /// inner handler producing a value (e.g., enqueueing a deferred retry,
     /// orphan-timer cleanup). The inner's apply hook runs only on `Some`.
-    type Outcome = Option<T::Outcome>;
+    type Output = Option<T::Output>;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -102,7 +102,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -125,7 +125,7 @@ where
         }
     }
 
-    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
@@ -133,7 +133,7 @@ where
         // at the defer/store/timer layer never reached the inner handler,
         // so the inner has no apply work to forward.
         match result {
-            Ok(Some(outcome)) => self.handler.after_commit(context, Ok(outcome)).await,
+            Ok(Some(output)) => self.handler.after_commit(context, Ok(output)).await,
             Err(DeferError::Handler(error)) => {
                 self.handler.after_commit(context, Err(error)).await;
             }
@@ -141,12 +141,12 @@ where
         }
     }
 
-    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         match result {
-            Ok(Some(outcome)) => self.handler.after_abort(context, Ok(outcome)).await,
+            Ok(Some(output)) => self.handler.after_abort(context, Ok(output)).await,
             Err(DeferError::Handler(error)) => {
                 self.handler.after_abort(context, Err(error)).await;
             }
@@ -168,14 +168,14 @@ where
     /// Handles an `Application` timer, deferring on transient failure if
     /// enabled.
     ///
-    /// Returns `Ok(Some(outcome))` only when the inner handler ran and
+    /// Returns `Ok(Some(output))` only when the inner handler ran and
     /// produced a value. Defer-only paths return `Ok(None)`.
     async fn handle_application_timer<C>(
         &self,
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<Option<T::Outcome>, DeferError<S::Error, T::Error>>
+    ) -> Result<Option<T::Output>, DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -196,7 +196,7 @@ where
             .on_timer(context.clone(), trigger.clone(), demand_type)
             .await
         {
-            Ok(outcome) => return Ok(Some(outcome)),
+            Ok(output) => return Ok(Some(output)),
             Err(error) => error,
         };
 
@@ -229,7 +229,7 @@ where
         &self,
         context: C,
         trigger: Trigger,
-    ) -> Result<Option<T::Outcome>, DeferError<S::Error, T::Error>>
+    ) -> Result<Option<T::Output>, DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -284,12 +284,12 @@ where
             self.source.clone(),
         );
 
-        let outcome = match self
+        let output = match self
             .handler
             .on_timer(context.clone(), stored_trigger.clone(), DemandType::Failure)
             .await
         {
-            Ok(outcome) => outcome,
+            Ok(output) => output,
             Err(error) => {
                 return self
                     .handle_retry_failure(&context, &trigger, &stored_trigger, retry_count, error)
@@ -316,7 +316,7 @@ where
             "Deferred timer retry succeeded"
         );
 
-        Ok(Some(outcome))
+        Ok(Some(output))
     }
 
     /// Defers a timer for the first time. Schedules retry timer before storing
@@ -325,7 +325,7 @@ where
         &self,
         context: C,
         trigger: &Trigger,
-    ) -> Result<Option<T::Outcome>, DeferError<S::Error, T::Error>>
+    ) -> Result<Option<T::Output>, DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -352,7 +352,7 @@ where
     async fn append_to_deferred_queue(
         &self,
         trigger: &Trigger,
-    ) -> Result<Option<T::Outcome>, DeferError<S::Error, T::Error>> {
+    ) -> Result<Option<T::Output>, DeferError<S::Error, T::Error>> {
         self.store
             .defer_additional_timer(trigger)
             .await
@@ -381,7 +381,7 @@ where
         stored_trigger: &Trigger,
         retry_count: u32,
         error: T::Error,
-    ) -> Result<Option<T::Outcome>, DeferError<S::Error, T::Error>>
+    ) -> Result<Option<T::Output>, DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {

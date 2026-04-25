@@ -196,17 +196,17 @@ where
     S: DeduplicationStore,
 {
     type Error = DeduplicationError<T::Error>;
-    /// `Some(inner_outcome)` when the inner handler ran and succeeded;
+    /// `Some(inner_output)` when the inner handler ran and succeeded;
     /// `None` when the message was already deduplicated (handler skipped).
     /// This gates whether the inner's apply hook fires.
-    type Outcome = Option<T::Outcome>;
+    type Output = Option<T::Output>;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -278,7 +278,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -289,13 +289,13 @@ where
             .map_err(DeduplicationError::Inner)
     }
 
-    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         match result {
-            // Inner handler ran and succeeded: forward its outcome.
-            Ok(Some(outcome)) => self.inner.after_commit(context, Ok(outcome)).await,
+            // Inner handler ran and succeeded: forward its output.
+            Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
             // Already deduplicated: inner never ran, so its apply must not run.
             Ok(None) => {}
             Err(DeduplicationError::Inner(error)) => {
@@ -304,12 +304,12 @@ where
         }
     }
 
-    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         match result {
-            Ok(Some(outcome)) => self.inner.after_abort(context, Ok(outcome)).await,
+            Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
             Ok(None) => {}
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_abort(context, Err(error)).await;

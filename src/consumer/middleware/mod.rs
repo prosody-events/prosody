@@ -68,7 +68,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
-//! #     type Outcome = ();
+//! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -105,7 +105,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
-//! #     type Outcome = ();
+//! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -254,7 +254,7 @@ pub trait HandlerMiddleware {
     /// # struct MyHandler;
     /// # impl FallibleHandler for MyHandler {
     /// #     type Error = Infallible;
-    /// #     type Outcome = ();
+    /// #     type Output = ();
     /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
     /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
     /// #     async fn shutdown(self) {}
@@ -332,9 +332,9 @@ pub trait HandlerMiddleware {
 
 /// Defines a handler that can fail during message processing.
 ///
-/// # Lifecycle and `Outcome`
+/// # Lifecycle and `Output`
 ///
-/// Each handler call returns a typed `Self::Outcome` value on success, which
+/// Each handler call returns a typed `Self::Output` value on success, which
 /// the framework then hands back to one of the apply hooks
 /// ([`Self::after_commit`] or [`Self::after_abort`]) once the durability marker
 /// has been resolved. This gives handlers a 2-phase-commit seam: stage external
@@ -342,7 +342,7 @@ pub trait HandlerMiddleware {
 /// finalise (or unstage) the staged state in the apply hook with ownership of
 /// that handle.
 ///
-/// Most handlers don't need 2PC and set `type Outcome = ();`. The default
+/// Most handlers don't need 2PC and set `type Output = ();`. The default
 /// `after_commit`/`after_abort` implementations are no-ops that LLVM inlines
 /// away for that case.
 ///
@@ -356,7 +356,7 @@ pub trait HandlerMiddleware {
 /// - After every `commit().await`, call `inner.after_commit(ctx, result).await`
 /// - After every `abort().await`, call `inner.after_abort(ctx, result).await`
 ///
-/// where `result` is the same `Result<Self::Outcome, Self::Error>` the inner
+/// where `result` is the same `Result<Self::Output, Self::Error>` the inner
 /// handler chain produced. Failing to do so silently breaks any 2PC handler
 /// further down the chain. The blanket `FallibleEventHandler → EventHandler`
 /// impl in this module and `RetryHandler` are the existing sites that take
@@ -374,14 +374,14 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// ([`Self::after_commit`]/[`Self::after_abort`]) consume once the
     /// durability marker is resolved.
     ///
-    /// Most handlers set `type Outcome = ();`. 2PC handlers carry a staging
+    /// Most handlers set `type Output = ();`. 2PC handlers carry a staging
     /// handle, a transaction token, or whatever they need to finalise /
-    /// unstage. Wrapping middleware threads `Outcome` through using either
-    /// the pass-through pattern (`type Outcome = Inner::Outcome`) or the
-    /// extending pattern (`type Outcome = (Inner::Outcome, MyHandle)`);
+    /// unstage. Wrapping middleware threads `Output` through using either
+    /// the pass-through pattern (`type Output = Inner::Output`) or the
+    /// extending pattern (`type Output = (Inner::Output, MyHandle)`);
     /// never collapse to `()` in middleware — that silently discards the
     /// inner's value and breaks 2PC composition.
-    type Outcome: Send;
+    type Output: Send;
 
     /// Handles a message, potentially returning an error.
     ///
@@ -393,7 +393,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// A `Future` that resolves to `Ok(outcome)` carrying the typed value the
+    /// A `Future` that resolves to `Ok(output)` carrying the typed value the
     /// handler produced on success, or an `Err` containing the error if
     /// processing failed.
     fn on_message<C>(
@@ -401,7 +401,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Outcome, Self::Error>> + Send
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
         C: EventContext;
 
@@ -423,7 +423,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// # Returns
     ///
     /// A [`Future`] that resolves to:
-    /// - `Ok(outcome)` carrying the typed value the handler produced on success
+    /// - `Ok(output)` carrying the typed value the handler produced on success
     /// - `Err(Self::Error)` if processing failed
     ///
     /// # Error Handling
@@ -446,14 +446,14 @@ pub trait FallibleHandler: Send + Sync + 'static {
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Outcome, Self::Error>> + Send
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
         C: EventContext;
 
     /// Runs after the durability marker has been **committed**, with ownership
     /// of the `Result` produced by the handler chain.
     ///
-    /// `Ok(outcome)` — handler succeeded; finalise staged state.
+    /// `Ok(output)` — handler succeeded; finalise staged state.
     /// `Err(error)` — handler returned a Transient or Permanent error; the
     /// marker still committed (offset advance, dedup-insert as applicable).
     ///
@@ -467,7 +467,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     fn after_commit<C>(
         &self,
         _context: C,
-        _result: Result<Self::Outcome, Self::Error>,
+        _result: Result<Self::Output, Self::Error>,
     ) -> impl Future<Output = ()> + Send
     where
         C: EventContext,
@@ -478,7 +478,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// Runs after the durability marker has been **aborted**, with ownership
     /// of the `Result` produced by the handler chain.
     ///
-    /// `Ok(outcome)` — handler succeeded but the marker was aborted anyway
+    /// `Ok(output)` — handler succeeded but the marker was aborted anyway
     /// (e.g., shutdown intervened between `Ok` and commit; see
     /// `RetryHandler::on_message` shutdown-during-retry path).
     /// `Err(error)` — handler returned a Terminal error, or shutdown aborted
@@ -489,7 +489,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     fn after_abort<C>(
         &self,
         _context: C,
-        _result: Result<Self::Outcome, Self::Error>,
+        _result: Result<Self::Output, Self::Error>,
     ) -> impl Future<Output = ()> + Send
     where
         C: EventContext,
@@ -659,7 +659,7 @@ mod after_hook_tests {
     //!
     //! These tests exercise the full lifecycle: handler runs → blanket impl
     //! resolves the marker → matching apply hook fires with the correct
-    //! `Result<Outcome, Error>` value.
+    //! `Result<Output, Error>` value.
     use std::error::Error as StdError;
     use std::fmt::{Display, Formatter, Result as FmtResult};
     use std::sync::Arc;
@@ -724,7 +724,7 @@ mod after_hook_tests {
         AfterAbort(Result<u64, TestError>),
     }
 
-    /// Probe handler whose `Outcome` is a `u64` sentinel; records every
+    /// Probe handler whose `Output` is a `u64` sentinel; records every
     /// lifecycle hook into a shared log.
     #[derive(Clone)]
     struct ProbeHandler {
@@ -753,14 +753,14 @@ mod after_hook_tests {
 
     impl FallibleHandler for ProbeHandler {
         type Error = TestError;
-        type Outcome = u64;
+        type Output = u64;
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             _demand_type: DemandType,
-        ) -> Result<Self::Outcome, Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -773,7 +773,7 @@ mod after_hook_tests {
             _context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
-        ) -> Result<Self::Outcome, Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -781,14 +781,14 @@ mod after_hook_tests {
             self.result.clone().map(|()| self.sentinel)
         }
 
-        async fn after_commit<C>(&self, _context: C, result: Result<Self::Outcome, Self::Error>)
+        async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
             C: EventContext,
         {
             self.log.lock().push(HookEvent::AfterCommit(result));
         }
 
-        async fn after_abort<C>(&self, _context: C, result: Result<Self::Outcome, Self::Error>)
+        async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
         where
             C: EventContext,
         {
@@ -817,7 +817,7 @@ mod after_hook_tests {
     }
 
     #[tokio::test]
-    async fn after_commit_fires_with_ok_outcome_after_handler_success() -> color_eyre::Result<()> {
+    async fn after_commit_fires_with_ok_output_after_handler_success() -> color_eyre::Result<()> {
         let handler = ProbeHandler::ok(42);
         let log = handler.log.clone();
         let context = MockEventContext::new();
@@ -944,7 +944,7 @@ mod after_hook_tests {
     }
 
     #[tokio::test]
-    async fn after_commit_for_timer_path_with_ok_outcome() {
+    async fn after_commit_for_timer_path_with_ok_output() {
         // Timer arm of the blanket impl: build a minimal `UncommittedTimer`
         // and verify the same lifecycle.
         use std::sync::OnceLock;
@@ -1041,7 +1041,7 @@ mod after_hook_tests {
 
     /// Minimal pass-through middleware to verify the composition contract.
     /// Stands in for any real `FallibleHandler` middleware that wraps an
-    /// inner with `type Outcome = Inner::Outcome` and forwards apply hooks.
+    /// inner with `type Output = Inner::Output` and forwards apply hooks.
     struct PassThroughMiddleware<T> {
         inner: T,
     }
@@ -1051,14 +1051,14 @@ mod after_hook_tests {
         T: FallibleHandler,
     {
         type Error = T::Error;
-        type Outcome = T::Outcome;
+        type Output = T::Output;
 
         async fn on_message<C>(
             &self,
             context: C,
             message: ConsumerMessage,
             demand_type: DemandType,
-        ) -> Result<Self::Outcome, Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -1070,21 +1070,21 @@ mod after_hook_tests {
             context: C,
             trigger: Trigger,
             demand_type: DemandType,
-        ) -> Result<Self::Outcome, Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
             self.inner.on_timer(context, trigger, demand_type).await
         }
 
-        async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+        async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
         where
             C: EventContext,
         {
             self.inner.after_commit(context, result).await;
         }
 
-        async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+        async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
         where
             C: EventContext,
         {
@@ -1099,7 +1099,7 @@ mod after_hook_tests {
     impl<T> FallibleEventHandler for PassThroughMiddleware<T> where T: FallibleHandler {}
 
     #[tokio::test]
-    async fn pass_through_middleware_forwards_outcome_to_inner_after_commit()
+    async fn pass_through_middleware_forwards_output_to_inner_after_commit()
     -> color_eyre::Result<()> {
         let inner = ProbeHandler::ok(7);
         let log = inner.log.clone();
@@ -1118,7 +1118,7 @@ mod after_hook_tests {
         assert_eq!(
             log.lock().clone(),
             vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(7))],
-            "pass-through middleware forwards typed outcome unchanged",
+            "pass-through middleware forwards typed output unchanged",
         );
         Ok(())
     }

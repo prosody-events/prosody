@@ -106,14 +106,14 @@ struct DeferTestHandler {
 
 impl FallibleHandler for DeferTestHandler {
     type Error = TestError;
-    type Outcome = ();
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -154,7 +154,7 @@ impl FallibleHandler for DeferTestHandler {
         _context: C,
         _timer: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -177,14 +177,14 @@ struct PermanentErrorHandler {
 
 impl FallibleHandler for PermanentErrorHandler {
     type Error = TestError;
-    type Outcome = ();
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -200,7 +200,7 @@ impl FallibleHandler for PermanentErrorHandler {
         context: C,
         timer: Trigger,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {

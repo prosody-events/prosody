@@ -55,7 +55,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
-//! #     type Outcome = ();
+//! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -314,7 +314,7 @@ impl<T> RetryHandler<T> {
                 DemandType::Failure
             };
             let error = match invoke(demand).await {
-                Ok(outcome) => return Resolution::Commit(Ok(outcome)),
+                Ok(output) => return Resolution::Commit(Ok(output)),
                 Err(error) => error,
             };
 
@@ -484,14 +484,14 @@ where
     T: FallibleHandler,
 {
     type Error = T::Error;
-    type Outcome = T::Outcome;
+    type Output = T::Output;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -531,7 +531,7 @@ where
         context: C,
         timer: Trigger,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -550,14 +550,14 @@ where
         }
     }
 
-    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         self.handler.after_commit(context, result).await;
     }
 
-    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
@@ -744,14 +744,14 @@ mod tests {
 
     impl FallibleHandler for MockHandler {
         type Error = TestError;
-        type Outcome = ();
+        type Output = ();
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             demand_type: DemandType,
-        ) -> Result<Self::Outcome, Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -772,7 +772,7 @@ mod tests {
             _context: C,
             _trigger: Trigger,
             demand_type: DemandType,
-        ) -> Result<Self::Outcome, Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {

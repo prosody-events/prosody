@@ -49,7 +49,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
-//! #     type Outcome = ();
+//! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -218,11 +218,11 @@ where
     T: FallibleHandler,
 {
     type Error = FailureTopicError<T::Error>;
-    /// `Some(inner_outcome)` when the wrapped handler succeeded; `None` when
+    /// `Some(inner_output)` when the wrapped handler succeeded; `None` when
     /// the handler failed with a non-Terminal error and the message/timer was
     /// routed to the failure topic instead. This mirrors the dedup pattern:
     /// `None` means the inner's apply work must not run.
-    type Outcome = Option<T::Outcome>;
+    type Output = Option<T::Output>;
 
     /// Handles a message, attempting to process it with the wrapped handler.
     /// If processing fails, sends the message to the failure topic.
@@ -234,7 +234,7 @@ where
     ///
     /// # Returns
     ///
-    /// A `Result` that is `Ok(Some(outcome))` if the message was processed
+    /// A `Result` that is `Ok(Some(output))` if the message was processed
     /// successfully, `Ok(None)` if it was sent to the failure topic, or an
     /// `Err` containing a `FailureTopicError` if processing terminated or
     /// sending to the failure topic failed.
@@ -249,7 +249,7 @@ where
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -268,7 +268,7 @@ where
             .on_message(context, message.clone(), demand_type)
             .await
         {
-            Ok(outcome) => return Ok(Some(outcome)),
+            Ok(output) => return Ok(Some(output)),
             Err(error) => error,
         };
 
@@ -318,7 +318,7 @@ where
         context: C,
         timer: Trigger,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -328,7 +328,7 @@ where
             .on_timer(context, timer.clone(), demand_type)
             .await
         {
-            Ok(outcome) => return Ok(Some(outcome)),
+            Ok(output) => return Ok(Some(output)),
             Err(error) => error,
         };
 
@@ -371,7 +371,7 @@ where
         Ok(None)
     }
 
-    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
@@ -384,7 +384,7 @@ where
         // inner's failure, so the inner's apply hook is intentionally dropped
         // rather than forwarded.
         match result {
-            Ok(Some(outcome)) => self.handler.after_commit(context, Ok(outcome)).await,
+            Ok(Some(output)) => self.handler.after_commit(context, Ok(output)).await,
             Err(FailureTopicError::Handler(inner)) => {
                 self.handler.after_commit(context, Err(inner)).await;
             }
@@ -392,13 +392,13 @@ where
         }
     }
 
-    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         // See `after_commit` for the rationale on the dropped variants.
         match result {
-            Ok(Some(outcome)) => self.handler.after_abort(context, Ok(outcome)).await,
+            Ok(Some(output)) => self.handler.after_abort(context, Ok(output)).await,
             Err(FailureTopicError::Handler(inner)) => {
                 self.handler.after_abort(context, Err(inner)).await;
             }

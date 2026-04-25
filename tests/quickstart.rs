@@ -23,14 +23,14 @@ struct MyHandler {
 
 impl FallibleHandler for MyHandler {
     type Error = Infallible;
-    type Outcome = ();
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {

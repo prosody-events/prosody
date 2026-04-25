@@ -39,7 +39,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
-//! #     type Outcome = ();
+//! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -130,20 +130,20 @@ where
     T: FallibleHandler,
 {
     type Error = T::Error;
-    type Outcome = T::Outcome;
+    type Output = T::Output;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the message with the wrapped handler
         let error = match self.handler.on_message(context, message, demand_type).await {
-            Ok(outcome) => return Ok(outcome),
+            Ok(output) => return Ok(output),
             Err(error) => error,
         };
 
@@ -168,13 +168,13 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
         let error = match self.handler.on_timer(context, trigger, demand_type).await {
-            Ok(outcome) => return Ok(outcome),
+            Ok(output) => return Ok(output),
             Err(error) => error,
         };
 
@@ -194,14 +194,14 @@ where
         Err(error)
     }
 
-    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         self.handler.after_commit(context, result).await;
     }
 
-    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {

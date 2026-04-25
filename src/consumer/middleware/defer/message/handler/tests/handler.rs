@@ -214,14 +214,14 @@ impl Debug for OutcomeHandler {
 
 impl FallibleHandler for OutcomeHandler {
     type Error = OutcomeError;
-    type Outcome = ();
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -252,7 +252,7 @@ impl FallibleHandler for OutcomeHandler {
         _context: C,
         trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {

@@ -145,14 +145,14 @@ where
     T: EventHandler + Send + Sync + 'static,
 {
     type Error = Infallible;
-    type Outcome = ();
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -167,7 +167,7 @@ where
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {

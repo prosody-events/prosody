@@ -294,7 +294,7 @@ where
         &self,
         message_key: &Key,
         offset: Offset,
-    ) -> DeferResult<Option<T::Outcome>, M::Error, T::Error, L::Error> {
+    ) -> DeferResult<Option<T::Output>, M::Error, T::Error, L::Error> {
         self.store
             .defer_additional_message(message_key, offset)
             .await
@@ -322,7 +322,7 @@ where
         offset: Offset,
         retry_count: u32,
         error: T::Error,
-    ) -> DeferResult<Option<T::Outcome>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<T::Output>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -501,7 +501,7 @@ where
         context: C,
         message_key: &Key,
         offset: Offset,
-    ) -> DeferResult<Option<T::Outcome>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<T::Output>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -533,7 +533,7 @@ where
         offset: Offset,
         retry_count: u32,
         message: ConsumerMessage,
-    ) -> DeferResult<Option<T::Outcome>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<T::Output>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -557,7 +557,7 @@ where
             .on_message(context.clone(), message, DemandType::Failure)
             .await
         {
-            Ok(outcome) => {
+            Ok(output) => {
                 self.sender.timer_succeeded(
                     trigger.key.clone(),
                     trigger.time,
@@ -581,7 +581,7 @@ where
                     partition = self.partition,
                     "Deferred message retry succeeded"
                 );
-                Ok(Some(outcome))
+                Ok(Some(output))
             }
             Err(error) => {
                 let error_category = error.classify_error();
@@ -612,17 +612,17 @@ where
     D: DeferralDecider,
 {
     type Error = DeferError<M::Error, T::Error, L::Error>;
-    /// `Some(inner_outcome)` when the inner handler ran and succeeded;
+    /// `Some(inner_output)` when the inner handler ran and succeeded;
     /// `None` for paths where the message was queued/re-queued without
     /// completing inner processing. Inner's apply hook fires only on `Some`.
-    type Outcome = Option<T::Outcome>;
+    type Output = Option<T::Output>;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -647,7 +647,7 @@ where
             .on_message(context.clone(), message, demand_type)
             .await
         {
-            Ok(outcome) => return Ok(Some(outcome)),
+            Ok(output) => return Ok(Some(output)),
             Err(error) => error,
         };
 
@@ -686,7 +686,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<Self::Outcome, Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -748,7 +748,7 @@ where
             .await
     }
 
-    async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
@@ -756,7 +756,7 @@ where
         // originated at the defer layer; the inner handler did not see
         // them, so its apply hook must not fire.
         match result {
-            Ok(Some(outcome)) => self.handler.after_commit(context, Ok(outcome)).await,
+            Ok(Some(output)) => self.handler.after_commit(context, Ok(output)).await,
             Err(DeferError::Handler(error)) => {
                 self.handler.after_commit(context, Err(error)).await;
             }
@@ -764,12 +764,12 @@ where
         }
     }
 
-    async fn after_abort<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
     {
         match result {
-            Ok(Some(outcome)) => self.handler.after_abort(context, Ok(outcome)).await,
+            Ok(Some(output)) => self.handler.after_abort(context, Ok(output)).await,
             Err(DeferError::Handler(error)) => {
                 self.handler.after_abort(context, Err(error)).await;
             }
