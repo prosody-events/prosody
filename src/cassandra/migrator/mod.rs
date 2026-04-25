@@ -380,7 +380,7 @@ pub enum MigrationError {
 
     /// Failed to refresh cluster metadata.
     #[error("Failed to refresh metadata: {0:#}")]
-    MetadataRefreshFailed(#[from] MetadataError),
+    MetadataRefreshFailed(Box<MetadataError>),
 
     /// Failed to load embedded migration file.
     #[error("Failed to load migration file: {0}")]
@@ -465,6 +465,12 @@ pub enum MigrationError {
     /// Failed to parse applied migrations from query result.
     #[error("Failed to parse applied migrations query result")]
     AppliedMigrationsParsingFailed(Box<TypeCheckError>),
+}
+
+impl From<MetadataError> for MigrationError {
+    fn from(error: MetadataError) -> Self {
+        Self::MetadataRefreshFailed(Box::new(error))
+    }
 }
 
 impl From<ExecutionError> for MigrationError {
