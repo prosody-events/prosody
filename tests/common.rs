@@ -533,6 +533,12 @@ impl ClassifyError for TestError {
 
 /// A test handler that implements `FallibleHandler` for high-level client
 /// testing.
+///
+/// This is a leaf handler (no inner): it relies on the default no-op
+/// `after_commit` / `after_abort` apply hooks. The framework still guarantees
+/// that exactly one of those hooks fires per `on_message` / `on_timer` call
+/// (the rule-3 invariant), but with `type Output = ()` and no staged state to
+/// finalise or unwind, this handler has nothing to do in either hook.
 #[derive(Clone, Debug)]
 pub struct FallibleTestHandler {
     /// Channel for transmitting received messages.

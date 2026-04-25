@@ -12,14 +12,32 @@
 //!
 //! **Response Path:**
 //! 1. Receive result from inner layers
-//! 2. **Record handler completion** - Log success/failure and timing
+//! 2. **Record handler completion** - Log success/failure and timing of the
+//!    handler invocation as observed at this layer
 //! 3. Pass original result through unchanged
+//!
+//! Note: the `Succeeded`/`Failed` events recorded here reflect the outcome of
+//! the wrapped `on_message` / `on_timer` invocation as it returns to this
+//! layer. They are work-level signals only; they do NOT indicate whether the
+//! framework will treat the dispatch as final (commit) or non-final (retry of
+//! the same logical event). The framework's `FallibleHandler` invariant
+//! guarantees that for every `on_message`/`on_timer` call that runs and
+//! returns, exactly one of `after_commit` or `after_abort` will subsequently
+//! fire on the same handler instance — `after_commit` marking the dispatch as
+//! final, `after_abort` marking it as non-final with a retry to come.
+//! `TelemetryHandler` forwards both apply hooks verbatim to the inner handler
+//! and does not currently emit dedicated events distinguishing the two. The
+//! inner is invoked at most once per call; per-invocation invariant trivially
+//! upheld.
 //!
 //! # Telemetry Events
 //!
 //! - **Handler Invoked**: When processing begins
-//! - **Handler Succeeded**: When processing completes successfully
-//! - **Handler Failed**: When processing fails (with error category)
+//! - **Handler Succeeded**: When the handler invocation returns `Ok` at this
+//!   layer (work-level outcome; not a commit/abort signal)
+//! - **Handler Failed**: When the handler invocation returns `Err` at this
+//!   layer, with error category (work-level outcome; not a commit/abort
+//!   signal)
 //! - **Execution Time**: Duration of processing
 //! - **Partition Context**: Which topic-partition was processed
 //!
@@ -285,6 +303,17 @@ where
         result
     }
 
+    /// Pass-through forwarder for the framework's terminal apply hook.
+    ///
+    /// `TelemetryHandler` is a pure pass-through middleware
+    /// (`Output = T::Output`, `Error = T::Error`) and therefore cannot change
+    /// the dispatch's final outcome. The framework calls this hook to mark
+    /// the dispatch as FINAL: no retry of the same logical event will follow
+    /// through this consumer. Per the `FallibleHandler` invariant, exactly
+    /// one of `after_commit` or `after_abort` fires for each `on_message` /
+    /// `on_timer` call that runs and returns; this layer simply forwards the
+    /// hook verbatim so the inner handler observes the framework-level
+    /// commit/abort decision unchanged.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -292,6 +321,17 @@ where
         self.handler.after_commit(context, result).await;
     }
 
+    /// Pass-through forwarder for the framework's non-terminal apply hook.
+    ///
+    /// `TelemetryHandler` is a pure pass-through middleware
+    /// (`Output = T::Output`, `Error = T::Error`) and therefore cannot change
+    /// the dispatch's final outcome. The framework calls this hook to mark
+    /// the dispatch as NOT final: a retry of the same logical event is coming
+    /// through this consumer. Per the `FallibleHandler` invariant, exactly
+    /// one of `after_commit` or `after_abort` fires for each `on_message` /
+    /// `on_timer` call that runs and returns; this layer simply forwards the
+    /// hook verbatim so the inner handler observes the framework-level
+    /// commit/abort decision unchanged.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,

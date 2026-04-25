@@ -34,6 +34,48 @@
 //!   continues, skipping any remaining sleep delay. This ensures that
 //!   cancellation doesn't cause message loss when retries could still succeed.
 //!
+//! # Apply-Hook Contract: Per-Invocation, No Exceptions
+//!
+//! The [`FallibleHandler`] trait requires, **per invocation**, that for every
+//! call to `inner.on_message` / `inner.on_timer` which runs and returns, the
+//! framework fires exactly one of `inner.after_commit` (final — no
+//! re-dispatch into the inner is coming) or `inner.after_abort` (non-final —
+//! the same logical event will be re-dispatched into the inner).
+//!
+//! Retry middleware re-invokes its inner once per attempt; each attempt is
+//! itself an invocation that must be paired with exactly one apply hook on
+//! the inner. Splitting responsibility between this middleware and the
+//! framework above:
+//!
+//! - For every **non-final** attempt — i.e. an attempt whose error was
+//!   `Transient` and which will be followed by another attempt within this
+//!   retry session — this middleware fires `inner.after_abort(Err(error))`
+//!   on the inner *between attempts*, before invoking the inner again. The
+//!   next iteration's `on_message` / `on_timer` is a fresh dispatch from the
+//!   inner's POV.
+//! - For the **final** attempt — the one whose outcome the retry session
+//!   resolves with (success, `Permanent`, `Terminal`, or `Transient` after
+//!   `max_retries`) — this middleware does not fire any apply hook on the
+//!   inner. Instead, the outer layer fires it:
+//!     * When acting as inner [`FallibleHandler`], the outer middleware (or
+//!       the blanket impl) inspects the final `Result<O, E>` and fires the
+//!       apply hook on `RetryHandler`, which we forward verbatim to our own
+//!       inner handler.
+//!     * When acting as the outermost [`EventHandler`] (the durability
+//!       boundary), we pair the offset/timer commit/abort with exactly one
+//!       apply hook on the inner.
+//!
+//! In other words: an inner that is invoked N times in a retry session sees
+//! N apply-hook firings on itself — the first N-1 are `after_abort(Err(...))`
+//! fired by this middleware between attempts, and the last is the framework's
+//! final hook for the whole session.
+//!
+//! Composition note: layers above retry (failure-topic, defer, DLQ
+//! middlewares) still see retry as a single dispatch — they observe one
+//! final `Result` from retry and one corresponding apply-hook call. The
+//! intermediate per-attempt apply hooks fire only on retry's own inner
+//! handler, never on layers above retry.
+//!
 //! # Usage
 //!
 //! Often used multiple times in a pipeline for different failure points:
@@ -235,11 +277,35 @@ async fn wait_with_cancellation<C: EventContext>(
     }
 }
 
-/// How [`RetryHandler::run`] resolved a single dispatch. Mapped at the call
-/// site to either `Result<O, E>` (for the [`FallibleHandler`] impl, which
-/// surfaces the error to an outer middleware) or to `commit`/`abort` plus the
-/// matching apply hook (for the [`EventHandler`] impl, which is the durability
-/// boundary).
+/// How [`RetryHandler::run`] resolved the **final attempt** of a retry
+/// session. Intermediate (non-final) attempts are not represented here — the
+/// loop has already paired each of them with `inner.after_abort(Err(error))`
+/// before invoking the inner again. This enum describes only what the outer
+/// layer should do with the marker and the apply hook for the *last* attempt.
+///
+/// - [`Resolution::Commit`] — the final attempt completed and is **final
+///   from the inner's POV**: success (`Ok`), `Permanent`, or `Transient`
+///   after `max_retries` was exhausted. No further dispatch into the inner
+///   is coming for this logical event from retry's standpoint; the outer
+///   should commit the marker and fire `after_commit` on the inner with this
+///   `Result<O, E>`.
+///
+/// - [`Resolution::Abort`] — the final attempt was cut short and a **retry
+///   of this dispatch is coming via redelivery** (shutdown signalled
+///   mid-loop, or a `Terminal` error). The durability marker must NOT
+///   advance, and the inner should see `after_abort(Err(error))` so it knows
+///   the same logical event will be re-delivered.
+///
+/// The mapping is performed at the call site:
+///
+/// - In the [`FallibleHandler`] impl, both variants collapse to `Result<O, E>`
+///   and the outer middleware (or blanket impl) decides which apply hook to
+///   fire. `Commit` flattens to its inner `Result`; `Abort` becomes `Err`
+///   (the outer treats this as abort because the underlying error is
+///   `Terminal` or shutdown-driven).
+/// - In the [`EventHandler`] impl (the durability boundary), `Commit` triggers
+///   `commit() + after_commit(result)` and `Abort` triggers
+///   `abort() + after_abort(Err(error))`.
 enum Resolution<O, E> {
     Commit(Result<O, E>),
     Abort(E),
@@ -283,19 +349,32 @@ impl<T> RetryHandler<T> {
     }
 
     /// Drives a single dispatch (message or timer) through the retry loop and
-    /// returns a [`Resolution`] describing how the durability marker should
-    /// be handled.
+    /// returns a [`Resolution`] describing how the **final attempt** should
+    /// be handled by the outer layer.
     ///
     /// `max_retries = None` means retry transient errors forever; used at the
     /// outermost layer where there is no fallback. `max_retries = Some(n)`
     /// caps transient retries at `n`, after which the call resolves to
     /// `Commit(Err)` so an outer DLQ middleware can take over.
-    async fn run<C, E, O, F, Fut>(
+    ///
+    /// **Apply-hook responsibility split:**
+    ///
+    /// - For every **non-final** attempt (Transient error followed by a real
+    ///   retry within this session), this loop fires `apply_abort(Err(error))`
+    ///   on the inner — the inner saw an invocation that returned, and per
+    ///   the per-invocation apply-hook contract that attempt is non-final
+    ///   (another invocation of the inner is coming), so `after_abort` is
+    ///   the matching hook.
+    /// - For the **final** attempt (the one whose outcome populates the
+    ///   returned `Resolution`), this loop does not fire any apply hook on
+    ///   the inner. The outer call site is responsible for that one.
+    async fn run<C, E, O, F, Fut, A, AFut>(
         &self,
         context: &C,
         demand_type: DemandType,
         max_retries: Option<u32>,
         mut invoke: F,
+        mut apply_abort: A,
         log: impl Fn(LogReason<'_, E>),
     ) -> Resolution<O, E>
     where
@@ -303,6 +382,8 @@ impl<T> RetryHandler<T> {
         E: ClassifyError,
         F: FnMut(DemandType) -> Fut,
         Fut: Future<Output = Result<O, E>>,
+        A: FnMut(E) -> AFut,
+        AFut: Future<Output = ()>,
     {
         let mut attempt: u32 = 0;
         loop {
@@ -319,6 +400,9 @@ impl<T> RetryHandler<T> {
             };
 
             // Only abort on shutdown. Message cancellation is treated as transient.
+            // Shutdown returns Abort *without* firing apply_abort here — the
+            // outer layer will fire the inner's after_abort exactly once for
+            // this final attempt.
             if context.is_shutdown() {
                 return Resolution::Abort(error);
             }
@@ -330,6 +414,7 @@ impl<T> RetryHandler<T> {
                             attempt,
                             error: &error,
                         });
+                        // Final attempt: outer layer fires the apply hook.
                         return Resolution::Commit(Err(error));
                     }
                     let sleep_time = self.sleep_time(attempt);
@@ -338,11 +423,24 @@ impl<T> RetryHandler<T> {
                         error: &error,
                         sleep: sleep_time,
                     });
+                    // Sleep BEFORE firing the per-attempt apply hook. If
+                    // shutdown intervenes during the sleep, this attempt
+                    // becomes the final attempt of the session and the
+                    // outer's after_abort is the only apply-hook firing —
+                    // we must not double-fire here.
                     if wait_with_cancellation(context, sleep_time).await
                         == RetryWaitResult::Shutdown
                     {
                         return Resolution::Abort(error);
                     }
+                    // We will retry: this attempt was a non-final dispatch
+                    // from the inner's POV. Per the per-invocation apply-hook
+                    // invariant, fire `inner.after_abort(Err(error))` before
+                    // the next invocation of the inner. Whether the sleep
+                    // returned `Completed` or `Cancelled` (message
+                    // cancellation, treated as transient), we are committing
+                    // to another attempt on the next loop iteration.
+                    apply_abort(error).await;
                 }
                 ErrorCategory::Permanent => {
                     log(LogReason::Permanent {
@@ -478,6 +576,15 @@ where
 //
 // As an inner middleware, transient errors are capped at `max_retries` so an
 // outer DLQ middleware can take over. All error variants collapse to `Err`.
+//
+// Apply-hook contract: a single retry session is ONE dispatch from the outer
+// middleware's view. The outer (or the blanket impl) inspects the final
+// `Result<O, E>` returned here and fires exactly one of `after_commit` /
+// `after_abort` on this `RetryHandler` (the FINAL attempt's hook), which we
+// forward verbatim to our inner handler. The intermediate (non-final)
+// attempts inside the retry loop have already been resolved on the inner by
+// the loop itself, which fires `inner.after_abort(Err(error))` on the inner
+// between attempts; those firings are invisible to the outer layer.
 
 impl<T> FallibleHandler for RetryHandler<T>
 where
@@ -508,6 +615,7 @@ where
                     self.handler
                         .on_message(context.clone(), message.clone(), dt)
                 },
+                |error| self.handler.after_abort(context.clone(), Err(error)),
                 |reason| {
                     log_message_failure(
                         topic.as_ref(),
@@ -541,6 +649,7 @@ where
                 demand_type,
                 Some(self.max_retries),
                 |dt| self.handler.on_timer(context.clone(), timer.clone(), dt),
+                |error| self.handler.after_abort(context.clone(), Err(error)),
                 |reason| log_timer_failure(&reason, ""),
             )
             .await;
@@ -550,6 +659,11 @@ where
         }
     }
 
+    /// Forward verbatim. The outer middleware fires exactly one apply hook
+    /// per retry-session dispatch on `RetryHandler`, which we pass through
+    /// to the inner. This pairs with the final attempt's invocation of the
+    /// inner. Apply hooks for any intermediate (non-final) attempts have
+    /// already fired on the inner from inside `run`'s loop.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -557,6 +671,11 @@ where
         self.handler.after_commit(context, result).await;
     }
 
+    /// Forward verbatim. The outer middleware fires exactly one apply hook
+    /// per retry-session dispatch on `RetryHandler`, which we pass through
+    /// to the inner. This pairs with the final attempt's invocation of the
+    /// inner. Apply hooks for any intermediate (non-final) attempts have
+    /// already fired on the inner from inside `run`'s loop.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -575,8 +694,13 @@ where
 // ============================================================================
 //
 // As the outermost durability layer, transient errors retry forever (no
-// fallback exists below). The `Resolution` returned by `run` is mapped to
-// commit/abort plus the matching apply hook.
+// fallback exists below). This impl IS the durability boundary that ties the
+// commit/abort of the offset (or timer) marker to the inner handler's apply
+// hook for the FINAL attempt: the `Resolution` returned by `run` is mapped
+// to commit + after_commit or abort + after_abort. Intermediate (non-final)
+// attempts have already been resolved on the inner by `run`'s loop, which
+// fires `inner.after_abort(Err(error))` between attempts to satisfy the
+// per-invocation apply-hook invariant on the inner.
 
 impl<T> EventHandler for RetryHandler<T>
 where
@@ -601,6 +725,7 @@ where
                     self.handler
                         .on_message(context.clone(), message.clone(), dt)
                 },
+                |error| self.handler.after_abort(context.clone(), Err(error)),
                 |reason| {
                     log_message_failure(
                         topic.as_ref(),
@@ -639,6 +764,7 @@ where
                 demand_type,
                 None,
                 |dt| self.handler.on_timer(context.clone(), trigger.clone(), dt),
+                |error| self.handler.after_abort(context.clone(), Err(error)),
                 |reason| log_timer_failure(&reason, "; discarding timer"),
             )
             .await;
@@ -696,6 +822,19 @@ mod tests {
         }
     }
 
+    /// Records every lifecycle hook firing on the inner handler in order so
+    /// tests can assert the per-invocation apply-hook invariant.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum HookEvent {
+        /// `on_message` / `on_timer` was invoked with this demand type.
+        Invoke(DemandType),
+        /// `after_commit` was fired with this `Result` shape (Ok / Err
+        /// category).
+        AfterCommit(Result<(), ErrorCategory>),
+        /// `after_abort` was fired with this `Result` shape.
+        AfterAbort(Result<(), ErrorCategory>),
+    }
+
     /// Mock handler that tracks calls and can be configured to fail.
     #[derive(Clone)]
     struct MockHandler {
@@ -705,6 +844,8 @@ mod tests {
         failure_sequence: Arc<Mutex<Vec<ErrorCategory>>>,
         /// Recorded demand types from calls.
         demand_types: Arc<Mutex<Vec<DemandType>>>,
+        /// Ordered log of every lifecycle hook firing (invoke + apply hooks).
+        hook_log: Arc<Mutex<Vec<HookEvent>>>,
     }
 
     impl MockHandler {
@@ -713,6 +854,7 @@ mod tests {
                 call_count: Arc::new(AtomicUsize::new(0)),
                 failure_sequence: Arc::new(Mutex::new(vec![])),
                 demand_types: Arc::new(Mutex::new(vec![])),
+                hook_log: Arc::new(Mutex::new(vec![])),
             }
         }
 
@@ -721,6 +863,7 @@ mod tests {
                 call_count: Arc::new(AtomicUsize::new(0)),
                 failure_sequence: Arc::new(Mutex::new(failures)),
                 demand_types: Arc::new(Mutex::new(vec![])),
+                hook_log: Arc::new(Mutex::new(vec![])),
             }
         }
 
@@ -730,6 +873,7 @@ mod tests {
                 call_count: Arc::new(AtomicUsize::new(0)),
                 failure_sequence: Arc::new(Mutex::new(vec![category; 100])),
                 demand_types: Arc::new(Mutex::new(vec![])),
+                hook_log: Arc::new(Mutex::new(vec![])),
             }
         }
 
@@ -740,6 +884,16 @@ mod tests {
         fn recorded_demand_types(&self) -> Vec<DemandType> {
             self.demand_types.lock().clone()
         }
+
+        fn hook_events(&self) -> Vec<HookEvent> {
+            self.hook_log.lock().clone()
+        }
+    }
+
+    /// Project a `Result<(), TestError>` onto the equality-friendly
+    /// `Result<(), ErrorCategory>` carried by `HookEvent`.
+    fn project_result(result: Result<(), TestError>) -> Result<(), ErrorCategory> {
+        result.map_err(|TestError(category)| category)
     }
 
     impl FallibleHandler for MockHandler {
@@ -757,6 +911,7 @@ mod tests {
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             self.demand_types.lock().push(demand_type);
+            self.hook_log.lock().push(HookEvent::Invoke(demand_type));
 
             let mut seq = self.failure_sequence.lock();
             if seq.is_empty() {
@@ -778,6 +933,7 @@ mod tests {
         {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             self.demand_types.lock().push(demand_type);
+            self.hook_log.lock().push(HookEvent::Invoke(demand_type));
 
             let mut seq = self.failure_sequence.lock();
             if seq.is_empty() {
@@ -786,6 +942,24 @@ mod tests {
                 let category = seq.remove(0);
                 Err(TestError(category))
             }
+        }
+
+        async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext,
+        {
+            self.hook_log
+                .lock()
+                .push(HookEvent::AfterCommit(project_result(result)));
+        }
+
+        async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext,
+        {
+            self.hook_log
+                .lock()
+                .push(HookEvent::AfterAbort(project_result(result)));
         }
 
         async fn shutdown(self) {}
@@ -1381,6 +1555,210 @@ mod tests {
         assert_eq!(handler.call_count(), 3); // 2 failures + 1 success
         assert!(committed.load(Ordering::Relaxed));
         assert!(!aborted.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    // =========================================================================
+    // Per-Invocation Apply-Hook Invariant Tests
+    // =========================================================================
+    //
+    // The `FallibleHandler` apply-hook contract is **per-invocation**: every
+    // call to `on_message` / `on_timer` that runs and returns is paired with
+    // exactly one apply hook (`after_commit` or `after_abort`) on the same
+    // handler instance. The retry middleware preserves this on its inner by
+    // firing `inner.after_abort(Err(error))` between attempts; the final
+    // attempt's hook is fired by the outer (FallibleHandler blanket impl or
+    // EventHandler durability boundary).
+
+    /// Two transient failures followed by a success — the inner sees three
+    /// invocations, each paired with exactly one apply hook. The first two
+    /// (non-final) attempts fire `after_abort(Err)` from the retry loop;
+    /// the third (success, final) fires `after_commit(Ok)` via the outer
+    /// blanket-impl boundary.
+    #[tokio::test]
+    async fn fallible_inner_sees_one_apply_hook_per_attempt_when_retries_then_succeeds()
+    -> Result<()> {
+        let handler = MockHandler::failing_then_success(vec![
+            ErrorCategory::Transient,
+            ErrorCategory::Transient,
+        ]);
+        let retry_handler = create_retry_handler(handler.clone(), 5);
+        // Wrap in the FallibleEventHandler blanket impl by going through the
+        // EventHandler path with a real durability marker. The blanket impl
+        // is what fires the final attempt's apply hook on the outer
+        // RetryHandler, which retry forwards to the inner.
+        let context = MockEventContext::new();
+        let tracker = create_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let Some(message) = create_test_message() else {
+            bail!("failed to create test message");
+        };
+        let uncommitted_message = message.into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(
+            &retry_handler,
+            context,
+            uncommitted_message,
+            DemandType::Normal,
+        )
+        .await;
+
+        let events = handler.hook_events();
+        assert_eq!(
+            events,
+            vec![
+                HookEvent::Invoke(DemandType::Normal),
+                HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
+                HookEvent::Invoke(DemandType::Failure),
+                HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
+                HookEvent::Invoke(DemandType::Failure),
+                HookEvent::AfterCommit(Ok(())),
+            ],
+            "each invocation must be paired with exactly one apply hook on the inner",
+        );
+        Ok(())
+    }
+
+    /// All transient failures with `max_retries = 2` exhausted: 1 initial +
+    /// 2 retries = 3 invocations. The first two (non-final) attempts fire
+    /// `after_abort(Err)` from the retry loop. The third (final) attempt's
+    /// hook is `after_commit(Err)` because max-retries-exceeded is treated
+    /// as commit (DLQ takes over) by the outer.
+    ///
+    /// We drive `FallibleHandler::on_message` directly here (that path
+    /// honours `max_retries`; the `EventHandler` path uses `None` for
+    /// retry-forever semantics at the durability boundary) and then
+    /// manually invoke the outer apply hook the way an outer
+    /// `FallibleEventHandler` blanket impl would for a `Transient`
+    /// classification (commit + `after_commit(Err)`).
+    #[tokio::test]
+    async fn fallible_inner_sees_one_apply_hook_per_attempt_when_max_retries_exhausted()
+    -> Result<()> {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        let retry_handler = create_retry_handler(handler.clone(), 2);
+        let context = MockEventContext::new();
+        let Some(message) = create_test_message() else {
+            bail!("failed to create test message");
+        };
+
+        let result = FallibleHandler::on_message(
+            &retry_handler,
+            context.clone(),
+            message,
+            DemandType::Normal,
+        )
+        .await;
+
+        // Simulate the outer (FallibleEventHandler blanket impl): a
+        // Transient error commits the marker and fires `after_commit`.
+        assert!(
+            matches!(&result, Err(TestError(ErrorCategory::Transient))),
+            "max retries should exhaust to a Transient Err",
+        );
+        FallibleHandler::after_commit(&retry_handler, context, result).await;
+
+        let events = handler.hook_events();
+        assert_eq!(
+            events,
+            vec![
+                HookEvent::Invoke(DemandType::Normal),
+                HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
+                HookEvent::Invoke(DemandType::Failure),
+                HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
+                HookEvent::Invoke(DemandType::Failure),
+                HookEvent::AfterCommit(Err(ErrorCategory::Transient)),
+            ],
+            "max-retries-exhausted: 3 invocations, each paired with exactly one apply hook; \
+             final hook is after_commit because the outer treats this as commit (DLQ takeover)",
+        );
+        Ok(())
+    }
+
+    /// Shutdown during a retry sleep: every attempt that ran and returned is
+    /// paired with exactly one apply hook on the inner, with no double-fire
+    /// for the abandoned attempt. The retry loop's `Resolution::Abort`
+    /// branch on shutdown deliberately skips the per-attempt `apply_abort`
+    /// so the outer's `after_abort` (fired here by `EventHandler`) is the
+    /// sole apply-hook firing for the final attempt.
+    ///
+    /// We avoid asserting a fixed event count because the jitter floor on
+    /// `sleep_time` is zero: between the first failure and the shutdown
+    /// signal a second attempt may slip in. Instead we assert the
+    /// invariant directly: events alternate `Invoke` / `Apply` strictly
+    /// 1:1, every intermediate apply hook is `AfterAbort(Err(Transient))`,
+    /// and the final apply hook is the outer's `AfterAbort` (shutdown
+    /// path), never `AfterCommit`.
+    #[tokio::test]
+    async fn shutdown_during_sleep_does_not_double_fire_apply_hook() -> Result<()> {
+        let handler = MockHandler::always_failing(ErrorCategory::Transient);
+        // Long sleep so we can race the shutdown signal against it.
+        let retry_handler = RetryHandler {
+            base_delay_millis: 1000,
+            max_delay_millis: 10_000,
+            max_retries: 10,
+            handler: handler.clone(),
+        };
+        let context = MockEventContext::new();
+
+        let tracker = create_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let Some(message) = create_test_message() else {
+            bail!("failed to create test message");
+        };
+        let uncommitted_message = message.into_uncommitted(uncommitted_offset);
+
+        // Spawn the dispatch and signal shutdown shortly after the first
+        // attempt fails and the retry-sleep is in flight.
+        let ctx = context.clone();
+        let handle = tokio::spawn(async move {
+            EventHandler::on_message(&retry_handler, ctx, uncommitted_message, DemandType::Normal)
+                .await;
+        });
+
+        tokio_sleep(Duration::from_millis(50)).await;
+        context.request_shutdown();
+
+        // Bound the wait so a regression doesn't hang the suite.
+        match timeout(Duration::from_secs(5), handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => bail!("dispatch task panicked"),
+            Err(_) => bail!("dispatch did not finish within timeout after shutdown"),
+        }
+
+        let events = handler.hook_events();
+        assert!(
+            !events.is_empty() && events.len().is_multiple_of(2),
+            "events must come in invoke+apply pairs; got {events:?}",
+        );
+        for (i, pair) in events.chunks(2).enumerate() {
+            let [invoke, apply] = pair else {
+                bail!("uneven event chunk: {pair:?}");
+            };
+            assert!(
+                matches!(invoke, HookEvent::Invoke(_)),
+                "pair {i} expected to start with Invoke, got {invoke:?}",
+            );
+            let is_last = i + 1 == events.len() / 2;
+            if is_last {
+                // The shutdown-abandoned final attempt must be paired with
+                // exactly one `AfterAbort(Err(Transient))` from the outer
+                // (NEVER `AfterCommit`, and NEVER duplicated).
+                assert_eq!(
+                    apply,
+                    &HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
+                    "final pair must be after_abort fired by the outer (not from the loop), \
+                     got {apply:?}",
+                );
+            } else {
+                // Intermediate (non-final) attempts get the loop's
+                // between-attempts after_abort.
+                assert_eq!(
+                    apply,
+                    &HookEvent::AfterAbort(Err(ErrorCategory::Transient)),
+                    "intermediate pair {i} expected after_abort, got {apply:?}",
+                );
+            }
+        }
         Ok(())
     }
 }

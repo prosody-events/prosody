@@ -332,15 +332,63 @@ pub trait HandlerMiddleware {
 
 /// Defines a handler that can fail during message processing.
 ///
-/// # Lifecycle and `Output`
+/// # Lifecycle and the strictly-per-invocation apply-hook invariant
 ///
-/// Each handler call returns a typed `Self::Output` value on success, which
-/// the framework then hands back to one of the apply hooks
-/// ([`Self::after_commit`] or [`Self::after_abort`]) once the durability marker
-/// has been resolved. This gives handlers a 2-phase-commit seam: stage external
-/// state inside `on_message`/`on_timer`, return a handle in the `Ok` value, and
-/// finalise (or unstage) the staged state in the apply hook with ownership of
-/// that handle.
+/// **The invariant is strictly per-invocation, with no exceptions.** For
+/// every individual call to `on_message` / `on_timer` on a handler instance
+/// `H` that runs and returns, the framework MUST call EXACTLY ONE of the
+/// apply hooks on that same `H`, paired with that specific invocation:
+///
+/// - [`Self::after_commit`] — this invocation is **final**. The same logical
+///   message/timer will not be re-dispatched into `H` by this consumer.
+/// - [`Self::after_abort`]  — this invocation is **not final**. The same
+///   logical message/timer **will** be re-dispatched into `H` (a retry is
+///   coming via this consumer, e.g. through a deferred timer or an
+///   in-process retry loop that re-invokes the inner).
+///
+/// If a given `on_message` / `on_timer` invocation did not run (e.g. the
+/// dispatch was short-circuited above `H`), neither apply hook fires for
+/// that non-existent invocation.
+///
+/// There is no "session" or "logical-dispatch" exception. A wrapping
+/// middleware that re-invokes the inner — for example, a retry loop that
+/// calls `inner.on_message(...)` multiple times for the same logical
+/// message — MUST fire one apply hook on the inner **between every pair of
+/// invocations**, and one final apply hook after the last invocation. Each
+/// invocation gets its own `after_commit` or `after_abort`; they are never
+/// coalesced across a retry session.
+///
+/// The choice between `after_commit` and `after_abort` is determined by the
+/// **work outcome for that single invocation** (is `H` going to be invoked
+/// again for this same logical event?), not by which durability marker
+/// primitive was invoked. The framework — including any rescue / defer /
+/// retry middleware in the stack — is the source of truth for that
+/// distinction, not the marker. In particular: even when the durability
+/// marker commits (e.g. the Kafka offset advances because a defer
+/// middleware took ownership and scheduled a deferred retry), the inner
+/// invocation can still be told `after_abort`, because another invocation
+/// is coming.
+///
+/// Wrapping middleware that re-invokes the inner (e.g. an in-process retry
+/// loop) MUST fire apply hooks **between** invocations. The canonical
+/// example is the [`retry`] module: every attempt that calls the inner
+/// pairs with its own `after_abort` (intermediate attempts where another
+/// retry is coming) or `after_commit` (the final attempt that gives up or
+/// succeeds).
+///
+/// # `Output` and 2-phase commit
+///
+/// Each handler invocation returns a typed `Self::Output` value on success.
+/// The framework hands the resulting `Result<Self::Output, Self::Error>`
+/// back to the matching apply hook with ownership, paired with that exact
+/// invocation. This gives handlers a 2-phase-commit seam: stage external
+/// state inside `on_message`/`on_timer`, return a handle in the `Ok` value,
+/// and finalise (on `after_commit`) or unstage (on `after_abort`) that
+/// state in the apply hook for that invocation.
+///
+/// Because the invariant is strictly per-invocation, every staged handle
+/// returned by an invocation is paired with exactly one apply hook firing
+/// — no batching across retries, no skipping the hook between attempts.
 ///
 /// Most handlers don't need 2PC and set `type Output = ();`. The default
 /// `after_commit`/`after_abort` implementations are no-ops that LLVM inlines
@@ -348,31 +396,63 @@ pub trait HandlerMiddleware {
 ///
 /// # EventHandler-implementor contract
 ///
-/// Any [`EventHandler`] that drives the durability marker
-/// ([`Uncommitted::commit`]/[`Uncommitted::abort`] on the inner message or
-/// timer) is responsible for invoking the **matching** apply hook on the
-/// inner handler before returning:
+/// Any [`EventHandler`] (including any rescue / defer / retry middleware)
+/// that resolves the apply hook for an inner [`FallibleHandler`] is
+/// responsible for invoking **exactly one** apply hook per inner
+/// invocation that ran, and for picking the hook that matches the
+/// **per-invocation work outcome**:
 ///
-/// - After every `commit().await`, call `inner.after_commit(ctx, result).await`
-/// - After every `abort().await`, call `inner.after_abort(ctx, result).await`
+/// - If this specific invocation is final from this consumer's POV — there
+///   will be no further invocation of the inner for this logical
+///   message/timer — call `inner.after_commit(ctx, result).await`.
+/// - If another invocation of the inner is coming (an in-process retry
+///   loop's next attempt, a deferred retry via a timer middleware, the
+///   broker re-polling after marker abort, etc.) — call
+///   `inner.after_abort(ctx, result).await`.
 ///
-/// where `result` is the same `Result<Self::Output, Self::Error>` the inner
-/// handler chain produced. Failing to do so silently breaks any 2PC handler
-/// further down the chain. The blanket `FallibleEventHandler → EventHandler`
-/// impl in this module and `RetryHandler` are the existing sites that take
-/// this responsibility; any new `EventHandler` that resolves the marker must
-/// follow the same pattern.
+/// In particular, an in-process retry loop that calls the inner N times
+/// MUST fire N apply hooks on the inner: the first N-1 are `after_abort`
+/// (another attempt is coming) and the last is whichever hook matches the
+/// terminal work outcome. Apply hooks are **never** coalesced across a
+/// retry session.
+///
+/// `result` MUST be the same `Result<Self::Output, Self::Error>` the inner
+/// produced for that invocation. Middleware that rescues an inner error
+/// (e.g. by routing it to a DLQ or scheduling a deferred retry) MUST
+/// preserve the inner's typed error and forward it through the appropriate
+/// apply hook — it must not drop it on the floor or coerce it to `Ok`.
+/// Failing to do so silently breaks any 2PC handler further down the
+/// chain.
+///
+/// The blanket `FallibleEventHandler → EventHandler` impl in this module is
+/// the default durability boundary: with no rescue middleware below it,
+/// each invocation maps 1:1 to a single dispatch and resolving the marker
+/// coincides with the work outcome (commit ⇒ final invocation, abort ⇒
+/// re-dispatch on the next poll, which produces a new invocation that
+/// gets its own apply hook). `RetryHandler` and the defer / topic
+/// middlewares take on this responsibility for richer cases; any new
+/// `EventHandler` that resolves the marker — or any wrapping
+/// `FallibleHandler` middleware that re-invokes the inner — must follow
+/// the same per-invocation pattern.
 ///
 /// [`EventHandler`]: crate::consumer::EventHandler
 /// [`Uncommitted::commit`]: crate::consumer::Uncommitted::commit
 /// [`Uncommitted::abort`]: crate::consumer::Uncommitted::abort
+/// [`retry`]: crate::consumer::middleware::retry
 pub trait FallibleHandler: Send + Sync + 'static {
     /// The error type returned by this handler.
     type Error: ClassifyError + StdError + Send;
 
     /// Value the handler returns on success and that the apply hooks
     /// ([`Self::after_commit`]/[`Self::after_abort`]) consume once the
-    /// durability marker is resolved.
+    /// framework has decided whether this specific invocation is final or
+    /// whether another invocation of the handler is coming.
+    ///
+    /// Each invocation produces its own `Output` (or `Error`) and is paired
+    /// with exactly one apply hook firing carrying that value. There is no
+    /// coalescing across invocations: a retry session that invokes the
+    /// inner three times produces three apply-hook firings, each consuming
+    /// the `Output`/`Error` of its matching invocation.
     ///
     /// Most handlers set `type Output = ();`. 2PC handlers carry a staging
     /// handle, a transaction token, or whatever they need to finalise /
@@ -450,20 +530,31 @@ pub trait FallibleHandler: Send + Sync + 'static {
     where
         C: EventContext;
 
-    /// Runs after the durability marker has been **committed**, with ownership
-    /// of the `Result` produced by the handler chain.
+    /// Runs when **the just-completed invocation** of `on_message` /
+    /// `on_timer` is final: this handler will not be invoked again for the
+    /// same logical message/timer by this consumer. The hook owns the
+    /// `Result<Self::Output, Self::Error>` produced by **that specific
+    /// invocation** — either the success value (finalise staged state) or
+    /// the typed error (the message/timer is being given up on without a
+    /// redelivery, e.g. routed to a DLQ, dedup-recorded, or simply dropped
+    /// after a Permanent classification).
     ///
-    /// `Ok(output)` — handler succeeded; finalise staged state.
-    /// `Err(error)` — handler returned a Transient or Permanent error; the
-    /// marker still committed (offset advance, dedup-insert as applicable).
+    /// "Final" is a **per-invocation, work-outcome** statement, not a
+    /// marker statement. Resolving the durability marker (Kafka offset
+    /// commit, timer commit) is the typical mechanism, but `after_commit`
+    /// is the right hook whenever no further invocation of this handler is
+    /// coming for this logical event — even if a different middleware took
+    /// ownership of the marker. Conversely, this hook fires **once per
+    /// final invocation**, never as a roll-up across a retry session.
     ///
-    /// Per-key serialised: a same-key follow-up event will not dispatch until
-    /// this returns. Failures here cannot redeliver — retry-internally or
-    /// accept logging-only semantics.
+    /// Per-key serialised: a same-key follow-up event will not dispatch
+    /// until this returns. Failures here cannot redeliver — retry-internally
+    /// or accept logging-only semantics.
     ///
     /// Wrapping middleware MUST forward this call to its inner handler with
     /// the inner-typed `Result`; see the trait-level docs for the
-    /// `EventHandler` contract that ensures this hook fires.
+    /// `EventHandler` contract that ensures this hook fires exactly once
+    /// per inner invocation that ran.
     fn after_commit<C>(
         &self,
         _context: C,
@@ -475,14 +566,30 @@ pub trait FallibleHandler: Send + Sync + 'static {
         async {}
     }
 
-    /// Runs after the durability marker has been **aborted**, with ownership
-    /// of the `Result` produced by the handler chain.
+    /// Runs when **the just-completed invocation** of `on_message` /
+    /// `on_timer` is not final: this handler **will be invoked again** for
+    /// the same logical message/timer by this consumer (the next attempt of
+    /// an in-process retry loop, a deferred retry via a timer middleware,
+    /// or a re-poll after marker abort). The hook owns the
+    /// `Result<Self::Output, Self::Error>` produced by **that specific
+    /// invocation** — typically an `Err` describing why the invocation did
+    /// not stick, but it can also be `Ok` if a finalisation step above the
+    /// handler decided the work must be redone (e.g. shutdown intervened
+    /// between `Ok` and commit; see `RetryHandler::on_message`
+    /// shutdown-during-retry path).
     ///
-    /// `Ok(output)` — handler succeeded but the marker was aborted anyway
-    /// (e.g., shutdown intervened between `Ok` and commit; see
-    /// `RetryHandler::on_message` shutdown-during-retry path).
-    /// `Err(error)` — handler returned a Terminal error, or shutdown aborted
-    /// a Transient retry loop.
+    /// "Not final" is a **per-invocation, work-outcome** statement. The
+    /// durability marker may have been aborted (the default boundary), or
+    /// the marker may have been committed by a rescue middleware that took
+    /// ownership and scheduled a redelivery; in both cases this is the
+    /// correct hook because the inner is going to be invoked again for
+    /// this logical event.
+    ///
+    /// Crucially, this hook fires for **every intermediate invocation** of
+    /// a multi-attempt retry session — once per attempt that ran and
+    /// returned, before the next attempt runs. There is no
+    /// "session-as-one-dispatch" exception that would let middleware skip
+    /// this hook between retry attempts.
     ///
     /// Per-key serialised; same retry / cancel-safety constraints as
     /// [`Self::after_commit`]. Same EventHandler-implementor contract.
@@ -534,13 +641,35 @@ pub struct ComposedMiddleware<M1, M2>(M1, M2);
 /// Provides default `EventHandler` implementation for types that implement
 /// `FallibleHandler`.
 ///
-/// This trait implements the standard failure handling pattern:
-/// 1. Extract inner message/timer and uncommitted offset/timer
-/// 2. Call the `FallibleHandler` method
-/// 3. Commit on success or handle errors based on classification
+/// This is the **default durability boundary**: with no rescue / defer /
+/// retry middleware below it, each `EventHandler::on_message` /
+/// `EventHandler::on_timer` call performs **exactly one** invocation of
+/// the inner `FallibleHandler` and pairs it with **exactly one** apply
+/// hook firing — satisfying the strictly-per-invocation invariant
+/// required by the [`FallibleHandler`] apply-hook contract:
 ///
-/// Types can override the default implementations to add custom behavior like
-/// logging or custom error handling.
+/// 1. Extract inner message/timer and the uncommitted offset/timer.
+/// 2. Invoke the `FallibleHandler` method **once**.
+/// 3. On `Ok`, `Permanent`, or `Transient`: commit the marker — this
+///    invocation is final from the consumer's POV — and call
+///    `after_commit` with the typed result.
+/// 4. On `Terminal`: abort the marker — the message/timer will be
+///    redelivered on the next poll, producing a **new** invocation that
+///    will get its own apply hook — and call `after_abort` with the
+///    typed error.
+///
+/// Because there is exactly one inner invocation per call into this impl,
+/// the per-invocation invariant is satisfied trivially: one invocation
+/// pairs with one apply-hook firing.
+///
+/// Types can override the default implementations to add custom behavior
+/// like logging. Implementations that change the work-outcome shape (e.g.
+/// rescue an inner error and schedule a retry while still committing the
+/// marker), or any wrapping `FallibleHandler` middleware that re-invokes
+/// the inner more than once per outer call, MUST NOT use this default;
+/// they must drive the apply hooks according to the per-invocation rule
+/// in the [`FallibleHandler`] docs — one hook per inner invocation, never
+/// coalesced.
 pub trait FallibleEventHandler: FallibleHandler {
     /// Called when message processing fails.
     ///
@@ -585,23 +714,44 @@ where
     {
         let (inner_message, uncommitted_offset) = message.into_inner();
 
-        // Attempt to process the message
+        // Per-invocation correctness: this method invokes the inner
+        // `FallibleHandler::on_message` EXACTLY ONCE below, and every
+        // control-flow path through the rest of this function fires
+        // EXACTLY ONE apply hook (`after_commit` or `after_abort`)
+        // carrying that single invocation's `Result`. One inner
+        // invocation, one apply-hook firing — the strictly-per-invocation
+        // invariant is satisfied trivially here.
         let result =
             FallibleHandler::on_message(self, context.clone(), inner_message, demand_type).await;
 
+        // Pick the apply hook by the per-invocation work outcome. At this
+        // default boundary (no rescue middleware below us) committing the
+        // offset coincides with "this invocation is final" and aborting
+        // it coincides with "this invocation is not final — the broker
+        // will redeliver and produce a fresh invocation that gets its
+        // own apply hook".
         if let Err(error) = &result {
             self.on_message_error(error);
             match error.classify_error() {
                 ErrorCategory::Transient | ErrorCategory::Permanent => {
+                    // Final from this consumer's POV: nothing below us is
+                    // going to redeliver this message into the handler,
+                    // so this invocation pairs with `after_commit`.
                     uncommitted_offset.commit();
                     self.after_commit(context, result).await;
                 }
                 ErrorCategory::Terminal => {
+                    // Not final: aborting the offset means the broker will
+                    // redeliver this message to this handler on the next
+                    // poll, producing a new invocation. This invocation
+                    // pairs with `after_abort`; the future invocation
+                    // will get its own apply hook.
                     uncommitted_offset.abort();
                     self.after_abort(context, result).await;
                 }
             }
         } else {
+            // Success: final invocation, pair with `after_commit`.
             uncommitted_offset.commit();
             self.after_commit(context, result).await;
         }
@@ -614,22 +764,38 @@ where
     {
         let (trigger, uncommitted_timer) = timer.into_inner();
 
-        // Attempt to process the timer
+        // Per-invocation correctness: as with the message arm, the inner
+        // `FallibleHandler::on_timer` is invoked EXACTLY ONCE below, and
+        // every control-flow path through the rest of this function fires
+        // EXACTLY ONE apply hook carrying that single invocation's
+        // `Result`. One inner invocation, one apply-hook firing.
         let result = FallibleHandler::on_timer(self, context.clone(), trigger, demand_type).await;
 
+        // Same per-invocation work-outcome rule as the message arm: at
+        // this default boundary, committing the timer marker coincides
+        // with "this invocation is final" and aborting coincides with
+        // "this invocation is not final — the timer will fire again,
+        // producing a fresh invocation that gets its own apply hook".
         if let Err(error) = &result {
             self.on_timer_error(error);
             match error.classify_error() {
                 ErrorCategory::Transient | ErrorCategory::Permanent => {
+                    // Final invocation: no further invocation of the
+                    // handler is coming for this trigger.
                     uncommitted_timer.commit().await;
                     self.after_commit(context, result).await;
                 }
                 ErrorCategory::Terminal => {
+                    // Not final: aborting leaves the timer in place to
+                    // fire again, so `after_abort` is the matching hook
+                    // for this invocation. The next firing will produce
+                    // a new invocation paired with its own apply hook.
                     uncommitted_timer.abort().await;
                     self.after_abort(context, result).await;
                 }
             }
         } else {
+            // Success: final invocation, pair with `after_commit`.
             uncommitted_timer.commit().await;
             self.after_commit(context, result).await;
         }
@@ -654,12 +820,21 @@ impl ClassifyError for IoError {
 
 #[cfg(test)]
 mod after_hook_tests {
-    //! Tests for the `after_commit` / `after_abort` lifecycle hooks plumbed
+    //! Tests for the `after_commit` / `after_abort` apply hooks plumbed
     //! through the blanket `FallibleEventHandler → EventHandler` impl.
     //!
-    //! These tests exercise the full lifecycle: handler runs → blanket impl
-    //! resolves the marker → matching apply hook fires with the correct
-    //! `Result<Output, Error>` value.
+    //! These tests pin down the strictly-per-invocation apply-hook
+    //! invariant for the default durability boundary: for every inner
+    //! invocation of `on_message` / `on_timer` that runs and returns,
+    //! exactly one of `after_commit` / `after_abort` fires, carrying the
+    //! handler's typed `Result<Output, Error>` for that invocation. At
+    //! this boundary (no rescue / defer / retry middleware in the stack)
+    //! each call into `EventHandler::on_message` performs exactly one
+    //! inner invocation, so the per-invocation invariant collapses to
+    //! "one apply hook per call": `Ok` / `Permanent` / `Transient` are
+    //! final invocations (`after_commit`), and `Terminal` is a non-final
+    //! invocation (`after_abort`, the broker / timer will redeliver and
+    //! produce a fresh invocation paired with its own apply hook).
     use std::error::Error as StdError;
     use std::fmt::{Display, Formatter, Result as FmtResult};
     use std::sync::Arc;
@@ -907,8 +1082,20 @@ mod after_hook_tests {
 
     #[tokio::test]
     async fn hook_1_to_1_invariant_one_apply_per_dispatch() -> color_eyre::Result<()> {
-        // Exactly one apply hook (after_commit OR after_abort) fires per
-        // dispatch — not both, not neither.
+        // The load-bearing invariant, stated **per inner invocation**:
+        // for every individual call to the inner `on_message` /
+        // `on_timer` that ran and returned, exactly one apply hook
+        // (after_commit OR after_abort) fires — not both, not neither,
+        // and never coalesced across multiple invocations. This is what
+        // 2PC handlers and rescue middleware rely on to know they are
+        // guaranteed a single finalisation signal per inner invocation.
+        //
+        // At this default boundary the blanket impl performs exactly one
+        // inner invocation per outer call, so this test exercises the
+        // 1:1 case directly. Wrapping middleware that re-invokes the
+        // inner (e.g. a retry loop) must preserve the same invariant
+        // per invocation; that is verified in the `retry` module's
+        // tests.
         for category in [
             ErrorCategory::Permanent,
             ErrorCategory::Transient,

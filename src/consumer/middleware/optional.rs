@@ -4,6 +4,11 @@
 //! [`Option<M>`] that conditionally enables middleware at runtime. When `None`,
 //! the middleware is bypassed entirely.
 //!
+//! Exactly one of the two inner branches (Enabled or Disabled) runs per call,
+//! and apply hooks are routed to the same branch via the variant tags on
+//! `OptionOutput`/`OptionError`. The inner is invoked at most once per call;
+//! per-invocation invariant trivially upheld.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -149,6 +154,14 @@ where
         }
     }
 
+    /// Forwards the apply hook to whichever inner handler actually ran.
+    ///
+    /// The `OptionOutput`/`OptionError` variant tags identify which inner
+    /// produced the result, so exactly one inner `after_commit` is invoked —
+    /// preserving the per-handler "exactly one apply hook per dispatch"
+    /// invariant. Mismatched `(self, result)` variants are unreachable: the
+    /// handler that produced the result is the same one being asked to
+    /// consume it.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -167,11 +180,18 @@ where
                 handler.after_commit(context, Err(e)).await;
             }
             // Mismatched variants cannot occur: the handler that produced
-            // the result is the same one being asked to consume it.
-            _ => {}
+            // the result is the same one being asked to consume it. Trip a
+            // debug assertion so any future breakage of that invariant is
+            // caught loudly in tests; release builds still no-op safely.
+            _ => debug_assert!(false, "OptionHandler variant mismatch in after_commit"),
         }
     }
 
+    /// Forwards the apply hook to whichever inner handler actually ran.
+    ///
+    /// As with [`after_commit`](Self::after_commit), the variant tags route
+    /// the result to the inner that produced it, so exactly one inner
+    /// `after_abort` fires. Mismatched variants are unreachable.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -189,7 +209,8 @@ where
             (Self::Disabled(handler), Err(OptionError::Disabled(e))) => {
                 handler.after_abort(context, Err(e)).await;
             }
-            _ => {}
+            // Mismatched variants cannot occur (see `after_commit`).
+            _ => debug_assert!(false, "OptionHandler variant mismatch in after_abort"),
         }
     }
 

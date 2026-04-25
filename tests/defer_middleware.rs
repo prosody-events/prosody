@@ -5,7 +5,14 @@
 //! - Timer scheduling and retry logic
 //! - Multi-message queuing per key
 //! - Successful retry and completion
-//! - Cache and Cassandra store integration
+//! - Cassandra store integration
+//!
+//! The leaf [`FallibleHandler`] impls below (`DeferTestHandler`,
+//! `PermanentErrorHandler`) rely on the default no-op `after_commit` /
+//! `after_abort` hooks. The framework guarantees exactly one of those hooks
+//! fires per `on_message` / `on_timer` invocation that runs and returns; we
+//! observe behavior end-to-end via the `event_tx` channel rather than via the
+//! apply hooks themselves.
 //!
 //! # Running Tests
 //!
@@ -158,9 +165,12 @@ impl FallibleHandler for DeferTestHandler {
     where
         C: EventContext,
     {
-        // DeferRetry timers are handled by defer middleware internally
-        // and do NOT call this method. This would only be called for
-        // non-defer timers, which we don't use in these tests.
+        // DeferRetry timers are consumed by the defer middleware: it loads
+        // the deferred message and re-dispatches it through `on_message`,
+        // so this leaf `on_timer` does not run for those triggers (and
+        // therefore the framework fires neither apply hook on this leaf for
+        // that path). This method only runs for non-defer timers, which the
+        // tests in this file do not schedule.
         Ok(())
     }
 

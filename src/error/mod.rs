@@ -18,7 +18,7 @@ use serde::Serialize;
 pub mod kafka;
 
 /// Categorizes errors in message processing.
-#[derive(Copy, Clone, Debug, Serialize)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ErrorCategory {
     /// Error is temporary and recovery is possible.

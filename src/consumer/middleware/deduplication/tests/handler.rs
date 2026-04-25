@@ -409,12 +409,27 @@ fn ttl_below_minimum_rejected() {
     assert!(result.is_err());
 }
 
-/// Probe handler that records every lifecycle hook into a shared log.
-/// Distinguishes "inner ran" (`Handler` event) from "inner's apply hook
-/// fired" (`InnerAfterCommit` / `InnerAfterAbort`).
+/// Probe handler that records every work-stage event into a shared log.
+///
+/// Distinguishes whether the inner's `on_message` / `on_timer` actually ran
+/// (`Handler`) from which apply hook the framework chose for that run
+/// (`InnerAfterCommit` for a final dispatch, `InnerAfterAbort` for a dispatch
+/// that will be re-attempted via this consumer). Per the `FallibleHandler`
+/// invariant, exactly one apply event must be logged per `Handler` event,
+/// and zero apply events must be logged when no `Handler` event was logged.
 #[derive(Clone, Default)]
 struct ApplyProbe {
     log: Arc<parking_lot::Mutex<Vec<ApplyEvent>>>,
+    error: Option<TestError>,
+}
+
+impl ApplyProbe {
+    fn failing(error: TestError) -> Self {
+        Self {
+            log: Arc::default(),
+            error: Some(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,7 +453,10 @@ impl FallibleHandler for ApplyProbe {
         C: EventContext,
     {
         self.log.lock().push(ApplyEvent::Handler);
-        Ok(())
+        match &self.error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
     }
 
     async fn on_timer<C>(
@@ -451,7 +469,10 @@ impl FallibleHandler for ApplyProbe {
         C: EventContext,
     {
         self.log.lock().push(ApplyEvent::Handler);
-        Ok(())
+        match &self.error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
     }
 
     async fn after_commit<C>(&self, _context: C, _result: Result<Self::Output, Self::Error>)
@@ -529,6 +550,34 @@ async fn dedup_passthrough_forwards_after_commit_for_handler_ok() {
         log.lock().clone(),
         vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
         "passthrough: inner.after_commit fires when inner ran successfully",
+    );
+}
+
+#[tokio::test]
+async fn dedup_passthrough_forwards_after_commit_for_handler_err() {
+    // When the inner runs and returns an `Err`, the dedup middleware must
+    // forward that `Err` through whichever apply hook the framework chooses.
+    // Here we simulate the framework treating the dispatch as final (e.g. a
+    // permanent-classification error routed to a DLQ) by calling
+    // `after_commit` with the inner-typed error wrapped by the dedup layer.
+    let inner = ApplyProbe::failing(TestError::Permanent);
+    let log = inner.log.clone();
+    let handler = create_handler_apply(inner);
+    let context = MockEventContext::new();
+
+    let Some(msg) = create_test_message("key1", Some("evt-err")) else {
+        return;
+    };
+
+    let result =
+        FallibleHandler::on_message(&handler, context.clone(), msg, DemandType::Normal).await;
+    assert!(result.is_err());
+    FallibleHandler::after_commit(&handler, context, result).await;
+
+    assert_eq!(
+        log.lock().clone(),
+        vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
+        "inner.after_commit must receive the inner-typed Err when the dispatch is final",
     );
 }
 
