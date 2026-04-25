@@ -375,9 +375,14 @@ where
     where
         C: EventContext,
     {
-        // `Ok(None)` (routed to failure topic) and `Err(Producer(_))`
-        // (failure-topic send failed before the inner handler could have
-        // succeeded) both correspond to "inner had nothing to apply".
+        // `Ok(None)` — inner failed with a non-Terminal error and the
+        // message/timer was routed to the failure topic; the inner's failed
+        // result is consumed by the DLQ hand-off, so its apply hook does not
+        // fire.
+        // `Err(Producer(_))` — inner failed with a non-Terminal error and the
+        // failure-topic send itself failed; the producer error subsumes the
+        // inner's failure, so the inner's apply hook is intentionally dropped
+        // rather than forwarded.
         match result {
             Ok(Some(outcome)) => self.handler.after_commit(context, Ok(outcome)).await,
             Err(FailureTopicError::Handler(inner)) => {
@@ -391,6 +396,7 @@ where
     where
         C: EventContext,
     {
+        // See `after_commit` for the rationale on the dropped variants.
         match result {
             Ok(Some(outcome)) => self.handler.after_abort(context, Ok(outcome)).await,
             Err(FailureTopicError::Handler(inner)) => {

@@ -142,25 +142,25 @@ where
         C: EventContext,
     {
         // Attempt to process the message with the wrapped handler
-        let outcome = match self.handler.on_message(context, message, demand_type).await {
+        let error = match self.handler.on_message(context, message, demand_type).await {
             Ok(outcome) => return Ok(outcome),
             Err(error) => error,
         };
 
         // Log the error based on its category
-        match outcome.classify_error() {
+        match error.classify_error() {
             ErrorCategory::Transient => {
-                error!("transient error occurred during message processing: {outcome:#}");
+                error!("transient error occurred during message processing: {error:#}");
             }
             ErrorCategory::Permanent => {
-                error!("permanent error occurred during message processing: {outcome:#}");
+                error!("permanent error occurred during message processing: {error:#}");
             }
             ErrorCategory::Terminal => {
-                error!("terminal error occurred during message processing: {outcome:#}");
+                error!("terminal error occurred during message processing: {error:#}");
             }
         }
 
-        Err(outcome)
+        Err(error)
     }
 
     async fn on_timer<C>(
@@ -173,25 +173,25 @@ where
         C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
-        let outcome = match self.handler.on_timer(context, trigger, demand_type).await {
+        let error = match self.handler.on_timer(context, trigger, demand_type).await {
             Ok(outcome) => return Ok(outcome),
             Err(error) => error,
         };
 
         // Log the error based on its category
-        match outcome.classify_error() {
+        match error.classify_error() {
             ErrorCategory::Transient => {
-                error!("transient error occurred during timer processing: {outcome:#}");
+                error!("transient error occurred during timer processing: {error:#}");
             }
             ErrorCategory::Permanent => {
-                error!("permanent error occurred during timer processing: {outcome:#}");
+                error!("permanent error occurred during timer processing: {error:#}");
             }
             ErrorCategory::Terminal => {
-                error!("terminal error occurred during timer processing: {outcome:#}");
+                error!("terminal error occurred during timer processing: {error:#}");
             }
         }
 
-        Err(outcome)
+        Err(error)
     }
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Outcome, Self::Error>)
