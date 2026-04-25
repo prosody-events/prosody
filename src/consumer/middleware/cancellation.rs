@@ -45,6 +45,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
+//! #     type Outcome = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -124,6 +125,7 @@ where
     T: FallibleHandler,
 {
     type Error = CancellationError<T::Error>;
+    type Outcome = T::Outcome;
 
     /// Checks cancellation state, then delegates to inner handler if clear.
     ///
@@ -136,7 +138,7 @@ where
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -166,7 +168,7 @@ where
         context: C,
         timer: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -189,6 +191,42 @@ where
                     CancellationError::Handler(error)
                 }
             })
+    }
+
+    async fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            Ok(outcome) => self.handler.after_commit(context, Ok(outcome)).await,
+            Err(CancellationError::Handler(inner)) => {
+                self.handler.after_commit(context, Err(inner)).await;
+            }
+            // Cancellation/Shutdown originated at this layer; the inner
+            // handler did not see them, so there is no inner-typed error to
+            // forward.
+            Err(CancellationError::Shutdown | CancellationError::MessageCancelled) => {}
+        }
+    }
+
+    async fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            Ok(outcome) => self.handler.after_abort(context, Ok(outcome)).await,
+            Err(CancellationError::Handler(inner)) => {
+                self.handler.after_abort(context, Err(inner)).await;
+            }
+            // Cancellation/Shutdown originated here; nothing to forward.
+            Err(CancellationError::Shutdown | CancellationError::MessageCancelled) => {}
+        }
     }
 
     async fn shutdown(self) {
@@ -293,13 +331,14 @@ mod tests {
 
     impl FallibleHandler for MockHandler {
         type Error = TestError;
+        type Outcome = ();
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Outcome, Self::Error>
         where
             C: EventContext,
         {
@@ -312,7 +351,7 @@ mod tests {
             _context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Outcome, Self::Error>
         where
             C: EventContext,
         {
@@ -507,13 +546,14 @@ mod tests {
 
     impl FallibleHandler for ShutdownTriggerHandler {
         type Error = TestError;
+        type Outcome = ();
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Outcome, Self::Error>
         where
             C: EventContext,
         {
@@ -526,7 +566,7 @@ mod tests {
             _context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Outcome, Self::Error>
         where
             C: EventContext,
         {

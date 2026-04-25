@@ -39,6 +39,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
+//! #     type Outcome = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -129,35 +130,37 @@ where
     T: FallibleHandler,
 {
     type Error = T::Error;
+    type Outcome = T::Outcome;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the message with the wrapped handler
-        let Err(error) = self.handler.on_message(context, message, demand_type).await else {
-            return Ok(());
+        let outcome = match self.handler.on_message(context, message, demand_type).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => error,
         };
 
         // Log the error based on its category
-        match error.classify_error() {
+        match outcome.classify_error() {
             ErrorCategory::Transient => {
-                error!("transient error occurred during message processing: {error:#}");
+                error!("transient error occurred during message processing: {outcome:#}");
             }
             ErrorCategory::Permanent => {
-                error!("permanent error occurred during message processing: {error:#}");
+                error!("permanent error occurred during message processing: {outcome:#}");
             }
             ErrorCategory::Terminal => {
-                error!("terminal error occurred during message processing: {error:#}");
+                error!("terminal error occurred during message processing: {outcome:#}");
             }
         }
 
-        Err(error)
+        Err(outcome)
     }
 
     async fn on_timer<C>(
@@ -165,29 +168,50 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
-        let Err(error) = self.handler.on_timer(context, trigger, demand_type).await else {
-            return Ok(());
+        let outcome = match self.handler.on_timer(context, trigger, demand_type).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => error,
         };
 
         // Log the error based on its category
-        match error.classify_error() {
+        match outcome.classify_error() {
             ErrorCategory::Transient => {
-                error!("transient error occurred during timer processing: {error:#}");
+                error!("transient error occurred during timer processing: {outcome:#}");
             }
             ErrorCategory::Permanent => {
-                error!("permanent error occurred during timer processing: {error:#}");
+                error!("permanent error occurred during timer processing: {outcome:#}");
             }
             ErrorCategory::Terminal => {
-                error!("terminal error occurred during timer processing: {error:#}");
+                error!("terminal error occurred during timer processing: {outcome:#}");
             }
         }
 
-        Err(error)
+        Err(outcome)
+    }
+
+    async fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        self.handler.after_commit(context, result).await;
+    }
+
+    async fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        self.handler.after_abort(context, result).await;
     }
 
     async fn shutdown(self) {

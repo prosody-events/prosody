@@ -68,6 +68,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
+//! #     type Outcome = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -104,6 +105,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
+//! #     type Outcome = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -252,6 +254,7 @@ pub trait HandlerMiddleware {
     /// # struct MyHandler;
     /// # impl FallibleHandler for MyHandler {
     /// #     type Error = Infallible;
+    /// #     type Outcome = ();
     /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
     /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
     /// #     async fn shutdown(self) {}
@@ -328,9 +331,57 @@ pub trait HandlerMiddleware {
 }
 
 /// Defines a handler that can fail during message processing.
+///
+/// # Lifecycle and `Outcome`
+///
+/// Each handler call returns a typed `Self::Outcome` value on success, which
+/// the framework then hands back to one of the apply hooks ([`Self::after_commit`]
+/// or [`Self::after_abort`]) once the durability marker has been resolved. This
+/// gives handlers a 2-phase-commit seam: stage external state inside
+/// `on_message`/`on_timer`, return a handle in the `Ok` value, and finalise
+/// (or unstage) the staged state in the apply hook with ownership of that
+/// handle.
+///
+/// Most handlers don't need 2PC and set `type Outcome = ();`. The default
+/// `after_commit`/`after_abort` implementations are no-ops that LLVM inlines
+/// away for that case.
+///
+/// # EventHandler-implementor contract
+///
+/// Any [`EventHandler`] that drives the durability marker
+/// ([`Uncommitted::commit`]/[`Uncommitted::abort`] on the inner message or
+/// timer) is responsible for invoking the **matching** apply hook on the
+/// inner handler before returning:
+///
+/// - After every `commit().await`, call `inner.after_commit(ctx, result).await`
+/// - After every `abort().await`, call `inner.after_abort(ctx, result).await`
+///
+/// where `result` is the same `Result<Self::Outcome, Self::Error>` the inner
+/// handler chain produced. Failing to do so silently breaks any 2PC handler
+/// further down the chain. The blanket `FallibleEventHandler → EventHandler`
+/// impl in this module and `RetryHandler` are the existing sites that take
+/// this responsibility; any new `EventHandler` that resolves the marker must
+/// follow the same pattern.
+///
+/// [`EventHandler`]: crate::consumer::EventHandler
+/// [`Uncommitted::commit`]: crate::consumer::Uncommitted::commit
+/// [`Uncommitted::abort`]: crate::consumer::Uncommitted::abort
 pub trait FallibleHandler: Send + Sync + 'static {
     /// The error type returned by this handler.
     type Error: ClassifyError + StdError + Send;
+
+    /// Value the handler returns on success and that the apply hooks
+    /// ([`Self::after_commit`]/[`Self::after_abort`]) consume once the
+    /// durability marker is resolved.
+    ///
+    /// Most handlers set `type Outcome = ();`. 2PC handlers carry a staging
+    /// handle, a transaction token, or whatever they need to finalise / unstage.
+    /// Wrapping middleware threads `Outcome` through using either the
+    /// pass-through pattern (`type Outcome = Inner::Outcome`) or the extending
+    /// pattern (`type Outcome = (Inner::Outcome, MyHandle)`); never collapse
+    /// to `()` in middleware — that silently discards the inner's value and
+    /// breaks 2PC composition.
+    type Outcome: Send;
 
     /// Handles a message, potentially returning an error.
     ///
@@ -342,14 +393,15 @@ pub trait FallibleHandler: Send + Sync + 'static {
     ///
     /// # Returns
     ///
-    /// A `Future` that resolves to `Ok(())` if the message was processed
-    /// successfully, or an `Err` containing the error if processing failed.
+    /// A `Future` that resolves to `Ok(outcome)` carrying the typed value the
+    /// handler produced on success, or an `Err` containing the error if
+    /// processing failed.
     fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    ) -> impl Future<Output = Result<Self::Outcome, Self::Error>> + Send
     where
         C: EventContext;
 
@@ -371,7 +423,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// # Returns
     ///
     /// A [`Future`] that resolves to:
-    /// - `Ok(())` if the timer was processed successfully
+    /// - `Ok(outcome)` carrying the typed value the handler produced on success
     /// - `Err(Self::Error)` if processing failed
     ///
     /// # Error Handling
@@ -394,9 +446,56 @@ pub trait FallibleHandler: Send + Sync + 'static {
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    ) -> impl Future<Output = Result<Self::Outcome, Self::Error>> + Send
     where
         C: EventContext;
+
+    /// Runs after the durability marker has been **committed**, with ownership
+    /// of the `Result` produced by the handler chain.
+    ///
+    /// `Ok(outcome)` — handler succeeded; finalise staged state.
+    /// `Err(error)` — handler returned a Transient or Permanent error; the
+    /// marker still committed (offset advance, dedup-insert as applicable).
+    ///
+    /// Per-key serialised: a same-key follow-up event will not dispatch until
+    /// this returns. Failures here cannot redeliver — retry-internally or
+    /// accept logging-only semantics.
+    ///
+    /// Wrapping middleware MUST forward this call to its inner handler with
+    /// the inner-typed `Result`; see the trait-level docs for the
+    /// `EventHandler` contract that ensures this hook fires.
+    fn after_commit<C>(
+        &self,
+        _context: C,
+        _result: Result<Self::Outcome, Self::Error>,
+    ) -> impl Future<Output = ()> + Send
+    where
+        C: EventContext,
+    {
+        async {}
+    }
+
+    /// Runs after the durability marker has been **aborted**, with ownership
+    /// of the `Result` produced by the handler chain.
+    ///
+    /// `Ok(outcome)` — handler succeeded but the marker was aborted anyway
+    /// (e.g., shutdown intervened between `Ok` and commit; see
+    /// `RetryHandler::on_message` shutdown-during-retry path).
+    /// `Err(error)` — handler returned a Terminal error, or shutdown aborted
+    /// a Transient retry loop.
+    ///
+    /// Per-key serialised; same retry / cancel-safety constraints as
+    /// [`Self::after_commit`]. Same EventHandler-implementor contract.
+    fn after_abort<C>(
+        &self,
+        _context: C,
+        _result: Result<Self::Outcome, Self::Error>,
+    ) -> impl Future<Output = ()> + Send
+    where
+        C: EventContext,
+    {
+        async {}
+    }
 
     /// Shuts down the handler and cleans up any resources.
     ///
@@ -487,20 +586,24 @@ where
         let (inner_message, uncommitted_offset) = message.into_inner();
 
         // Attempt to process the message
-        let Err(error) =
-            FallibleHandler::on_message(self, context, inner_message, demand_type).await
-        else {
+        let result =
+            FallibleHandler::on_message(self, context.clone(), inner_message, demand_type).await;
+
+        if let Err(error) = &result {
+            self.on_message_error(error);
+            match error.classify_error() {
+                ErrorCategory::Transient | ErrorCategory::Permanent => {
+                    uncommitted_offset.commit();
+                    self.after_commit(context, result).await;
+                }
+                ErrorCategory::Terminal => {
+                    uncommitted_offset.abort();
+                    self.after_abort(context, result).await;
+                }
+            }
+        } else {
             uncommitted_offset.commit();
-            return;
-        };
-
-        // Call error handler
-        self.on_message_error(&error);
-
-        // Handle offset management based on error category
-        match error.classify_error() {
-            ErrorCategory::Transient | ErrorCategory::Permanent => uncommitted_offset.commit(),
-            ErrorCategory::Terminal => uncommitted_offset.abort(),
+            self.after_commit(context, result).await;
         }
     }
 
@@ -512,23 +615,24 @@ where
         let (trigger, uncommitted_timer) = timer.into_inner();
 
         // Attempt to process the timer
-        let Err(error) = FallibleHandler::on_timer(self, context, trigger, demand_type).await
-        else {
+        let result =
+            FallibleHandler::on_timer(self, context.clone(), trigger, demand_type).await;
+
+        if let Err(error) = &result {
+            self.on_timer_error(error);
+            match error.classify_error() {
+                ErrorCategory::Transient | ErrorCategory::Permanent => {
+                    uncommitted_timer.commit().await;
+                    self.after_commit(context, result).await;
+                }
+                ErrorCategory::Terminal => {
+                    uncommitted_timer.abort().await;
+                    self.after_abort(context, result).await;
+                }
+            }
+        } else {
             uncommitted_timer.commit().await;
-            return;
-        };
-
-        // Call error handler
-        self.on_timer_error(&error);
-
-        // Handle timer management based on error category
-        match error.classify_error() {
-            ErrorCategory::Transient | ErrorCategory::Permanent => {
-                uncommitted_timer.commit().await;
-            }
-            ErrorCategory::Terminal => {
-                uncommitted_timer.abort().await;
-            }
+            self.after_commit(context, result).await;
         }
     }
 
@@ -546,5 +650,513 @@ impl ClassifyError for Infallible {
 impl ClassifyError for IoError {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Transient
+    }
+}
+
+#[cfg(test)]
+mod after_hook_tests {
+    //! Tests for the `after_commit` / `after_abort` lifecycle hooks plumbed
+    //! through the blanket `FallibleEventHandler → EventHandler` impl.
+    //!
+    //! These tests exercise the full lifecycle: handler runs → blanket impl
+    //! resolves the marker → matching apply hook fires with the correct
+    //! `Result<Outcome, Error>` value.
+    use std::error::Error as StdError;
+    use std::fmt::{Display, Formatter, Result as FmtResult};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crossbeam_utils::CachePadded;
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::consumer::EventHandler;
+    use crate::consumer::message::ConsumerMessage;
+    use crate::consumer::middleware::test_support::MockEventContext;
+    use crate::consumer::partition::offsets::OffsetTracker;
+    use crate::error::ErrorCategory;
+    use crate::timers::Trigger;
+    use crate::timers::TimerType;
+    use crate::timers::datetime::CompactDateTime;
+
+    /// Test error with a fixed classification. Equality compares the
+    /// classification discriminant + tag, since `ErrorCategory` itself is
+    /// only `Copy + Clone + Debug + Serialize`.
+    #[derive(Debug, Clone)]
+    struct TestError(ErrorCategory, &'static str);
+
+    impl Display for TestError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+            write!(f, "test error ({}): {:?}", self.1, self.0)
+        }
+    }
+
+    impl StdError for TestError {}
+
+    impl ClassifyError for TestError {
+        fn classify_error(&self) -> ErrorCategory {
+            self.0
+        }
+    }
+
+    impl PartialEq for TestError {
+        fn eq(&self, other: &Self) -> bool {
+            // Compare classification discriminants + tags.
+            let cat_eq = matches!(
+                (self.0, other.0),
+                (ErrorCategory::Transient, ErrorCategory::Transient)
+                    | (ErrorCategory::Permanent, ErrorCategory::Permanent)
+                    | (ErrorCategory::Terminal, ErrorCategory::Terminal)
+            );
+            cat_eq && self.1 == other.1
+        }
+    }
+
+    impl Eq for TestError {}
+
+    impl FallibleEventHandler for ProbeHandler {}
+
+    /// Records every lifecycle hook firing for later assertion.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum HookEvent {
+        Handler,
+        AfterCommit(Result<u64, TestError>),
+        AfterAbort(Result<u64, TestError>),
+    }
+
+    /// Probe handler whose `Outcome` is a `u64` sentinel; records every
+    /// lifecycle hook into a shared log.
+    #[derive(Clone)]
+    struct ProbeHandler {
+        sentinel: u64,
+        result: Result<(), TestError>,
+        log: Arc<Mutex<Vec<HookEvent>>>,
+    }
+
+    impl ProbeHandler {
+        fn ok(sentinel: u64) -> Self {
+            Self {
+                sentinel,
+                result: Ok(()),
+                log: Arc::default(),
+            }
+        }
+
+        fn err(sentinel: u64, error: TestError) -> Self {
+            Self {
+                sentinel,
+                result: Err(error),
+                log: Arc::default(),
+            }
+        }
+
+    }
+
+    impl FallibleHandler for ProbeHandler {
+        type Error = TestError;
+        type Outcome = u64;
+
+        async fn on_message<C>(
+            &self,
+            _context: C,
+            _message: ConsumerMessage,
+            _demand_type: DemandType,
+        ) -> Result<Self::Outcome, Self::Error>
+        where
+            C: EventContext,
+        {
+            self.log.lock().push(HookEvent::Handler);
+            self.result.clone().map(|()| self.sentinel)
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<Self::Outcome, Self::Error>
+        where
+            C: EventContext,
+        {
+            self.log.lock().push(HookEvent::Handler);
+            self.result.clone().map(|()| self.sentinel)
+        }
+
+        async fn after_commit<C>(
+            &self,
+            _context: C,
+            result: Result<Self::Outcome, Self::Error>,
+        ) where
+            C: EventContext,
+        {
+            self.log.lock().push(HookEvent::AfterCommit(result));
+        }
+
+        async fn after_abort<C>(
+            &self,
+            _context: C,
+            result: Result<Self::Outcome, Self::Error>,
+        ) where
+            C: EventContext,
+        {
+            self.log.lock().push(HookEvent::AfterAbort(result));
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    fn make_offset_tracker() -> OffsetTracker {
+        let version = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+        OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version)
+    }
+
+    fn make_test_message() -> Option<ConsumerMessage> {
+        use crate::consumer::message::ConsumerMessageValue;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        let semaphore = Arc::new(Semaphore::new(10));
+        let permit = semaphore.try_acquire_owned().ok()?;
+        Some(ConsumerMessage::new(
+            ConsumerMessageValue::default(),
+            tracing::Span::current(),
+            permit,
+        ))
+    }
+
+    #[tokio::test]
+    async fn after_commit_fires_with_ok_outcome_after_handler_success() -> color_eyre::Result<()> {
+        let handler = ProbeHandler::ok(42);
+        let log = handler.log.clone();
+        let context = MockEventContext::new();
+        let tracker = make_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let message = make_test_message()
+            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
+            .into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
+
+        assert_eq!(
+            log.lock().clone(),
+            vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(42))],
+            "handler runs first, then after_commit with Ok(sentinel)",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_commit_fires_with_err_after_permanent_error() -> color_eyre::Result<()> {
+        let err = TestError(ErrorCategory::Permanent, "permanent");
+        let handler = ProbeHandler::err(0, err.clone());
+        let log = handler.log.clone();
+        let context = MockEventContext::new();
+        let tracker = make_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let message = make_test_message()
+            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
+            .into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
+
+        assert_eq!(
+            log.lock().clone(),
+            vec![HookEvent::Handler, HookEvent::AfterCommit(Err(err))],
+            "Permanent error commits the marker; after_commit fires with Err",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_commit_fires_with_err_after_transient_error() -> color_eyre::Result<()> {
+        // Transient (when no retry middleware is in front) commits like
+        // Permanent at the blanket-impl level.
+        let err = TestError(ErrorCategory::Transient, "transient");
+        let handler = ProbeHandler::err(0, err.clone());
+        let log = handler.log.clone();
+        let context = MockEventContext::new();
+        let tracker = make_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let message = make_test_message()
+            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
+            .into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
+
+        assert_eq!(
+            log.lock().clone(),
+            vec![HookEvent::Handler, HookEvent::AfterCommit(Err(err))],
+            "Transient error at the blanket-impl level commits + fires after_commit",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_abort_fires_with_err_after_terminal_error() -> color_eyre::Result<()> {
+        let err = TestError(ErrorCategory::Terminal, "terminal");
+        let handler = ProbeHandler::err(0, err.clone());
+        let log = handler.log.clone();
+        let context = MockEventContext::new();
+        let tracker = make_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let message = make_test_message()
+            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
+            .into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
+
+        assert_eq!(
+            log.lock().clone(),
+            vec![HookEvent::Handler, HookEvent::AfterAbort(Err(err))],
+            "Terminal error aborts the marker; after_abort fires with Err",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_1_to_1_invariant_one_apply_per_dispatch() -> color_eyre::Result<()> {
+        // Exactly one apply hook (after_commit OR after_abort) fires per
+        // dispatch — not both, not neither.
+        for category in [
+            ErrorCategory::Permanent,
+            ErrorCategory::Transient,
+            ErrorCategory::Terminal,
+        ] {
+            let handler = ProbeHandler::err(0, TestError(category, "x"));
+            let log = handler.log.clone();
+            let context = MockEventContext::new();
+            let tracker = make_offset_tracker();
+            let uncommitted_offset = tracker.take(0).await?;
+            let message = make_test_message()
+                .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
+                .into_uncommitted(uncommitted_offset);
+
+            EventHandler::on_message(&handler, context, message, DemandType::Normal).await;
+
+            let recorded = log.lock().clone();
+            let commit_count = recorded
+                .iter()
+                .filter(|e| matches!(e, HookEvent::AfterCommit(_)))
+                .count();
+            let abort_count = recorded
+                .iter()
+                .filter(|e| matches!(e, HookEvent::AfterAbort(_)))
+                .count();
+            assert_eq!(
+                commit_count + abort_count,
+                1,
+                "{category:?}: exactly one apply hook should fire per dispatch ({recorded:?})",
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_commit_for_timer_path_with_ok_outcome() {
+        // Timer arm of the blanket impl: build a minimal `UncommittedTimer`
+        // and verify the same lifecycle.
+        use std::sync::OnceLock;
+
+        use crate::Key;
+        use crate::consumer::{Keyed, Uncommitted};
+        use crate::timers::UncommittedTimer;
+
+        struct MockUncommittedTimer {
+            committed: Arc<AtomicUsize>,
+            aborted: Arc<AtomicUsize>,
+        }
+
+        struct MockGuard {
+            committed: Arc<AtomicUsize>,
+            aborted: Arc<AtomicUsize>,
+        }
+
+        impl Uncommitted for MockGuard {
+            async fn commit(self) {
+                self.committed.fetch_add(1, Ordering::SeqCst);
+            }
+            async fn abort(self) {
+                self.aborted.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl Keyed for MockUncommittedTimer {
+            type Key = Key;
+            fn key(&self) -> &Self::Key {
+                static KEY: OnceLock<Key> = OnceLock::new();
+                KEY.get_or_init(|| "test-key".into())
+            }
+        }
+
+        impl Uncommitted for MockUncommittedTimer {
+            async fn commit(self) {
+                self.committed.fetch_add(1, Ordering::SeqCst);
+            }
+            async fn abort(self) {
+                self.aborted.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl UncommittedTimer for MockUncommittedTimer {
+            type CommitGuard = MockGuard;
+
+            fn time(&self) -> CompactDateTime {
+                CompactDateTime::from(0_u32)
+            }
+
+            fn timer_type(&self) -> TimerType {
+                TimerType::Application
+            }
+
+            fn span(&self) -> tracing::Span {
+                tracing::Span::current()
+            }
+
+            fn into_inner(self) -> (Trigger, Self::CommitGuard) {
+                let trigger = Trigger::for_testing(
+                    "test-key".into(),
+                    self.time(),
+                    self.timer_type(),
+                );
+                let guard = MockGuard {
+                    committed: self.committed.clone(),
+                    aborted: self.aborted.clone(),
+                };
+                (trigger, guard)
+            }
+        }
+
+        let handler = ProbeHandler::ok(99);
+        let log = handler.log.clone();
+        let context = MockEventContext::new();
+        let committed = Arc::new(AtomicUsize::new(0));
+        let aborted = Arc::new(AtomicUsize::new(0));
+        let timer = MockUncommittedTimer {
+            committed: committed.clone(),
+            aborted: aborted.clone(),
+        };
+
+        EventHandler::on_timer(&handler, context, timer, DemandType::Normal).await;
+
+        assert_eq!(committed.load(Ordering::SeqCst), 1, "marker committed once");
+        assert_eq!(aborted.load(Ordering::SeqCst), 0, "marker not aborted");
+        assert_eq!(
+            log.lock().clone(),
+            vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(99))],
+            "timer Ok path: handler then after_commit with sentinel",
+        );
+    }
+
+    /// Minimal pass-through middleware to verify the composition contract.
+    /// Stands in for any real `FallibleHandler` middleware that wraps an
+    /// inner with `type Outcome = Inner::Outcome` and forwards apply hooks.
+    struct PassThroughMiddleware<T> {
+        inner: T,
+    }
+
+    impl<T> FallibleHandler for PassThroughMiddleware<T>
+    where
+        T: FallibleHandler,
+    {
+        type Error = T::Error;
+        type Outcome = T::Outcome;
+
+        async fn on_message<C>(
+            &self,
+            context: C,
+            message: ConsumerMessage,
+            demand_type: DemandType,
+        ) -> Result<Self::Outcome, Self::Error>
+        where
+            C: EventContext,
+        {
+            self.inner.on_message(context, message, demand_type).await
+        }
+
+        async fn on_timer<C>(
+            &self,
+            context: C,
+            trigger: Trigger,
+            demand_type: DemandType,
+        ) -> Result<Self::Outcome, Self::Error>
+        where
+            C: EventContext,
+        {
+            self.inner.on_timer(context, trigger, demand_type).await
+        }
+
+        async fn after_commit<C>(
+            &self,
+            context: C,
+            result: Result<Self::Outcome, Self::Error>,
+        ) where
+            C: EventContext,
+        {
+            self.inner.after_commit(context, result).await;
+        }
+
+        async fn after_abort<C>(
+            &self,
+            context: C,
+            result: Result<Self::Outcome, Self::Error>,
+        ) where
+            C: EventContext,
+        {
+            self.inner.after_abort(context, result).await;
+        }
+
+        async fn shutdown(self) {
+            self.inner.shutdown().await;
+        }
+    }
+
+    impl<T> FallibleEventHandler for PassThroughMiddleware<T> where T: FallibleHandler {}
+
+    #[tokio::test]
+    async fn pass_through_middleware_forwards_outcome_to_inner_after_commit()
+    -> color_eyre::Result<()> {
+        let inner = ProbeHandler::ok(7);
+        let log = inner.log.clone();
+        let middleware = PassThroughMiddleware { inner };
+        let context = MockEventContext::new();
+        let tracker = make_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let message = make_test_message()
+            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
+            .into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&middleware, context, message, DemandType::Normal).await;
+
+        // The inner handler observes both Handler (it ran) and AfterCommit
+        // (the middleware forwarded with Ok(7)).
+        assert_eq!(
+            log.lock().clone(),
+            vec![HookEvent::Handler, HookEvent::AfterCommit(Ok(7))],
+            "pass-through middleware forwards typed outcome unchanged",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyre::Result<()> {
+        let err = TestError(ErrorCategory::Terminal, "terminal");
+        let inner = ProbeHandler::err(0, err.clone());
+        let log = inner.log.clone();
+        let middleware = PassThroughMiddleware { inner };
+        let context = MockEventContext::new();
+        let tracker = make_offset_tracker();
+        let uncommitted_offset = tracker.take(0).await?;
+        let message = make_test_message()
+            .ok_or_else(|| color_eyre::eyre::eyre!("failed to construct test message"))?
+            .into_uncommitted(uncommitted_offset);
+
+        EventHandler::on_message(&middleware, context, message, DemandType::Normal).await;
+
+        assert_eq!(
+            log.lock().clone(),
+            vec![HookEvent::Handler, HookEvent::AfterAbort(Err(err))],
+            "pass-through middleware forwards after_abort on terminal",
+        );
+        Ok(())
     }
 }

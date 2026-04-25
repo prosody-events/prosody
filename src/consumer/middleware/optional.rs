@@ -101,13 +101,14 @@ where
     D: FallibleHandler,
 {
     type Error = OptionError<E::Error, D::Error>;
+    type Outcome = OptionOutcome<E::Outcome, D::Outcome>;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -115,10 +116,12 @@ where
             Self::Enabled(handler) => handler
                 .on_message(context, message, demand_type)
                 .await
+                .map(OptionOutcome::Enabled)
                 .map_err(OptionError::Enabled),
             Self::Disabled(handler) => handler
                 .on_message(context, message, demand_type)
                 .await
+                .map(OptionOutcome::Disabled)
                 .map_err(OptionError::Disabled),
         }
     }
@@ -128,7 +131,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -136,11 +139,63 @@ where
             Self::Enabled(handler) => handler
                 .on_timer(context, trigger, demand_type)
                 .await
+                .map(OptionOutcome::Enabled)
                 .map_err(OptionError::Enabled),
             Self::Disabled(handler) => handler
                 .on_timer(context, trigger, demand_type)
                 .await
+                .map(OptionOutcome::Disabled)
                 .map_err(OptionError::Disabled),
+        }
+    }
+
+    async fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match (self, result) {
+            (Self::Enabled(handler), Ok(OptionOutcome::Enabled(o))) => {
+                handler.after_commit(context, Ok(o)).await;
+            }
+            (Self::Enabled(handler), Err(OptionError::Enabled(e))) => {
+                handler.after_commit(context, Err(e)).await;
+            }
+            (Self::Disabled(handler), Ok(OptionOutcome::Disabled(o))) => {
+                handler.after_commit(context, Ok(o)).await;
+            }
+            (Self::Disabled(handler), Err(OptionError::Disabled(e))) => {
+                handler.after_commit(context, Err(e)).await;
+            }
+            // Mismatched variants cannot occur: the handler that produced
+            // the result is the same one being asked to consume it.
+            _ => {}
+        }
+    }
+
+    async fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match (self, result) {
+            (Self::Enabled(handler), Ok(OptionOutcome::Enabled(o))) => {
+                handler.after_abort(context, Ok(o)).await;
+            }
+            (Self::Enabled(handler), Err(OptionError::Enabled(e))) => {
+                handler.after_abort(context, Err(e)).await;
+            }
+            (Self::Disabled(handler), Ok(OptionOutcome::Disabled(o))) => {
+                handler.after_abort(context, Ok(o)).await;
+            }
+            (Self::Disabled(handler), Err(OptionError::Disabled(e))) => {
+                handler.after_abort(context, Err(e)).await;
+            }
+            _ => {}
         }
     }
 
@@ -150,6 +205,17 @@ where
             Self::Disabled(handler) => handler.shutdown().await,
         }
     }
+}
+
+/// Outcome from optional middleware, mirroring the [`OptionHandler`]
+/// enabled/disabled split.
+#[derive(Debug)]
+pub enum OptionOutcome<E, D> {
+    /// Outcome from the enabled middleware.
+    Enabled(E),
+
+    /// Outcome from the disabled passthrough.
+    Disabled(D),
 }
 
 /// Error from optional middleware.

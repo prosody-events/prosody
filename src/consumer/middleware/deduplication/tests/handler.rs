@@ -94,13 +94,14 @@ impl MockHandler {
 
 impl FallibleHandler for MockHandler {
     type Error = TestError;
+    type Outcome = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         _message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -117,7 +118,7 @@ impl FallibleHandler for MockHandler {
         _context: C,
         _trigger: Trigger,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -406,4 +407,147 @@ fn ttl_below_minimum_rejected() {
     let result =
         DeduplicationMiddleware::new(config, "group", MemoryDeduplicationStoreProvider::new());
     assert!(result.is_err());
+}
+
+/// Probe handler that records every lifecycle hook into a shared log.
+/// Distinguishes "inner ran" (`Handler` event) from "inner's apply hook
+/// fired" (`InnerAfterCommit` / `InnerAfterAbort`).
+#[derive(Clone, Default)]
+struct ApplyProbe {
+    log: Arc<parking_lot::Mutex<Vec<ApplyEvent>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApplyEvent {
+    Handler,
+    InnerAfterCommit,
+    InnerAfterAbort,
+}
+
+impl FallibleHandler for ApplyProbe {
+    type Error = TestError;
+    type Outcome = ();
+
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage,
+        _demand_type: DemandType,
+    ) -> Result<Self::Outcome, Self::Error>
+    where
+        C: EventContext,
+    {
+        self.log.lock().push(ApplyEvent::Handler);
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _context: C,
+        _trigger: Trigger,
+        _demand_type: DemandType,
+    ) -> Result<Self::Outcome, Self::Error>
+    where
+        C: EventContext,
+    {
+        self.log.lock().push(ApplyEvent::Handler);
+        Ok(())
+    }
+
+    async fn after_commit<C>(
+        &self,
+        _context: C,
+        _result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        self.log.lock().push(ApplyEvent::InnerAfterCommit);
+    }
+
+    async fn after_abort<C>(
+        &self,
+        _context: C,
+        _result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        self.log.lock().push(ApplyEvent::InnerAfterAbort);
+    }
+
+    async fn shutdown(self) {}
+}
+
+#[tokio::test]
+async fn dedup_skip_does_not_invoke_inner_after_commit() {
+    // First message goes through, second is deduplicated → inner.after_commit
+    // must fire on the first dispatch but NOT on the second.
+    let inner = ApplyProbe::default();
+    let log = inner.log.clone();
+    let handler = create_handler_apply(inner);
+    let context = MockEventContext::new();
+
+    let Some(msg1) = create_test_message("key1", Some("evt1")) else {
+        return;
+    };
+    let Some(msg2) = create_test_message("key1", Some("evt1")) else {
+        return;
+    };
+
+    // First dispatch: inner runs, on_message returns Ok(Some(())).
+    let result1 =
+        FallibleHandler::on_message(&handler, context.clone(), msg1, DemandType::Normal).await;
+    assert!(matches!(result1, Ok(Some(()))));
+    // The dedup middleware's after_commit must forward the inner half.
+    FallibleHandler::after_commit(&handler, context.clone(), result1).await;
+
+    // Second dispatch: deduplicated, on_message returns Ok(None).
+    let result2 =
+        FallibleHandler::on_message(&handler, context.clone(), msg2, DemandType::Normal).await;
+    assert!(matches!(result2, Ok(None)));
+    FallibleHandler::after_commit(&handler, context, result2).await;
+
+    assert_eq!(
+        log.lock().clone(),
+        vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
+        "second dispatch must NOT invoke inner.after_commit (handler never ran)",
+    );
+}
+
+#[tokio::test]
+async fn dedup_passthrough_forwards_after_commit_for_handler_ok() {
+    // Sanity: when the handler runs, inner.after_commit must receive the Ok
+    // forwarded through DeduplicationHandler::after_commit.
+    let inner = ApplyProbe::default();
+    let log = inner.log.clone();
+    let handler = create_handler_apply(inner);
+    let context = MockEventContext::new();
+
+    let Some(msg) = create_test_message("key1", Some("evt-fresh")) else {
+        return;
+    };
+
+    let result =
+        FallibleHandler::on_message(&handler, context.clone(), msg, DemandType::Normal).await;
+    assert!(matches!(result, Ok(Some(()))));
+    FallibleHandler::after_commit(&handler, context, result).await;
+
+    assert_eq!(
+        log.lock().clone(),
+        vec![ApplyEvent::Handler, ApplyEvent::InnerAfterCommit],
+        "passthrough: inner.after_commit fires when inner ran successfully",
+    );
+}
+
+fn create_handler_apply(
+    inner: ApplyProbe,
+) -> DeduplicationHandler<ApplyProbe, MemoryDeduplicationStore> {
+    DeduplicationHandler {
+        inner,
+        cache: Arc::new(Cache::new(100)),
+        store: MemoryDeduplicationStore::new(),
+        version: "1".to_owned(),
+        group_id: Arc::from("test-group"),
+        topic: Topic::from("test-topic"),
+        partition: 0,
+    }
 }

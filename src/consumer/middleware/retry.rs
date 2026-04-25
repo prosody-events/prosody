@@ -55,6 +55,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
+//! #     type Outcome = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -318,6 +319,7 @@ where
     T: FallibleHandler,
 {
     type Error = T::Error;
+    type Outcome = T::Outcome;
 
     /// Handles a message with retry functionality.
     ///
@@ -339,7 +341,7 @@ where
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -358,12 +360,13 @@ where
             } else {
                 DemandType::Failure
             };
-            let Err(error) = self
+            let error = match self
                 .handler
                 .on_message(context.clone(), message.clone(), current_demand_type)
                 .await
-            else {
-                return Ok(());
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => error,
             };
 
             // Only abort on shutdown (partition revoked). Message cancellation is
@@ -439,7 +442,7 @@ where
         context: C,
         timer: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -455,12 +458,13 @@ where
                 DemandType::Failure
             };
             // Try handling the timer
-            let Err(error) = self
+            let error = match self
                 .handler
                 .on_timer(context.clone(), timer.clone(), current_demand_type)
                 .await
-            else {
-                return Ok(());
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => error,
             };
             // Only abort on shutdown (partition revoked). Message cancellation is
             // treated as transient - we continue retrying.
@@ -498,6 +502,26 @@ where
         }
     }
 
+    async fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        self.handler.after_commit(context, result).await;
+    }
+
+    async fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        self.handler.after_abort(context, result).await;
+    }
+
     async fn shutdown(self) {
         debug!("shutting down retry handler");
 
@@ -505,6 +529,14 @@ where
         // Cascade shutdown to the inner handler
         self.handler.shutdown().await;
     }
+}
+
+/// How the retry loop in [`RetryHandler::on_message`] /
+/// [`RetryHandler::on_timer`] resolved: commit or abort the marker, with the
+/// `Result` we'll thread into the matching apply hook.
+enum Resolution<O, E> {
+    Commit(Result<O, E>),
+    Abort(Result<O, E>),
 }
 
 impl<T> EventHandler for RetryHandler<T>
@@ -528,9 +560,12 @@ where
         let key = message.key().to_owned();
         let offset = message.offset();
         let (message, uncommitted_offset) = message.into_inner();
-        let mut attempt: u32 = 0;
 
-        loop {
+        // Run the retry loop and bind the final Result. Every break-out of
+        // the loop yields the result we'll thread into commit+after_commit
+        // or abort+after_abort below.
+        let mut attempt: u32 = 0;
+        let resolution: Resolution<T::Outcome, T::Error> = loop {
             attempt = attempt.saturating_add(1);
             // Use the original demand type for the first attempt, failure demand for
             // retries
@@ -539,20 +574,19 @@ where
             } else {
                 DemandType::Failure
             };
-            let Err(error) = self
+            let error = match self
                 .handler
                 .on_message(context.clone(), message.clone(), current_demand_type)
                 .await
-            else {
-                uncommitted_offset.commit();
-                break;
+            {
+                Ok(outcome) => break Resolution::Commit(Ok(outcome)),
+                Err(error) => error,
             };
 
             // Only abort on shutdown (partition revoked). Message cancellation is
             // treated as transient - we continue retrying.
             if context.is_shutdown() {
-                uncommitted_offset.abort();
-                break;
+                break Resolution::Abort(Err(error));
             }
 
             // Handle different error categories
@@ -572,8 +606,7 @@ where
                     if wait_with_cancellation(&context, sleep_time).await
                         == RetryWaitResult::Shutdown
                     {
-                        uncommitted_offset.abort();
-                        break;
+                        break Resolution::Abort(Err(error));
                     }
                 }
                 ErrorCategory::Permanent => {
@@ -585,8 +618,7 @@ where
                         topic = topic.as_ref(),
                         "permanently failed to handle message: {error:#}; discarding message"
                     );
-                    uncommitted_offset.commit();
-                    break;
+                    break Resolution::Commit(Err(error));
                 }
                 ErrorCategory::Terminal => {
                     info!(
@@ -598,9 +630,19 @@ where
                         "terminal condition encountered while handling message: {error:#}; \
                          aborting"
                     );
-                    uncommitted_offset.abort();
-                    break;
+                    break Resolution::Abort(Err(error));
                 }
+            }
+        };
+
+        match resolution {
+            Resolution::Commit(result) => {
+                uncommitted_offset.commit();
+                self.handler.after_commit(context, result).await;
+            }
+            Resolution::Abort(result) => {
+                uncommitted_offset.abort();
+                self.handler.after_abort(context, result).await;
             }
         }
     }
@@ -612,8 +654,9 @@ where
     {
         // Retry logic for an uncommitted timer
         let (trigger, uncommitted) = timer.into_inner();
+
         let mut attempt: u32 = 0;
-        loop {
+        let resolution: Resolution<T::Outcome, T::Error> = loop {
             attempt = attempt.saturating_add(1);
             // Use the original demand type for the first attempt, failure demand for
             // retries
@@ -623,19 +666,18 @@ where
                 DemandType::Failure
             };
             // Try handling the timer
-            let Err(error) = self
+            let error = match self
                 .handler
                 .on_timer(context.clone(), trigger.clone(), current_demand_type)
                 .await
-            else {
-                uncommitted.commit().await;
-                break;
+            {
+                Ok(outcome) => break Resolution::Commit(Ok(outcome)),
+                Err(error) => error,
             };
             // Only abort on shutdown (partition revoked). Message cancellation is
             // treated as transient - we continue retrying.
             if context.is_shutdown() {
-                uncommitted.abort().await;
-                break;
+                break Resolution::Abort(Err(error));
             }
             match error.classify_error() {
                 ErrorCategory::Transient => {
@@ -647,22 +689,30 @@ where
                     if wait_with_cancellation(&context, sleep_time).await
                         == RetryWaitResult::Shutdown
                     {
-                        uncommitted.abort().await;
-                        break;
+                        break Resolution::Abort(Err(error));
                     }
                 }
                 ErrorCategory::Permanent => {
                     error!("permanently failed to handle timer: {error:#}; discarding timer");
-                    uncommitted.commit().await;
-                    break;
+                    break Resolution::Commit(Err(error));
                 }
                 ErrorCategory::Terminal => {
                     info!(
                         "terminal condition encountered while handling timer: {error:#}; aborting"
                     );
-                    uncommitted.abort().await;
-                    break;
+                    break Resolution::Abort(Err(error));
                 }
+            }
+        };
+
+        match resolution {
+            Resolution::Commit(result) => {
+                uncommitted.commit().await;
+                self.handler.after_commit(context, result).await;
+            }
+            Resolution::Abort(result) => {
+                uncommitted.abort().await;
+                self.handler.after_abort(context, result).await;
             }
         }
     }
@@ -760,13 +810,14 @@ mod tests {
 
     impl FallibleHandler for MockHandler {
         type Error = TestError;
+        type Outcome = ();
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Outcome, Self::Error>
         where
             C: EventContext,
         {
@@ -787,7 +838,7 @@ mod tests {
             _context: C,
             _trigger: Trigger,
             demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Outcome, Self::Error>
         where
             C: EventContext,
         {

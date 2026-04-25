@@ -273,13 +273,14 @@ where
     T: FallibleHandler,
 {
     type Error = SchedulerError<T::Error>;
+    type Outcome = T::Outcome;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -297,7 +298,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -308,6 +309,40 @@ where
             .on_timer(context, trigger, demand_type)
             .await
             .map_err(SchedulerError::Handler)
+    }
+
+    async fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            Ok(outcome) => self.handler.after_commit(context, Ok(outcome)).await,
+            Err(SchedulerError::Handler(inner)) => {
+                self.handler.after_commit(context, Err(inner)).await;
+            }
+            // Permit-acquisition error happened at this layer; the inner
+            // handler did not run.
+            Err(SchedulerError::PermitAcquisition(_)) => {}
+        }
+    }
+
+    async fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            Ok(outcome) => self.handler.after_abort(context, Ok(outcome)).await,
+            Err(SchedulerError::Handler(inner)) => {
+                self.handler.after_abort(context, Err(inner)).await;
+            }
+            Err(SchedulerError::PermitAcquisition(_)) => {}
+        }
     }
 
     async fn shutdown(self) {

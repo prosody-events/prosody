@@ -233,13 +233,14 @@ where
     T: FallibleHandler,
 {
     type Error = MonopolizationError<T::Error>;
+    type Outcome = T::Outcome;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -259,7 +260,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -272,6 +273,41 @@ where
             .on_timer(context, trigger, demand_type)
             .await
             .map_err(MonopolizationError::Handler)
+    }
+
+    async fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            Ok(outcome) => self.handler.after_commit(context, Ok(outcome)).await,
+            Err(MonopolizationError::Handler(inner)) => {
+                self.handler.after_commit(context, Err(inner)).await;
+            }
+            // Monopolization rejection happened at this layer; the inner
+            // handler did not run, so there is no inner-typed error to
+            // forward.
+            Err(MonopolizationError::Monopolization { .. }) => {}
+        }
+    }
+
+    async fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            Ok(outcome) => self.handler.after_abort(context, Ok(outcome)).await,
+            Err(MonopolizationError::Handler(inner)) => {
+                self.handler.after_abort(context, Err(inner)).await;
+            }
+            Err(MonopolizationError::Monopolization { .. }) => {}
+        }
     }
 
     async fn shutdown(self) {
@@ -532,13 +568,14 @@ mod tests {
 
     impl FallibleHandler for MockHandler {
         type Error = MockError;
+        type Outcome = ();
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Outcome, Self::Error>
         where
             C: EventContext,
         {
@@ -551,7 +588,7 @@ mod tests {
             _context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Outcome, Self::Error>
         where
             C: EventContext,
         {

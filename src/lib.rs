@@ -35,6 +35,7 @@
 //!
 //! impl FallibleHandler for MyHandler {
 //!     type Error = Infallible;
+//!     type Outcome = ();
 //!
 //!     async fn on_message<C>(
 //!         &self,

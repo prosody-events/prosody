@@ -196,13 +196,17 @@ where
     S: DeduplicationStore,
 {
     type Error = DeduplicationError<T::Error>;
+    /// `Some(inner_outcome)` when the inner handler ran and succeeded;
+    /// `None` when the message was already deduplicated (handler skipped).
+    /// This gates whether the inner's apply hook fires.
+    type Outcome = Option<T::Outcome>;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -218,7 +222,7 @@ where
             .in_scope(|| {
                 debug!("message deduplicated via local cache");
             });
-            return Ok(());
+            return Ok(None);
         }
 
         // 2. Check persistent store
@@ -233,7 +237,7 @@ where
                 .in_scope(|| {
                     debug!("message deduplicated via persistent store");
                 });
-                return Ok(());
+                return Ok(None);
             }
             Ok(false) => {}
             Err(error) => {
@@ -255,7 +259,7 @@ where
         // transient so the retry layer can reattempt, terminal because
         // processing is being aborted.
         let should_dedup = match &result {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(e) => matches!(e.classify_error(), ErrorCategory::Permanent),
         };
 
@@ -266,7 +270,7 @@ where
             }
         }
 
-        result
+        result.map(Some)
     }
 
     async fn on_timer<C>(
@@ -274,14 +278,49 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
         self.inner
             .on_timer(context, trigger, demand_type)
             .await
+            .map(Some)
             .map_err(DeduplicationError::Inner)
+    }
+
+    async fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            // Inner handler ran and succeeded: forward its outcome.
+            Ok(Some(outcome)) => self.inner.after_commit(context, Ok(outcome)).await,
+            // Already deduplicated: inner never ran, so its apply must not run.
+            Ok(None) => {}
+            Err(DeduplicationError::Inner(error)) => {
+                self.inner.after_commit(context, Err(error)).await;
+            }
+        }
+    }
+
+    async fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            Ok(Some(outcome)) => self.inner.after_abort(context, Ok(outcome)).await,
+            Ok(None) => {}
+            Err(DeduplicationError::Inner(error)) => {
+                self.inner.after_abort(context, Err(error)).await;
+            }
+        }
     }
 
     async fn shutdown(self) {

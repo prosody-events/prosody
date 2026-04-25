@@ -49,6 +49,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
+//! #     type Outcome = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -217,6 +218,11 @@ where
     T: FallibleHandler,
 {
     type Error = FailureTopicError<T::Error>;
+    /// `Some(inner_outcome)` when the wrapped handler succeeded; `None` when
+    /// the handler failed with a non-Terminal error and the message/timer was
+    /// routed to the failure topic instead. This mirrors the dedup pattern:
+    /// `None` means the inner's apply work must not run.
+    type Outcome = Option<T::Outcome>;
 
     /// Handles a message, attempting to process it with the wrapped handler.
     /// If processing fails, sends the message to the failure topic.
@@ -228,9 +234,10 @@ where
     ///
     /// # Returns
     ///
-    /// A `Result` that is `Ok(())` if the message was processed successfully or
-    /// sent to the failure topic, or an `Err` containing a `FailureTopicError`
-    /// if processing or sending to the failure topic failed.
+    /// A `Result` that is `Ok(Some(outcome))` if the message was processed
+    /// successfully, `Ok(None)` if it was sent to the failure topic, or an
+    /// `Err` containing a `FailureTopicError` if processing terminated or
+    /// sending to the failure topic failed.
     ///
     /// # Errors
     ///
@@ -242,7 +249,7 @@ where
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -256,12 +263,13 @@ where
             .to_rfc3339_opts(SecondsFormat::Millis, true);
 
         // Attempt to process the message with the wrapped handler
-        let Err(error) = self
+        let error = match self
             .handler
             .on_message(context, message.clone(), demand_type)
             .await
-        else {
-            return Ok(());
+        {
+            Ok(outcome) => return Ok(Some(outcome)),
+            Err(error) => error,
         };
 
         // Handle terminal errors by aborting
@@ -302,7 +310,7 @@ where
             .send(headers, self.topic, key, message.payload())
             .await?;
 
-        Ok(())
+        Ok(None)
     }
 
     async fn on_timer<C>(
@@ -310,17 +318,18 @@ where
         context: C,
         timer: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
-        let Err(error) = self
+        let error = match self
             .handler
             .on_timer(context, timer.clone(), demand_type)
             .await
-        else {
-            return Ok(());
+        {
+            Ok(outcome) => return Ok(Some(outcome)),
+            Err(error) => error,
         };
 
         // Terminal errors abort and propagate
@@ -359,7 +368,42 @@ where
             .send(headers, self.topic, key_str, &payload)
             .await?;
 
-        Ok(())
+        Ok(None)
+    }
+
+    async fn after_commit<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        // `Ok(None)` (routed to failure topic) and `Err(Producer(_))`
+        // (failure-topic send failed before the inner handler could have
+        // succeeded) both correspond to "inner had nothing to apply".
+        match result {
+            Ok(Some(outcome)) => self.handler.after_commit(context, Ok(outcome)).await,
+            Err(FailureTopicError::Handler(inner)) => {
+                self.handler.after_commit(context, Err(inner)).await;
+            }
+            Ok(None) | Err(FailureTopicError::Producer(_)) => {}
+        }
+    }
+
+    async fn after_abort<C>(
+        &self,
+        context: C,
+        result: Result<Self::Outcome, Self::Error>,
+    ) where
+        C: EventContext,
+    {
+        match result {
+            Ok(Some(outcome)) => self.handler.after_abort(context, Ok(outcome)).await,
+            Err(FailureTopicError::Handler(inner)) => {
+                self.handler.after_abort(context, Err(inner)).await;
+            }
+            Ok(None) | Err(FailureTopicError::Producer(_)) => {}
+        }
     }
 
     async fn shutdown(self) {

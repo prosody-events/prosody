@@ -541,13 +541,14 @@ pub struct FallibleTestHandler {
 
 impl FallibleHandler for FallibleTestHandler {
     type Error = TestError;
+    type Outcome = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
@@ -564,7 +565,7 @@ impl FallibleHandler for FallibleTestHandler {
         _context: C,
         _timer: Trigger,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Outcome, Self::Error>
     where
         C: EventContext,
     {
