@@ -20,6 +20,7 @@ use scylla::deserialize::value::DeserializeValue;
 use scylla::deserialize::{DeserializationError, FrameSlice, TypeCheckError};
 use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
+use scylla::policies::timestamp_generator::MonotonicTimestampGenerator;
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
 use scylla::statement::Consistency;
@@ -203,7 +204,8 @@ async fn create_session(config: &CassandraConfiguration) -> Result<Session, Cass
     let mut session = SessionBuilder::new()
         .known_nodes(&config.nodes)
         .compression(Some(Compression::Lz4))
-        .default_execution_profile_handle(profile.into_handle());
+        .default_execution_profile_handle(profile.into_handle())
+        .timestamp_generator(Arc::new(MonotonicTimestampGenerator::new()));
 
     if let Some(user) = &config.user {
         session = session.user(user.clone(), config.password.clone().unwrap_or_default());
