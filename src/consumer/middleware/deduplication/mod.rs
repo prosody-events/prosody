@@ -26,12 +26,13 @@ pub mod store;
 #[cfg(test)]
 pub mod tests;
 
+use std::error::Error as StdError;
 use std::hash::Hasher;
 use std::sync::Arc;
 
 use quick_cache::sync::Cache;
 use thiserror::Error;
-use tracing::{debug, info_span, warn};
+use tracing::{debug, info_span};
 use uuid::Uuid;
 use validator::Validate;
 use xxhash_rust::xxh3::Xxh3Default;
@@ -231,23 +232,22 @@ where
         }
 
         // 2. Check persistent store
-        match self.store.exists(dedup_uuid).await {
-            Ok(true) => {
-                self.cache.insert(dedup_uuid, ());
-                info_span!(
-                    parent: message.span(),
-                    "message.filtered",
-                    reason = "deduplicated"
-                )
-                .in_scope(|| {
-                    debug!("message deduplicated via persistent store");
-                });
-                return Ok(None);
-            }
-            Ok(false) => {}
-            Err(error) => {
-                warn!("deduplication store read failed: {error:#}; treating as cache miss");
-            }
+        if self
+            .store
+            .exists(dedup_uuid)
+            .await
+            .map_err(|e| DeduplicationError::Store(Box::new(e)))?
+        {
+            self.cache.insert(dedup_uuid, ());
+            info_span!(
+                parent: message.span(),
+                "message.filtered",
+                reason = "deduplicated"
+            )
+            .in_scope(|| {
+                debug!("message deduplicated via persistent store");
+            });
+            return Ok(None);
         }
 
         // 3. Process message
@@ -269,10 +269,11 @@ where
         };
 
         if should_dedup {
+            self.store
+                .insert(dedup_uuid)
+                .await
+                .map_err(|e| DeduplicationError::Store(Box::new(e)))?;
             self.cache.insert(dedup_uuid, ());
-            if let Err(error) = self.store.insert(dedup_uuid).await {
-                warn!("deduplication store write failed: {error:#}; continuing");
-            }
         }
 
         result.map(Some)
@@ -300,7 +301,7 @@ where
     {
         match result {
             Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
-            Ok(None) => {} // dedup hit — inner did not run
+            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store write failed
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_commit(context, Err(error)).await;
             }
@@ -313,7 +314,7 @@ where
     {
         match result {
             Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
-            Ok(None) => {} // dedup hit — inner did not run
+            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store write failed
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_abort(context, Err(error)).await;
             }
@@ -334,12 +335,19 @@ pub enum DeduplicationError<E> {
     /// Error from the inner handler.
     #[error(transparent)]
     Inner(E),
+    /// A store read or write failed.
+    ///
+    /// Classified as transient so the retry layer prevents the Kafka offset
+    /// from committing until the store is healthy.
+    #[error("deduplication store error")]
+    Store(#[source] Box<dyn StdError + Send + Sync + 'static>),
 }
 
 impl<E: ClassifyError> ClassifyError for DeduplicationError<E> {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             Self::Inner(e) => e.classify_error(),
+            Self::Store(_) => ErrorCategory::Transient,
         }
     }
 }
