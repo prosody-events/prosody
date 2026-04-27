@@ -774,7 +774,7 @@ impl<CM: HandlerMiddleware> PipelineMiddlewareStack<CM> {
         handler: T,
     ) -> Result<ProsodyConsumer<serde_json::Value>, ConsumerError>
     where
-        T: FallibleHandler + Clone + Send + Sync + 'static,
+        T: FallibleHandler<Payload = serde_json::Value> + Clone + Send + Sync + 'static,
         MP: MessageDeferStoreProvider,
         TP: TimerDeferStoreProvider,
         DP: DeduplicationStoreProvider,
@@ -1035,7 +1035,7 @@ impl ProsodyConsumer<serde_json::Value> {
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler + Clone + Send + Sync + 'static,
+        T: FallibleHandler<Payload = serde_json::Value> + Clone + Send + Sync + 'static,
     {
         // Create both stores atomically - ensures trigger and defer stores match
         let stores = StorePair::new(
@@ -1178,7 +1178,7 @@ impl ProsodyConsumer<serde_json::Value> {
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler + Clone + Send + Sync + 'static,
+        T: FallibleHandler<Payload = serde_json::Value> + Clone + Send + Sync + 'static,
     {
         let LowLatencyMiddlewareConfiguration {
             retry: retry_config,
@@ -1233,7 +1233,7 @@ impl ProsodyConsumer<serde_json::Value> {
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler + Clone + Send + Sync + 'static,
+        T: FallibleHandler<Payload = serde_json::Value> + Clone + Send + Sync + 'static,
     {
         let common_middleware = build_common_middleware(
             common_config,

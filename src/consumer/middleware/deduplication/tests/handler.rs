@@ -95,11 +95,12 @@ impl MockHandler {
 impl FallibleHandler for MockHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = serde_json::Value;
 
     async fn on_message<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage,
+        _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -153,7 +154,10 @@ fn create_handler(
     create_handler_with(inner, "1", "test-group", "test-topic", 0)
 }
 
-fn create_test_message(key: &str, event_id: Option<&str>) -> Option<ConsumerMessage> {
+fn create_test_message(
+    key: &str,
+    event_id: Option<&str>,
+) -> Option<ConsumerMessage<serde_json::Value>> {
     let semaphore = Arc::new(Semaphore::new(10));
     let permit = semaphore.try_acquire_owned().ok()?;
     let payload = match event_id {
@@ -439,11 +443,12 @@ enum ApplyEvent {
 impl FallibleHandler for ApplyProbe {
     type Error = TestError;
     type Output = ();
+    type Payload = serde_json::Value;
 
     async fn on_message<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage,
+        _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
