@@ -5,7 +5,14 @@
 //! - Timer scheduling and retry logic
 //! - Multi-message queuing per key
 //! - Successful retry and completion
-//! - Cache and Cassandra store integration
+//! - Cassandra store integration
+//!
+//! The leaf [`FallibleHandler`] impls below (`DeferTestHandler`,
+//! `PermanentErrorHandler`) rely on the default no-op `after_commit` /
+//! `after_abort` hooks. The framework guarantees exactly one of those hooks
+//! fires per `on_message` / `on_timer` invocation that runs and returns; we
+//! observe behavior end-to-end via the `event_tx` channel rather than via the
+//! apply hooks themselves.
 //!
 //! # Running Tests
 //!
@@ -106,13 +113,14 @@ struct DeferTestHandler {
 
 impl FallibleHandler for DeferTestHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
         message: ConsumerMessage,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -153,13 +161,16 @@ impl FallibleHandler for DeferTestHandler {
         _context: C,
         _timer: Trigger,
         _demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
-        // DeferRetry timers are handled by defer middleware internally
-        // and do NOT call this method. This would only be called for
-        // non-defer timers, which we don't use in these tests.
+        // DeferRetry timers are consumed by the defer middleware: it loads
+        // the deferred message and re-dispatches it through `on_message`,
+        // so this leaf `on_timer` does not run for those triggers (and
+        // therefore the framework fires neither apply hook on this leaf for
+        // that path). This method only runs for non-defer timers, which the
+        // tests in this file do not schedule.
         Ok(())
     }
 
@@ -176,13 +187,14 @@ struct PermanentErrorHandler {
 
 impl FallibleHandler for PermanentErrorHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -198,7 +210,7 @@ impl FallibleHandler for PermanentErrorHandler {
         context: C,
         timer: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {

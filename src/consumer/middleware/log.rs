@@ -1,8 +1,11 @@
 //! Error logging middleware.
 //!
 //! Logs handler failures based on [`ErrorCategory`] classification while
-//! preserving the original error flow. Typically positioned as an outer layer
-//! for comprehensive error visibility.
+//! preserving the original error flow verbatim. This middleware is a pure
+//! pass-through: it observes outcomes and emits log records, but it never
+//! changes the dispatch result or the apply-hook outcome that downstream
+//! layers see. Typically positioned as an outer layer for comprehensive
+//! error visibility.
 //!
 //! # Execution Order
 //!
@@ -14,7 +17,20 @@
 //! 2. **Log error if present** - Categorizes and logs with appropriate severity
 //! 3. Pass original result through unchanged
 //!
-//! # Error Classification
+//! **Apply Hooks:**
+//!
+//! `after_commit` and `after_abort` are forwarded verbatim to the inner
+//! handler. Logging is observability only and does not influence whether a
+//! dispatch is final (`after_commit`) or will be retried (`after_abort`),
+//! so this middleware participates in the apply-hook contract by simply
+//! relaying the framework's choice without alteration. The inner is invoked
+//! at most once per call; per-invocation invariant trivially upheld.
+//!
+//! # Error Classification (observability)
+//!
+//! These categories drive the *log severity and wording* only. They do not
+//! make any commitment about whether the work will be retried or discarded;
+//! that decision is owned by downstream durability/retry layers.
 //!
 //! - **Transient errors**: Logged as errors with context for retry analysis
 //! - **Permanent errors**: Logged as errors indicating business logic issues
@@ -39,6 +55,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
+//! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -129,19 +146,21 @@ where
     T: FallibleHandler,
 {
     type Error = T::Error;
+    type Output = T::Output;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the message with the wrapped handler
-        let Err(error) = self.handler.on_message(context, message, demand_type).await else {
-            return Ok(());
+        let error = match self.handler.on_message(context, message, demand_type).await {
+            Ok(output) => return Ok(output),
+            Err(error) => error,
         };
 
         // Log the error based on its category
@@ -165,13 +184,14 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
         // Attempt to process the timer with the wrapped handler
-        let Err(error) = self.handler.on_timer(context, trigger, demand_type).await else {
-            return Ok(());
+        let error = match self.handler.on_timer(context, trigger, demand_type).await {
+            Ok(output) => return Ok(output),
+            Err(error) => error,
         };
 
         // Log the error based on its category
@@ -190,6 +210,33 @@ where
         Err(error)
     }
 
+    /// Pass-through forwarder for the final-dispatch apply hook.
+    ///
+    /// Logging cannot change whether a dispatch is final, so this method
+    /// forwards the framework's `after_commit` call to the inner handler
+    /// verbatim. The inner handler observes exactly the `(context, result)`
+    /// the framework chose to commit on.
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        self.handler.after_commit(context, result).await;
+    }
+
+    /// Pass-through forwarder for the non-final apply hook.
+    ///
+    /// Logging cannot change whether a retry is coming, so this method
+    /// forwards the framework's `after_abort` call to the inner handler
+    /// verbatim. The inner handler observes exactly the `(context, result)`
+    /// the framework chose to abort on, with the same retry semantics it
+    /// would see without this middleware in the stack.
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        self.handler.after_abort(context, result).await;
+    }
+
     async fn shutdown(self) {
         debug!("shutting down log handler");
 
@@ -203,6 +250,17 @@ impl<T> FallibleEventHandler for LogHandler<T>
 where
     T: FallibleHandler,
 {
+    // NOTE on log-message wording:
+    //
+    // The trailing phrases ("discarding message", "discarding timer",
+    // "aborting processing") describe what *this dispatch attempt* did with
+    // the error and are intentionally preserved as stable observability
+    // strings (operators grep for them). Under the apply-hook contract they
+    // are NOT a claim that the logical event is permanently dropped: a
+    // Transient failure observed here typically results in `after_abort` and
+    // a subsequent retry through this consumer. Only the durability boundary
+    // decides whether a message is truly discarded; the messages below are
+    // accurate as per-attempt observability and should be read accordingly.
     fn on_message_error(&self, error: &Self::Error) {
         match error.classify_error() {
             ErrorCategory::Transient => {

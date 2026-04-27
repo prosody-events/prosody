@@ -16,6 +16,13 @@
 //!    handler
 //! 5. **Success/Failure**: On success advance queue, on transient re-defer, on
 //!    permanent skip
+//!
+//! # Apply hooks
+//!
+//! The inner is invoked at most once per dispatch. [`TimerDeferOutput`]
+//! encodes the routing: `Inner` forwards the framework's chosen hook,
+//! `Deferred` always fires `after_abort` (the original timer's retry is
+//! coming even though our marker commits), and `NoInner` suppresses both.
 
 use super::context::TimerDeferContext;
 use super::store::{TimerDeferStore, TimerRetryCompletionResult};
@@ -35,6 +42,22 @@ use crate::timers::{TimerType, Trigger};
 use crate::{Partition, Topic};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Output of [`TimerDeferHandler`] dispatches; drives apply-hook routing.
+///
+/// See the module-level apply-hooks section.
+#[derive(Debug)]
+pub enum TimerDeferOutput<O, E> {
+    /// Inner ran and produced an output; forward the surrounding hook.
+    Inner(O),
+    /// Inner did not run (orphan `DeferredTimer` or queue-append for an
+    /// already-deferred key) — suppress both apply hooks.
+    NoInner,
+    /// Inner ran and returned a transient error captured for retry. Both
+    /// hooks fire `after_abort(Err(e))`: the `DeferredTimer` will
+    /// re-dispatch the same logical event.
+    Deferred(E),
+}
 
 /// Per-partition handler wrapping an inner handler with timer defer logic.
 ///
@@ -71,13 +94,16 @@ where
     D: DeferralDecider,
 {
     type Error = DeferError<S::Error, T::Error>;
+    /// Encodes the inner's outcome; drives apply-hook routing. See
+    /// [`TimerDeferOutput`].
+    type Output = TimerDeferOutput<T::Output, T::Error>;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -88,6 +114,7 @@ where
         self.handler
             .on_message(wrapped_context, message, demand_type)
             .await
+            .map(TimerDeferOutput::Inner)
             .map_err(DeferError::Handler)
     }
 
@@ -96,7 +123,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -114,7 +141,56 @@ where
                 .handler
                 .on_timer(wrapped_context, trigger, demand_type)
                 .await
+                .map(TimerDeferOutput::Inner)
                 .map_err(DeferError::Handler),
+        }
+    }
+
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        // Apply-hook routing (see module docs):
+        // - Inner(o):     inner ran and succeeded         -> after_commit(Ok)
+        // - NoInner:      no inner dispatch happened      -> suppress
+        // - Deferred(e):  inner ran, transient err swallowed by defer
+        //                 -> after_abort(Err(e)) (a retry is coming)
+        // - Handler(e):   inner ran and surfaced an error -> after_commit(Err)
+        // - Store/Timer/...: defer-layer error before/after inner work; no
+        //   inner apply work to forward -> suppress.
+        match result {
+            Ok(TimerDeferOutput::Inner(output)) => {
+                self.handler.after_commit(context, Ok(output)).await;
+            }
+            Ok(TimerDeferOutput::Deferred(inner_err)) => {
+                self.handler.after_abort(context, Err(inner_err)).await;
+            }
+            Err(DeferError::Handler(error)) => {
+                self.handler.after_commit(context, Err(error)).await;
+            }
+            Ok(TimerDeferOutput::NoInner) | Err(_) => {}
+        }
+    }
+
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        // Symmetric to after_commit. The only twist: Deferred(e) still
+        // routes to after_abort(Err(e)) on the inner — the inner's prior
+        // dispatch is being rolled back regardless of whether the outer
+        // commit/abort decision committed our defer marker.
+        match result {
+            Ok(TimerDeferOutput::Inner(output)) => {
+                self.handler.after_abort(context, Ok(output)).await;
+            }
+            Ok(TimerDeferOutput::Deferred(inner_err)) => {
+                self.handler.after_abort(context, Err(inner_err)).await;
+            }
+            Err(DeferError::Handler(error)) => {
+                self.handler.after_abort(context, Err(error)).await;
+            }
+            Ok(TimerDeferOutput::NoInner) | Err(_) => {}
         }
     }
 
@@ -131,12 +207,23 @@ where
 {
     /// Handles an `Application` timer, deferring on transient failure if
     /// enabled.
+    ///
+    /// Returns:
+    /// - [`TimerDeferOutput::NoInner`] when the key was already deferred and
+    ///   this trigger is appended to its queue (inner not invoked).
+    /// - [`TimerDeferOutput::Inner`] when the inner handler ran and produced
+    ///   an output.
+    /// - [`TimerDeferOutput::Deferred`] when the inner ran, returned a
+    ///   transient error, and the middleware enqueued a retry. The wrapped
+    ///   inner error must be threaded into `after_abort` on the inner.
+    /// - `Err(DeferError::Handler(e))` when the inner ran and the error must
+    ///   surface (non-transient, or transient but deferral disabled).
     async fn handle_application_timer<C>(
         &self,
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
+    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -152,12 +239,13 @@ where
         }
 
         // Try handler, defer on transient failure if enabled
-        let Err(error) = self
+        let error = match self
             .handler
             .on_timer(context.clone(), trigger.clone(), demand_type)
             .await
-        else {
-            return Ok(());
+        {
+            Ok(output) => return Ok(TimerDeferOutput::Inner(output)),
+            Err(error) => error,
         };
 
         if !matches!(error.classify_error(), ErrorCategory::Transient) {
@@ -169,7 +257,7 @@ where
         let should_defer = self.decider.should_defer();
 
         if enabled && should_defer {
-            return self.defer_first_timer(context, &trigger).await;
+            return self.defer_first_timer(context, &trigger, error).await;
         }
 
         debug!(
@@ -189,7 +277,7 @@ where
         &self,
         context: C,
         trigger: Trigger,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
+    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -210,7 +298,8 @@ where
             .await
             .map_err(DeferError::Store)?
         else {
-            // Queue empty - clear orphaned timer
+            // Queue empty - clear orphaned timer. Inner did not run, so the
+            // inner has no apply work for this dispatch.
             debug!(
                 key = ?key,
                 topic = %self.topic,
@@ -223,7 +312,7 @@ where
                 .await
                 .map_err(DeferError::Store)?;
 
-            return Ok(());
+            return Ok(TimerDeferOutput::NoInner);
         };
 
         debug!(
@@ -244,15 +333,18 @@ where
             self.source.clone(),
         );
 
-        if let Err(error) = self
+        let output = match self
             .handler
             .on_timer(context.clone(), stored_trigger.clone(), DemandType::Failure)
             .await
         {
-            return self
-                .handle_retry_failure(&context, &trigger, &stored_trigger, retry_count, error)
-                .await;
-        }
+            Ok(output) => output,
+            Err(error) => {
+                return self
+                    .handle_retry_failure(&context, &trigger, &stored_trigger, retry_count, error)
+                    .await;
+            }
+        };
 
         self.sender.timer_succeeded(
             trigger.key.clone(),
@@ -273,16 +365,23 @@ where
             "Deferred timer retry succeeded"
         );
 
-        Ok(())
+        Ok(TimerDeferOutput::Inner(output))
     }
 
-    /// Defers a timer for the first time. Schedules retry timer before storing
-    /// to ensure timer coverage on partial failure.
+    /// Defers a timer for the first time after the inner handler returned a
+    /// transient error. Schedules retry timer before storing to ensure timer
+    /// coverage on partial failure.
+    ///
+    /// Returns [`TimerDeferOutput::Deferred`] carrying the inner error so the
+    /// apply hooks can drive `after_abort(Err(inner_err))` on the inner: the
+    /// inner's prior dispatch is being rolled back even though our defer
+    /// marker commits.
     async fn defer_first_timer<C>(
         &self,
         context: C,
         trigger: &Trigger,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
+        inner_err: T::Error,
+    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -302,14 +401,16 @@ where
             "Deferred timer for timer-based retry"
         );
 
-        Ok(())
+        Ok(TimerDeferOutput::Deferred(inner_err))
     }
 
     /// Appends timer to an already-deferred key's queue (maintains ordering).
+    /// The inner handler is not invoked for this dispatch — the trigger is a
+    /// pure side-effect on the defer queue.
     async fn append_to_deferred_queue(
         &self,
         trigger: &Trigger,
-    ) -> Result<(), DeferError<S::Error, T::Error>> {
+    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>> {
         self.store
             .defer_additional_timer(trigger)
             .await
@@ -323,7 +424,7 @@ where
             "Queued timer behind already-deferred key"
         );
 
-        Ok(())
+        Ok(TimerDeferOutput::NoInner)
     }
 
     /// Handles retry failures by error category.
@@ -331,6 +432,12 @@ where
     /// `deferred_trigger` is the `DeferredTimer` that fired (used for
     /// telemetry). `stored_trigger` is the original `Application` timer
     /// retrieved from the store (used for store operations).
+    ///
+    /// On a transient error this returns [`TimerDeferOutput::Deferred`]
+    /// carrying the inner error so the apply hooks route to
+    /// `after_abort(Err(inner_err))` on the inner — the inner's retry attempt
+    /// is being rolled back and another `DeferredTimer` will re-dispatch it.
+    /// Permanent and terminal errors propagate as `Err(DeferError::Handler)`.
     async fn handle_retry_failure<C>(
         &self,
         context: &C,
@@ -338,7 +445,7 @@ where
         stored_trigger: &Trigger,
         retry_count: u32,
         error: T::Error,
-    ) -> Result<(), DeferError<S::Error, T::Error>>
+    ) -> Result<TimerDeferOutput<T::Output, T::Error>, DeferError<S::Error, T::Error>>
     where
         C: EventContext,
     {
@@ -377,7 +484,7 @@ where
                     "Re-deferred timer after transient failure"
                 );
 
-                Ok(())
+                Ok(TimerDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
                 warn!(

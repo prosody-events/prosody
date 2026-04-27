@@ -13,6 +13,19 @@
 //! 3. **Deferral**: When enabled, all transient errors are deferred. Once
 //!    deferred, transient errors always re-defer (config/decider only gate
 //!    initial deferral).
+//!
+//! # Apply hooks
+//!
+//! The inner is invoked at most once per dispatch; retries arrive as new
+//! `on_timer` dispatches, each with their own apply-hook pairing.
+//! [`MessageDeferOutput`] encodes the routing:
+//!
+//! * `Inner` — inner ran; forward the framework's chosen hook.
+//! * `Deferred` — inner ran and returned a transient error that we captured
+//!   for retry. Both hooks route to `after_abort(Err(..))`: a retry is
+//!   coming even though the defer marker itself commits.
+//! * `NoInner` — inner did not run (queue-append, orphan-timer, loader
+//!   failure, key-mismatch); suppress both hooks.
 
 use super::loader::{KafkaLoader, MessageLoader};
 use super::store::{MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult};
@@ -38,6 +51,23 @@ use tracing::{debug, info, warn};
 /// Property-based tests for defer handler invariants.
 #[cfg(test)]
 pub mod tests;
+
+/// Output of [`MessageDeferHandler`] dispatches; drives apply-hook routing.
+///
+/// See the module-level apply-hooks section for how `after_commit` /
+/// `after_abort` dispatch on these variants.
+#[derive(Debug)]
+pub enum MessageDeferOutput<O, E> {
+    /// Inner ran and produced an output.
+    Inner(O),
+    /// Inner did not run (queue-append, orphan-timer, loader failure,
+    /// key-mismatch) — suppress both apply hooks.
+    NoInner,
+    /// Inner ran and returned a transient error captured for retry. Both
+    /// apply hooks fire `after_abort(Err(E))`: the retry will re-dispatch
+    /// the same logical message.
+    Deferred(E),
+}
 
 /// Middleware that defers transiently-failed messages for timer-based retry.
 ///
@@ -290,11 +320,17 @@ where
     }
 
     /// Appends message to an already-deferred key's queue (maintains ordering).
+    ///
+    /// The inner handler does *not* run on this dispatch — the message is
+    /// queued behind an existing deferred entry and will be retried later
+    /// when the deferred timer fires. Returns
+    /// [`MessageDeferOutput::NoInner`] so both inner apply hooks are
+    /// suppressed.
     async fn append_to_deferred_queue(
         &self,
         message_key: &Key,
         offset: Offset,
-    ) -> DeferResult<(), M::Error, T::Error, L::Error> {
+    ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error> {
         self.store
             .defer_additional_message(message_key, offset)
             .await
@@ -308,13 +344,20 @@ where
             "Queued message behind already-deferred key"
         );
 
-        Ok(())
+        Ok(MessageDeferOutput::NoInner)
     }
 
     /// Handles retry failures by error category:
-    /// - **Transient**: Always re-defer (maintains completion invariant)
-    /// - **Permanent**: Remove and advance (unblocks queue)
-    /// - **Terminal**: Propagate without state change (shutdown handling)
+    /// - **Transient**: Always re-defer (maintains completion invariant).
+    ///   Returns [`MessageDeferOutput::Deferred`] carrying the inner error so
+    ///   that `after_abort(Err(e))` is forwarded to the inner — the same
+    ///   logical message will be re-dispatched when the rescheduled timer
+    ///   fires.
+    /// - **Permanent**: Remove and advance (unblocks queue). Surfaces as
+    ///   `Err(DeferError::Handler(error))`; the inner sees its chosen apply
+    ///   hook with `Err(error)` (final — the message will not be retried).
+    /// - **Terminal**: Propagate without state change (shutdown handling).
+    ///   Surfaces as `Err(DeferError::Handler(error))`.
     async fn handle_retry_failure<C>(
         &self,
         context: &C,
@@ -322,7 +365,7 @@ where
         offset: Offset,
         retry_count: u32,
         error: T::Error,
-    ) -> DeferResult<(), M::Error, T::Error, L::Error>
+    ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -332,7 +375,11 @@ where
         match error_category {
             ErrorCategory::Transient => {
                 // Always re-defer: message is committed to queue, dropping would
-                // violate ordering for messages queued behind it.
+                // violate ordering for messages queued behind it. The inner
+                // ran and returned `error`; we capture it in `Deferred` so
+                // the inner sees `after_abort(Err(error))` (its attempt is
+                // being rolled back; a retry is coming via the rescheduled
+                // timer).
                 let new_retry_count = self
                     .store
                     .increment_retry_count(message_key, retry_count)
@@ -359,7 +406,7 @@ where
                     "Re-deferred message after transient failure"
                 );
 
-                Ok(())
+                Ok(MessageDeferOutput::Deferred(error))
             }
             ErrorCategory::Permanent => {
                 warn!(
@@ -400,8 +447,12 @@ where
         }
     }
 
-    /// Loads message from Kafka. Returns `None` if load failed and was handled
-    /// (timer rescheduled). Returns `Err` only for terminal errors.
+    /// Loads message from Kafka. Returns `None` if the load failed and was
+    /// handled at the defer layer (timer rescheduled, queue advanced past a
+    /// permanently broken offset, or key-mismatch skip) — the inner handler
+    /// is *not* invoked for this dispatch and the caller surfaces
+    /// [`MessageDeferOutput::NoInner`]. Returns `Err` only for terminal
+    /// loader errors.
     async fn load_deferred_message<C>(
         &self,
         context: &C,
@@ -445,7 +496,10 @@ where
     }
 
     /// Handles loader errors: permanent skips, transient retries, terminal
-    /// propagates.
+    /// propagates. The inner handler does not run on any of these paths, so
+    /// the caller maps the resulting `Ok(None)` / `Err(Loader)` to
+    /// [`MessageDeferOutput::NoInner`] / `Err` and both inner apply hooks
+    /// stay suppressed.
     async fn handle_load_failure<C>(
         &self,
         context: &C,
@@ -496,12 +550,19 @@ where
 
     /// Defers a message for the first time. Schedules timer before storing
     /// to ensure timer coverage on partial failure.
+    ///
+    /// `inner_error` is the transient error returned by the inner handler
+    /// for *this* dispatch — it is preserved in the returned
+    /// [`MessageDeferOutput::Deferred`] so the inner sees
+    /// `after_abort(Err(inner_error))` (its attempt is being rolled back;
+    /// the deferred timer will re-dispatch the same logical message).
     async fn defer_message<C>(
         &self,
         context: C,
         message_key: &Key,
         offset: Offset,
-    ) -> DeferResult<(), M::Error, T::Error, L::Error>
+        inner_error: T::Error,
+    ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -521,10 +582,18 @@ where
             "Deferred message for timer-based retry"
         );
 
-        Ok(())
+        Ok(MessageDeferOutput::Deferred(inner_error))
     }
 
     /// Retries a deferred message and emits timer + message telemetry.
+    ///
+    /// On inner success: returns [`MessageDeferOutput::Inner`] (forward
+    /// `after_commit(Ok(..))` to the inner). On inner Transient failure:
+    /// the queued message is re-deferred and the inner sees
+    /// `after_abort(Err(..))` via [`MessageDeferOutput::Deferred`]. On
+    /// Permanent / Terminal failure: surfaces as
+    /// `Err(DeferError::Handler(_))` and the inner sees the wrapping
+    /// framework's chosen apply hook with that `Err`.
     async fn retry_deferred_message<C>(
         &self,
         context: C,
@@ -533,7 +602,7 @@ where
         offset: Offset,
         retry_count: u32,
         message: ConsumerMessage,
-    ) -> DeferResult<(), M::Error, T::Error, L::Error>
+    ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -557,7 +626,7 @@ where
             .on_message(context.clone(), message, DemandType::Failure)
             .await
         {
-            Ok(()) => {
+            Ok(output) => {
                 self.sender.timer_succeeded(
                     trigger.key.clone(),
                     trigger.time,
@@ -581,7 +650,7 @@ where
                     partition = self.partition,
                     "Deferred message retry succeeded"
                 );
-                Ok(())
+                Ok(MessageDeferOutput::Inner(output))
             }
             Err(error) => {
                 let error_category = error.classify_error();
@@ -612,17 +681,21 @@ where
     D: DeferralDecider,
 {
     type Error = DeferError<M::Error, T::Error, L::Error>;
+    /// Encodes the inner's outcome; drives apply-hook routing. See
+    /// [`MessageDeferOutput`] and the module-level apply-hooks section.
+    type Output = MessageDeferOutput<T::Output, T::Error>;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
-        // Already deferred: queue behind existing messages (ordering invariant).
+        // Already deferred: queue behind existing messages (ordering
+        // invariant). Inner does not run -> NoInner.
         if self
             .store
             .is_deferred(message.key())
@@ -638,12 +711,13 @@ where
         let message_key = message.key().clone();
         let offset = message.offset();
 
-        let Err(error) = self
+        let error = match self
             .handler
             .on_message(context.clone(), message, demand_type)
             .await
-        else {
-            return Ok(());
+        {
+            Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
+            Err(error) => error,
         };
 
         if !matches!(error.classify_error(), ErrorCategory::Transient) {
@@ -673,7 +747,8 @@ where
             return Err(DeferError::Handler(error));
         }
 
-        self.defer_message(context, &message_key, offset).await
+        self.defer_message(context, &message_key, offset, error)
+            .await
     }
 
     async fn on_timer<C>(
@@ -681,7 +756,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -690,6 +765,7 @@ where
                 .handler
                 .on_timer(context, trigger, demand_type)
                 .await
+                .map(MessageDeferOutput::Inner)
                 .map_err(DeferError::Handler);
         }
 
@@ -709,6 +785,7 @@ where
             .await
             .map_err(DeferError::Store)?
         else {
+            // Orphan timer for an empty queue — inner did not run.
             debug!(
                 key = ?message_key,
                 topic = %self.topic,
@@ -719,14 +796,17 @@ where
                 .delete_key(message_key)
                 .await
                 .map_err(DeferError::Store)?;
-            return Ok(());
+            return Ok(MessageDeferOutput::NoInner);
         };
 
         let Some(message) = self
             .load_deferred_message(&context, message_key, offset, retry_count)
             .await?
         else {
-            return Ok(());
+            // Loader handled the failure (retry rescheduled, queue advanced
+            // past a permanent skip, or key-mismatch skip) — inner did not
+            // run for this dispatch.
+            return Ok(MessageDeferOutput::NoInner);
         };
 
         debug!(
@@ -740,6 +820,47 @@ where
 
         self.retry_deferred_message(context, &trigger, message_key, offset, retry_count, message)
             .await
+    }
+
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        // Apply-hook routing (see module docs):
+        // - Inner(o):    inner ran and succeeded           -> after_commit(Ok)
+        // - NoInner:     no inner dispatch happened        -> suppress
+        // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e)) (retry coming)
+        // - Handler(e):  inner ran and surfaced an error   -> after_commit(Err)
+        // - Store/Loader/...: defer-layer error, inner never ran -> suppress
+        match result {
+            Ok(MessageDeferOutput::Inner(output)) => {
+                self.handler.after_commit(context, Ok(output)).await;
+            }
+            Ok(MessageDeferOutput::Deferred(error)) => {
+                self.handler.after_abort(context, Err(error)).await;
+            }
+            Err(DeferError::Handler(error)) => {
+                self.handler.after_commit(context, Err(error)).await;
+            }
+            Ok(MessageDeferOutput::NoInner) | Err(_) => {}
+        }
+    }
+
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        // Symmetric to after_commit. The only twist: Deferred(e) still routes
+        // to after_abort(Err(e)) regardless of the outer commit/abort decision.
+        match result {
+            Ok(MessageDeferOutput::Inner(output)) => {
+                self.handler.after_abort(context, Ok(output)).await;
+            }
+            Ok(MessageDeferOutput::Deferred(error)) | Err(DeferError::Handler(error)) => {
+                self.handler.after_abort(context, Err(error)).await;
+            }
+            Ok(MessageDeferOutput::NoInner) | Err(_) => {}
+        }
     }
 
     async fn shutdown(self) {

@@ -99,11 +99,8 @@ mod tests {
             .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
 
         let cassandra_store = CassandraStore::new(&config).await?;
-        let queries = Arc::new(
-            DeduplicationQueries::new(cassandra_store.session(), "prosody_test")
-                .await?
-                .with_local_one_consistency(),
-        );
+        let queries =
+            Arc::new(DeduplicationQueries::new(cassandra_store.session(), "prosody_test").await?);
 
         Ok::<_, color_eyre::Report>(CassandraDeduplicationStore {
             store: cassandra_store,

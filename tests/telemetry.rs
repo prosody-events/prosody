@@ -80,6 +80,7 @@ struct ForwardHandler {
 
 impl FallibleHandler for ForwardHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
@@ -117,6 +118,7 @@ struct FailingHandler {
 
 impl FallibleHandler for FailingHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
@@ -155,6 +157,7 @@ struct TimerSchedulingHandler {
 
 impl FallibleHandler for TimerSchedulingHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
@@ -201,6 +204,7 @@ struct TimerFailingHandler {
 
 impl FallibleHandler for TimerFailingHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
@@ -246,6 +250,7 @@ struct TimerCancellingHandler {
 
 impl FallibleHandler for TimerCancellingHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
@@ -294,6 +299,7 @@ struct ClearAndScheduleHandler {
 
 impl FallibleHandler for ClearAndScheduleHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
@@ -361,6 +367,7 @@ struct InlineReplacementHandler {
 
 impl FallibleHandler for InlineReplacementHandler {
     type Error = TestError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
@@ -443,6 +450,7 @@ struct TransientMessageHandler {
 
 impl FallibleHandler for TransientMessageHandler {
     type Error = TransientError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
@@ -494,6 +502,7 @@ struct TransientTimerHandler {
 
 impl FallibleHandler for TransientTimerHandler {
     type Error = TransientError;
+    type Output = ();
 
     async fn on_message<C>(
         &self,

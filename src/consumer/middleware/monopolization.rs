@@ -14,6 +14,26 @@
 //! - Tracks execution intervals per key using `IntervalSet<u64>`
 //! - Maintains rolling 5-minute window of execution intervals
 //!
+//! # Apply-hook contract
+//!
+//! This middleware is a "reject-at-this-layer" gate. The `FallibleHandler`
+//! invariant requires that for every `on_message`/`on_timer` call on the
+//! inner handler that runs and returns, the framework must call exactly one
+//! of `after_commit`/`after_abort` on that same inner handler — and if the
+//! inner handler did NOT run, neither apply hook fires for it.
+//!
+//! There are exactly two work outcomes here:
+//!
+//! - **Inner ran** — `Ok(_)` or `Err(MonopolizationError::Handler(_))`. The
+//!   apply hook is forwarded to the inner handler with the inner-typed
+//!   result.
+//! - **Inner did NOT run** — `Err(MonopolizationError::Monopolization { .. })`
+//!   was produced at this layer before delegation. The inner handler's apply
+//!   hook is suppressed.
+//!
+//! The inner is invoked at most once per call; per-invocation invariant
+//! trivially upheld.
+//!
 //! # Configuration
 //!
 //! - `monopolization_threshold`: Execution time ratio threshold (default: 0.9
@@ -233,13 +253,14 @@ where
     T: FallibleHandler,
 {
     type Error = MonopolizationError<T::Error>;
+    type Output = T::Output;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -259,7 +280,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -272,6 +293,63 @@ where
             .on_timer(context, trigger, demand_type)
             .await
             .map_err(MonopolizationError::Handler)
+    }
+
+    /// Forwards the FINAL apply hook to the inner handler iff the inner
+    /// handler actually ran.
+    ///
+    /// Work-centric reasoning, per the `FallibleHandler` invariant:
+    ///
+    /// - `Ok(_)` — inner ran and succeeded. Forward `Ok` so the inner
+    ///   handler observes its own success exactly once.
+    /// - `Err(Handler(inner))` — inner ran and returned an error. Unwrap and
+    ///   forward the inner-typed error so the inner handler sees its own
+    ///   failure exactly once.
+    /// - `Err(Monopolization { .. })` — rejection produced at THIS layer
+    ///   before delegation; the inner handler did not run. Suppress its
+    ///   apply hook entirely; firing it would violate the invariant by
+    ///   reporting an outcome for work that never happened.
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        match result {
+            Ok(output) => self.handler.after_commit(context, Ok(output)).await,
+            Err(MonopolizationError::Handler(inner)) => {
+                self.handler.after_commit(context, Err(inner)).await;
+            }
+            // Monopolization rejection happened at this layer; the inner
+            // handler did not run, so there is no inner-typed error to
+            // forward and no apply hook is owed to it.
+            Err(MonopolizationError::Monopolization { .. }) => {}
+        }
+    }
+
+    /// Forwards the non-final apply hook to the inner handler iff the inner
+    /// handler actually ran (a retry of the same logical event is coming).
+    ///
+    /// Work-centric reasoning, per the `FallibleHandler` invariant:
+    ///
+    /// - `Ok(_)` / `Err(Handler(_))` — inner ran. Forward the inner-typed
+    ///   result so the inner handler can observe the abort and prepare for
+    ///   the upcoming retry.
+    /// - `Err(Monopolization { .. })` — rejection produced at THIS layer
+    ///   before delegation; the inner handler did not run. Suppress its
+    ///   apply hook. The retry will reach this layer again and either be
+    ///   admitted (and then dispatched to the inner) or rejected once more
+    ///   here, and the inner handler must not see a phantom abort for work
+    ///   it never performed.
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        match result {
+            Ok(output) => self.handler.after_abort(context, Ok(output)).await,
+            Err(MonopolizationError::Handler(inner)) => {
+                self.handler.after_abort(context, Err(inner)).await;
+            }
+            Err(MonopolizationError::Monopolization { .. }) => {}
+        }
     }
 
     async fn shutdown(self) {
@@ -532,13 +610,14 @@ mod tests {
 
     impl FallibleHandler for MockHandler {
         type Error = MockError;
+        type Output = ();
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -551,7 +630,7 @@ mod tests {
             _context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {

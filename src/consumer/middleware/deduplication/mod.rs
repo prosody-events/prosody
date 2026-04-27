@@ -11,6 +11,12 @@
 //! The middleware sits just inside the retry layer on the pipeline consumer.
 //! It is optional — setting `cache_capacity = 0` disables it via the
 //! [`Option<M>`](crate::consumer::middleware::optional) pattern.
+//!
+//! # Apply hooks
+//!
+//! `Output` encodes whether the inner ran: `Some` means the inner ran and
+//! its apply hook is forwarded; `None` means a dedup hit prevented the inner
+//! from running and both hooks are suppressed.
 
 pub mod cassandra;
 pub mod config;
@@ -20,12 +26,13 @@ pub mod store;
 #[cfg(test)]
 pub mod tests;
 
+use std::error::Error as StdError;
 use std::hash::Hasher;
 use std::sync::Arc;
 
 use quick_cache::sync::Cache;
 use thiserror::Error;
-use tracing::{debug, info_span, warn};
+use tracing::{debug, info_span};
 use uuid::Uuid;
 use validator::Validate;
 use xxhash_rust::xxh3::Xxh3Default;
@@ -196,13 +203,16 @@ where
     S: DeduplicationStore,
 {
     type Error = DeduplicationError<T::Error>;
+    /// `Some` — inner ran; forward apply hook. `None` — dedup hit; suppress
+    /// both hooks.
+    type Output = Option<T::Output>;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -218,27 +228,26 @@ where
             .in_scope(|| {
                 debug!("message deduplicated via local cache");
             });
-            return Ok(());
+            return Ok(None);
         }
 
         // 2. Check persistent store
-        match self.store.exists(dedup_uuid).await {
-            Ok(true) => {
-                self.cache.insert(dedup_uuid, ());
-                info_span!(
-                    parent: message.span(),
-                    "message.filtered",
-                    reason = "deduplicated"
-                )
-                .in_scope(|| {
-                    debug!("message deduplicated via persistent store");
-                });
-                return Ok(());
-            }
-            Ok(false) => {}
-            Err(error) => {
-                warn!("deduplication store read failed: {error:#}; treating as cache miss");
-            }
+        if self
+            .store
+            .exists(dedup_uuid)
+            .await
+            .map_err(|e| DeduplicationError::Store(Box::new(e)))?
+        {
+            self.cache.insert(dedup_uuid, ());
+            info_span!(
+                parent: message.span(),
+                "message.filtered",
+                reason = "deduplicated"
+            )
+            .in_scope(|| {
+                debug!("message deduplicated via persistent store");
+            });
+            return Ok(None);
         }
 
         // 3. Process message
@@ -255,18 +264,19 @@ where
         // transient so the retry layer can reattempt, terminal because
         // processing is being aborted.
         let should_dedup = match &result {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(e) => matches!(e.classify_error(), ErrorCategory::Permanent),
         };
 
         if should_dedup {
+            self.store
+                .insert(dedup_uuid)
+                .await
+                .map_err(|e| DeduplicationError::Store(Box::new(e)))?;
             self.cache.insert(dedup_uuid, ());
-            if let Err(error) = self.store.insert(dedup_uuid).await {
-                warn!("deduplication store write failed: {error:#}; continuing");
-            }
         }
 
-        result
+        result.map(Some)
     }
 
     async fn on_timer<C>(
@@ -274,14 +284,41 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
         self.inner
             .on_timer(context, trigger, demand_type)
             .await
+            .map(Some)
             .map_err(DeduplicationError::Inner)
+    }
+
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        match result {
+            Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
+            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store write failed
+            Err(DeduplicationError::Inner(error)) => {
+                self.inner.after_commit(context, Err(error)).await;
+            }
+        }
+    }
+
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        match result {
+            Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
+            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store write failed
+            Err(DeduplicationError::Inner(error)) => {
+                self.inner.after_abort(context, Err(error)).await;
+            }
+        }
     }
 
     async fn shutdown(self) {
@@ -298,12 +335,19 @@ pub enum DeduplicationError<E> {
     /// Error from the inner handler.
     #[error(transparent)]
     Inner(E),
+    /// A store read or write failed.
+    ///
+    /// Classified as transient so the retry layer prevents the Kafka offset
+    /// from committing until the store is healthy.
+    #[error("deduplication store error")]
+    Store(#[source] Box<dyn StdError + Send + Sync + 'static>),
 }
 
 impl<E: ClassifyError> ClassifyError for DeduplicationError<E> {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             Self::Inner(e) => e.classify_error(),
+            Self::Store(_) => ErrorCategory::Transient,
         }
     }
 }

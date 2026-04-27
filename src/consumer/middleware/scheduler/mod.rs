@@ -3,6 +3,26 @@
 //! Enforces global concurrency limits while prioritizing keys by accumulated
 //! virtual time, preventing monopolization by high-throughput keys and ensuring
 //! timely execution of waiting tasks through urgency boosting.
+//!
+//! # Apply-hook contract
+//!
+//! This middleware acquires a permit from the dispatcher before delegating to
+//! the inner handler. Permit acquisition can fail at this layer, in which case
+//! the inner handler's `on_message` / `on_timer` is never invoked.
+//!
+//! Per the `FallibleHandler` invariant, an apply hook (`after_commit` or
+//! `after_abort`) MUST fire on the inner handler exactly once — and only if —
+//! its `on_message` / `on_timer` actually ran. Therefore:
+//!
+//! - When the inner ran (the result is `Ok` or `Err(Handler(_))`), this
+//!   middleware forwards the corresponding apply hook to the inner.
+//! - When permit acquisition failed (`Err(PermitAcquisition(_))`), the inner
+//!   did not run, so this middleware suppresses the apply hook for the inner.
+//!   The outcome of the dispatch (final vs. retry) is captured by which hook
+//!   the framework calls on this `SchedulerHandler`, not on the inner.
+//!
+//! The inner is invoked at most once per call; per-invocation invariant
+//! trivially upheld.
 
 use derive_builder::Builder;
 use std::time::Duration;
@@ -273,13 +293,14 @@ where
     T: FallibleHandler,
 {
     type Error = SchedulerError<T::Error>;
+    type Output = T::Output;
 
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -297,7 +318,7 @@ where
         context: C,
         trigger: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -308,6 +329,58 @@ where
             .on_timer(context, trigger, demand_type)
             .await
             .map_err(SchedulerError::Handler)
+    }
+
+    /// Forwards the final-dispatch apply hook to the inner handler iff its
+    /// `on_message` / `on_timer` actually ran.
+    ///
+    /// Work-centric reasoning:
+    /// - `Ok(_)` and `Err(Handler(_))` both originate from the inner having
+    ///   run and returned, so the inner's `after_commit` is invoked exactly
+    ///   once with the corresponding result.
+    /// - `Err(PermitAcquisition(_))` is produced at this layer before the
+    ///   inner is reached, so the inner did not run; per the
+    ///   `FallibleHandler` invariant, neither apply hook may fire on the
+    ///   inner in this case.
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        match result {
+            Ok(output) => self.handler.after_commit(context, Ok(output)).await,
+            Err(SchedulerError::Handler(inner)) => {
+                self.handler.after_commit(context, Err(inner)).await;
+            }
+            // Permit acquisition failed at this layer; the inner handler's
+            // `on_message` / `on_timer` did not run, so per the
+            // `FallibleHandler` invariant we must not fire any apply hook on
+            // the inner for this dispatch.
+            Err(SchedulerError::PermitAcquisition(_)) => {}
+        }
+    }
+
+    /// Forwards the non-final (retry-pending) apply hook to the inner handler
+    /// iff its `on_message` / `on_timer` actually ran.
+    ///
+    /// Work-centric reasoning mirrors `after_commit`: only outcomes where the
+    /// inner actually executed (`Ok(_)` or `Err(Handler(_))`) propagate to the
+    /// inner's `after_abort`. A `PermitAcquisition` error is a rejection at
+    /// this layer — the inner did no work, so no apply hook is fired on it.
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        match result {
+            Ok(output) => self.handler.after_abort(context, Ok(output)).await,
+            Err(SchedulerError::Handler(inner)) => {
+                self.handler.after_abort(context, Err(inner)).await;
+            }
+            // Permit acquisition failed at this layer; the inner handler's
+            // `on_message` / `on_timer` did not run, so per the
+            // `FallibleHandler` invariant we must not fire any apply hook on
+            // the inner for this dispatch.
+            Err(SchedulerError::PermitAcquisition(_)) => {}
+        }
     }
 
     async fn shutdown(self) {

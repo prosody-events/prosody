@@ -15,15 +15,28 @@
 //!
 //! # Cancellation Behavior
 //!
-//! The middleware distinguishes between two types of cancellation:
+//! The middleware distinguishes between three cases:
 //!
-//! - **Shutdown** (partition revoked): Returns [`CancellationError::Shutdown`]
-//!   classified as [`ErrorCategory::Terminal`]. Processing must stop
-//!   immediately to release the partition.
+//! - **Shutdown** (partition revoked, observed before inner ran): Returns
+//!   [`CancellationError::Shutdown`] classified as [`ErrorCategory::Terminal`].
+//!   Processing must stop immediately to release the partition. The inner
+//!   handler did *not* run.
+//!
+//! - **Shutdown after inner ran**: The inner handler ran and returned a
+//!   Transient error, but shutdown was signaled mid-flight. Returns
+//!   [`CancellationError::ShutdownAfterInner`] (Terminal). The inner attempt
+//!   *did* run and will be redelivered, so its apply-hook (`after_abort`)
+//!   must still fire with the original inner error.
 //!
 //! - **Message cancellation**: Returns [`CancellationError::MessageCancelled`]
 //!   classified as [`ErrorCategory::Transient`]. The retry middleware will
 //!   continue retrying rather than aborting the message.
+//!
+//! # Apply hooks
+//!
+//! Forwards apply hooks to the inner only if the inner ran on this dispatch.
+//! Short-circuiting on `Shutdown` or `MessageCancelled` suppresses both hooks
+//! since the inner never executed.
 //!
 //! # Usage
 //!
@@ -45,6 +58,7 @@
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
 //! #     type Error = Infallible;
+//! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
@@ -124,19 +138,18 @@ where
     T: FallibleHandler,
 {
     type Error = CancellationError<T::Error>;
+    type Output = T::Output;
 
     /// Checks cancellation state, then delegates to inner handler if clear.
-    ///
-    /// Post-call: Transient errors are promoted to
-    /// [`CancellationError::Shutdown`] (Terminal) if shutdown is active
-    /// when the handler returns, ensuring outer middleware layers treat the
-    /// failure as unrecoverable rather than retrying or deferring.
+    /// Transient errors from the inner are promoted to
+    /// [`CancellationError::ShutdownAfterInner`] if shutdown is active on
+    /// return, preserving the inner error for `after_abort` routing.
     async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -154,7 +167,7 @@ where
                 if context.is_shutdown()
                     && matches!(error.classify_error(), ErrorCategory::Transient)
                 {
-                    CancellationError::Shutdown
+                    CancellationError::ShutdownAfterInner(error)
                 } else {
                     CancellationError::Handler(error)
                 }
@@ -166,7 +179,7 @@ where
         context: C,
         timer: Trigger,
         demand_type: DemandType,
-    ) -> Result<(), Self::Error>
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext,
     {
@@ -184,11 +197,47 @@ where
                 if context.is_shutdown()
                     && matches!(error.classify_error(), ErrorCategory::Transient)
                 {
-                    CancellationError::Shutdown
+                    CancellationError::ShutdownAfterInner(error)
                 } else {
                     CancellationError::Handler(error)
                 }
             })
+    }
+
+    /// Forwards `after_commit` to the inner if the inner ran; suppresses if
+    /// the dispatch was short-circuited before the inner.
+    async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        match result {
+            Ok(output) => self.handler.after_commit(context, Ok(output)).await,
+            Err(
+                CancellationError::Handler(inner) | CancellationError::ShutdownAfterInner(inner),
+            ) => {
+                self.handler.after_commit(context, Err(inner)).await;
+            }
+            // Inner did not run — nothing to forward.
+            Err(CancellationError::Shutdown | CancellationError::MessageCancelled) => {}
+        }
+    }
+
+    /// Forwards `after_abort` to the inner if the inner ran; suppresses if
+    /// the dispatch was short-circuited before the inner.
+    async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
+    where
+        C: EventContext,
+    {
+        match result {
+            Ok(output) => self.handler.after_abort(context, Ok(output)).await,
+            Err(
+                CancellationError::Handler(inner) | CancellationError::ShutdownAfterInner(inner),
+            ) => {
+                self.handler.after_abort(context, Err(inner)).await;
+            }
+            // Inner did not run — nothing to forward.
+            Err(CancellationError::Shutdown | CancellationError::MessageCancelled) => {}
+        }
     }
 
     async fn shutdown(self) {
@@ -198,23 +247,27 @@ where
 }
 
 /// Errors from the cancellation middleware.
+///
+/// `Shutdown` and `MessageCancelled` mean the inner did not run (no apply
+/// hook forwarded). `ShutdownAfterInner` and `Handler` mean it did.
 #[derive(Debug, Error)]
 pub enum CancellationError<T> {
-    /// Indicates shutdown was requested (partition revoked).
-    ///
-    /// Classified as [`ErrorCategory::Terminal`] - processing must stop
-    /// immediately to release the partition.
+    /// Partition revoked before the inner ran. Terminal; inner apply hooks
+    /// suppressed.
     #[error("partition is being revoked")]
     Shutdown,
 
-    /// Indicates message processing was cancelled.
-    ///
-    /// Classified as [`ErrorCategory::Transient`] - retry middleware will
-    /// continue retrying rather than aborting the message.
+    /// Inner ran and returned a Transient error while shutdown was signaled;
+    /// promoted to Terminal. Carries the inner error for `after_abort`.
+    #[error("partition is being revoked (inner attempt: {0:#})")]
+    ShutdownAfterInner(T),
+
+    /// Message cancelled before the inner ran. Transient; inner apply hooks
+    /// suppressed.
     #[error("message processing was cancelled")]
     MessageCancelled,
 
-    /// Wraps an error from the underlying handler.
+    /// Inner ran and returned an error that was not promoted.
     #[error("handler error: {0:#}")]
     Handler(T),
 }
@@ -225,7 +278,9 @@ where
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            CancellationError::Shutdown => ErrorCategory::Terminal,
+            CancellationError::Shutdown | CancellationError::ShutdownAfterInner(_) => {
+                ErrorCategory::Terminal
+            }
             CancellationError::MessageCancelled => ErrorCategory::Transient,
             CancellationError::Handler(error) => error.classify_error(),
         }
@@ -293,13 +348,14 @@ mod tests {
 
     impl FallibleHandler for MockHandler {
         type Error = TestError;
+        type Output = ();
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -312,7 +368,7 @@ mod tests {
             _context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -507,13 +563,14 @@ mod tests {
 
     impl FallibleHandler for ShutdownTriggerHandler {
         type Error = TestError;
+        type Output = ();
 
         async fn on_message<C>(
             &self,
             _context: C,
             _message: ConsumerMessage,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -526,7 +583,7 @@ mod tests {
             _context: C,
             _trigger: Trigger,
             _demand_type: DemandType,
-        ) -> Result<(), Self::Error>
+        ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
@@ -551,7 +608,13 @@ mod tests {
             .on_message(context, message, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(CancellationError::Shutdown)));
+        // The inner ran and returned a Transient err while shutdown was
+        // signaled; we promote it to Terminal but keep the inner err so
+        // its apply hook (`after_abort`) can still fire.
+        assert!(matches!(
+            result,
+            Err(CancellationError::ShutdownAfterInner(_))
+        ));
         assert!(matches!(
             result.as_ref().err().map(ClassifyError::classify_error),
             Some(ErrorCategory::Terminal)
@@ -592,7 +655,10 @@ mod tests {
             .on_timer(context, trigger, DemandType::Normal)
             .await;
 
-        assert!(matches!(result, Err(CancellationError::Shutdown)));
+        assert!(matches!(
+            result,
+            Err(CancellationError::ShutdownAfterInner(_))
+        ));
         assert!(matches!(
             result.as_ref().err().map(ClassifyError::classify_error),
             Some(ErrorCategory::Terminal)
@@ -617,5 +683,111 @@ mod tests {
             result.as_ref().err().map(ClassifyError::classify_error),
             Some(ErrorCategory::Permanent)
         ));
+    }
+
+    /// Records results passed to `after_commit` / `after_abort`.
+    #[derive(Clone)]
+    struct RecordingHandler {
+        commit_calls: Arc<parking_lot::Mutex<Vec<Result<(), TestError>>>>,
+        abort_calls: Arc<parking_lot::Mutex<Vec<Result<(), TestError>>>>,
+    }
+
+    impl RecordingHandler {
+        fn new() -> Self {
+            Self {
+                commit_calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                abort_calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl FallibleHandler for RecordingHandler {
+        type Error = TestError;
+        type Output = ();
+
+        async fn on_message<C>(
+            &self,
+            _context: C,
+            _message: ConsumerMessage,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext,
+        {
+            Ok(())
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext,
+        {
+            Ok(())
+        }
+
+        async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext,
+        {
+            self.commit_calls.lock().push(result);
+        }
+
+        async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext,
+        {
+            self.abort_calls.lock().push(result);
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    #[tokio::test]
+    async fn after_abort_forwards_inner_error_when_shutdown_promoted() {
+        let recorder = RecordingHandler::new();
+        let guard_handler = CancellationHandler::new(recorder.clone());
+        let context = MockEventContext::new();
+
+        let promoted: Result<(), CancellationError<TestError>> = Err(
+            CancellationError::ShutdownAfterInner(TestError(ErrorCategory::Transient)),
+        );
+
+        guard_handler.after_abort(context, promoted).await;
+
+        let abort_calls = recorder.abort_calls.lock();
+        assert_eq!(
+            abort_calls.len(),
+            1,
+            "inner after_abort must fire exactly once"
+        );
+        assert!(matches!(
+            &abort_calls[0],
+            Err(TestError(ErrorCategory::Transient))
+        ));
+        assert!(
+            recorder.commit_calls.lock().is_empty(),
+            "after_commit must not fire on the abort path"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_hooks_suppressed_when_inner_did_not_run() {
+        let recorder = RecordingHandler::new();
+        let guard_handler = CancellationHandler::new(recorder.clone());
+        let context = MockEventContext::new();
+
+        let pre_call: Result<(), CancellationError<TestError>> = Err(CancellationError::Shutdown);
+        guard_handler.after_abort(context.clone(), pre_call).await;
+
+        let pre_call_cancel: Result<(), CancellationError<TestError>> =
+            Err(CancellationError::MessageCancelled);
+        guard_handler.after_abort(context, pre_call_cancel).await;
+
+        assert!(recorder.abort_calls.lock().is_empty());
+        assert!(recorder.commit_calls.lock().is_empty());
     }
 }
