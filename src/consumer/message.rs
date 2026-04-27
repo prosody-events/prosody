@@ -156,7 +156,7 @@ impl<P> UncommittedMessage<P> {
     }
 }
 
-impl<P: Send + 'static> Uncommitted for UncommittedMessage<P> {
+impl<P: Send + Sync + 'static> Uncommitted for UncommittedMessage<P> {
     /// Commit the message offset to Kafka and log the action.
     async fn commit(self) {
         debug!(
@@ -220,7 +220,8 @@ impl<P: Send + 'static> ProcessScope for UncommittedMessage<P> {
 ///
 /// Internally wraps its data in an `Arc<ConsumerMessageValue<P>>` with shared
 /// processing state across clones.
-#[derive(Clone, Debug)]
+#[derive(Educe)]
+#[educe(Clone, Debug(bound = ""))]
 pub struct ConsumerMessage<P> {
     value: Arc<ConsumerMessageValue<P>>,
     processing_state: Arc<ArcSwapOption<ProcessingState>>,

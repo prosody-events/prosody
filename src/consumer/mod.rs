@@ -46,10 +46,12 @@
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
+//!     type Payload = serde_json::Value;
+//!
 //!     async fn on_message<C>(
 //!         &self,
 //!         context: C,
-//!         message: UncommittedMessage,
+//!         message: UncommittedMessage<serde_json::Value>,
 //!         _demand_type: DemandType,
 //!     ) where
 //!         C: EventContext,
@@ -121,6 +123,7 @@
 //! - `heartbeat`: Monitoring for stalled processes
 //! - `probes`: HTTP endpoints for health and readiness checking
 
+use crate::Codec;
 use crate::cassandra::CassandraStore;
 pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
@@ -223,14 +226,14 @@ type WatermarkVersion = CachePadded<AtomicUsize>;
 /// Maps (Topic, Partition) pairs to their corresponding `PartitionManager`
 /// instances. Protected by a `RwLock` to allow concurrent reads with exclusive
 /// writes.
-type Managers = RwLock<HashMap<(Topic, Partition), PartitionManager>>;
+type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
 
 /// Consumer runtime components returned by consumer initialization.
 ///
 /// Contains the partition managers and runtime state necessary for operating
 /// a consumer instance. This type alias eliminates clippy warnings about
 /// complex return types.
-type ConsumerComponents = (Arc<Managers>, Arc<Mutex<Option<RuntimeState>>>);
+type ConsumerComponents<P> = (Arc<Managers<P>>, Arc<Mutex<Option<RuntimeState>>>);
 
 /// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
@@ -332,6 +335,9 @@ pub trait HandlerProvider: Send + Sync + 'static {
 /// This is the primary trait to implement for message processing logic.
 /// It provides methods for processing messages and handling shutdown.
 pub trait EventHandler {
+    /// The payload type carried by messages delivered to this handler.
+    type Payload: Send + Sync + 'static;
+
     /// Processes a consumed message.
     ///
     /// This method should contain the business logic for message processing.
@@ -350,7 +356,7 @@ pub trait EventHandler {
     fn on_message<C>(
         &self,
         context: C,
-        message: UncommittedMessage,
+        message: UncommittedMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
@@ -693,16 +699,19 @@ pub struct LowLatencyMiddlewareConfiguration {
 /// - Pipeline processing with retries
 /// - Low-latency processing with failure topic
 /// - Best-effort processing with logging
+///
+/// The `P` type parameter is the payload type carried by consumed messages.
+/// Defaults to `serde_json::Value` for source compatibility.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub struct ProsodyConsumer {
+pub struct ProsodyConsumer<P: Send + Sync + 'static = serde_json::Value> {
     /// Flag to signal consumer shutdown.
     #[educe(Debug(ignore))]
     shutdown: Arc<AtomicBool>,
 
     /// Thread-safe storage for partition managers.
     #[educe(Debug(ignore))]
-    managers: Arc<Managers>,
+    managers: Arc<Managers<P>>,
 
     /// Runtime state of the consumer.
     #[educe(Debug(ignore))]
@@ -763,7 +772,7 @@ impl<CM: HandlerMiddleware> PipelineMiddlewareStack<CM> {
         dedup_provider: DP,
         trigger_provider: PP,
         handler: T,
-    ) -> Result<ProsodyConsumer, ConsumerError>
+    ) -> Result<ProsodyConsumer<serde_json::Value>, ConsumerError>
     where
         T: FallibleHandler + Clone + Send + Sync + 'static,
         MP: MessageDeferStoreProvider,
@@ -831,9 +840,10 @@ fn initialize_consumer_with_provider<T, P>(
     trigger_provider: P,
     telemetry: &Telemetry,
     heartbeats: HeartbeatRegistry,
-) -> Result<ProsodyConsumer, ConsumerError>
+) -> Result<ProsodyConsumer<serde_json::Value>, ConsumerError>
 where
     T: HandlerProvider,
+    T::Handler: EventHandler<Payload = serde_json::Value>,
     P: TriggerStoreProvider,
 {
     // Validate the configuration
@@ -841,7 +851,7 @@ where
 
     // Initialize shared state
     let watermark_version: Arc<WatermarkVersion> = Arc::default();
-    let managers: Arc<Managers> = Arc::default();
+    let managers: Arc<Managers<serde_json::Value>> = Arc::default();
     let shutdown: Arc<AtomicBool> = Arc::default();
     let telemetry_sender = telemetry.sender();
 
@@ -856,17 +866,21 @@ where
         })
         .transpose()?;
 
-    let (managers, runtime_state) = initialize_consumer(ConsumerInitParams {
-        config: consumer_config.clone(),
-        handler_provider,
-        trigger_provider,
-        watermark_version: watermark_version.clone(),
-        managers: managers.clone(),
-        allowed_events,
-        telemetry: telemetry_sender,
-        shutdown: shutdown.clone(),
-        heartbeats: heartbeats.clone(),
-    })?;
+    let (managers, runtime_state) =
+        initialize_consumer::<T, P, crate::codec::JsonCodec>(ConsumerInitParams {
+            config: consumer_config.clone(),
+            handler_provider,
+            trigger_provider,
+            watermark_version: watermark_version.clone(),
+            managers: managers.clone(),
+            allowed_events,
+            event_type_extractor: Some(|p: &serde_json::Value| {
+                p.get("type").and_then(serde_json::Value::as_str)
+            }),
+            telemetry: telemetry_sender,
+            shutdown: shutdown.clone(),
+            heartbeats: heartbeats.clone(),
+        })?;
 
     Ok(ProsodyConsumer {
         shutdown,
@@ -876,7 +890,7 @@ where
     })
 }
 
-impl ProsodyConsumer {
+impl ProsodyConsumer<serde_json::Value> {
     /// Creates a new `ProsodyConsumer` with the given configuration and handler
     /// provider.
     ///
@@ -910,13 +924,14 @@ impl ProsodyConsumer {
     ) -> Result<Self, ConsumerError>
     where
         T: HandlerProvider,
+        T::Handler: EventHandler<Payload = serde_json::Value>,
     {
         // Validate the configuration
         consumer_config.validate()?;
 
         // Initialize shared state
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
-        let managers: Arc<Managers> = Arc::default();
+        let managers: Arc<Managers<serde_json::Value>> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
         let telemetry_sender = telemetry.sender();
         let heartbeats = HeartbeatRegistry::new(
@@ -935,18 +950,24 @@ impl ProsodyConsumer {
             })
             .transpose()?;
 
+        let event_type_extractor: Option<fn(&serde_json::Value) -> Option<&str>> =
+            Some(|p: &serde_json::Value| p.get("type").and_then(serde_json::Value::as_str));
+
         let (managers, runtime_state) = match trigger_store_config {
-            TriggerStoreConfiguration::InMemory => initialize_consumer(ConsumerInitParams {
-                config: consumer_config.clone(),
-                handler_provider,
-                trigger_provider: InMemoryTriggerStoreProvider::new(),
-                watermark_version: watermark_version.clone(),
-                managers: managers.clone(),
-                allowed_events,
-                telemetry: telemetry_sender,
-                shutdown: shutdown.clone(),
-                heartbeats: heartbeats.clone(),
-            })?,
+            TriggerStoreConfiguration::InMemory => {
+                initialize_consumer::<T, _, crate::codec::JsonCodec>(ConsumerInitParams {
+                    config: consumer_config.clone(),
+                    handler_provider,
+                    trigger_provider: InMemoryTriggerStoreProvider::new(),
+                    watermark_version: watermark_version.clone(),
+                    managers: managers.clone(),
+                    allowed_events,
+                    event_type_extractor,
+                    telemetry: telemetry_sender,
+                    shutdown: shutdown.clone(),
+                    heartbeats: heartbeats.clone(),
+                })?
+            }
             TriggerStoreConfiguration::Cassandra(cassandra_config) => {
                 let store = CassandraStore::new(cassandra_config)
                     .await
@@ -957,13 +978,14 @@ impl ProsodyConsumer {
                     consumer_config.timer_spans,
                 )
                 .await?;
-                initialize_consumer(ConsumerInitParams {
+                initialize_consumer::<T, _, crate::codec::JsonCodec>(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
                     trigger_provider,
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,
+                    event_type_extractor,
                     telemetry: telemetry_sender,
                     shutdown: shutdown.clone(),
                     heartbeats: heartbeats.clone(),
@@ -1227,7 +1249,9 @@ impl ProsodyConsumer {
 
         Self::new(consumer_config, trigger_store_config, provider, telemetry).await
     }
+}
 
+impl<P: Send + Sync + 'static> ProsodyConsumer<P> {
     /// Returns the number of currently assigned partitions.
     ///
     /// This method is useful for monitoring how many partitions have been
@@ -1298,7 +1322,7 @@ impl ProsodyConsumer {
 ///
 /// This implementation guarantees that resources are cleaned up even if
 /// the consumer is dropped without explicitly calling `shutdown()`.
-impl Drop for ProsodyConsumer {
+impl<P: Send + Sync + 'static> Drop for ProsodyConsumer<P> {
     fn drop(&mut self) {
         block_on(self.execute_shutdown());
     }
@@ -1313,15 +1337,18 @@ impl Drop for ProsodyConsumer {
 /// # Returns
 ///
 /// The number of partitions currently assigned to this consumer.
-fn get_assigned_partition_count(managers: &Managers) -> u32 {
+pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
+    managers: &Managers<P>,
+) -> u32 {
     managers.read().len() as u32
 }
 
 /// Parameters passed to [`initialize_consumer`] to create a consumer instance.
-struct ConsumerInitParams<T, P>
+struct ConsumerInitParams<T, P, PL>
 where
     T: HandlerProvider,
     P: TriggerStoreProvider,
+    PL: Send + Sync + 'static,
 {
     /// Consumer configuration (Kafka settings, buffer sizes, timeouts).
     config: ConsumerConfiguration,
@@ -1332,9 +1359,11 @@ where
     /// Shared atomic counter for tracking watermark changes.
     watermark_version: Arc<WatermarkVersion>,
     /// Thread-safe map of active partition managers.
-    managers: Arc<Managers>,
+    managers: Arc<Managers<PL>>,
     /// Optional event type filter; `None` passes all events through.
     allowed_events: Option<AhoCorasick>,
+    /// Optional function to extract an event-type tag from a payload.
+    event_type_extractor: Option<fn(&PL) -> Option<&str>>,
     /// Sender for consumer-level telemetry events.
     telemetry: TelemetrySender,
     /// Atomic flag for coordinating consumer shutdown.
@@ -1361,12 +1390,15 @@ where
 /// - The Kafka consumer cannot be created with the provided configuration
 /// - Topic subscription fails
 /// - The probe server cannot be started (if enabled)
-fn initialize_consumer<T, P>(
-    params: ConsumerInitParams<T, P>,
-) -> Result<ConsumerComponents, ConsumerError>
+fn initialize_consumer<T, P, C>(
+    params: ConsumerInitParams<T, P, C::Payload>,
+) -> Result<ConsumerComponents<C::Payload>, ConsumerError>
 where
     T: HandlerProvider,
+    T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
+    C: Codec,
+    C::Payload: Clone,
 {
     // Create the consumer context with the message handler and shared state
     let context = Context::new(
@@ -1376,6 +1408,7 @@ where
         params.watermark_version.clone(),
         params.managers.clone(),
         params.allowed_events,
+        params.event_type_extractor,
         params.telemetry,
     );
 
@@ -1426,6 +1459,7 @@ where
             poll_interval,
             max_message_count,
             consumer,
+            codec: C::default(),
             watermark_version: &params.watermark_version,
             managers: &cloned_managers,
             heartbeat: &cloned_heartbeat,
@@ -1463,7 +1497,7 @@ where
 /// # Returns
 ///
 /// `true` if any partition is stalled, `false` otherwise.
-fn get_is_stalled(managers: &Managers) -> bool {
+pub(crate) fn get_is_stalled<P: Send + Sync + 'static>(managers: &Managers<P>) -> bool {
     managers.read().values().any(PartitionManager::is_stalled)
 }
 

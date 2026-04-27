@@ -60,13 +60,19 @@ pub struct ProbeServer {
 ///
 /// Contains references to the components needed to determine
 /// consumer health status.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ProbeState {
-    /// Reference to partition managers for checking assignment status
-    managers: Arc<Managers>,
+    /// Returns the number of assigned partitions
+    assigned_partition_count: Arc<dyn Fn() -> u32 + Send + Sync>,
 
-    /// Registry for checking if consumer-level actors are stalled
-    heartbeats: HeartbeatRegistry,
+    /// Returns whether any partition or actor is stalled
+    is_stalled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for ProbeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeState").finish_non_exhaustive()
+    }
 }
 
 impl ProbeServer {
@@ -85,15 +91,22 @@ impl ProbeServer {
     /// # Errors
     ///
     /// Returns an `io::Error` if the server fails to bind to the specified port
-    pub fn new(
+    pub fn new<P: Send + Sync + 'static>(
         port: u16,
-        managers: Arc<Managers>,
+        managers: Arc<Managers<P>>,
         heartbeats: HeartbeatRegistry,
     ) -> Result<Self, io::Error> {
+        let managers_for_count = managers.clone();
+        let managers_for_stall = managers;
+        let heartbeats_clone = heartbeats;
         // Create application state with references to components
         let state = ProbeState {
-            managers,
-            heartbeats,
+            assigned_partition_count: Arc::new(move || {
+                get_assigned_partition_count(&managers_for_count)
+            }),
+            is_stalled: Arc::new(move || {
+                get_is_stalled(&managers_for_stall) || heartbeats_clone.any_stalled()
+            }),
         };
 
         // Define router with health check endpoints
@@ -183,10 +196,8 @@ impl ProbeServer {
 /// - `StatusCode::OK` (200) if partitions are assigned, or
 ///   `StatusCode::SERVICE_UNAVAILABLE` (503) otherwise
 /// - A message describing the current assignment status
-async fn readiness_probe(
-    State(ProbeState { managers, .. }): State<ProbeState>,
-) -> (StatusCode, Cow<'static, str>) {
-    let assigned_count = get_assigned_partition_count(&managers);
+async fn readiness_probe(State(state): State<ProbeState>) -> (StatusCode, Cow<'static, str>) {
+    let assigned_count = (state.assigned_partition_count)();
 
     if assigned_count == 0 {
         // No partitions assigned yet - service is not ready
@@ -220,13 +231,8 @@ async fn readiness_probe(
 /// - `StatusCode::OK` (200) if no stalls are detected, or
 ///   `StatusCode::SERVICE_UNAVAILABLE` (503) otherwise
 /// - A message describing the current stall status
-async fn liveness_probe(
-    State(ProbeState {
-        managers,
-        heartbeats,
-    }): State<ProbeState>,
-) -> (StatusCode, &'static str) {
-    if heartbeats.any_stalled() || get_is_stalled(&managers) {
+async fn liveness_probe(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
+    if (state.is_stalled)() {
         // Either a consumer-level actor or a partition has stalled
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -251,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn test_probe_server_endpoints_respond() -> Result<()> {
         // Create mock components
-        let managers = Arc::default();
+        let managers: Arc<Managers<serde_json::Value>> = Arc::default();
         let heartbeats = HeartbeatRegistry::test();
 
         // Create ProbeServer instance on a random port (0)

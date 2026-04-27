@@ -221,7 +221,7 @@ impl<P: Send + 'static> PartitionManager<P> {
         partition: Partition,
     ) -> Self
     where
-        T: EventHandler + Send + Sync + 'static,
+        T: EventHandler<Payload = P> + Send + Sync + 'static,
         S: TriggerStoreProvider,
         P: Sync,
     {
@@ -470,7 +470,7 @@ async fn handle_messages<T, S, P>(
     handler: T,
     context: PartitionContext<P>,
 ) where
-    T: EventHandler,
+    T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStoreProvider,
     P: Send + Sync + 'static,
 {
@@ -518,7 +518,7 @@ async fn run_partition<T, S, P>(
     context: PartitionContext<P>,
     params: PartitionParams<P>,
 ) where
-    T: EventHandler,
+    T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStore,
     P: Send + Sync + 'static,
 {
@@ -594,7 +594,7 @@ async fn process_event<T, S, P>(
     timer_manager: &TimerManager<S>,
     timer_spans: SpanRelation,
 ) where
-    T: EventHandler,
+    T: EventHandler<Payload = P>,
     S: TriggerStore,
     P: Send + 'static,
 {
@@ -661,7 +661,7 @@ fn build_message_stream<T, P>(
 ) -> impl Stream<Item = UncommittedEvent<T, P>>
 where
     T: TriggerStore,
-    P: Send + 'static,
+    P: Send + Sync + 'static,
 {
     stream! {
         while let Some(message) = message_rx.recv().await {
@@ -773,7 +773,7 @@ async fn reserve_offset<P: Send + 'static>(
 ///
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
-async fn filter_loops<P: Send + 'static>(
+async fn filter_loops<P: Send + Sync + 'static>(
     group_id: &str,
     message: UncommittedMessage<P>,
 ) -> Option<UncommittedMessage<P>> {
@@ -816,7 +816,7 @@ async fn filter_loops<P: Send + 'static>(
 ///
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
-async fn filter_event_type<P: Send + 'static>(
+async fn filter_event_type<P: Send + Sync + 'static>(
     event_type_extractor: Option<fn(&P) -> Option<&str>>,
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage<P>,

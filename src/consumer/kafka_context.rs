@@ -27,7 +27,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::Topic;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
-use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
+use crate::consumer::{
+    ConsumerConfiguration, EventHandler, HandlerProvider, Managers, WatermarkVersion,
+};
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::TimerSemaphores;
 use crate::timers::duration::CompactDuration;
@@ -47,25 +49,27 @@ use crate::timers::store::TriggerStoreProvider;
 ///   partitions
 /// * `P` - Type implementing `TriggerStoreProvider` for persistent timer
 ///   trigger storage
-pub struct Context<T, P>
+/// * `PL` - The payload type carried by consumed messages
+pub struct Context<T, P, PL>
 where
     T: HandlerProvider,
 {
     /// Partition-level configuration settings
-    config: PartitionConfiguration<P>,
+    config: PartitionConfiguration<P, PL>,
 
     /// Creates message handlers for partitions
     handler_provider: T,
 
     /// Thread-safe storage for partition managers
-    managers: Arc<Managers>,
+    managers: Arc<Managers<PL>>,
 
     telemetry: TelemetrySender,
 }
 
-impl<T, P> Context<T, P>
+impl<T, P, PL> Context<T, P, PL>
 where
     T: HandlerProvider,
+    PL: Clone + Send + Sync + 'static,
 {
     /// Creates a new consumer context with the given configuration.
     ///
@@ -81,13 +85,16 @@ where
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
     /// * `allowed_events` - Optional filter for permitted event types
+    /// * `event_type_extractor` - Optional function to extract event type from
+    ///   payload
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
         trigger_provider: P,
         watermark_version: Arc<WatermarkVersion>,
-        managers: Arc<Managers>,
+        managers: Arc<Managers<PL>>,
         allowed_events: Option<AhoCorasick>,
+        event_type_extractor: Option<fn(&PL) -> Option<&str>>,
         telemetry: TelemetrySender,
     ) -> Self {
         let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
@@ -104,6 +111,7 @@ where
             buffer_size: config.max_uncommitted,
             max_uncommitted: config.max_uncommitted,
             allowed_events,
+            event_type_extractor,
             shutdown_timeout: config.shutdown_timeout,
             stall_threshold: config.stall_threshold,
             watermark_version,
@@ -123,17 +131,20 @@ where
     }
 }
 
-impl<T, P> ClientContext for Context<T, P>
+impl<T, P, PL> ClientContext for Context<T, P, PL>
 where
     T: HandlerProvider,
     P: TriggerStoreProvider,
+    PL: Clone + Send + Sync + 'static,
 {
 }
 
-impl<T, P> ConsumerContext for Context<T, P>
+impl<T, P, PL> ConsumerContext for Context<T, P, PL>
 where
     T: HandlerProvider,
+    T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
+    PL: Clone + Send + Sync + 'static,
 {
     /// Handles partition assignments and revocations during consumer group
     /// rebalancing.
