@@ -232,6 +232,8 @@ use std::sync::{Arc, LazyLock};
 
 pub mod admin;
 pub mod cassandra;
+/// Wire-format abstraction for pluggable message encoding and decoding.
+pub mod codec;
 pub mod consumer;
 pub mod error;
 pub mod heartbeat;
@@ -245,6 +247,7 @@ pub mod timers;
 pub mod tracing;
 mod util;
 
+pub use crate::codec::{Codec, JsonCodec};
 pub use crate::error::{ClassifyError, ErrorCategory};
 
 /// A lazily initialized mock Kafka cluster for testing.
