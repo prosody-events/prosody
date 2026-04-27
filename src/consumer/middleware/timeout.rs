@@ -229,11 +229,12 @@ where
 {
     type Error = T::Error;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -382,11 +383,12 @@ mod tests {
     impl FallibleHandler for MockHandler {
         type Error = TestError;
         type Output = ();
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
@@ -432,7 +434,7 @@ mod tests {
         async fn shutdown(self) {}
     }
 
-    fn create_test_message() -> Option<ConsumerMessage> {
+    fn create_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
         let semaphore = Arc::new(Semaphore::new(10));
         let permit = semaphore.try_acquire_owned().ok()?;
         Some(ConsumerMessage::new(

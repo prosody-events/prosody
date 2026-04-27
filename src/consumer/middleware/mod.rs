@@ -209,7 +209,14 @@ pub trait FallibleHandlerProvider: Send + Sync + 'static {
 /// Defines middleware for message processing.
 pub trait HandlerMiddleware {
     /// The provider type that wraps another fallible handler provider.
-    type Provider<T: FallibleHandlerProvider>: FallibleHandlerProvider;
+    ///
+    /// The bound `Handler: FallibleHandler<Payload = T::Handler::Payload>`
+    /// ensures every middleware implementation preserves the payload type
+    /// end-to-end, which is required for typed message delivery through the
+    /// composed stack.
+    type Provider<T: FallibleHandlerProvider>: FallibleHandlerProvider<
+        Handler: FallibleHandler<Payload = <T::Handler as FallibleHandler>::Payload>,
+    >;
 
     /// Wraps a handler provider with this middleware.
     ///

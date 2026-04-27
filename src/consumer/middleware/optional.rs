@@ -65,6 +65,7 @@ impl<E, D> FallibleHandlerProvider for OptionProvider<E, D>
 where
     E: FallibleHandlerProvider,
     D: FallibleHandlerProvider,
+    D::Handler: FallibleHandler<Payload = <E::Handler as FallibleHandler>::Payload>,
 {
     type Handler = OptionHandler<E::Handler, D::Handler>;
 
@@ -103,15 +104,16 @@ impl<E, D> OptionHandler<E, D> {
 impl<E, D> FallibleHandler for OptionHandler<E, D>
 where
     E: FallibleHandler,
-    D: FallibleHandler,
+    D: FallibleHandler<Payload = E::Payload>,
 {
     type Error = OptionError<E::Error, D::Error>;
     type Output = OptionOutput<E::Output, D::Output>;
+    type Payload = E::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

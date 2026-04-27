@@ -54,9 +54,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -147,11 +148,12 @@ where
 {
     type Error = T::Error;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

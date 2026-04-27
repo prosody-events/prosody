@@ -294,11 +294,12 @@ where
 {
     type Error = SchedulerError<T::Error>;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

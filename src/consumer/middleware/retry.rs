@@ -96,9 +96,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -591,11 +592,12 @@ where
 {
     type Error = T::Error;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -705,8 +707,14 @@ impl<T> EventHandler for RetryHandler<T>
 where
     T: FallibleHandler,
 {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
-    where
+    type Payload = T::Payload;
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let topic = message.topic();
@@ -898,11 +906,12 @@ mod tests {
     impl FallibleHandler for MockHandler {
         type Error = TestError;
         type Output = ();
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
@@ -964,7 +973,7 @@ mod tests {
         async fn shutdown(self) {}
     }
 
-    fn create_test_message() -> Option<ConsumerMessage> {
+    fn create_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
         let semaphore = Arc::new(Semaphore::new(10));
         let permit = semaphore.try_acquire_owned().ok()?;
         Some(ConsumerMessage::new(
