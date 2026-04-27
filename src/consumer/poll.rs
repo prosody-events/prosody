@@ -23,6 +23,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
+use crate::Codec;
 use crate::Topic;
 use crate::consumer::decode::decode_message;
 use crate::consumer::kafka_context::Context;
@@ -35,8 +36,6 @@ use crate::propagator::new_propagator;
 use crate::related_span;
 
 use crate::timers::store::TriggerStoreProvider;
-#[cfg(not(target_arch = "arm"))]
-use simd_json::Buffers;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Configuration for the Kafka message polling process.
@@ -49,10 +48,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 ///
 /// * `T` - A type implementing [`HandlerProvider`] that creates message
 ///   handlers for assigned partitions.
-pub struct PollConfig<'a, T, P>
+/// * `P` - A type implementing [`TriggerStoreProvider`] for timer storage.
+/// * `C` - A type implementing [`Codec`] for deserializing message payloads.
+pub struct PollConfig<'a, T, P, C>
 where
     T: HandlerProvider,
     P: TriggerStoreProvider,
+    C: Codec,
 {
     /// Time between consecutive poll operations
     pub poll_interval: Duration,
@@ -62,6 +64,9 @@ where
 
     /// The configured Kafka consumer with context
     pub consumer: BaseConsumer<Context<T, P>>,
+
+    /// Codec for deserializing message payloads
+    pub codec: C,
 
     /// Reference to counter tracking watermark version changes
     pub watermark_version: &'a WatermarkVersion,
@@ -95,20 +100,18 @@ where
 /// # Arguments
 ///
 /// * `config` - The configuration for the polling process
-pub fn poll<T, P>(config: PollConfig<T, P>)
+pub fn poll<T, P, C>(config: PollConfig<T, P, C>)
 where
     T: HandlerProvider,
     P: TriggerStoreProvider,
+    C: Codec,
 {
-    // Create buffers for SIMD JSON parsing if on supported platforms
-    #[cfg(not(target_arch = "arm"))]
-    let mut buffers = Buffers::default();
-
     // Destructure configuration for cleaner access
     let PollConfig {
         poll_interval,
         max_message_count,
         consumer,
+        mut codec,
         watermark_version,
         managers,
         heartbeat,
@@ -168,12 +171,7 @@ where
         debug!(topic, partition, offset, "received message");
 
         // Decode message through extraction, validation, and filtering
-        let maybe_decoded = decode_message(
-            &message,
-            &propagator,
-            #[cfg(not(target_arch = "arm"))]
-            &mut buffers,
-        );
+        let maybe_decoded = decode_message(&message, &propagator, &mut codec);
 
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {
@@ -210,7 +208,11 @@ where
 /// * `message` - The message to dispatch
 /// * `poll_interval` - Duration to wait between retry attempts
 /// * `managers` - Reference to the collection of partition managers
-fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, managers: &Managers) {
+fn dispatch_with_retry<P: Send + Sync + 'static>(
+    message: ConsumerMessage<P>,
+    poll_interval: Duration,
+    managers: &Managers,
+) {
     let mut current_message = message;
     loop {
         match dispatch_message(current_message, managers) {
@@ -392,7 +394,10 @@ where
 ///
 /// - `DispatchError::PartitionNotFound` - The target partition is not assigned
 /// - `DispatchError::Busy` - The partition's message queue is full
-fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(), DispatchError> {
+fn dispatch_message<P: Send + Sync + 'static>(
+    message: ConsumerMessage<P>,
+    managers: &Managers,
+) -> Result<(), DispatchError<P>> {
     debug!(
         topic = message.topic().as_ref(),
         partition = message.partition(),
@@ -417,12 +422,12 @@ fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(),
 
 /// Errors that can occur during message dispatch.
 #[derive(Debug, Error)]
-enum DispatchError {
+enum DispatchError<P: Send + Sync + 'static> {
     /// The target partition is not assigned to this consumer
     #[error("message sent to unassigned partition")]
-    PartitionNotFound(ConsumerMessage),
+    PartitionNotFound(ConsumerMessage<P>),
 
     /// The partition manager's buffer is full
     #[error("partition is busy")]
-    Busy(ConsumerMessage),
+    Busy(ConsumerMessage<P>),
 }
