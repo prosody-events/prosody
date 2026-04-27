@@ -23,14 +23,10 @@ use std::str;
 use std::sync::Arc;
 use tracing::error;
 
-#[cfg(not(target_arch = "arm"))]
-use simd_json::Buffers;
-#[cfg(not(target_arch = "arm"))]
-use simd_json::serde::from_reader_with_buffers;
-
+use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessageValue;
-use crate::{Payload, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
+use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 /// A decoded Kafka message without live span references.
 ///
@@ -65,7 +61,7 @@ pub struct DecodedMessage<P> {
 ///
 /// This function performs comprehensive message processing:
 /// 1. Extracts distributed tracing context from message headers
-/// 2. Parses and validates the JSON payload
+/// 2. Parses and validates the payload via the provided codec
 /// 3. Extracts and validates the message key
 /// 4. Resolves the message timestamp from Kafka metadata
 ///
@@ -77,30 +73,26 @@ pub struct DecodedMessage<P> {
 ///
 /// * `message` - The Kafka message to decode
 /// * `propagator` - Distributed tracing context propagator
-/// * `buffers` - (Non-ARM only) Buffers for SIMD JSON parsing
+/// * `codec` - Codec used to deserialize the raw payload bytes
 ///
 /// # Returns
 ///
 /// * `Some(DecodedMessage)` - A validated, parsed message with parent context
 /// * `None` - If the message is invalid or missing required fields
-pub fn decode_message(
+pub fn decode_message<C: Codec>(
     message: &BorrowedMessage,
     propagator: &TextMapCompositePropagator,
-    #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
-) -> Option<DecodedMessage<Payload>> {
-    // Extract basic message coordinates
+    codec: &mut C,
+) -> Option<DecodedMessage<C::Payload>> {
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
     let offset = message.offset();
 
-    // Extract distributed tracing context from message headers (no local span)
     let parent_context = propagator.extract(&MessageExtractor::new(message));
 
-    // Extract source system header if present
     let source_system = extract_source_system(message);
 
-    // Validate and parse payload
-    let Some(payload_data) = message.payload() else {
+    let Some(payload_bytes) = message.payload() else {
         error!(
             topic = %topic,
             partition = partition,
@@ -110,13 +102,14 @@ pub fn decode_message(
         return None;
     };
 
-    let payload = parse_payload(
-        payload_data,
-        #[cfg(not(target_arch = "arm"))]
-        buffers,
-    )?;
+    let payload = match codec.deserialize(payload_bytes) {
+        Ok(p) => p,
+        Err(error) => {
+            error!("invalid payload: {error:#}; discarding message");
+            return None;
+        }
+    };
 
-    // Validate and extract key
     let Some(key_data) = message.key() else {
         error!(
             topic = %topic,
@@ -140,10 +133,8 @@ pub fn decode_message(
         }
     };
 
-    // Determine message timestamp based on available metadata
     let timestamp = resolve_timestamp(message);
 
-    // Create and return decoded message with parent context (no span)
     let value = Arc::new(ConsumerMessageValue {
         source_system,
         topic,
@@ -185,35 +176,6 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
         Ok(source_system) => source_system.map(SourceSystem::from),
         Err(error) => {
             error!("invalid source system encoding: {error:#}; ignoring");
-            None
-        }
-    }
-}
-
-/// Parses a message payload as JSON using platform-optimized implementations.
-///
-/// # Arguments
-///
-/// * `payload_data` - Raw payload bytes
-/// * `buffers` - (Non-ARM only) Buffers for SIMD JSON parsing
-///
-/// # Returns
-///
-/// * `Some(Payload)` - Successfully parsed JSON payload
-/// * `None` - If parsing fails
-fn parse_payload(
-    payload_data: &[u8],
-    #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
-) -> Option<Payload> {
-    #[cfg(target_arch = "arm")]
-    let payload = serde_json::from_slice(payload_data);
-    #[cfg(not(target_arch = "arm"))]
-    let payload = from_reader_with_buffers(payload_data, buffers);
-
-    match payload {
-        Ok(p) => Some(p),
-        Err(error) => {
-            error!("invalid payload: {error:#}; discarding message");
             None
         }
     }
