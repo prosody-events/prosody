@@ -67,9 +67,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -104,9 +105,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -253,9 +255,10 @@ pub trait HandlerMiddleware {
     /// # #[derive(Clone)]
     /// # struct MyHandler;
     /// # impl FallibleHandler for MyHandler {
+    /// #     type Payload = serde_json::Value;
     /// #     type Error = Infallible;
     /// #     type Output = ();
-    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
     /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
     /// #     async fn shutdown(self) {}
     /// # }
@@ -481,6 +484,12 @@ pub trait HandlerMiddleware {
 /// [`Uncommitted::abort`]: crate::consumer::Uncommitted::abort
 /// [`retry`]: crate::consumer::middleware::retry
 pub trait FallibleHandler: Send + Sync + 'static {
+    /// The payload type this handler processes.
+    ///
+    /// Must match the codec's `Payload` type so the consumer pipeline can
+    /// deliver typed messages. Set to `serde_json::Value` for JSON consumers.
+    type Payload: Send + Sync + 'static;
+
     /// Error type returned by [`Self::on_message`] / [`Self::on_timer`].
     ///
     /// Must implement [`ClassifyError`] so the framework can decide
@@ -522,7 +531,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
@@ -748,8 +757,14 @@ where
     T: FallibleEventHandler,
     T::Error: ClassifyError,
 {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
-    where
+    type Payload = T::Payload;
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let (inner_message, uncommitted_offset) = message.into_inner();
@@ -969,11 +984,12 @@ mod after_hook_tests {
     impl FallibleHandler for ProbeHandler {
         type Error = TestError;
         type Output = u64;
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
@@ -1018,7 +1034,7 @@ mod after_hook_tests {
         OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version)
     }
 
-    fn make_test_message() -> Option<ConsumerMessage> {
+    fn make_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
         use crate::consumer::message::ConsumerMessageValue;
         use std::sync::Arc;
         use tokio::sync::Semaphore;
@@ -1279,11 +1295,12 @@ mod after_hook_tests {
     {
         type Error = T::Error;
         type Output = T::Output;
+        type Payload = T::Payload;
 
         async fn on_message<C>(
             &self,
             context: C,
-            message: ConsumerMessage,
+            message: ConsumerMessage<Self::Payload>,
             demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
