@@ -19,8 +19,8 @@
 //!    with metadata. On success, surface the inner's error in
 //!    [`FailureTopicOutput::Routed`] so the apply hook can forward it.
 //! 4. **If failure topic write fails**: Surface
-//!    [`FailureTopicError::DlqSendFailed`] (which carries both the inner
-//!    error and the producer error) for outer retry middleware
+//!    [`FailureTopicError::DlqSendFailed`] (which carries both the inner error
+//!    and the producer error) for outer retry middleware
 //!
 //! # Failure Topic Message Format
 //!
@@ -56,11 +56,11 @@
 //!   not be re-dispatched. The inner's typed error is preserved in the
 //!   `Output::Routed(inner_err)` variant and forwarded as
 //!   `after_commit(Err(inner_err))`.
-//! - **Inner non-Terminal Err, DLQ send fails**: the produced error is
-//!   surfaced as [`FailureTopicError::DlqSendFailed`], which carries both the
-//!   producer error (used by the outer retry layer for classification) and
-//!   the original inner error. When the outer retry re-drives the stack,
-//!   this dispatch is *not* final from the inner's POV, so the inner sees
+//! - **Inner non-Terminal Err, DLQ send fails**: the produced error is surfaced
+//!   as [`FailureTopicError::DlqSendFailed`], which carries both the producer
+//!   error (used by the outer retry layer for classification) and the original
+//!   inner error. When the outer retry re-drives the stack, this dispatch is
+//!   *not* final from the inner's POV, so the inner sees
 //!   `after_abort(Err(inner_err))`.
 //!
 //! # Usage
@@ -281,11 +281,11 @@ where
     /// - [`FailureTopicOutput::Inner`] — the inner returned `Ok(_)`; carries
     ///   the inner's [`FallibleHandler::Output`] for downstream 2PC.
     /// - [`FailureTopicOutput::Routed`] — the inner returned a non-Terminal
-    ///   `Err(_)` and the DLQ producer accepted the routed message. The
-    ///   inner's typed error is **preserved** here so the apply hook can
-    ///   forward it to the inner as `Err(_)` per the
-    ///   [`FallibleHandler`] work-centric invariant. We must not collapse
-    ///   this to `()` — see the trait-level docs.
+    ///   `Err(_)` and the DLQ producer accepted the routed message. The inner's
+    ///   typed error is **preserved** here so the apply hook can forward it to
+    ///   the inner as `Err(_)` per the [`FallibleHandler`] work-centric
+    ///   invariant. We must not collapse this to `()` — see the trait-level
+    ///   docs.
     type Output = FailureTopicOutput<T::Output, T::Error>;
 
     /// Handles a message, attempting to process it with the wrapped handler.
@@ -301,17 +301,16 @@ where
     ///
     /// A `Result` whose variants are:
     /// - `Ok(FailureTopicOutput::Inner(output))` — inner ran and succeeded.
-    /// - `Ok(FailureTopicOutput::Routed(inner_err))` — inner ran and
-    ///   returned a non-Terminal error; DLQ producer accepted the routed
-    ///   message. The inner error is preserved for the apply hook.
+    /// - `Ok(FailureTopicOutput::Routed(inner_err))` — inner ran and returned a
+    ///   non-Terminal error; DLQ producer accepted the routed message. The
+    ///   inner error is preserved for the apply hook.
     /// - `Err(FailureTopicError::Handler(inner_err))` — inner returned a
     ///   Terminal error.
-    /// - `Err(FailureTopicError::DlqSendFailed { inner, producer })` —
-    ///   inner returned a non-Terminal error, but routing to the failure
-    ///   topic failed. Both the inner error and the producer error are
-    ///   preserved so the outer retry layer can classify on `producer` and
-    ///   the inner's apply hook can fire as `after_abort(Err(inner))` on
-    ///   re-dispatch.
+    /// - `Err(FailureTopicError::DlqSendFailed { inner, producer })` — inner
+    ///   returned a non-Terminal error, but routing to the failure topic
+    ///   failed. Both the inner error and the producer error are preserved so
+    ///   the outer retry layer can classify on `producer` and the inner's apply
+    ///   hook can fire as `after_abort(Err(inner))` on re-dispatch.
     ///
     /// # Errors
     ///
@@ -465,15 +464,15 @@ where
     /// - `Ok(Inner(o))` → `inner.after_commit(Ok(o))`. Inner ran, succeeded;
     ///   dispatch is final.
     /// - `Ok(Routed(e))` → `inner.after_commit(Err(e))`. DLQ accepted, the
-    ///   marker committed, the inner will not see this logical
-    ///   message/timer again — fire its apply hook with its original error.
-    /// - `Err(Handler(e))` → `inner.after_commit(Err(e))`. Terminal error
-    ///   that the framework chose to commit (rather than abort); forward
-    ///   it to the inner.
+    ///   marker committed, the inner will not see this logical message/timer
+    ///   again — fire its apply hook with its original error.
+    /// - `Err(Handler(e))` → `inner.after_commit(Err(e))`. Terminal error that
+    ///   the framework chose to commit (rather than abort); forward it to the
+    ///   inner.
     /// - `Err(DlqSendFailed { inner, .. })` → `inner.after_commit(Err(inner))`.
-    ///   This branch only fires if the outer treats the producer error as
-    ///   final (no retry); the inner's typed error is still forwarded so
-    ///   2PC handlers further down can finalise correctly.
+    ///   This branch only fires if the outer treats the producer error as final
+    ///   (no retry); the inner's typed error is still forwarded so 2PC handlers
+    ///   further down can finalise correctly.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -494,18 +493,17 @@ where
     /// Resolves the inner's apply hook on an **aborted** marker.
     ///
     /// Routing per the work-centric invariant:
-    /// - `Ok(Inner(o))` → `inner.after_abort(Ok(o))`. Inner succeeded but
-    ///   the outer aborted (e.g. shutdown intervened); forward Ok.
-    /// - `Ok(Routed(e))` → `inner.after_abort(Err(e))`. Rare path: the
-    ///   outer aborted despite the DLQ accepting the routed message;
-    ///   re-dispatch is coming, so the inner sees abort with its original
-    ///   error.
+    /// - `Ok(Inner(o))` → `inner.after_abort(Ok(o))`. Inner succeeded but the
+    ///   outer aborted (e.g. shutdown intervened); forward Ok.
+    /// - `Ok(Routed(e))` → `inner.after_abort(Err(e))`. Rare path: the outer
+    ///   aborted despite the DLQ accepting the routed message; re-dispatch is
+    ///   coming, so the inner sees abort with its original error.
     /// - `Err(Handler(e))` → `inner.after_abort(Err(e))`. Terminal error;
     ///   marker aborted.
     /// - `Err(DlqSendFailed { inner, .. })` → `inner.after_abort(Err(inner))`.
-    ///   The outer retry layer will re-drive the whole stack including
-    ///   the inner; the inner's apply hook fires as `after_abort` with its
-    ///   original error.
+    ///   The outer retry layer will re-drive the whole stack including the
+    ///   inner; the inner's apply hook fires as `after_abort` with its original
+    ///   error.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -547,9 +545,9 @@ pub enum FailureTopicError<E> {
     /// Both errors are preserved so the framework can:
     /// - classify on `producer` (the immediate failure that the outer retry
     ///   layer should react to), and
-    /// - fire the inner's apply hook with `Err(inner)` when re-dispatch
-    ///   happens (`after_abort(Err(inner))`) or, in the unlikely case the
-    ///   outer commits despite this error, `after_commit(Err(inner))`.
+    /// - fire the inner's apply hook with `Err(inner)` when re-dispatch happens
+    ///   (`after_abort(Err(inner))`) or, in the unlikely case the outer commits
+    ///   despite this error, `after_commit(Err(inner))`.
     #[error("failure-topic send failed: {producer}")]
     DlqSendFailed {
         /// Inner handler's original (non-Terminal) error.

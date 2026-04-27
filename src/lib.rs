@@ -351,15 +351,6 @@ impl TopicPartitionKey {
     }
 }
 
-/// A compact string for storing event identifiers.
-///
-/// Uses `Flexstr` to efficiently store event IDs up to UUID length without heap
-/// allocation.
-pub type EventId = Flexstr<UUID_STR_LEN>;
-
-/// A borrowed string slice for event identifiers.
-pub type BorrowedEventId = str;
-
 /// Source system header used to prevent processing loops.
 const SOURCE_SYSTEM_HEADER: &str = "source-system";
 
@@ -377,34 +368,18 @@ const SOURCE_SYSTEM_HEADER: &str = "source-system";
 /// be delivered due to retries or network issues. The event ID should be stable
 /// across message delivery attempts.
 pub trait EventIdentity {
-    /// The type used to represent a borrowed event ID.
-    type BorrowedEventId: ?Sized;
-
-    /// The type used to represent the event ID when owned.
-    /// Must implement `AsRef<Self::BorrowedEventId>` and be constructible from
-    /// a borrowed event ID.
-    type EventId: AsRef<Self::BorrowedEventId> + for<'a> From<&'a Self::BorrowedEventId>;
-
     /// Returns a reference to this event's identifier if one exists.
     ///
-    /// # Returns
-    ///
-    /// - `Some(&BorrowedEventId)` if the event has an identifier
-    /// - `None` if the event has no identifier
-    fn event_id(&self) -> Option<&Self::BorrowedEventId>;
+    /// Returns `None` if the event has no identifier.
+    fn event_id(&self) -> Option<&str>;
 }
 
-impl EventIdentity for Payload {
-    type BorrowedEventId = str;
-    type EventId = EventId;
-
-    /// Extracts the event ID from a JSON payload's "id" field.
+impl EventIdentity for serde_json::Value {
+    /// Extracts the event ID from the JSON `"id"` field.
     ///
-    /// # Returns
-    ///
-    /// The string value of the "id" field if it exists and is a string,
-    /// otherwise `None`.
-    fn event_id(&self) -> Option<&Self::BorrowedEventId> {
+    /// Returns the string value of the `"id"` field if it exists and is a
+    /// string, otherwise `None`.
+    fn event_id(&self) -> Option<&str> {
         match self.get("id")? {
             Value::String(value) => Some(value.as_str()),
             _ => None,

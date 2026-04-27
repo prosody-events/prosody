@@ -335,13 +335,12 @@ where
     /// `on_message` / `on_timer` actually ran.
     ///
     /// Work-centric reasoning:
-    /// - `Ok(_)` and `Err(Handler(_))` both originate from the inner having
-    ///   run and returned, so the inner's `after_commit` is invoked exactly
-    ///   once with the corresponding result.
-    /// - `Err(PermitAcquisition(_))` is produced at this layer before the
-    ///   inner is reached, so the inner did not run; per the
-    ///   `FallibleHandler` invariant, neither apply hook may fire on the
-    ///   inner in this case.
+    /// - `Ok(_)` and `Err(Handler(_))` both originate from the inner having run
+    ///   and returned, so the inner's `after_commit` is invoked exactly once
+    ///   with the corresponding result.
+    /// - `Err(PermitAcquisition(_))` is produced at this layer before the inner
+    ///   is reached, so the inner did not run; per the `FallibleHandler`
+    ///   invariant, neither apply hook may fire on the inner in this case.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,

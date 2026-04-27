@@ -22,10 +22,7 @@ use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::PendingTimer;
 use crate::timers::store::TriggerStore;
-use crate::{
-    BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, ProcessScope,
-    SourceSystem, Topic,
-};
+use crate::{EventIdentity, Key, Offset, Partition, Payload, ProcessScope, SourceSystem, Topic};
 
 /// A unified event that must be explicitly committed or aborted.
 ///
@@ -193,10 +190,7 @@ impl Keyed for UncommittedMessage {
 }
 
 impl EventIdentity for UncommittedMessage {
-    type BorrowedEventId = BorrowedEventId;
-    type EventId = EventId;
-
-    fn event_id(&self) -> Option<&Self::BorrowedEventId> {
+    fn event_id(&self) -> Option<&str> {
         self.payload().event_id()
     }
 }

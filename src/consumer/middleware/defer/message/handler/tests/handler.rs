@@ -9,14 +9,13 @@
 //! (via [`OutcomeHandler::applied`]). Tests use those records to assert
 //! apply-hook routing: for every dispatch that ran, at most one hook fires,
 //! and `MessageDeferOutput::Deferred(e)` must produce `after_abort(Err(e))`.
-//
 // TODO(apply-hooks): the harness/properties tests in
 // `consumer::middleware::defer::message::handler::tests::{harness,
 // properties, integration}` do not yet inspect [`OutcomeHandler::applied`]
 // to verify the apply-hook invariant end-to-end. A follow-up should:
 //   * Drain `inner_handler.applied()` after each scenario.
-//   * For each recorded `on_message`/`on_timer` dispatch, assert exactly
-//     one matching apply-hook record is present.
+//   * For each recorded `on_message`/`on_timer` dispatch, assert exactly one
+//     matching apply-hook record is present.
 //   * For Transient outcomes that produced `MessageDeferOutput::Deferred`,
 //     assert the matching record is `AppliedHook::Abort` carrying
 //     `Err(ErrorCategory::Transient)`.
@@ -171,7 +170,8 @@ pub struct OutcomeHandler {
     next_outcome: Arc<Mutex<Option<HandlerOutcome>>>,
     /// Record of all messages processed by this handler (in order).
     processed: Arc<scc::Queue<ProcessedMessage>>,
-    /// Apply-hook records in call order. Drained by [`OutcomeHandler::applied`].
+    /// Apply-hook records in call order. Drained by
+    /// [`OutcomeHandler::applied`].
     applied: Arc<scc::Queue<AppliedRecord>>,
     /// When set, triggers partition shutdown before returning the outcome.
     ///

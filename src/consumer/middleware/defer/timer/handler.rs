@@ -153,11 +153,11 @@ where
         // Apply-hook routing (see module docs):
         // - Inner(o):     inner ran and succeeded         -> after_commit(Ok)
         // - NoInner:      no inner dispatch happened      -> suppress
-        // - Deferred(e):  inner ran, transient err swallowed by defer
-        //                 -> after_abort(Err(e)) (a retry is coming)
+        // - Deferred(e):  inner ran, transient err swallowed by defer ->
+        //   after_abort(Err(e)) (a retry is coming)
         // - Handler(e):   inner ran and surfaced an error -> after_commit(Err)
-        // - Store/Timer/...: defer-layer error before/after inner work; no
-        //   inner apply work to forward -> suppress.
+        // - Store/Timer/...: defer-layer error before/after inner work; no inner apply
+        //   work to forward -> suppress.
         match result {
             Ok(TimerDeferOutput::Inner(output)) => {
                 self.handler.after_commit(context, Ok(output)).await;
@@ -211,8 +211,8 @@ where
     /// Returns:
     /// - [`TimerDeferOutput::NoInner`] when the key was already deferred and
     ///   this trigger is appended to its queue (inner not invoked).
-    /// - [`TimerDeferOutput::Inner`] when the inner handler ran and produced
-    ///   an output.
+    /// - [`TimerDeferOutput::Inner`] when the inner handler ran and produced an
+    ///   output.
     /// - [`TimerDeferOutput::Deferred`] when the inner ran, returned a
     ///   transient error, and the middleware enqueued a retry. The wrapped
     ///   inner error must be threaded into `after_abort` on the inner.

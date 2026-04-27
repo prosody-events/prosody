@@ -36,8 +36,7 @@
 //! - **Handler Succeeded**: When the handler invocation returns `Ok` at this
 //!   layer (work-level outcome; not a commit/abort signal)
 //! - **Handler Failed**: When the handler invocation returns `Err` at this
-//!   layer, with error category (work-level outcome; not a commit/abort
-//!   signal)
+//!   layer, with error category (work-level outcome; not a commit/abort signal)
 //! - **Execution Time**: Duration of processing
 //! - **Partition Context**: Which topic-partition was processed
 //!

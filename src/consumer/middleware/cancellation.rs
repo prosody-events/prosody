@@ -25,8 +25,8 @@
 //! - **Shutdown after inner ran**: The inner handler ran and returned a
 //!   Transient error, but shutdown was signaled mid-flight. Returns
 //!   [`CancellationError::ShutdownAfterInner`] (Terminal). The inner attempt
-//!   *did* run and will be redelivered, so its apply-hook (`after_abort`)
-//!   must still fire with the original inner error.
+//!   *did* run and will be redelivered, so its apply-hook (`after_abort`) must
+//!   still fire with the original inner error.
 //!
 //! - **Message cancellation**: Returns [`CancellationError::MessageCancelled`]
 //!   classified as [`ErrorCategory::Transient`]. The retry middleware will

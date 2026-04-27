@@ -10,12 +10,11 @@
 //! **Work Path:**
 //! 1. Race the inner handler's per-event work against the configured timeout.
 //! 2. If the timeout fires first, signal cancellation via `context.cancel()`
-//!    and continue awaiting the inner future. The inner handler is always
-//!    given a chance to observe the signal and return `Ok` or `Err`, so the
-//!    outcome that flows into the apply hook always reflects the inner's
-//!    actual return.
-//! 3. Reset the cancellation flag on the way out so a retry of the same
-//!    logical event starts with a clean context.
+//!    and continue awaiting the inner future. The inner handler is always given
+//!    a chance to observe the signal and return `Ok` or `Err`, so the outcome
+//!    that flows into the apply hook always reflects the inner's actual return.
+//! 3. Reset the cancellation flag on the way out so a retry of the same logical
+//!    event starts with a clean context.
 //!
 //! # Apply-hook invariant
 //!

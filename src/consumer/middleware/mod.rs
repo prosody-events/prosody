@@ -337,24 +337,24 @@ pub trait HandlerMiddleware {
 /// pipeline. You provide:
 ///
 /// - An [`Error`](Self::Error) type whose variants are classified by
-///   [`ClassifyError`] (drives the framework's retry vs. give-up vs.
-///   shutdown decisions — see [Error classification](#error-classification)).
-/// - [`on_message`](Self::on_message) — called for each Kafka message
-///   delivered to the consumer.
-/// - [`on_timer`](Self::on_timer) — called for each scheduled timer that
-///   fires (when the consumer is configured with a timer system).
+///   [`ClassifyError`] (drives the framework's retry vs. give-up vs. shutdown
+///   decisions — see [Error classification](#error-classification)).
+/// - [`on_message`](Self::on_message) — called for each Kafka message delivered
+///   to the consumer.
+/// - [`on_timer`](Self::on_timer) — called for each scheduled timer that fires
+///   (when the consumer is configured with a timer system).
 /// - [`shutdown`](Self::shutdown) — called when the consumer stops or a
 ///   partition is revoked.
 ///
 /// Two optional pieces extend the basic shape for handlers that stage
 /// external work during processing:
 ///
-/// - [`Output`](Self::Output) — a typed value the handler returns on
-///   success (defaults to `()`); carried into the apply hook.
+/// - [`Output`](Self::Output) — a typed value the handler returns on success
+///   (defaults to `()`); carried into the apply hook.
 /// - [`after_commit`](Self::after_commit) and
 ///   [`after_abort`](Self::after_abort) — apply hooks that fire after the
-///   framework decides whether the just-completed invocation will be
-///   retried, enabling 2-phase-commit workflows.
+///   framework decides whether the just-completed invocation will be retried,
+///   enabling 2-phase-commit workflows.
 ///
 /// The consumer pipeline is itself a stack of `FallibleHandler` impls
 /// (retry, deduplication, defer, telemetry, your handler at the bottom),
@@ -370,19 +370,19 @@ pub trait HandlerMiddleware {
 /// [`ClassifyError::classify_error`] into one of three categories that
 /// determine how the consumer pipeline reacts:
 ///
-/// - [`Transient`](ErrorCategory::Transient) — **retry**. A temporary
-///   problem (network blip, store timeout, downstream service
-///   unavailable) that may succeed later. The retry middleware
-///   reattempts; if configured, the defer middleware can move the
-///   message to a timer-based retry to unblock the partition.
-/// - [`Permanent`](ErrorCategory::Permanent) — **give up on this
-///   message**. The data itself is bad (deserialization failure, schema
-///   violation, business rule rejection) and retrying won't help. The
-///   message is committed, and may be routed to a dead-letter topic if
-///   the failure-topic middleware is configured.
-/// - [`Terminal`](ErrorCategory::Terminal) — **shut the consumer down**.
-///   The process can't safely continue (corrupted local state, an
-///   invariant violation) and a new instance must take over.
+/// - [`Transient`](ErrorCategory::Transient) — **retry**. A temporary problem
+///   (network blip, store timeout, downstream service unavailable) that may
+///   succeed later. The retry middleware reattempts; if configured, the defer
+///   middleware can move the message to a timer-based retry to unblock the
+///   partition.
+/// - [`Permanent`](ErrorCategory::Permanent) — **give up on this message**. The
+///   data itself is bad (deserialization failure, schema violation, business
+///   rule rejection) and retrying won't help. The message is committed, and may
+///   be routed to a dead-letter topic if the failure-topic middleware is
+///   configured.
+/// - [`Terminal`](ErrorCategory::Terminal) — **shut the consumer down**. The
+///   process can't safely continue (corrupted local state, an invariant
+///   violation) and a new instance must take over.
 ///
 /// The classification is the contract between your handler and the
 /// framework: pick the right category and the middleware stack handles
@@ -398,13 +398,12 @@ pub trait HandlerMiddleware {
 /// Every `on_message` / `on_timer` invocation that runs and returns is
 /// paired with one apply hook on the same handler instance:
 ///
-/// - [`after_commit`](Self::after_commit) — the invocation is **final**.
-///   The same logical message/timer will not be dispatched to this
-///   handler again.
-/// - [`after_abort`](Self::after_abort) — the invocation is **not
-///   final**. The same logical message/timer **will** be dispatched again
-///   (in-process retry, deferred retry via a timer, or a re-poll after
-///   the durability marker aborted).
+/// - [`after_commit`](Self::after_commit) — the invocation is **final**. The
+///   same logical message/timer will not be dispatched to this handler again.
+/// - [`after_abort`](Self::after_abort) — the invocation is **not final**. The
+///   same logical message/timer **will** be dispatched again (in-process retry,
+///   deferred retry via a timer, or a re-poll after the durability marker
+///   aborted).
 ///
 /// Hook firing is best-effort: a process crash, unavailable bookkeeping
 /// storage, or a middleware above the handler that cannot determine the
@@ -438,36 +437,33 @@ pub trait HandlerMiddleware {
 /// stack. It covers what a `FallibleHandler` middleware (a wrapper around
 /// an inner handler) must do.
 ///
-/// 1. **Forward the handler methods.** Call `self.inner.on_message(...)`
-///    and `self.inner.on_timer(...)` (await them), then decide whether to
+/// 1. **Forward the handler methods.** Call `self.inner.on_message(...)` and
+///    `self.inner.on_timer(...)` (await them), then decide whether to
 ///    short-circuit, transform the result, or pass it through. Cascade
-///    `shutdown` by awaiting `self.inner.shutdown()` so inner resources
-///    are released.
+///    `shutdown` by awaiting `self.inner.shutdown()` so inner resources are
+///    released.
 ///
-/// 2. **Wrap the inner's error.** Define an enum like
-///    `enum MyError<E> { Inner(E), MyOwn(...) }`. Implement
-///    [`ClassifyError`] for it by delegating `Inner` to the wrapped
-///    error's classification and classifying your own variants
-///    explicitly — see [Error classification](#error-classification) for
-///    the categories.
+/// 2. **Wrap the inner's error.** Define an enum like `enum MyError<E> {
+///    Inner(E), MyOwn(...) }`. Implement [`ClassifyError`] for it by delegating
+///    `Inner` to the wrapped error's classification and classifying your own
+///    variants explicitly — see [Error classification](#error-classification)
+///    for the categories.
 ///
-/// 3. **Thread `Output`.** Use `type Output = Inner::Output` if you don't
-///    add staging of your own, or `type Output = (Inner::Output,
-///    MyHandle)` if you do. Short-circuiting middleware that may skip the
-///    inner (deduplication, filtering) typically encodes the skip in the
-///    Output type — `type Output = Option<Inner::Output>`, with `None`
-///    meaning the inner did not run. **Never collapse to `()`** in
-///    middleware: that discards the inner's value and breaks 2PC handlers
-///    downstream.
+/// 3. **Thread `Output`.** Use `type Output = Inner::Output` if you don't add
+///    staging of your own, or `type Output = (Inner::Output, MyHandle)` if you
+///    do. Short-circuiting middleware that may skip the inner (deduplication,
+///    filtering) typically encodes the skip in the Output type — `type Output =
+///    Option<Inner::Output>`, with `None` meaning the inner did not run.
+///    **Never collapse to `()`** in middleware: that discards the inner's value
+///    and breaks 2PC handlers downstream.
 ///
-/// 4. **Route apply hooks.** Fire exactly one apply hook on the inner
-///    per inner invocation that ran, chosen by the per-invocation work
-///    outcome (see [Apply hooks](#apply-hooks-optional)). Pass the
-///    inner's typed `Result` through unchanged — never coerce errors to
-///    `Ok` or drop them, since that silently breaks 2PC handlers below.
-///    An in-process retry loop that runs N attempts must fire N hooks:
-///    the first N-1 are `after_abort` and the last matches the terminal
-///    outcome. Hooks are never coalesced.
+/// 4. **Route apply hooks.** Fire exactly one apply hook on the inner per inner
+///    invocation that ran, chosen by the per-invocation work outcome (see
+///    [Apply hooks](#apply-hooks-optional)). Pass the inner's typed `Result`
+///    through unchanged — never coerce errors to `Ok` or drop them, since that
+///    silently breaks 2PC handlers below. An in-process retry loop that runs N
+///    attempts must fire N hooks: the first N-1 are `after_abort` and the last
+///    matches the terminal outcome. Hooks are never coalesced.
 ///
 ///    On a skip path (the inner did not run), suppress both apply hooks
 ///    on the inner — there's no invocation to pair them with.
@@ -695,13 +691,12 @@ pub struct ComposedMiddleware<M1, M2>(M1, M2);
 ///
 /// 1. Extract inner message/timer and the uncommitted offset/timer.
 /// 2. Invoke the `FallibleHandler` method **once**.
-/// 3. On `Ok`, `Permanent`, or `Transient`: commit the marker — this
-///    invocation is final from the consumer's POV — and call
-///    `after_commit` with the typed result.
-/// 4. On `Terminal`: abort the marker — the message/timer will be
-///    redelivered on the next poll, producing a **new** invocation that
-///    will get its own apply hook — and call `after_abort` with the
-///    typed error.
+/// 3. On `Ok`, `Permanent`, or `Transient`: commit the marker — this invocation
+///    is final from the consumer's POV — and call `after_commit` with the typed
+///    result.
+/// 4. On `Terminal`: abort the marker — the message/timer will be redelivered
+///    on the next poll, producing a **new** invocation that will get its own
+///    apply hook — and call `after_abort` with the typed error.
 ///
 /// Because there is exactly one inner invocation per call into this impl,
 /// the per-invocation invariant is satisfied trivially: one invocation

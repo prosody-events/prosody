@@ -21,11 +21,11 @@
 //! [`MessageDeferOutput`] encodes the routing:
 //!
 //! * `Inner` — inner ran; forward the framework's chosen hook.
-//! * `Deferred` — inner ran and returned a transient error that we captured
-//!   for retry. Both hooks route to `after_abort(Err(..))`: a retry is
-//!   coming even though the defer marker itself commits.
-//! * `NoInner` — inner did not run (queue-append, orphan-timer, loader
-//!   failure, key-mismatch); suppress both hooks.
+//! * `Deferred` — inner ran and returned a transient error that we captured for
+//!   retry. Both hooks route to `after_abort(Err(..))`: a retry is coming even
+//!   though the defer marker itself commits.
+//! * `NoInner` — inner did not run (queue-append, orphan-timer, loader failure,
+//!   key-mismatch); suppress both hooks.
 
 use super::loader::{KafkaLoader, MessageLoader};
 use super::store::{MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult};
@@ -829,7 +829,8 @@ where
         // Apply-hook routing (see module docs):
         // - Inner(o):    inner ran and succeeded           -> after_commit(Ok)
         // - NoInner:     no inner dispatch happened        -> suppress
-        // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e)) (retry coming)
+        // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e))
+        //   (retry coming)
         // - Handler(e):  inner ran and surfaced an error   -> after_commit(Err)
         // - Store/Loader/...: defer-layer error, inner never ran -> suppress
         match result {

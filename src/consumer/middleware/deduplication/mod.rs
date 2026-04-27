@@ -301,7 +301,8 @@ where
     {
         match result {
             Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
-            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store write failed
+            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store
+            // write failed
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_commit(context, Err(error)).await;
             }
@@ -314,7 +315,8 @@ where
     {
         match result {
             Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
-            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store write failed
+            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store
+            // write failed
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_abort(context, Err(error)).await;
             }
