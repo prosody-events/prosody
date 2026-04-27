@@ -31,7 +31,6 @@ use crossbeam_utils::CachePadded;
 use educe::Educe;
 use futures::stream::select;
 use futures::{Stream, StreamExt, pin_mut};
-use serde_json::Value;
 use std::future::{Ready, ready};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -94,11 +93,13 @@ struct PartitionInfo {
 ///
 /// Groups the channels and trackers needed for partition processing,
 /// separating runtime state from static configuration.
-struct PartitionContext {
+///
+/// `P` is the payload type carried by incoming [`ConsumerMessage`]s.
+struct PartitionContext<P> {
     /// Tracks offset commits and processing progress.
     offsets: OffsetTracker,
     /// Channel receiving messages to process.
-    message_rx: Receiver<ConsumerMessage>,
+    message_rx: Receiver<ConsumerMessage<P>>,
     /// Registry for monitoring processing and timer heartbeats.
     heartbeats: HeartbeatRegistry,
     /// Channel receiving shutdown phase transitions.
@@ -111,9 +112,10 @@ struct PartitionContext {
 /// for a Kafka partition, including buffer sizes, timer concurrency,
 /// and filtering options.
 ///
-/// `P` is a [`TriggerStoreProvider`] that creates per-partition stores.
+/// `S` is a [`TriggerStoreProvider`] that creates per-partition stores.
+/// `P` is the payload type carried by consumed messages.
 #[derive(Clone, Debug)]
-pub struct PartitionConfiguration<P> {
+pub struct PartitionConfiguration<S, P> {
     /// Consumer group identifier
     pub group_id: Arc<str>,
 
@@ -126,6 +128,10 @@ pub struct PartitionConfiguration<P> {
     /// Optional automaton for filtering messages by event type
     pub allowed_events: Option<AhoCorasick>,
 
+    /// Optional function to extract an event-type tag from a payload for
+    /// filtering against `allowed_events`.
+    pub event_type_extractor: Option<fn(&P) -> Option<&str>>,
+
     /// Timeout duration for shutdown operations
     pub shutdown_timeout: Duration,
 
@@ -137,7 +143,7 @@ pub struct PartitionConfiguration<P> {
 
     /// Trigger store provider — creates per-partition stores with independent
     /// caches.
-    pub trigger_provider: P,
+    pub trigger_provider: S,
 
     /// Timer slab size
     pub timer_slab_size: CompactDuration,
@@ -161,9 +167,11 @@ pub struct PartitionConfiguration<P> {
 /// - Managing graceful partition shutdown during rebalancing
 /// - Enforcing backpressure through the bounded message channel
 /// - Monitoring for processing stalls
+///
+/// `P` is the payload type carried by consumed messages.
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct PartitionManager {
+pub struct PartitionManager<P> {
     /// The Kafka topic this partition belongs to
     topic: Topic,
     /// The partition number this manager handles
@@ -175,7 +183,7 @@ pub struct PartitionManager {
 
     /// Channel for sending messages to be processed
     #[educe(Debug(ignore))]
-    message_tx: Sender<ConsumerMessage>,
+    message_tx: Sender<ConsumerMessage<P>>,
 
     /// Heartbeat registry
     #[educe(Debug(ignore))]
@@ -193,7 +201,7 @@ pub struct PartitionManager {
     handle: JoinHandle<()>,
 }
 
-impl PartitionManager {
+impl<P: Send + 'static> PartitionManager<P> {
     /// Creates a new partition manager.
     ///
     /// # Arguments
@@ -205,16 +213,17 @@ impl PartitionManager {
     ///
     /// # Returns
     ///
-    /// A new `PartitionManager` instance
-    pub fn new<T, P>(
-        config: PartitionConfiguration<P>,
+    /// A new `PartitionManager<P>` instance
+    pub fn new<T, S>(
+        config: PartitionConfiguration<S, P>,
         handler: T,
         topic: Topic,
         partition: Partition,
     ) -> Self
     where
         T: EventHandler + Send + Sync + 'static,
-        P: TriggerStoreProvider,
+        S: TriggerStoreProvider,
+        P: Sync,
     {
         // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
@@ -281,7 +290,7 @@ impl PartitionManager {
     ///
     /// `Ok(())` if the message was enqueued, or `Err(ConsumerMessage)`
     /// containing the original message if the queue is full or closed
-    pub fn try_send(&self, message: ConsumerMessage) -> Result<(), ConsumerMessage> {
+    pub fn try_send(&self, message: ConsumerMessage<P>) -> Result<(), ConsumerMessage<P>> {
         self.message_tx
             .try_send(message)
             .map_err(|error| match error {
@@ -439,34 +448,36 @@ where
     }
 }
 
-/// Processes messages for a partition.
 /// Store-agnostic fields extracted from [`PartitionConfiguration`] for
 /// [`run_partition`].
-struct PartitionParams {
+struct PartitionParams<P> {
     group_id: Arc<str>,
     allowed_events: Option<AhoCorasick>,
+    event_type_extractor: Option<fn(&P) -> Option<&str>>,
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     name: String,
     timer_spans: SpanRelation,
 }
 
-/// Extracts the store from the provider `P` then delegates to
-/// [`run_partition`], which is generic only over `P::Store`.  This keeps the
-/// provider type `P` out of the long-lived coroutine state machine, preventing
+/// Extracts the store from the provider `S` then delegates to
+/// [`run_partition`], which is generic only over `S::Store`.  This keeps the
+/// provider type `S` out of the long-lived coroutine state machine, preventing
 /// future-size explosion with the deeply nested middleware handler type `T`.
-async fn handle_messages<T, P>(
-    config: PartitionConfiguration<P>,
+async fn handle_messages<T, S, P>(
+    config: PartitionConfiguration<S, P>,
     partition_info: PartitionInfo,
     handler: T,
-    context: PartitionContext,
+    context: PartitionContext<P>,
 ) where
     T: EventHandler,
-    P: TriggerStoreProvider,
+    S: TriggerStoreProvider,
+    P: Send + Sync + 'static,
 {
     let PartitionConfiguration {
         group_id,
         allowed_events,
+        event_type_extractor,
         trigger_provider,
         timer_slab_size,
         timer_semaphores,
@@ -489,6 +500,7 @@ async fn handle_messages<T, P>(
     let params = PartitionParams {
         group_id,
         allowed_events,
+        event_type_extractor,
         timer_semaphores,
         telemetry_sender,
         name,
@@ -498,20 +510,22 @@ async fn handle_messages<T, P>(
     run_partition(trigger_store, partition_info, handler, context, params).await;
 }
 
-/// Core partition loop, generic only over `S: TriggerStore`.
-async fn run_partition<T, S>(
+/// Core partition loop, generic over `S: TriggerStore` and `P` (payload type).
+async fn run_partition<T, S, P>(
     trigger_store: S,
     partition_info: PartitionInfo,
     handler: T,
-    context: PartitionContext,
-    params: PartitionParams,
+    context: PartitionContext<P>,
+    params: PartitionParams<P>,
 ) where
     T: EventHandler,
     S: TriggerStore,
+    P: Send + Sync + 'static,
 {
     let PartitionParams {
         group_id,
         allowed_events,
+        event_type_extractor,
         timer_semaphores,
         telemetry_sender,
         name,
@@ -526,12 +540,13 @@ async fn run_partition<T, S>(
 
     let mut highest_offset_seen = -1;
 
-    let message_events = build_message_stream::<S>(
+    let message_events = build_message_stream::<S, P>(
         &offsets,
         message_rx,
         &group_id,
         &mut highest_offset_seen,
         allowed_events.as_ref(),
+        event_type_extractor,
     );
 
     let timer_ctx = TimerInitContext {
@@ -551,16 +566,16 @@ async fn run_partition<T, S>(
     let timer_events = stream! {
         pin_mut!(timer_stream);
         while let Some(timer) = cooperative(timer_stream.next()).await {
-            yield UncommittedEvent::Timer(timer);
+            yield UncommittedEvent::<S, P>::Timer(timer);
         }
     };
 
-    let process = |event: UncommittedEvent<S>| async {
+    let process = |event: UncommittedEvent<S, P>| async {
         debug!(?event, "calling handler");
         process_event(event, &handler, &shutdown_rx, &timer_manager, timer_spans).await;
     };
 
-    KeyManager::<UncommittedEvent<S>, _, _>::new(process)
+    KeyManager::<UncommittedEvent<S, P>, _, _>::new(process)
         .process_messages(
             select(message_events, timer_events),
             heartbeats.register("event processor"),
@@ -572,8 +587,8 @@ async fn run_partition<T, S>(
 }
 
 /// Processes a single event (message or timer) through the handler.
-async fn process_event<T, S>(
-    event: UncommittedEvent<S>,
+async fn process_event<T, S, P>(
+    event: UncommittedEvent<S, P>,
     handler: &T,
     shutdown_rx: &watch::Receiver<ShutdownPhase>,
     timer_manager: &TimerManager<S>,
@@ -581,6 +596,7 @@ async fn process_event<T, S>(
 ) where
     T: EventHandler,
     S: TriggerStore,
+    P: Send + 'static,
 {
     match event {
         UncommittedEvent::Message(message) => {
@@ -628,20 +644,24 @@ async fn process_event<T, S>(
 /// * `group_id` - Consumer group identifier
 /// * `highest_offset_seen` - Tracks the highest offset processed
 /// * `allowed_events` - Optional filter for permitted event types
+/// * `event_type_extractor` - Optional function to extract an event-type tag
+///   from a payload
 ///
 /// # Returns
 ///
 /// A stream of [`UncommittedEvent`] items (each wrapping an
 /// [`UncommittedMessage`] or a timer) ready for processing
-fn build_message_stream<T>(
+fn build_message_stream<T, P>(
     offsets: &OffsetTracker,
-    mut message_rx: Receiver<ConsumerMessage>,
+    mut message_rx: Receiver<ConsumerMessage<P>>,
     group_id: &str,
     highest_offset_seen: &mut i64,
     allowed_events: Option<&AhoCorasick>,
-) -> impl Stream<Item = UncommittedEvent<T>>
+    event_type_extractor: Option<fn(&P) -> Option<&str>>,
+) -> impl Stream<Item = UncommittedEvent<T, P>>
 where
     T: TriggerStore,
+    P: Send + 'static,
 {
     stream! {
         while let Some(message) = message_rx.recv().await {
@@ -661,7 +681,7 @@ where
             };
 
             // Apply filter_event_type - filter based on allowed event types
-            let Some(uncommitted) = filter_event_type(allowed_events, uncommitted).await else {
+            let Some(uncommitted) = filter_event_type(event_type_extractor, allowed_events, uncommitted).await else {
                 continue;
             };
 
@@ -684,7 +704,7 @@ where
 ///
 /// `true` if the message should be processed, `false` if it should be filtered
 /// out
-fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Ready<bool> {
+fn filter_rewind<P>(highest_offset_seen: &mut i64, message: &ConsumerMessage<P>) -> Ready<bool> {
     let partition = message.partition();
     let offset = message.offset();
 
@@ -718,10 +738,10 @@ fn filter_rewind(highest_offset_seen: &mut i64, message: &ConsumerMessage) -> Re
 ///
 /// `Some(UncommittedMessage)` if the offset was successfully reserved,
 /// `None` if the reservation failed
-async fn reserve_offset(
+async fn reserve_offset<P: Send + 'static>(
     offsets: &OffsetTracker,
-    received: ConsumerMessage,
-) -> Option<UncommittedMessage> {
+    received: ConsumerMessage<P>,
+) -> Option<UncommittedMessage<P>> {
     // Attempt to reserve the offset
     received
         .span()
@@ -730,7 +750,9 @@ async fn reserve_offset(
                 Ok(uncommitted_offset) => Some(received.into_uncommitted(uncommitted_offset)),
                 Err(error) => {
                     error!(
-                        ?received,
+                        topic = %received.topic(),
+                        partition = received.partition(),
+                        offset = received.offset(),
                         "unable to take uncommitted offset: {error:#}; discarding message"
                     );
                     None
@@ -751,7 +773,10 @@ async fn reserve_offset(
 ///
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
-async fn filter_loops(group_id: &str, message: UncommittedMessage) -> Option<UncommittedMessage> {
+async fn filter_loops<P: Send + 'static>(
+    group_id: &str,
+    message: UncommittedMessage<P>,
+) -> Option<UncommittedMessage<P>> {
     // Check if the message comes from the same source system as our own consumer
     // group
     if message
@@ -782,6 +807,8 @@ async fn filter_loops(group_id: &str, message: UncommittedMessage) -> Option<Unc
 ///
 /// # Arguments
 ///
+/// * `event_type_extractor` - Optional function to extract an event-type tag
+///   from the payload
 /// * `allowed_events` - Optional automaton defining allowed event type patterns
 /// * `message` - The message to check
 ///
@@ -789,12 +816,13 @@ async fn filter_loops(group_id: &str, message: UncommittedMessage) -> Option<Unc
 ///
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
-async fn filter_event_type(
+async fn filter_event_type<P: Send + 'static>(
+    event_type_extractor: Option<fn(&P) -> Option<&str>>,
     allowed_events: Option<&AhoCorasick>,
-    message: UncommittedMessage,
-) -> Option<UncommittedMessage> {
+    message: UncommittedMessage<P>,
+) -> Option<UncommittedMessage<P>> {
     // Extract event type from message payload if present
-    let Some(event_type) = message.payload().get("type").and_then(Value::as_str) else {
+    let Some(event_type) = event_type_extractor.and_then(|f| f(message.payload())) else {
         return Some(message);
     };
 

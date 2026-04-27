@@ -28,12 +28,13 @@ trait HasProcessedOffsets {
 }
 
 /// Returns a default `PartitionConfiguration` with sensible defaults.
-fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider> {
+fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider, serde_json::Value> {
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
         buffer_size: 10,
         max_uncommitted: 10,
         allowed_events: None,
+        event_type_extractor: None,
         shutdown_timeout: Duration::from_secs(1),
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
@@ -217,7 +218,7 @@ async fn test_partition_manager_is_stalled() {
         fn on_message<C>(
             &self,
             _context: C,
-            message: UncommittedMessage,
+            message: UncommittedMessage<serde_json::Value>,
             _demand_type: DemandType,
         ) -> impl Future<Output = ()> + Send
         where
@@ -306,6 +307,8 @@ async fn test_partition_manager_event_type_filtering() {
             .build(["allowed"])
             .expect("Invalid event pattern"),
     );
+    config.event_type_extractor =
+        Some(|payload: &serde_json::Value| payload.get("type").and_then(serde_json::Value::as_str));
 
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
@@ -423,7 +426,7 @@ impl EventHandler for TestHandler {
     fn on_message<C>(
         &self,
         _context: C,
-        message: UncommittedMessage,
+        message: UncommittedMessage<serde_json::Value>,
         _demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
@@ -470,7 +473,7 @@ impl EventHandler for TestHandler {
 }
 
 /// Helper functions to create test messages.
-fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
+fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage<serde_json::Value> {
     let semaphore = Arc::new(Semaphore::new(10));
     ConsumerMessage::new(
         ConsumerMessageValue {
@@ -489,7 +492,7 @@ fn create_test_message_with_event_id(
     offset: Offset,
     key: &str,
     event_id: Option<&str>,
-) -> ConsumerMessage {
+) -> ConsumerMessage<serde_json::Value> {
     let payload = event_id.map_or_else(
         || serde_json::json!({}),
         |id| serde_json::json!({ "id": id }),
