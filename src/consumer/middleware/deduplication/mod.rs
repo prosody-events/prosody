@@ -171,7 +171,7 @@ where
 {
     /// Computes the dedup UUID for a message, incorporating the `event_id`
     /// (from payload) or falling back to writing the offset directly.
-    fn dedup_uuid_for_message(&self, message: &ConsumerMessage) -> Uuid {
+    fn dedup_uuid_for_message(&self, message: &ConsumerMessage<T::Payload>) -> Uuid {
         let mut hasher = Xxh3Default::new();
         hasher.write_u32(self.version.len() as u32);
         hasher.write(self.version.as_bytes());
@@ -206,11 +206,12 @@ where
     /// `Some` — inner ran; forward apply hook. `None` — dedup hit; suppress
     /// both hooks.
     type Output = Option<T::Output>;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

@@ -495,7 +495,13 @@ pub trait FallibleHandler: Send + Sync + 'static {
     ///
     /// Must match the codec's `Payload` type so the consumer pipeline can
     /// deliver typed messages. Set to `serde_json::Value` for JSON consumers.
-    type Payload: Send + Sync + 'static;
+    ///
+    /// The [`crate::EventIdentity`] bound enables payload-aware middleware
+    /// (e.g. deduplication) to derive stable per-event identifiers from
+    /// the payload without additional where clauses at every use site.
+    /// `serde_json::Value` satisfies this bound, so JSON consumers require
+    /// no changes.
+    type Payload: crate::EventIdentity + Send + Sync + 'static;
 
     /// Error type returned by [`Self::on_message`] / [`Self::on_timer`].
     ///

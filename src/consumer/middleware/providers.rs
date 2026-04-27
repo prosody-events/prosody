@@ -170,6 +170,7 @@ impl<T> InfallibleWrapper<T> {
 impl<T> FallibleHandler for InfallibleWrapper<T>
 where
     T: EventHandler + Send + Sync + 'static,
+    T::Payload: crate::EventIdentity,
 {
     type Error = Infallible;
     type Output = ();
