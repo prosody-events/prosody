@@ -44,10 +44,14 @@ use crate::{Payload, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 /// - Context is safely cached (contains only remote trace identifiers)
 /// - Each load site creates its own span from the cached context
 /// - Spans close when processing completes, not on cache eviction
+///
+/// # Type Parameters
+///
+/// * `P` – The deserialized payload type.
 #[derive(Clone, Debug)]
-pub struct DecodedMessage {
+pub struct DecodedMessage<P> {
     /// Shared immutable message data
-    pub value: Arc<ConsumerMessageValue>,
+    pub value: Arc<ConsumerMessageValue<P>>,
 
     /// Parent trace context extracted from original Kafka headers.
     ///
@@ -83,7 +87,7 @@ pub fn decode_message(
     message: &BorrowedMessage,
     propagator: &TextMapCompositePropagator,
     #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
-) -> Option<DecodedMessage> {
+) -> Option<DecodedMessage<Payload>> {
     // Extract basic message coordinates
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
