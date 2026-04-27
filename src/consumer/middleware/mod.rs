@@ -330,148 +330,199 @@ pub trait HandlerMiddleware {
     }
 }
 
-/// Defines a handler that can fail during message processing.
+/// A handler for Kafka messages and scheduled timers — the application's
+/// integration point with a Prosody consumer.
 ///
-/// # Apply hooks: `after_commit` / `after_abort`
+/// Implementing this trait wires your business logic into the consumer
+/// pipeline. You provide:
 ///
-/// For every `on_message` / `on_timer` invocation on a handler instance
-/// `H` that runs and returns, at most one apply hook fires on `H`. Hooks
-/// are best-effort: they may not fire if the process crashes or storage is
-/// unavailable. Handler logic must be robust to a missing hook.
+/// - An [`Error`](Self::Error) type whose variants are classified by
+///   [`ClassifyError`] (drives the framework's retry vs. give-up vs.
+///   shutdown decisions — see [Error classification](#error-classification)).
+/// - [`on_message`](Self::on_message) — called for each Kafka message
+///   delivered to the consumer.
+/// - [`on_timer`](Self::on_timer) — called for each scheduled timer that
+///   fires (when the consumer is configured with a timer system).
+/// - [`shutdown`](Self::shutdown) — called when the consumer stops or a
+///   partition is revoked.
 ///
-/// - [`Self::after_commit`] — this invocation is **final**. The same logical
-///   message/timer will not be re-dispatched into `H` by this consumer.
-/// - [`Self::after_abort`] — this invocation is **not final**. The same
-///   logical message/timer **will** be re-dispatched into `H` (a retry is
-///   coming via this consumer, e.g. through a deferred timer or an
-///   in-process retry loop that re-invokes the inner).
+/// Two optional pieces extend the basic shape for handlers that stage
+/// external work during processing:
 ///
-/// If an invocation did not run (e.g. the dispatch was short-circuited
-/// above `H`), neither apply hook fires.
+/// - [`Output`](Self::Output) — a typed value the handler returns on
+///   success (defaults to `()`); carried into the apply hook.
+/// - [`after_commit`](Self::after_commit) and
+///   [`after_abort`](Self::after_abort) — apply hooks that fire after the
+///   framework decides whether the just-completed invocation will be
+///   retried, enabling 2-phase-commit workflows.
 ///
-/// A wrapping middleware that re-invokes the inner must fire one apply
-/// hook on the inner between every pair of invocations, and one final
-/// apply hook after the last invocation. Each invocation gets its own
-/// `after_commit` or `after_abort`; they are never coalesced.
+/// The consumer pipeline is itself a stack of `FallibleHandler` impls
+/// (retry, deduplication, defer, telemetry, your handler at the bottom),
+/// so middleware authors implement this same trait. The [module-level
+/// docs](self) cover how impls are composed (layering, providers,
+/// execution flow); [Implementing as middleware](#implementing-as-middleware)
+/// below covers what an individual middleware impl owes its inner
+/// handler.
 ///
-/// The choice between `after_commit` and `after_abort` is determined by the
-/// **work outcome for that single invocation** (is `H` going to be invoked
-/// again for this same logical event?), not by which durability marker
-/// primitive was invoked. The framework — including any rescue / defer /
-/// retry middleware in the stack — is the source of truth for that
-/// distinction, not the marker. In particular: even when the durability
-/// marker commits (e.g. the Kafka offset advances because a defer
-/// middleware took ownership and scheduled a deferred retry), the inner
-/// invocation can still be told `after_abort`, because another invocation
-/// is coming.
+/// # Error classification
 ///
-/// Wrapping middleware that re-invokes the inner (e.g. an in-process retry
-/// loop) MUST fire apply hooks **between** invocations. The canonical
-/// example is the [`retry`] module: every attempt that calls the inner
-/// pairs with its own `after_abort` (intermediate attempts where another
-/// retry is coming) or `after_commit` (the final attempt that gives up or
-/// succeeds).
+/// Every error returned by `on_message` or `on_timer` is routed by
+/// [`ClassifyError::classify_error`] into one of three categories that
+/// determine how the consumer pipeline reacts:
+///
+/// - [`Transient`](ErrorCategory::Transient) — **retry**. A temporary
+///   problem (network blip, store timeout, downstream service
+///   unavailable) that may succeed later. The retry middleware
+///   reattempts; if configured, the defer middleware can move the
+///   message to a timer-based retry to unblock the partition.
+/// - [`Permanent`](ErrorCategory::Permanent) — **give up on this
+///   message**. The data itself is bad (deserialization failure, schema
+///   violation, business rule rejection) and retrying won't help. The
+///   message is committed, and may be routed to a dead-letter topic if
+///   the failure-topic middleware is configured.
+/// - [`Terminal`](ErrorCategory::Terminal) — **shut the consumer down**.
+///   The process can't safely continue (corrupted local state, an
+///   invariant violation) and a new instance must take over.
+///
+/// The classification is the contract between your handler and the
+/// framework: pick the right category and the middleware stack handles
+/// the rest.
+///
+/// # Apply hooks (optional)
+///
+/// Apply hooks let a handler stage external state during processing and
+/// finalize or roll it back once the framework decides whether the
+/// invocation will be retried. Most handlers don't need them — leave
+/// [`Output`](Self::Output) as `()` and the default no-op hooks suffice.
+///
+/// Every `on_message` / `on_timer` invocation that runs and returns is
+/// paired with one apply hook on the same handler instance:
+///
+/// - [`after_commit`](Self::after_commit) — the invocation is **final**.
+///   The same logical message/timer will not be dispatched to this
+///   handler again.
+/// - [`after_abort`](Self::after_abort) — the invocation is **not
+///   final**. The same logical message/timer **will** be dispatched again
+///   (in-process retry, deferred retry via a timer, or a re-poll after
+///   the durability marker aborted).
+///
+/// Hook firing is best-effort: a process crash, unavailable bookkeeping
+/// storage, or a middleware above the handler that cannot determine the
+/// work outcome can skip the hook. If an invocation never runs (e.g.
+/// dispatch was short-circuited above the handler), neither hook fires
+/// for it. Handlers must be idempotent and must not depend on apply
+/// hooks for correctness or data integrity.
+///
+/// The choice between the two hooks is the **work outcome of that single
+/// invocation** — "is the handler going to be invoked again for this same
+/// logical event?" — not what happened to the durability marker (the
+/// Kafka offset commit or timer commit). The framework, including any
+/// defer / retry / rescue middleware in the stack, is the source of
+/// truth for that distinction. A defer middleware that commits the Kafka
+/// offset to schedule a deferred retry, for example, still pairs the
+/// just-completed invocation with `after_abort` — another invocation is
+/// coming.
 ///
 /// # `Output` and 2-phase commit
 ///
-/// Each handler invocation returns a typed `Self::Output` value on success.
-/// The framework hands the resulting `Result<Self::Output, Self::Error>`
-/// back to the matching apply hook with ownership, paired with that exact
-/// invocation. This gives handlers a 2-phase-commit seam: stage external
-/// state inside `on_message`/`on_timer`, return a handle in the `Ok` value,
-/// and finalise (on `after_commit`) or unstage (on `after_abort`) that
-/// state in the apply hook for that invocation.
+/// Each invocation returns a typed [`Self::Output`] on success, which the
+/// framework hands to the matching apply hook for that invocation. This
+/// gives handlers a 2-phase-commit seam: stage external state inside
+/// `on_message` / `on_timer`, return a staging handle as the `Ok` value,
+/// and finalize (in `after_commit`) or unstage (in `after_abort`) that
+/// state in the paired hook.
 ///
-/// Because the invariant is strictly per-invocation, every staged handle
-/// returned by an invocation is paired with exactly one apply hook firing
-/// — no batching across retries, no skipping the hook between attempts.
+/// # Implementing as middleware
 ///
-/// Most handlers don't need 2PC and set `type Output = ();`. The default
-/// `after_commit`/`after_abort` implementations are no-ops that LLVM inlines
-/// away for that case.
+/// You can skip this section if your handler sits at the bottom of the
+/// stack. It covers what a `FallibleHandler` middleware (a wrapper around
+/// an inner handler) must do.
 ///
-/// # EventHandler-implementor contract
+/// 1. **Forward the handler methods.** Call `self.inner.on_message(...)`
+///    and `self.inner.on_timer(...)` (await them), then decide whether to
+///    short-circuit, transform the result, or pass it through. Cascade
+///    `shutdown` by awaiting `self.inner.shutdown()` so inner resources
+///    are released.
 ///
-/// Any [`EventHandler`] (including any rescue / defer / retry middleware)
-/// that resolves the apply hook for an inner [`FallibleHandler`] is
-/// responsible for invoking **exactly one** apply hook per inner
-/// invocation that ran, and for picking the hook that matches the
-/// **per-invocation work outcome**:
+/// 2. **Wrap the inner's error.** Define an enum like
+///    `enum MyError<E> { Inner(E), MyOwn(...) }`. Implement
+///    [`ClassifyError`] for it by delegating `Inner` to the wrapped
+///    error's classification and classifying your own variants
+///    explicitly — see [Error classification](#error-classification) for
+///    the categories.
 ///
-/// - If this specific invocation is final from this consumer's POV — there
-///   will be no further invocation of the inner for this logical
-///   message/timer — call `inner.after_commit(ctx, result).await`.
-/// - If another invocation of the inner is coming (an in-process retry
-///   loop's next attempt, a deferred retry via a timer middleware, the
-///   broker re-polling after marker abort, etc.) — call
-///   `inner.after_abort(ctx, result).await`.
+/// 3. **Thread `Output`.** Use `type Output = Inner::Output` if you don't
+///    add staging of your own, or `type Output = (Inner::Output,
+///    MyHandle)` if you do. Short-circuiting middleware that may skip the
+///    inner (deduplication, filtering) typically encodes the skip in the
+///    Output type — `type Output = Option<Inner::Output>`, with `None`
+///    meaning the inner did not run. **Never collapse to `()`** in
+///    middleware: that discards the inner's value and breaks 2PC handlers
+///    downstream.
 ///
-/// In particular, an in-process retry loop that calls the inner N times
-/// MUST fire N apply hooks on the inner: the first N-1 are `after_abort`
-/// (another attempt is coming) and the last is whichever hook matches the
-/// terminal work outcome. Apply hooks are **never** coalesced across a
-/// retry session.
+/// 4. **Route apply hooks.** Fire exactly one apply hook on the inner
+///    per inner invocation that ran, chosen by the per-invocation work
+///    outcome (see [Apply hooks](#apply-hooks-optional)). Pass the
+///    inner's typed `Result` through unchanged — never coerce errors to
+///    `Ok` or drop them, since that silently breaks 2PC handlers below.
+///    An in-process retry loop that runs N attempts must fire N hooks:
+///    the first N-1 are `after_abort` and the last matches the terminal
+///    outcome. Hooks are never coalesced.
 ///
-/// `result` MUST be the same `Result<Self::Output, Self::Error>` the inner
-/// produced for that invocation. Middleware that rescues an inner error
-/// (e.g. by routing it to a DLQ or scheduling a deferred retry) MUST
-/// preserve the inner's typed error and forward it through the appropriate
-/// apply hook — it must not drop it on the floor or coerce it to `Ok`.
-/// Failing to do so silently breaks any 2PC handler further down the
-/// chain.
+///    On a skip path (the inner did not run), suppress both apply hooks
+///    on the inner — there's no invocation to pair them with.
 ///
-/// The blanket `FallibleEventHandler → EventHandler` impl in this module is
-/// the default durability boundary: with no rescue middleware below it,
-/// each invocation maps 1:1 to a single dispatch and resolving the marker
+/// The blanket `FallibleEventHandler → EventHandler` impl is the default
+/// durability boundary for handlers without rescue middleware: each
+/// invocation maps 1:1 to a single dispatch, and resolving the marker
 /// coincides with the work outcome (commit ⇒ final invocation, abort ⇒
-/// re-dispatch on the next poll, which produces a new invocation that
-/// gets its own apply hook). `RetryHandler` and the defer / topic
-/// middlewares take on this responsibility for richer cases; any new
-/// `EventHandler` that resolves the marker — or any wrapping
-/// `FallibleHandler` middleware that re-invokes the inner — must follow
-/// the same per-invocation pattern.
+/// re-dispatch on the next poll, which produces a new invocation with
+/// its own apply hook). [`retry`], defer, and topic middlewares take on
+/// this responsibility for richer compositions.
 ///
 /// [`EventHandler`]: crate::consumer::EventHandler
 /// [`Uncommitted::commit`]: crate::consumer::Uncommitted::commit
 /// [`Uncommitted::abort`]: crate::consumer::Uncommitted::abort
 /// [`retry`]: crate::consumer::middleware::retry
 pub trait FallibleHandler: Send + Sync + 'static {
-    /// The error type returned by this handler.
+    /// Error type returned by [`Self::on_message`] / [`Self::on_timer`].
+    ///
+    /// Must implement [`ClassifyError`] so the framework can decide
+    /// whether to retry, give up, or shut down for each variant — see
+    /// [Error classification](#error-classification) on the trait docs.
+    /// Use [`std::convert::Infallible`] for handlers that cannot fail.
     type Error: ClassifyError + StdError + Send;
 
-    /// Value the handler returns on success and that the apply hooks
-    /// ([`Self::after_commit`]/[`Self::after_abort`]) consume once the
-    /// framework has decided whether this specific invocation is final or
-    /// whether another invocation of the handler is coming.
+    /// Success value produced by [`Self::on_message`] / [`Self::on_timer`]
+    /// and handed to the matching apply hook for that invocation. This is
+    /// the staging handle in a 2-phase-commit workflow — a transaction
+    /// token, a deferred-write handle, or whatever the handler needs to
+    /// finalize (in [`Self::after_commit`]) or unstage (in
+    /// [`Self::after_abort`]).
     ///
-    /// Each invocation produces its own `Output` (or `Error`) and is paired
-    /// with exactly one apply hook firing carrying that value. There is no
-    /// coalescing across invocations: a retry session that invokes the
-    /// inner three times produces three apply-hook firings, each consuming
-    /// the `Output`/`Error` of its matching invocation.
-    ///
-    /// Most handlers set `type Output = ();`. 2PC handlers carry a staging
-    /// handle, a transaction token, or whatever they need to finalise /
-    /// unstage. Wrapping middleware threads `Output` through using either
-    /// the pass-through pattern (`type Output = Inner::Output`) or the
-    /// extending pattern (`type Output = (Inner::Output, MyHandle)`);
-    /// never collapse to `()` in middleware — that silently discards the
-    /// inner's value and breaks 2PC composition.
+    /// Most handlers don't need 2PC and set `type Output = ();`.
+    /// Middleware authors threading `Output` through a wrapper: see
+    /// [Implementing as middleware](#implementing-as-middleware) on the
+    /// trait docs for the pass-through and extending-tuple patterns.
     type Output: Send;
 
-    /// Handles a message, potentially returning an error.
+    /// Handles a Kafka message, returning a typed [`Result`].
     ///
-    /// # Arguments
+    /// On success, the `Ok` value is forwarded to the matching apply hook
+    /// ([`Self::after_commit`] or [`Self::after_abort`], depending on
+    /// whether this consumer will dispatch the same logical message
+    /// again). Use it to carry a staging handle for 2-phase-commit
+    /// workflows; set `Output = ()` if no staging is needed.
     ///
-    /// * `context` - The context of the message being processed.
-    /// * `message` - The message to be processed.
-    /// * `demand_type` - Whether this is normal processing or failure retry.
+    /// Errors are routed by their [`ClassifyError`] category — see
+    /// [Error classification](#error-classification) on the trait docs.
+    /// Implementations should be idempotent: the same logical message
+    /// may be redelivered after a retry, defer, or rebalance, and apply
+    /// hooks may not fire on every invocation.
     ///
-    /// # Returns
-    ///
-    /// A `Future` that resolves to `Ok(output)` carrying the typed value the
-    /// handler produced on success, or an `Err` containing the error if
-    /// processing failed.
+    /// `demand_type` distinguishes a fresh dispatch from a failure-driven
+    /// retry, which implementations can use for backpressure or
+    /// observability.
     fn on_message<C>(
         &self,
         context: C,
@@ -481,42 +532,23 @@ pub trait FallibleHandler: Send + Sync + 'static {
     where
         C: EventContext;
 
-    /// Handles timer events with potential for failure.
+    /// Handles a fired timer trigger, returning a typed [`Result`].
     ///
-    /// This method is called when a scheduled timer fires and is delivered to
-    /// the handler for processing. Unlike [`Self::on_message`], this method
-    /// handles timer events that contain a key, execution time, and tracing
-    /// span.
+    /// On success, the `Ok` value is forwarded to the matching apply hook
+    /// ([`Self::after_commit`] or [`Self::after_abort`], depending on
+    /// whether the same trigger will be redelivered). Use it to carry a
+    /// staging handle for 2-phase-commit workflows; set `Output = ()` if
+    /// no staging is needed.
     ///
-    /// # Arguments
+    /// Errors are routed by their [`ClassifyError`] category — see
+    /// [Error classification](#error-classification) on the trait docs.
+    /// Implementations should be idempotent: a trigger can be redelivered
+    /// if processing is interrupted, and apply hooks may not fire on
+    /// every invocation.
     ///
-    /// * `context` - The event processing context with access to timer
-    ///   management
-    /// * `trigger` - The timer trigger containing key, time, and span
-    ///   information
-    /// * `demand_type` - Whether this is normal processing or failure retry.
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves to:
-    /// - `Ok(output)` carrying the typed value the handler produced on success
-    /// - `Err(Self::Error)` if processing failed
-    ///
-    /// # Error Handling
-    ///
-    /// Errors returned by this method are classified using [`ClassifyError`] to
-    /// determine the appropriate failure handling approach:
-    /// - **Transient errors**: May be retried with backoff
-    /// - **Permanent errors**: Logged and timer may be discarded
-    /// - **Terminal errors**: Cause processing to stop entirely
-    ///
-    /// # Implementation Requirements
-    ///
-    /// Implementations should:
-    /// - Process the timer event according to business logic
-    /// - Return appropriate error types that implement [`ClassifyError`]
-    /// - Ensure processing is idempotent where possible
-    /// - Handle the timer's tracing span for observability
+    /// `demand_type` distinguishes a fresh dispatch from a failure-driven
+    /// retry, which implementations can use for backpressure or
+    /// observability.
     fn on_timer<C>(
         &self,
         context: C,
@@ -526,31 +558,49 @@ pub trait FallibleHandler: Send + Sync + 'static {
     where
         C: EventContext;
 
-    /// Runs when **the just-completed invocation** of `on_message` /
-    /// `on_timer` is final: this handler will not be invoked again for the
-    /// same logical message/timer by this consumer. The hook owns the
-    /// `Result<Self::Output, Self::Error>` produced by **that specific
-    /// invocation** — either the success value (finalise staged state) or
-    /// the typed error (the message/timer is being given up on without a
-    /// redelivery, e.g. routed to a DLQ, dedup-recorded, or simply dropped
-    /// after a Permanent classification).
+    /// Finalizes staged work after the just-completed invocation has been
+    /// committed.
     ///
-    /// "Final" is a **per-invocation, work-outcome** statement, not a
-    /// marker statement. Resolving the durability marker (Kafka offset
-    /// commit, timer commit) is the typical mechanism, but `after_commit`
-    /// is the right hook whenever no further invocation of this handler is
-    /// coming for this logical event — even if a different middleware took
-    /// ownership of the marker. Conversely, this hook fires **once per
-    /// final invocation**, never as a roll-up across a retry session.
+    /// Called after [`Self::on_message`] / [`Self::on_timer`] when this
+    /// consumer will not invoke the handler again for the same logical
+    /// event. Use this hook to finalize any external state that was staged
+    /// during the invocation (the second phase of a 2-phase-commit
+    /// pattern).
     ///
-    /// Per-key serialised: a same-key follow-up event will not dispatch
-    /// until this returns. Failures here cannot redeliver — retry-internally
-    /// or accept logging-only semantics.
+    /// The hook receives the exact [`Result`] the invocation returned. An
+    /// `Ok` carries the staged value to commit; an `Err` means the event
+    /// has been given up on (e.g. routed to a DLQ, dropped after a
+    /// `Permanent` classification, or recorded as a duplicate) and any
+    /// staged work should be cleaned up.
     ///
-    /// Wrapping middleware MUST forward this call to its inner handler with
-    /// the inner-typed `Result`; see the trait-level docs for the
-    /// `EventHandler` contract that ensures this hook fires exactly once
-    /// per inner invocation that ran.
+    /// # Delivery guarantees
+    ///
+    /// **Fires once per handler invocation that ran and returned**, paired
+    /// with the invocation's typed `Result`. Each invocation pairs with
+    /// either this hook or [`Self::after_abort`] — never both, and never
+    /// coalesced across multiple invocations.
+    ///
+    /// **Best-effort.** The hook may not fire if the process crashes, the
+    /// framework's bookkeeping storage is unavailable, or middleware above
+    /// this handler cannot determine the work outcome. **Handlers must be
+    /// idempotent and must not rely on this hook for correctness or data
+    /// integrity** — recovery on the next dispatch must reach the same end
+    /// state without depending on the hook having fired.
+    ///
+    /// # Behavior
+    ///
+    /// "Final" describes the per-invocation work outcome, not the
+    /// durability marker. `after_commit` is the right hook whenever no
+    /// further invocation is coming for this logical event — for example,
+    /// after a successful invocation, a permanent error that won't be
+    /// retried, or rescue middleware committing the marker on the
+    /// handler's behalf (DLQ routing, deduplication).
+    ///
+    /// Per-key serialized: the next event for the same key will not
+    /// dispatch until this hook returns. Because the hook returns no
+    /// error, internal failures (e.g. a staged write that won't
+    /// finalize) cannot trigger a redelivery — handle them within the
+    /// hook or log and move on.
     fn after_commit<C>(
         &self,
         _context: C,
@@ -562,33 +612,46 @@ pub trait FallibleHandler: Send + Sync + 'static {
         async {}
     }
 
-    /// Runs when **the just-completed invocation** of `on_message` /
-    /// `on_timer` is not final: this handler **will be invoked again** for
-    /// the same logical message/timer by this consumer (the next attempt of
-    /// an in-process retry loop, a deferred retry via a timer middleware,
-    /// or a re-poll after marker abort). The hook owns the
-    /// `Result<Self::Output, Self::Error>` produced by **that specific
-    /// invocation** — typically an `Err` describing why the invocation did
-    /// not stick, but it can also be `Ok` if a finalisation step above the
-    /// handler decided the work must be redone (e.g. shutdown intervened
-    /// between `Ok` and commit; see `RetryHandler::on_message`
-    /// shutdown-during-retry path).
+    /// Rolls back staged work after the just-completed invocation, before
+    /// the next attempt runs.
     ///
-    /// "Not final" is a **per-invocation, work-outcome** statement. The
-    /// durability marker may have been aborted (the default boundary), or
-    /// the marker may have been committed by a rescue middleware that took
-    /// ownership and scheduled a redelivery; in both cases this is the
-    /// correct hook because the inner is going to be invoked again for
-    /// this logical event.
+    /// Called after [`Self::on_message`] / [`Self::on_timer`] when this
+    /// consumer **will** invoke the handler again for the same logical
+    /// event — another attempt is coming (an in-process retry, a deferred
+    /// retry via a timer, or a re-poll after the durability marker
+    /// aborted). Use this hook to unstage any external state from the
+    /// invocation so the next attempt starts clean.
     ///
-    /// Crucially, this hook fires for **every intermediate invocation** of
-    /// a multi-attempt retry session — once per attempt that ran and
-    /// returned, before the next attempt runs. There is no
-    /// "session-as-one-dispatch" exception that would let middleware skip
-    /// this hook between retry attempts.
+    /// The hook receives the exact [`Result`] the invocation returned —
+    /// typically an `Err` carrying the failure that triggered the retry,
+    /// but it can also be `Ok` if something above the handler decided the
+    /// work must be redone anyway (e.g. a shutdown intervened between
+    /// success and the durability commit).
     ///
-    /// Per-key serialised; same retry / cancel-safety constraints as
-    /// [`Self::after_commit`]. Same EventHandler-implementor contract.
+    /// # Delivery guarantees
+    ///
+    /// **Fires once per handler invocation that ran and returned**, paired
+    /// with the invocation's typed `Result`. Each invocation pairs with
+    /// either this hook or [`Self::after_commit`]. In particular, an
+    /// in-process retry session that runs N attempts produces N apply hook
+    /// firings — the first N-1 are `after_abort` and the last matches the
+    /// terminal outcome — never coalesced into a single hook at the end.
+    ///
+    /// **Best-effort.** The hook may not fire if the process crashes, the
+    /// framework's bookkeeping storage is unavailable, or middleware above
+    /// this handler cannot determine the work outcome. **Handlers must be
+    /// idempotent and must not rely on this hook for correctness or data
+    /// integrity.**
+    ///
+    /// # Behavior
+    ///
+    /// "Not final" describes the per-invocation work outcome, not the
+    /// durability marker. The marker may have been aborted, or it may have
+    /// been committed by rescue middleware that scheduled a redelivery —
+    /// either way, `after_abort` is the right hook because the inner is
+    /// going to run again.
+    ///
+    /// Per-key serialized; same constraints as [`Self::after_commit`].
     fn after_abort<C>(
         &self,
         _context: C,
@@ -600,33 +663,19 @@ pub trait FallibleHandler: Send + Sync + 'static {
         async {}
     }
 
-    /// Shuts down the handler and cleans up any resources.
+    /// Shuts the handler down on consumer stop or partition revocation.
     ///
-    /// This method is called when a Kafka partition is being revoked or the
-    /// consumer is shutting down. It allows handlers (including middleware) to:
-    /// - Clean up accumulated state
-    /// - Close connections or file handles
-    /// - Flush pending operations
-    /// - Release resources
+    /// Use this to flush pending work, close connections, and release
+    /// resources owned by the handler. Takes `self` by value, so the
+    /// handler is consumed; the framework expects shutdown to complete
+    /// before this returns.
     ///
-    /// For middleware implementations, this should:
-    /// 1. Clean up middleware-specific state
-    /// 2. Cascade shutdown to the inner handler
+    /// The method returns no error — handle internal failures within the
+    /// implementation (log and move on if necessary).
     ///
-    /// # Arguments
-    ///
-    /// Takes ownership of `self` to ensure exclusive access during cleanup.
-    ///
-    /// # Returns
-    ///
-    /// A [`Future`] that resolves when shutdown is complete.
-    ///
-    /// # Implementation Requirements
-    ///
-    /// - **Infallible**: Shutdown should not fail - handle errors gracefully
-    /// - **Idempotent**: Safe to call multiple times
-    /// - **Complete**: Ensure all resources are cleaned up before returning
-    /// - **Cascade**: Middleware should shutdown inner handlers
+    /// Middleware implementations must cascade by calling
+    /// `inner.shutdown().await`; otherwise the inner handler's resources
+    /// leak.
     fn shutdown(self) -> impl Future<Output = ()> + Send;
 }
 
@@ -1084,7 +1133,7 @@ mod after_hook_tests {
         // (after_commit OR after_abort) fires — not both, not neither,
         // and never coalesced across multiple invocations. This is what
         // 2PC handlers and rescue middleware rely on to know they are
-        // guaranteed a single finalisation signal per inner invocation.
+        // guaranteed a single finalization signal per inner invocation.
         //
         // At this default boundary the blanket impl performs exactly one
         // inner invocation per outer call, so this test exercises the
