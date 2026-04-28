@@ -23,7 +23,6 @@ use axum_extra::routing::RouterExt;
 use educe::Educe;
 use futures::executor::block_on;
 use std::borrow::Cow;
-use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -61,19 +60,15 @@ pub struct ProbeServer {
 ///
 /// Contains references to the components needed to determine
 /// consumer health status.
-#[derive(Clone)]
-struct ProbeState {
-    /// Returns the number of assigned partitions
-    assigned_partition_count: Arc<dyn Fn() -> u32 + Send + Sync>,
+#[derive(Educe)]
+#[educe(Clone, Debug)]
+struct ProbeState<P: Send + Sync + 'static> {
+    /// Reference to partition managers for checking assignment status
+    #[educe(Debug(ignore))]
+    managers: Arc<Managers<P>>,
 
-    /// Returns whether any partition or actor is stalled
-    is_stalled: Arc<dyn Fn() -> bool + Send + Sync>,
-}
-
-impl fmt::Debug for ProbeState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProbeState").finish_non_exhaustive()
-    }
+    /// Registry for checking if consumer-level actors are stalled
+    heartbeats: HeartbeatRegistry,
 }
 
 impl ProbeServer {
@@ -97,17 +92,10 @@ impl ProbeServer {
         managers: Arc<Managers<P>>,
         heartbeats: HeartbeatRegistry,
     ) -> Result<Self, io::Error> {
-        let managers_for_count = managers.clone();
-        let managers_for_stall = managers;
-        let heartbeats_clone = heartbeats;
         // Create application state with references to components
         let state = ProbeState {
-            assigned_partition_count: Arc::new(move || {
-                get_assigned_partition_count(&managers_for_count)
-            }),
-            is_stalled: Arc::new(move || {
-                get_is_stalled(&managers_for_stall) || heartbeats_clone.any_stalled()
-            }),
+            managers,
+            heartbeats,
         };
 
         // Define router with health check endpoints
@@ -197,8 +185,10 @@ impl ProbeServer {
 /// - `StatusCode::OK` (200) if partitions are assigned, or
 ///   `StatusCode::SERVICE_UNAVAILABLE` (503) otherwise
 /// - A message describing the current assignment status
-async fn readiness_probe(State(state): State<ProbeState>) -> (StatusCode, Cow<'static, str>) {
-    let assigned_count = (state.assigned_partition_count)();
+async fn readiness_probe<P: Send + Sync + 'static>(
+    State(ProbeState { managers, .. }): State<ProbeState<P>>,
+) -> (StatusCode, Cow<'static, str>) {
+    let assigned_count = get_assigned_partition_count(&managers);
 
     if assigned_count == 0 {
         // No partitions assigned yet - service is not ready
@@ -232,8 +222,13 @@ async fn readiness_probe(State(state): State<ProbeState>) -> (StatusCode, Cow<'s
 /// - `StatusCode::OK` (200) if no stalls are detected, or
 ///   `StatusCode::SERVICE_UNAVAILABLE` (503) otherwise
 /// - A message describing the current stall status
-async fn liveness_probe(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
-    if (state.is_stalled)() {
+async fn liveness_probe<P: Send + Sync + 'static>(
+    State(ProbeState {
+        managers,
+        heartbeats,
+    }): State<ProbeState<P>>,
+) -> (StatusCode, &'static str) {
+    if heartbeats.any_stalled() || get_is_stalled(&managers) {
         // Either a consumer-level actor or a partition has stalled
         (
             StatusCode::SERVICE_UNAVAILABLE,
