@@ -60,10 +60,10 @@ pub use self::store::{DeduplicationStore, DeduplicationStoreProvider};
 
 /// Shared state for the deduplication middleware.
 #[derive(Clone, Debug)]
-struct DeduplicationShared<P> {
+struct DeduplicationShared<S> {
     config: DeduplicationConfiguration,
     group_id: Arc<str>,
-    store_provider: P,
+    store_provider: S,
     cache: Arc<DeduplicationCache>,
 }
 
@@ -73,15 +73,15 @@ struct DeduplicationShared<P> {
 /// two-tier cache (local + persistent store). Duplicates are filtered out
 /// before reaching the handler.
 ///
-/// The `Q` parameter is the handler payload type (defaults to `()` so
+/// The `P` parameter is the handler payload type (defaults to `()` so
 /// the struct can be named without turbofish when the payload is inferred).
 #[derive(Clone, Debug)]
-pub struct DeduplicationMiddleware<P: DeduplicationStoreProvider, Q = ()> {
-    shared: Arc<DeduplicationShared<P>>,
-    _payload: PhantomData<fn() -> Q>,
+pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P = ()> {
+    shared: Arc<DeduplicationShared<S>>,
+    _payload: PhantomData<fn() -> P>,
 }
 
-impl<P: DeduplicationStoreProvider, Q> DeduplicationMiddleware<P, Q> {
+impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
     /// Creates a new middleware, or `None` if `cache_capacity == 0`.
     ///
     /// # Errors
@@ -90,7 +90,7 @@ impl<P: DeduplicationStoreProvider, Q> DeduplicationMiddleware<P, Q> {
     pub fn new(
         config: DeduplicationConfiguration,
         group_id: &str,
-        store_provider: P,
+        store_provider: S,
     ) -> Result<Option<Self>, validator::ValidationErrors> {
         config.validate()?;
 
@@ -111,20 +111,20 @@ impl<P: DeduplicationStoreProvider, Q> DeduplicationMiddleware<P, Q> {
     }
 }
 
-impl<P: DeduplicationStoreProvider, Q: Send + Sync + 'static + EventIdentity> HandlerMiddleware
-    for DeduplicationMiddleware<P, Q>
+impl<S: DeduplicationStoreProvider, P: Send + Sync + 'static + EventIdentity> HandlerMiddleware
+    for DeduplicationMiddleware<S, P>
 {
-    type Payload = Q;
+    type Payload = P;
     type Provider<T>
-        = DeduplicationProvider<T, P>
+        = DeduplicationProvider<T, S>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Q>;
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Q>,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         DeduplicationProvider {
             inner: provider,
@@ -135,18 +135,18 @@ impl<P: DeduplicationStoreProvider, Q: Send + Sync + 'static + EventIdentity> Ha
 
 /// Provider that creates per-partition deduplication handlers.
 #[derive(Clone, Debug)]
-pub struct DeduplicationProvider<T, P: DeduplicationStoreProvider> {
+pub struct DeduplicationProvider<T, S: DeduplicationStoreProvider> {
     inner: T,
-    shared: Arc<DeduplicationShared<P>>,
+    shared: Arc<DeduplicationShared<S>>,
 }
 
-impl<T, P> FallibleHandlerProvider for DeduplicationProvider<T, P>
+impl<T, S> FallibleHandlerProvider for DeduplicationProvider<T, S>
 where
     T: FallibleHandlerProvider,
     <T::Handler as FallibleHandler>::Payload: EventIdentity,
-    P: DeduplicationStoreProvider,
+    S: DeduplicationStoreProvider,
 {
-    type Handler = DeduplicationHandler<T::Handler, P::Store>;
+    type Handler = DeduplicationHandler<T::Handler, S::Store>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let inner = self.inner.handler_for_partition(topic, partition);

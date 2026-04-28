@@ -21,33 +21,33 @@ use std::sync::Arc;
 ///
 /// # Type Parameters
 ///
-/// * `P` - Timer defer store provider
+/// * `S` - Timer defer store provider
 /// * `D` - Deferral decider (default: [`FailureTracker`])
-/// * `Q` - Handler payload type (payload-agnostic; defaults to `()`)
+/// * `P` - Handler payload type (payload-agnostic; defaults to `()`)
 #[derive(Clone)]
-pub struct TimerDeferMiddleware<P, D = FailureTracker, Q = ()>
+pub struct TimerDeferMiddleware<S, D = FailureTracker, P = ()>
 where
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
     config: DeferConfiguration,
-    provider: P,
+    provider: S,
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
-    _payload: PhantomData<fn() -> Q>,
+    _payload: PhantomData<fn() -> P>,
 }
 
-impl<P, D, Q> TimerDeferMiddleware<P, D, Q>
+impl<S, D, P> TimerDeferMiddleware<S, D, P>
 where
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
     /// Creates middleware with configuration and store provider.
     #[must_use]
     pub fn new(
         config: DeferConfiguration,
-        provider: P,
+        provider: S,
         decider: D,
         consumer_config: &ConsumerConfiguration,
         telemetry: &Telemetry,
@@ -65,36 +65,36 @@ where
 
 /// Creates [`TimerDeferHandler`]s for each partition.
 #[derive(Clone)]
-pub struct TimerDeferProvider<T, P, D = FailureTracker>
+pub struct TimerDeferProvider<T, S, D = FailureTracker>
 where
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
     inner_provider: T,
     config: DeferConfiguration,
-    store_provider: P,
+    store_provider: S,
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
 }
 
-impl<P, D, Q> HandlerMiddleware for TimerDeferMiddleware<P, D, Q>
+impl<S, D, P> HandlerMiddleware for TimerDeferMiddleware<S, D, P>
 where
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
-    Q: Send + Sync + 'static,
+    P: Send + Sync + 'static,
 {
-    type Payload = Q;
+    type Payload = P;
     type Provider<T>
-        = TimerDeferProvider<T, P, D>
+        = TimerDeferProvider<T, S, D>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Q>;
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Q>,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         TimerDeferProvider {
             inner_provider,
@@ -107,14 +107,14 @@ where
     }
 }
 
-impl<T, P, D> FallibleHandlerProvider for TimerDeferProvider<T, P, D>
+impl<T, S, D> FallibleHandlerProvider for TimerDeferProvider<T, S, D>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
-    type Handler = TimerDeferHandler<T::Handler, P::Store, D>;
+    type Handler = TimerDeferHandler<T::Handler, S::Store, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let store = self.store_provider.create_store(
