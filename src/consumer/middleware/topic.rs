@@ -6,9 +6,10 @@
 //! [`ErrorCategory::Terminal`] errors bypass the DLQ and propagate immediately,
 //! as they indicate partition shutdown rather than recoverable failures.
 //!
-//! Timer failures are **not** routed to the failure topic. The inner handler's
-//! result is forwarded as-is, so timer errors propagate to outer middleware
-//! unchanged.
+//! Timer failures are **not** routed to the failure topic. Non-terminal timer
+//! errors are absorbed in place: the marker commits and the inner's apply hook
+//! fires as `after_commit(Err(_))`. Terminal timer errors still propagate so
+//! partition shutdown is unaffected.
 //!
 //! # Execution Order
 //!
@@ -46,8 +47,10 @@
 //! invocation that ran and returned — is upheld: every arm of `after_commit`
 //! / `after_abort` forwards exactly one call to the inner.
 //!
-//! For timers, [`FallibleHandler::on_timer`] is a transparent passthrough; the
-//! apply-hook routing for `Inner` / `Handler` variants applies unchanged.
+//! For timers, [`FallibleHandler::on_timer`] absorbs non-terminal errors via
+//! the same [`FailureTopicOutput::Routed`] variant the message path uses on a
+//! successful DLQ write — without performing any producer call. The apply-hook
+//! routing matrix below therefore applies to both messages and timers.
 //!
 //! The inner's [`FallibleHandler::after_commit`] /
 //! [`FallibleHandler::after_abort`] hook still has to fire — and the choice
@@ -236,11 +239,11 @@ pub struct FailureTopicHandler<T, Enc: Codec> {
 pub enum FailureTopicOutput<O, E> {
     /// Inner handler ran and returned `Ok(output)`.
     Inner(O),
-    /// Inner handler returned a non-Terminal `Err(_)` for a message; the
-    /// failure was rescued by routing to the failure topic, which the producer
-    /// accepted. Only produced by [`FailureTopicHandler::on_message`] —
-    /// timer dispatch never produces this variant. The inner's typed error
-    /// is preserved here so the apply hook can fire
+    /// Inner handler returned a non-Terminal `Err(_)`; the failure was
+    /// rescued so the marker can commit. For messages, the rescue is a
+    /// successful failure-topic write. For timers, the error is absorbed in
+    /// place (timers do not route to the failure topic). The inner's typed
+    /// error is preserved here so the apply hook can fire
     /// `inner.after_commit(Err(_))`.
     Routed(E),
 }
@@ -415,11 +418,13 @@ where
         }
     }
 
-    /// Timers bypass the failure topic entirely: the inner handler's
-    /// result is forwarded as-is. `Ok(o)` becomes
-    /// [`FailureTopicOutput::Inner`]; any error is wrapped in
-    /// [`FailureTopicError::Handler`] so it propagates to outer middleware
-    /// without classification rewriting.
+    /// Timer failures are absorbed in place rather than written to the
+    /// failure topic. `Ok(o)` becomes [`FailureTopicOutput::Inner`];
+    /// terminal errors still propagate as [`FailureTopicError::Handler`]
+    /// (matching the message path, so partition shutdown still triggers);
+    /// any other error is logged and absorbed as
+    /// [`FailureTopicOutput::Routed`], so the marker commits and the inner's
+    /// apply hook fires as `after_commit(Err(_))` without any DLQ write.
     async fn on_timer<C>(
         &self,
         context: C,
@@ -429,10 +434,29 @@ where
     where
         C: EventContext,
     {
-        match self.handler.on_timer(context, timer, demand_type).await {
-            Ok(output) => Ok(FailureTopicOutput::Inner(output)),
-            Err(error) => Err(FailureTopicError::Handler(error)),
+        let error = match self
+            .handler
+            .on_timer(context, timer.clone(), demand_type)
+            .await
+        {
+            Ok(output) => return Ok(FailureTopicOutput::Inner(output)),
+            Err(error) => error,
+        };
+
+        if matches!(error.classify_error(), ErrorCategory::Terminal) {
+            info!(
+                key = %timer.key,
+                "terminal condition encountered while handling timer: {error:#}; aborting"
+            );
+            return Err(FailureTopicError::Handler(error));
         }
+
+        error!(
+            key = %timer.key,
+            "failed to process timer: {error:#}; absorbing (timers do not route to failure topic)"
+        );
+
+        Ok(FailureTopicOutput::Routed(error))
     }
 
     /// Resolves the inner's apply hook on a **committed** marker.
