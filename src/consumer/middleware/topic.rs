@@ -877,7 +877,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(FailureTopicError::Handler(TestError(ErrorCategory::Transient))),
+                Err(FailureTopicError::Handler(TestError(
+                    ErrorCategory::Transient
+                ))),
             ),
             "expected Err(Handler(Transient)); got {result:?}",
         );
