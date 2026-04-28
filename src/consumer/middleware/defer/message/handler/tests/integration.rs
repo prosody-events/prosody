@@ -317,7 +317,7 @@ fn permanent_error_schedules_timer_for_next_message() {
 type ShutdownProofHandler = MessageDeferHandler<
     CancellationHandler<OutcomeHandler>,
     MemoryMessageDeferStore,
-    MemoryLoader,
+    MemoryLoader<serde_json::Value>,
     TraceBasedDecider,
 >;
 
@@ -331,7 +331,7 @@ fn build_shutdown_proof_stack(
 ) -> Option<(
     ShutdownProofHandler,
     MemoryMessageDeferStore,
-    MemoryLoader,
+    MemoryLoader<serde_json::Value>,
     OutcomeHandler,
     TimerCapture,
     TraceBasedDecider,

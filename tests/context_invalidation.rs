@@ -7,7 +7,7 @@
 use color_eyre::eyre::{Result, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::event_context::{BoxEventContext, EventContext},
     consumer::message::UncommittedMessage,
@@ -17,7 +17,7 @@ use prosody::{
     telemetry::Telemetry,
     timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::yield_now;
 use tracing::info;
@@ -40,8 +40,14 @@ impl ContextInvalidationHandler {
 }
 
 impl EventHandler for ContextInvalidationHandler {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage, _demand_type: DemandType)
-    where
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<Value>,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         info!("Processing message in handler");
@@ -122,7 +128,7 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
         .build()?;
 
     // Create consumer
-    let consumer = ProsodyConsumer::new(
+    let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(handler),
@@ -136,7 +142,7 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
         .source_system("test-producer")
         .build()?;
 
-    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     // Send a test message
     let test_payload = json!({ "test": "context_invalidation" });

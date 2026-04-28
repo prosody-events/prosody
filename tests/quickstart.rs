@@ -6,10 +6,10 @@
 //! a disabled probe server to avoid port conflicts with parallel tests.
 
 use color_eyre::eyre::{Result, eyre};
-use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::prelude::*;
 use prosody::tracing::init_test_logging;
+use prosody::{JsonCodec, Topic};
 use serde_json::json;
 use std::convert::Infallible;
 use tokio::sync::mpsc::{Sender, channel};
@@ -24,11 +24,12 @@ struct MyHandler {
 impl FallibleHandler for MyHandler {
     type Error = Infallible;
     type Output = ();
+    type Payload = serde_json::Value;
 
     async fn on_message<C>(
         &self,
         _context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<serde_json::Value>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -93,7 +94,7 @@ async fn quickstart() -> Result<()> {
 
     let (sender, mut receiver) = channel(1);
 
-    let client = HighLevelClient::new(
+    let client = HighLevelClient::<MyHandler, JsonCodec>::new(
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,

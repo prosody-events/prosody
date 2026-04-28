@@ -51,7 +51,7 @@ use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::propagator::new_propagator;
-use crate::{Offset, Partition, Topic};
+use crate::{JsonCodec, Offset, Partition, Topic};
 use ahash::HashMap;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use quick_cache::sync::Cache;
@@ -74,9 +74,9 @@ use tokio::task::spawn_blocking;
 use tracing::field::Empty;
 use tracing::{Span, debug, error, instrument, warn};
 
+use crate::Codec;
 use crate::otel::SpanRelation;
 use crate::related_span;
-use crate::Codec;
 use tokio::select;
 use whoami::hostname;
 
@@ -177,6 +177,11 @@ pub struct LoaderConfiguration {
     pub message_spans: SpanRelation,
 }
 
+/// Cache mapping `(topic, partition, offset)` to a decoded message — keyed
+/// strongly enough to avoid collisions across partitions in a multiplexed
+/// loader.
+type LoadedCache<P> = Arc<Cache<(Topic, Partition, Offset), DecodedMessage<P>>>;
+
 /// Kafka message loader for retrieving messages by exact offset.
 ///
 /// Uses a dedicated Kafka consumer with manual partition assignment to load
@@ -184,10 +189,10 @@ pub struct LoaderConfiguration {
 /// coordination. A background polling thread fulfills load requests and
 /// semaphore-based permits provide backpressure. Messages are cached to avoid
 /// redundant Kafka reads.
-pub struct KafkaLoader<C: Codec = crate::codec::JsonCodec> {
+pub struct KafkaLoader<C: Codec = JsonCodec> {
     tx: mpsc::Sender<Request<C::Payload>>,
     semaphore: Arc<Semaphore>,
-    cache: Arc<Cache<(Topic, Partition, Offset), DecodedMessage<C::Payload>>>,
+    cache: LoadedCache<C::Payload>,
     message_spans: SpanRelation,
 }
 
@@ -209,8 +214,8 @@ impl<C: Codec> MessageLoader for KafkaLoader<C>
 where
     C::Payload: Clone,
 {
-    type Payload = C::Payload;
     type Error = KafkaLoaderError;
+    type Payload = C::Payload;
 
     fn load_message(
         &self,
@@ -554,13 +559,7 @@ fn poll_loop<C: Codec>(
             continue;
         };
 
-        process_poll_result::<C>(
-            result,
-            &propagator,
-            &mut codec,
-            &mut active,
-            consumer,
-        );
+        process_poll_result::<C>(result, &propagator, &mut codec, &mut active, consumer);
     }
 }
 

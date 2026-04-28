@@ -28,6 +28,7 @@ pub mod tests;
 
 use std::error::Error as StdError;
 use std::hash::Hasher;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use quick_cache::sync::Cache;
@@ -77,7 +78,7 @@ struct DeduplicationShared<P> {
 #[derive(Clone, Debug)]
 pub struct DeduplicationMiddleware<P: DeduplicationStoreProvider, Q = ()> {
     shared: Arc<DeduplicationShared<P>>,
-    _payload: std::marker::PhantomData<fn() -> Q>,
+    _payload: PhantomData<fn() -> Q>,
 }
 
 impl<P: DeduplicationStoreProvider, Q> DeduplicationMiddleware<P, Q> {
@@ -105,7 +106,7 @@ impl<P: DeduplicationStoreProvider, Q> DeduplicationMiddleware<P, Q> {
                 store_provider,
                 cache,
             }),
-            _payload: std::marker::PhantomData,
+            _payload: PhantomData,
         }))
     }
 }
@@ -114,8 +115,8 @@ impl<P: DeduplicationStoreProvider, Q: Send + Sync + 'static + EventIdentity> Ha
     for DeduplicationMiddleware<P, Q>
 {
     type Payload = Q;
-
-    type Provider<T> = DeduplicationProvider<T, P>
+    type Provider<T>
+        = DeduplicationProvider<T, P>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = Q>;

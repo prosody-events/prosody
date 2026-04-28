@@ -31,6 +31,7 @@
 //! - `timeout`: Fixed timeout duration (default: 80% of stall threshold)
 
 use std::future::Future;
+use std::marker::PhantomData;
 use std::time::Duration;
 
 use derive_builder::Builder;
@@ -70,7 +71,7 @@ pub struct TimeoutConfiguration {
 #[derive(Clone, Debug)]
 pub struct TimeoutMiddleware<P = ()> {
     timeout: Duration,
-    _payload: std::marker::PhantomData<fn() -> P>,
+    _payload: PhantomData<fn() -> P>,
 }
 
 /// Provider that creates timeout handlers for each partition.
@@ -194,15 +195,15 @@ impl<P> TimeoutMiddleware<P> {
 
         Ok(Self {
             timeout,
-            _payload: std::marker::PhantomData,
+            _payload: PhantomData,
         })
     }
 }
 
 impl<P: Send + Sync + 'static> HandlerMiddleware for TimeoutMiddleware<P> {
     type Payload = P;
-
-    type Provider<T> = TimeoutProvider<T>
+    type Provider<T>
+        = TimeoutProvider<T>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;

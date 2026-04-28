@@ -38,14 +38,14 @@ pub enum LoaderFailureType {
 /// semantics to prevent state leakage between test events).
 #[derive(Clone)]
 pub struct FailableLoader {
-    inner: MemoryLoader,
+    inner: MemoryLoader<Value>,
     next_failure: Arc<Mutex<Option<LoaderFailureType>>>,
 }
 
 impl FailableLoader {
     /// Creates a new failable loader wrapping the given memory loader.
     #[must_use]
-    pub fn new(inner: MemoryLoader) -> Self {
+    pub fn new(inner: MemoryLoader<Value>) -> Self {
         Self {
             inner,
             next_failure: Arc::new(Mutex::new(None)),
@@ -75,13 +75,14 @@ impl FailableLoader {
 
 impl MessageLoader for FailableLoader {
     type Error = FailableLoaderError;
+    type Payload = Value;
 
     async fn load_message(
         &self,
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> Result<ConsumerMessage, Self::Error> {
+    ) -> Result<ConsumerMessage<Value>, Self::Error> {
         // Check for injected failure (single-shot: take clears it)
         if let Some(failure) = self.next_failure.lock().take() {
             return Err(match failure {

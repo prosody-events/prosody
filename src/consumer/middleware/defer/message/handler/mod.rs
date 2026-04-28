@@ -29,6 +29,7 @@
 
 use super::loader::{KafkaLoader, MessageLoader};
 use super::store::{MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult};
+use crate::JsonCodec;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::calculate_backoff;
@@ -80,7 +81,7 @@ pub enum MessageDeferOutput<O, E> {
 /// * `L` - Message loader (default: [`KafkaLoader`])
 /// * `D` - Deferral decider (default: [`FailureTracker`])
 #[derive(Clone)]
-pub struct MessageDeferMiddleware<P, L = KafkaLoader<crate::codec::JsonCodec>, D = FailureTracker>
+pub struct MessageDeferMiddleware<P, L = KafkaLoader<JsonCodec>, D = FailureTracker>
 where
     P: MessageDeferStoreProvider,
     L: MessageLoader,
@@ -137,7 +138,7 @@ where
 
 /// Creates [`MessageDeferHandler`]s for each partition.
 #[derive(Clone)]
-pub struct MessageDeferProvider<T, P, L = KafkaLoader<crate::codec::JsonCodec>, D = FailureTracker>
+pub struct MessageDeferProvider<T, P, L = KafkaLoader<JsonCodec>, D = FailureTracker>
 where
     P: MessageDeferStoreProvider,
     L: MessageLoader,
@@ -154,7 +155,7 @@ where
 
 /// Per-partition handler wrapping an inner handler with defer logic.
 #[derive(Clone)]
-pub struct MessageDeferHandler<T, M, L = KafkaLoader<crate::codec::JsonCodec>, D = FailureTracker>
+pub struct MessageDeferHandler<T, M, L = KafkaLoader<JsonCodec>, D = FailureTracker>
 where
     M: MessageDeferStore,
     L: MessageLoader,
@@ -179,8 +180,8 @@ where
     L::Payload: crate::EventIdentity,
 {
     type Payload = L::Payload;
-
-    type Provider<T> = MessageDeferProvider<T, P, L, D>
+    type Provider<T>
+        = MessageDeferProvider<T, P, L, D>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = L::Payload>;

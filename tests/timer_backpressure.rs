@@ -7,7 +7,7 @@
 use color_eyre::eyre::Result;
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::event_context::EventContext,
     consumer::message::UncommittedMessage,
@@ -17,7 +17,7 @@ use prosody::{
     telemetry::Telemetry,
     timers::{TimerType, UncommittedTimer, datetime::CompactDateTime, duration::CompactDuration},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::{Sender, channel};
@@ -36,8 +36,14 @@ pub struct SlowTimerHandler {
 }
 
 impl EventHandler for SlowTimerHandler {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage, _demand_type: DemandType)
-    where
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<Value>,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
@@ -132,7 +138,7 @@ async fn test_timer_backpressure() -> Result<()> {
         .build()?;
 
     let slow_timer_handler = SlowTimerHandler { timers_tx };
-    let consumer = ProsodyConsumer::new(
+    let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(slow_timer_handler),
@@ -146,7 +152,7 @@ async fn test_timer_backpressure() -> Result<()> {
         .source_system("test-timer-producer")
         .build()?;
 
-    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     // Send messages that will schedule timers
     let total = 500u32;

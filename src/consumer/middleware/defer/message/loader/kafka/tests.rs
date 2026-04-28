@@ -1,5 +1,6 @@
 use super::*;
 use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use crate::codec::JsonCodec;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -240,7 +241,7 @@ async fn test_partition_truncated_mid_flight() -> color_eyre::Result<()> {
         let topic = Topic::from(topic_name);
         delete_records_multi(&topic, &[(0_i32, 50)]).await?;
 
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
+        let loader = KafkaLoader::<JsonCodec>::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // NOW request the deleted offset 40
         let offset_40 = offsets[40];
@@ -281,7 +282,7 @@ async fn test_seek_failure_recovery() -> color_eyre::Result<()> {
         let topic = Topic::from(topic_name);
         delete_records_multi(&topic, &[(0_i32, 30)]).await?;
 
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
+        let loader = KafkaLoader::<JsonCodec>::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Load valid offset after LSO
         let result = timeout(
@@ -318,7 +319,7 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
             discard_threshold: 5, // Small threshold for testing
             message_spans: SpanRelation::default(),
         };
-        let loader = KafkaLoader::new(config, &HeartbeatRegistry::test())?;
+        let loader = KafkaLoader::<JsonCodec>::new(config, &HeartbeatRegistry::test())?;
 
         // Load offset 50 (position will be at 51)
         let msg1 = timeout(
@@ -371,7 +372,7 @@ async fn test_multi_partition_recovery() -> color_eyre::Result<()> {
         let topic = Topic::from(topic_name);
         delete_records_multi(&topic, &[(0_i32, 50)]).await?;
 
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
+        let loader = KafkaLoader::<JsonCodec>::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Try to load deleted offset (should trigger seek failure and recovery)
         let result = timeout(
@@ -427,7 +428,7 @@ async fn test_decode_error() -> color_eyre::Result<()> {
         let bad_offset = delivery.offset;
         let topic = Topic::from(topic_name);
 
-        let loader = KafkaLoader::new(loader_config(), &HeartbeatRegistry::test())?;
+        let loader = KafkaLoader::<JsonCodec>::new(loader_config(), &HeartbeatRegistry::test())?;
 
         // Try to load the malformed message
         let result = timeout(
@@ -475,7 +476,7 @@ async fn test_concurrent_decode_error() -> color_eyre::Result<()> {
         let bad_offset = delivery.offset;
         let topic = Topic::from(topic_name);
 
-        let loader = Arc::new(KafkaLoader::new(
+        let loader = Arc::new(KafkaLoader::<JsonCodec>::new(
             loader_config(),
             &HeartbeatRegistry::test(),
         )?);
@@ -538,7 +539,10 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
             discard_threshold: 10,
             message_spans: SpanRelation::default(),
         };
-        let loader = Arc::new(KafkaLoader::new(config, &HeartbeatRegistry::test())?);
+        let loader = Arc::new(KafkaLoader::<JsonCodec>::new(
+            config,
+            &HeartbeatRegistry::test(),
+        )?);
 
         // Launch 10 concurrent loads for DIFFERENT offsets
         // This will cause 8+ cache evictions since cache_size=2
@@ -601,7 +605,7 @@ async fn test_cross_partition_lso_contamination() -> color_eyre::Result<()> {
         let topic = Topic::from(topic_name);
         delete_records_multi(&topic, &[(1_i32, offsets_p1[19])]).await?;
 
-        let loader = Arc::new(KafkaLoader::new(
+        let loader = Arc::new(KafkaLoader::<JsonCodec>::new(
             loader_config(),
             &HeartbeatRegistry::test(),
         )?);
@@ -967,7 +971,7 @@ async fn run_interleaved_async(scenario: InterleavedScenario) -> color_eyre::Res
             delete_partition_records(&topics[t], &topic_spec.partitions, &offsets[t]).await?;
         }
 
-        let loader = Arc::new(KafkaLoader::new(
+        let loader = Arc::new(KafkaLoader::<JsonCodec>::new(
             loader_config(),
             &HeartbeatRegistry::test(),
         )?);

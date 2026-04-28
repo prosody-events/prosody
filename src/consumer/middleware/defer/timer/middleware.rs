@@ -11,6 +11,7 @@ use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracke
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::telemetry::Telemetry;
 use crate::{ConsumerGroup, Partition, Topic};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Middleware that defers transiently-failed timers for timer-based retry.
@@ -34,7 +35,7 @@ where
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
-    _payload: std::marker::PhantomData<fn() -> Q>,
+    _payload: PhantomData<fn() -> Q>,
 }
 
 impl<P, D, Q> TimerDeferMiddleware<P, D, Q>
@@ -57,7 +58,7 @@ where
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
             telemetry: telemetry.clone(),
-            _payload: std::marker::PhantomData,
+            _payload: PhantomData,
         }
     }
 }
@@ -84,8 +85,8 @@ where
     Q: Send + Sync + 'static,
 {
     type Payload = Q;
-
-    type Provider<T> = TimerDeferProvider<T, P, D>
+    type Provider<T>
+        = TimerDeferProvider<T, P, D>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = Q>;

@@ -383,8 +383,11 @@ fn cache_capacity_zero_returns_none() {
         cache_capacity: 0,
         ttl: Duration::from_hours(1),
     };
-    let result =
-        DeduplicationMiddleware::new(config, "group", MemoryDeduplicationStoreProvider::new());
+    let result = DeduplicationMiddleware::<_, serde_json::Value>::new(
+        config,
+        "group",
+        MemoryDeduplicationStoreProvider::new(),
+    );
     assert!(result.is_ok());
     assert!(result.as_ref().is_ok_and(Option::is_none));
 }
@@ -396,8 +399,11 @@ fn ttl_exceeding_max_rejected() {
         cache_capacity: 100,
         ttl: Duration::from_secs(700_000_000),
     };
-    let result =
-        DeduplicationMiddleware::new(config, "group", MemoryDeduplicationStoreProvider::new());
+    let result = DeduplicationMiddleware::<_, serde_json::Value>::new(
+        config,
+        "group",
+        MemoryDeduplicationStoreProvider::new(),
+    );
     assert!(result.is_err());
 }
 
@@ -408,8 +414,11 @@ fn ttl_below_minimum_rejected() {
         cache_capacity: 100,
         ttl: Duration::from_secs(30),
     };
-    let result =
-        DeduplicationMiddleware::new(config, "group", MemoryDeduplicationStoreProvider::new());
+    let result = DeduplicationMiddleware::<_, serde_json::Value>::new(
+        config,
+        "group",
+        MemoryDeduplicationStoreProvider::new(),
+    );
     assert!(result.is_err());
 }
 

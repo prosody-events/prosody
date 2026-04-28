@@ -106,6 +106,10 @@ struct PartitionContext<P> {
     shutdown_rx: watch::Receiver<ShutdownPhase>,
 }
 
+/// Optional event-type extractor used to derive a tag from a payload for
+/// filtering against the consumer's `allowed_events` automaton.
+pub type EventTypeExtractor<P> = Option<fn(&P) -> Option<&str>>;
+
 /// Configuration settings for a partition manager.
 ///
 /// Contains all the parameters needed to configure message processing
@@ -130,7 +134,7 @@ pub struct PartitionConfiguration<S, P> {
 
     /// Optional function to extract an event-type tag from a payload for
     /// filtering against `allowed_events`.
-    pub event_type_extractor: Option<fn(&P) -> Option<&str>>,
+    pub event_type_extractor: EventTypeExtractor<P>,
 
     /// Timeout duration for shutdown operations
     pub shutdown_timeout: Duration,
@@ -453,7 +457,7 @@ where
 struct PartitionParams<P> {
     group_id: Arc<str>,
     allowed_events: Option<AhoCorasick>,
-    event_type_extractor: Option<fn(&P) -> Option<&str>>,
+    event_type_extractor: EventTypeExtractor<P>,
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     name: String,
@@ -657,7 +661,7 @@ fn build_message_stream<T, P>(
     group_id: &str,
     highest_offset_seen: &mut i64,
     allowed_events: Option<&AhoCorasick>,
-    event_type_extractor: Option<fn(&P) -> Option<&str>>,
+    event_type_extractor: EventTypeExtractor<P>,
 ) -> impl Stream<Item = UncommittedEvent<T, P>>
 where
     T: TriggerStore,
@@ -817,7 +821,7 @@ async fn filter_loops<P: Send + Sync + 'static>(
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
 async fn filter_event_type<P: Send + Sync + 'static>(
-    event_type_extractor: Option<fn(&P) -> Option<&str>>,
+    event_type_extractor: EventTypeExtractor<P>,
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage<P>,
 ) -> Option<UncommittedMessage<P>> {

@@ -78,6 +78,7 @@
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 
+use std::marker::PhantomData;
 use thiserror::Error;
 use tracing::debug;
 
@@ -93,13 +94,13 @@ use crate::{Partition, Topic};
 /// Middleware that checks cancellation state before invoking the handler.
 #[derive(Clone, Debug)]
 pub struct CancellationMiddleware<P = ()> {
-    _payload: std::marker::PhantomData<fn() -> P>,
+    _payload: PhantomData<fn() -> P>,
 }
 
 impl<P> Default for CancellationMiddleware<P> {
     fn default() -> Self {
         Self {
-            _payload: std::marker::PhantomData,
+            _payload: PhantomData,
         }
     }
 }
@@ -132,8 +133,8 @@ impl<T> CancellationHandler<T> {
 
 impl<P: Send + Sync + 'static> HandlerMiddleware for CancellationMiddleware<P> {
     type Payload = P;
-
-    type Provider<T> = CancellationProvider<T>
+    type Provider<T>
+        = CancellationProvider<T>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;

@@ -158,7 +158,7 @@ use crate::consumer::middleware::timeout::{
     TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
 };
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
-use crate::consumer::partition::PartitionManager;
+use crate::consumer::partition::{EventTypeExtractor, PartitionManager};
 use crate::consumer::poll::PollConfig;
 use crate::consumer::poll::poll;
 use crate::consumer::probes::ProbeServer;
@@ -873,7 +873,7 @@ where
         })
         .transpose()?;
 
-    let event_type_extractor: Option<fn(&C::Payload) -> Option<&str>> =
+    let event_type_extractor: EventTypeExtractor<C::Payload> =
         Some(<C::Payload as crate::EventTypeExtract>::event_type);
 
     let (managers, runtime_state) = initialize_consumer::<T, P, C>(ConsumerInitParams {
@@ -961,7 +961,7 @@ where
             })
             .transpose()?;
 
-        let event_type_extractor: Option<fn(&P) -> Option<&str>> =
+        let event_type_extractor: EventTypeExtractor<P> =
             Some(<P as crate::EventTypeExtract>::event_type);
 
         let (managers, runtime_state) = match trigger_store_config {
@@ -1201,8 +1201,7 @@ where
         } = low_latency_config;
         let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::<P>::new(retry_config)?;
-        let topic_middleware =
-            FailureTopicMiddleware::<C>::new(topic_config, group_id, producer)?;
+        let topic_middleware = FailureTopicMiddleware::<C>::new(topic_config, group_id, producer)?;
         let common_middleware = build_common_middleware::<P>(
             common_config,
             consumer_config.stall_threshold,
@@ -1380,7 +1379,7 @@ where
     /// Optional event type filter; `None` passes all events through.
     allowed_events: Option<AhoCorasick>,
     /// Optional function to extract an event-type tag from a payload.
-    event_type_extractor: Option<fn(&PL) -> Option<&str>>,
+    event_type_extractor: EventTypeExtractor<PL>,
     /// Sender for consumer-level telemetry events.
     telemetry: TelemetrySender,
     /// Atomic flag for coordinating consumer shutdown.
@@ -1424,8 +1423,7 @@ where
         params.trigger_provider,
         params.watermark_version.clone(),
         params.managers.clone(),
-        params.allowed_events,
-        params.event_type_extractor,
+        (params.allowed_events, params.event_type_extractor),
         params.telemetry,
     );
 

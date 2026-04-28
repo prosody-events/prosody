@@ -249,8 +249,8 @@ where
     Enc::Payload: TimerReplayPayload + EventIdentity,
 {
     type Payload = Enc::Payload;
-
-    type Provider<T> = FailureTopicProvider<T, Enc>
+    type Provider<T>
+        = FailureTopicProvider<T, Enc>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = Enc::Payload>;

@@ -215,6 +215,8 @@ async fn test_partition_manager_is_stalled() {
     }
 
     impl EventHandler for StallTestHandler {
+        type Payload = serde_json::Value;
+
         fn on_message<C>(
             &self,
             _context: C,
@@ -423,6 +425,8 @@ impl HasProcessedOffsets for TestHandler {
 }
 
 impl EventHandler for TestHandler {
+    type Payload = serde_json::Value;
+
     fn on_message<C>(
         &self,
         _context: C,

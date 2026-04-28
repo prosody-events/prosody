@@ -13,6 +13,7 @@
 
 use crate::error::{ClassifyError, ErrorCategory};
 use rdkafka::error::KafkaError;
+use std::error::Error as StdError;
 use std::time::SystemTimeError;
 use thiserror::Error;
 use validator::ValidationErrors;
@@ -26,7 +27,7 @@ pub enum ProducerError {
 
     /// Indicates a failure to serialize the payload.
     #[error("failed to serialize payload: {0}")]
-    Serialization(Box<dyn std::error::Error + Send + Sync>),
+    Serialization(Box<dyn StdError + Send + Sync>),
 
     /// Indicates a failure to set the message timestamp.
     #[error("failed to set timestamp: {0:#}")]

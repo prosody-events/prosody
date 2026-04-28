@@ -10,7 +10,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::consumer::event_context::EventContext;
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::message::UncommittedMessage,
     consumer::middleware::CloneProvider,
@@ -56,8 +56,14 @@ struct MessageEvent {
 }
 
 impl EventHandler for TimerTestHandler {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage, _demand_type: DemandType)
-    where
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<Value>,
+        _demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let (msg, uncommitted) = message.into_inner();
@@ -168,8 +174,8 @@ impl EventHandler for TimerTestHandler {
 struct TestEnvironment {
     topic: Topic,
     admin_client: &'static ProsodyAdminClient,
-    consumer: ProsodyConsumer,
-    producer: ProsodyProducer,
+    consumer: ProsodyConsumer<Value>,
+    producer: ProsodyProducer<JsonCodec>,
     timer_rx: Receiver<TimerEvent>,
     message_rx: Receiver<MessageEvent>,
 }
@@ -210,7 +216,7 @@ impl TestEnvironment {
             .probe_port(None)
             .build()?;
 
-        let consumer = ProsodyConsumer::new(
+        let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
             handler_provider,
@@ -223,7 +229,8 @@ impl TestEnvironment {
             .bootstrap_servers(bootstrap.clone())
             .source_system("test-producer")
             .build()?;
-        let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
+        let producer =
+            ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
         // Give consumer time to start and subscribe
         sleep(Duration::from_secs(5)).await;

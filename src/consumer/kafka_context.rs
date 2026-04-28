@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::Topic;
-use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
+use crate::consumer::partition::{EventTypeExtractor, PartitionConfiguration, PartitionManager};
 use crate::consumer::{
     ConsumerConfiguration, EventHandler, HandlerProvider, Managers, WatermarkVersion,
 };
@@ -84,19 +84,19 @@ where
     /// * `trigger_provider` - Factory for per-partition trigger stores
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
-    /// * `allowed_events` - Optional filter for permitted event types
-    /// * `event_type_extractor` - Optional function to extract event type from
-    ///   payload
+    /// * `event_filter` - `(allowed_events, event_type_extractor)`: optional
+    ///   filter automaton paired with the extractor used to derive event-type
+    ///   tags from each payload
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
         trigger_provider: P,
         watermark_version: Arc<WatermarkVersion>,
         managers: Arc<Managers<PL>>,
-        allowed_events: Option<AhoCorasick>,
-        event_type_extractor: Option<fn(&PL) -> Option<&str>>,
+        event_filter: (Option<AhoCorasick>, EventTypeExtractor<PL>),
         telemetry: TelemetrySender,
     ) -> Self {
+        let (allowed_events, event_type_extractor) = event_filter;
         let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
             error!("invalid timer slab size: {error:#}; using default");
             CompactDuration::new(10 * 60)

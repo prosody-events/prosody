@@ -43,7 +43,7 @@ use prosody::consumer::event_context::EventContext;
 use prosody::timers::UncommittedTimer;
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::ConsumerConfiguration,
     consumer::ProsodyConsumer,
@@ -54,7 +54,7 @@ use prosody::{
     producer::ProsodyProducer,
     telemetry::Telemetry,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
@@ -82,10 +82,12 @@ struct ConcurrencyTestHandler {
 }
 
 impl EventHandler for ConcurrencyTestHandler {
+    type Payload = Value;
+
     async fn on_message<C>(
         &self,
         _context: C,
-        message: UncommittedMessage,
+        message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
         C: EventContext,
@@ -136,7 +138,7 @@ impl EventHandler for ConcurrencyTestHandler {
 /// # Errors
 /// Returns an error if message production fails.
 async fn produce_messages(
-    producer: &ProsodyProducer,
+    producer: &ProsodyProducer<JsonCodec>,
     topic: Topic,
     total: usize,
     num_keys: usize,
@@ -213,7 +215,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     };
 
     // Create the consumer with the test handler
-    let consumer: ProsodyConsumer = ProsodyConsumer::new(
+    let consumer: ProsodyConsumer<Value> = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(handler.clone()),
@@ -226,7 +228,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
         .bootstrap_servers(bootstrap.clone())
         .source_system("test-producer")
         .build()?;
-    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     // Produce messages with varying keys to distribute across partitions
     produce_messages(&producer, topic, total_messages, num_keys).await?;

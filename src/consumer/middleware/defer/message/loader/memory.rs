@@ -154,8 +154,8 @@ impl<P: Send + Sync + 'static> Default for MemoryLoader<P> {
 }
 
 impl<P: Clone + Send + Sync + 'static> MessageLoader for MemoryLoader<P> {
-    type Payload = P;
     type Error = MemoryLoaderError;
+    type Payload = P;
 
     fn load_message(
         &self,
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_not_found() {
-        let loader: MemoryLoader = MemoryLoader::new();
+        let loader: MemoryLoader<serde_json::Value> = MemoryLoader::new();
         let topic = Topic::from("test-topic");
 
         let result = loader.load_message(topic, 0, 100).await;

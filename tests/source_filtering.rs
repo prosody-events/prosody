@@ -10,7 +10,7 @@ use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
@@ -95,14 +95,14 @@ async fn run_scenario(
 
     // Set up a channel to communicate received messages.
     let (tx, mut rx) = channel(10);
-    let consumer = ProsodyConsumer::new(
+    let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(TestHandler { messages_tx: tx }),
         Telemetry::new(),
     )
     .await?;
-    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     // Send a test message and an end-of-stream marker.
     let key = "test-key";

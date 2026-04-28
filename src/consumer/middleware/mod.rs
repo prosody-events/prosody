@@ -224,9 +224,7 @@ pub trait HandlerMiddleware {
     /// the payload through the chain so callers can layer middleware over an
     /// `impl HandlerMiddleware<Payload = P>` opaque return without losing the
     /// payload identity.
-    type Provider<T>: FallibleHandlerProvider<
-        Handler: FallibleHandler<Payload = Self::Payload>,
-    >
+    type Provider<T>: FallibleHandlerProvider<Handler: FallibleHandler<Payload = Self::Payload>>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = Self::Payload>;
@@ -767,8 +765,8 @@ where
     M2: HandlerMiddleware<Payload = M1::Payload>,
 {
     type Payload = M1::Payload;
-
-    type Provider<T> = M1::Provider<M2::Provider<T>>
+    type Provider<T>
+        = M1::Provider<M2::Provider<T>>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = Self::Payload>;

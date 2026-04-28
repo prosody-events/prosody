@@ -6,14 +6,14 @@ use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc::channel;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
@@ -69,14 +69,14 @@ async fn test_allowed_events_filtering() -> Result<()> {
     let (messages_tx, mut messages_rx) = channel(10);
 
     // Initialize consumer and producer
-    let consumer = ProsodyConsumer::new(
+    let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(TestHandler { messages_tx }),
         Telemetry::new(),
     )
     .await?;
-    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     let key = "test-key";
 

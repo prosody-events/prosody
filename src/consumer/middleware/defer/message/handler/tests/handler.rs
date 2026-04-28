@@ -285,11 +285,12 @@ impl Debug for OutcomeHandler {
 impl FallibleHandler for OutcomeHandler {
     type Error = OutcomeError;
     type Output = ();
+    type Payload = serde_json::Value;
 
     async fn on_message<C>(
         &self,
         _context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<serde_json::Value>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

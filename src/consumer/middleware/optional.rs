@@ -40,8 +40,8 @@ where
     M: HandlerMiddleware,
 {
     type Payload = M::Payload;
-
-    type Provider<T> = OptionProvider<M::Provider<T>, T>
+    type Provider<T>
+        = OptionProvider<M::Provider<T>, T>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = Self::Payload>;

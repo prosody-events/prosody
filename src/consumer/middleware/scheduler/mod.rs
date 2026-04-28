@@ -25,6 +25,7 @@
 //! trivially upheld.
 
 use derive_builder::Builder;
+use std::marker::PhantomData;
 use std::time::Duration;
 use thiserror::Error;
 use validator::{Validate, ValidationErrors};
@@ -180,7 +181,7 @@ pub struct SchedulerConfiguration {
 #[derive(Clone, Debug)]
 pub struct SchedulerMiddleware<P = ()> {
     dispatcher: Dispatcher,
-    _payload: std::marker::PhantomData<fn() -> P>,
+    _payload: PhantomData<fn() -> P>,
 }
 
 /// Provider that creates scheduled handlers for each partition.
@@ -257,15 +258,15 @@ impl<P> SchedulerMiddleware<P> {
         let dispatcher = Dispatcher::new(config, telemetry);
         Ok(Self {
             dispatcher,
-            _payload: std::marker::PhantomData,
+            _payload: PhantomData,
         })
     }
 }
 
 impl<P: Send + Sync + 'static> HandlerMiddleware for SchedulerMiddleware<P> {
     type Payload = P;
-
-    type Provider<T> = SchedulerProvider<T>
+    type Provider<T>
+        = SchedulerProvider<T>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;

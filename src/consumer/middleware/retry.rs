@@ -124,6 +124,7 @@
 use std::cmp::min;
 use std::fmt::Display;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::time::Duration;
 
 use derive_builder::Builder;
@@ -203,7 +204,7 @@ impl RetryConfiguration {
 #[derive(Clone, Debug)]
 pub struct RetryMiddleware<P = ()> {
     config: RetryConfiguration,
-    _payload: std::marker::PhantomData<fn() -> P>,
+    _payload: PhantomData<fn() -> P>,
 }
 
 impl<P> RetryMiddleware<P> {
@@ -226,7 +227,7 @@ impl<P> RetryMiddleware<P> {
         config.validate()?;
         Ok(Self {
             config,
-            _payload: std::marker::PhantomData,
+            _payload: PhantomData,
         })
     }
 }
@@ -542,8 +543,8 @@ fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, discard_suffix: &str
 
 impl<P: Send + Sync + 'static> HandlerMiddleware for RetryMiddleware<P> {
     type Payload = P;
-
-    type Provider<T> = RetryProvider<T>
+    type Provider<T>
+        = RetryProvider<T>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;

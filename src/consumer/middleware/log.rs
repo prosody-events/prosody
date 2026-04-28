@@ -73,6 +73,7 @@
 //!
 //! [`ErrorCategory`]: crate::consumer::middleware::ErrorCategory
 
+use std::marker::PhantomData;
 use tracing::{debug, error};
 
 use crate::consumer::DemandType;
@@ -89,13 +90,13 @@ use crate::{Partition, Topic};
 /// Middleware that logs failures during message processing.
 #[derive(Clone, Debug)]
 pub struct LogMiddleware<P = ()> {
-    _payload: std::marker::PhantomData<fn() -> P>,
+    _payload: PhantomData<fn() -> P>,
 }
 
 impl<P> Default for LogMiddleware<P> {
     fn default() -> Self {
         Self {
-            _payload: std::marker::PhantomData,
+            _payload: PhantomData,
         }
     }
 }
@@ -125,8 +126,8 @@ pub struct LogHandler<T> {
 
 impl<P: Send + Sync + 'static> HandlerMiddleware for LogMiddleware<P> {
     type Payload = P;
-
-    type Provider<T> = LogProvider<T>
+    type Provider<T>
+        = LogProvider<T>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;

@@ -23,6 +23,7 @@ use axum_extra::routing::RouterExt;
 use educe::Educe;
 use futures::executor::block_on;
 use std::borrow::Cow;
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -69,8 +70,8 @@ struct ProbeState {
     is_stalled: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
-impl std::fmt::Debug for ProbeState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ProbeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProbeState").finish_non_exhaustive()
     }
 }

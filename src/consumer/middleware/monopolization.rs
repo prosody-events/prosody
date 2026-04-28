@@ -48,6 +48,7 @@ use interval::prelude::{Bounded, Intersection, Union};
 use quanta::Instant;
 use quick_cache::UnitWeighter;
 use quick_cache::sync::Cache;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -122,7 +123,7 @@ pub struct MonopolizationMiddleware<P = ()> {
     window_duration: Duration,
     reference_instant: Instant,
     key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
-    _payload: std::marker::PhantomData<fn() -> P>,
+    _payload: PhantomData<fn() -> P>,
 }
 
 /// Provider that creates monopolization handlers for each partition.
@@ -208,15 +209,15 @@ impl<P> MonopolizationMiddleware<P> {
             window_duration,
             reference_instant,
             key_intervals,
-            _payload: std::marker::PhantomData,
+            _payload: PhantomData,
         }))
     }
 }
 
 impl<P: Send + Sync + 'static> HandlerMiddleware for MonopolizationMiddleware<P> {
     type Payload = P;
-
-    type Provider<T> = MonopolizationProvider<T>
+    type Provider<T>
+        = MonopolizationProvider<T>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;
@@ -710,7 +711,7 @@ mod tests {
             .enabled(false)
             .build()?;
 
-        let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
+        let middleware = MonopolizationMiddleware::<serde_json::Value>::new(&config, &telemetry)?;
         assert!(middleware.is_none(), "Disabled config should return None");
 
         Ok(())

@@ -44,7 +44,7 @@ use prosody::telemetry::Telemetry;
 use prosody::timers::Trigger;
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
 };
 use quickcheck::{QuickCheck, TestResult};
@@ -114,11 +114,12 @@ struct DeferTestHandler {
 impl FallibleHandler for DeferTestHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         _context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -188,11 +189,12 @@ struct PermanentErrorHandler {
 impl FallibleHandler for PermanentErrorHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Value>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -224,8 +226,8 @@ impl FallibleHandler for PermanentErrorHandler {
 
 /// Test environment that encapsulates setup and provides helper methods.
 struct DeferTestEnvironment {
-    consumer: ProsodyConsumer,
-    producer: ProsodyProducer,
+    consumer: ProsodyConsumer<Value>,
+    producer: ProsodyProducer<JsonCodec>,
     topic: Topic,
     event_rx: Receiver<HandlerEvent>,
     handler: DeferTestHandler,
@@ -279,7 +281,8 @@ impl DeferTestEnvironment {
             &telemetry,
             &heartbeats,
         );
-        let loader = KafkaLoader::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
+        let loader =
+            KafkaLoader::<JsonCodec>::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
@@ -290,10 +293,10 @@ impl DeferTestEnvironment {
         )?;
 
         let handler_provider = defer_middleware
-            .layer(LogMiddleware)
+            .layer(LogMiddleware::<Value>::new())
             .into_provider(handler.clone());
 
-        let consumer = ProsodyConsumer::new(
+        let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
             handler_provider,
@@ -301,7 +304,7 @@ impl DeferTestEnvironment {
         )
         .await?;
 
-        let producer = ProsodyProducer::new(
+        let producer = ProsodyProducer::<JsonCodec>::new(
             &ProducerConfiguration::builder()
                 .bootstrap_servers(vec!["localhost:9094".to_owned()])
                 .source_system("defer-integration-test".to_owned())
@@ -370,7 +373,8 @@ impl DeferTestEnvironment {
             &telemetry,
             &heartbeats,
         );
-        let loader = KafkaLoader::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
+        let loader =
+            KafkaLoader::<JsonCodec>::for_consumer(&consumer_config, &defer_config, &heartbeats)?;
         let defer_middleware = MessageDeferMiddleware::new(
             defer_config,
             &consumer_config,
@@ -381,10 +385,10 @@ impl DeferTestEnvironment {
         )?;
 
         let handler_provider = defer_middleware
-            .layer(LogMiddleware)
+            .layer(LogMiddleware::<Value>::new())
             .into_provider(permanent_handler);
 
-        let consumer = ProsodyConsumer::new(
+        let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
             handler_provider,
@@ -392,7 +396,7 @@ impl DeferTestEnvironment {
         )
         .await?;
 
-        let producer = ProsodyProducer::new(
+        let producer = ProsodyProducer::<JsonCodec>::new(
             &ProducerConfiguration::builder()
                 .bootstrap_servers(vec!["localhost:9094".to_owned()])
                 .source_system("defer-integration-test".to_owned())
