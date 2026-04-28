@@ -4,6 +4,7 @@
 //! of the consumer, along with methods for building and displaying the state.
 //! It also includes a custom error type for handling state-related errors.
 
+use crate::Codec;
 use crate::consumer::ProsodyConsumer;
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
@@ -18,10 +19,10 @@ use tracing::info;
 ///
 /// This type provides a view into the current state of the consumer,
 /// allowing read-only access to the underlying `ConsumerState`.
-pub struct ConsumerStateView<'a, T>(pub(crate) MutexGuard<'a, ConsumerState<T>>);
+pub struct ConsumerStateView<'a, T, C: Codec>(pub(crate) MutexGuard<'a, ConsumerState<T, C>>);
 
-impl<T> Deref for ConsumerStateView<'_, T> {
-    type Target = ConsumerState<T>;
+impl<T, C: Codec> Deref for ConsumerStateView<'_, T, C> {
+    type Target = ConsumerState<T, C>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -30,7 +31,7 @@ impl<T> Deref for ConsumerStateView<'_, T> {
 
 /// Represents the current state of the consumer.
 #[derive(Debug, Default)]
-pub enum ConsumerState<T> {
+pub enum ConsumerState<T, C: Codec> {
     /// The consumer is not yet configured.
     #[default]
     Unconfigured,
@@ -41,7 +42,7 @@ pub enum ConsumerState<T> {
     /// The consumer is actively running.
     Running {
         /// The active Prosody consumer instance.
-        consumer: ProsodyConsumer,
+        consumer: ProsodyConsumer<C>,
         /// The configuration used for this consumer.
         config: ModeConfiguration,
         /// The handler for processing messages.
@@ -49,7 +50,7 @@ pub enum ConsumerState<T> {
     },
 }
 
-impl<T> ConsumerState<T> {
+impl<T, C: Codec> ConsumerState<T, C> {
     /// Builds a new `ConsumerState` based on the provided configuration.
     ///
     /// # Arguments
@@ -72,7 +73,7 @@ impl<T> ConsumerState<T> {
     }
 }
 
-impl<T> Display for ConsumerState<T> {
+impl<T, C: Codec> Display for ConsumerState<T, C> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let state = match self {
             ConsumerState::Unconfigured => "unconfigured",

@@ -258,12 +258,17 @@ impl SchedulerMiddleware {
     }
 }
 
-impl HandlerMiddleware for SchedulerMiddleware {
-    type Provider<T: FallibleHandlerProvider> = SchedulerProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware<P> for SchedulerMiddleware {
+    type Provider<T>
+        = SchedulerProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         SchedulerProvider {
             provider,
@@ -294,11 +299,12 @@ where
 {
     type Error = SchedulerError<T::Error>;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -335,13 +341,12 @@ where
     /// `on_message` / `on_timer` actually ran.
     ///
     /// Work-centric reasoning:
-    /// - `Ok(_)` and `Err(Handler(_))` both originate from the inner having
-    ///   run and returned, so the inner's `after_commit` is invoked exactly
-    ///   once with the corresponding result.
-    /// - `Err(PermitAcquisition(_))` is produced at this layer before the
-    ///   inner is reached, so the inner did not run; per the
-    ///   `FallibleHandler` invariant, neither apply hook may fire on the
-    ///   inner in this case.
+    /// - `Ok(_)` and `Err(Handler(_))` both originate from the inner having run
+    ///   and returned, so the inner's `after_commit` is invoked exactly once
+    ///   with the corresponding result.
+    /// - `Err(PermitAcquisition(_))` is produced at this layer before the inner
+    ///   is reached, so the inner did not run; per the `FallibleHandler`
+    ///   invariant, neither apply hook may fire on the inner in this case.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,

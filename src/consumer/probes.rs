@@ -60,10 +60,12 @@ pub struct ProbeServer {
 ///
 /// Contains references to the components needed to determine
 /// consumer health status.
-#[derive(Clone, Debug)]
-struct ProbeState {
+#[derive(Educe)]
+#[educe(Clone, Debug)]
+struct ProbeState<P: Send + Sync + 'static> {
     /// Reference to partition managers for checking assignment status
-    managers: Arc<Managers>,
+    #[educe(Debug(ignore))]
+    managers: Arc<Managers<P>>,
 
     /// Registry for checking if consumer-level actors are stalled
     heartbeats: HeartbeatRegistry,
@@ -85,9 +87,9 @@ impl ProbeServer {
     /// # Errors
     ///
     /// Returns an `io::Error` if the server fails to bind to the specified port
-    pub fn new(
+    pub fn new<P: Send + Sync + 'static>(
         port: u16,
-        managers: Arc<Managers>,
+        managers: Arc<Managers<P>>,
         heartbeats: HeartbeatRegistry,
     ) -> Result<Self, io::Error> {
         // Create application state with references to components
@@ -183,8 +185,8 @@ impl ProbeServer {
 /// - `StatusCode::OK` (200) if partitions are assigned, or
 ///   `StatusCode::SERVICE_UNAVAILABLE` (503) otherwise
 /// - A message describing the current assignment status
-async fn readiness_probe(
-    State(ProbeState { managers, .. }): State<ProbeState>,
+async fn readiness_probe<P: Send + Sync + 'static>(
+    State(ProbeState { managers, .. }): State<ProbeState<P>>,
 ) -> (StatusCode, Cow<'static, str>) {
     let assigned_count = get_assigned_partition_count(&managers);
 
@@ -220,11 +222,11 @@ async fn readiness_probe(
 /// - `StatusCode::OK` (200) if no stalls are detected, or
 ///   `StatusCode::SERVICE_UNAVAILABLE` (503) otherwise
 /// - A message describing the current stall status
-async fn liveness_probe(
+async fn liveness_probe<P: Send + Sync + 'static>(
     State(ProbeState {
         managers,
         heartbeats,
-    }): State<ProbeState>,
+    }): State<ProbeState<P>>,
 ) -> (StatusCode, &'static str) {
     if heartbeats.any_stalled() || get_is_stalled(&managers) {
         // Either a consumer-level actor or a partition has stalled
@@ -251,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn test_probe_server_endpoints_respond() -> Result<()> {
         // Create mock components
-        let managers = Arc::default();
+        let managers: Arc<Managers<serde_json::Value>> = Arc::default();
         let heartbeats = HeartbeatRegistry::test();
 
         // Create ProbeServer instance on a random port (0)

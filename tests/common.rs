@@ -24,7 +24,6 @@ use ahash::{HashMap, HashMapExt};
 use color_eyre::eyre::{Result, eyre};
 use derive_quickcheck_arbitrary::Arbitrary;
 use itertools::Itertools;
-use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::cassandra::config::CassandraConfiguration;
 use prosody::consumer::event_context::EventContext;
@@ -36,6 +35,7 @@ use prosody::high_level::config::TriggerStoreConfiguration;
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::timers::{Trigger, UncommittedTimer};
+use prosody::{JsonCodec, Topic};
 use quickcheck::{Arbitrary as QCArbitrary, Gen};
 use serde_json::{Value, json};
 use tokio::runtime::{Builder, Runtime};
@@ -216,7 +216,8 @@ pub fn spawn_producers(
         let topic = *topic;
 
         tasks.spawn(async move {
-            let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
+            let producer =
+                ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
             for (key, messages) in producer_messages {
                 let key = key.to_string();
                 for message in messages {
@@ -254,7 +255,7 @@ pub fn spawn_consumers(
         let handler_provider = CloneProvider::new(handler);
 
         tasks.spawn(async move {
-            let consumer = ProsodyConsumer::new(
+            let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
                 &consumer_config,
                 &create_cassandra_trigger_store_config(),
                 handler_provider,
@@ -439,10 +440,12 @@ pub struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
+    type Payload = Value;
+
     async fn on_message<C>(
         &self,
         _context: C,
-        message: UncommittedMessage,
+        message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
         C: EventContext,
@@ -482,9 +485,15 @@ pub struct SlowTestHandler {
 }
 
 impl EventHandler for SlowTestHandler {
+    type Payload = Value;
+
     #[instrument(skip(self, context, demand_type))]
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
-    where
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<Value>,
+        demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let _ = (context, demand_type);
@@ -548,11 +557,12 @@ pub struct FallibleTestHandler {
 impl FallibleHandler for FallibleTestHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         _context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

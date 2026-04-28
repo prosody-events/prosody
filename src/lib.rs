@@ -34,13 +34,14 @@
 //! struct MyHandler;
 //!
 //! impl FallibleHandler for MyHandler {
+//!     type Payload = serde_json::Value;
 //!     type Error = Infallible;
 //!     type Output = ();
 //!
 //!     async fn on_message<C>(
 //!         &self,
 //!         _context: C,
-//!         message: ConsumerMessage,
+//!         message: ConsumerMessage<serde_json::Value>,
 //!         _demand_type: DemandType,
 //!     ) -> Result<(), Self::Error>
 //!     where
@@ -89,7 +90,7 @@
 //!         ..ConsumerBuilders::default()
 //!     };
 //!
-//!     let client = HighLevelClient::new(
+//!     let client: HighLevelClient<MyHandler> = HighLevelClient::new(
 //!         Mode::Pipeline,
 //!         &mut producer_config,
 //!         &consumer_builders,
@@ -225,13 +226,14 @@ use ::tracing::info;
 use fixedstr::Flexstr;
 use internment::Intern;
 use rdkafka::mocking::MockCluster;
-use serde_json::Value;
 use std::env;
 use std::mem::forget;
 use std::sync::{Arc, LazyLock};
 
 pub mod admin;
 pub mod cassandra;
+/// Wire-format abstraction for pluggable message encoding and decoding.
+pub mod codec;
 pub mod consumer;
 pub mod error;
 pub mod heartbeat;
@@ -245,6 +247,7 @@ pub mod timers;
 pub mod tracing;
 mod util;
 
+pub use crate::codec::{Codec, JsonCodec};
 pub use crate::error::{ClassifyError, ErrorCategory};
 
 /// A lazily initialized mock Kafka cluster for testing.
@@ -308,12 +311,6 @@ pub type Key = Arc<str>;
 /// Uses an Arc so the consumer group can be cheaply cloned across components.
 pub type ConsumerGroup = Arc<str>;
 
-/// A JSON value containing a Kafka message's content.
-///
-/// Stores message payloads as arbitrary JSON to support flexible message
-/// formats.
-pub type Payload = Value;
-
 /// An offset position within a Kafka partition.
 pub type Offset = i64;
 
@@ -348,15 +345,6 @@ impl TopicPartitionKey {
     }
 }
 
-/// A compact string for storing event identifiers.
-///
-/// Uses `Flexstr` to efficiently store event IDs up to UUID length without heap
-/// allocation.
-pub type EventId = Flexstr<UUID_STR_LEN>;
-
-/// A borrowed string slice for event identifiers.
-pub type BorrowedEventId = str;
-
 /// Source system header used to prevent processing loops.
 const SOURCE_SYSTEM_HEADER: &str = "source-system";
 
@@ -374,39 +362,19 @@ const SOURCE_SYSTEM_HEADER: &str = "source-system";
 /// be delivered due to retries or network issues. The event ID should be stable
 /// across message delivery attempts.
 pub trait EventIdentity {
-    /// The type used to represent a borrowed event ID.
-    type BorrowedEventId: ?Sized;
-
-    /// The type used to represent the event ID when owned.
-    /// Must implement `AsRef<Self::BorrowedEventId>` and be constructible from
-    /// a borrowed event ID.
-    type EventId: AsRef<Self::BorrowedEventId> + for<'a> From<&'a Self::BorrowedEventId>;
-
     /// Returns a reference to this event's identifier if one exists.
     ///
-    /// # Returns
-    ///
-    /// - `Some(&BorrowedEventId)` if the event has an identifier
-    /// - `None` if the event has no identifier
-    fn event_id(&self) -> Option<&Self::BorrowedEventId>;
+    /// Returns `None` if the event has no identifier.
+    fn event_id(&self) -> Option<&str>;
 }
 
-impl EventIdentity for Payload {
-    type BorrowedEventId = str;
-    type EventId = EventId;
-
-    /// Extracts the event ID from a JSON payload's "id" field.
-    ///
-    /// # Returns
-    ///
-    /// The string value of the "id" field if it exists and is a string,
-    /// otherwise `None`.
-    fn event_id(&self) -> Option<&Self::BorrowedEventId> {
-        match self.get("id")? {
-            Value::String(value) => Some(value.as_str()),
-            _ => None,
-        }
-    }
+/// Provides access to the event type field within a payload.
+///
+/// Used to extract event type identifiers for event filtering and routing.
+/// Implementations should extract the type from their internal representation.
+pub trait EventType {
+    /// Returns the event type string if present.
+    fn event_type(&self) -> Option<&str>;
 }
 
 /// Manages processing resources (spans and permits) for deterministic cleanup.

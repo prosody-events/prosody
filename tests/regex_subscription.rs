@@ -11,6 +11,7 @@ use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     cassandra::config::CassandraConfigurationBuilder,
+    codec::JsonCodecError,
     consumer::ConsumerConfigurationBuilder,
     consumer::middleware::{
         deduplication::DeduplicationConfigurationBuilder, defer::DeferConfigurationBuilder,
@@ -98,7 +99,7 @@ async fn create_test_topics(
 fn create_high_level_client(
     regex_pattern: String,
     consumer_group: String,
-) -> Result<HighLevelClient<FallibleTestHandler>, HighLevelClientError> {
+) -> Result<HighLevelClient<FallibleTestHandler>, HighLevelClientError<JsonCodecError>> {
     let bootstrap = vec![BOOTSTRAP_SERVER.to_owned()];
 
     let mut producer_builder = ProducerConfigurationBuilder::default();

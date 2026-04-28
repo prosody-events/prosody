@@ -20,18 +20,21 @@ use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
 use std::array::from_fn;
 use std::collections::hash_map::Entry;
 use std::future::ready;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use crate::Topic;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
-use crate::consumer::{ConsumerConfiguration, HandlerProvider, Managers, WatermarkVersion};
+use crate::consumer::{
+    ConsumerConfiguration, EventHandler, HandlerProvider, Managers, WatermarkVersion,
+};
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::TimerSemaphores;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::TriggerStoreProvider;
+use crate::{EventType, Topic};
 
 /// Manages Kafka partition assignments and message processing for a consumer.
 ///
@@ -47,25 +50,27 @@ use crate::timers::store::TriggerStoreProvider;
 ///   partitions
 /// * `P` - Type implementing `TriggerStoreProvider` for persistent timer
 ///   trigger storage
-pub struct Context<T, P>
+/// * `PL` - The payload type carried by consumed messages
+pub struct Context<T, P, PL>
 where
     T: HandlerProvider,
 {
     /// Partition-level configuration settings
-    config: PartitionConfiguration<P>,
+    config: PartitionConfiguration<P, PL>,
 
     /// Creates message handlers for partitions
     handler_provider: T,
 
     /// Thread-safe storage for partition managers
-    managers: Arc<Managers>,
+    managers: Arc<Managers<PL>>,
 
     telemetry: TelemetrySender,
 }
 
-impl<T, P> Context<T, P>
+impl<T, P, PL> Context<T, P, PL>
 where
     T: HandlerProvider,
+    PL: Clone + Send + Sync + 'static,
 {
     /// Creates a new consumer context with the given configuration.
     ///
@@ -80,13 +85,14 @@ where
     /// * `trigger_provider` - Factory for per-partition trigger stores
     /// * `watermark_version` - Shared counter tracking watermark updates
     /// * `managers` - Thread-safe storage for partition managers
-    /// * `allowed_events` - Optional filter for permitted event types
+    /// * `allowed_events` - Optional filter automaton; payloads supply their
+    ///   event type via [`EventType`]
     pub fn new(
         config: &ConsumerConfiguration,
         handler_provider: T,
         trigger_provider: P,
         watermark_version: Arc<WatermarkVersion>,
-        managers: Arc<Managers>,
+        managers: Arc<Managers<PL>>,
         allowed_events: Option<AhoCorasick>,
         telemetry: TelemetrySender,
     ) -> Self {
@@ -112,6 +118,7 @@ where
             timer_semaphores,
             telemetry_sender: telemetry.clone(),
             timer_spans: config.timer_spans,
+            _payload: PhantomData,
         };
 
         Self {
@@ -123,17 +130,20 @@ where
     }
 }
 
-impl<T, P> ClientContext for Context<T, P>
+impl<T, P, PL> ClientContext for Context<T, P, PL>
 where
     T: HandlerProvider,
     P: TriggerStoreProvider,
+    PL: Clone + Send + Sync + 'static,
 {
 }
 
-impl<T, P> ConsumerContext for Context<T, P>
+impl<T, P, PL> ConsumerContext for Context<T, P, PL>
 where
     T: HandlerProvider,
+    T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
+    PL: Clone + Send + Sync + 'static + EventType,
 {
     /// Handles partition assignments and revocations during consumer group
     /// rebalancing.

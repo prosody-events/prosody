@@ -25,8 +25,8 @@
 //! - **Shutdown after inner ran**: The inner handler ran and returned a
 //!   Transient error, but shutdown was signaled mid-flight. Returns
 //!   [`CancellationError::ShutdownAfterInner`] (Terminal). The inner attempt
-//!   *did* run and will be redelivered, so its apply-hook (`after_abort`)
-//!   must still fire with the original inner error.
+//!   *did* run and will be redelivered, so its apply-hook (`after_abort`) must
+//!   still fire with the original inner error.
 //!
 //! - **Message cancellation**: Returns [`CancellationError::MessageCancelled`]
 //!   classified as [`ErrorCategory::Transient`]. The retry middleware will
@@ -57,9 +57,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -90,8 +91,16 @@ use crate::timers::Trigger;
 use crate::{Partition, Topic};
 
 /// Middleware that checks cancellation state before invoking the handler.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CancellationMiddleware;
+
+impl CancellationMiddleware {
+    /// Creates a new `CancellationMiddleware`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 /// Provider that wraps handlers with cancellation checks.
 #[derive(Clone, Debug)]
@@ -111,12 +120,17 @@ impl<T> CancellationHandler<T> {
     }
 }
 
-impl HandlerMiddleware for CancellationMiddleware {
-    type Provider<T: FallibleHandlerProvider> = CancellationProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware<P> for CancellationMiddleware {
+    type Provider<T>
+        = CancellationProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         CancellationProvider { provider }
     }
@@ -139,6 +153,7 @@ where
 {
     type Error = CancellationError<T::Error>;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     /// Checks cancellation state, then delegates to inner handler if clear.
     /// Transient errors from the inner are promoted to
@@ -147,7 +162,7 @@ where
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -349,11 +364,12 @@ mod tests {
     impl FallibleHandler for MockHandler {
         type Error = TestError;
         type Output = ();
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
@@ -379,7 +395,7 @@ mod tests {
         async fn shutdown(self) {}
     }
 
-    fn create_test_message() -> Option<ConsumerMessage> {
+    fn create_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
         let semaphore = Arc::new(Semaphore::new(10));
         let permit = semaphore.try_acquire_owned().ok()?;
         Some(ConsumerMessage::new(
@@ -564,11 +580,12 @@ mod tests {
     impl FallibleHandler for ShutdownTriggerHandler {
         type Error = TestError;
         type Output = ();
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
@@ -704,11 +721,12 @@ mod tests {
     impl FallibleHandler for RecordingHandler {
         type Error = TestError;
         type Output = ();
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where

@@ -25,8 +25,7 @@
 //! There are exactly two work outcomes here:
 //!
 //! - **Inner ran** — `Ok(_)` or `Err(MonopolizationError::Handler(_))`. The
-//!   apply hook is forwarded to the inner handler with the inner-typed
-//!   result.
+//!   apply hook is forwarded to the inner handler with the inner-typed result.
 //! - **Inner did NOT run** — `Err(MonopolizationError::Monopolization { .. })`
 //!   was produced at this layer before delegation. The inner handler's apply
 //!   hook is suppressed.
@@ -212,12 +211,17 @@ impl MonopolizationMiddleware {
     }
 }
 
-impl HandlerMiddleware for MonopolizationMiddleware {
-    type Provider<T: FallibleHandlerProvider> = MonopolizationProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware<P> for MonopolizationMiddleware {
+    type Provider<T>
+        = MonopolizationProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         MonopolizationProvider {
             provider,
@@ -254,11 +258,12 @@ where
 {
     type Error = MonopolizationError<T::Error>;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -300,15 +305,15 @@ where
     ///
     /// Work-centric reasoning, per the `FallibleHandler` invariant:
     ///
-    /// - `Ok(_)` — inner ran and succeeded. Forward `Ok` so the inner
-    ///   handler observes its own success exactly once.
+    /// - `Ok(_)` — inner ran and succeeded. Forward `Ok` so the inner handler
+    ///   observes its own success exactly once.
     /// - `Err(Handler(inner))` — inner ran and returned an error. Unwrap and
     ///   forward the inner-typed error so the inner handler sees its own
     ///   failure exactly once.
-    /// - `Err(Monopolization { .. })` — rejection produced at THIS layer
-    ///   before delegation; the inner handler did not run. Suppress its
-    ///   apply hook entirely; firing it would violate the invariant by
-    ///   reporting an outcome for work that never happened.
+    /// - `Err(Monopolization { .. })` — rejection produced at THIS layer before
+    ///   delegation; the inner handler did not run. Suppress its apply hook
+    ///   entirely; firing it would violate the invariant by reporting an
+    ///   outcome for work that never happened.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -331,14 +336,13 @@ where
     /// Work-centric reasoning, per the `FallibleHandler` invariant:
     ///
     /// - `Ok(_)` / `Err(Handler(_))` — inner ran. Forward the inner-typed
-    ///   result so the inner handler can observe the abort and prepare for
-    ///   the upcoming retry.
-    /// - `Err(Monopolization { .. })` — rejection produced at THIS layer
-    ///   before delegation; the inner handler did not run. Suppress its
-    ///   apply hook. The retry will reach this layer again and either be
-    ///   admitted (and then dispatched to the inner) or rejected once more
-    ///   here, and the inner handler must not see a phantom abort for work
-    ///   it never performed.
+    ///   result so the inner handler can observe the abort and prepare for the
+    ///   upcoming retry.
+    /// - `Err(Monopolization { .. })` — rejection produced at THIS layer before
+    ///   delegation; the inner handler did not run. Suppress its apply hook.
+    ///   The retry will reach this layer again and either be admitted (and then
+    ///   dispatched to the inner) or rejected once more here, and the inner
+    ///   handler must not see a phantom abort for work it never performed.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -611,11 +615,12 @@ mod tests {
     impl FallibleHandler for MockHandler {
         type Error = MockError;
         type Output = ();
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where

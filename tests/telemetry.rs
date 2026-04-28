@@ -81,11 +81,12 @@ struct ForwardHandler {
 impl FallibleHandler for ForwardHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         _ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -119,11 +120,12 @@ struct FailingHandler {
 impl FallibleHandler for FailingHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         _ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -158,11 +160,12 @@ struct TimerSchedulingHandler {
 impl FallibleHandler for TimerSchedulingHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -205,11 +208,12 @@ struct TimerFailingHandler {
 impl FallibleHandler for TimerFailingHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -251,11 +255,12 @@ struct TimerCancellingHandler {
 impl FallibleHandler for TimerCancellingHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -300,11 +305,12 @@ struct ClearAndScheduleHandler {
 impl FallibleHandler for ClearAndScheduleHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -368,11 +374,12 @@ struct InlineReplacementHandler {
 impl FallibleHandler for InlineReplacementHandler {
     type Error = TestError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -451,11 +458,12 @@ struct TransientMessageHandler {
 impl FallibleHandler for TransientMessageHandler {
     type Error = TransientError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         _ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -503,11 +511,12 @@ struct TransientTimerHandler {
 impl FallibleHandler for TransientTimerHandler {
     type Error = TransientError;
     type Output = ();
+    type Payload = Value;
 
     async fn on_message<C>(
         &self,
         ctx: C,
-        msg: ConsumerMessage,
+        msg: ConsumerMessage<Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where

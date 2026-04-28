@@ -15,10 +15,12 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
+use std::cell::RefCell;
 use std::env::var;
 use std::hash::Hasher;
 use std::mem::take;
 use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{Span, info_span, instrument};
@@ -26,6 +28,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
 use xxhash_rust::xxh3::Xxh3Default;
 
+use crate::codec::JsonCodec;
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::telemetry::sender::TelemetrySender;
@@ -33,13 +36,8 @@ use crate::util::{
     DEFAULT_IDEMPOTENCE_CACHE_SIZE, from_env, from_env_with_fallback,
     from_option_duration_env_with_fallback, from_vec_env,
 };
-use crate::{EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, Payload, SOURCE_SYSTEM_HEADER, Topic};
-
-#[cfg(target_arch = "arm")]
-use serde_json as json;
-
-#[cfg(not(target_arch = "arm"))]
-use simd_json as json;
+use crate::{Codec, EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, SOURCE_SYSTEM_HEADER, Topic};
+use std::marker::PhantomData;
 use tracing::field::debug;
 use tracing::log::info;
 use whoami::hostname;
@@ -51,6 +49,50 @@ pub use error::ProducerError;
 
 /// Environment variable name for the source system identifier.
 const PROSODY_SOURCE_SYSTEM: &str = "PROSODY_SOURCE_SYSTEM";
+
+thread_local! {
+    static SERIALIZE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard that takes the per-thread serialize buffer for the duration of a
+/// send and returns it on drop, preserving its capacity for reuse.
+struct SerializeBufGuard {
+    buf: Vec<u8>,
+}
+
+impl SerializeBufGuard {
+    fn acquire() -> Self {
+        Self {
+            buf: SERIALIZE_BUF.with_borrow_mut(take),
+        }
+    }
+}
+
+impl Drop for SerializeBufGuard {
+    fn drop(&mut self) {
+        let mut buf = take(&mut self.buf);
+        buf.clear();
+        SERIALIZE_BUF.with_borrow_mut(|tls| {
+            if buf.capacity() > tls.capacity() {
+                *tls = buf;
+            }
+        });
+    }
+}
+
+impl Deref for SerializeBufGuard {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.buf
+    }
+}
+
+impl DerefMut for SerializeBufGuard {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+}
 
 /// Configuration for the Kafka producer.
 ///
@@ -150,7 +192,7 @@ impl ProducerConfiguration {
 /// - Best-effort: Optimized for throughput with reasonable timeout defaults
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct ProsodyProducer {
+pub struct ProsodyProducer<C: Codec = JsonCodec> {
     /// Timeout for send operations.
     send_timeout: Timeout,
 
@@ -171,9 +213,12 @@ pub struct ProsodyProducer {
     /// Telemetry sender for emitting producer events.
     #[educe(Debug(ignore))]
     telemetry: TelemetrySender,
+
+    /// Codec marker (variance-correct phantom; does not add `C: Send + Sync`).
+    _codec: PhantomData<fn() -> C>,
 }
 
-impl Clone for ProsodyProducer {
+impl<C: Codec> Clone for ProsodyProducer<C> {
     fn clone(&self) -> Self {
         Self {
             send_timeout: self.send_timeout,
@@ -182,11 +227,12 @@ impl Clone for ProsodyProducer {
             idempotence_cache: self.idempotence_cache.clone(),
             propagator: new_propagator(),
             telemetry: self.telemetry.clone(),
+            _codec: PhantomData,
         }
     }
 }
 
-impl ProsodyProducer {
+impl<C: Codec> ProsodyProducer<C> {
     /// Creates a new `ProsodyProducer` instance.
     ///
     /// # Arguments
@@ -206,7 +252,7 @@ impl ProsodyProducer {
     pub fn new(
         config: &ProducerConfiguration,
         telemetry: TelemetrySender,
-    ) -> Result<Self, ProducerError> {
+    ) -> Result<Self, ProducerError<C::Error>> {
         config.validate()?;
 
         let send_timeout = config.send_timeout.map_or(Timeout::Never, Timeout::After);
@@ -237,6 +283,7 @@ impl ProsodyProducer {
             idempotence_cache,
             propagator: new_propagator(),
             telemetry,
+            _codec: PhantomData,
         })
     }
 
@@ -260,7 +307,7 @@ impl ProsodyProducer {
     pub fn pipeline_producer(
         mut config: ProducerConfiguration,
         telemetry: TelemetrySender,
-    ) -> Result<Self, ProducerError> {
+    ) -> Result<Self, ProducerError<C::Error>> {
         config.send_timeout = None;
         Self::new(&config, telemetry)
     }
@@ -285,7 +332,7 @@ impl ProsodyProducer {
     pub(crate) fn low_latency_producer(
         mut config: ProducerConfiguration,
         telemetry: TelemetrySender,
-    ) -> Result<Self, ProducerError> {
+    ) -> Result<Self, ProducerError<C::Error>> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
@@ -312,7 +359,7 @@ impl ProsodyProducer {
     pub(crate) fn best_effort_producer(
         mut config: ProducerConfiguration,
         telemetry: TelemetrySender,
-    ) -> Result<Self, ProducerError> {
+    ) -> Result<Self, ProducerError<C::Error>> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
@@ -348,10 +395,11 @@ impl ProsodyProducer {
         headers: H,
         topic: Topic,
         key: &str,
-        payload: &Payload,
-    ) -> Result<(), ProducerError>
+        payload: &C::Payload,
+    ) -> Result<(), ProducerError<C::Error>>
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
+        C::Payload: EventIdentity,
     {
         let maybe_event_id = payload.event_id();
         let key: Key = key.into();
@@ -373,14 +421,19 @@ impl ProsodyProducer {
             _ => None,
         };
 
-        // Serialize the payload to JSON
-        let serialized = json::to_vec(&payload)?;
+        // Serialize the payload using a thread-local cached codec into a
+        // thread-local buffer. The guard returns the buffer to the TLS slot on
+        // drop, preserving its capacity across calls.
+        let mut serialized = SerializeBufGuard::acquire();
+        C::with_cached_local(|codec| codec.serialize(payload, &mut serialized))
+            .map_err(ProducerError::Serialization)?;
+
         Span::current().record("payload_size", serialized.len());
 
         // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
             .key(key.as_ref())
-            .payload(&serialized)
+            .payload(serialized.as_slice())
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 
         // Inject OpenTelemetry context

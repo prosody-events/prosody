@@ -28,6 +28,7 @@ pub mod tests;
 
 use std::error::Error as StdError;
 use std::hash::Hasher;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use quick_cache::sync::Cache;
@@ -59,10 +60,10 @@ pub use self::store::{DeduplicationStore, DeduplicationStoreProvider};
 
 /// Shared state for the deduplication middleware.
 #[derive(Clone, Debug)]
-struct DeduplicationShared<P> {
+struct DeduplicationShared<S> {
     config: DeduplicationConfiguration,
     group_id: Arc<str>,
-    store_provider: P,
+    store_provider: S,
     cache: Arc<DeduplicationCache>,
 }
 
@@ -71,12 +72,16 @@ struct DeduplicationShared<P> {
 /// Wraps the inner middleware stack and checks incoming messages against a
 /// two-tier cache (local + persistent store). Duplicates are filtered out
 /// before reaching the handler.
+///
+/// The `P` parameter is the handler payload type, fixed by the chain it is
+/// composed into.
 #[derive(Clone, Debug)]
-pub struct DeduplicationMiddleware<P: DeduplicationStoreProvider> {
-    shared: Arc<DeduplicationShared<P>>,
+pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
+    shared: Arc<DeduplicationShared<S>>,
+    _payload: PhantomData<fn() -> P>,
 }
 
-impl<P: DeduplicationStoreProvider> DeduplicationMiddleware<P> {
+impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
     /// Creates a new middleware, or `None` if `cache_capacity == 0`.
     ///
     /// # Errors
@@ -85,7 +90,7 @@ impl<P: DeduplicationStoreProvider> DeduplicationMiddleware<P> {
     pub fn new(
         config: DeduplicationConfiguration,
         group_id: &str,
-        store_provider: P,
+        store_provider: S,
     ) -> Result<Option<Self>, validator::ValidationErrors> {
         config.validate()?;
 
@@ -101,16 +106,24 @@ impl<P: DeduplicationStoreProvider> DeduplicationMiddleware<P> {
                 store_provider,
                 cache,
             }),
+            _payload: PhantomData,
         }))
     }
 }
 
-impl<P: DeduplicationStoreProvider> HandlerMiddleware for DeduplicationMiddleware<P> {
-    type Provider<T: FallibleHandlerProvider> = DeduplicationProvider<T, P>;
+impl<S: DeduplicationStoreProvider, P: Send + Sync + 'static + EventIdentity> HandlerMiddleware<P>
+    for DeduplicationMiddleware<S, P>
+{
+    type Provider<T>
+        = DeduplicationProvider<T, S>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         DeduplicationProvider {
             inner: provider,
@@ -121,17 +134,18 @@ impl<P: DeduplicationStoreProvider> HandlerMiddleware for DeduplicationMiddlewar
 
 /// Provider that creates per-partition deduplication handlers.
 #[derive(Clone, Debug)]
-pub struct DeduplicationProvider<T, P: DeduplicationStoreProvider> {
+pub struct DeduplicationProvider<T, S: DeduplicationStoreProvider> {
     inner: T,
-    shared: Arc<DeduplicationShared<P>>,
+    shared: Arc<DeduplicationShared<S>>,
 }
 
-impl<T, P> FallibleHandlerProvider for DeduplicationProvider<T, P>
+impl<T, S> FallibleHandlerProvider for DeduplicationProvider<T, S>
 where
     T: FallibleHandlerProvider,
-    P: DeduplicationStoreProvider,
+    <T::Handler as FallibleHandler>::Payload: EventIdentity,
+    S: DeduplicationStoreProvider,
 {
-    type Handler = DeduplicationHandler<T::Handler, P::Store>;
+    type Handler = DeduplicationHandler<T::Handler, S::Store>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let inner = self.inner.handler_for_partition(topic, partition);
@@ -167,11 +181,12 @@ pub struct DeduplicationHandler<T, S: DeduplicationStore> {
 impl<T, S> DeduplicationHandler<T, S>
 where
     T: FallibleHandler,
+    T::Payload: EventIdentity,
     S: DeduplicationStore,
 {
     /// Computes the dedup UUID for a message, incorporating the `event_id`
     /// (from payload) or falling back to writing the offset directly.
-    fn dedup_uuid_for_message(&self, message: &ConsumerMessage) -> Uuid {
+    fn dedup_uuid_for_message(&self, message: &ConsumerMessage<T::Payload>) -> Uuid {
         let mut hasher = Xxh3Default::new();
         hasher.write_u32(self.version.len() as u32);
         hasher.write(self.version.as_bytes());
@@ -200,17 +215,19 @@ where
 impl<T, S> FallibleHandler for DeduplicationHandler<T, S>
 where
     T: FallibleHandler,
+    T::Payload: EventIdentity,
     S: DeduplicationStore,
 {
     type Error = DeduplicationError<T::Error>;
     /// `Some` — inner ran; forward apply hook. `None` — dedup hit; suppress
     /// both hooks.
     type Output = Option<T::Output>;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -299,9 +316,17 @@ where
     where
         C: EventContext,
     {
+        // The `Err(Store(_))` arm covers two cases:
+        //   1. Inner did not run (store read failed before dispatch).
+        //   2. Inner ran, then the post-inner store write failed.
+        // Both deliberately suppress the inner's apply hook. `Store(_)` is
+        // classified as Transient (see `ClassifyError` impl below), so the
+        // outer retry layer will redrive the whole stack and the inner sees
+        // a fresh invocation. Apply hooks are best-effort by design — see
+        // `FallibleHandler::after_commit` docs.
         match result {
             Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
-            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store write failed
+            Ok(None) | Err(DeduplicationError::Store(_)) => {}
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_commit(context, Err(error)).await;
             }
@@ -312,9 +337,12 @@ where
     where
         C: EventContext,
     {
+        // See `after_commit`: `Err(Store(_))` covers both pre-inner read
+        // failure and post-inner write failure. Both suppress the inner hook;
+        // retry redrives.
         match result {
             Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
-            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store write failed
+            Ok(None) | Err(DeduplicationError::Store(_)) => {}
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_abort(context, Err(error)).await;
             }

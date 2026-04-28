@@ -29,7 +29,7 @@ use crate::producer::{
 use crate::propagator::new_propagator;
 use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use crate::telemetry::{EmitterError, Telemetry, spawn_telemetry_emitter};
-use crate::{Payload, Topic};
+use crate::{Codec, JsonCodec, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
 use std::time::Duration;
@@ -72,17 +72,23 @@ pub struct ConsumerBuilders {
 
 /// A combined client that manages both producer and consumer operations.
 #[derive(Debug)]
-pub struct HighLevelClient<T> {
-    producer: ProsodyProducer,
+pub struct HighLevelClient<T, C: Codec = JsonCodec>
+where
+    C::Payload: crate::EventIdentity,
+{
+    producer: ProsodyProducer<C>,
     producer_config: ProducerConfiguration,
-    consumer: Mutex<ConsumerState<T>>,
+    consumer: Mutex<ConsumerState<T, C>>,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
 }
 
-impl<T> HighLevelClient<T> {
+impl<T, C: Codec> HighLevelClient<T, C>
+where
+    C::Payload: crate::EventIdentity,
+{
     /// Returns a reference to the internal `ProsodyProducer`.
-    pub fn producer(&self) -> &ProsodyProducer {
+    pub fn producer(&self) -> &ProsodyProducer<C> {
         &self.producer
     }
 
@@ -92,7 +98,7 @@ impl<T> HighLevelClient<T> {
     }
 
     /// Returns a view of the current consumer state.
-    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T> {
+    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, C> {
         ConsumerStateView(self.consumer.lock().await)
     }
 
@@ -142,7 +148,7 @@ impl<T> HighLevelClient<T> {
         producer_builder: &mut ProducerConfigurationBuilder,
         consumer_builders: &ConsumerBuilders,
         cassandra_builder: &CassandraConfigurationBuilder,
-    ) -> Result<Self, HighLevelClientError> {
+    ) -> Result<Self, HighLevelClientError<C::Error>> {
         // Set the producer source system to the consumer group if unspecified
         if let (None, Some(group_id)) = (
             producer_builder.configured_source_system(),
@@ -154,7 +160,7 @@ impl<T> HighLevelClient<T> {
         let producer_config = producer_builder.build()?;
         let cloned_config = producer_config.clone();
         let telemetry = Telemetry::new();
-        let producer = match mode {
+        let producer: ProsodyProducer<C> = match mode {
             Mode::Pipeline => ProsodyProducer::pipeline_producer(cloned_config, telemetry.sender()),
             Mode::LowLatency => {
                 ProsodyProducer::low_latency_producer(cloned_config, telemetry.sender())
@@ -214,8 +220,8 @@ impl<T> HighLevelClient<T> {
         &self,
         topic: Topic,
         key: &str,
-        payload: &Payload,
-    ) -> Result<(), HighLevelClientError> {
+        payload: &C::Payload,
+    ) -> Result<(), HighLevelClientError<C::Error>> {
         self.producer.send([], topic, key, payload).await?;
         Ok(())
     }
@@ -232,9 +238,10 @@ impl<T> HighLevelClient<T> {
     /// - The consumer is unconfigured.
     /// - The consumer is already subscribed.
     /// - Consumer initialization fails.
-    pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
+    pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>
     where
-        T: FallibleHandler + Clone,
+        T: FallibleHandler<Payload = C::Payload> + Clone,
+        C::Payload: crate::EventType + Clone,
     {
         let mut guard = self.consumer.lock().await;
         let consumer_ref = &mut *guard;
@@ -262,7 +269,7 @@ impl<T> HighLevelClient<T> {
                 common,
                 trigger_store,
             } => {
-                ProsodyConsumer::pipeline_consumer(
+                ProsodyConsumer::<C>::pipeline_consumer(
                     consumer,
                     trigger_store,
                     PipelineMiddlewareConfiguration {
@@ -305,7 +312,7 @@ impl<T> HighLevelClient<T> {
                 trigger_store,
                 ..
             } => {
-                ProsodyConsumer::best_effort_consumer(
+                ProsodyConsumer::<C>::best_effort_consumer(
                     consumer,
                     trigger_store,
                     common,
@@ -331,7 +338,7 @@ impl<T> HighLevelClient<T> {
     ///
     /// Returns a `HighLevelClientError` if the consumer is not currently
     /// subscribed.
-    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError> {
+    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
         let consumer = {
             let mut guard = self.consumer.lock().await;
             let consumer_ref = &mut *guard;
@@ -390,10 +397,13 @@ impl<T> HighLevelClient<T> {
 /// # Errors
 ///
 /// Returns a `HighLevelClientError` if any required topics are missing.
-fn check_topic_existence<S>(
-    producer: &ProsodyProducer,
-    consumer_state: &ConsumerState<S>,
-) -> Result<(), HighLevelClientError> {
+fn check_topic_existence<S, C: Codec, D: Codec>(
+    producer: &ProsodyProducer<C>,
+    consumer_state: &ConsumerState<S, D>,
+) -> Result<(), HighLevelClientError<C::Error>>
+where
+    C::Payload: crate::EventIdentity,
+{
     let ConsumerState::Configured(mode_config) = &consumer_state else {
         return Ok(());
     };
@@ -417,10 +427,13 @@ fn check_topic_existence<S>(
 /// # Errors
 ///
 /// Returns a `ProducerError` if metadata fetching fails.
-fn missing_topics(
-    producer: &ProsodyProducer,
+fn missing_topics<C: Codec>(
+    producer: &ProsodyProducer<C>,
     mut topics: Vec<Topic>,
-) -> Result<Vec<Topic>, ProducerError> {
+) -> Result<Vec<Topic>, ProducerError<C::Error>>
+where
+    C::Payload: crate::EventIdentity,
+{
     const TIMEOUT: Duration = Duration::from_mins(1);
     let metadata = producer.kafka_client().fetch_metadata(None, TIMEOUT)?;
 
@@ -450,14 +463,14 @@ fn missing_topics(
 
 /// Errors that can occur in the `HighLevelClient` operations.
 #[derive(Debug, Error)]
-pub enum HighLevelClientError {
+pub enum HighLevelClientError<E> {
     /// Error when the producer configuration is invalid.
     #[error("invalid producer configuration: {0:#}")]
     ProducerConfiguration(#[from] ProducerConfigurationBuilderError),
 
     /// Error when initializing the producer fails.
     #[error("failed to initialize producer: {0:#}")]
-    Producer(#[from] ProducerError),
+    Producer(#[from] ProducerError<E>),
 
     /// Error when initializing the consumer fails.
     #[error("failed to initialize consumer: {0:#}")]

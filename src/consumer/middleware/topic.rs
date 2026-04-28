@@ -1,17 +1,22 @@
 //! Dead letter queue (failure topic) middleware.
 //!
-//! Routes failed messages to a designated failure topic for later analysis or
-//! reprocessing. All non-terminal errors (both [`ErrorCategory::Permanent`] and
-//! [`ErrorCategory::Transient`]) are sent to the failure topic. Only
+//! Routes failed **messages** to a designated failure topic for later analysis
+//! or reprocessing. All non-terminal errors (both [`ErrorCategory::Permanent`]
+//! and [`ErrorCategory::Transient`]) are sent to the failure topic. Only
 //! [`ErrorCategory::Terminal`] errors bypass the DLQ and propagate immediately,
 //! as they indicate partition shutdown rather than recoverable failures.
+//!
+//! Timer failures are **not** routed to the failure topic. Every timer error
+//! propagates as [`FailureTopicError::Handler`] with its original
+//! classification — the failure-topic middleware is a no-op on the timer
+//! path. Outer retry / telemetry observe the inner's classification directly.
 //!
 //! # Execution Order
 //!
 //! **Request Path:**
 //! 1. Pass control to inner middleware layers
 //!
-//! **Response Path:**
+//! **Response Path (messages):**
 //! 1. Receive result from inner layers
 //! 2. **If error is terminal**: Pass through unchanged as
 //!    [`FailureTopicError::Handler`] (triggers partition shutdown)
@@ -19,8 +24,8 @@
 //!    with metadata. On success, surface the inner's error in
 //!    [`FailureTopicOutput::Routed`] so the apply hook can forward it.
 //! 4. **If failure topic write fails**: Surface
-//!    [`FailureTopicError::DlqSendFailed`] (which carries both the inner
-//!    error and the producer error) for outer retry middleware
+//!    [`FailureTopicError::DlqSendFailed`] (which carries both the inner error
+//!    and the producer error) for outer retry middleware
 //!
 //! # Failure Topic Message Format
 //!
@@ -32,21 +37,26 @@
 //!
 //! # Apply hooks (work-centric invariant)
 //!
-//! This middleware is a **rescue** layer: when the inner handler fails with a
-//! non-Terminal error, the failure is routed to the DLQ instead of bubbling
-//! up. The inner handler is invoked **at most once per call** to
-//! [`FallibleHandler::on_message`] / [`FallibleHandler::on_timer`] on this
-//! middleware; the subsequent `producer.send` to the failure topic is a
-//! Kafka producer call, **not** another inner-handler invocation. The
-//! per-invocation invariant — exactly one of `inner.after_commit` /
-//! `inner.after_abort` fires per inner invocation that ran and returned —
-//! is upheld: every arm of `after_commit` / `after_abort` forwards exactly
-//! one call to the inner.
+//! For messages, this middleware is a **rescue** layer: when the inner handler
+//! fails with a non-Terminal error, the failure is routed to the DLQ instead
+//! of bubbling up. The inner handler is invoked **at most once per call** to
+//! [`FallibleHandler::on_message`] on this middleware; the subsequent
+//! `producer.send` to the failure topic is a Kafka producer call, **not**
+//! another inner-handler invocation. The per-invocation invariant — exactly
+//! one of `inner.after_commit` / `inner.after_abort` fires per inner
+//! invocation that ran and returned — is upheld: every arm of `after_commit`
+//! / `after_abort` forwards exactly one call to the inner.
+//!
+//! For timers, [`FallibleHandler::on_timer`] propagates every error through
+//! [`FailureTopicError::Handler`] without any producer call — symmetric with
+//! how the message path treats Terminal errors. Outer retry's standard policy
+//! (max-retries on `Transient`, immediate pass-through on `Permanent`) handles
+//! whatever classification the inner produced.
 //!
 //! The inner's [`FallibleHandler::after_commit`] /
 //! [`FallibleHandler::after_abort`] hook still has to fire — and the choice
-//! of hook is driven by whether the inner will see this same logical
-//! message/timer again:
+//! of hook is driven by whether the inner will see this same logical message
+//! again:
 //!
 //! - **Inner Ok**: forward `after_commit(Ok(inner_output))` /
 //!   `after_abort(Ok(inner_output))` per the outer's marker outcome.
@@ -56,12 +66,15 @@
 //!   not be re-dispatched. The inner's typed error is preserved in the
 //!   `Output::Routed(inner_err)` variant and forwarded as
 //!   `after_commit(Err(inner_err))`.
-//! - **Inner non-Terminal Err, DLQ send fails**: the produced error is
-//!   surfaced as [`FailureTopicError::DlqSendFailed`], which carries both the
-//!   producer error (used by the outer retry layer for classification) and
-//!   the original inner error. When the outer retry re-drives the stack,
-//!   this dispatch is *not* final from the inner's POV, so the inner sees
+//! - **Inner non-Terminal Err, DLQ send fails**: the produced error is surfaced
+//!   as [`FailureTopicError::DlqSendFailed`], which carries both the producer
+//!   error (used by the outer retry layer for classification) and the original
+//!   inner error. When the outer retry re-drives the stack, this dispatch is
+//!   *not* final from the inner's POV, so the inner sees
 //!   `after_abort(Err(inner_err))`.
+//! - **Timer Err (any category)**: propagated as [`FailureTopicError::Handler`]
+//!   with the inner's classification untouched; the apply hook forwards
+//!   `Err(inner_err)` to the inner.
 //!
 //! # Usage
 //!
@@ -83,9 +96,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -93,7 +107,7 @@
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let topic_config = FailureTopicConfiguration::builder().build().unwrap();
 //! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
-//! # let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
+//! # let producer: ProsodyProducer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
 //! # let telemetry = Telemetry::default();
 //! # let handler = MyHandler;
 //!
@@ -109,13 +123,13 @@
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::SecondsFormat;
 use derive_builder::Builder;
-use serde_json::json;
 use thiserror::Error;
 use tracing::{debug, error, info};
 use validator::{Validate, ValidationErrors};
 
+use crate::Codec;
 use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
@@ -126,7 +140,7 @@ use crate::consumer::middleware::{
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
 use crate::util::from_env;
-use crate::{Partition, Topic, Topic as TopicType};
+use crate::{EventIdentity, Partition, Topic, Topic as TopicType};
 
 /// Configuration for failure topic middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -156,13 +170,13 @@ impl FailureTopicConfiguration {
 
 /// Middleware that sends failed messages to a designated failure topic.
 #[derive(Clone, Debug)]
-pub struct FailureTopicMiddleware {
+pub struct FailureTopicMiddleware<Enc: Codec = crate::JsonCodec> {
     config: FailureTopicConfiguration,
-    producer: ProsodyProducer,
+    producer: ProsodyProducer<Enc>,
     group_id: String,
 }
 
-impl FailureTopicMiddleware {
+impl<Enc: Codec> FailureTopicMiddleware<Enc> {
     /// Creates a new [`FailureTopicMiddleware`] with the given configuration.
     ///
     /// # Arguments
@@ -187,7 +201,7 @@ impl FailureTopicMiddleware {
     pub fn new(
         config: FailureTopicConfiguration,
         group_id: String,
-        producer: ProsodyProducer,
+        producer: ProsodyProducer<Enc>,
     ) -> Result<Self, ValidationErrors> {
         config.validate()?;
         Ok(Self {
@@ -200,18 +214,18 @@ impl FailureTopicMiddleware {
 
 /// A provider that wraps handlers with failure topic functionality.
 #[derive(Clone, Debug)]
-pub struct FailureTopicProvider<T> {
+pub struct FailureTopicProvider<T, Enc: Codec> {
     provider: T,
     config: FailureTopicConfiguration,
-    producer: ProsodyProducer,
+    producer: ProsodyProducer<Enc>,
     group_id: String,
 }
 
 /// A handler wrapped with failure topic functionality.
 #[derive(Clone, Debug)]
-pub struct FailureTopicHandler<T> {
+pub struct FailureTopicHandler<T, Enc: Codec> {
     topic: Topic,
-    producer: ProsodyProducer,
+    producer: ProsodyProducer<Enc>,
     group_id: String,
     handler: T,
 }
@@ -229,19 +243,29 @@ pub struct FailureTopicHandler<T> {
 pub enum FailureTopicOutput<O, E> {
     /// Inner handler ran and returned `Ok(output)`.
     Inner(O),
-    /// Inner handler returned a non-Terminal `Err(_)`; the failure was
-    /// rescued by routing the message/timer to the failure topic, which the
-    /// producer accepted. The inner's typed error is preserved here so the
-    /// apply hook can fire `inner.after_commit(Err(_))`.
+    /// Inner handler returned a non-Terminal `Err(_)`; the DLQ producer
+    /// accepted the routed message, so the marker can commit. The inner's
+    /// typed error is preserved here so the apply hook can fire
+    /// `inner.after_commit(Err(_))`. Only used on the message path; timer
+    /// errors surface through [`FailureTopicError::Handler`] instead.
     Routed(E),
 }
 
-impl HandlerMiddleware for FailureTopicMiddleware {
-    type Provider<T: FallibleHandlerProvider> = FailureTopicProvider<T>;
+impl<Enc> HandlerMiddleware<Enc::Payload> for FailureTopicMiddleware<Enc>
+where
+    Enc: Codec,
+    Enc::Payload: EventIdentity,
+{
+    type Provider<T>
+        = FailureTopicProvider<T, Enc>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Enc::Payload>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Enc::Payload>,
     {
         FailureTopicProvider {
             provider,
@@ -252,11 +276,13 @@ impl HandlerMiddleware for FailureTopicMiddleware {
     }
 }
 
-impl<T> FallibleHandlerProvider for FailureTopicProvider<T>
+impl<T, Enc> FallibleHandlerProvider for FailureTopicProvider<T, Enc>
 where
     T: FallibleHandlerProvider,
+    Enc: Codec<Payload = <T::Handler as FallibleHandler>::Payload>,
+    Enc::Payload: EventIdentity,
 {
-    type Handler = FailureTopicHandler<T::Handler>;
+    type Handler = FailureTopicHandler<T::Handler, Enc>;
 
     fn handler_for_partition(&self, topic: TopicType, partition: Partition) -> Self::Handler {
         FailureTopicHandler {
@@ -268,11 +294,13 @@ where
     }
 }
 
-impl<T> FallibleHandler for FailureTopicHandler<T>
+impl<T, Enc> FallibleHandler for FailureTopicHandler<T, Enc>
 where
     T: FallibleHandler,
+    Enc: Codec<Payload = T::Payload>,
+    Enc::Payload: EventIdentity,
 {
-    type Error = FailureTopicError<T::Error>;
+    type Error = FailureTopicError<T::Error, Enc::Error>;
     /// Output for the DLQ middleware. The inner handler always ran when this
     /// type is produced (unlike middlewares that may short-circuit), so the
     /// variants encode whether the inner succeeded or whether its
@@ -281,12 +309,13 @@ where
     /// - [`FailureTopicOutput::Inner`] — the inner returned `Ok(_)`; carries
     ///   the inner's [`FallibleHandler::Output`] for downstream 2PC.
     /// - [`FailureTopicOutput::Routed`] — the inner returned a non-Terminal
-    ///   `Err(_)` and the DLQ producer accepted the routed message. The
-    ///   inner's typed error is **preserved** here so the apply hook can
-    ///   forward it to the inner as `Err(_)` per the
-    ///   [`FallibleHandler`] work-centric invariant. We must not collapse
-    ///   this to `()` — see the trait-level docs.
+    ///   `Err(_)` and the DLQ producer accepted the routed message. The inner's
+    ///   typed error is **preserved** here so the apply hook can forward it to
+    ///   the inner as `Err(_)` per the [`FallibleHandler`] work-centric
+    ///   invariant. We must not collapse this to `()` — see the trait-level
+    ///   docs.
     type Output = FailureTopicOutput<T::Output, T::Error>;
+    type Payload = T::Payload;
 
     /// Handles a message, attempting to process it with the wrapped handler.
     /// If processing fails with a non-Terminal error, sends the message to
@@ -301,17 +330,16 @@ where
     ///
     /// A `Result` whose variants are:
     /// - `Ok(FailureTopicOutput::Inner(output))` — inner ran and succeeded.
-    /// - `Ok(FailureTopicOutput::Routed(inner_err))` — inner ran and
-    ///   returned a non-Terminal error; DLQ producer accepted the routed
-    ///   message. The inner error is preserved for the apply hook.
+    /// - `Ok(FailureTopicOutput::Routed(inner_err))` — inner ran and returned a
+    ///   non-Terminal error; DLQ producer accepted the routed message. The
+    ///   inner error is preserved for the apply hook.
     /// - `Err(FailureTopicError::Handler(inner_err))` — inner returned a
     ///   Terminal error.
-    /// - `Err(FailureTopicError::DlqSendFailed { inner, producer })` —
-    ///   inner returned a non-Terminal error, but routing to the failure
-    ///   topic failed. Both the inner error and the producer error are
-    ///   preserved so the outer retry layer can classify on `producer` and
-    ///   the inner's apply hook can fire as `after_abort(Err(inner))` on
-    ///   re-dispatch.
+    /// - `Err(FailureTopicError::DlqSendFailed { inner, producer })` — inner
+    ///   returned a non-Terminal error, but routing to the failure topic
+    ///   failed. Both the inner error and the producer error are preserved so
+    ///   the outer retry layer can classify on `producer` and the inner's apply
+    ///   hook can fire as `after_abort(Err(inner))` on re-dispatch.
     ///
     /// # Errors
     ///
@@ -319,7 +347,7 @@ where
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -393,6 +421,10 @@ where
         }
     }
 
+    /// Timer failures are not routed to the failure topic. `Ok(o)` becomes
+    /// [`FailureTopicOutput::Inner`]; every error — Terminal, Permanent, or
+    /// Transient — propagates as [`FailureTopicError::Handler`] with its
+    /// original classification. Outer retry / telemetry decide what to do.
     async fn on_timer<C>(
         &self,
         context: C,
@@ -402,60 +434,9 @@ where
     where
         C: EventContext,
     {
-        // Attempt to process the timer with the wrapped handler
-        let error = match self
-            .handler
-            .on_timer(context, timer.clone(), demand_type)
-            .await
-        {
-            Ok(output) => return Ok(FailureTopicOutput::Inner(output)),
-            Err(error) => error,
-        };
-
-        // Terminal errors abort and propagate
-        if matches!(error.classify_error(), ErrorCategory::Terminal) {
-            info!(
-                key = %timer.key,
-                "terminal condition encountered while handling timer: {error:#}; aborting"
-            );
-            return Err(FailureTopicError::Handler(error));
-        }
-
-        // Extract the timer key as &str to avoid moving the Flexstr
-        let key_str = timer.key.as_ref();
-        // Log the error and prepare to send to failure topic
-        error!(
-            key = key_str,
-            "failed to process timer: {error:#}; sending to {}", self.topic
-        );
-
-        // Prepare headers for the failure timer message
-        let timestamp: DateTime<Utc> = timer.time.into();
-        let timestamp = timestamp.to_rfc3339_opts(SecondsFormat::Secs, true);
-
-        let headers = [
-            ("source-kind", "timer"),
-            ("source-timestamp", timestamp.as_str()),
-            ("source-group-id", &self.group_id),
-            ("source-error", &error.to_string()),
-        ];
-
-        // Build payload for replaying the timer
-        let payload = json!({ "key": key_str, "time": timestamp });
-
-        // Send the failed timer event to the failure topic. On failure,
-        // surface BOTH the inner handler error and the producer error so the
-        // inner's apply hook can fire on outer-retry re-dispatch.
-        match self
-            .producer
-            .send(headers, self.topic, key_str, &payload)
-            .await
-        {
-            Ok(()) => Ok(FailureTopicOutput::Routed(error)),
-            Err(producer) => Err(FailureTopicError::DlqSendFailed {
-                inner: error,
-                producer,
-            }),
+        match self.handler.on_timer(context, timer, demand_type).await {
+            Ok(output) => Ok(FailureTopicOutput::Inner(output)),
+            Err(error) => Err(FailureTopicError::Handler(error)),
         }
     }
 
@@ -465,15 +446,15 @@ where
     /// - `Ok(Inner(o))` → `inner.after_commit(Ok(o))`. Inner ran, succeeded;
     ///   dispatch is final.
     /// - `Ok(Routed(e))` → `inner.after_commit(Err(e))`. DLQ accepted, the
-    ///   marker committed, the inner will not see this logical
-    ///   message/timer again — fire its apply hook with its original error.
-    /// - `Err(Handler(e))` → `inner.after_commit(Err(e))`. Terminal error
-    ///   that the framework chose to commit (rather than abort); forward
-    ///   it to the inner.
+    ///   marker committed, the inner will not see this logical message/timer
+    ///   again — fire its apply hook with its original error.
+    /// - `Err(Handler(e))` → `inner.after_commit(Err(e))`. Terminal error that
+    ///   the framework chose to commit (rather than abort); forward it to the
+    ///   inner.
     /// - `Err(DlqSendFailed { inner, .. })` → `inner.after_commit(Err(inner))`.
-    ///   This branch only fires if the outer treats the producer error as
-    ///   final (no retry); the inner's typed error is still forwarded so
-    ///   2PC handlers further down can finalise correctly.
+    ///   This branch only fires if the outer treats the producer error as final
+    ///   (no retry); the inner's typed error is still forwarded so 2PC handlers
+    ///   further down can finalise correctly.
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -494,18 +475,17 @@ where
     /// Resolves the inner's apply hook on an **aborted** marker.
     ///
     /// Routing per the work-centric invariant:
-    /// - `Ok(Inner(o))` → `inner.after_abort(Ok(o))`. Inner succeeded but
-    ///   the outer aborted (e.g. shutdown intervened); forward Ok.
-    /// - `Ok(Routed(e))` → `inner.after_abort(Err(e))`. Rare path: the
-    ///   outer aborted despite the DLQ accepting the routed message;
-    ///   re-dispatch is coming, so the inner sees abort with its original
-    ///   error.
+    /// - `Ok(Inner(o))` → `inner.after_abort(Ok(o))`. Inner succeeded but the
+    ///   outer aborted (e.g. shutdown intervened); forward Ok.
+    /// - `Ok(Routed(e))` → `inner.after_abort(Err(e))`. Rare path: the outer
+    ///   aborted despite the DLQ accepting the routed message; re-dispatch is
+    ///   coming, so the inner sees abort with its original error.
     /// - `Err(Handler(e))` → `inner.after_abort(Err(e))`. Terminal error;
     ///   marker aborted.
     /// - `Err(DlqSendFailed { inner, .. })` → `inner.after_abort(Err(inner))`.
-    ///   The outer retry layer will re-drive the whole stack including
-    ///   the inner; the inner's apply hook fires as `after_abort` with its
-    ///   original error.
+    ///   The outer retry layer will re-drive the whole stack including the
+    ///   inner; the inner's apply hook fires as `after_abort` with its original
+    ///   error.
     async fn after_abort<C>(&self, context: C, result: Result<Self::Output, Self::Error>)
     where
         C: EventContext,
@@ -534,10 +514,11 @@ where
 
 /// Errors that can occur during failure topic handling.
 #[derive(Debug, Error)]
-pub enum FailureTopicError<E> {
-    /// Error from the wrapped handler that the middleware did not rescue
-    /// (e.g. a Terminal error). Carries the inner's typed error so the
-    /// apply hook can forward it.
+pub enum FailureTopicError<E, P> {
+    /// Error from the wrapped handler that the middleware did not rescue.
+    /// Used for any Terminal message error, every timer error, and any
+    /// non-Terminal message error that does not reach the DLQ branch.
+    /// Carries the inner's typed error so the apply hook can forward it.
     #[error(transparent)]
     Handler(E),
 
@@ -547,20 +528,20 @@ pub enum FailureTopicError<E> {
     /// Both errors are preserved so the framework can:
     /// - classify on `producer` (the immediate failure that the outer retry
     ///   layer should react to), and
-    /// - fire the inner's apply hook with `Err(inner)` when re-dispatch
-    ///   happens (`after_abort(Err(inner))`) or, in the unlikely case the
-    ///   outer commits despite this error, `after_commit(Err(inner))`.
+    /// - fire the inner's apply hook with `Err(inner)` when re-dispatch happens
+    ///   (`after_abort(Err(inner))`) or, in the unlikely case the outer commits
+    ///   despite this error, `after_commit(Err(inner))`.
     #[error("failure-topic send failed: {producer}")]
     DlqSendFailed {
         /// Inner handler's original (non-Terminal) error.
         inner: E,
         /// Producer error from the failure-topic send.
         #[source]
-        producer: ProducerError,
+        producer: ProducerError<P>,
     },
 }
 
-impl<E> ClassifyError for FailureTopicError<E>
+impl<E, P> ClassifyError for FailureTopicError<E, P>
 where
     E: ClassifyError,
 {
@@ -579,6 +560,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::JsonCodecError;
     use crate::consumer::middleware::test_support::MockEventContext;
     use crate::error::ErrorCategory;
     use crate::producer::ProducerConfiguration;
@@ -611,21 +593,21 @@ mod tests {
 
     #[test]
     fn handler_error_delegates_classification_transient() {
-        let error: FailureTopicError<TestError> =
+        let error: FailureTopicError<TestError, JsonCodecError> =
             FailureTopicError::Handler(TestError(ErrorCategory::Transient));
         assert!(matches!(error.classify_error(), ErrorCategory::Transient));
     }
 
     #[test]
     fn handler_error_delegates_classification_permanent() {
-        let error: FailureTopicError<TestError> =
+        let error: FailureTopicError<TestError, JsonCodecError> =
             FailureTopicError::Handler(TestError(ErrorCategory::Permanent));
         assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
     }
 
     #[test]
     fn handler_error_delegates_classification_terminal() {
-        let error: FailureTopicError<TestError> =
+        let error: FailureTopicError<TestError, JsonCodecError> =
             FailureTopicError::Handler(TestError(ErrorCategory::Terminal));
         assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
     }
@@ -637,12 +619,13 @@ mod tests {
         // handler error, so the outer retry layer reacts to the producer-level
         // failure.
         let kafka_error = KafkaError::MessageProduction(RDKafkaErrorCode::BrokerNotAvailable);
-        let error: FailureTopicError<TestError> = FailureTopicError::DlqSendFailed {
-            // Inner is Permanent, but we expect the classification to follow
-            // the producer error (Transient), not the inner.
-            inner: TestError(ErrorCategory::Permanent),
-            producer: ProducerError::Kafka(kafka_error),
-        };
+        let error: FailureTopicError<TestError, JsonCodecError> =
+            FailureTopicError::DlqSendFailed {
+                // Inner is Permanent, but we expect the classification to follow
+                // the producer error (Transient), not the inner.
+                inner: TestError(ErrorCategory::Permanent),
+                producer: ProducerError::Kafka(kafka_error),
+            };
         assert!(
             matches!(error.classify_error(), ErrorCategory::Transient),
             "DlqSendFailed should classify by the producer error, not the inner",
@@ -664,34 +647,45 @@ mod tests {
         Abort(Result<u64, TestError>),
     }
 
-    /// Probe inner handler that records every apply-hook call.
+    /// Probe inner handler that records every apply-hook call and returns a
+    /// configurable result from `on_timer` (defaults to `Ok(0)` for tests
+    /// that don't drive the timer dispatch path).
     #[derive(Clone)]
-    struct ProbeInner {
+    struct Probe {
         log: Arc<Mutex<Vec<InnerHookEvent>>>,
+        timer_result: Arc<Mutex<Result<u64, TestError>>>,
     }
 
-    impl ProbeInner {
+    impl Probe {
         fn new() -> Self {
             Self {
                 log: Arc::default(),
+                timer_result: Arc::new(Mutex::new(Ok(0))),
+            }
+        }
+
+        fn returning_timer(timer_result: Result<u64, TestError>) -> Self {
+            Self {
+                log: Arc::default(),
+                timer_result: Arc::new(Mutex::new(timer_result)),
             }
         }
     }
 
-    impl FallibleHandler for ProbeInner {
+    impl FallibleHandler for Probe {
         type Error = TestError;
         type Output = u64;
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext,
         {
-            // Apply-hook tests never invoke this path.
             Ok(0)
         }
 
@@ -704,7 +698,7 @@ mod tests {
         where
             C: EventContext,
         {
-            Ok(0)
+            self.timer_result.lock().clone()
         }
 
         async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
@@ -726,7 +720,9 @@ mod tests {
 
     /// Constructs a `FailureTopicHandler` over a probe inner using a mock
     /// producer (no real Kafka connection required).
-    fn make_handler(inner: ProbeInner) -> color_eyre::Result<FailureTopicHandler<ProbeInner>> {
+    fn make_handler(
+        inner: Probe,
+    ) -> color_eyre::Result<FailureTopicHandler<Probe, crate::JsonCodec>> {
         // The mock-flag short-circuits the bootstrap-server lookup, but the
         // builder still validates the field, so we supply a sentinel value
         // along with a non-empty source system.
@@ -745,7 +741,9 @@ mod tests {
         })
     }
 
-    fn dlq_send_failed_err(category: ErrorCategory) -> FailureTopicError<TestError> {
+    fn dlq_send_failed_err(
+        category: ErrorCategory,
+    ) -> FailureTopicError<TestError, JsonCodecError> {
         FailureTopicError::DlqSendFailed {
             inner: TestError(category),
             producer: ProducerError::Kafka(KafkaError::MessageProduction(
@@ -758,13 +756,16 @@ mod tests {
     async fn after_commit_routed_forwards_inner_err_to_inner() -> color_eyre::Result<()> {
         // DLQ accepted: marker commits, the inner will not be re-dispatched,
         // so the inner's apply hook MUST fire as `after_commit(Err(inner))`.
-        let inner = ProbeInner::new();
+        let inner = Probe::new();
         let log = inner.log.clone();
         let handler = make_handler(inner)?;
 
-        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> = Ok(
-            FailureTopicOutput::Routed(TestError(ErrorCategory::Permanent)),
-        );
+        let result: Result<
+            FailureTopicOutput<u64, TestError>,
+            FailureTopicError<TestError, JsonCodecError>,
+        > = Ok(FailureTopicOutput::Routed(TestError(
+            ErrorCategory::Permanent,
+        )));
         handler.after_commit(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
@@ -782,12 +783,14 @@ mod tests {
 
     #[tokio::test]
     async fn after_commit_inner_ok_forwards_inner_output() -> color_eyre::Result<()> {
-        let inner = ProbeInner::new();
+        let inner = Probe::new();
         let log = inner.log.clone();
         let handler = make_handler(inner)?;
 
-        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
-            Ok(FailureTopicOutput::Inner(42));
+        let result: Result<
+            FailureTopicOutput<u64, TestError>,
+            FailureTopicError<TestError, JsonCodecError>,
+        > = Ok(FailureTopicOutput::Inner(42));
         handler.after_commit(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
@@ -805,12 +808,14 @@ mod tests {
         // retry layer (and thus surface to the inner via `after_abort`),
         // when the framework decides the marker commits anyway, we still
         // owe the inner a typed `Err(inner)` here.
-        let inner = ProbeInner::new();
+        let inner = Probe::new();
         let log = inner.log.clone();
         let handler = make_handler(inner)?;
 
-        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
-            Err(dlq_send_failed_err(ErrorCategory::Transient));
+        let result: Result<
+            FailureTopicOutput<u64, TestError>,
+            FailureTopicError<TestError, JsonCodecError>,
+        > = Err(dlq_send_failed_err(ErrorCategory::Transient));
         handler.after_commit(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
@@ -831,12 +836,14 @@ mod tests {
         // Outer retry path: the producer error fired the outer retry, the
         // whole stack will be re-dispatched, so the inner sees
         // `after_abort(Err(inner))`.
-        let inner = ProbeInner::new();
+        let inner = Probe::new();
         let log = inner.log.clone();
         let handler = make_handler(inner)?;
 
-        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
-            Err(dlq_send_failed_err(ErrorCategory::Permanent));
+        let result: Result<
+            FailureTopicOutput<u64, TestError>,
+            FailureTopicError<TestError, JsonCodecError>,
+        > = Err(dlq_send_failed_err(ErrorCategory::Permanent));
         handler.after_abort(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
@@ -849,6 +856,59 @@ mod tests {
             "expected Abort(Err(Permanent)), got {:?}",
             events[0],
         );
+        Ok(())
+    }
+
+    // === on_timer dispatch tests ===
+    //
+    // The on_timer impl is a pure pass-through: `Ok` becomes `Inner`, `Err`
+    // becomes `Handler` regardless of category. One Err and one Ok test cover
+    // the full code path.
+
+    fn test_trigger() -> Trigger {
+        use crate::timers::TimerType;
+        use crate::timers::datetime::CompactDateTime;
+        Trigger::new(
+            Arc::from("key"),
+            CompactDateTime::from(0_u32),
+            TimerType::Application,
+            tracing::Span::current(),
+        )
+    }
+
+    #[tokio::test]
+    async fn on_timer_err_propagates_as_handler() -> color_eyre::Result<()> {
+        // Timer errors are not rescued; outer retry/telemetry see the inner's
+        // classification unchanged.
+        let inner = Probe::returning_timer(Err(TestError(ErrorCategory::Transient)));
+        let handler = make_handler(inner)?;
+
+        let result = handler
+            .on_timer(MockEventContext::new(), test_trigger(), DemandType::Normal)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FailureTopicError::Handler(TestError(
+                    ErrorCategory::Transient
+                ))),
+            ),
+            "expected Err(Handler(Transient)); got {result:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn on_timer_ok_returns_inner_output() -> color_eyre::Result<()> {
+        let inner = Probe::returning_timer(Ok(7));
+        let handler = make_handler(inner)?;
+
+        let result = handler
+            .on_timer(MockEventContext::new(), test_trigger(), DemandType::Normal)
+            .await;
+
+        assert!(matches!(result, Ok(FailureTopicOutput::Inner(7))));
         Ok(())
     }
 

@@ -21,14 +21,15 @@
 //! [`MessageDeferOutput`] encodes the routing:
 //!
 //! * `Inner` — inner ran; forward the framework's chosen hook.
-//! * `Deferred` — inner ran and returned a transient error that we captured
-//!   for retry. Both hooks route to `after_abort(Err(..))`: a retry is
-//!   coming even though the defer marker itself commits.
-//! * `NoInner` — inner did not run (queue-append, orphan-timer, loader
-//!   failure, key-mismatch); suppress both hooks.
+//! * `Deferred` — inner ran and returned a transient error that we captured for
+//!   retry. Both hooks route to `after_abort(Err(..))`: a retry is coming even
+//!   though the defer marker itself commits.
+//! * `NoInner` — inner did not run (queue-append, orphan-timer, loader failure,
+//!   key-mismatch); suppress both hooks.
 
 use super::loader::{KafkaLoader, MessageLoader};
 use super::store::{MessageDeferStore, MessageDeferStoreProvider, MessageRetryCompletionResult};
+use crate::JsonCodec;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::defer::calculate_backoff;
@@ -76,27 +77,27 @@ pub enum MessageDeferOutput<O, E> {
 ///
 /// # Type Parameters
 ///
-/// * `P` - Message defer store provider
+/// * `S` - Message defer store provider
 /// * `L` - Message loader (default: [`KafkaLoader`])
 /// * `D` - Deferral decider (default: [`FailureTracker`])
 #[derive(Clone)]
-pub struct MessageDeferMiddleware<P, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferMiddleware<S, L = KafkaLoader<JsonCodec>, D = FailureTracker>
 where
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     config: DeferConfiguration,
     loader: L,
-    provider: P,
+    provider: S,
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
 }
 
-impl<P, L> MessageDeferMiddleware<P, L, FailureTracker>
+impl<S, L> MessageDeferMiddleware<S, L, FailureTracker>
 where
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader,
 {
     /// Creates middleware with a caller-supplied loader and a
@@ -115,7 +116,7 @@ where
     pub fn new(
         config: DeferConfiguration,
         consumer_config: &ConsumerConfiguration,
-        provider: P,
+        provider: S,
         decider: FailureTracker,
         loader: L,
         telemetry: &Telemetry,
@@ -137,16 +138,16 @@ where
 
 /// Creates [`MessageDeferHandler`]s for each partition.
 #[derive(Clone)]
-pub struct MessageDeferProvider<T, P, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferProvider<T, S, L = KafkaLoader<JsonCodec>, D = FailureTracker>
 where
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     inner_provider: T,
     config: DeferConfiguration,
     loader: L,
-    store_provider: P,
+    store_provider: S,
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
@@ -154,7 +155,7 @@ where
 
 /// Per-partition handler wrapping an inner handler with defer logic.
 #[derive(Clone)]
-pub struct MessageDeferHandler<T, M, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferHandler<T, M, L = KafkaLoader<JsonCodec>, D = FailureTracker>
 where
     M: MessageDeferStore,
     L: MessageLoader,
@@ -171,17 +172,23 @@ where
     pub(crate) source: Arc<str>,
 }
 
-impl<P, L, D> HandlerMiddleware for MessageDeferMiddleware<P, L, D>
+impl<S, L, D> HandlerMiddleware<L::Payload> for MessageDeferMiddleware<S, L, D>
 where
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
+    L::Payload: crate::EventIdentity,
 {
-    type Provider<T: FallibleHandlerProvider> = MessageDeferProvider<T, P, L, D>;
+    type Provider<T>
+        = MessageDeferProvider<T, S, L, D>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = L::Payload>;
 
     fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = L::Payload>,
     {
         MessageDeferProvider {
             inner_provider,
@@ -195,15 +202,16 @@ where
     }
 }
 
-impl<T, P, L, D> FallibleHandlerProvider for MessageDeferProvider<T, P, L, D>
+impl<T, S, L, D> FallibleHandlerProvider for MessageDeferProvider<T, S, L, D>
 where
     T: FallibleHandlerProvider,
-    T::Handler: FallibleHandler,
-    P: MessageDeferStoreProvider,
+    T::Handler: FallibleHandler<Payload = L::Payload>,
+    S: MessageDeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
+    L::Payload: crate::EventIdentity,
 {
-    type Handler = MessageDeferHandler<T::Handler, P::Store, L, D>;
+    type Handler = MessageDeferHandler<T::Handler, S::Store, L, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let store = self.store_provider.create_store(
@@ -233,7 +241,7 @@ where
 
 impl<T, M, L, D> MessageDeferHandler<T, M, L, D>
 where
-    T: FallibleHandler,
+    T: FallibleHandler<Payload = L::Payload>,
     M: MessageDeferStore,
     L: MessageLoader + 'static,
     D: DeferralDecider,
@@ -459,7 +467,7 @@ where
         message_key: &Key,
         offset: Offset,
         retry_count: u32,
-    ) -> DeferResult<Option<ConsumerMessage>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<ConsumerMessage<T::Payload>>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -507,7 +515,7 @@ where
         offset: Offset,
         retry_count: u32,
         error: L::Error,
-    ) -> DeferResult<Option<ConsumerMessage>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<ConsumerMessage<T::Payload>>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -601,7 +609,7 @@ where
         message_key: &Key,
         offset: Offset,
         retry_count: u32,
-        message: ConsumerMessage,
+        message: ConsumerMessage<T::Payload>,
     ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
@@ -675,20 +683,22 @@ where
 
 impl<T, M, L, D> FallibleHandler for MessageDeferHandler<T, M, L, D>
 where
-    T: FallibleHandler,
+    T: FallibleHandler<Payload = L::Payload>,
     M: MessageDeferStore,
     L: MessageLoader + 'static,
     D: DeferralDecider,
+    L::Payload: crate::EventIdentity,
 {
     type Error = DeferError<M::Error, T::Error, L::Error>;
     /// Encodes the inner's outcome; drives apply-hook routing. See
     /// [`MessageDeferOutput`] and the module-level apply-hooks section.
     type Output = MessageDeferOutput<T::Output, T::Error>;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<T::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -829,9 +839,15 @@ where
         // Apply-hook routing (see module docs):
         // - Inner(o):    inner ran and succeeded           -> after_commit(Ok)
         // - NoInner:     no inner dispatch happened        -> suppress
-        // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e)) (retry coming)
+        // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e))
+        //   (retry coming)
         // - Handler(e):  inner ran and surfaced an error   -> after_commit(Err)
-        // - Store/Loader/...: defer-layer error, inner never ran -> suppress
+        // - Store/Timer/Loader: defer-layer rescue failed. Suppress the inner hook
+        //   regardless of whether the inner ran on this dispatch. These errors classify
+        //   as Transient (see `DeferError::classify_error`) so the outer retry layer
+        //   will redrive the whole stack; consistency lives in the failed Result, not
+        //   in the hook. Apply hooks are best-effort — see
+        //   `FallibleHandler::after_commit` docs.
         match result {
             Ok(MessageDeferOutput::Inner(output)) => {
                 self.handler.after_commit(context, Ok(output)).await;
@@ -850,8 +866,11 @@ where
     where
         C: EventContext,
     {
-        // Symmetric to after_commit. The only twist: Deferred(e) still routes
-        // to after_abort(Err(e)) regardless of the outer commit/abort decision.
+        // Symmetric to after_commit. Two notes:
+        //   - Deferred(e) still routes to after_abort(Err(e)) regardless of the outer
+        //     commit/abort decision (a retry is coming via the deferred timer).
+        //   - Store/Timer/Loader rescue-failure paths suppress the inner hook on
+        //     purpose; the outer retry redrives the stack. See after_commit.
         match result {
             Ok(MessageDeferOutput::Inner(output)) => {
                 self.handler.after_abort(context, Ok(output)).await;

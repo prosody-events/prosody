@@ -11,6 +11,7 @@ use crate::consumer::middleware::defer::decider::{DeferralDecider, FailureTracke
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::telemetry::Telemetry;
 use crate::{ConsumerGroup, Partition, Topic};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Middleware that defers transiently-failed timers for timer-based retry.
@@ -20,31 +21,33 @@ use std::sync::Arc;
 ///
 /// # Type Parameters
 ///
-/// * `P` - Timer defer store provider
+/// * `S` - Timer defer store provider
+/// * `P` - Handler payload type, fixed by the chain it is composed into
 /// * `D` - Deferral decider (default: [`FailureTracker`])
 #[derive(Clone)]
-pub struct TimerDeferMiddleware<P, D = FailureTracker>
+pub struct TimerDeferMiddleware<S, P, D = FailureTracker>
 where
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
     config: DeferConfiguration,
-    provider: P,
+    provider: S,
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
+    _payload: PhantomData<fn() -> P>,
 }
 
-impl<P, D> TimerDeferMiddleware<P, D>
+impl<S, P, D> TimerDeferMiddleware<S, P, D>
 where
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
     /// Creates middleware with configuration and store provider.
     #[must_use]
     pub fn new(
         config: DeferConfiguration,
-        provider: P,
+        provider: S,
         decider: D,
         consumer_config: &ConsumerConfiguration,
         telemetry: &Telemetry,
@@ -55,35 +58,42 @@ where
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
             telemetry: telemetry.clone(),
+            _payload: PhantomData,
         }
     }
 }
 
 /// Creates [`TimerDeferHandler`]s for each partition.
 #[derive(Clone)]
-pub struct TimerDeferProvider<T, P, D = FailureTracker>
+pub struct TimerDeferProvider<T, S, D = FailureTracker>
 where
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
     inner_provider: T,
     config: DeferConfiguration,
-    store_provider: P,
+    store_provider: S,
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
 }
 
-impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
+impl<S, P, D> HandlerMiddleware<P> for TimerDeferMiddleware<S, P, D>
 where
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
+    P: Send + Sync + 'static,
 {
-    type Provider<T: FallibleHandlerProvider> = TimerDeferProvider<T, P, D>;
+    type Provider<T>
+        = TimerDeferProvider<T, S, D>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         TimerDeferProvider {
             inner_provider,
@@ -96,14 +106,14 @@ where
     }
 }
 
-impl<T, P, D> FallibleHandlerProvider for TimerDeferProvider<T, P, D>
+impl<T, S, D> FallibleHandlerProvider for TimerDeferProvider<T, S, D>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
-    P: TimerDeferStoreProvider,
+    S: TimerDeferStoreProvider,
     D: DeferralDecider,
 {
-    type Handler = TimerDeferHandler<T::Handler, P::Store, D>;
+    type Handler = TimerDeferHandler<T::Handler, S::Store, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let store = self.store_provider.create_store(

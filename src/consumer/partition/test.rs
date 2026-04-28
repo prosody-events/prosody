@@ -14,6 +14,7 @@ use crossbeam_utils::CachePadded;
 use serde_json::json;
 use std::array::from_fn;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -28,7 +29,7 @@ trait HasProcessedOffsets {
 }
 
 /// Returns a default `PartitionConfiguration` with sensible defaults.
-fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider> {
+fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider, serde_json::Value> {
     PartitionConfiguration {
         group_id: Arc::from("test-group"),
         buffer_size: 10,
@@ -42,6 +43,7 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider> {
         timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(10)))),
         telemetry_sender: Telemetry::new().sender(),
         timer_spans: SpanRelation::default(),
+        _payload: PhantomData,
     }
 }
 
@@ -214,10 +216,12 @@ async fn test_partition_manager_is_stalled() {
     }
 
     impl EventHandler for StallTestHandler {
+        type Payload = serde_json::Value;
+
         fn on_message<C>(
             &self,
             _context: C,
-            message: UncommittedMessage,
+            message: UncommittedMessage<serde_json::Value>,
             _demand_type: DemandType,
         ) -> impl Future<Output = ()> + Send
         where
@@ -306,7 +310,6 @@ async fn test_partition_manager_event_type_filtering() {
             .build(["allowed"])
             .expect("Invalid event pattern"),
     );
-
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     let test_semaphore = Arc::new(Semaphore::new(10));
@@ -420,10 +423,12 @@ impl HasProcessedOffsets for TestHandler {
 }
 
 impl EventHandler for TestHandler {
+    type Payload = serde_json::Value;
+
     fn on_message<C>(
         &self,
         _context: C,
-        message: UncommittedMessage,
+        message: UncommittedMessage<serde_json::Value>,
         _demand_type: DemandType,
     ) -> impl Future<Output = ()> + Send
     where
@@ -470,7 +475,7 @@ impl EventHandler for TestHandler {
 }
 
 /// Helper functions to create test messages.
-fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage {
+fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage<serde_json::Value> {
     let semaphore = Arc::new(Semaphore::new(10));
     ConsumerMessage::new(
         ConsumerMessageValue {
@@ -489,7 +494,7 @@ fn create_test_message_with_event_id(
     offset: Offset,
     key: &str,
     event_id: Option<&str>,
-) -> ConsumerMessage {
+) -> ConsumerMessage<serde_json::Value> {
     let payload = event_id.map_or_else(
         || serde_json::json!({}),
         |id| serde_json::json!({ "id": id }),

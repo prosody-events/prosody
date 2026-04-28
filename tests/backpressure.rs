@@ -8,7 +8,7 @@ use crate::common::SlowTestHandler;
 use color_eyre::eyre::Result;
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     consumer::middleware::CloneProvider,
     consumer::{ConsumerConfiguration, ProsodyConsumer},
@@ -65,7 +65,7 @@ async fn test_backpressure() -> Result<()> {
         .build()?;
 
     let slow_handler = SlowTestHandler { messages_tx };
-    let consumer = ProsodyConsumer::new(
+    let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(slow_handler),
@@ -79,7 +79,7 @@ async fn test_backpressure() -> Result<()> {
         .source_system("test-producer")
         .build()?;
 
-    let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender())?;
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     // Produce a large number of messages
     let total = 1_000u32;

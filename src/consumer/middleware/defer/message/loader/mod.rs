@@ -43,6 +43,9 @@ pub use memory::{MemoryLoader, MemoryLoaderError};
 /// The loader is used by defer middleware to reload failed messages when their
 /// retry timer fires.
 pub trait MessageLoader: Send + Sync + Clone {
+    /// The payload type of messages returned by this loader.
+    type Payload: Send + Sync + 'static;
+
     /// Error type for load operations.
     ///
     /// Must implement [`ClassifyError`] so the defer middleware can determine
@@ -69,5 +72,5 @@ pub trait MessageLoader: Send + Sync + Clone {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> impl Future<Output = Result<ConsumerMessage, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send;
 }

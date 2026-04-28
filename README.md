@@ -65,12 +65,14 @@ use std::convert::Infallible;
 struct MyHandler;
 
 impl FallibleHandler for MyHandler {
+    type Payload = serde_json::Value;
     type Error = Infallible;
+    type Output = ();
 
     async fn on_message<C>(
         &self,
         _context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<serde_json::Value>,
         _demand_type: DemandType,
     ) -> Result<(), Self::Error>
     where
@@ -119,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ConsumerBuilders::default()
     };
 
-    let client = HighLevelClient::new(
+    let client: HighLevelClient<MyHandler> = HighLevelClient::new(
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,

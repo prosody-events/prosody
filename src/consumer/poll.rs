@@ -23,20 +23,20 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
+use crate::Codec;
+use crate::EventType;
 use crate::Topic;
 use crate::consumer::decode::decode_message;
 use crate::consumer::kafka_context::Context;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
-use crate::consumer::{HandlerProvider, Managers, WatermarkVersion};
+use crate::consumer::{EventHandler, HandlerProvider, Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
 use crate::otel::SpanRelation;
 use crate::propagator::new_propagator;
 use crate::related_span;
 
 use crate::timers::store::TriggerStoreProvider;
-#[cfg(not(target_arch = "arm"))]
-use simd_json::Buffers;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Configuration for the Kafka message polling process.
@@ -49,10 +49,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 ///
 /// * `T` - A type implementing [`HandlerProvider`] that creates message
 ///   handlers for assigned partitions.
-pub struct PollConfig<'a, T, P>
+/// * `P` - A type implementing [`TriggerStoreProvider`] for timer storage.
+/// * `C` - A type implementing [`Codec`] for deserializing message payloads.
+pub struct PollConfig<'a, T, P, C>
 where
     T: HandlerProvider,
+    T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
+    C: Codec,
+    C::Payload: Clone + EventType,
 {
     /// Time between consecutive poll operations
     pub poll_interval: Duration,
@@ -61,13 +66,16 @@ where
     pub max_message_count: usize,
 
     /// The configured Kafka consumer with context
-    pub consumer: BaseConsumer<Context<T, P>>,
+    pub consumer: BaseConsumer<Context<T, P, C::Payload>>,
+
+    /// Codec for deserializing message payloads
+    pub codec: C,
 
     /// Reference to counter tracking watermark version changes
     pub watermark_version: &'a WatermarkVersion,
 
     /// Reference to the collection of partition managers
-    pub managers: &'a Managers,
+    pub managers: &'a Managers<C::Payload>,
 
     /// Reference to heartbeat for tracking liveness
     pub heartbeat: &'a Heartbeat,
@@ -95,20 +103,20 @@ where
 /// # Arguments
 ///
 /// * `config` - The configuration for the polling process
-pub fn poll<T, P>(config: PollConfig<T, P>)
+pub fn poll<T, P, C>(config: PollConfig<T, P, C>)
 where
     T: HandlerProvider,
+    T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
+    C: Codec,
+    C::Payload: Clone + EventType,
 {
-    // Create buffers for SIMD JSON parsing if on supported platforms
-    #[cfg(not(target_arch = "arm"))]
-    let mut buffers = Buffers::default();
-
     // Destructure configuration for cleaner access
     let PollConfig {
         poll_interval,
         max_message_count,
         consumer,
+        mut codec,
         watermark_version,
         managers,
         heartbeat,
@@ -148,7 +156,7 @@ where
         };
 
         // Handle poll errors
-        let message = match result {
+        let mut message = match result {
             Ok(msg) => msg,
             Err(error) => {
                 error!("error polling for message: {error:#}");
@@ -162,18 +170,13 @@ where
             continue;
         };
 
-        let topic = message.topic();
+        let topic = message.topic().to_owned();
         let partition = message.partition();
         let offset = message.offset();
         debug!(topic, partition, offset, "received message");
 
         // Decode message through extraction, validation, and filtering
-        let maybe_decoded = decode_message(
-            &message,
-            &propagator,
-            #[cfg(not(target_arch = "arm"))]
-            &mut buffers,
-        );
+        let maybe_decoded = decode_message(&mut message, &propagator, &mut codec);
 
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {
@@ -210,7 +213,11 @@ where
 /// * `message` - The message to dispatch
 /// * `poll_interval` - Duration to wait between retry attempts
 /// * `managers` - Reference to the collection of partition managers
-fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, managers: &Managers) {
+fn dispatch_with_retry<P: Send + Sync + 'static>(
+    message: ConsumerMessage<P>,
+    poll_interval: Duration,
+    managers: &Managers<P>,
+) {
     let mut current_message = message;
     loop {
         match dispatch_message(current_message, managers) {
@@ -241,14 +248,16 @@ fn dispatch_with_retry(message: ConsumerMessage, poll_interval: Duration, manage
 /// * `watermark_version` - Counter tracking changes to committed offsets
 /// * `managers` - Collection of partition managers that track committed offsets
 /// * `last_version` - The last processed watermark version
-fn store_watermarks<T, P>(
-    consumer: &BaseConsumer<Context<T, P>>,
+fn store_watermarks<T, P, PL>(
+    consumer: &BaseConsumer<Context<T, P, PL>>,
     watermark_version: &WatermarkVersion,
-    managers: &Managers,
+    managers: &Managers<PL>,
     last_version: &mut usize,
 ) where
     T: HandlerProvider,
+    T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
+    PL: Clone + Send + Sync + 'static + EventType,
 {
     // Skip if no watermark updates have occurred
     let current_version = watermark_version.load(Ordering::Acquire);
@@ -323,15 +332,17 @@ fn store_watermarks<T, P>(
 /// # Errors
 ///
 /// Returns any error from the underlying Kafka pause/resume operations.
-fn pause_busy_partitions<T, P>(
+fn pause_busy_partitions<T, P, PL>(
     is_paused: &mut bool,
     maybe_permit: Option<&OwnedSemaphorePermit>,
-    consumer: &BaseConsumer<Context<T, P>>,
-    managers: &Managers,
+    consumer: &BaseConsumer<Context<T, P, PL>>,
+    managers: &Managers<PL>,
 ) -> Result<(), KafkaError>
 where
     T: HandlerProvider,
+    T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
+    PL: Clone + Send + Sync + 'static + EventType,
 {
     let managers = managers.read();
     let has_global_capacity = maybe_permit.is_some();
@@ -392,7 +403,10 @@ where
 ///
 /// - `DispatchError::PartitionNotFound` - The target partition is not assigned
 /// - `DispatchError::Busy` - The partition's message queue is full
-fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(), DispatchError> {
+fn dispatch_message<P: Send + Sync + 'static>(
+    message: ConsumerMessage<P>,
+    managers: &Managers<P>,
+) -> Result<(), DispatchError<P>> {
     debug!(
         topic = message.topic().as_ref(),
         partition = message.partition(),
@@ -417,12 +431,12 @@ fn dispatch_message(message: ConsumerMessage, managers: &Managers) -> Result<(),
 
 /// Errors that can occur during message dispatch.
 #[derive(Debug, Error)]
-enum DispatchError {
+enum DispatchError<P: Send + Sync + 'static> {
     /// The target partition is not assigned to this consumer
     #[error("message sent to unassigned partition")]
-    PartitionNotFound(ConsumerMessage),
+    PartitionNotFound(ConsumerMessage<P>),
 
     /// The partition manager's buffer is full
     #[error("partition is busy")]
-    Busy(ConsumerMessage),
+    Busy(ConsumerMessage<P>),
 }

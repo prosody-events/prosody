@@ -6,10 +6,10 @@
 //!
 //! These providers do not wrap an inner `FallibleHandler`; they vend a handler
 //! instance per partition. `InfallibleWrapper`'s `on_message`/`on_timer` are
-//! stubs that perform no inner dispatch (zero invocations), so the trait-default
-//! no-op apply hooks correctly satisfy the per-invocation invariant. Where an
-//! inner exists in this module, it is invoked at most once per call;
-//! per-invocation invariant trivially upheld.
+//! stubs that perform no inner dispatch (zero invocations), so the
+//! trait-default no-op apply hooks correctly satisfy the per-invocation
+//! invariant. Where an inner exists in this module, it is invoked at most once
+//! per call; per-invocation invariant trivially upheld.
 //!
 //! # Available Providers
 //!
@@ -170,14 +170,16 @@ impl<T> InfallibleWrapper<T> {
 impl<T> FallibleHandler for InfallibleWrapper<T>
 where
     T: EventHandler + Send + Sync + 'static,
+    T::Payload: crate::EventIdentity,
 {
     type Error = Infallible;
     type Output = ();
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage,
+        _message: ConsumerMessage<Self::Payload>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

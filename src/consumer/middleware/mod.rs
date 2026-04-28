@@ -67,9 +67,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -104,9 +105,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -114,7 +116,7 @@
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let topic_config = FailureTopicConfiguration::builder().failure_topic("dlq").build().unwrap();
 //! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
-//! # let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
+//! # let producer: ProsodyProducer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
 //! # let telemetry = Telemetry::default();
 //! # let my_business_handler = MyHandler;
 //!
@@ -152,6 +154,7 @@ use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Error as IoError;
+use std::marker::PhantomData;
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
@@ -204,10 +207,42 @@ pub trait FallibleHandlerProvider: Send + Sync + 'static {
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler;
 }
 
-/// Defines middleware for message processing.
-pub trait HandlerMiddleware {
+/// Defines middleware for message processing over a payload type `P`.
+///
+/// Payload-agnostic middleware (retry, log, cancellation, etc.) implement
+/// `HandlerMiddleware<P>` for all `P`. Payload-aware middleware (defer,
+/// failure topic, deduplication) implement it only for their bound payload
+/// type.
+///
+/// # Anchoring `P`
+///
+/// Because payload-agnostic middleware implements `HandlerMiddleware<P>` for
+/// every `P`, a bare `.layer()` chain has no way to pick `P` on its own. The
+/// chain compiles without turbofish in any of these contexts:
+///
+/// 1. The chain ends in `.into_provider(handler)` — `P` flows from `H:
+///    FallibleHandler<Payload = P>`.
+/// 2. The chain is bound to an `-> impl HandlerMiddleware<P>` return type that
+///    pins `P` for the caller.
+/// 3. An explicit type ascription on the let binding pins
+///    `ComposedMiddleware<…, P>`.
+///
+/// A bare-chain construction with no anchor needs UFCS or a let-binding with
+/// an explicit type — usually a sign that you should terminate the chain with
+/// `.into_provider(handler)` instead.
+pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// The provider type that wraps another fallible handler provider.
-    type Provider<T: FallibleHandlerProvider>: FallibleHandlerProvider;
+    ///
+    /// The `where` clause constrains `T` so that only providers whose handler
+    /// payload matches `P` can be wrapped. The associated-type bound
+    /// `Handler: FallibleHandler<Payload = P>` propagates the payload through
+    /// the chain so callers can layer middleware over an
+    /// `impl HandlerMiddleware<P>` opaque return without losing the payload
+    /// identity.
+    type Provider<T>: FallibleHandlerProvider<Handler: FallibleHandler<Payload = P>>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     /// Wraps a handler provider with this middleware.
     ///
@@ -221,7 +256,8 @@ pub trait HandlerMiddleware {
     /// A new provider that implements `FallibleHandlerProvider`.
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: FallibleHandlerProvider;
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     /// Transforms this middleware stack into a provider by consuming the stack
     /// and terminating it with a fallible handler wrapped in a
@@ -253,21 +289,21 @@ pub trait HandlerMiddleware {
     /// # #[derive(Clone)]
     /// # struct MyHandler;
     /// # impl FallibleHandler for MyHandler {
+    /// #     type Payload = serde_json::Value;
     /// #     type Error = Infallible;
     /// #     type Output = ();
-    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
     /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
     /// #     async fn shutdown(self) {}
     /// # }
     /// # let config = RetryConfiguration::builder().build().unwrap();
     /// # let my_handler = MyHandler;
-    /// let middleware = RetryMiddleware::new(config).unwrap();
-    /// let provider = middleware.into_provider(my_handler);
+    /// let provider = RetryMiddleware::new(config).unwrap().into_provider(my_handler);
     /// ```
     fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
     where
         Self: Sized,
-        H: FallibleHandler + Clone + Send + Sync + 'static,
+        H: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
     {
         self.with_provider(FallibleCloneProvider::new(handler))
     }
@@ -310,23 +346,41 @@ pub trait HandlerMiddleware {
     /// # use prosody::consumer::middleware::*;
     /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
     /// # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
+    /// # use prosody::consumer::DemandType;
+    /// # use prosody::consumer::event_context::EventContext;
+    /// # use prosody::consumer::message::ConsumerMessage;
+    /// # use prosody::timers::Trigger;
+    /// # use std::convert::Infallible;
+    /// # #[derive(Clone)]
+    /// # struct MyHandler;
+    /// # impl FallibleHandler for MyHandler {
+    /// #     type Payload = serde_json::Value;
+    /// #     type Error = Infallible;
+    /// #     type Output = ();
+    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn shutdown(self) {}
+    /// # }
     /// # let retry_config = RetryConfiguration::builder().build().unwrap();
     /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
     /// # let middle_middleware = CancellationMiddleware;
     /// # let outer_middleware = CancellationMiddleware;
+    /// # let my_handler = MyHandler;
     /// // Builds from inner to outer: inner -> middle -> outer
-    /// let middleware = inner_middleware
-    ///     .layer(middle_middleware) // middle wraps inner
-    ///     .layer(outer_middleware); // outer wraps middle+inner
+    /// let provider = inner_middleware
+    ///     .layer(middle_middleware)
+    ///     .layer(outer_middleware)
+    ///     .into_provider(my_handler);
     ///
     /// // Request:  outer → middle → inner → handler
     /// // Response: handler → inner → middle → outer
     /// ```
-    fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self>
+    fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self, P>
     where
         Self: Sized,
+        T: HandlerMiddleware<P>,
     {
-        ComposedMiddleware(outer_middleware, self)
+        ComposedMiddleware(outer_middleware, self, PhantomData)
     }
 }
 
@@ -337,24 +391,24 @@ pub trait HandlerMiddleware {
 /// pipeline. You provide:
 ///
 /// - An [`Error`](Self::Error) type whose variants are classified by
-///   [`ClassifyError`] (drives the framework's retry vs. give-up vs.
-///   shutdown decisions — see [Error classification](#error-classification)).
-/// - [`on_message`](Self::on_message) — called for each Kafka message
-///   delivered to the consumer.
-/// - [`on_timer`](Self::on_timer) — called for each scheduled timer that
-///   fires (when the consumer is configured with a timer system).
+///   [`ClassifyError`] (drives the framework's retry vs. give-up vs. shutdown
+///   decisions — see [Error classification](#error-classification)).
+/// - [`on_message`](Self::on_message) — called for each Kafka message delivered
+///   to the consumer.
+/// - [`on_timer`](Self::on_timer) — called for each scheduled timer that fires
+///   (when the consumer is configured with a timer system).
 /// - [`shutdown`](Self::shutdown) — called when the consumer stops or a
 ///   partition is revoked.
 ///
 /// Two optional pieces extend the basic shape for handlers that stage
 /// external work during processing:
 ///
-/// - [`Output`](Self::Output) — a typed value the handler returns on
-///   success (defaults to `()`); carried into the apply hook.
+/// - [`Output`](Self::Output) — a typed value the handler returns on success
+///   (defaults to `()`); carried into the apply hook.
 /// - [`after_commit`](Self::after_commit) and
 ///   [`after_abort`](Self::after_abort) — apply hooks that fire after the
-///   framework decides whether the just-completed invocation will be
-///   retried, enabling 2-phase-commit workflows.
+///   framework decides whether the just-completed invocation will be retried,
+///   enabling 2-phase-commit workflows.
 ///
 /// The consumer pipeline is itself a stack of `FallibleHandler` impls
 /// (retry, deduplication, defer, telemetry, your handler at the bottom),
@@ -370,19 +424,19 @@ pub trait HandlerMiddleware {
 /// [`ClassifyError::classify_error`] into one of three categories that
 /// determine how the consumer pipeline reacts:
 ///
-/// - [`Transient`](ErrorCategory::Transient) — **retry**. A temporary
-///   problem (network blip, store timeout, downstream service
-///   unavailable) that may succeed later. The retry middleware
-///   reattempts; if configured, the defer middleware can move the
-///   message to a timer-based retry to unblock the partition.
-/// - [`Permanent`](ErrorCategory::Permanent) — **give up on this
-///   message**. The data itself is bad (deserialization failure, schema
-///   violation, business rule rejection) and retrying won't help. The
-///   message is committed, and may be routed to a dead-letter topic if
-///   the failure-topic middleware is configured.
-/// - [`Terminal`](ErrorCategory::Terminal) — **shut the consumer down**.
-///   The process can't safely continue (corrupted local state, an
-///   invariant violation) and a new instance must take over.
+/// - [`Transient`](ErrorCategory::Transient) — **retry**. A temporary problem
+///   (network blip, store timeout, downstream service unavailable) that may
+///   succeed later. The retry middleware reattempts; if configured, the defer
+///   middleware can move the message to a timer-based retry to unblock the
+///   partition.
+/// - [`Permanent`](ErrorCategory::Permanent) — **give up on this message**. The
+///   data itself is bad (deserialization failure, schema violation, business
+///   rule rejection) and retrying won't help. The message is committed, and may
+///   be routed to a dead-letter topic if the failure-topic middleware is
+///   configured.
+/// - [`Terminal`](ErrorCategory::Terminal) — **shut the consumer down**. The
+///   process can't safely continue (corrupted local state, an invariant
+///   violation) and a new instance must take over.
 ///
 /// The classification is the contract between your handler and the
 /// framework: pick the right category and the middleware stack handles
@@ -398,13 +452,12 @@ pub trait HandlerMiddleware {
 /// Every `on_message` / `on_timer` invocation that runs and returns is
 /// paired with one apply hook on the same handler instance:
 ///
-/// - [`after_commit`](Self::after_commit) — the invocation is **final**.
-///   The same logical message/timer will not be dispatched to this
-///   handler again.
-/// - [`after_abort`](Self::after_abort) — the invocation is **not
-///   final**. The same logical message/timer **will** be dispatched again
-///   (in-process retry, deferred retry via a timer, or a re-poll after
-///   the durability marker aborted).
+/// - [`after_commit`](Self::after_commit) — the invocation is **final**. The
+///   same logical message/timer will not be dispatched to this handler again.
+/// - [`after_abort`](Self::after_abort) — the invocation is **not final**. The
+///   same logical message/timer **will** be dispatched again (in-process retry,
+///   deferred retry via a timer, or a re-poll after the durability marker
+///   aborted).
 ///
 /// Hook firing is best-effort: a process crash, unavailable bookkeeping
 /// storage, or a middleware above the handler that cannot determine the
@@ -438,36 +491,33 @@ pub trait HandlerMiddleware {
 /// stack. It covers what a `FallibleHandler` middleware (a wrapper around
 /// an inner handler) must do.
 ///
-/// 1. **Forward the handler methods.** Call `self.inner.on_message(...)`
-///    and `self.inner.on_timer(...)` (await them), then decide whether to
+/// 1. **Forward the handler methods.** Call `self.inner.on_message(...)` and
+///    `self.inner.on_timer(...)` (await them), then decide whether to
 ///    short-circuit, transform the result, or pass it through. Cascade
-///    `shutdown` by awaiting `self.inner.shutdown()` so inner resources
-///    are released.
+///    `shutdown` by awaiting `self.inner.shutdown()` so inner resources are
+///    released.
 ///
-/// 2. **Wrap the inner's error.** Define an enum like
-///    `enum MyError<E> { Inner(E), MyOwn(...) }`. Implement
-///    [`ClassifyError`] for it by delegating `Inner` to the wrapped
-///    error's classification and classifying your own variants
-///    explicitly — see [Error classification](#error-classification) for
-///    the categories.
+/// 2. **Wrap the inner's error.** Define an enum like `enum MyError<E> {
+///    Inner(E), MyOwn(...) }`. Implement [`ClassifyError`] for it by delegating
+///    `Inner` to the wrapped error's classification and classifying your own
+///    variants explicitly — see [Error classification](#error-classification)
+///    for the categories.
 ///
-/// 3. **Thread `Output`.** Use `type Output = Inner::Output` if you don't
-///    add staging of your own, or `type Output = (Inner::Output,
-///    MyHandle)` if you do. Short-circuiting middleware that may skip the
-///    inner (deduplication, filtering) typically encodes the skip in the
-///    Output type — `type Output = Option<Inner::Output>`, with `None`
-///    meaning the inner did not run. **Never collapse to `()`** in
-///    middleware: that discards the inner's value and breaks 2PC handlers
-///    downstream.
+/// 3. **Thread `Output`.** Use `type Output = Inner::Output` if you don't add
+///    staging of your own, or `type Output = (Inner::Output, MyHandle)` if you
+///    do. Short-circuiting middleware that may skip the inner (deduplication,
+///    filtering) typically encodes the skip in the Output type — `type Output =
+///    Option<Inner::Output>`, with `None` meaning the inner did not run.
+///    **Never collapse to `()`** in middleware: that discards the inner's value
+///    and breaks 2PC handlers downstream.
 ///
-/// 4. **Route apply hooks.** Fire exactly one apply hook on the inner
-///    per inner invocation that ran, chosen by the per-invocation work
-///    outcome (see [Apply hooks](#apply-hooks-optional)). Pass the
-///    inner's typed `Result` through unchanged — never coerce errors to
-///    `Ok` or drop them, since that silently breaks 2PC handlers below.
-///    An in-process retry loop that runs N attempts must fire N hooks:
-///    the first N-1 are `after_abort` and the last matches the terminal
-///    outcome. Hooks are never coalesced.
+/// 4. **Route apply hooks.** Fire exactly one apply hook on the inner per inner
+///    invocation that ran, chosen by the per-invocation work outcome (see
+///    [Apply hooks](#apply-hooks-optional)). Pass the inner's typed `Result`
+///    through unchanged — never coerce errors to `Ok` or drop them, since that
+///    silently breaks 2PC handlers below. An in-process retry loop that runs N
+///    attempts must fire N hooks: the first N-1 are `after_abort` and the last
+///    matches the terminal outcome. Hooks are never coalesced.
 ///
 ///    On a skip path (the inner did not run), suppress both apply hooks
 ///    on the inner — there's no invocation to pair them with.
@@ -485,6 +535,16 @@ pub trait HandlerMiddleware {
 /// [`Uncommitted::abort`]: crate::consumer::Uncommitted::abort
 /// [`retry`]: crate::consumer::middleware::retry
 pub trait FallibleHandler: Send + Sync + 'static {
+    /// The payload type this handler processes.
+    ///
+    /// Must match the codec's `Payload` type so the consumer pipeline can
+    /// deliver typed messages. Set to `serde_json::Value` for JSON consumers.
+    ///
+    /// Payload-specific middleware (e.g. deduplication) adds `EventIdentity`
+    /// locally via a where clause on its impl, rather than requiring all
+    /// payloads to satisfy `EventIdentity`.
+    type Payload: Send + Sync + 'static;
+
     /// Error type returned by [`Self::on_message`] / [`Self::on_timer`].
     ///
     /// Must implement [`ClassifyError`] so the framework can decide
@@ -526,7 +586,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
@@ -680,8 +740,14 @@ pub trait FallibleHandler: Send + Sync + 'static {
 }
 
 /// A composition of two middleware components.
+///
+/// The `P` payload parameter is carried as a phantom so that, once the chain is
+/// anchored to a specific payload type at the first `.layer()` call, the type
+/// stays fixed through subsequent chain operations — eliminating the
+/// `HandlerMiddleware<_>` inference ambiguity that would otherwise arise from
+/// payload-agnostic middleware impls.
 #[derive(Clone, Debug)]
-pub struct ComposedMiddleware<M1, M2>(M1, M2);
+pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 
 /// Provides default `EventHandler` implementation for types that implement
 /// `FallibleHandler`.
@@ -695,13 +761,12 @@ pub struct ComposedMiddleware<M1, M2>(M1, M2);
 ///
 /// 1. Extract inner message/timer and the uncommitted offset/timer.
 /// 2. Invoke the `FallibleHandler` method **once**.
-/// 3. On `Ok`, `Permanent`, or `Transient`: commit the marker — this
-///    invocation is final from the consumer's POV — and call
-///    `after_commit` with the typed result.
-/// 4. On `Terminal`: abort the marker — the message/timer will be
-///    redelivered on the next poll, producing a **new** invocation that
-///    will get its own apply hook — and call `after_abort` with the
-///    typed error.
+/// 3. On `Ok`, `Permanent`, or `Transient`: commit the marker — this invocation
+///    is final from the consumer's POV — and call `after_commit` with the typed
+///    result.
+/// 4. On `Terminal`: abort the marker — the message/timer will be redelivered
+///    on the next poll, producing a **new** invocation that will get its own
+///    apply hook — and call `after_abort` with the typed error.
 ///
 /// Because there is exactly one inner invocation per call into this impl,
 /// the per-invocation invariant is satisfied trivially: one invocation
@@ -731,16 +796,22 @@ pub trait FallibleEventHandler: FallibleHandler {
     fn on_timer_error(&self, _error: &Self::Error) {}
 }
 
-impl<M1, M2> HandlerMiddleware for ComposedMiddleware<M1, M2>
+impl<P, M1, M2> HandlerMiddleware<P> for ComposedMiddleware<M1, M2, P>
 where
-    M1: HandlerMiddleware,
-    M2: HandlerMiddleware,
+    P: Send + Sync + 'static,
+    M1: HandlerMiddleware<P>,
+    M2: HandlerMiddleware<P>,
 {
-    type Provider<T: FallibleHandlerProvider> = M1::Provider<M2::Provider<T>>;
+    type Provider<T>
+        = M1::Provider<M2::Provider<T>>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         // Apply the first middleware to the result of applying the second middleware
         // This matches Tower's pattern where M1 (outer) wraps M2 (inner)
@@ -753,8 +824,14 @@ where
     T: FallibleEventHandler,
     T::Error: ClassifyError,
 {
-    async fn on_message<C>(&self, context: C, message: UncommittedMessage, demand_type: DemandType)
-    where
+    type Payload = T::Payload;
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) where
         C: EventContext,
     {
         let (inner_message, uncommitted_offset) = message.into_inner();
@@ -974,11 +1051,12 @@ mod after_hook_tests {
     impl FallibleHandler for ProbeHandler {
         type Error = TestError;
         type Output = u64;
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
@@ -1023,7 +1101,7 @@ mod after_hook_tests {
         OffsetTracker::new("test-topic".into(), 0, 10, Duration::from_secs(5), version)
     }
 
-    fn make_test_message() -> Option<ConsumerMessage> {
+    fn make_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
         use crate::consumer::message::ConsumerMessageValue;
         use std::sync::Arc;
         use tokio::sync::Semaphore;
@@ -1284,11 +1362,12 @@ mod after_hook_tests {
     {
         type Error = T::Error;
         type Output = T::Output;
+        type Payload = T::Payload;
 
         async fn on_message<C>(
             &self,
             context: C,
-            message: ConsumerMessage,
+            message: ConsumerMessage<Self::Payload>,
             demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where

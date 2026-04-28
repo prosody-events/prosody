@@ -10,12 +10,11 @@
 //! **Work Path:**
 //! 1. Race the inner handler's per-event work against the configured timeout.
 //! 2. If the timeout fires first, signal cancellation via `context.cancel()`
-//!    and continue awaiting the inner future. The inner handler is always
-//!    given a chance to observe the signal and return `Ok` or `Err`, so the
-//!    outcome that flows into the apply hook always reflects the inner's
-//!    actual return.
-//! 3. Reset the cancellation flag on the way out so a retry of the same
-//!    logical event starts with a clean context.
+//!    and continue awaiting the inner future. The inner handler is always given
+//!    a chance to observe the signal and return `Ok` or `Err`, so the outcome
+//!    that flows into the apply hook always reflects the inner's actual return.
+//! 3. Reset the cancellation flag on the way out so a retry of the same logical
+//!    event starts with a clean context.
 //!
 //! # Apply-hook invariant
 //!
@@ -196,12 +195,17 @@ impl TimeoutMiddleware {
     }
 }
 
-impl HandlerMiddleware for TimeoutMiddleware {
-    type Provider<T: FallibleHandlerProvider> = TimeoutProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware<P> for TimeoutMiddleware {
+    type Provider<T>
+        = TimeoutProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         TimeoutProvider {
             provider,
@@ -230,11 +234,12 @@ where
 {
     type Error = T::Error;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -383,11 +388,12 @@ mod tests {
     impl FallibleHandler for MockHandler {
         type Error = TestError;
         type Output = ();
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
@@ -433,7 +439,7 @@ mod tests {
         async fn shutdown(self) {}
     }
 
-    fn create_test_message() -> Option<ConsumerMessage> {
+    fn create_test_message() -> Option<ConsumerMessage<serde_json::Value>> {
         let semaphore = Arc::new(Semaphore::new(10));
         let permit = semaphore.try_acquire_owned().ok()?;
         Some(ConsumerMessage::new(

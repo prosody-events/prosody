@@ -6,11 +6,11 @@
 
 use crate::consumer::DemandType;
 use crate::error::ErrorCategory;
-use crate::telemetry::Telemetry;
 use crate::telemetry::event::{
     Data, MessageEventType, MessageSentEvent, MessageTelemetryEvent, TimerEventType,
     TimerTelemetryEvent,
 };
+use crate::telemetry::{TELEMETRY_CHANNEL_CAPACITY, Telemetry};
 use crate::timers::TimerType;
 use crate::util::from_env_with_fallback;
 use bytes::Bytes;
@@ -31,11 +31,7 @@ use tracing::warn;
 use validator::Validate;
 use whoami::hostname;
 
-#[cfg(target_arch = "arm")]
-use serde_json as json;
-
-#[cfg(not(target_arch = "arm"))]
-use simd_json as json;
+use crate::codec::serialize_to_json;
 
 /// Environment variable for the telemetry Kafka topic.
 const PROSODY_TELEMETRY_TOPIC: &str = "PROSODY_TELEMETRY_TOPIC";
@@ -47,7 +43,7 @@ const PROSODY_TELEMETRY_ENABLED: &str = "PROSODY_TELEMETRY_ENABLED";
 const DEFAULT_TELEMETRY_TOPIC: &str = "prosody.telemetry-events";
 
 /// Number of produce futures to keep in flight concurrently.
-const PRODUCE_CONCURRENCY: usize = 256;
+const PRODUCE_CONCURRENCY: usize = TELEMETRY_CHANNEL_CAPACITY;
 
 /// Configuration for the telemetry Kafka emitter.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -218,7 +214,7 @@ fn serialize_timer(
         trace_state: data.trace_state.as_deref(),
     };
 
-    json::to_writer(buf as &mut Vec<u8>, &payload).is_ok()
+    serialize_to_json(&payload, buf)
 }
 
 fn serialize_message(
@@ -265,7 +261,7 @@ fn serialize_message(
         trace_state: data.trace_state.as_deref(),
     };
 
-    json::to_writer(buf as &mut Vec<u8>, &payload).is_ok()
+    serialize_to_json(&payload, buf)
 }
 
 fn serialize_message_sent(buf: &mut Vec<u8>, data: &MessageSentEvent, hostname: &str) -> bool {
@@ -284,7 +280,7 @@ fn serialize_message_sent(buf: &mut Vec<u8>, data: &MessageSentEvent, hostname: 
         trace_state: data.trace_state.as_deref(),
     };
 
-    json::to_writer(buf as &mut Vec<u8>, &payload).is_ok()
+    serialize_to_json(&payload, buf)
 }
 
 /// Serializes a `Data` variant into a thread-local buffer and returns

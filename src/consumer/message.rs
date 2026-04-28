@@ -22,10 +22,7 @@ use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
 use crate::timers::PendingTimer;
 use crate::timers::store::TriggerStore;
-use crate::{
-    BorrowedEventId, EventId, EventIdentity, Key, Offset, Partition, Payload, ProcessScope,
-    SourceSystem, Topic,
-};
+use crate::{EventIdentity, Key, Offset, Partition, ProcessScope, SourceSystem, Topic};
 
 /// A unified event that must be explicitly committed or aborted.
 ///
@@ -36,20 +33,21 @@ use crate::{
 /// # Type Parameters
 ///
 /// * `T` – The `TriggerStore` implementation for the timer variant.
+/// * `P` – The payload type carried by the message variant.
 #[derive(Educe)]
 #[educe(Debug(bound = ""))]
-pub enum UncommittedEvent<T>
+pub enum UncommittedEvent<T, P>
 where
     T: TriggerStore,
 {
     /// A message event requiring offset commit or abort.
-    Message(UncommittedMessage),
+    Message(UncommittedMessage<P>),
 
     /// A timer event requiring commit or abort.
     Timer(PendingTimer<T>),
 }
 
-impl<T> Keyed for UncommittedEvent<T>
+impl<T, P> Keyed for UncommittedEvent<T, P>
 where
     T: TriggerStore,
 {
@@ -63,16 +61,16 @@ where
     }
 }
 
-impl<T> From<UncommittedMessage> for UncommittedEvent<T>
+impl<T, P> From<UncommittedMessage<P>> for UncommittedEvent<T, P>
 where
     T: TriggerStore,
 {
-    fn from(value: UncommittedMessage) -> Self {
+    fn from(value: UncommittedMessage<P>) -> Self {
         Self::Message(value)
     }
 }
 
-impl<T> From<PendingTimer<T>> for UncommittedEvent<T>
+impl<T, P> From<PendingTimer<T>> for UncommittedEvent<T, P>
 where
     T: TriggerStore,
 {
@@ -85,15 +83,15 @@ where
 ///
 /// Wraps a `ConsumerMessage` and its corresponding `UncommittedOffset` handler.
 #[derive(Educe)]
-#[educe(Debug)]
-pub struct UncommittedMessage {
-    inner: ConsumerMessage,
+#[educe(Debug(bound = ""))]
+pub struct UncommittedMessage<P> {
+    inner: ConsumerMessage<P>,
 
     #[educe(Debug(ignore))]
     uncommitted_offset: UncommittedOffset,
 }
 
-impl UncommittedMessage {
+impl<P> UncommittedMessage<P> {
     /// Returns the optional source system identifier from message headers.
     ///
     /// # Returns
@@ -128,9 +126,9 @@ impl UncommittedMessage {
         self.inner.timestamp()
     }
 
-    /// Returns a reference to the deserialized JSON payload.
+    /// Returns a reference to the deserialized payload.
     #[must_use]
-    pub fn payload(&self) -> &Payload {
+    pub fn payload(&self) -> &P {
         self.inner.payload()
     }
 
@@ -147,9 +145,9 @@ impl UncommittedMessage {
     ///
     /// # Returns
     ///
-    /// A tuple `(ConsumerMessage, UncommittedOffset)`.
+    /// A tuple `(ConsumerMessage<P>, UncommittedOffset)`.
     #[must_use]
-    pub fn into_inner(self) -> (ConsumerMessage, UncommittedOffset) {
+    pub fn into_inner(self) -> (ConsumerMessage<P>, UncommittedOffset) {
         (self.inner, self.uncommitted_offset)
     }
 
@@ -158,7 +156,7 @@ impl UncommittedMessage {
     }
 }
 
-impl Uncommitted for UncommittedMessage {
+impl<P: Send + Sync + 'static> Uncommitted for UncommittedMessage<P> {
     /// Commit the message offset to Kafka and log the action.
     async fn commit(self) {
         debug!(
@@ -184,7 +182,7 @@ impl Uncommitted for UncommittedMessage {
     }
 }
 
-impl Keyed for UncommittedMessage {
+impl<P> Keyed for UncommittedMessage<P> {
     type Key = Key;
 
     fn key(&self) -> &Self::Key {
@@ -192,11 +190,8 @@ impl Keyed for UncommittedMessage {
     }
 }
 
-impl EventIdentity for UncommittedMessage {
-    type BorrowedEventId = BorrowedEventId;
-    type EventId = EventId;
-
-    fn event_id(&self) -> Option<&Self::BorrowedEventId> {
+impl<P: EventIdentity> EventIdentity for UncommittedMessage<P> {
+    fn event_id(&self) -> Option<&str> {
         self.payload().event_id()
     }
 }
@@ -213,7 +208,7 @@ impl Drop for MessageProcessGuard {
     }
 }
 
-impl ProcessScope for UncommittedMessage {
+impl<P: Send + 'static> ProcessScope for UncommittedMessage<P> {
     type Guard = MessageProcessGuard;
 
     fn process_scope(&self) -> Self::Guard {
@@ -223,11 +218,12 @@ impl ProcessScope for UncommittedMessage {
 
 /// A lightweight, clonable Kafka message without offset tracking.
 ///
-/// Internally wraps its data in an `Arc<ConsumerMessageValue>` with shared
+/// Internally wraps its data in an `Arc<ConsumerMessageValue<P>>` with shared
 /// processing state across clones.
-#[derive(Clone, Debug)]
-pub struct ConsumerMessage {
-    value: Arc<ConsumerMessageValue>,
+#[derive(Educe)]
+#[educe(Clone, Debug(bound = ""))]
+pub struct ConsumerMessage<P> {
+    value: Arc<ConsumerMessageValue<P>>,
     processing_state: Arc<ArcSwapOption<ProcessingState>>,
 }
 
@@ -246,8 +242,8 @@ struct ProcessingState {
 ///
 /// Owned by `ConsumerMessage` and shared via `Arc`.
 #[derive(Educe)]
-#[educe(Debug)]
-pub struct ConsumerMessageValue {
+#[educe(Debug(bound = ""))]
+pub struct ConsumerMessageValue<P> {
     /// Optional header indicating the source system that produced the message.
     pub source_system: Option<SourceSystem>,
 
@@ -266,13 +262,13 @@ pub struct ConsumerMessageValue {
     /// Broker timestamp when the message was produced.
     pub timestamp: DateTime<Utc>,
 
-    /// JSON payload of the message.
+    /// Deserialized message payload.
     #[educe(Debug(ignore))]
-    pub payload: Payload,
+    pub payload: P,
 }
 
 #[cfg(test)]
-impl Default for ConsumerMessageValue {
+impl Default for ConsumerMessageValue<serde_json::Value> {
     fn default() -> Self {
         Self {
             source_system: None,
@@ -286,7 +282,7 @@ impl Default for ConsumerMessageValue {
     }
 }
 
-impl ConsumerMessage {
+impl<P> ConsumerMessage<P> {
     /// Create a new `ConsumerMessage` from a message value and processing state
     /// components.
     ///
@@ -297,7 +293,7 @@ impl ConsumerMessage {
     /// * `span` – Tracing span for distributed context.
     /// * `permit` – Semaphore permit for backpressure management.
     #[must_use]
-    pub fn new(value: ConsumerMessageValue, span: Span, permit: OwnedSemaphorePermit) -> Self {
+    pub fn new(value: ConsumerMessageValue<P>, span: Span, permit: OwnedSemaphorePermit) -> Self {
         let value = Arc::new(value);
         let processing_state = ArcSwapOption::from_pointee(ProcessingState { span, permit }).into();
 
@@ -319,7 +315,7 @@ impl ConsumerMessage {
     /// * `permit` - Semaphore permit for backpressure management
     #[must_use]
     pub fn from_decoded(
-        value: Arc<ConsumerMessageValue>,
+        value: Arc<ConsumerMessageValue<P>>,
         span: Span,
         permit: OwnedSemaphorePermit,
     ) -> Self {
@@ -361,9 +357,9 @@ impl ConsumerMessage {
         &self.value.timestamp
     }
 
-    /// Returns the JSON payload.
+    /// Returns the deserialized payload.
     #[must_use]
-    pub fn payload(&self) -> &Payload {
+    pub fn payload(&self) -> &P {
         &self.value.payload
     }
 
@@ -384,7 +380,7 @@ impl ConsumerMessage {
     ///
     /// * `uncommitted_offset` – The offset guard to manage commit/abort.
     #[must_use]
-    pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage {
+    pub fn into_uncommitted(self, uncommitted_offset: UncommittedOffset) -> UncommittedMessage<P> {
         UncommittedMessage {
             inner: self,
             uncommitted_offset,
@@ -402,7 +398,7 @@ impl ConsumerMessage {
     /// * `partition` - Partition index
     /// * `offset` - Message offset
     /// * `key` - Message key
-    /// * `payload` - JSON payload
+    /// * `payload` - Message payload
     ///
     /// # Errors
     ///
@@ -415,7 +411,7 @@ impl ConsumerMessage {
         partition: Partition,
         offset: Offset,
         key: Key,
-        payload: Payload,
+        payload: P,
     ) -> color_eyre::Result<Self> {
         use color_eyre::eyre::eyre;
         use tokio::sync::Semaphore;
@@ -441,7 +437,7 @@ impl ConsumerMessage {
     }
 }
 
-impl Keyed for ConsumerMessage {
+impl<P> Keyed for ConsumerMessage<P> {
     type Key = Key;
 
     fn key(&self) -> &Self::Key {

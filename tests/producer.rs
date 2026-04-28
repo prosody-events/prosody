@@ -14,8 +14,10 @@ use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::timers::UncommittedTimer;
 use prosody::tracing::init_test_logging;
-use prosody::{Payload, Topic};
+use prosody::{JsonCodec, Topic};
 use serde_json::{Value, json};
+
+type Payload = Value;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::timeout;
@@ -30,7 +32,9 @@ struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
-    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage, _demand_type: DemandType)
+    type Payload = Value;
+
+    async fn on_message<C>(&self, _ctx: C, msg: UncommittedMessage<Value>, _demand_type: DemandType)
     where
         C: EventContext,
     {
@@ -78,7 +82,7 @@ async fn expect_message(
 
 /// Tests that messages with duplicate IDs but the same key are deduplicated.
 async fn case_duplicate_id_same_key(
-    producer: &ProsodyProducer,
+    producer: &ProsodyProducer<JsonCodec>,
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
@@ -109,7 +113,7 @@ async fn case_duplicate_id_same_key(
 /// Tests that messages with the same ID but different keys are not
 /// deduplicated.
 async fn case_same_id_different_keys(
-    producer: &ProsodyProducer,
+    producer: &ProsodyProducer<JsonCodec>,
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
@@ -141,7 +145,7 @@ async fn case_same_id_different_keys(
 
 /// Tests that messages with different IDs but the same key are all delivered.
 async fn case_distinct_ids_same_key(
-    producer: &ProsodyProducer,
+    producer: &ProsodyProducer<JsonCodec>,
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
@@ -174,7 +178,7 @@ async fn case_distinct_ids_same_key(
 /// Sending id=X, no-id, id=X delivers only the first two; the third is
 /// deduplicated because the hash of (topic, key, X) is still in the cache.
 async fn case_reset_after_none(
-    producer: &ProsodyProducer,
+    producer: &ProsodyProducer<JsonCodec>,
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
@@ -210,7 +214,7 @@ async fn case_reset_after_none(
 /// message, because the hash-based cache remembers all seen (topic, key, id)
 /// triples — not just the most recent.
 async fn case_return_to_original_id(
-    producer: &ProsodyProducer,
+    producer: &ProsodyProducer<JsonCodec>,
     topic: &Topic,
     rx: &mut Receiver<(String, Value)>,
     receive_timeout: Duration,
@@ -266,7 +270,7 @@ async fn test_producer_deduplication() -> Result<()> {
         )
         .await?;
 
-    let producer = ProsodyProducer::new(
+    let producer = ProsodyProducer::<JsonCodec>::new(
         &ProducerConfiguration::builder()
             .bootstrap_servers(brokers.clone())
             .source_system("test-producer")
@@ -285,7 +289,7 @@ async fn test_producer_deduplication() -> Result<()> {
             .probe_port(None)
             .build()?;
         let (tx, rx) = channel(16);
-        let consumer = ProsodyConsumer::new(
+        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &cfg,
             &common::create_cassandra_trigger_store_config(),
             CloneProvider::new(TestHandler { tx }),

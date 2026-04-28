@@ -11,7 +11,6 @@ use crate::{Key, Offset, Partition, Topic};
 use ahash::HashMap;
 use chrono::Utc;
 use parking_lot::RwLock;
-use serde_json::Value;
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
@@ -19,7 +18,7 @@ use tokio::sync::Semaphore;
 use tracing::Span;
 
 /// Type alias for the message storage map.
-type MessageStorage = HashMap<(Topic, Partition, Offset), Arc<ConsumerMessageValue>>;
+type MessageStorage<P> = HashMap<(Topic, Partition, Offset), Arc<ConsumerMessageValue<P>>>;
 
 /// In-memory message loader for testing.
 ///
@@ -39,12 +38,12 @@ type MessageStorage = HashMap<(Topic, Partition, Offset), Arc<ConsumerMessageVal
 /// assert_eq!(message.offset(), 100);
 /// ```
 #[derive(Clone)]
-pub struct MemoryLoader {
-    messages: Arc<RwLock<MessageStorage>>,
+pub struct MemoryLoader<P> {
+    messages: Arc<RwLock<MessageStorage<P>>>,
     semaphore: Arc<Semaphore>,
 }
 
-impl MemoryLoader {
+impl<P: Send + Sync + 'static> MemoryLoader<P> {
     /// Creates a new in-memory loader with empty storage.
     #[must_use]
     pub fn new() -> Self {
@@ -66,14 +65,14 @@ impl MemoryLoader {
     /// * `partition` - The partition of the message
     /// * `offset` - The offset of the message
     /// * `key` - The message key
-    /// * `payload` - The message payload as JSON
+    /// * `payload` - The message payload
     pub fn store_message(
         &self,
         topic: Topic,
         partition: Partition,
         offset: Offset,
         key: Key,
-        payload: Value,
+        payload: P,
     ) {
         let message_value = Arc::new(ConsumerMessageValue {
             source_system: None,
@@ -121,7 +120,7 @@ impl MemoryLoader {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> Result<ConsumerMessage, MemoryLoaderError> {
+    ) -> Result<ConsumerMessage<P>, MemoryLoaderError> {
         // Acquire a dummy permit to construct ConsumerMessage
         let permit = self
             .semaphore
@@ -148,21 +147,22 @@ impl MemoryLoader {
     }
 }
 
-impl Default for MemoryLoader {
+impl<P: Send + Sync + 'static> Default for MemoryLoader<P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MessageLoader for MemoryLoader {
+impl<P: Clone + Send + Sync + 'static> MessageLoader for MemoryLoader<P> {
     type Error = MemoryLoaderError;
+    type Payload = P;
 
     fn load_message(
         &self,
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> impl Future<Output = Result<ConsumerMessage, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send {
         self.load_message_impl(topic, partition, offset)
     }
 }
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_not_found() {
-        let loader = MemoryLoader::new();
+        let loader: MemoryLoader<serde_json::Value> = MemoryLoader::new();
         let topic = Topic::from("test-topic");
 
         let result = loader.load_message(topic, 0, 100).await;

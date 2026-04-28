@@ -54,9 +54,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -86,8 +87,16 @@ use crate::timers::Trigger;
 use crate::{Partition, Topic};
 
 /// Middleware that logs failures during message processing.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct LogMiddleware;
+
+impl LogMiddleware {
+    /// Creates a new `LogMiddleware`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 /// A provider that logs failures during message processing.
 #[derive(Clone, Debug)]
@@ -104,12 +113,17 @@ pub struct LogHandler<T> {
     handler: T,
 }
 
-impl HandlerMiddleware for LogMiddleware {
-    type Provider<T: FallibleHandlerProvider> = LogProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware<P> for LogMiddleware {
+    type Provider<T>
+        = LogProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         LogProvider { provider }
     }
@@ -147,11 +161,12 @@ where
 {
     type Error = T::Error;
     type Output = T::Output;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

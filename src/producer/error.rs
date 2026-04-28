@@ -17,22 +17,16 @@ use std::time::SystemTimeError;
 use thiserror::Error;
 use validator::ValidationErrors;
 
-#[cfg(target_arch = "arm")]
-use serde_json as json;
-
-#[cfg(not(target_arch = "arm"))]
-use simd_json as json;
-
 /// Errors that can occur during producer operations.
 #[derive(Debug, Error)]
-pub enum ProducerError {
+pub enum ProducerError<E> {
     /// Indicates invalid producer configuration.
     #[error("invalid producer configuration: {0:#}")]
     Configuration(#[from] ValidationErrors),
 
     /// Indicates a failure to serialize the payload.
-    #[error("failed to serialize payload: {0:#}")]
-    Serialization(#[from] json::Error),
+    #[error("failed to serialize payload: {0}")]
+    Serialization(E),
 
     /// Indicates a failure to set the message timestamp.
     #[error("failed to set timestamp: {0:#}")]
@@ -47,7 +41,7 @@ pub enum ProducerError {
     Kafka(#[from] KafkaError),
 }
 
-impl ClassifyError for ProducerError {
+impl<E> ClassifyError for ProducerError<E> {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             // Configuration validation failed or failed to retrieve hostname. Programming

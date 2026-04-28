@@ -19,7 +19,7 @@ use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::tracing::init_test_logging;
 use prosody::{
-    Topic,
+    JsonCodec, Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
 };
 use serde_json::json;
@@ -72,7 +72,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     let handler = FallibleTestHandler { messages_tx };
 
     let telemetry = Telemetry::new();
-    let producer = ProsodyProducer::new(&producer_config, telemetry.sender())?;
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, telemetry.sender())?;
 
     let pipeline_config = PipelineMiddlewareConfiguration {
         retry: RetryConfigurationBuilder::default().build()?,
@@ -86,7 +86,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         timeout: TimeoutConfigurationBuilder::default().build()?,
     };
 
-    let consumer = ProsodyConsumer::pipeline_consumer(
+    let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         pipeline_config,

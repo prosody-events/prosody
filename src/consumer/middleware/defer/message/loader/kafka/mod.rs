@@ -51,7 +51,7 @@ use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::propagator::new_propagator;
-use crate::{Offset, Partition, Topic};
+use crate::{JsonCodec, Offset, Partition, Topic};
 use ahash::HashMap;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use quick_cache::sync::Cache;
@@ -74,11 +74,9 @@ use tokio::task::spawn_blocking;
 use tracing::field::Empty;
 use tracing::{Span, debug, error, instrument, warn};
 
+use crate::Codec;
 use crate::otel::SpanRelation;
 use crate::related_span;
-
-#[cfg(not(target_arch = "arm"))]
-use simd_json::Buffers;
 use tokio::select;
 use whoami::hostname;
 
@@ -91,7 +89,7 @@ mod tests;
 /// When multiple callers request the same offset, only one permit is needed for
 /// decoding. Subsequent callers' permits are dropped, but they still acquire
 /// permits initially to maintain backpressure semantics.
-type Responses = SmallVec<[oneshot::Sender<Result<DecodedMessage, KafkaLoaderError>>; 1]>;
+type Responses<P> = SmallVec<[oneshot::Sender<Result<DecodedMessage<P>, KafkaLoaderError>>; 1]>;
 
 /// Per-partition state for the loader poll loop.
 ///
@@ -104,10 +102,18 @@ type Responses = SmallVec<[oneshot::Sender<Result<DecodedMessage, KafkaLoaderErr
 /// `None` once the seek has materialised. A new seek is issued (replacing the
 /// stored value) whenever `min_offset < pending_seek`, which handles the case
 /// where a lower-offset request arrives after the seek was already dispatched.
-#[derive(Default)]
-struct PartitionState {
-    offsets: BTreeMap<Offset, Responses>,
+struct PartitionState<P> {
+    offsets: BTreeMap<Offset, Responses<P>>,
     pending_seek: Option<Offset>,
+}
+
+impl<P> Default for PartitionState<P> {
+    fn default() -> Self {
+        Self {
+            offsets: BTreeMap::default(),
+            pending_seek: None,
+        }
+    }
 }
 
 /// Active load requests indexed by topic-partition.
@@ -116,7 +122,7 @@ struct PartitionState {
 /// [`BTreeMap`] inside [`PartitionState`]) to efficiently find the minimum
 /// offset for seek optimization. `pending_seek` is managed per-partition so
 /// a message on one partition does not clear the flag for another.
-type ActiveRequests = HashMap<(Topic, Partition), PartitionState>;
+type ActiveRequests<P> = HashMap<(Topic, Partition), PartitionState<P>>;
 
 /// Configuration for the Kafka message loader.
 ///
@@ -171,6 +177,11 @@ pub struct LoaderConfiguration {
     pub message_spans: SpanRelation,
 }
 
+/// Cache mapping `(topic, partition, offset)` to a decoded message — keyed
+/// strongly enough to avoid collisions across partitions in a multiplexed
+/// loader.
+type LoadedCache<P> = Arc<Cache<(Topic, Partition, Offset), DecodedMessage<P>>>;
+
 /// Kafka message loader for retrieving messages by exact offset.
 ///
 /// Uses a dedicated Kafka consumer with manual partition assignment to load
@@ -178,28 +189,48 @@ pub struct LoaderConfiguration {
 /// coordination. A background polling thread fulfills load requests and
 /// semaphore-based permits provide backpressure. Messages are cached to avoid
 /// redundant Kafka reads.
-#[derive(Clone)]
-pub struct KafkaLoader {
-    tx: mpsc::Sender<Request>,
+pub struct KafkaLoader<C: Codec = JsonCodec> {
+    tx: mpsc::Sender<Request<C::Payload>>,
     semaphore: Arc<Semaphore>,
-    cache: Arc<Cache<(Topic, Partition, Offset), DecodedMessage>>,
+    cache: LoadedCache<C::Payload>,
     message_spans: SpanRelation,
 }
 
-impl MessageLoader for KafkaLoader {
+impl<C: Codec> Clone for KafkaLoader<C>
+where
+    C::Payload: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            semaphore: self.semaphore.clone(),
+            cache: self.cache.clone(),
+            message_spans: self.message_spans,
+        }
+    }
+}
+
+impl<C: Codec> MessageLoader for KafkaLoader<C>
+where
+    C::Payload: Clone,
+{
     type Error = KafkaLoaderError;
+    type Payload = C::Payload;
 
     fn load_message(
         &self,
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> impl Future<Output = Result<ConsumerMessage, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<ConsumerMessage<C::Payload>, Self::Error>> + Send {
         self.load_message_impl(topic, partition, offset)
     }
 }
 
-impl KafkaLoader {
+impl<C: Codec> KafkaLoader<C>
+where
+    C::Payload: Clone,
+{
     /// Creates a new Kafka message loader.
     ///
     /// Creates a dedicated `BaseConsumer` for loading messages and spawns
@@ -258,7 +289,7 @@ impl KafkaLoader {
 
         let message_spans = config.message_spans;
         let heartbeat = heartbeats.register("kafka loader");
-        spawn_blocking(move || poll_loop(rx, &consumer, &config, &heartbeat));
+        spawn_blocking(move || poll_loop::<C>(rx, &consumer, &config, &heartbeat));
 
         Ok(Self {
             tx,
@@ -323,7 +354,7 @@ impl KafkaLoader {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> Result<ConsumerMessage, KafkaLoaderError> {
+    ) -> Result<ConsumerMessage<C::Payload>, KafkaLoaderError> {
         let instrument_span = Span::current();
 
         debug!(
@@ -391,7 +422,7 @@ impl KafkaLoader {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> Result<DecodedMessage, KafkaLoaderError> {
+    ) -> Result<DecodedMessage<C::Payload>, KafkaLoaderError> {
         debug!(
             topic = %topic,
             partition = partition,
@@ -439,11 +470,11 @@ impl KafkaLoader {
 }
 
 /// A load request for a specific message offset.
-struct Request {
+struct Request<P> {
     topic: Topic,
     partition: Partition,
     offset: Offset,
-    tx: oneshot::Sender<Result<DecodedMessage, KafkaLoaderError>>,
+    tx: oneshot::Sender<Result<DecodedMessage<P>, KafkaLoaderError>>,
 }
 
 /// Background polling loop that fulfills load requests.
@@ -451,17 +482,17 @@ struct Request {
 /// Runs on a blocking thread to avoid blocking the async runtime. Drains all
 /// pending requests, seeks to optimize reads, polls Kafka, and fulfills
 /// requests via lazy validation.
-fn poll_loop(
-    mut rx: mpsc::Receiver<Request>,
+fn poll_loop<C: Codec>(
+    mut rx: mpsc::Receiver<Request<C::Payload>>,
     consumer: &BaseConsumer,
     config: &LoaderConfiguration,
     heartbeat: &Heartbeat,
-) {
-    let mut active: ActiveRequests = HashMap::default();
+) where
+    C::Payload: Clone,
+{
+    let mut active: ActiveRequests<C::Payload> = HashMap::default();
     let propagator = new_propagator();
-
-    #[cfg(not(target_arch = "arm"))]
-    let mut buffers = Buffers::default();
+    let mut codec = C::default();
 
     debug!("Deferred message loader poll loop started");
 
@@ -528,14 +559,7 @@ fn poll_loop(
             continue;
         };
 
-        process_poll_result(
-            result,
-            &propagator,
-            #[cfg(not(target_arch = "arm"))]
-            &mut buffers,
-            &mut active,
-            consumer,
-        );
+        process_poll_result::<C>(result, &propagator, &mut codec, &mut active, consumer);
     }
 }
 
@@ -545,14 +569,16 @@ fn poll_loop(
 /// offsets against the received offset. Decodes the message using the first
 /// response's permit and sends the result to all waiting channels. Unassigns
 /// the partition if all requests are fulfilled.
-fn process_poll_result(
+fn process_poll_result<C: Codec>(
     result: Result<BorrowedMessage, KafkaError>,
     propagator: &TextMapCompositePropagator,
-    #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
-    active: &mut ActiveRequests,
+    codec: &mut C,
+    active: &mut ActiveRequests<C::Payload>,
     consumer: &BaseConsumer,
-) {
-    let message = match result {
+) where
+    C::Payload: Clone,
+{
+    let mut message = match result {
         Ok(message) => message,
         Err(error) => {
             error!(error = %format_args!("{error:#}"), "Error polling for deferred message");
@@ -611,12 +637,11 @@ fn process_poll_result(
         return;
     };
 
-    fulfill_requests(
+    fulfill_requests::<C>(
         senders,
-        &message,
+        &mut message,
         propagator,
-        #[cfg(not(target_arch = "arm"))]
-        buffers,
+        codec,
         msg_topic,
         msg_partition,
         msg_offset,
@@ -626,8 +651,8 @@ fn process_poll_result(
 }
 
 /// Notifies senders about deleted offsets and logs warnings.
-fn notify_deleted_offsets(
-    deleted_offsets: BTreeMap<Offset, Responses>,
+fn notify_deleted_offsets<P>(
+    deleted_offsets: BTreeMap<Offset, Responses<P>>,
     topic: Topic,
     partition: Partition,
     next_offset: Offset,
@@ -654,25 +679,22 @@ fn notify_deleted_offsets(
 }
 
 /// Decodes and fulfills requests for a specific offset.
-fn fulfill_requests(
-    senders: Responses,
-    message: &BorrowedMessage<'_>,
+fn fulfill_requests<C: Codec>(
+    senders: Responses<C::Payload>,
+    message: &mut BorrowedMessage<'_>,
     propagator: &TextMapCompositePropagator,
-    #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
+    codec: &mut C,
     topic: Topic,
     partition: Partition,
     offset: Offset,
-) {
+) where
+    C::Payload: Clone,
+{
     let request_count = senders.len();
     debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,
         "Fulfilling active requests for deferred message");
 
-    let decoded_message = decode_message(
-        message,
-        propagator,
-        #[cfg(not(target_arch = "arm"))]
-        buffers,
-    );
+    let decoded_message = decode_message(message, propagator, codec);
 
     if let Some(decoded) = decoded_message {
         debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,
@@ -691,8 +713,8 @@ fn fulfill_requests(
 }
 
 /// Cleans up partition entry and unassigns if no more requests remain.
-fn cleanup_if_empty(
-    active: &mut ActiveRequests,
+fn cleanup_if_empty<P>(
+    active: &mut ActiveRequests<P>,
     consumer: &BaseConsumer,
     topic: Topic,
     partition: Partition,
@@ -722,7 +744,7 @@ fn cleanup_if_empty(
 /// * `request` - The load request to process
 /// * `active` - Active requests map
 /// * `consumer` - Kafka consumer for assignment
-fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &BaseConsumer) {
+fn handle_request<P>(request: Request<P>, active: &mut ActiveRequests<P>, consumer: &BaseConsumer) {
     use std::collections::btree_map::Entry;
 
     let Request {
@@ -812,8 +834,8 @@ fn handle_request(request: Request, active: &mut ActiveRequests, consumer: &Base
 /// a seek failure — the consumer's position is unknown and polling would
 /// risk misclassifying pending offsets as deleted. The caller should retry
 /// the seek on the next iteration.
-fn seek_to_first_active_offset(
-    active: &mut ActiveRequests,
+fn seek_to_first_active_offset<P>(
+    active: &mut ActiveRequests<P>,
     consumer: &BaseConsumer,
     discard_threshold: i64,
     seek_timeout: Duration,
@@ -947,8 +969,8 @@ fn seek_to_first_active_offset(
 /// # Errors
 ///
 /// Returns a [`KafkaError`] if the assignment operation fails.
-fn assign_if_needed(
-    active: &ActiveRequests,
+fn assign_if_needed<P>(
+    active: &ActiveRequests<P>,
     consumer: &BaseConsumer,
     topic: Topic,
     partition: Partition,
@@ -1032,7 +1054,7 @@ fn unassign_partition(
 /// # Returns
 ///
 /// A tracing span linked to the parent context with message metadata recorded.
-fn create_load_span(decoded: &DecodedMessage, cached: bool, relation: SpanRelation) -> Span {
+fn create_load_span<P>(decoded: &DecodedMessage<P>, cached: bool, relation: SpanRelation) -> Span {
     related_span!(
         relation,
         decoded.parent_context.clone(),

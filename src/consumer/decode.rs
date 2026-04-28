@@ -23,14 +23,10 @@ use std::str;
 use std::sync::Arc;
 use tracing::error;
 
-#[cfg(not(target_arch = "arm"))]
-use simd_json::Buffers;
-#[cfg(not(target_arch = "arm"))]
-use simd_json::serde::from_reader_with_buffers;
-
+use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessageValue;
-use crate::{Payload, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
+use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 /// A decoded Kafka message without live span references.
 ///
@@ -44,10 +40,14 @@ use crate::{Payload, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 /// - Context is safely cached (contains only remote trace identifiers)
 /// - Each load site creates its own span from the cached context
 /// - Spans close when processing completes, not on cache eviction
+///
+/// # Type Parameters
+///
+/// * `P` – The deserialized payload type.
 #[derive(Clone, Debug)]
-pub struct DecodedMessage {
+pub struct DecodedMessage<P> {
     /// Shared immutable message data
-    pub value: Arc<ConsumerMessageValue>,
+    pub value: Arc<ConsumerMessageValue<P>>,
 
     /// Parent trace context extracted from original Kafka headers.
     ///
@@ -61,7 +61,7 @@ pub struct DecodedMessage {
 ///
 /// This function performs comprehensive message processing:
 /// 1. Extracts distributed tracing context from message headers
-/// 2. Parses and validates the JSON payload
+/// 2. Parses and validates the payload via the provided codec
 /// 3. Extracts and validates the message key
 /// 4. Resolves the message timestamp from Kafka metadata
 ///
@@ -71,48 +71,30 @@ pub struct DecodedMessage {
 ///
 /// # Arguments
 ///
-/// * `message` - The Kafka message to decode
+/// * `message` - The Kafka message to decode. Taken as `&mut` so the codec can
+///   parse the payload in place via `payload_mut`, avoiding a copy. The payload
+///   bytes are consumed (left in an unspecified state) by this call.
 /// * `propagator` - Distributed tracing context propagator
-/// * `buffers` - (Non-ARM only) Buffers for SIMD JSON parsing
+/// * `codec` - Codec used to deserialize the raw payload bytes
 ///
 /// # Returns
 ///
 /// * `Some(DecodedMessage)` - A validated, parsed message with parent context
 /// * `None` - If the message is invalid or missing required fields
-pub fn decode_message(
-    message: &BorrowedMessage,
+pub fn decode_message<C: Codec>(
+    message: &mut BorrowedMessage,
     propagator: &TextMapCompositePropagator,
-    #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
-) -> Option<DecodedMessage> {
-    // Extract basic message coordinates
+    codec: &mut C,
+) -> Option<DecodedMessage<C::Payload>> {
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
     let offset = message.offset();
 
-    // Extract distributed tracing context from message headers (no local span)
     let parent_context = propagator.extract(&MessageExtractor::new(message));
 
-    // Extract source system header if present
     let source_system = extract_source_system(message);
+    let timestamp = resolve_timestamp(message);
 
-    // Validate and parse payload
-    let Some(payload_data) = message.payload() else {
-        error!(
-            topic = %topic,
-            partition = partition,
-            offset = offset,
-            "missing payload; discarding message"
-        );
-        return None;
-    };
-
-    let payload = parse_payload(
-        payload_data,
-        #[cfg(not(target_arch = "arm"))]
-        buffers,
-    )?;
-
-    // Validate and extract key
     let Some(key_data) = message.key() else {
         error!(
             topic = %topic,
@@ -136,10 +118,38 @@ pub fn decode_message(
         }
     };
 
-    // Determine message timestamp based on available metadata
-    let timestamp = resolve_timestamp(message);
+    // SAFETY: librdkafka does not formally promise the payload is mutable,
+    // but on the consumer poll path:
+    //   - `on_consume` interceptors run inside `rd_kafka_message_setup` before the
+    //     message is returned to the application, so no librdkafka-internal code
+    //     reads these bytes after delivery.
+    //   - The payload occupies a disjoint slice of the refcounted fetch buffer;
+    //     mutating it cannot corrupt sibling messages.
+    //   - `decode_message` is the only site in the crate that reads the borrowed
+    //     payload bytes, so the codec's destructive parse cannot affect downstream
+    //     code.
+    // The audit boundary is the rdkafka version resolved in `Cargo.lock`, not
+    // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
+    // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
+    #[allow(unsafe_code)]
+    let Some(payload_bytes) = (unsafe { message.payload_mut() }) else {
+        error!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "missing payload; discarding message"
+        );
+        return None;
+    };
 
-    // Create and return decoded message with parent context (no span)
+    let payload = match codec.deserialize(payload_bytes) {
+        Ok(p) => p,
+        Err(error) => {
+            error!("invalid payload: {error:#}; discarding message");
+            return None;
+        }
+    };
+
     let value = Arc::new(ConsumerMessageValue {
         source_system,
         topic,
@@ -181,35 +191,6 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
         Ok(source_system) => source_system.map(SourceSystem::from),
         Err(error) => {
             error!("invalid source system encoding: {error:#}; ignoring");
-            None
-        }
-    }
-}
-
-/// Parses a message payload as JSON using platform-optimized implementations.
-///
-/// # Arguments
-///
-/// * `payload_data` - Raw payload bytes
-/// * `buffers` - (Non-ARM only) Buffers for SIMD JSON parsing
-///
-/// # Returns
-///
-/// * `Some(Payload)` - Successfully parsed JSON payload
-/// * `None` - If parsing fails
-fn parse_payload(
-    payload_data: &[u8],
-    #[cfg(not(target_arch = "arm"))] buffers: &mut Buffers,
-) -> Option<Payload> {
-    #[cfg(target_arch = "arm")]
-    let payload = serde_json::from_slice(payload_data);
-    #[cfg(not(target_arch = "arm"))]
-    let payload = from_reader_with_buffers(payload_data, buffers);
-
-    match payload {
-        Ok(p) => Some(p),
-        Err(error) => {
-            error!("invalid payload: {error:#}; discarding message");
             None
         }
     }
