@@ -252,7 +252,7 @@ impl<C: Codec> ProsodyProducer<C> {
     pub fn new(
         config: &ProducerConfiguration,
         telemetry: TelemetrySender,
-    ) -> Result<Self, ProducerError> {
+    ) -> Result<Self, ProducerError<C::Error>> {
         config.validate()?;
 
         let send_timeout = config.send_timeout.map_or(Timeout::Never, Timeout::After);
@@ -307,7 +307,7 @@ impl<C: Codec> ProsodyProducer<C> {
     pub fn pipeline_producer(
         mut config: ProducerConfiguration,
         telemetry: TelemetrySender,
-    ) -> Result<Self, ProducerError> {
+    ) -> Result<Self, ProducerError<C::Error>> {
         config.send_timeout = None;
         Self::new(&config, telemetry)
     }
@@ -332,7 +332,7 @@ impl<C: Codec> ProsodyProducer<C> {
     pub(crate) fn low_latency_producer(
         mut config: ProducerConfiguration,
         telemetry: TelemetrySender,
-    ) -> Result<Self, ProducerError> {
+    ) -> Result<Self, ProducerError<C::Error>> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
@@ -359,7 +359,7 @@ impl<C: Codec> ProsodyProducer<C> {
     pub(crate) fn best_effort_producer(
         mut config: ProducerConfiguration,
         telemetry: TelemetrySender,
-    ) -> Result<Self, ProducerError> {
+    ) -> Result<Self, ProducerError<C::Error>> {
         if config.send_timeout.is_none() {
             config.send_timeout = Some(Duration::from_secs(1));
         }
@@ -396,7 +396,7 @@ impl<C: Codec> ProsodyProducer<C> {
         topic: Topic,
         key: &str,
         payload: &C::Payload,
-    ) -> Result<(), ProducerError>
+    ) -> Result<(), ProducerError<C::Error>>
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
         C::Payload: EventIdentity,
@@ -426,7 +426,8 @@ impl<C: Codec> ProsodyProducer<C> {
         // drop, preserving its capacity across calls.
         let mut serialized = SerializeBufGuard::acquire();
         C::with_cached_local(|codec| codec.serialize(payload, &mut serialized))
-            .map_err(|e| ProducerError::Serialization(Box::new(e)))?;
+            .map_err(ProducerError::Serialization)?;
+
         Span::current().record("payload_size", serialized.len());
 
         // Build the Kafka record

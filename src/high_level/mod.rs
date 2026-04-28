@@ -148,7 +148,7 @@ where
         producer_builder: &mut ProducerConfigurationBuilder,
         consumer_builders: &ConsumerBuilders,
         cassandra_builder: &CassandraConfigurationBuilder,
-    ) -> Result<Self, HighLevelClientError> {
+    ) -> Result<Self, HighLevelClientError<C::Error>> {
         // Set the producer source system to the consumer group if unspecified
         if let (None, Some(group_id)) = (
             producer_builder.configured_source_system(),
@@ -221,7 +221,7 @@ where
         topic: Topic,
         key: &str,
         payload: &C::Payload,
-    ) -> Result<(), HighLevelClientError> {
+    ) -> Result<(), HighLevelClientError<C::Error>> {
         self.producer.send([], topic, key, payload).await?;
         Ok(())
     }
@@ -238,7 +238,7 @@ where
     /// - The consumer is unconfigured.
     /// - The consumer is already subscribed.
     /// - Consumer initialization fails.
-    pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
+    pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone,
         C::Payload: crate::EventType + Clone,
@@ -338,7 +338,7 @@ where
     ///
     /// Returns a `HighLevelClientError` if the consumer is not currently
     /// subscribed.
-    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError> {
+    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
         let consumer = {
             let mut guard = self.consumer.lock().await;
             let consumer_ref = &mut *guard;
@@ -400,7 +400,7 @@ where
 fn check_topic_existence<S, C: Codec, D: Codec>(
     producer: &ProsodyProducer<C>,
     consumer_state: &ConsumerState<S, D>,
-) -> Result<(), HighLevelClientError>
+) -> Result<(), HighLevelClientError<C::Error>>
 where
     C::Payload: crate::EventIdentity,
 {
@@ -430,7 +430,7 @@ where
 fn missing_topics<C: Codec>(
     producer: &ProsodyProducer<C>,
     mut topics: Vec<Topic>,
-) -> Result<Vec<Topic>, ProducerError>
+) -> Result<Vec<Topic>, ProducerError<C::Error>>
 where
     C::Payload: crate::EventIdentity,
 {
@@ -463,14 +463,14 @@ where
 
 /// Errors that can occur in the `HighLevelClient` operations.
 #[derive(Debug, Error)]
-pub enum HighLevelClientError {
+pub enum HighLevelClientError<E> {
     /// Error when the producer configuration is invalid.
     #[error("invalid producer configuration: {0:#}")]
     ProducerConfiguration(#[from] ProducerConfigurationBuilderError),
 
     /// Error when initializing the producer fails.
     #[error("failed to initialize producer: {0:#}")]
-    Producer(#[from] ProducerError),
+    Producer(#[from] ProducerError<E>),
 
     /// Error when initializing the consumer fails.
     #[error("failed to initialize consumer: {0:#}")]

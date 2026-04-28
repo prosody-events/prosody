@@ -300,7 +300,7 @@ where
     Enc: Codec<Payload = T::Payload>,
     Enc::Payload: EventIdentity,
 {
-    type Error = FailureTopicError<T::Error>;
+    type Error = FailureTopicError<T::Error, Enc::Error>;
     /// Output for the DLQ middleware. The inner handler always ran when this
     /// type is produced (unlike middlewares that may short-circuit), so the
     /// variants encode whether the inner succeeded or whether its
@@ -514,7 +514,7 @@ where
 
 /// Errors that can occur during failure topic handling.
 #[derive(Debug, Error)]
-pub enum FailureTopicError<E> {
+pub enum FailureTopicError<E, P> {
     /// Error from the wrapped handler that the middleware did not rescue.
     /// Used for any Terminal message error, every timer error, and any
     /// non-Terminal message error that does not reach the DLQ branch.
@@ -537,11 +537,11 @@ pub enum FailureTopicError<E> {
         inner: E,
         /// Producer error from the failure-topic send.
         #[source]
-        producer: ProducerError,
+        producer: ProducerError<P>,
     },
 }
 
-impl<E> ClassifyError for FailureTopicError<E>
+impl<E, P> ClassifyError for FailureTopicError<E, P>
 where
     E: ClassifyError,
 {

@@ -13,21 +13,20 @@
 
 use crate::error::{ClassifyError, ErrorCategory};
 use rdkafka::error::KafkaError;
-use std::error::Error as StdError;
 use std::time::SystemTimeError;
 use thiserror::Error;
 use validator::ValidationErrors;
 
 /// Errors that can occur during producer operations.
 #[derive(Debug, Error)]
-pub enum ProducerError {
+pub enum ProducerError<E> {
     /// Indicates invalid producer configuration.
     #[error("invalid producer configuration: {0:#}")]
     Configuration(#[from] ValidationErrors),
 
     /// Indicates a failure to serialize the payload.
     #[error("failed to serialize payload: {0}")]
-    Serialization(Box<dyn StdError + Send + Sync>),
+    Serialization(E),
 
     /// Indicates a failure to set the message timestamp.
     #[error("failed to set timestamp: {0:#}")]
@@ -42,7 +41,7 @@ pub enum ProducerError {
     Kafka(#[from] KafkaError),
 }
 
-impl ClassifyError for ProducerError {
+impl<E> ClassifyError for ProducerError<E> {
     fn classify_error(&self) -> ErrorCategory {
         match self {
             // Configuration validation failed or failed to retrieve hostname. Programming
