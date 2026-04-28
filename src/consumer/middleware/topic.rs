@@ -247,7 +247,7 @@ pub enum FailureTopicOutput<O, E> {
     /// accepted the routed message, so the marker can commit. The inner's
     /// typed error is preserved here so the apply hook can fire
     /// `inner.after_commit(Err(_))`. Only used on the message path; timer
-    /// errors surface through [`FailureTopicError::Timer`] instead.
+    /// errors surface through [`FailureTopicError::Handler`] instead.
     Routed(E),
 }
 
