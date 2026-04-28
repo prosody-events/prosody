@@ -7,9 +7,12 @@
 //! as they indicate partition shutdown rather than recoverable failures.
 //!
 //! Timer failures are **not** routed to the failure topic. Non-terminal timer
-//! errors are absorbed in place: the marker commits and the inner's apply hook
-//! fires as `after_commit(Err(_))`. Terminal timer errors still propagate so
-//! partition shutdown is unaffected.
+//! errors are surfaced as [`FailureTopicError::Timer`], whose `ClassifyError`
+//! impl always returns [`ErrorCategory::Permanent`]. This keeps timer failures
+//! visible to outer telemetry/retry layers while preventing the upstream retry
+//! middleware from looping on a `Transient` classification — there is no DLQ
+//! to absorb the eventual exhaustion. Terminal timer errors still propagate as
+//! [`FailureTopicError::Handler`], unaffected.
 //!
 //! # Execution Order
 //!
@@ -47,10 +50,11 @@
 //! invocation that ran and returned — is upheld: every arm of `after_commit`
 //! / `after_abort` forwards exactly one call to the inner.
 //!
-//! For timers, [`FallibleHandler::on_timer`] absorbs non-terminal errors via
-//! the same [`FailureTopicOutput::Routed`] variant the message path uses on a
-//! successful DLQ write — without performing any producer call. The apply-hook
-//! routing matrix below therefore applies to both messages and timers.
+//! For timers, [`FallibleHandler::on_timer`] surfaces non-terminal errors as
+//! [`FailureTopicError::Timer`] (classified `Permanent`) without any producer
+//! call. The apply-hook routing matrix below treats `Timer` exactly like
+//! `Handler`: the inner ran and returned `Err`, so its apply hook fires with
+//! that same `Err`.
 //!
 //! The inner's [`FallibleHandler::after_commit`] /
 //! [`FallibleHandler::after_abort`] hook still has to fire — and the choice
@@ -71,6 +75,9 @@
 //!   inner error. When the outer retry re-drives the stack, this dispatch is
 //!   *not* final from the inner's POV, so the inner sees
 //!   `after_abort(Err(inner_err))`.
+//! - **Inner non-Terminal timer Err**: surfaced as
+//!   [`FailureTopicError::Timer`] (classified `Permanent`); the apply hook
+//!   forwards `Err(inner_err)` to the inner exactly as for `Handler`.
 //!
 //! # Usage
 //!
@@ -239,12 +246,11 @@ pub struct FailureTopicHandler<T, Enc: Codec> {
 pub enum FailureTopicOutput<O, E> {
     /// Inner handler ran and returned `Ok(output)`.
     Inner(O),
-    /// Inner handler returned a non-Terminal `Err(_)`; the failure was
-    /// rescued so the marker can commit. For messages, the rescue is a
-    /// successful failure-topic write. For timers, the error is absorbed in
-    /// place (timers do not route to the failure topic). The inner's typed
-    /// error is preserved here so the apply hook can fire
-    /// `inner.after_commit(Err(_))`.
+    /// Inner handler returned a non-Terminal `Err(_)`; the DLQ producer
+    /// accepted the routed message, so the marker can commit. The inner's
+    /// typed error is preserved here so the apply hook can fire
+    /// `inner.after_commit(Err(_))`. Only used on the message path; timer
+    /// errors surface through [`FailureTopicError::Timer`] instead.
     Routed(E),
 }
 
@@ -418,13 +424,13 @@ where
         }
     }
 
-    /// Timer failures are absorbed in place rather than written to the
-    /// failure topic. `Ok(o)` becomes [`FailureTopicOutput::Inner`];
-    /// terminal errors still propagate as [`FailureTopicError::Handler`]
-    /// (matching the message path, so partition shutdown still triggers);
-    /// any other error is logged and absorbed as
-    /// [`FailureTopicOutput::Routed`], so the marker commits and the inner's
-    /// apply hook fires as `after_commit(Err(_))` without any DLQ write.
+    /// Timer failures are not routed to the failure topic. `Ok(o)` becomes
+    /// [`FailureTopicOutput::Inner`]; terminal errors propagate as
+    /// [`FailureTopicError::Handler`] (matching the message path, so partition
+    /// shutdown still triggers); any other error propagates as
+    /// [`FailureTopicError::Timer`], whose `ClassifyError` impl forces
+    /// `Permanent`. This keeps the failure visible to outer telemetry while
+    /// preventing upstream retry from looping on a `Transient` timer error.
     async fn on_timer<C>(
         &self,
         context: C,
@@ -453,10 +459,10 @@ where
 
         error!(
             key = %timer.key,
-            "failed to process timer: {error:#}; absorbing (timers do not route to failure topic)"
+            "failed to process timer: {error:#}; surfacing as Permanent (timers do not route to failure topic)"
         );
 
-        Ok(FailureTopicOutput::Routed(error))
+        Err(FailureTopicError::Timer(error))
     }
 
     /// Resolves the inner's apply hook on a **committed** marker.
@@ -484,7 +490,9 @@ where
             }
             Ok(FailureTopicOutput::Routed(inner))
             | Err(
-                FailureTopicError::Handler(inner) | FailureTopicError::DlqSendFailed { inner, .. },
+                FailureTopicError::Handler(inner)
+                | FailureTopicError::Timer(inner)
+                | FailureTopicError::DlqSendFailed { inner, .. },
             ) => {
                 self.handler.after_commit(context, Err(inner)).await;
             }
@@ -515,7 +523,9 @@ where
             }
             Ok(FailureTopicOutput::Routed(inner))
             | Err(
-                FailureTopicError::Handler(inner) | FailureTopicError::DlqSendFailed { inner, .. },
+                FailureTopicError::Handler(inner)
+                | FailureTopicError::Timer(inner)
+                | FailureTopicError::DlqSendFailed { inner, .. },
             ) => {
                 self.handler.after_abort(context, Err(inner)).await;
             }
@@ -539,6 +549,15 @@ pub enum FailureTopicError<E> {
     /// apply hook can forward it.
     #[error(transparent)]
     Handler(E),
+
+    /// Non-Terminal timer error surfaced through this middleware. Timers do
+    /// not route to the failure topic; the inner error is preserved here so
+    /// the apply hook can forward it as `Err(_)`. `ClassifyError` reports
+    /// `Permanent` regardless of the inner's classification, so the upstream
+    /// retry middleware does not loop on a `Transient` timer error that has
+    /// nowhere to be absorbed.
+    #[error(transparent)]
+    Timer(E),
 
     /// The wrapped handler returned a non-Terminal error and the producer
     /// failed to accept the routed message.
@@ -566,6 +585,9 @@ where
     fn classify_error(&self) -> ErrorCategory {
         match self {
             FailureTopicError::Handler(error) => error.classify_error(),
+            // Force `Permanent`: outer retry must not loop on a `Transient`
+            // timer error since timers have no DLQ to absorb exhaustion.
+            FailureTopicError::Timer(_) => ErrorCategory::Permanent,
             // Outer retry layers should react to the producer-level failure
             // (e.g. transient broker errors) rather than the inner's
             // classification; the inner error is only carried through for
@@ -839,6 +861,245 @@ mod tests {
 
         let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
             Err(dlq_send_failed_err(ErrorCategory::Permanent));
+        handler.after_abort(MockEventContext::new(), result).await;
+
+        let events = log.lock().clone();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                &events[0],
+                InnerHookEvent::Abort(Err(TestError(ErrorCategory::Permanent))),
+            ),
+            "expected Abort(Err(Permanent)), got {:?}",
+            events[0],
+        );
+        Ok(())
+    }
+
+    // === on_timer dispatch tests ===
+    //
+    // These tests drive `FailureTopicHandler::on_timer` end-to-end with a
+    // configurable inner. They assert that non-terminal timer errors surface
+    // through `FailureTopicError::Timer` (classified `Permanent`) rather than
+    // being absorbed via `Routed`, so outer telemetry sees the failure and
+    // outer retry does not loop.
+
+    /// Inner handler whose `on_timer` returns a configured `Result`. No
+    /// producer is consulted; observing the returned `Result` is sufficient
+    /// to prove the dispatch path took no DLQ branch.
+    #[derive(Clone)]
+    struct TimerProbeInner {
+        result: Arc<Mutex<Result<u64, TestError>>>,
+        log: Arc<Mutex<Vec<InnerHookEvent>>>,
+    }
+
+    impl TimerProbeInner {
+        fn returning(result: Result<u64, TestError>) -> Self {
+            Self {
+                result: Arc::new(Mutex::new(result)),
+                log: Arc::default(),
+            }
+        }
+    }
+
+    impl FallibleHandler for TimerProbeInner {
+        type Error = TestError;
+        type Output = u64;
+        type Payload = serde_json::Value;
+
+        async fn on_message<C>(
+            &self,
+            _context: C,
+            _message: ConsumerMessage<Self::Payload>,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext,
+        {
+            Ok(0)
+        }
+
+        async fn on_timer<C>(
+            &self,
+            _context: C,
+            _trigger: Trigger,
+            _demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext,
+        {
+            self.result.lock().clone()
+        }
+
+        async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext,
+        {
+            self.log.lock().push(InnerHookEvent::Commit(result));
+        }
+
+        async fn after_abort<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
+        where
+            C: EventContext,
+        {
+            self.log.lock().push(InnerHookEvent::Abort(result));
+        }
+
+        async fn shutdown(self) {}
+    }
+
+    fn make_timer_handler(
+        inner: TimerProbeInner,
+    ) -> color_eyre::Result<FailureTopicHandler<TimerProbeInner, crate::JsonCodec>> {
+        let config = ProducerConfiguration::builder()
+            .bootstrap_servers(vec!["mock:9092".to_owned()])
+            .source_system("test")
+            .mock(true)
+            .build()?;
+        let telemetry = Telemetry::default();
+        let producer = ProsodyProducer::new(&config, telemetry.sender())?;
+        Ok(FailureTopicHandler {
+            topic: "dlq".into(),
+            producer,
+            group_id: "group".to_owned(),
+            handler: inner,
+        })
+    }
+
+    fn test_trigger() -> Trigger {
+        use crate::timers::TimerType;
+        use crate::timers::datetime::CompactDateTime;
+        Trigger::new(
+            Arc::from("key"),
+            CompactDateTime::from(0_u32),
+            TimerType::Application,
+            tracing::Span::current(),
+        )
+    }
+
+    #[test]
+    fn timer_variant_classifies_as_permanent_regardless_of_inner() {
+        // The whole point of `Timer`: outer retry must see Permanent even when
+        // the inner error itself is Transient.
+        let from_transient: FailureTopicError<TestError> =
+            FailureTopicError::Timer(TestError(ErrorCategory::Transient));
+        assert!(matches!(
+            from_transient.classify_error(),
+            ErrorCategory::Permanent,
+        ));
+
+        let from_permanent: FailureTopicError<TestError> =
+            FailureTopicError::Timer(TestError(ErrorCategory::Permanent));
+        assert!(matches!(
+            from_permanent.classify_error(),
+            ErrorCategory::Permanent,
+        ));
+    }
+
+    #[tokio::test]
+    async fn on_timer_transient_surfaces_as_permanent_not_absorbed()
+    -> color_eyre::Result<()> {
+        let inner = TimerProbeInner::returning(Err(TestError(ErrorCategory::Transient)));
+        let handler = make_timer_handler(inner)?;
+
+        let result = handler
+            .on_timer(MockEventContext::new(), test_trigger(), DemandType::Normal)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FailureTopicError::Timer(TestError(ErrorCategory::Transient))),
+            ),
+            "expected Err(Timer(Transient)); got {result:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn on_timer_permanent_surfaces_as_timer_not_absorbed() -> color_eyre::Result<()> {
+        let inner = TimerProbeInner::returning(Err(TestError(ErrorCategory::Permanent)));
+        let handler = make_timer_handler(inner)?;
+
+        let result = handler
+            .on_timer(MockEventContext::new(), test_trigger(), DemandType::Normal)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FailureTopicError::Timer(TestError(ErrorCategory::Permanent))),
+            ),
+            "expected Err(Timer(Permanent)); got {result:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn on_timer_terminal_propagates_as_handler() -> color_eyre::Result<()> {
+        // Terminal must still propagate as `Handler` so partition shutdown
+        // semantics are preserved.
+        let inner = TimerProbeInner::returning(Err(TestError(ErrorCategory::Terminal)));
+        let handler = make_timer_handler(inner)?;
+
+        let result = handler
+            .on_timer(MockEventContext::new(), test_trigger(), DemandType::Normal)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(FailureTopicError::Handler(TestError(ErrorCategory::Terminal))),
+            ),
+            "expected Err(Handler(Terminal)); got {result:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn on_timer_ok_returns_inner_output() -> color_eyre::Result<()> {
+        let inner = TimerProbeInner::returning(Ok(7));
+        let handler = make_timer_handler(inner)?;
+
+        let result = handler
+            .on_timer(MockEventContext::new(), test_trigger(), DemandType::Normal)
+            .await;
+
+        assert!(matches!(result, Ok(FailureTopicOutput::Inner(7))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_commit_timer_forwards_inner_err() -> color_eyre::Result<()> {
+        let inner = ProbeInner::new();
+        let log = inner.log.clone();
+        let handler = make_handler(inner)?;
+
+        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
+            Err(FailureTopicError::Timer(TestError(ErrorCategory::Transient)));
+        handler.after_commit(MockEventContext::new(), result).await;
+
+        let events = log.lock().clone();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                &events[0],
+                InnerHookEvent::Commit(Err(TestError(ErrorCategory::Transient))),
+            ),
+            "expected Commit(Err(Transient)), got {:?}",
+            events[0],
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_abort_timer_forwards_inner_err() -> color_eyre::Result<()> {
+        let inner = ProbeInner::new();
+        let log = inner.log.clone();
+        let handler = make_handler(inner)?;
+
+        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
+            Err(FailureTopicError::Timer(TestError(ErrorCategory::Permanent)));
         handler.after_abort(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
