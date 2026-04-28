@@ -15,10 +15,12 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::future_producer::FutureProducerContext;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
+use std::cell::RefCell;
 use std::env::var;
 use std::hash::Hasher;
 use std::mem::take;
 use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{Span, info_span, instrument};
@@ -47,6 +49,50 @@ pub use error::ProducerError;
 
 /// Environment variable name for the source system identifier.
 const PROSODY_SOURCE_SYSTEM: &str = "PROSODY_SOURCE_SYSTEM";
+
+thread_local! {
+    static SERIALIZE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard that takes the per-thread serialize buffer for the duration of a
+/// send and returns it on drop, preserving its capacity for reuse.
+struct SerializeBufGuard {
+    buf: Vec<u8>,
+}
+
+impl SerializeBufGuard {
+    fn acquire() -> Self {
+        Self {
+            buf: SERIALIZE_BUF.with_borrow_mut(take),
+        }
+    }
+}
+
+impl Drop for SerializeBufGuard {
+    fn drop(&mut self) {
+        let mut buf = take(&mut self.buf);
+        buf.clear();
+        SERIALIZE_BUF.with_borrow_mut(|tls| {
+            if buf.capacity() > tls.capacity() {
+                *tls = buf;
+            }
+        });
+    }
+}
+
+impl Deref for SerializeBufGuard {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.buf
+    }
+}
+
+impl DerefMut for SerializeBufGuard {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+}
 
 /// Configuration for the Kafka producer.
 ///
@@ -375,17 +421,18 @@ impl<C: Codec> ProsodyProducer<C> {
             _ => None,
         };
 
-        // Serialize the payload using the codec
-        let mut serialized = Vec::new();
-        C::default()
-            .serialize(payload, &mut serialized)
+        // Serialize the payload using a thread-local cached codec into a
+        // thread-local buffer. The guard returns the buffer to the TLS slot on
+        // drop, preserving its capacity across calls.
+        let mut serialized = SerializeBufGuard::acquire();
+        C::with_cached_local(|codec| codec.serialize(payload, &mut serialized))
             .map_err(|e| ProducerError::Serialization(Box::new(e)))?;
         Span::current().record("payload_size", serialized.len());
 
         // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
             .key(key.as_ref())
-            .payload(&serialized)
+            .payload(serialized.as_slice())
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 
         // Inject OpenTelemetry context

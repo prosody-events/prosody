@@ -155,7 +155,7 @@ where
         };
 
         // Handle poll errors
-        let message = match result {
+        let mut message = match result {
             Ok(msg) => msg,
             Err(error) => {
                 error!("error polling for message: {error:#}");
@@ -169,13 +169,13 @@ where
             continue;
         };
 
-        let topic = message.topic();
+        let topic = message.topic().to_owned();
         let partition = message.partition();
         let offset = message.offset();
         debug!(topic, partition, offset, "received message");
 
         // Decode message through extraction, validation, and filtering
-        let maybe_decoded = decode_message(&message, &propagator, &mut codec);
+        let maybe_decoded = decode_message(&mut message, &propagator, &mut codec);
 
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {

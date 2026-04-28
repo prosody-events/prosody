@@ -2,6 +2,7 @@
 
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_slice_with_buffers;
+use std::cell::RefCell;
 use std::error::Error;
 
 use crate::{EventIdentity, EventTypeExtract, TimerReplayPayload};
@@ -19,10 +20,15 @@ pub trait Codec: Default + Send + Sync + 'static {
 
     /// Deserializes a payload from raw bytes.
     ///
+    /// The buffer is passed mutably so implementations may parse in place
+    /// (for example, `simd_json` rewrites the input as a tape during
+    /// parsing). After this call returns, the bytes in `buf` are
+    /// unspecified — callers must not read them again.
+    ///
     /// # Errors
     ///
     /// Returns an error if the bytes cannot be decoded into `Self::Payload`.
-    fn deserialize(&mut self, bytes: &[u8]) -> Result<Self::Payload, Self::Error>;
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error>;
 
     /// Serializes a payload into the provided buffer, replacing its contents.
     ///
@@ -30,9 +36,23 @@ pub trait Codec: Default + Send + Sync + 'static {
     ///
     /// Returns an error if `payload` cannot be encoded.
     fn serialize(&mut self, payload: &Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error>;
+
+    /// Runs `f` with a thread-local cached instance of this codec.
+    ///
+    /// The first call on each thread constructs the codec via `Default`;
+    /// subsequent calls reuse the same instance, allowing internal buffers
+    /// (such as `simd_json::Buffers`) to be reused across calls.
+    ///
+    /// Implementors should back this with a `thread_local!` of the concrete
+    /// codec type so dispatch stays static.
+    fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R;
 }
 
 /// JSON codec using `serde_json` (ARM) or `simd_json` (non-ARM).
+///
+/// On non-ARM targets `simd_json` parses **in place**, overwriting the input
+/// buffer with tape data; the bytes passed to `deserialize` are unspecified
+/// after the call returns.
 #[derive(Default)]
 pub struct JsonCodec {
     #[cfg(not(target_arch = "arm"))]
@@ -43,21 +63,27 @@ impl Codec for JsonCodec {
     type Error = JsonCodecError;
     type Payload = serde_json::Value;
 
-    fn deserialize(&mut self, bytes: &[u8]) -> Result<Self::Payload, Self::Error> {
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
         #[cfg(target_arch = "arm")]
         {
-            serde_json::from_slice(bytes).map_err(JsonCodecError::Serde)
+            serde_json::from_slice(buf).map_err(JsonCodecError::Serde)
         }
         #[cfg(not(target_arch = "arm"))]
         {
-            let mut owned = bytes.to_owned();
-            from_slice_with_buffers(&mut owned, &mut self.buffers).map_err(JsonCodecError::Simd)
+            from_slice_with_buffers(buf, &mut self.buffers).map_err(JsonCodecError::Simd)
         }
     }
 
     fn serialize(&mut self, payload: &Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
-        *buf = serde_json::to_vec(payload).map_err(JsonCodecError::Serde)?;
+        serde_json::to_writer(buf, payload).map_err(JsonCodecError::Serde)?;
         Ok(())
+    }
+
+    fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        thread_local! {
+            static CACHE: RefCell<JsonCodec> = RefCell::new(JsonCodec::default());
+        }
+        CACHE.with_borrow_mut(f)
     }
 }
 

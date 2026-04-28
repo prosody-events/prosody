@@ -71,7 +71,9 @@ pub struct DecodedMessage<P> {
 ///
 /// # Arguments
 ///
-/// * `message` - The Kafka message to decode
+/// * `message` - The Kafka message to decode. Taken as `&mut` so the codec can
+///   parse the payload in place via `payload_mut`, avoiding a copy. The payload
+///   bytes are consumed (left in an unspecified state) by this call.
 /// * `propagator` - Distributed tracing context propagator
 /// * `codec` - Codec used to deserialize the raw payload bytes
 ///
@@ -80,7 +82,7 @@ pub struct DecodedMessage<P> {
 /// * `Some(DecodedMessage)` - A validated, parsed message with parent context
 /// * `None` - If the message is invalid or missing required fields
 pub fn decode_message<C: Codec>(
-    message: &BorrowedMessage,
+    message: &mut BorrowedMessage,
     propagator: &TextMapCompositePropagator,
     codec: &mut C,
 ) -> Option<DecodedMessage<C::Payload>> {
@@ -91,24 +93,7 @@ pub fn decode_message<C: Codec>(
     let parent_context = propagator.extract(&MessageExtractor::new(message));
 
     let source_system = extract_source_system(message);
-
-    let Some(payload_bytes) = message.payload() else {
-        error!(
-            topic = %topic,
-            partition = partition,
-            offset = offset,
-            "missing payload; discarding message"
-        );
-        return None;
-    };
-
-    let payload = match codec.deserialize(payload_bytes) {
-        Ok(p) => p,
-        Err(error) => {
-            error!("invalid payload: {error:#}; discarding message");
-            return None;
-        }
-    };
+    let timestamp = resolve_timestamp(message);
 
     let Some(key_data) = message.key() else {
         error!(
@@ -133,7 +118,35 @@ pub fn decode_message<C: Codec>(
         }
     };
 
-    let timestamp = resolve_timestamp(message);
+    // SAFETY: librdkafka does not formally promise the payload is mutable,
+    // but on the consumer poll path:
+    //   - `on_consume` interceptors run inside `rd_kafka_message_setup` before the
+    //     message is returned to the application, so no librdkafka-internal code
+    //     reads these bytes after delivery.
+    //   - The payload occupies a disjoint slice of the refcounted fetch buffer;
+    //     mutating it cannot corrupt sibling messages.
+    //   - `decode_message` is the only site in the crate that reads the borrowed
+    //     payload bytes, so the codec's destructive parse cannot affect downstream
+    //     code.
+    // Pinned to the rdkafka version in `Cargo.toml`; re-audit on upgrade.
+    #[allow(unsafe_code)]
+    let Some(payload_bytes) = (unsafe { message.payload_mut() }) else {
+        error!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "missing payload; discarding message"
+        );
+        return None;
+    };
+
+    let payload = match codec.deserialize(payload_bytes) {
+        Ok(p) => p,
+        Err(error) => {
+            error!("invalid payload: {error:#}; discarding message");
+            return None;
+        }
+    };
 
     let value = Arc::new(ConsumerMessageValue {
         source_system,

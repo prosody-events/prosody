@@ -578,7 +578,7 @@ fn process_poll_result<C: Codec>(
 ) where
     C::Payload: Clone,
 {
-    let message = match result {
+    let mut message = match result {
         Ok(message) => message,
         Err(error) => {
             error!(error = %format_args!("{error:#}"), "Error polling for deferred message");
@@ -639,7 +639,7 @@ fn process_poll_result<C: Codec>(
 
     fulfill_requests::<C>(
         senders,
-        &message,
+        &mut message,
         propagator,
         codec,
         msg_topic,
@@ -681,7 +681,7 @@ fn notify_deleted_offsets<P>(
 /// Decodes and fulfills requests for a specific offset.
 fn fulfill_requests<C: Codec>(
     senders: Responses<C::Payload>,
-    message: &BorrowedMessage<'_>,
+    message: &mut BorrowedMessage<'_>,
     propagator: &TextMapCompositePropagator,
     codec: &mut C,
     topic: Topic,
