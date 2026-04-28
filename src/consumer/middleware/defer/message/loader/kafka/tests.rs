@@ -977,7 +977,7 @@ async fn run_interleaved_async(scenario: InterleavedScenario) -> color_eyre::Res
         // SlotMap gives stable DefaultKey handles with no index bookkeeping.
         let mut handles: SlotMap<
             DefaultKey,
-            JoinHandle<Result<ConsumerMessage, KafkaLoaderError>>,
+            JoinHandle<Result<ConsumerMessage<serde_json::Value>, KafkaLoaderError>>,
         > = SlotMap::new();
         let mut pending: AHashMap<ResolvedKey, Vec<DefaultKey>> = AHashMap::new();
 
@@ -1124,7 +1124,7 @@ async fn delete_partition_records(
 /// Assert the outcome of one load request against the expected deleted/valid
 /// boundary.
 fn assert_load_result(
-    result: Result<ConsumerMessage, KafkaLoaderError>,
+    result: Result<ConsumerMessage<serde_json::Value>, KafkaLoaderError>,
     topic: usize,
     partition: Partition,
     offset_idx: usize,

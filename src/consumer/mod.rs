@@ -701,10 +701,10 @@ pub struct LowLatencyMiddlewareConfiguration {
 /// - Best-effort processing with logging
 ///
 /// The `P` type parameter is the payload type carried by consumed messages.
-/// Defaults to `serde_json::Value` for source compatibility.
+/// Pair the consumer with a [`Codec`] whose `Payload` matches `P`.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub struct ProsodyConsumer<P: Send + Sync + 'static = serde_json::Value> {
+pub struct ProsodyConsumer<P: Send + Sync + 'static> {
     /// Flag to signal consumer shutdown.
     #[educe(Debug(ignore))]
     shutdown: Arc<AtomicBool>,
@@ -752,34 +752,39 @@ pub struct ProsodyConsumer<P: Send + Sync + 'static = serde_json::Value> {
 ///
 /// Groups the middleware and configuration that are common to both memory
 /// and Cassandra storage backends, reducing parameter counts.
-struct PipelineMiddlewareStack<CM> {
+struct PipelineMiddlewareStack<CM, P> {
     consumer_config: ConsumerConfiguration,
     defer_config: DeferConfiguration,
     dedup_config: DeduplicationConfiguration,
     failure_tracker: FailureTracker,
     common_middleware: CM,
-    monopolization_middleware: Option<MonopolizationMiddleware>,
-    retry_middleware: RetryMiddleware,
+    monopolization_middleware: Option<MonopolizationMiddleware<P>>,
+    retry_middleware: RetryMiddleware<P>,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
 }
 
-impl<CM: HandlerMiddleware> PipelineMiddlewareStack<CM> {
-    fn build<T, MP, TP, DP, PP, L>(
+impl<CM, P: Send + Sync + 'static> PipelineMiddlewareStack<CM, P>
+where
+    CM: HandlerMiddleware<Payload = P>,
+{
+    fn build<T, MP, TP, DP, PP, L, C>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: DP,
         trigger_provider: PP,
         handler: T,
-    ) -> Result<ProsodyConsumer<serde_json::Value>, ConsumerError>
+    ) -> Result<ProsodyConsumer<P>, ConsumerError>
     where
-        T: FallibleHandler<Payload = serde_json::Value> + Clone + Send + Sync + 'static,
+        T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
         MP: MessageDeferStoreProvider,
         TP: TimerDeferStoreProvider,
         DP: DeduplicationStoreProvider,
         PP: TriggerStoreProvider,
-        L: MessageLoader + 'static,
+        L: MessageLoader<Payload = P> + 'static,
+        C: Codec<Payload = P>,
+        P: crate::EventIdentity + crate::EventTypeExtract + Clone,
     {
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
@@ -804,7 +809,7 @@ impl<CM: HandlerMiddleware> PipelineMiddlewareStack<CM> {
             .layer(self.retry_middleware)
             .into_provider(handler);
 
-        initialize_consumer_with_provider(
+        initialize_consumer_with_provider::<_, _, C>(
             &self.consumer_config,
             provider,
             trigger_provider,
@@ -814,44 +819,46 @@ impl<CM: HandlerMiddleware> PipelineMiddlewareStack<CM> {
     }
 }
 
-fn build_common_middleware(
+fn build_common_middleware<P: Send + Sync + 'static>(
     config: &CommonMiddlewareConfiguration,
     stall_threshold: Duration,
     telemetry: Telemetry,
     source: Arc<str>,
-) -> Result<impl HandlerMiddleware, ConsumerError> {
-    let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, &telemetry)?;
-    let timeout_middleware = TimeoutMiddleware::new(&config.timeout, stall_threshold)?;
-    let telemetry_middleware = TelemetryMiddleware::new(telemetry, source);
+) -> Result<impl HandlerMiddleware<Payload = P>, ConsumerError> {
+    let scheduler_middleware = SchedulerMiddleware::<P>::new(&config.scheduler, &telemetry)?;
+    let timeout_middleware = TimeoutMiddleware::<P>::new(&config.timeout, stall_threshold)?;
+    let telemetry_middleware = TelemetryMiddleware::<P>::new(telemetry, source);
 
     // Layer common middleware: telemetry -> timeout -> scheduler -> shutdown
     Ok(telemetry_middleware
         .layer(timeout_middleware)
         .layer(scheduler_middleware)
-        .layer(CancellationMiddleware))
+        .layer(CancellationMiddleware::<P>::new()))
 }
 
 /// Helper function to initialize a consumer with a trigger store provider.
 ///
 /// The provider creates per-partition stores with independent caches.
-fn initialize_consumer_with_provider<T, P>(
+fn initialize_consumer_with_provider<T, P, C>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
     trigger_provider: P,
     telemetry: &Telemetry,
     heartbeats: HeartbeatRegistry,
-) -> Result<ProsodyConsumer<serde_json::Value>, ConsumerError>
+) -> Result<ProsodyConsumer<C::Payload>, ConsumerError>
 where
     T: HandlerProvider,
-    T::Handler: EventHandler<Payload = serde_json::Value>,
+    T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
+    C: Codec,
+    C::Payload: crate::EventTypeExtract + Clone,
 {
     // Validate the configuration
     consumer_config.validate()?;
 
     // Initialize shared state
     let watermark_version: Arc<WatermarkVersion> = Arc::default();
-    let managers: Arc<Managers<serde_json::Value>> = Arc::default();
+    let managers: Arc<Managers<C::Payload>> = Arc::default();
     let shutdown: Arc<AtomicBool> = Arc::default();
     let telemetry_sender = telemetry.sender();
 
@@ -866,21 +873,21 @@ where
         })
         .transpose()?;
 
-    let (managers, runtime_state) =
-        initialize_consumer::<T, P, crate::codec::JsonCodec>(ConsumerInitParams {
-            config: consumer_config.clone(),
-            handler_provider,
-            trigger_provider,
-            watermark_version: watermark_version.clone(),
-            managers: managers.clone(),
-            allowed_events,
-            event_type_extractor: Some(|p: &serde_json::Value| {
-                p.get("type").and_then(serde_json::Value::as_str)
-            }),
-            telemetry: telemetry_sender,
-            shutdown: shutdown.clone(),
-            heartbeats: heartbeats.clone(),
-        })?;
+    let event_type_extractor: Option<fn(&C::Payload) -> Option<&str>> =
+        Some(<C::Payload as crate::EventTypeExtract>::event_type);
+
+    let (managers, runtime_state) = initialize_consumer::<T, P, C>(ConsumerInitParams {
+        config: consumer_config.clone(),
+        handler_provider,
+        trigger_provider,
+        watermark_version: watermark_version.clone(),
+        managers: managers.clone(),
+        allowed_events,
+        event_type_extractor,
+        telemetry: telemetry_sender,
+        shutdown: shutdown.clone(),
+        heartbeats: heartbeats.clone(),
+    })?;
 
     Ok(ProsodyConsumer {
         shutdown,
@@ -890,7 +897,10 @@ where
     })
 }
 
-impl ProsodyConsumer<serde_json::Value> {
+impl<P: Send + Sync + 'static> ProsodyConsumer<P>
+where
+    P: crate::EventTypeExtract + Clone,
+{
     /// Creates a new `ProsodyConsumer` with the given configuration and handler
     /// provider.
     ///
@@ -916,7 +926,7 @@ impl ProsodyConsumer<serde_json::Value> {
     /// - The hostname cannot be retrieved
     /// - The Kafka consumer cannot be created
     /// - The consumer fails to subscribe to the specified topics
-    pub async fn new<T>(
+    pub async fn new<T, C>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         handler_provider: T,
@@ -924,14 +934,15 @@ impl ProsodyConsumer<serde_json::Value> {
     ) -> Result<Self, ConsumerError>
     where
         T: HandlerProvider,
-        T::Handler: EventHandler<Payload = serde_json::Value>,
+        T::Handler: EventHandler<Payload = P>,
+        C: Codec<Payload = P>,
     {
         // Validate the configuration
         consumer_config.validate()?;
 
         // Initialize shared state
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
-        let managers: Arc<Managers<serde_json::Value>> = Arc::default();
+        let managers: Arc<Managers<P>> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
         let telemetry_sender = telemetry.sender();
         let heartbeats = HeartbeatRegistry::new(
@@ -950,12 +961,12 @@ impl ProsodyConsumer<serde_json::Value> {
             })
             .transpose()?;
 
-        let event_type_extractor: Option<fn(&serde_json::Value) -> Option<&str>> =
-            Some(|p: &serde_json::Value| p.get("type").and_then(serde_json::Value::as_str));
+        let event_type_extractor: Option<fn(&P) -> Option<&str>> =
+            Some(<P as crate::EventTypeExtract>::event_type);
 
         let (managers, runtime_state) = match trigger_store_config {
             TriggerStoreConfiguration::InMemory => {
-                initialize_consumer::<T, _, crate::codec::JsonCodec>(ConsumerInitParams {
+                initialize_consumer::<T, _, C>(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
                     trigger_provider: InMemoryTriggerStoreProvider::new(),
@@ -978,7 +989,7 @@ impl ProsodyConsumer<serde_json::Value> {
                     consumer_config.timer_spans,
                 )
                 .await?;
-                initialize_consumer::<T, _, crate::codec::JsonCodec>(ConsumerInitParams {
+                initialize_consumer::<T, _, C>(ConsumerInitParams {
                     config: consumer_config.clone(),
                     handler_provider,
                     trigger_provider,
@@ -1026,7 +1037,7 @@ impl ProsodyConsumer<serde_json::Value> {
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn pipeline_consumer<T>(
+    pub async fn pipeline_consumer<T, C>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         pipeline_config: PipelineMiddlewareConfiguration,
@@ -1035,7 +1046,9 @@ impl ProsodyConsumer<serde_json::Value> {
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler<Payload = serde_json::Value> + Clone + Send + Sync + 'static,
+        T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
+        C: Codec<Payload = P>,
+        P: crate::EventIdentity + Clone,
     {
         // Create both stores atomically - ensures trigger and defer stores match
         let stores = StorePair::new(
@@ -1052,7 +1065,7 @@ impl ProsodyConsumer<serde_json::Value> {
             dedup: dedup_config,
         } = pipeline_config;
         let monopolization_middleware =
-            MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
+            MonopolizationMiddleware::<P>::new(&monopolization_config, &telemetry)?;
         let heartbeats = HeartbeatRegistry::new(
             consumer_config.group_id.clone(),
             consumer_config.stall_threshold,
@@ -1070,14 +1083,14 @@ impl ProsodyConsumer<serde_json::Value> {
             defer_config,
             dedup_config,
             failure_tracker,
-            common_middleware: build_common_middleware(
+            common_middleware: build_common_middleware::<P>(
                 common_config,
                 consumer_config.stall_threshold,
                 telemetry.clone(),
                 Arc::from(consumer_config.group_id.as_str()),
             )?,
             monopolization_middleware,
-            retry_middleware: RetryMiddleware::new(retry_config)?,
+            retry_middleware: RetryMiddleware::<P>::new(retry_config)?,
             heartbeats,
             telemetry,
         };
@@ -1096,10 +1109,10 @@ impl ProsodyConsumer<serde_json::Value> {
                     &stack.consumer_config,
                     message_provider,
                     stack.failure_tracker.clone(),
-                    MemoryLoader::new(),
+                    MemoryLoader::<P>::new(),
                     &stack.telemetry,
                 )?;
-                stack.build(
+                stack.build::<T, _, _, _, _, _, C>(
                     message_defer_middleware,
                     timer_provider,
                     dedup_provider,
@@ -1113,7 +1126,7 @@ impl ProsodyConsumer<serde_json::Value> {
                 timer_provider,
                 dedup_provider,
             } => {
-                let loader = KafkaLoader::for_consumer(
+                let loader = KafkaLoader::<C>::for_consumer(
                     &stack.consumer_config,
                     &stack.defer_config,
                     &stack.heartbeats,
@@ -1127,7 +1140,7 @@ impl ProsodyConsumer<serde_json::Value> {
                     loader,
                     &stack.telemetry,
                 )?;
-                stack.build(
+                stack.build::<T, _, _, _, _, _, C>(
                     message_defer_middleware,
                     timer_provider,
                     dedup_provider,
@@ -1168,26 +1181,29 @@ impl ProsodyConsumer<serde_json::Value> {
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn low_latency_consumer<T>(
+    pub async fn low_latency_consumer<T, C>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         common_config: &CommonMiddlewareConfiguration,
-        producer: ProsodyProducer,
+        producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler<Payload = serde_json::Value> + Clone + Send + Sync + 'static,
+        T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
+        C: Codec<Payload = P>,
+        P: crate::EventIdentity + crate::TimerReplayPayload + Clone,
     {
         let LowLatencyMiddlewareConfiguration {
             retry: retry_config,
             failure_topic: topic_config,
         } = low_latency_config;
         let group_id = consumer_config.group_id.clone();
-        let retry_middleware = RetryMiddleware::new(retry_config)?;
-        let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
-        let common_middleware = build_common_middleware(
+        let retry_middleware = RetryMiddleware::<P>::new(retry_config)?;
+        let topic_middleware =
+            FailureTopicMiddleware::<C>::new(topic_config, group_id, producer)?;
+        let common_middleware = build_common_middleware::<P>(
             common_config,
             consumer_config.stall_threshold,
             telemetry.clone(),
@@ -1200,7 +1216,7 @@ impl ProsodyConsumer<serde_json::Value> {
             .layer(retry_middleware) // retry writing to the failure topic indefinitely
             .into_provider(handler);
 
-        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
+        Self::new::<_, C>(consumer_config, trigger_store_config, provider, telemetry).await
     }
 
     /// Creates a new `ProsodyConsumer` with logging middleware for failure
@@ -1225,7 +1241,7 @@ impl ProsodyConsumer<serde_json::Value> {
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub(crate) async fn best_effort_consumer<T>(
+    pub(crate) async fn best_effort_consumer<T, C>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         common_config: &CommonMiddlewareConfiguration,
@@ -1233,9 +1249,10 @@ impl ProsodyConsumer<serde_json::Value> {
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler<Payload = serde_json::Value> + Clone + Send + Sync + 'static,
+        T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
+        C: Codec<Payload = P>,
     {
-        let common_middleware = build_common_middleware(
+        let common_middleware = build_common_middleware::<P>(
             common_config,
             consumer_config.stall_threshold,
             telemetry.clone(),
@@ -1244,10 +1261,10 @@ impl ProsodyConsumer<serde_json::Value> {
 
         // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then log
         let provider = common_middleware
-            .layer(LogMiddleware)
+            .layer(LogMiddleware::<P>::new())
             .into_provider(handler);
 
-        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
+        Self::new::<_, C>(consumer_config, trigger_store_config, provider, telemetry).await
     }
 }
 

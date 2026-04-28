@@ -4,6 +4,8 @@
 use simd_json::serde::from_slice_with_buffers;
 use std::error::Error;
 
+use crate::{EventIdentity, EventTypeExtract, TimerReplayPayload};
+
 /// Wire-format abstraction for encoding and decoding message payloads.
 ///
 /// Implement this trait to plug in a custom serialization format. The codec
@@ -56,6 +58,41 @@ impl Codec for JsonCodec {
     fn serialize(&mut self, payload: &Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
         *buf = serde_json::to_vec(payload).map_err(JsonCodecError::Serde)?;
         Ok(())
+    }
+}
+
+impl EventIdentity for serde_json::Value {
+    /// Extracts the event ID from the JSON `"id"` field.
+    fn event_id(&self) -> Option<&str> {
+        self.get("id")?.as_str()
+    }
+}
+
+impl EventTypeExtract for serde_json::Value {
+    /// Extracts the event type from the JSON `"type"` field.
+    fn event_type(&self) -> Option<&str> {
+        self.get("type")?.as_str()
+    }
+}
+
+impl TimerReplayPayload for serde_json::Value {
+    fn timer_replay(key: &str, time: &str) -> Self {
+        serde_json::json!({ "key": key, "time": time })
+    }
+}
+
+/// Serializes a value to JSON into the provided buffer.
+///
+/// Uses `simd_json` on non-ARM targets and `serde_json` on ARM. Returns
+/// `true` on success and `false` if serialization fails.
+pub fn serialize_to_json<T: serde::Serialize>(value: &T, buf: &mut Vec<u8>) -> bool {
+    #[cfg(target_arch = "arm")]
+    {
+        serde_json::to_writer(buf as &mut Vec<u8>, value).is_ok()
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        simd_json::to_writer(buf as &mut Vec<u8>, value).is_ok()
     }
 }
 

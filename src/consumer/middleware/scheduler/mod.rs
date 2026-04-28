@@ -178,8 +178,9 @@ pub struct SchedulerConfiguration {
 ///
 /// Wraps handlers to enforce concurrency limits and priority-based dispatch.
 #[derive(Clone, Debug)]
-pub struct SchedulerMiddleware {
+pub struct SchedulerMiddleware<P = ()> {
     dispatcher: Dispatcher,
+    _payload: std::marker::PhantomData<fn() -> P>,
 }
 
 /// Provider that creates scheduled handlers for each partition.
@@ -242,7 +243,7 @@ impl SchedulerConfiguration {
     }
 }
 
-impl SchedulerMiddleware {
+impl<P> SchedulerMiddleware<P> {
     /// Creates a new scheduler middleware with the given configuration.
     ///
     /// # Errors
@@ -254,16 +255,25 @@ impl SchedulerMiddleware {
     ) -> Result<Self, SchedulerInitError> {
         config.validate()?;
         let dispatcher = Dispatcher::new(config, telemetry);
-        Ok(Self { dispatcher })
+        Ok(Self {
+            dispatcher,
+            _payload: std::marker::PhantomData,
+        })
     }
 }
 
-impl HandlerMiddleware for SchedulerMiddleware {
-    type Provider<T: FallibleHandlerProvider> = SchedulerProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware for SchedulerMiddleware<P> {
+    type Payload = P;
+
+    type Provider<T> = SchedulerProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         SchedulerProvider {
             provider,

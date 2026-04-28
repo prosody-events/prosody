@@ -29,7 +29,7 @@ use crate::producer::{
 use crate::propagator::new_propagator;
 use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use crate::telemetry::{EmitterError, Telemetry, spawn_telemetry_emitter};
-use crate::{Payload, Topic};
+use crate::{Codec, JsonCodec, Topic};
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
 use std::time::Duration;
@@ -72,17 +72,23 @@ pub struct ConsumerBuilders {
 
 /// A combined client that manages both producer and consumer operations.
 #[derive(Debug)]
-pub struct HighLevelClient<T> {
-    producer: ProsodyProducer,
+pub struct HighLevelClient<T, C: Codec = JsonCodec>
+where
+    C::Payload: crate::EventIdentity,
+{
+    producer: ProsodyProducer<C>,
     producer_config: ProducerConfiguration,
-    consumer: Mutex<ConsumerState<T>>,
+    consumer: Mutex<ConsumerState<T, C::Payload>>,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
 }
 
-impl<T> HighLevelClient<T> {
+impl<T, C: Codec> HighLevelClient<T, C>
+where
+    C::Payload: crate::EventIdentity,
+{
     /// Returns a reference to the internal `ProsodyProducer`.
-    pub fn producer(&self) -> &ProsodyProducer {
+    pub fn producer(&self) -> &ProsodyProducer<C> {
         &self.producer
     }
 
@@ -92,7 +98,7 @@ impl<T> HighLevelClient<T> {
     }
 
     /// Returns a view of the current consumer state.
-    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T> {
+    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, C::Payload> {
         ConsumerStateView(self.consumer.lock().await)
     }
 
@@ -154,7 +160,7 @@ impl<T> HighLevelClient<T> {
         let producer_config = producer_builder.build()?;
         let cloned_config = producer_config.clone();
         let telemetry = Telemetry::new();
-        let producer = match mode {
+        let producer: ProsodyProducer<C> = match mode {
             Mode::Pipeline => ProsodyProducer::pipeline_producer(cloned_config, telemetry.sender()),
             Mode::LowLatency => {
                 ProsodyProducer::low_latency_producer(cloned_config, telemetry.sender())
@@ -214,7 +220,7 @@ impl<T> HighLevelClient<T> {
         &self,
         topic: Topic,
         key: &str,
-        payload: &Payload,
+        payload: &C::Payload,
     ) -> Result<(), HighLevelClientError> {
         self.producer.send([], topic, key, payload).await?;
         Ok(())
@@ -234,7 +240,8 @@ impl<T> HighLevelClient<T> {
     /// - Consumer initialization fails.
     pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
     where
-        T: FallibleHandler<Payload = serde_json::Value> + Clone,
+        T: FallibleHandler<Payload = C::Payload> + Clone,
+        C::Payload: crate::EventTypeExtract + crate::TimerReplayPayload + Clone,
     {
         let mut guard = self.consumer.lock().await;
         let consumer_ref = &mut *guard;
@@ -262,7 +269,7 @@ impl<T> HighLevelClient<T> {
                 common,
                 trigger_store,
             } => {
-                ProsodyConsumer::pipeline_consumer(
+                ProsodyConsumer::pipeline_consumer::<_, C>(
                     consumer,
                     trigger_store,
                     PipelineMiddlewareConfiguration {
@@ -285,7 +292,7 @@ impl<T> HighLevelClient<T> {
                 trigger_store,
                 ..
             } => {
-                ProsodyConsumer::low_latency_consumer(
+                ProsodyConsumer::low_latency_consumer::<_, C>(
                     consumer,
                     trigger_store,
                     LowLatencyMiddlewareConfiguration {
@@ -305,7 +312,7 @@ impl<T> HighLevelClient<T> {
                 trigger_store,
                 ..
             } => {
-                ProsodyConsumer::best_effort_consumer(
+                ProsodyConsumer::best_effort_consumer::<_, C>(
                     consumer,
                     trigger_store,
                     common,
@@ -390,10 +397,13 @@ impl<T> HighLevelClient<T> {
 /// # Errors
 ///
 /// Returns a `HighLevelClientError` if any required topics are missing.
-fn check_topic_existence<S>(
-    producer: &ProsodyProducer,
-    consumer_state: &ConsumerState<S>,
-) -> Result<(), HighLevelClientError> {
+fn check_topic_existence<S, C: Codec, P: Send + Sync + 'static>(
+    producer: &ProsodyProducer<C>,
+    consumer_state: &ConsumerState<S, P>,
+) -> Result<(), HighLevelClientError>
+where
+    C::Payload: crate::EventIdentity,
+{
     let ConsumerState::Configured(mode_config) = &consumer_state else {
         return Ok(());
     };
@@ -417,10 +427,13 @@ fn check_topic_existence<S>(
 /// # Errors
 ///
 /// Returns a `ProducerError` if metadata fetching fails.
-fn missing_topics(
-    producer: &ProsodyProducer,
+fn missing_topics<C: Codec>(
+    producer: &ProsodyProducer<C>,
     mut topics: Vec<Topic>,
-) -> Result<Vec<Topic>, ProducerError> {
+) -> Result<Vec<Topic>, ProducerError>
+where
+    C::Payload: crate::EventIdentity,
+{
     const TIMEOUT: Duration = Duration::from_mins(1);
     let metadata = producer.kafka_client().fetch_metadata(None, TIMEOUT)?;
 

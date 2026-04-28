@@ -83,9 +83,10 @@
 //! # #[derive(Clone)]
 //! # struct MyHandler;
 //! # impl FallibleHandler for MyHandler {
+//! #     type Payload = serde_json::Value;
 //! #     type Error = Infallible;
 //! #     type Output = ();
-//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -109,13 +110,15 @@
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 
+use std::marker::PhantomData;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use derive_builder::Builder;
-use serde_json::json;
 use thiserror::Error;
 use tracing::{debug, error, info};
 use validator::{Validate, ValidationErrors};
 
+use crate::Codec;
 use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
@@ -126,7 +129,7 @@ use crate::consumer::middleware::{
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
 use crate::util::from_env;
-use crate::{Partition, Topic, Topic as TopicType};
+use crate::{EventIdentity, Partition, TimerReplayPayload, Topic, Topic as TopicType};
 
 /// Configuration for failure topic middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -156,13 +159,14 @@ impl FailureTopicConfiguration {
 
 /// Middleware that sends failed messages to a designated failure topic.
 #[derive(Clone, Debug)]
-pub struct FailureTopicMiddleware {
+pub struct FailureTopicMiddleware<Enc: Codec = crate::JsonCodec> {
     config: FailureTopicConfiguration,
-    producer: ProsodyProducer,
+    producer: ProsodyProducer<Enc>,
     group_id: String,
+    _codec: PhantomData<fn() -> Enc>,
 }
 
-impl FailureTopicMiddleware {
+impl<Enc: Codec> FailureTopicMiddleware<Enc> {
     /// Creates a new [`FailureTopicMiddleware`] with the given configuration.
     ///
     /// # Arguments
@@ -187,33 +191,36 @@ impl FailureTopicMiddleware {
     pub fn new(
         config: FailureTopicConfiguration,
         group_id: String,
-        producer: ProsodyProducer,
+        producer: ProsodyProducer<Enc>,
     ) -> Result<Self, ValidationErrors> {
         config.validate()?;
         Ok(Self {
             config,
             producer,
             group_id,
+            _codec: PhantomData,
         })
     }
 }
 
 /// A provider that wraps handlers with failure topic functionality.
 #[derive(Clone, Debug)]
-pub struct FailureTopicProvider<T> {
+pub struct FailureTopicProvider<T, Enc: Codec> {
     provider: T,
     config: FailureTopicConfiguration,
-    producer: ProsodyProducer,
+    producer: ProsodyProducer<Enc>,
     group_id: String,
+    _codec: PhantomData<fn() -> Enc>,
 }
 
 /// A handler wrapped with failure topic functionality.
 #[derive(Clone, Debug)]
-pub struct FailureTopicHandler<T> {
+pub struct FailureTopicHandler<T, Enc: Codec> {
     topic: Topic,
-    producer: ProsodyProducer,
+    producer: ProsodyProducer<Enc>,
     group_id: String,
     handler: T,
+    _codec: PhantomData<fn() -> Enc>,
 }
 
 /// Outcome of a [`FailureTopicHandler`] dispatch.
@@ -236,27 +243,40 @@ pub enum FailureTopicOutput<O, E> {
     Routed(E),
 }
 
-impl HandlerMiddleware for FailureTopicMiddleware {
-    type Provider<T: FallibleHandlerProvider> = FailureTopicProvider<T>;
+impl<Enc> HandlerMiddleware for FailureTopicMiddleware<Enc>
+where
+    Enc: Codec,
+    Enc::Payload: TimerReplayPayload + EventIdentity,
+{
+    type Payload = Enc::Payload;
+
+    type Provider<T> = FailureTopicProvider<T, Enc>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Enc::Payload>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Enc::Payload>,
     {
         FailureTopicProvider {
             provider,
             config: self.config.clone(),
             producer: self.producer.clone(),
             group_id: self.group_id.clone(),
+            _codec: PhantomData,
         }
     }
 }
 
-impl<T> FallibleHandlerProvider for FailureTopicProvider<T>
+impl<T, Enc> FallibleHandlerProvider for FailureTopicProvider<T, Enc>
 where
     T: FallibleHandlerProvider,
+    Enc: Codec<Payload = <T::Handler as FallibleHandler>::Payload>,
+    Enc::Payload: TimerReplayPayload + EventIdentity,
 {
-    type Handler = FailureTopicHandler<T::Handler>;
+    type Handler = FailureTopicHandler<T::Handler, Enc>;
 
     fn handler_for_partition(&self, topic: TopicType, partition: Partition) -> Self::Handler {
         FailureTopicHandler {
@@ -264,13 +284,16 @@ where
             producer: self.producer.clone(),
             group_id: self.group_id.clone(),
             handler: self.provider.handler_for_partition(topic, partition),
+            _codec: PhantomData,
         }
     }
 }
 
-impl<T> FallibleHandler for FailureTopicHandler<T>
+impl<T, Enc> FallibleHandler for FailureTopicHandler<T, Enc>
 where
     T: FallibleHandler,
+    Enc: Codec<Payload = T::Payload>,
+    Enc::Payload: TimerReplayPayload + EventIdentity,
 {
     type Error = FailureTopicError<T::Error>;
     /// Output for the DLQ middleware. The inner handler always ran when this
@@ -287,6 +310,7 @@ where
     ///   invariant. We must not collapse this to `()` — see the trait-level
     ///   docs.
     type Output = FailureTopicOutput<T::Output, T::Error>;
+    type Payload = T::Payload;
 
     /// Handles a message, attempting to process it with the wrapped handler.
     /// If processing fails with a non-Terminal error, sends the message to
@@ -318,7 +342,7 @@ where
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -440,7 +464,7 @@ where
         ];
 
         // Build payload for replaying the timer
-        let payload = json!({ "key": key_str, "time": timestamp });
+        let payload = Enc::Payload::timer_replay(key_str, &timestamp);
 
         // Send the failed timer event to the failure topic. On failure,
         // surface BOTH the inner handler error and the producer error so the
@@ -679,11 +703,12 @@ mod tests {
     impl FallibleHandler for ProbeInner {
         type Error = TestError;
         type Output = u64;
+        type Payload = serde_json::Value;
 
         async fn on_message<C>(
             &self,
             _context: C,
-            _message: ConsumerMessage,
+            _message: ConsumerMessage<Self::Payload>,
             _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
@@ -724,7 +749,9 @@ mod tests {
 
     /// Constructs a `FailureTopicHandler` over a probe inner using a mock
     /// producer (no real Kafka connection required).
-    fn make_handler(inner: ProbeInner) -> color_eyre::Result<FailureTopicHandler<ProbeInner>> {
+    fn make_handler(
+        inner: ProbeInner,
+    ) -> color_eyre::Result<FailureTopicHandler<ProbeInner, crate::JsonCodec>> {
         // The mock-flag short-circuits the bootstrap-server lookup, but the
         // builder still validates the field, so we supply a sentinel value
         // along with a non-empty source system.
@@ -740,6 +767,7 @@ mod tests {
             producer,
             group_id: "group".to_owned(),
             handler: inner,
+            _codec: PhantomData,
         })
     }
 

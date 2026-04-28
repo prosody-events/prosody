@@ -71,12 +71,16 @@ struct DeduplicationShared<P> {
 /// Wraps the inner middleware stack and checks incoming messages against a
 /// two-tier cache (local + persistent store). Duplicates are filtered out
 /// before reaching the handler.
+///
+/// The `Q` parameter is the handler payload type (defaults to `()` so
+/// the struct can be named without turbofish when the payload is inferred).
 #[derive(Clone, Debug)]
-pub struct DeduplicationMiddleware<P: DeduplicationStoreProvider> {
+pub struct DeduplicationMiddleware<P: DeduplicationStoreProvider, Q = ()> {
     shared: Arc<DeduplicationShared<P>>,
+    _payload: std::marker::PhantomData<fn() -> Q>,
 }
 
-impl<P: DeduplicationStoreProvider> DeduplicationMiddleware<P> {
+impl<P: DeduplicationStoreProvider, Q> DeduplicationMiddleware<P, Q> {
     /// Creates a new middleware, or `None` if `cache_capacity == 0`.
     ///
     /// # Errors
@@ -101,16 +105,25 @@ impl<P: DeduplicationStoreProvider> DeduplicationMiddleware<P> {
                 store_provider,
                 cache,
             }),
+            _payload: std::marker::PhantomData,
         }))
     }
 }
 
-impl<P: DeduplicationStoreProvider> HandlerMiddleware for DeduplicationMiddleware<P> {
-    type Provider<T: FallibleHandlerProvider> = DeduplicationProvider<T, P>;
+impl<P: DeduplicationStoreProvider, Q: Send + Sync + 'static + EventIdentity> HandlerMiddleware
+    for DeduplicationMiddleware<P, Q>
+{
+    type Payload = Q;
+
+    type Provider<T> = DeduplicationProvider<T, P>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Q>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Q>,
     {
         DeduplicationProvider {
             inner: provider,
@@ -129,6 +142,7 @@ pub struct DeduplicationProvider<T, P: DeduplicationStoreProvider> {
 impl<T, P> FallibleHandlerProvider for DeduplicationProvider<T, P>
 where
     T: FallibleHandlerProvider,
+    <T::Handler as FallibleHandler>::Payload: EventIdentity,
     P: DeduplicationStoreProvider,
 {
     type Handler = DeduplicationHandler<T::Handler, P::Store>;
@@ -167,6 +181,7 @@ pub struct DeduplicationHandler<T, S: DeduplicationStore> {
 impl<T, S> DeduplicationHandler<T, S>
 where
     T: FallibleHandler,
+    T::Payload: EventIdentity,
     S: DeduplicationStore,
 {
     /// Computes the dedup UUID for a message, incorporating the `event_id`
@@ -200,6 +215,7 @@ where
 impl<T, S> FallibleHandler for DeduplicationHandler<T, S>
 where
     T: FallibleHandler,
+    T::Payload: EventIdentity,
     S: DeduplicationStore,
 {
     type Error = DeduplicationError<T::Error>;

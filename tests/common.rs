@@ -439,10 +439,12 @@ pub struct TestHandler {
 }
 
 impl EventHandler for TestHandler {
+    type Payload = Value;
+
     async fn on_message<C>(
         &self,
         _context: C,
-        message: UncommittedMessage,
+        message: UncommittedMessage<Value>,
         _demand_type: DemandType,
     ) where
         C: EventContext,

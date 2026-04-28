@@ -18,10 +18,12 @@ use tracing::info;
 ///
 /// This type provides a view into the current state of the consumer,
 /// allowing read-only access to the underlying `ConsumerState`.
-pub struct ConsumerStateView<'a, T>(pub(crate) MutexGuard<'a, ConsumerState<T>>);
+pub struct ConsumerStateView<'a, T, P: Send + Sync + 'static>(
+    pub(crate) MutexGuard<'a, ConsumerState<T, P>>,
+);
 
-impl<T> Deref for ConsumerStateView<'_, T> {
-    type Target = ConsumerState<T>;
+impl<T, P: Send + Sync + 'static> Deref for ConsumerStateView<'_, T, P> {
+    type Target = ConsumerState<T, P>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -30,7 +32,7 @@ impl<T> Deref for ConsumerStateView<'_, T> {
 
 /// Represents the current state of the consumer.
 #[derive(Debug, Default)]
-pub enum ConsumerState<T> {
+pub enum ConsumerState<T, P: Send + Sync + 'static> {
     /// The consumer is not yet configured.
     #[default]
     Unconfigured,
@@ -41,7 +43,7 @@ pub enum ConsumerState<T> {
     /// The consumer is actively running.
     Running {
         /// The active Prosody consumer instance.
-        consumer: ProsodyConsumer,
+        consumer: ProsodyConsumer<P>,
         /// The configuration used for this consumer.
         config: ModeConfiguration,
         /// The handler for processing messages.
@@ -49,7 +51,7 @@ pub enum ConsumerState<T> {
     },
 }
 
-impl<T> ConsumerState<T> {
+impl<T, P: Send + Sync + 'static> ConsumerState<T, P> {
     /// Builds a new `ConsumerState` based on the provided configuration.
     ///
     /// # Arguments
@@ -72,7 +74,7 @@ impl<T> ConsumerState<T> {
     }
 }
 
-impl<T> Display for ConsumerState<T> {
+impl<T, P: Send + Sync + 'static> Display for ConsumerState<T, P> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let state = match self {
             ConsumerState::Unconfigured => "unconfigured",

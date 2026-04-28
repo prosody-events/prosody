@@ -31,11 +31,7 @@ use tracing::warn;
 use validator::Validate;
 use whoami::hostname;
 
-#[cfg(target_arch = "arm")]
-use serde_json as json;
-
-#[cfg(not(target_arch = "arm"))]
-use simd_json as json;
+use crate::codec::serialize_to_json;
 
 /// Environment variable for the telemetry Kafka topic.
 const PROSODY_TELEMETRY_TOPIC: &str = "PROSODY_TELEMETRY_TOPIC";
@@ -218,7 +214,7 @@ fn serialize_timer(
         trace_state: data.trace_state.as_deref(),
     };
 
-    json::to_writer(buf as &mut Vec<u8>, &payload).is_ok()
+    serialize_to_json(&payload, buf)
 }
 
 fn serialize_message(
@@ -265,7 +261,7 @@ fn serialize_message(
         trace_state: data.trace_state.as_deref(),
     };
 
-    json::to_writer(buf as &mut Vec<u8>, &payload).is_ok()
+    serialize_to_json(&payload, buf)
 }
 
 fn serialize_message_sent(buf: &mut Vec<u8>, data: &MessageSentEvent, hostname: &str) -> bool {
@@ -284,7 +280,7 @@ fn serialize_message_sent(buf: &mut Vec<u8>, data: &MessageSentEvent, hostname: 
         trace_state: data.trace_state.as_deref(),
     };
 
-    json::to_writer(buf as &mut Vec<u8>, &payload).is_ok()
+    serialize_to_json(&payload, buf)
 }
 
 /// Serializes a `Data` variant into a thread-local buffer and returns

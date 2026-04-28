@@ -201,9 +201,12 @@ impl RetryConfiguration {
 
 /// Middleware that retries failed message processing attempts.
 #[derive(Clone, Debug)]
-pub struct RetryMiddleware(RetryConfiguration);
+pub struct RetryMiddleware<P = ()> {
+    config: RetryConfiguration,
+    _payload: std::marker::PhantomData<fn() -> P>,
+}
 
-impl RetryMiddleware {
+impl<P> RetryMiddleware<P> {
     /// Creates a new `RetryMiddleware` with the given configuration.
     ///
     /// # Arguments
@@ -221,7 +224,10 @@ impl RetryMiddleware {
     /// `RetryConfiguration` struct fails.
     pub fn new(config: RetryConfiguration) -> Result<Self, ValidationErrors> {
         config.validate()?;
-        Ok(Self(config))
+        Ok(Self {
+            config,
+            _payload: std::marker::PhantomData,
+        })
     }
 }
 
@@ -534,16 +540,22 @@ fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, discard_suffix: &str
     }
 }
 
-impl HandlerMiddleware for RetryMiddleware {
-    type Provider<T: FallibleHandlerProvider> = RetryProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware for RetryMiddleware<P> {
+    type Payload = P;
+
+    type Provider<T> = RetryProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         RetryProvider {
             provider,
-            config: self.0.clone(),
+            config: self.config.clone(),
         }
     }
 }

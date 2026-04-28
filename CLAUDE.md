@@ -16,6 +16,12 @@ Development patterns and practices for Prosody: distributed Kafka consumer with 
 - Never suppress warnings with `#[allow(...)]` without permission
 - Run: `cargo clippy`, `cargo clippy --tests`, `cargo doc`, `cargo +nightly fmt`
 
+**JSON codec isolation:**
+
+- `serde_json`, `simd_json`, and the `json!` macro are **banned** in all production code outside `src/codec.rs`
+- Tests may use `serde_json::Value` as a concrete payload type — that is fine
+- Any `use serde_json` or `use simd_json` import in non-test, non-codec production code is a bug
+
 **Debugging Discipline:**
 
 - Never claim "found the issue" without rigorous proof

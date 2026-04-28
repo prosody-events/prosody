@@ -22,8 +22,9 @@ use std::sync::Arc;
 ///
 /// * `P` - Timer defer store provider
 /// * `D` - Deferral decider (default: [`FailureTracker`])
+/// * `Q` - Handler payload type (payload-agnostic; defaults to `()`)
 #[derive(Clone)]
-pub struct TimerDeferMiddleware<P, D = FailureTracker>
+pub struct TimerDeferMiddleware<P, D = FailureTracker, Q = ()>
 where
     P: TimerDeferStoreProvider,
     D: DeferralDecider,
@@ -33,9 +34,10 @@ where
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
+    _payload: std::marker::PhantomData<fn() -> Q>,
 }
 
-impl<P, D> TimerDeferMiddleware<P, D>
+impl<P, D, Q> TimerDeferMiddleware<P, D, Q>
 where
     P: TimerDeferStoreProvider,
     D: DeferralDecider,
@@ -55,6 +57,7 @@ where
             decider,
             consumer_group: Arc::from(consumer_config.group_id.as_str()),
             telemetry: telemetry.clone(),
+            _payload: std::marker::PhantomData,
         }
     }
 }
@@ -74,16 +77,23 @@ where
     telemetry: Telemetry,
 }
 
-impl<P, D> HandlerMiddleware for TimerDeferMiddleware<P, D>
+impl<P, D, Q> HandlerMiddleware for TimerDeferMiddleware<P, D, Q>
 where
     P: TimerDeferStoreProvider,
     D: DeferralDecider,
+    Q: Send + Sync + 'static,
 {
-    type Provider<T: FallibleHandlerProvider> = TimerDeferProvider<T, P, D>;
+    type Payload = Q;
+
+    type Provider<T> = TimerDeferProvider<T, P, D>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Q>;
 
     fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Q>,
     {
         TimerDeferProvider {
             inner_provider,

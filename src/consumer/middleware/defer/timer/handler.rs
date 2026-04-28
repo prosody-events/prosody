@@ -97,11 +97,12 @@ where
     /// Encodes the inner's outcome; drives apply-hook routing. See
     /// [`TimerDeferOutput`].
     type Output = TimerDeferOutput<T::Output, T::Error>;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<T::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

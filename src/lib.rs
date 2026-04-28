@@ -225,7 +225,6 @@ use ::tracing::info;
 use fixedstr::Flexstr;
 use internment::Intern;
 use rdkafka::mocking::MockCluster;
-use serde_json::Value;
 use std::env;
 use std::mem::forget;
 use std::sync::{Arc, LazyLock};
@@ -311,12 +310,6 @@ pub type Key = Arc<str>;
 /// Uses an Arc so the consumer group can be cheaply cloned across components.
 pub type ConsumerGroup = Arc<str>;
 
-/// A JSON value containing a Kafka message's content.
-///
-/// Stores message payloads as arbitrary JSON to support flexible message
-/// formats.
-pub type Payload = Value;
-
 /// An offset position within a Kafka partition.
 pub type Offset = i64;
 
@@ -374,17 +367,27 @@ pub trait EventIdentity {
     fn event_id(&self) -> Option<&str>;
 }
 
-impl EventIdentity for serde_json::Value {
-    /// Extracts the event ID from the JSON `"id"` field.
+/// Provides access to the event type field within a payload.
+///
+/// Used to extract event type identifiers for event filtering and routing.
+/// Implementations should extract the type from their internal representation.
+pub trait EventTypeExtract {
+    /// Returns the event type string if present.
+    fn event_type(&self) -> Option<&str>;
+}
+
+/// Constructs a payload suitable for replaying a timer event.
+///
+/// Used by failure-topic middleware to build a synthetic payload when routing
+/// timer failures to a DLQ topic.
+pub trait TimerReplayPayload: Sized {
+    /// Creates a payload representing a timer replay event.
     ///
-    /// Returns the string value of the `"id"` field if it exists and is a
-    /// string, otherwise `None`.
-    fn event_id(&self) -> Option<&str> {
-        match self.get("id")? {
-            Value::String(value) => Some(value.as_str()),
-            _ => None,
-        }
-    }
+    /// # Arguments
+    ///
+    /// * `key` - The timer key.
+    /// * `time` - The timer timestamp as an RFC 3339 string.
+    fn timer_replay(key: &str, time: &str) -> Self;
 }
 
 /// Manages processing resources (spans and permits) for deterministic cleanup.

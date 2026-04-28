@@ -117,11 +117,12 @@ pub struct MonopolizationConfiguration {
 
 /// Middleware that detects and prevents key-level execution monopolies.
 #[derive(Clone)]
-pub struct MonopolizationMiddleware {
+pub struct MonopolizationMiddleware<P = ()> {
     monopolization_threshold: f64,
     window_duration: Duration,
     reference_instant: Instant,
     key_intervals: Arc<Cache<TopicPartitionKey, IntervalSet<u64>, UnitWeighter, RandomState>>,
+    _payload: std::marker::PhantomData<fn() -> P>,
 }
 
 /// Provider that creates monopolization handlers for each partition.
@@ -155,7 +156,7 @@ impl MonopolizationConfiguration {
     }
 }
 
-impl MonopolizationMiddleware {
+impl<P> MonopolizationMiddleware<P> {
     /// Creates a new monopolization middleware with the given configuration.
     ///
     /// Returns `None` if monopolization detection is disabled in the config.
@@ -207,16 +208,23 @@ impl MonopolizationMiddleware {
             window_duration,
             reference_instant,
             key_intervals,
+            _payload: std::marker::PhantomData,
         }))
     }
 }
 
-impl HandlerMiddleware for MonopolizationMiddleware {
-    type Provider<T: FallibleHandlerProvider> = MonopolizationProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware for MonopolizationMiddleware<P> {
+    type Payload = P;
+
+    type Provider<T> = MonopolizationProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         MonopolizationProvider {
             provider,

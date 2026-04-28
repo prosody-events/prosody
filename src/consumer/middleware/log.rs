@@ -87,8 +87,26 @@ use crate::timers::Trigger;
 use crate::{Partition, Topic};
 
 /// Middleware that logs failures during message processing.
-#[derive(Copy, Clone, Debug)]
-pub struct LogMiddleware;
+#[derive(Clone, Debug)]
+pub struct LogMiddleware<P = ()> {
+    _payload: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<P> Default for LogMiddleware<P> {
+    fn default() -> Self {
+        Self {
+            _payload: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P> LogMiddleware<P> {
+    /// Creates a new `LogMiddleware`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// A provider that logs failures during message processing.
 #[derive(Clone, Debug)]
@@ -105,12 +123,18 @@ pub struct LogHandler<T> {
     handler: T,
 }
 
-impl HandlerMiddleware for LogMiddleware {
-    type Provider<T: FallibleHandlerProvider> = LogProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware for LogMiddleware<P> {
+    type Payload = P;
+
+    type Provider<T> = LogProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         LogProvider { provider }
     }

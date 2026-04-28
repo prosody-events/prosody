@@ -68,8 +68,9 @@ pub struct TimeoutConfiguration {
 
 /// Middleware that applies fixed timeouts to handler execution.
 #[derive(Clone, Debug)]
-pub struct TimeoutMiddleware {
+pub struct TimeoutMiddleware<P = ()> {
     timeout: Duration,
+    _payload: std::marker::PhantomData<fn() -> P>,
 }
 
 /// Provider that creates timeout handlers for each partition.
@@ -164,7 +165,7 @@ impl TimeoutConfiguration {
     }
 }
 
-impl TimeoutMiddleware {
+impl<P> TimeoutMiddleware<P> {
     /// Creates a new timeout middleware with the given configuration.
     ///
     /// # Arguments
@@ -191,16 +192,25 @@ impl TimeoutMiddleware {
             "Timeout middleware initialized"
         );
 
-        Ok(Self { timeout })
+        Ok(Self {
+            timeout,
+            _payload: std::marker::PhantomData,
+        })
     }
 }
 
-impl HandlerMiddleware for TimeoutMiddleware {
-    type Provider<T: FallibleHandlerProvider> = TimeoutProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware for TimeoutMiddleware<P> {
+    type Payload = P;
+
+    type Provider<T> = TimeoutProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         TimeoutProvider {
             provider,

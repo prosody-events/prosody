@@ -26,6 +26,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use validator::Validate;
 use xxhash_rust::xxh3::Xxh3Default;
 
+use crate::codec::JsonCodec;
 use crate::producer::injector::RecordInjector;
 use crate::propagator::new_propagator;
 use crate::telemetry::sender::TelemetrySender;
@@ -33,13 +34,8 @@ use crate::util::{
     DEFAULT_IDEMPOTENCE_CACHE_SIZE, from_env, from_env_with_fallback,
     from_option_duration_env_with_fallback, from_vec_env,
 };
-use crate::{EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, Payload, SOURCE_SYSTEM_HEADER, Topic};
-
-#[cfg(target_arch = "arm")]
-use serde_json as json;
-
-#[cfg(not(target_arch = "arm"))]
-use simd_json as json;
+use crate::{Codec, EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, SOURCE_SYSTEM_HEADER, Topic};
+use std::marker::PhantomData;
 use tracing::field::debug;
 use tracing::log::info;
 use whoami::hostname;
@@ -150,7 +146,7 @@ impl ProducerConfiguration {
 /// - Best-effort: Optimized for throughput with reasonable timeout defaults
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct ProsodyProducer {
+pub struct ProsodyProducer<C: Codec = JsonCodec> {
     /// Timeout for send operations.
     send_timeout: Timeout,
 
@@ -171,9 +167,12 @@ pub struct ProsodyProducer {
     /// Telemetry sender for emitting producer events.
     #[educe(Debug(ignore))]
     telemetry: TelemetrySender,
+
+    /// Codec marker (variance-correct phantom; does not add `C: Send + Sync`).
+    _codec: PhantomData<fn() -> C>,
 }
 
-impl Clone for ProsodyProducer {
+impl<C: Codec> Clone for ProsodyProducer<C> {
     fn clone(&self) -> Self {
         Self {
             send_timeout: self.send_timeout,
@@ -182,11 +181,12 @@ impl Clone for ProsodyProducer {
             idempotence_cache: self.idempotence_cache.clone(),
             propagator: new_propagator(),
             telemetry: self.telemetry.clone(),
+            _codec: PhantomData,
         }
     }
 }
 
-impl ProsodyProducer {
+impl<C: Codec> ProsodyProducer<C> {
     /// Creates a new `ProsodyProducer` instance.
     ///
     /// # Arguments
@@ -237,6 +237,7 @@ impl ProsodyProducer {
             idempotence_cache,
             propagator: new_propagator(),
             telemetry,
+            _codec: PhantomData,
         })
     }
 
@@ -348,10 +349,11 @@ impl ProsodyProducer {
         headers: H,
         topic: Topic,
         key: &str,
-        payload: &Payload,
+        payload: &C::Payload,
     ) -> Result<(), ProducerError>
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
+        C::Payload: EventIdentity,
     {
         let maybe_event_id = payload.event_id();
         let key: Key = key.into();
@@ -373,8 +375,11 @@ impl ProsodyProducer {
             _ => None,
         };
 
-        // Serialize the payload to JSON
-        let serialized = json::to_vec(&payload)?;
+        // Serialize the payload using the codec
+        let mut serialized = Vec::new();
+        C::default()
+            .serialize(payload, &mut serialized)
+            .map_err(|e| ProducerError::Serialization(Box::new(e)))?;
         Span::current().record("payload_size", serialized.len());
 
         // Build the Kafka record

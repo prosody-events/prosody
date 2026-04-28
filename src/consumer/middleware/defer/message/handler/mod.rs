@@ -80,7 +80,7 @@ pub enum MessageDeferOutput<O, E> {
 /// * `L` - Message loader (default: [`KafkaLoader`])
 /// * `D` - Deferral decider (default: [`FailureTracker`])
 #[derive(Clone)]
-pub struct MessageDeferMiddleware<P, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferMiddleware<P, L = KafkaLoader<crate::codec::JsonCodec>, D = FailureTracker>
 where
     P: MessageDeferStoreProvider,
     L: MessageLoader,
@@ -137,7 +137,7 @@ where
 
 /// Creates [`MessageDeferHandler`]s for each partition.
 #[derive(Clone)]
-pub struct MessageDeferProvider<T, P, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferProvider<T, P, L = KafkaLoader<crate::codec::JsonCodec>, D = FailureTracker>
 where
     P: MessageDeferStoreProvider,
     L: MessageLoader,
@@ -154,7 +154,7 @@ where
 
 /// Per-partition handler wrapping an inner handler with defer logic.
 #[derive(Clone)]
-pub struct MessageDeferHandler<T, M, L = KafkaLoader, D = FailureTracker>
+pub struct MessageDeferHandler<T, M, L = KafkaLoader<crate::codec::JsonCodec>, D = FailureTracker>
 where
     M: MessageDeferStore,
     L: MessageLoader,
@@ -176,12 +176,19 @@ where
     P: MessageDeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
+    L::Payload: crate::EventIdentity,
 {
-    type Provider<T: FallibleHandlerProvider> = MessageDeferProvider<T, P, L, D>;
+    type Payload = L::Payload;
+
+    type Provider<T> = MessageDeferProvider<T, P, L, D>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = L::Payload>;
 
     fn with_provider<T>(&self, inner_provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = L::Payload>,
     {
         MessageDeferProvider {
             inner_provider,
@@ -198,10 +205,11 @@ where
 impl<T, P, L, D> FallibleHandlerProvider for MessageDeferProvider<T, P, L, D>
 where
     T: FallibleHandlerProvider,
-    T::Handler: FallibleHandler,
+    T::Handler: FallibleHandler<Payload = L::Payload>,
     P: MessageDeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
+    L::Payload: crate::EventIdentity,
 {
     type Handler = MessageDeferHandler<T::Handler, P::Store, L, D>;
 
@@ -233,7 +241,7 @@ where
 
 impl<T, M, L, D> MessageDeferHandler<T, M, L, D>
 where
-    T: FallibleHandler,
+    T: FallibleHandler<Payload = L::Payload>,
     M: MessageDeferStore,
     L: MessageLoader + 'static,
     D: DeferralDecider,
@@ -459,7 +467,7 @@ where
         message_key: &Key,
         offset: Offset,
         retry_count: u32,
-    ) -> DeferResult<Option<ConsumerMessage>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<ConsumerMessage<T::Payload>>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -507,7 +515,7 @@ where
         offset: Offset,
         retry_count: u32,
         error: L::Error,
-    ) -> DeferResult<Option<ConsumerMessage>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<ConsumerMessage<T::Payload>>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
     {
@@ -601,7 +609,7 @@ where
         message_key: &Key,
         offset: Offset,
         retry_count: u32,
-        message: ConsumerMessage,
+        message: ConsumerMessage<T::Payload>,
     ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
         C: EventContext,
@@ -675,20 +683,22 @@ where
 
 impl<T, M, L, D> FallibleHandler for MessageDeferHandler<T, M, L, D>
 where
-    T: FallibleHandler,
+    T: FallibleHandler<Payload = L::Payload>,
     M: MessageDeferStore,
     L: MessageLoader + 'static,
     D: DeferralDecider,
+    L::Payload: crate::EventIdentity,
 {
     type Error = DeferError<M::Error, T::Error, L::Error>;
     /// Encodes the inner's outcome; drives apply-hook routing. See
     /// [`MessageDeferOutput`] and the module-level apply-hooks section.
     type Output = MessageDeferOutput<T::Output, T::Error>;
+    type Payload = T::Payload;
 
     async fn on_message<C>(
         &self,
         context: C,
-        message: ConsumerMessage,
+        message: ConsumerMessage<T::Payload>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

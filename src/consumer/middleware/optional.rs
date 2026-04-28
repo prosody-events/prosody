@@ -39,11 +39,17 @@ impl<M> HandlerMiddleware for Option<M>
 where
     M: HandlerMiddleware,
 {
-    type Provider<T: FallibleHandlerProvider> = OptionProvider<M::Provider<T>, T>;
+    type Payload = M::Payload;
+
+    type Provider<T> = OptionProvider<M::Provider<T>, T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Self::Payload>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Self::Payload>,
     {
         match self {
             Some(middleware) => OptionProvider::Enabled(middleware.with_provider(provider)),

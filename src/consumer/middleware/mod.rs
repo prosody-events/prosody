@@ -208,15 +208,28 @@ pub trait FallibleHandlerProvider: Send + Sync + 'static {
 
 /// Defines middleware for message processing.
 pub trait HandlerMiddleware {
+    /// The payload type this middleware operates on.
+    ///
+    /// Payload-agnostic middleware (retry, log, cancellation, etc.) expose this
+    /// as a generic parameter so they work with any handler payload.
+    /// Payload-aware middleware (defer, failure topic) fix this to their
+    /// internal payload type.
+    type Payload: Send + Sync + 'static;
+
     /// The provider type that wraps another fallible handler provider.
     ///
-    /// The bound `Handler: FallibleHandler<Payload = T::Handler::Payload>`
-    /// ensures every middleware implementation preserves the payload type
-    /// end-to-end, which is required for typed message delivery through the
-    /// composed stack.
-    type Provider<T: FallibleHandlerProvider>: FallibleHandlerProvider<
-        Handler: FallibleHandler<Payload = <T::Handler as FallibleHandler>::Payload>,
-    >;
+    /// The `where` clause constrains `T` so that only providers whose handler
+    /// payload matches `Self::Payload` can be wrapped. The associated-type
+    /// bound `Handler: FallibleHandler<Payload = Self::Payload>` propagates
+    /// the payload through the chain so callers can layer middleware over an
+    /// `impl HandlerMiddleware<Payload = P>` opaque return without losing the
+    /// payload identity.
+    type Provider<T>: FallibleHandlerProvider<
+        Handler: FallibleHandler<Payload = Self::Payload>,
+    >
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Self::Payload>;
 
     /// Wraps a handler provider with this middleware.
     ///
@@ -230,7 +243,8 @@ pub trait HandlerMiddleware {
     /// A new provider that implements `FallibleHandlerProvider`.
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
-        T: FallibleHandlerProvider;
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Self::Payload>;
 
     /// Transforms this middleware stack into a provider by consuming the stack
     /// and terminating it with a fallible handler wrapped in a
@@ -271,13 +285,13 @@ pub trait HandlerMiddleware {
     /// # }
     /// # let config = RetryConfiguration::builder().build().unwrap();
     /// # let my_handler = MyHandler;
-    /// let middleware = RetryMiddleware::new(config).unwrap();
+    /// let middleware = RetryMiddleware::<serde_json::Value>::new(config).unwrap();
     /// let provider = middleware.into_provider(my_handler);
     /// ```
     fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
     where
         Self: Sized,
-        H: FallibleHandler + Clone + Send + Sync + 'static,
+        H: FallibleHandler<Payload = Self::Payload> + Clone + Send + Sync + 'static,
     {
         self.with_provider(FallibleCloneProvider::new(handler))
     }
@@ -321,9 +335,9 @@ pub trait HandlerMiddleware {
     /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
     /// # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
     /// # let retry_config = RetryConfiguration::builder().build().unwrap();
-    /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
-    /// # let middle_middleware = CancellationMiddleware;
-    /// # let outer_middleware = CancellationMiddleware;
+    /// # let inner_middleware = RetryMiddleware::<serde_json::Value>::new(retry_config).unwrap();
+    /// # let middle_middleware = CancellationMiddleware::<serde_json::Value>;
+    /// # let outer_middleware = CancellationMiddleware::<serde_json::Value>;
     /// // Builds from inner to outer: inner -> middle -> outer
     /// let middleware = inner_middleware
     ///     .layer(middle_middleware) // middle wraps inner
@@ -335,6 +349,7 @@ pub trait HandlerMiddleware {
     fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self>
     where
         Self: Sized,
+        T: HandlerMiddleware<Payload = Self::Payload>,
     {
         ComposedMiddleware(outer_middleware, self)
     }
@@ -496,12 +511,10 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// Must match the codec's `Payload` type so the consumer pipeline can
     /// deliver typed messages. Set to `serde_json::Value` for JSON consumers.
     ///
-    /// The [`crate::EventIdentity`] bound enables payload-aware middleware
-    /// (e.g. deduplication) to derive stable per-event identifiers from
-    /// the payload without additional where clauses at every use site.
-    /// `serde_json::Value` satisfies this bound, so JSON consumers require
-    /// no changes.
-    type Payload: crate::EventIdentity + Send + Sync + 'static;
+    /// Payload-specific middleware (e.g. deduplication) adds `EventIdentity`
+    /// locally via a where clause on its impl, rather than requiring all
+    /// payloads to satisfy `EventIdentity`.
+    type Payload: Send + Sync + 'static;
 
     /// Error type returned by [`Self::on_message`] / [`Self::on_timer`].
     ///
@@ -751,13 +764,19 @@ pub trait FallibleEventHandler: FallibleHandler {
 impl<M1, M2> HandlerMiddleware for ComposedMiddleware<M1, M2>
 where
     M1: HandlerMiddleware,
-    M2: HandlerMiddleware,
+    M2: HandlerMiddleware<Payload = M1::Payload>,
 {
-    type Provider<T: FallibleHandlerProvider> = M1::Provider<M2::Provider<T>>;
+    type Payload = M1::Payload;
+
+    type Provider<T> = M1::Provider<M2::Provider<T>>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Self::Payload>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = Self::Payload>,
     {
         // Apply the first middleware to the result of applying the second middleware
         // This matches Tower's pattern where M1 (outer) wraps M2 (inner)

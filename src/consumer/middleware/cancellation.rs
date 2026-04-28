@@ -91,8 +91,26 @@ use crate::timers::Trigger;
 use crate::{Partition, Topic};
 
 /// Middleware that checks cancellation state before invoking the handler.
-#[derive(Clone, Copy, Debug)]
-pub struct CancellationMiddleware;
+#[derive(Clone, Debug)]
+pub struct CancellationMiddleware<P = ()> {
+    _payload: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<P> Default for CancellationMiddleware<P> {
+    fn default() -> Self {
+        Self {
+            _payload: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P> CancellationMiddleware<P> {
+    /// Creates a new `CancellationMiddleware`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// Provider that wraps handlers with cancellation checks.
 #[derive(Clone, Debug)]
@@ -112,12 +130,18 @@ impl<T> CancellationHandler<T> {
     }
 }
 
-impl HandlerMiddleware for CancellationMiddleware {
-    type Provider<T: FallibleHandlerProvider> = CancellationProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware for CancellationMiddleware<P> {
+    type Payload = P;
+
+    type Provider<T> = CancellationProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         CancellationProvider { provider }
     }

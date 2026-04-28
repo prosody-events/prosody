@@ -94,9 +94,10 @@ use std::sync::Arc;
 
 /// Middleware that records telemetry events during message processing.
 #[derive(Clone, Debug)]
-pub struct TelemetryMiddleware {
+pub struct TelemetryMiddleware<P = ()> {
     telemetry: Telemetry,
     source: Arc<str>,
+    _payload: std::marker::PhantomData<fn() -> P>,
 }
 
 /// A provider that records telemetry events during message processing.
@@ -118,7 +119,7 @@ pub struct TelemetryHandler<T> {
     source: Arc<str>,
 }
 
-impl TelemetryMiddleware {
+impl<P> TelemetryMiddleware<P> {
     /// Creates a new `TelemetryMiddleware` with the provided telemetry system.
     ///
     /// # Arguments
@@ -127,16 +128,26 @@ impl TelemetryMiddleware {
     /// * `source` - The consumer `group_id` used as source identifier in events
     #[must_use]
     pub fn new(telemetry: Telemetry, source: Arc<str>) -> Self {
-        Self { telemetry, source }
+        Self {
+            telemetry,
+            source,
+            _payload: std::marker::PhantomData,
+        }
     }
 }
 
-impl HandlerMiddleware for TelemetryMiddleware {
-    type Provider<T: FallibleHandlerProvider> = TelemetryProvider<T>;
+impl<P: Send + Sync + 'static> HandlerMiddleware for TelemetryMiddleware<P> {
+    type Payload = P;
+
+    type Provider<T> = TelemetryProvider<T>
+    where
+        T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         TelemetryProvider {
             provider,
