@@ -241,7 +241,7 @@ where
     pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone,
-        C::Payload: crate::EventType + crate::TimerReplayPayload + Clone,
+        C::Payload: crate::EventType + Clone,
     {
         let mut guard = self.consumer.lock().await;
         let consumer_ref = &mut *guard;

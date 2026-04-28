@@ -377,20 +377,6 @@ pub trait EventType {
     fn event_type(&self) -> Option<&str>;
 }
 
-/// Constructs a payload suitable for replaying a timer event.
-///
-/// Used by failure-topic middleware to build a synthetic payload when routing
-/// timer failures to a DLQ topic.
-pub trait TimerReplayPayload: Sized {
-    /// Creates a payload representing a timer replay event.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The timer key.
-    /// * `time` - The timer timestamp as an RFC 3339 string.
-    fn timer_replay(key: &str, time: &str) -> Self;
-}
-
 /// Manages processing resources (spans and permits) for deterministic cleanup.
 ///
 /// Ensures tracing spans and semaphore permits are released immediately when

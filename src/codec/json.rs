@@ -5,7 +5,7 @@ use simd_json::serde::from_slice_with_buffers;
 use std::cell::RefCell;
 
 use crate::codec::Codec;
-use crate::{EventIdentity, EventType, TimerReplayPayload};
+use crate::{EventIdentity, EventType};
 
 /// JSON codec using `serde_json` (ARM) or `simd_json` (non-ARM).
 ///
@@ -63,12 +63,6 @@ impl EventType for serde_json::Value {
     /// Extracts the event type from the JSON `"type"` field.
     fn event_type(&self) -> Option<&str> {
         self.get("type")?.as_str()
-    }
-}
-
-impl TimerReplayPayload for serde_json::Value {
-    fn timer_replay(key: &str, time: &str) -> Self {
-        serde_json::json!({ "key": key, "time": time })
     }
 }
 

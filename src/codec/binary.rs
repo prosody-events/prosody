@@ -8,8 +8,7 @@ use std::cell::RefCell;
 use std::error::Error as StdError;
 
 use crate::codec::Codec;
-use crate::codec::serialize_to_json;
-use crate::{EventIdentity, EventType, TimerReplayPayload};
+use crate::{EventIdentity, EventType};
 
 /// Metadata extracted from a binary payload at decode time.
 ///
@@ -92,28 +91,6 @@ impl EventIdentity for BinaryPayload {
 impl EventType for BinaryPayload {
     fn event_type(&self) -> Option<&str> {
         self.event_type.as_deref()
-    }
-}
-
-impl TimerReplayPayload for BinaryPayload {
-    /// Builds a synthetic timer-replay payload by JSON-encoding `{"key",
-    /// "time"}` into [`BinaryPayload::bytes`]. Mirrors the
-    /// [`JsonCodec`](crate::JsonCodec) shape so a consumer routing
-    /// failure-topic timer replays through a binary pipeline produces bytes
-    /// that downstream JSON-aware tooling can read.
-    fn timer_replay(key: &str, time: &str) -> Self {
-        #[derive(serde::Serialize)]
-        struct Replay<'a> {
-            key: &'a str,
-            time: &'a str,
-        }
-        let mut bytes = Vec::new();
-        let _ = serialize_to_json(&Replay { key, time }, &mut bytes);
-        Self {
-            bytes,
-            event_id: None,
-            event_type: None,
-        }
     }
 }
 

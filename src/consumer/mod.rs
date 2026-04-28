@@ -177,7 +177,7 @@ use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
-use crate::{Codec, EventIdentity, EventType, JsonCodec, TimerReplayPayload};
+use crate::{Codec, EventIdentity, EventType, JsonCodec};
 use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 use ahash::HashMap;
 use aho_corasick::{AhoCorasick, StartKind};
@@ -1179,7 +1179,7 @@ where
     ) -> Result<Self, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        C::Payload: EventIdentity + TimerReplayPayload + Clone,
+        C::Payload: EventIdentity + Clone,
     {
         let LowLatencyMiddlewareConfiguration {
             retry: retry_config,

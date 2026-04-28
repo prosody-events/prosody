@@ -1,17 +1,21 @@
 //! Dead letter queue (failure topic) middleware.
 //!
-//! Routes failed messages to a designated failure topic for later analysis or
-//! reprocessing. All non-terminal errors (both [`ErrorCategory::Permanent`] and
-//! [`ErrorCategory::Transient`]) are sent to the failure topic. Only
+//! Routes failed **messages** to a designated failure topic for later analysis
+//! or reprocessing. All non-terminal errors (both [`ErrorCategory::Permanent`]
+//! and [`ErrorCategory::Transient`]) are sent to the failure topic. Only
 //! [`ErrorCategory::Terminal`] errors bypass the DLQ and propagate immediately,
 //! as they indicate partition shutdown rather than recoverable failures.
+//!
+//! Timer failures are **not** routed to the failure topic. The inner handler's
+//! result is forwarded as-is, so timer errors propagate to outer middleware
+//! unchanged.
 //!
 //! # Execution Order
 //!
 //! **Request Path:**
 //! 1. Pass control to inner middleware layers
 //!
-//! **Response Path:**
+//! **Response Path (messages):**
 //! 1. Receive result from inner layers
 //! 2. **If error is terminal**: Pass through unchanged as
 //!    [`FailureTopicError::Handler`] (triggers partition shutdown)
@@ -32,21 +36,23 @@
 //!
 //! # Apply hooks (work-centric invariant)
 //!
-//! This middleware is a **rescue** layer: when the inner handler fails with a
-//! non-Terminal error, the failure is routed to the DLQ instead of bubbling
-//! up. The inner handler is invoked **at most once per call** to
-//! [`FallibleHandler::on_message`] / [`FallibleHandler::on_timer`] on this
-//! middleware; the subsequent `producer.send` to the failure topic is a
-//! Kafka producer call, **not** another inner-handler invocation. The
-//! per-invocation invariant — exactly one of `inner.after_commit` /
-//! `inner.after_abort` fires per inner invocation that ran and returned —
-//! is upheld: every arm of `after_commit` / `after_abort` forwards exactly
-//! one call to the inner.
+//! For messages, this middleware is a **rescue** layer: when the inner handler
+//! fails with a non-Terminal error, the failure is routed to the DLQ instead
+//! of bubbling up. The inner handler is invoked **at most once per call** to
+//! [`FallibleHandler::on_message`] on this middleware; the subsequent
+//! `producer.send` to the failure topic is a Kafka producer call, **not**
+//! another inner-handler invocation. The per-invocation invariant — exactly
+//! one of `inner.after_commit` / `inner.after_abort` fires per inner
+//! invocation that ran and returned — is upheld: every arm of `after_commit`
+//! / `after_abort` forwards exactly one call to the inner.
+//!
+//! For timers, [`FallibleHandler::on_timer`] is a transparent passthrough; the
+//! apply-hook routing for `Inner` / `Handler` variants applies unchanged.
 //!
 //! The inner's [`FallibleHandler::after_commit`] /
 //! [`FallibleHandler::after_abort`] hook still has to fire — and the choice
-//! of hook is driven by whether the inner will see this same logical
-//! message/timer again:
+//! of hook is driven by whether the inner will see this same logical message
+//! again:
 //!
 //! - **Inner Ok**: forward `after_commit(Ok(inner_output))` /
 //!   `after_abort(Ok(inner_output))` per the outer's marker outcome.
@@ -110,7 +116,7 @@
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::SecondsFormat;
 use derive_builder::Builder;
 use thiserror::Error;
 use tracing::{debug, error, info};
@@ -127,7 +133,7 @@ use crate::consumer::middleware::{
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
 use crate::util::from_env;
-use crate::{EventIdentity, Partition, TimerReplayPayload, Topic, Topic as TopicType};
+use crate::{EventIdentity, Partition, Topic, Topic as TopicType};
 
 /// Configuration for failure topic middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -230,17 +236,19 @@ pub struct FailureTopicHandler<T, Enc: Codec> {
 pub enum FailureTopicOutput<O, E> {
     /// Inner handler ran and returned `Ok(output)`.
     Inner(O),
-    /// Inner handler returned a non-Terminal `Err(_)`; the failure was
-    /// rescued by routing the message/timer to the failure topic, which the
-    /// producer accepted. The inner's typed error is preserved here so the
-    /// apply hook can fire `inner.after_commit(Err(_))`.
+    /// Inner handler returned a non-Terminal `Err(_)` for a message; the
+    /// failure was rescued by routing to the failure topic, which the producer
+    /// accepted. Only produced by [`FailureTopicHandler::on_message`] —
+    /// timer dispatch never produces this variant. The inner's typed error
+    /// is preserved here so the apply hook can fire
+    /// `inner.after_commit(Err(_))`.
     Routed(E),
 }
 
 impl<Enc> HandlerMiddleware<Enc::Payload> for FailureTopicMiddleware<Enc>
 where
     Enc: Codec,
-    Enc::Payload: TimerReplayPayload + EventIdentity,
+    Enc::Payload: EventIdentity,
 {
     type Provider<T>
         = FailureTopicProvider<T, Enc>
@@ -266,7 +274,7 @@ impl<T, Enc> FallibleHandlerProvider for FailureTopicProvider<T, Enc>
 where
     T: FallibleHandlerProvider,
     Enc: Codec<Payload = <T::Handler as FallibleHandler>::Payload>,
-    Enc::Payload: TimerReplayPayload + EventIdentity,
+    Enc::Payload: EventIdentity,
 {
     type Handler = FailureTopicHandler<T::Handler, Enc>;
 
@@ -284,7 +292,7 @@ impl<T, Enc> FallibleHandler for FailureTopicHandler<T, Enc>
 where
     T: FallibleHandler,
     Enc: Codec<Payload = T::Payload>,
-    Enc::Payload: TimerReplayPayload + EventIdentity,
+    Enc::Payload: EventIdentity,
 {
     type Error = FailureTopicError<T::Error>;
     /// Output for the DLQ middleware. The inner handler always ran when this
@@ -407,6 +415,11 @@ where
         }
     }
 
+    /// Timers bypass the failure topic entirely: the inner handler's
+    /// result is forwarded as-is. `Ok(o)` becomes
+    /// [`FailureTopicOutput::Inner`]; any error is wrapped in
+    /// [`FailureTopicError::Handler`] so it propagates to outer middleware
+    /// without classification rewriting.
     async fn on_timer<C>(
         &self,
         context: C,
@@ -416,60 +429,9 @@ where
     where
         C: EventContext,
     {
-        // Attempt to process the timer with the wrapped handler
-        let error = match self
-            .handler
-            .on_timer(context, timer.clone(), demand_type)
-            .await
-        {
-            Ok(output) => return Ok(FailureTopicOutput::Inner(output)),
-            Err(error) => error,
-        };
-
-        // Terminal errors abort and propagate
-        if matches!(error.classify_error(), ErrorCategory::Terminal) {
-            info!(
-                key = %timer.key,
-                "terminal condition encountered while handling timer: {error:#}; aborting"
-            );
-            return Err(FailureTopicError::Handler(error));
-        }
-
-        // Extract the timer key as &str to avoid moving the Flexstr
-        let key_str = timer.key.as_ref();
-        // Log the error and prepare to send to failure topic
-        error!(
-            key = key_str,
-            "failed to process timer: {error:#}; sending to {}", self.topic
-        );
-
-        // Prepare headers for the failure timer message
-        let timestamp: DateTime<Utc> = timer.time.into();
-        let timestamp = timestamp.to_rfc3339_opts(SecondsFormat::Secs, true);
-
-        let headers = [
-            ("source-kind", "timer"),
-            ("source-timestamp", timestamp.as_str()),
-            ("source-group-id", &self.group_id),
-            ("source-error", &error.to_string()),
-        ];
-
-        // Build payload for replaying the timer
-        let payload = Enc::Payload::timer_replay(key_str, &timestamp);
-
-        // Send the failed timer event to the failure topic. On failure,
-        // surface BOTH the inner handler error and the producer error so the
-        // inner's apply hook can fire on outer-retry re-dispatch.
-        match self
-            .producer
-            .send(headers, self.topic, key_str, &payload)
-            .await
-        {
-            Ok(()) => Ok(FailureTopicOutput::Routed(error)),
-            Err(producer) => Err(FailureTopicError::DlqSendFailed {
-                inner: error,
-                producer,
-            }),
+        match self.handler.on_timer(context, timer, demand_type).await {
+            Ok(output) => Ok(FailureTopicOutput::Inner(output)),
+            Err(error) => Err(FailureTopicError::Handler(error)),
         }
     }
 
