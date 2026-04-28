@@ -78,13 +78,12 @@ where
     telemetry: Telemetry,
 }
 
-impl<S, D, P> HandlerMiddleware for TimerDeferMiddleware<S, D, P>
+impl<S, D, P> HandlerMiddleware<P> for TimerDeferMiddleware<S, D, P>
 where
     S: TimerDeferStoreProvider,
     D: DeferralDecider,
     P: Send + Sync + 'static,
 {
-    type Payload = P;
     type Provider<T>
         = TimerDeferProvider<T, S, D>
     where

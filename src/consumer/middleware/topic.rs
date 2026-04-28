@@ -110,8 +110,6 @@
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 //! [`ErrorCategory::Terminal`]: crate::consumer::middleware::ErrorCategory::Terminal
 
-use std::marker::PhantomData;
-
 use chrono::{DateTime, SecondsFormat, Utc};
 use derive_builder::Builder;
 use thiserror::Error;
@@ -163,7 +161,6 @@ pub struct FailureTopicMiddleware<Enc: Codec = crate::JsonCodec> {
     config: FailureTopicConfiguration,
     producer: ProsodyProducer<Enc>,
     group_id: String,
-    _codec: PhantomData<fn() -> Enc>,
 }
 
 impl<Enc: Codec> FailureTopicMiddleware<Enc> {
@@ -198,7 +195,6 @@ impl<Enc: Codec> FailureTopicMiddleware<Enc> {
             config,
             producer,
             group_id,
-            _codec: PhantomData,
         })
     }
 }
@@ -210,7 +206,6 @@ pub struct FailureTopicProvider<T, Enc: Codec> {
     config: FailureTopicConfiguration,
     producer: ProsodyProducer<Enc>,
     group_id: String,
-    _codec: PhantomData<fn() -> Enc>,
 }
 
 /// A handler wrapped with failure topic functionality.
@@ -220,7 +215,6 @@ pub struct FailureTopicHandler<T, Enc: Codec> {
     producer: ProsodyProducer<Enc>,
     group_id: String,
     handler: T,
-    _codec: PhantomData<fn() -> Enc>,
 }
 
 /// Outcome of a [`FailureTopicHandler`] dispatch.
@@ -243,12 +237,11 @@ pub enum FailureTopicOutput<O, E> {
     Routed(E),
 }
 
-impl<Enc> HandlerMiddleware for FailureTopicMiddleware<Enc>
+impl<Enc> HandlerMiddleware<Enc::Payload> for FailureTopicMiddleware<Enc>
 where
     Enc: Codec,
     Enc::Payload: TimerReplayPayload + EventIdentity,
 {
-    type Payload = Enc::Payload;
     type Provider<T>
         = FailureTopicProvider<T, Enc>
     where
@@ -265,7 +258,6 @@ where
             config: self.config.clone(),
             producer: self.producer.clone(),
             group_id: self.group_id.clone(),
-            _codec: PhantomData,
         }
     }
 }
@@ -284,7 +276,6 @@ where
             producer: self.producer.clone(),
             group_id: self.group_id.clone(),
             handler: self.provider.handler_for_partition(topic, partition),
-            _codec: PhantomData,
         }
     }
 }
@@ -767,7 +758,6 @@ mod tests {
             producer,
             group_id: "group".to_owned(),
             handler: inner,
-            _codec: PhantomData,
         })
     }
 

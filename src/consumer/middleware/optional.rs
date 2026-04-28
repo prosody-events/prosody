@@ -35,21 +35,21 @@ use crate::consumer::middleware::{
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
 
-impl<M> HandlerMiddleware for Option<M>
+impl<P, M> HandlerMiddleware<P> for Option<M>
 where
-    M: HandlerMiddleware,
+    P: Send + Sync + 'static,
+    M: HandlerMiddleware<P>,
 {
-    type Payload = M::Payload;
     type Provider<T>
         = OptionProvider<M::Provider<T>, T>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Self::Payload>;
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Self::Payload>,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         match self {
             Some(middleware) => OptionProvider::Enabled(middleware.with_provider(provider)),

@@ -25,7 +25,6 @@
 //! trivially upheld.
 
 use derive_builder::Builder;
-use std::marker::PhantomData;
 use std::time::Duration;
 use thiserror::Error;
 use validator::{Validate, ValidationErrors};
@@ -179,9 +178,8 @@ pub struct SchedulerConfiguration {
 ///
 /// Wraps handlers to enforce concurrency limits and priority-based dispatch.
 #[derive(Clone, Debug)]
-pub struct SchedulerMiddleware<P = ()> {
+pub struct SchedulerMiddleware {
     dispatcher: Dispatcher,
-    _payload: PhantomData<fn() -> P>,
 }
 
 /// Provider that creates scheduled handlers for each partition.
@@ -244,7 +242,7 @@ impl SchedulerConfiguration {
     }
 }
 
-impl<P> SchedulerMiddleware<P> {
+impl SchedulerMiddleware {
     /// Creates a new scheduler middleware with the given configuration.
     ///
     /// # Errors
@@ -256,15 +254,11 @@ impl<P> SchedulerMiddleware<P> {
     ) -> Result<Self, SchedulerInitError> {
         config.validate()?;
         let dispatcher = Dispatcher::new(config, telemetry);
-        Ok(Self {
-            dispatcher,
-            _payload: PhantomData,
-        })
+        Ok(Self { dispatcher })
     }
 }
 
-impl<P: Send + Sync + 'static> HandlerMiddleware for SchedulerMiddleware<P> {
-    type Payload = P;
+impl<P: Send + Sync + 'static> HandlerMiddleware<P> for SchedulerMiddleware {
     type Provider<T>
         = SchedulerProvider<T>
     where

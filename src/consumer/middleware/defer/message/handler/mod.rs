@@ -77,27 +77,27 @@ pub enum MessageDeferOutput<O, E> {
 ///
 /// # Type Parameters
 ///
-/// * `P` - Message defer store provider
+/// * `S` - Message defer store provider
 /// * `L` - Message loader (default: [`KafkaLoader`])
 /// * `D` - Deferral decider (default: [`FailureTracker`])
 #[derive(Clone)]
-pub struct MessageDeferMiddleware<P, L = KafkaLoader<JsonCodec>, D = FailureTracker>
+pub struct MessageDeferMiddleware<S, L = KafkaLoader<JsonCodec>, D = FailureTracker>
 where
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     config: DeferConfiguration,
     loader: L,
-    provider: P,
+    provider: S,
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
 }
 
-impl<P, L> MessageDeferMiddleware<P, L, FailureTracker>
+impl<S, L> MessageDeferMiddleware<S, L, FailureTracker>
 where
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader,
 {
     /// Creates middleware with a caller-supplied loader and a
@@ -116,7 +116,7 @@ where
     pub fn new(
         config: DeferConfiguration,
         consumer_config: &ConsumerConfiguration,
-        provider: P,
+        provider: S,
         decider: FailureTracker,
         loader: L,
         telemetry: &Telemetry,
@@ -138,16 +138,16 @@ where
 
 /// Creates [`MessageDeferHandler`]s for each partition.
 #[derive(Clone)]
-pub struct MessageDeferProvider<T, P, L = KafkaLoader<JsonCodec>, D = FailureTracker>
+pub struct MessageDeferProvider<T, S, L = KafkaLoader<JsonCodec>, D = FailureTracker>
 where
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader,
     D: DeferralDecider,
 {
     inner_provider: T,
     config: DeferConfiguration,
     loader: L,
-    store_provider: P,
+    store_provider: S,
     decider: D,
     consumer_group: ConsumerGroup,
     telemetry: Telemetry,
@@ -172,16 +172,15 @@ where
     pub(crate) source: Arc<str>,
 }
 
-impl<P, L, D> HandlerMiddleware for MessageDeferMiddleware<P, L, D>
+impl<S, L, D> HandlerMiddleware<L::Payload> for MessageDeferMiddleware<S, L, D>
 where
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
     L::Payload: crate::EventIdentity,
 {
-    type Payload = L::Payload;
     type Provider<T>
-        = MessageDeferProvider<T, P, L, D>
+        = MessageDeferProvider<T, S, L, D>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = L::Payload>;
@@ -203,16 +202,16 @@ where
     }
 }
 
-impl<T, P, L, D> FallibleHandlerProvider for MessageDeferProvider<T, P, L, D>
+impl<T, S, L, D> FallibleHandlerProvider for MessageDeferProvider<T, S, L, D>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler<Payload = L::Payload>,
-    P: MessageDeferStoreProvider,
+    S: MessageDeferStoreProvider,
     L: MessageLoader + 'static,
     D: DeferralDecider,
     L::Payload: crate::EventIdentity,
 {
-    type Handler = MessageDeferHandler<T::Handler, P::Store, L, D>;
+    type Handler = MessageDeferHandler<T::Handler, S::Store, L, D>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let store = self.store_provider.create_store(

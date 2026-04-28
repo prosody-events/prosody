@@ -154,6 +154,7 @@ use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Error as IoError;
+use std::marker::PhantomData;
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
@@ -206,28 +207,25 @@ pub trait FallibleHandlerProvider: Send + Sync + 'static {
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler;
 }
 
-/// Defines middleware for message processing.
-pub trait HandlerMiddleware {
-    /// The payload type this middleware operates on.
-    ///
-    /// Payload-agnostic middleware (retry, log, cancellation, etc.) expose this
-    /// as a generic parameter so they work with any handler payload.
-    /// Payload-aware middleware (defer, failure topic) fix this to their
-    /// internal payload type.
-    type Payload: Send + Sync + 'static;
-
+/// Defines middleware for message processing over a payload type `P`.
+///
+/// Payload-agnostic middleware (retry, log, cancellation, etc.) implement
+/// `HandlerMiddleware<P>` for all `P`. Payload-aware middleware (defer,
+/// failure topic, deduplication) implement it only for their bound payload
+/// type.
+pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// The provider type that wraps another fallible handler provider.
     ///
     /// The `where` clause constrains `T` so that only providers whose handler
-    /// payload matches `Self::Payload` can be wrapped. The associated-type
-    /// bound `Handler: FallibleHandler<Payload = Self::Payload>` propagates
-    /// the payload through the chain so callers can layer middleware over an
-    /// `impl HandlerMiddleware<Payload = P>` opaque return without losing the
-    /// payload identity.
-    type Provider<T>: FallibleHandlerProvider<Handler: FallibleHandler<Payload = Self::Payload>>
+    /// payload matches `P` can be wrapped. The associated-type bound
+    /// `Handler: FallibleHandler<Payload = P>` propagates the payload through
+    /// the chain so callers can layer middleware over an
+    /// `impl HandlerMiddleware<P>` opaque return without losing the payload
+    /// identity.
+    type Provider<T>: FallibleHandlerProvider<Handler: FallibleHandler<Payload = P>>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Self::Payload>;
+        T::Handler: FallibleHandler<Payload = P>;
 
     /// Wraps a handler provider with this middleware.
     ///
@@ -242,7 +240,7 @@ pub trait HandlerMiddleware {
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Self::Payload>;
+        T::Handler: FallibleHandler<Payload = P>;
 
     /// Transforms this middleware stack into a provider by consuming the stack
     /// and terminating it with a fallible handler wrapped in a
@@ -283,13 +281,13 @@ pub trait HandlerMiddleware {
     /// # }
     /// # let config = RetryConfiguration::builder().build().unwrap();
     /// # let my_handler = MyHandler;
-    /// let middleware = RetryMiddleware::<serde_json::Value>::new(config).unwrap();
-    /// let provider = middleware.into_provider(my_handler);
+    /// let middleware = RetryMiddleware::new(config).unwrap();
+    /// let provider = HandlerMiddleware::<serde_json::Value>::into_provider(middleware, my_handler);
     /// ```
     fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
     where
         Self: Sized,
-        H: FallibleHandler<Payload = Self::Payload> + Clone + Send + Sync + 'static,
+        H: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
     {
         self.with_provider(FallibleCloneProvider::new(handler))
     }
@@ -333,23 +331,24 @@ pub trait HandlerMiddleware {
     /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
     /// # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
     /// # let retry_config = RetryConfiguration::builder().build().unwrap();
-    /// # let inner_middleware = RetryMiddleware::<serde_json::Value>::new(retry_config).unwrap();
-    /// # let middle_middleware = CancellationMiddleware::<serde_json::Value>;
-    /// # let outer_middleware = CancellationMiddleware::<serde_json::Value>;
+    /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
+    /// # let middle_middleware = CancellationMiddleware;
+    /// # let outer_middleware = CancellationMiddleware;
     /// // Builds from inner to outer: inner -> middle -> outer
-    /// let middleware = inner_middleware
-    ///     .layer(middle_middleware) // middle wraps inner
-    ///     .layer(outer_middleware); // outer wraps middle+inner
+    /// let middleware = HandlerMiddleware::<serde_json::Value>::layer(
+    ///     HandlerMiddleware::<serde_json::Value>::layer(inner_middleware, middle_middleware),
+    ///     outer_middleware,
+    /// );
     ///
     /// // Request:  outer → middle → inner → handler
     /// // Response: handler → inner → middle → outer
     /// ```
-    fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self>
+    fn layer<T>(self, outer_middleware: T) -> ComposedMiddleware<T, Self, P>
     where
         Self: Sized,
-        T: HandlerMiddleware<Payload = Self::Payload>,
+        T: HandlerMiddleware<P>,
     {
-        ComposedMiddleware(outer_middleware, self)
+        ComposedMiddleware(outer_middleware, self, PhantomData)
     }
 }
 
@@ -709,8 +708,14 @@ pub trait FallibleHandler: Send + Sync + 'static {
 }
 
 /// A composition of two middleware components.
+///
+/// The `P` payload parameter is carried as a phantom so that, once the chain is
+/// anchored to a specific payload type at the first `.layer()` call, the type
+/// stays fixed through subsequent chain operations — eliminating the
+/// `HandlerMiddleware<_>` inference ambiguity that would otherwise arise from
+/// payload-agnostic middleware impls.
 #[derive(Clone, Debug)]
-pub struct ComposedMiddleware<M1, M2>(M1, M2);
+pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<P>);
 
 /// Provides default `EventHandler` implementation for types that implement
 /// `FallibleHandler`.
@@ -759,22 +764,22 @@ pub trait FallibleEventHandler: FallibleHandler {
     fn on_timer_error(&self, _error: &Self::Error) {}
 }
 
-impl<M1, M2> HandlerMiddleware for ComposedMiddleware<M1, M2>
+impl<P, M1, M2> HandlerMiddleware<P> for ComposedMiddleware<M1, M2, P>
 where
-    M1: HandlerMiddleware,
-    M2: HandlerMiddleware<Payload = M1::Payload>,
+    P: Send + Sync + 'static,
+    M1: HandlerMiddleware<P>,
+    M2: HandlerMiddleware<P>,
 {
-    type Payload = M1::Payload;
     type Provider<T>
         = M1::Provider<M2::Provider<T>>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Self::Payload>;
+        T::Handler: FallibleHandler<Payload = P>;
 
     fn with_provider<T>(&self, provider: T) -> Self::Provider<T>
     where
         T: FallibleHandlerProvider,
-        T::Handler: FallibleHandler<Payload = Self::Payload>,
+        T::Handler: FallibleHandler<Payload = P>,
     {
         // Apply the first middleware to the result of applying the second middleware
         // This matches Tower's pattern where M1 (outer) wraps M2 (inner)

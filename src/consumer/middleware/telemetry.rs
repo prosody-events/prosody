@@ -90,15 +90,13 @@ use crate::telemetry::event::TimerEventType;
 use crate::telemetry::{Telemetry, partition::TelemetryPartitionSender};
 use crate::timers::Trigger;
 use crate::{Partition, Topic};
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Middleware that records telemetry events during message processing.
 #[derive(Clone, Debug)]
-pub struct TelemetryMiddleware<P = ()> {
+pub struct TelemetryMiddleware {
     telemetry: Telemetry,
     source: Arc<str>,
-    _payload: PhantomData<fn() -> P>,
 }
 
 /// A provider that records telemetry events during message processing.
@@ -120,7 +118,7 @@ pub struct TelemetryHandler<T> {
     source: Arc<str>,
 }
 
-impl<P> TelemetryMiddleware<P> {
+impl TelemetryMiddleware {
     /// Creates a new `TelemetryMiddleware` with the provided telemetry system.
     ///
     /// # Arguments
@@ -129,16 +127,11 @@ impl<P> TelemetryMiddleware<P> {
     /// * `source` - The consumer `group_id` used as source identifier in events
     #[must_use]
     pub fn new(telemetry: Telemetry, source: Arc<str>) -> Self {
-        Self {
-            telemetry,
-            source,
-            _payload: PhantomData,
-        }
+        Self { telemetry, source }
     }
 }
 
-impl<P: Send + Sync + 'static> HandlerMiddleware for TelemetryMiddleware<P> {
-    type Payload = P;
+impl<P: Send + Sync + 'static> HandlerMiddleware<P> for TelemetryMiddleware {
     type Provider<T>
         = TelemetryProvider<T>
     where

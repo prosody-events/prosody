@@ -293,7 +293,7 @@ impl DeferTestEnvironment {
         )?;
 
         let handler_provider = defer_middleware
-            .layer(LogMiddleware::<Value>::new())
+            .layer(LogMiddleware::new())
             .into_provider(handler.clone());
 
         let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
@@ -385,7 +385,7 @@ impl DeferTestEnvironment {
         )?;
 
         let handler_provider = defer_middleware
-            .layer(LogMiddleware::<Value>::new())
+            .layer(LogMiddleware::new())
             .into_provider(permanent_handler);
 
         let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(

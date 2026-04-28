@@ -752,23 +752,20 @@ pub struct ProsodyConsumer<P: Send + Sync + 'static> {
 ///
 /// Groups the middleware and configuration that are common to both memory
 /// and Cassandra storage backends, reducing parameter counts.
-struct PipelineMiddlewareStack<CM, P> {
+struct PipelineMiddlewareStack<CM> {
     consumer_config: ConsumerConfiguration,
     defer_config: DeferConfiguration,
     dedup_config: DeduplicationConfiguration,
     failure_tracker: FailureTracker,
     common_middleware: CM,
-    monopolization_middleware: Option<MonopolizationMiddleware<P>>,
-    retry_middleware: RetryMiddleware<P>,
+    monopolization_middleware: Option<MonopolizationMiddleware>,
+    retry_middleware: RetryMiddleware,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
 }
 
-impl<CM, P: Send + Sync + 'static> PipelineMiddlewareStack<CM, P>
-where
-    CM: HandlerMiddleware<Payload = P>,
-{
-    fn build<T, MP, TP, DP, PP, L, C>(
+impl<CM> PipelineMiddlewareStack<CM> {
+    fn build<T, MP, TP, DP, PP, L, C, P>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
@@ -777,6 +774,7 @@ where
         handler: T,
     ) -> Result<ProsodyConsumer<P>, ConsumerError>
     where
+        CM: HandlerMiddleware<P>,
         T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
         MP: MessageDeferStoreProvider,
         TP: TimerDeferStoreProvider,
@@ -784,7 +782,7 @@ where
         PP: TriggerStoreProvider,
         L: MessageLoader<Payload = P> + 'static,
         C: Codec<Payload = P>,
-        P: crate::EventIdentity + crate::EventTypeExtract + Clone,
+        P: Send + Sync + 'static + crate::EventIdentity + crate::EventTypeExtract + Clone,
     {
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
@@ -824,16 +822,16 @@ fn build_common_middleware<P: Send + Sync + 'static>(
     stall_threshold: Duration,
     telemetry: Telemetry,
     source: Arc<str>,
-) -> Result<impl HandlerMiddleware<Payload = P>, ConsumerError> {
-    let scheduler_middleware = SchedulerMiddleware::<P>::new(&config.scheduler, &telemetry)?;
-    let timeout_middleware = TimeoutMiddleware::<P>::new(&config.timeout, stall_threshold)?;
-    let telemetry_middleware = TelemetryMiddleware::<P>::new(telemetry, source);
+) -> Result<impl HandlerMiddleware<P>, ConsumerError> {
+    let scheduler_middleware = SchedulerMiddleware::new(&config.scheduler, &telemetry)?;
+    let timeout_middleware = TimeoutMiddleware::new(&config.timeout, stall_threshold)?;
+    let telemetry_middleware = TelemetryMiddleware::new(telemetry, source);
 
     // Layer common middleware: telemetry -> timeout -> scheduler -> shutdown
     Ok(telemetry_middleware
         .layer(timeout_middleware)
         .layer(scheduler_middleware)
-        .layer(CancellationMiddleware::<P>::new()))
+        .layer(CancellationMiddleware::new()))
 }
 
 /// Helper function to initialize a consumer with a trigger store provider.
@@ -1065,7 +1063,7 @@ where
             dedup: dedup_config,
         } = pipeline_config;
         let monopolization_middleware =
-            MonopolizationMiddleware::<P>::new(&monopolization_config, &telemetry)?;
+            MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
         let heartbeats = HeartbeatRegistry::new(
             consumer_config.group_id.clone(),
             consumer_config.stall_threshold,
@@ -1090,7 +1088,7 @@ where
                 Arc::from(consumer_config.group_id.as_str()),
             )?,
             monopolization_middleware,
-            retry_middleware: RetryMiddleware::<P>::new(retry_config)?,
+            retry_middleware: RetryMiddleware::new(retry_config)?,
             heartbeats,
             telemetry,
         };
@@ -1112,7 +1110,7 @@ where
                     MemoryLoader::<P>::new(),
                     &stack.telemetry,
                 )?;
-                stack.build::<T, _, _, _, _, _, C>(
+                stack.build::<T, _, _, _, _, _, C, _>(
                     message_defer_middleware,
                     timer_provider,
                     dedup_provider,
@@ -1140,7 +1138,7 @@ where
                     loader,
                     &stack.telemetry,
                 )?;
-                stack.build::<T, _, _, _, _, _, C>(
+                stack.build::<T, _, _, _, _, _, C, _>(
                     message_defer_middleware,
                     timer_provider,
                     dedup_provider,
@@ -1200,8 +1198,8 @@ where
             failure_topic: topic_config,
         } = low_latency_config;
         let group_id = consumer_config.group_id.clone();
-        let retry_middleware = RetryMiddleware::<P>::new(retry_config)?;
-        let topic_middleware = FailureTopicMiddleware::<C>::new(topic_config, group_id, producer)?;
+        let retry_middleware = RetryMiddleware::new(retry_config)?;
+        let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
         let common_middleware = build_common_middleware::<P>(
             common_config,
             consumer_config.stall_threshold,
@@ -1260,7 +1258,7 @@ where
 
         // Common middleware (telemetry -> timeout -> scheduler -> shutdown) then log
         let provider = common_middleware
-            .layer(LogMiddleware::<P>::new())
+            .layer(LogMiddleware::new())
             .into_provider(handler);
 
         Self::new::<_, C>(consumer_config, trigger_store_config, provider, telemetry).await

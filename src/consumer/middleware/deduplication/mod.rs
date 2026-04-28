@@ -111,10 +111,9 @@ impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
     }
 }
 
-impl<S: DeduplicationStoreProvider, P: Send + Sync + 'static + EventIdentity> HandlerMiddleware
+impl<S: DeduplicationStoreProvider, P: Send + Sync + 'static + EventIdentity> HandlerMiddleware<P>
     for DeduplicationMiddleware<S, P>
 {
-    type Payload = P;
     type Provider<T>
         = DeduplicationProvider<T, S>
     where

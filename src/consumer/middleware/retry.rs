@@ -124,7 +124,6 @@
 use std::cmp::min;
 use std::fmt::Display;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::time::Duration;
 
 use derive_builder::Builder;
@@ -202,12 +201,11 @@ impl RetryConfiguration {
 
 /// Middleware that retries failed message processing attempts.
 #[derive(Clone, Debug)]
-pub struct RetryMiddleware<P = ()> {
+pub struct RetryMiddleware {
     config: RetryConfiguration,
-    _payload: PhantomData<fn() -> P>,
 }
 
-impl<P> RetryMiddleware<P> {
+impl RetryMiddleware {
     /// Creates a new `RetryMiddleware` with the given configuration.
     ///
     /// # Arguments
@@ -225,10 +223,7 @@ impl<P> RetryMiddleware<P> {
     /// `RetryConfiguration` struct fails.
     pub fn new(config: RetryConfiguration) -> Result<Self, ValidationErrors> {
         config.validate()?;
-        Ok(Self {
-            config,
-            _payload: PhantomData,
-        })
+        Ok(Self { config })
     }
 }
 
@@ -541,8 +536,7 @@ fn log_timer_failure<E: Display>(reason: &LogReason<'_, E>, discard_suffix: &str
     }
 }
 
-impl<P: Send + Sync + 'static> HandlerMiddleware for RetryMiddleware<P> {
-    type Payload = P;
+impl<P: Send + Sync + 'static> HandlerMiddleware<P> for RetryMiddleware {
     type Provider<T>
         = RetryProvider<T>
     where
