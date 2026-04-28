@@ -14,6 +14,7 @@ Development patterns and practices for Prosody: distributed Kafka consumer with 
 
 - Clippy must pass for code and tests - zero warnings tolerated
 - Never suppress warnings with `#[allow(...)]` without permission
+- Never introduce `dyn` (trait objects, `Box<dyn ...>`, `&dyn ...`) without permission - prefer generics and associated types
 - Run: `cargo clippy`, `cargo clippy --tests`, `cargo doc`, `cargo +nightly fmt`
 
 **JSON codec isolation:**
