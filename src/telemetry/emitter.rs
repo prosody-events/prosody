@@ -6,11 +6,11 @@
 
 use crate::consumer::DemandType;
 use crate::error::ErrorCategory;
-use crate::telemetry::Telemetry;
 use crate::telemetry::event::{
     Data, MessageEventType, MessageSentEvent, MessageTelemetryEvent, TimerEventType,
     TimerTelemetryEvent,
 };
+use crate::telemetry::{TELEMETRY_CHANNEL_CAPACITY, Telemetry};
 use crate::timers::TimerType;
 use crate::util::from_env_with_fallback;
 use bytes::Bytes;
@@ -43,7 +43,7 @@ const PROSODY_TELEMETRY_ENABLED: &str = "PROSODY_TELEMETRY_ENABLED";
 const DEFAULT_TELEMETRY_TOPIC: &str = "prosody.telemetry-events";
 
 /// Number of produce futures to keep in flight concurrently.
-const PRODUCE_CONCURRENCY: usize = 256;
+const PRODUCE_CONCURRENCY: usize = TELEMETRY_CHANNEL_CAPACITY;
 
 /// Configuration for the telemetry Kafka emitter.
 #[derive(Builder, Clone, Debug, Validate)]
