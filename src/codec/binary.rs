@@ -4,10 +4,12 @@
 use serde::Deserialize;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_slice_with_buffers;
+use std::cell::RefCell;
 use std::error::Error as StdError;
 
 use crate::codec::Codec;
-use crate::{EventIdentity, EventType};
+use crate::codec::serialize_to_json;
+use crate::{EventIdentity, EventType, TimerReplayPayload};
 
 /// Metadata extracted from a binary payload at decode time.
 ///
@@ -49,6 +51,10 @@ pub trait BinaryExtractor: Default + Send + Sync + 'static {
     ///
     /// Returns [`Self::Error`] when the buffer cannot be parsed.
     fn extract<'a>(&mut self, buf: &'a mut [u8]) -> Result<BinaryMetadata<'a>, Self::Error>;
+
+    /// Runs `f` with an owned cached extractor, returning the extractor and
+    /// the closure's result so the cache can reclaim it.
+    fn with_cached_local<R>(f: impl FnOnce(Self) -> (Self, R)) -> R;
 }
 
 /// Payload produced by [`BinaryCodec`]: the raw bytes plus optional
@@ -89,6 +95,28 @@ impl EventType for BinaryPayload {
     }
 }
 
+impl TimerReplayPayload for BinaryPayload {
+    /// Builds a synthetic timer-replay payload by JSON-encoding `{"key",
+    /// "time"}` into [`BinaryPayload::bytes`]. Mirrors the
+    /// [`JsonCodec`](crate::JsonCodec) shape so a consumer routing
+    /// failure-topic timer replays through a binary pipeline produces bytes
+    /// that downstream JSON-aware tooling can read.
+    fn timer_replay(key: &str, time: &str) -> Self {
+        #[derive(serde::Serialize)]
+        struct Replay<'a> {
+            key: &'a str,
+            time: &'a str,
+        }
+        let mut bytes = Vec::new();
+        let _ = serialize_to_json(&Replay { key, time }, &mut bytes);
+        Self {
+            bytes,
+            event_id: None,
+            event_type: None,
+        }
+    }
+}
+
 /// Codec that performs a verbatim byte copy and delegates metadata extraction
 /// to `E`.
 ///
@@ -123,8 +151,16 @@ impl<E: BinaryExtractor> Codec for BinaryCodec<E> {
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        let mut codec = Self::default();
-        f(&mut codec)
+        // A generic `BinaryCodec<E>` can't host a `thread_local!` of itself,
+        // because statics can't depend on a generic parameter. Delegate the
+        // cache to `E`, which is concrete at the implementor site and can back
+        // its `with_cached_local` with a real `thread_local!` when it owns
+        // expensive state.
+        E::with_cached_local(|extractor| {
+            let mut codec = BinaryCodec { extractor };
+            let result = f(&mut codec);
+            (codec.extractor, result)
+        })
     }
 }
 
@@ -182,6 +218,23 @@ impl BinaryExtractor for JsonExtractor {
                 event_type: view.event_type,
             })
         }
+    }
+
+    fn with_cached_local<R>(f: impl FnOnce(Self) -> (Self, R)) -> R {
+        // `JsonExtractor` is concrete here, so a `thread_local!` of its own
+        // type is well-formed. The `Option` slot lets us hand the extractor
+        // out by `take` and put it back after `f` returns, preserving the
+        // `simd_json::Buffers` allocation across calls. A panic inside `f`
+        // leaves the slot empty; the next call constructs fresh.
+        thread_local! {
+            static CACHE: RefCell<Option<JsonExtractor>> = const { RefCell::new(None) };
+        }
+        CACHE.with_borrow_mut(|slot| {
+            let extractor = slot.take().unwrap_or_default();
+            let (extractor, result) = f(extractor);
+            *slot = Some(extractor);
+            result
+        })
     }
 }
 
@@ -244,6 +297,10 @@ mod tests {
                 event_type: None,
             })
         }
+
+        fn with_cached_local<R>(f: impl FnOnce(Self) -> (Self, R)) -> R {
+            f(Self).1
+        }
     }
 
     fn frame(id: &[u8]) -> color_eyre::Result<Vec<u8>> {
@@ -292,6 +349,10 @@ mod tests {
                 _buf: &'a mut [u8],
             ) -> Result<BinaryMetadata<'a>, Self::Error> {
                 Ok(BinaryMetadata::default())
+            }
+
+            fn with_cached_local<R>(f: impl FnOnce(Self) -> (Self, R)) -> R {
+                f(Self).1
             }
         }
         let mut wire = b"\x00\x00\x00\x00payload".to_vec();

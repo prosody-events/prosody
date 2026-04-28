@@ -128,7 +128,9 @@ pub fn decode_message<C: Codec>(
     //   - `decode_message` is the only site in the crate that reads the borrowed
     //     payload bytes, so the codec's destructive parse cannot affect downstream
     //     code.
-    // Pinned to the rdkafka version in `Cargo.toml`; re-audit on upgrade.
+    // The audit boundary is the rdkafka version resolved in `Cargo.lock`, not
+    // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
+    // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
     #[allow(unsafe_code)]
     let Some(payload_bytes) = (unsafe { message.payload_mut() }) else {
         error!(

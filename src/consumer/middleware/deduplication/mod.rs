@@ -316,10 +316,17 @@ where
     where
         C: EventContext,
     {
+        // The `Err(Store(_))` arm covers two cases:
+        //   1. Inner did not run (store read failed before dispatch).
+        //   2. Inner ran, then the post-inner store write failed.
+        // Both deliberately suppress the inner's apply hook. `Store(_)` is
+        // classified as Transient (see `ClassifyError` impl below), so the
+        // outer retry layer will redrive the whole stack and the inner sees
+        // a fresh invocation. Apply hooks are best-effort by design — see
+        // `FallibleHandler::after_commit` docs.
         match result {
             Ok(Some(output)) => self.inner.after_commit(context, Ok(output)).await,
-            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store
-            // write failed
+            Ok(None) | Err(DeduplicationError::Store(_)) => {}
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_commit(context, Err(error)).await;
             }
@@ -330,10 +337,12 @@ where
     where
         C: EventContext,
     {
+        // See `after_commit`: `Err(Store(_))` covers both pre-inner read
+        // failure and post-inner write failure. Both suppress the inner hook;
+        // retry redrives.
         match result {
             Ok(Some(output)) => self.inner.after_abort(context, Ok(output)).await,
-            Ok(None) | Err(DeduplicationError::Store(_)) => {} // inner did not run or store
-            // write failed
+            Ok(None) | Err(DeduplicationError::Store(_)) => {}
             Err(DeduplicationError::Inner(error)) => {
                 self.inner.after_abort(context, Err(error)).await;
             }

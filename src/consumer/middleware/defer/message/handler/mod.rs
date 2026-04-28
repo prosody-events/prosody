@@ -842,7 +842,12 @@ where
         // - Deferred(e): inner ran, transient err deferred -> after_abort(Err(e))
         //   (retry coming)
         // - Handler(e):  inner ran and surfaced an error   -> after_commit(Err)
-        // - Store/Loader/...: defer-layer error, inner never ran -> suppress
+        // - Store/Timer/Loader: defer-layer rescue failed. Suppress the inner hook
+        //   regardless of whether the inner ran on this dispatch. These errors classify
+        //   as Transient (see `DeferError::classify_error`) so the outer retry layer
+        //   will redrive the whole stack; consistency lives in the failed Result, not
+        //   in the hook. Apply hooks are best-effort — see
+        //   `FallibleHandler::after_commit` docs.
         match result {
             Ok(MessageDeferOutput::Inner(output)) => {
                 self.handler.after_commit(context, Ok(output)).await;
@@ -861,8 +866,11 @@ where
     where
         C: EventContext,
     {
-        // Symmetric to after_commit. The only twist: Deferred(e) still routes
-        // to after_abort(Err(e)) regardless of the outer commit/abort decision.
+        // Symmetric to after_commit. Two notes:
+        //   - Deferred(e) still routes to after_abort(Err(e)) regardless of the outer
+        //     commit/abort decision (a retry is coming via the deferred timer).
+        //   - Store/Timer/Loader rescue-failure paths suppress the inner hook on
+        //     purpose; the outer retry redrives the stack. See after_commit.
         match result {
             Ok(MessageDeferOutput::Inner(output)) => {
                 self.handler.after_abort(context, Ok(output)).await;
