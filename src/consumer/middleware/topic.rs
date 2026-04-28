@@ -560,6 +560,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::JsonCodecError;
     use crate::consumer::middleware::test_support::MockEventContext;
     use crate::error::ErrorCategory;
     use crate::producer::ProducerConfiguration;
@@ -592,21 +593,21 @@ mod tests {
 
     #[test]
     fn handler_error_delegates_classification_transient() {
-        let error: FailureTopicError<TestError> =
+        let error: FailureTopicError<TestError, JsonCodecError> =
             FailureTopicError::Handler(TestError(ErrorCategory::Transient));
         assert!(matches!(error.classify_error(), ErrorCategory::Transient));
     }
 
     #[test]
     fn handler_error_delegates_classification_permanent() {
-        let error: FailureTopicError<TestError> =
+        let error: FailureTopicError<TestError, JsonCodecError> =
             FailureTopicError::Handler(TestError(ErrorCategory::Permanent));
         assert!(matches!(error.classify_error(), ErrorCategory::Permanent));
     }
 
     #[test]
     fn handler_error_delegates_classification_terminal() {
-        let error: FailureTopicError<TestError> =
+        let error: FailureTopicError<TestError, JsonCodecError> =
             FailureTopicError::Handler(TestError(ErrorCategory::Terminal));
         assert!(matches!(error.classify_error(), ErrorCategory::Terminal));
     }
@@ -618,12 +619,13 @@ mod tests {
         // handler error, so the outer retry layer reacts to the producer-level
         // failure.
         let kafka_error = KafkaError::MessageProduction(RDKafkaErrorCode::BrokerNotAvailable);
-        let error: FailureTopicError<TestError> = FailureTopicError::DlqSendFailed {
-            // Inner is Permanent, but we expect the classification to follow
-            // the producer error (Transient), not the inner.
-            inner: TestError(ErrorCategory::Permanent),
-            producer: ProducerError::Kafka(kafka_error),
-        };
+        let error: FailureTopicError<TestError, JsonCodecError> =
+            FailureTopicError::DlqSendFailed {
+                // Inner is Permanent, but we expect the classification to follow
+                // the producer error (Transient), not the inner.
+                inner: TestError(ErrorCategory::Permanent),
+                producer: ProducerError::Kafka(kafka_error),
+            };
         assert!(
             matches!(error.classify_error(), ErrorCategory::Transient),
             "DlqSendFailed should classify by the producer error, not the inner",
@@ -739,7 +741,9 @@ mod tests {
         })
     }
 
-    fn dlq_send_failed_err(category: ErrorCategory) -> FailureTopicError<TestError> {
+    fn dlq_send_failed_err(
+        category: ErrorCategory,
+    ) -> FailureTopicError<TestError, JsonCodecError> {
         FailureTopicError::DlqSendFailed {
             inner: TestError(category),
             producer: ProducerError::Kafka(KafkaError::MessageProduction(
@@ -756,9 +760,12 @@ mod tests {
         let log = inner.log.clone();
         let handler = make_handler(inner)?;
 
-        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> = Ok(
-            FailureTopicOutput::Routed(TestError(ErrorCategory::Permanent)),
-        );
+        let result: Result<
+            FailureTopicOutput<u64, TestError>,
+            FailureTopicError<TestError, JsonCodecError>,
+        > = Ok(FailureTopicOutput::Routed(TestError(
+            ErrorCategory::Permanent,
+        )));
         handler.after_commit(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
@@ -780,8 +787,10 @@ mod tests {
         let log = inner.log.clone();
         let handler = make_handler(inner)?;
 
-        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
-            Ok(FailureTopicOutput::Inner(42));
+        let result: Result<
+            FailureTopicOutput<u64, TestError>,
+            FailureTopicError<TestError, JsonCodecError>,
+        > = Ok(FailureTopicOutput::Inner(42));
         handler.after_commit(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
@@ -803,8 +812,10 @@ mod tests {
         let log = inner.log.clone();
         let handler = make_handler(inner)?;
 
-        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
-            Err(dlq_send_failed_err(ErrorCategory::Transient));
+        let result: Result<
+            FailureTopicOutput<u64, TestError>,
+            FailureTopicError<TestError, JsonCodecError>,
+        > = Err(dlq_send_failed_err(ErrorCategory::Transient));
         handler.after_commit(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
@@ -829,8 +840,10 @@ mod tests {
         let log = inner.log.clone();
         let handler = make_handler(inner)?;
 
-        let result: Result<FailureTopicOutput<u64, TestError>, FailureTopicError<TestError>> =
-            Err(dlq_send_failed_err(ErrorCategory::Permanent));
+        let result: Result<
+            FailureTopicOutput<u64, TestError>,
+            FailureTopicError<TestError, JsonCodecError>,
+        > = Err(dlq_send_failed_err(ErrorCategory::Permanent));
         handler.after_abort(MockEventContext::new(), result).await;
 
         let events = log.lock().clone();
