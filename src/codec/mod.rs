@@ -50,5 +50,9 @@ pub trait Codec: Default + Send + Sync + 'static {
     ///
     /// Implementors should back this with a `thread_local!` of the concrete
     /// codec type so dispatch stays static.
+    ///
+    /// Reentrant calls on the same thread are not supported; implementations
+    /// backed by `RefCell::with_borrow_mut` will panic if `f` recurses into
+    /// `with_cached_local` for the same codec.
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R;
 }
