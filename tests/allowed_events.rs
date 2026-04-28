@@ -13,7 +13,7 @@ use prosody::{
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::sync::mpsc::channel;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
@@ -69,7 +69,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     let (messages_tx, mut messages_rx) = channel(10);
 
     // Initialize consumer and producer
-    let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+    let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(TestHandler { messages_tx }),

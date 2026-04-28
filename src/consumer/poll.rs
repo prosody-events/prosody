@@ -24,6 +24,7 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 
 use crate::Codec;
+use crate::EventType;
 use crate::Topic;
 use crate::consumer::decode::decode_message;
 use crate::consumer::kafka_context::Context;
@@ -56,7 +57,7 @@ where
     T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
     C: Codec,
-    C::Payload: Clone,
+    C::Payload: Clone + EventType,
 {
     /// Time between consecutive poll operations
     pub poll_interval: Duration,
@@ -108,7 +109,7 @@ where
     T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
     C: Codec,
-    C::Payload: Clone,
+    C::Payload: Clone + EventType,
 {
     // Destructure configuration for cleaner access
     let PollConfig {
@@ -256,7 +257,7 @@ fn store_watermarks<T, P, PL>(
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
-    PL: Clone + Send + Sync + 'static,
+    PL: Clone + Send + Sync + 'static + EventType,
 {
     // Skip if no watermark updates have occurred
     let current_version = watermark_version.load(Ordering::Acquire);
@@ -341,7 +342,7 @@ where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
-    PL: Clone + Send + Sync + 'static,
+    PL: Clone + Send + Sync + 'static + EventType,
 {
     let managers = managers.read();
     let has_global_capacity = maybe_permit.is_some();

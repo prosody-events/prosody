@@ -95,7 +95,7 @@ async fn run_scenario(
 
     // Set up a channel to communicate received messages.
     let (tx, mut rx) = channel(10);
-    let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+    let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(TestHandler { messages_tx: tx }),

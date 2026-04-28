@@ -22,10 +22,10 @@ use std::sync::Arc;
 /// # Type Parameters
 ///
 /// * `S` - Timer defer store provider
+/// * `P` - Handler payload type, fixed by the chain it is composed into
 /// * `D` - Deferral decider (default: [`FailureTracker`])
-/// * `P` - Handler payload type (payload-agnostic; defaults to `()`)
 #[derive(Clone)]
-pub struct TimerDeferMiddleware<S, D = FailureTracker, P = ()>
+pub struct TimerDeferMiddleware<S, P, D = FailureTracker>
 where
     S: TimerDeferStoreProvider,
     D: DeferralDecider,
@@ -38,7 +38,7 @@ where
     _payload: PhantomData<fn() -> P>,
 }
 
-impl<S, D, P> TimerDeferMiddleware<S, D, P>
+impl<S, P, D> TimerDeferMiddleware<S, P, D>
 where
     S: TimerDeferStoreProvider,
     D: DeferralDecider,
@@ -78,7 +78,7 @@ where
     telemetry: Telemetry,
 }
 
-impl<S, D, P> HandlerMiddleware<P> for TimerDeferMiddleware<S, D, P>
+impl<S, P, D> HandlerMiddleware<P> for TimerDeferMiddleware<S, P, D>
 where
     S: TimerDeferStoreProvider,
     D: DeferralDecider,

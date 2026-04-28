@@ -289,7 +289,7 @@ async fn test_producer_deduplication() -> Result<()> {
             .probe_port(None)
             .build()?;
         let (tx, rx) = channel(16);
-        let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &cfg,
             &common::create_cassandra_trigger_store_config(),
             CloneProvider::new(TestHandler { tx }),

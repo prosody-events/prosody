@@ -128,7 +128,7 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
         .build()?;
 
     // Create consumer
-    let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+    let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(handler),

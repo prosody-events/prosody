@@ -215,7 +215,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     };
 
     // Create the consumer with the test handler
-    let consumer: ProsodyConsumer<Value> = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+    let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(handler.clone()),

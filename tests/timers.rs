@@ -174,7 +174,7 @@ impl EventHandler for TimerTestHandler {
 struct TestEnvironment {
     topic: Topic,
     admin_client: &'static ProsodyAdminClient,
-    consumer: ProsodyConsumer<Value>,
+    consumer: ProsodyConsumer<JsonCodec>,
     producer: ProsodyProducer<JsonCodec>,
     timer_rx: Receiver<TimerEvent>,
     message_rx: Receiver<MessageEvent>,
@@ -216,7 +216,7 @@ impl TestEnvironment {
             .probe_port(None)
             .build()?;
 
-        let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
             handler_provider,

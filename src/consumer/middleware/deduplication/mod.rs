@@ -73,10 +73,10 @@ struct DeduplicationShared<S> {
 /// two-tier cache (local + persistent store). Duplicates are filtered out
 /// before reaching the handler.
 ///
-/// The `P` parameter is the handler payload type (defaults to `()` so
-/// the struct can be named without turbofish when the payload is inferred).
+/// The `P` parameter is the handler payload type, fixed by the chain it is
+/// composed into.
 #[derive(Clone, Debug)]
-pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P = ()> {
+pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
     shared: Arc<DeduplicationShared<S>>,
     _payload: PhantomData<fn() -> P>,
 }

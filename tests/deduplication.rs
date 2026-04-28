@@ -86,7 +86,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         timeout: TimeoutConfigurationBuilder::default().build()?,
     };
 
-    let consumer = ProsodyConsumer::pipeline_consumer::<_, JsonCodec>(
+    let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         pipeline_config,

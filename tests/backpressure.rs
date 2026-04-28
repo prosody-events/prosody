@@ -15,7 +15,7 @@ use prosody::{
     producer::{ProducerConfiguration, ProsodyProducer},
     telemetry::Telemetry,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::spawn;
 use tokio::sync::mpsc::channel;
 use tokio::time::Instant;
@@ -65,7 +65,7 @@ async fn test_backpressure() -> Result<()> {
         .build()?;
 
     let slow_handler = SlowTestHandler { messages_tx };
-    let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+    let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
         CloneProvider::new(slow_handler),

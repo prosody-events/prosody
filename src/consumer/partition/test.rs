@@ -14,6 +14,7 @@ use crossbeam_utils::CachePadded;
 use serde_json::json;
 use std::array::from_fn;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -34,7 +35,6 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider, serd
         buffer_size: 10,
         max_uncommitted: 10,
         allowed_events: None,
-        event_type_extractor: None,
         shutdown_timeout: Duration::from_secs(1),
         stall_threshold: Duration::from_secs(1),
         watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
@@ -43,6 +43,7 @@ fn default_config() -> PartitionConfiguration<InMemoryTriggerStoreProvider, serd
         timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(10)))),
         telemetry_sender: Telemetry::new().sender(),
         timer_spans: SpanRelation::default(),
+        _payload: PhantomData,
     }
 }
 
@@ -309,9 +310,6 @@ async fn test_partition_manager_event_type_filtering() {
             .build(["allowed"])
             .expect("Invalid event pattern"),
     );
-    config.event_type_extractor =
-        Some(|payload: &serde_json::Value| payload.get("type").and_then(serde_json::Value::as_str));
-
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     let test_semaphore = Arc::new(Semaphore::new(10));

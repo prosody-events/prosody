@@ -78,7 +78,7 @@ where
 {
     producer: ProsodyProducer<C>,
     producer_config: ProducerConfiguration,
-    consumer: Mutex<ConsumerState<T, C::Payload>>,
+    consumer: Mutex<ConsumerState<T, C>>,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
 }
@@ -98,7 +98,7 @@ where
     }
 
     /// Returns a view of the current consumer state.
-    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, C::Payload> {
+    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, C> {
         ConsumerStateView(self.consumer.lock().await)
     }
 
@@ -241,7 +241,7 @@ where
     pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone,
-        C::Payload: crate::EventTypeExtract + crate::TimerReplayPayload + Clone,
+        C::Payload: crate::EventType + crate::TimerReplayPayload + Clone,
     {
         let mut guard = self.consumer.lock().await;
         let consumer_ref = &mut *guard;
@@ -269,7 +269,7 @@ where
                 common,
                 trigger_store,
             } => {
-                ProsodyConsumer::pipeline_consumer::<_, C>(
+                ProsodyConsumer::<C>::pipeline_consumer(
                     consumer,
                     trigger_store,
                     PipelineMiddlewareConfiguration {
@@ -292,7 +292,7 @@ where
                 trigger_store,
                 ..
             } => {
-                ProsodyConsumer::low_latency_consumer::<_, C>(
+                ProsodyConsumer::low_latency_consumer(
                     consumer,
                     trigger_store,
                     LowLatencyMiddlewareConfiguration {
@@ -312,7 +312,7 @@ where
                 trigger_store,
                 ..
             } => {
-                ProsodyConsumer::best_effort_consumer::<_, C>(
+                ProsodyConsumer::<C>::best_effort_consumer(
                     consumer,
                     trigger_store,
                     common,
@@ -397,9 +397,9 @@ where
 /// # Errors
 ///
 /// Returns a `HighLevelClientError` if any required topics are missing.
-fn check_topic_existence<S, C: Codec, P: Send + Sync + 'static>(
+fn check_topic_existence<S, C: Codec, D: Codec>(
     producer: &ProsodyProducer<C>,
-    consumer_state: &ConsumerState<S, P>,
+    consumer_state: &ConsumerState<S, D>,
 ) -> Result<(), HighLevelClientError>
 where
     C::Payload: crate::EventIdentity,

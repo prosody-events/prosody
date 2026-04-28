@@ -24,7 +24,7 @@ use crate::telemetry::sender::TelemetrySender;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::{Segment, SegmentVersion, TriggerStore, TriggerStoreProvider};
 use crate::timers::{PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores};
-use crate::{Offset, Partition, ProcessScope, Topic};
+use crate::{EventType, Offset, Partition, ProcessScope, Topic};
 use aho_corasick::{AhoCorasick, Anchored, Input};
 use async_stream::stream;
 use crossbeam_utils::CachePadded;
@@ -32,6 +32,7 @@ use educe::Educe;
 use futures::stream::select;
 use futures::{Stream, StreamExt, pin_mut};
 use std::future::{Ready, ready};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -106,10 +107,6 @@ struct PartitionContext<P> {
     shutdown_rx: watch::Receiver<ShutdownPhase>,
 }
 
-/// Optional event-type extractor used to derive a tag from a payload for
-/// filtering against the consumer's `allowed_events` automaton.
-pub type EventTypeExtractor<P> = Option<fn(&P) -> Option<&str>>;
-
 /// Configuration settings for a partition manager.
 ///
 /// Contains all the parameters needed to configure message processing
@@ -131,10 +128,6 @@ pub struct PartitionConfiguration<S, P> {
 
     /// Optional automaton for filtering messages by event type
     pub allowed_events: Option<AhoCorasick>,
-
-    /// Optional function to extract an event-type tag from a payload for
-    /// filtering against `allowed_events`.
-    pub event_type_extractor: EventTypeExtractor<P>,
 
     /// Timeout duration for shutdown operations
     pub shutdown_timeout: Duration,
@@ -161,6 +154,10 @@ pub struct PartitionConfiguration<S, P> {
 
     /// How timer dispatch spans relate to the propagated `OTel` context.
     pub timer_spans: SpanRelation,
+
+    /// Phantom marker for the payload type, used to keep `P` consistent
+    /// between [`PartitionConfiguration`] and [`PartitionManager`].
+    pub _payload: PhantomData<fn() -> P>,
 }
 
 /// Manages message processing and offset tracking for a single Kafka partition.
@@ -227,7 +224,7 @@ impl<P: Send + 'static> PartitionManager<P> {
     where
         T: EventHandler<Payload = P> + Send + Sync + 'static,
         S: TriggerStoreProvider,
-        P: Sync,
+        P: Sync + EventType,
     {
         // Initialize offset tracker to manage offset state
         let offsets = OffsetTracker::new(
@@ -454,10 +451,9 @@ where
 
 /// Store-agnostic fields extracted from [`PartitionConfiguration`] for
 /// [`run_partition`].
-struct PartitionParams<P> {
+struct PartitionParams {
     group_id: Arc<str>,
     allowed_events: Option<AhoCorasick>,
-    event_type_extractor: EventTypeExtractor<P>,
     timer_semaphores: Arc<TimerSemaphores>,
     telemetry_sender: TelemetrySender,
     name: String,
@@ -476,12 +472,11 @@ async fn handle_messages<T, S, P>(
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStoreProvider,
-    P: Send + Sync + 'static,
+    P: Send + Sync + 'static + EventType,
 {
     let PartitionConfiguration {
         group_id,
         allowed_events,
-        event_type_extractor,
         trigger_provider,
         timer_slab_size,
         timer_semaphores,
@@ -504,7 +499,6 @@ async fn handle_messages<T, S, P>(
     let params = PartitionParams {
         group_id,
         allowed_events,
-        event_type_extractor,
         timer_semaphores,
         telemetry_sender,
         name,
@@ -520,16 +514,15 @@ async fn run_partition<T, S, P>(
     partition_info: PartitionInfo,
     handler: T,
     context: PartitionContext<P>,
-    params: PartitionParams<P>,
+    params: PartitionParams,
 ) where
     T: EventHandler<Payload = P> + Send + Sync + 'static,
     S: TriggerStore,
-    P: Send + Sync + 'static,
+    P: Send + Sync + 'static + EventType,
 {
     let PartitionParams {
         group_id,
         allowed_events,
-        event_type_extractor,
         timer_semaphores,
         telemetry_sender,
         name,
@@ -550,7 +543,6 @@ async fn run_partition<T, S, P>(
         &group_id,
         &mut highest_offset_seen,
         allowed_events.as_ref(),
-        event_type_extractor,
     );
 
     let timer_ctx = TimerInitContext {
@@ -648,8 +640,6 @@ async fn process_event<T, S, P>(
 /// * `group_id` - Consumer group identifier
 /// * `highest_offset_seen` - Tracks the highest offset processed
 /// * `allowed_events` - Optional filter for permitted event types
-/// * `event_type_extractor` - Optional function to extract an event-type tag
-///   from a payload
 ///
 /// # Returns
 ///
@@ -661,11 +651,10 @@ fn build_message_stream<T, P>(
     group_id: &str,
     highest_offset_seen: &mut i64,
     allowed_events: Option<&AhoCorasick>,
-    event_type_extractor: EventTypeExtractor<P>,
 ) -> impl Stream<Item = UncommittedEvent<T, P>>
 where
     T: TriggerStore,
-    P: Send + Sync + 'static,
+    P: Send + Sync + 'static + EventType,
 {
     stream! {
         while let Some(message) = message_rx.recv().await {
@@ -685,7 +674,7 @@ where
             };
 
             // Apply filter_event_type - filter based on allowed event types
-            let Some(uncommitted) = filter_event_type(event_type_extractor, allowed_events, uncommitted).await else {
+            let Some(uncommitted) = filter_event_type(allowed_events, uncommitted).await else {
                 continue;
             };
 
@@ -811,8 +800,6 @@ async fn filter_loops<P: Send + Sync + 'static>(
 ///
 /// # Arguments
 ///
-/// * `event_type_extractor` - Optional function to extract an event-type tag
-///   from the payload
 /// * `allowed_events` - Optional automaton defining allowed event type patterns
 /// * `message` - The message to check
 ///
@@ -820,13 +807,12 @@ async fn filter_loops<P: Send + Sync + 'static>(
 ///
 /// `Some(message)` if the message should be processed,
 /// `None` if it should be filtered out
-async fn filter_event_type<P: Send + Sync + 'static>(
-    event_type_extractor: EventTypeExtractor<P>,
+async fn filter_event_type<P: Send + Sync + 'static + EventType>(
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage<P>,
 ) -> Option<UncommittedMessage<P>> {
     // Extract event type from message payload if present
-    let Some(event_type) = event_type_extractor.and_then(|f| f(message.payload())) else {
+    let Some(event_type) = message.payload().event_type() else {
         return Some(message);
     };
 

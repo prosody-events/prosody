@@ -116,7 +116,7 @@
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let topic_config = FailureTopicConfiguration::builder().failure_topic("dlq").build().unwrap();
 //! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
-//! # let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
+//! # let producer: ProsodyProducer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
 //! # let telemetry = Telemetry::default();
 //! # let my_business_handler = MyHandler;
 //!
@@ -213,6 +213,23 @@ pub trait FallibleHandlerProvider: Send + Sync + 'static {
 /// `HandlerMiddleware<P>` for all `P`. Payload-aware middleware (defer,
 /// failure topic, deduplication) implement it only for their bound payload
 /// type.
+///
+/// # Anchoring `P`
+///
+/// Because payload-agnostic middleware implements `HandlerMiddleware<P>` for
+/// every `P`, a bare `.layer()` chain has no way to pick `P` on its own. The
+/// chain compiles without turbofish in any of these contexts:
+///
+/// 1. The chain ends in `.into_provider(handler)` — `P` flows from `H:
+///    FallibleHandler<Payload = P>`.
+/// 2. The chain is bound to an `-> impl HandlerMiddleware<P>` return type that
+///    pins `P` for the caller.
+/// 3. An explicit type ascription on the let binding pins
+///    `ComposedMiddleware<…, P>`.
+///
+/// A bare-chain construction with no anchor needs UFCS or a let-binding with
+/// an explicit type — usually a sign that you should terminate the chain with
+/// `.into_provider(handler)` instead.
 pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// The provider type that wraps another fallible handler provider.
     ///
@@ -281,8 +298,7 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// # }
     /// # let config = RetryConfiguration::builder().build().unwrap();
     /// # let my_handler = MyHandler;
-    /// let middleware = RetryMiddleware::new(config).unwrap();
-    /// let provider = HandlerMiddleware::<serde_json::Value>::into_provider(middleware, my_handler);
+    /// let provider = RetryMiddleware::new(config).unwrap().into_provider(my_handler);
     /// ```
     fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<H>>
     where
@@ -330,15 +346,31 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     /// # use prosody::consumer::middleware::*;
     /// # use prosody::consumer::middleware::retry::{RetryMiddleware, RetryConfiguration};
     /// # use prosody::consumer::middleware::cancellation::CancellationMiddleware;
+    /// # use prosody::consumer::DemandType;
+    /// # use prosody::consumer::event_context::EventContext;
+    /// # use prosody::consumer::message::ConsumerMessage;
+    /// # use prosody::timers::Trigger;
+    /// # use std::convert::Infallible;
+    /// # #[derive(Clone)]
+    /// # struct MyHandler;
+    /// # impl FallibleHandler for MyHandler {
+    /// #     type Payload = serde_json::Value;
+    /// #     type Error = Infallible;
+    /// #     type Output = ();
+    /// #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+    /// #     async fn shutdown(self) {}
+    /// # }
     /// # let retry_config = RetryConfiguration::builder().build().unwrap();
     /// # let inner_middleware = RetryMiddleware::new(retry_config).unwrap();
     /// # let middle_middleware = CancellationMiddleware;
     /// # let outer_middleware = CancellationMiddleware;
+    /// # let my_handler = MyHandler;
     /// // Builds from inner to outer: inner -> middle -> outer
-    /// let middleware = HandlerMiddleware::<serde_json::Value>::layer(
-    ///     HandlerMiddleware::<serde_json::Value>::layer(inner_middleware, middle_middleware),
-    ///     outer_middleware,
-    /// );
+    /// let provider = inner_middleware
+    ///     .layer(middle_middleware)
+    ///     .layer(outer_middleware)
+    ///     .into_provider(my_handler);
     ///
     /// // Request:  outer → middle → inner → handler
     /// // Response: handler → inner → middle → outer
@@ -715,7 +747,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
 /// `HandlerMiddleware<_>` inference ambiguity that would otherwise arise from
 /// payload-agnostic middleware impls.
 #[derive(Clone, Debug)]
-pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<P>);
+pub struct ComposedMiddleware<M1, M2, P>(M1, M2, PhantomData<fn() -> P>);
 
 /// Provides default `EventHandler` implementation for types that implement
 /// `FallibleHandler`.

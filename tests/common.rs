@@ -255,7 +255,7 @@ pub fn spawn_consumers(
         let handler_provider = CloneProvider::new(handler);
 
         tasks.spawn(async move {
-            let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+            let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
                 &consumer_config,
                 &create_cassandra_trigger_store_config(),
                 handler_provider,

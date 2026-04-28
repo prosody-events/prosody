@@ -46,9 +46,14 @@ impl FromStr for SpanRelation {
 /// location.
 ///
 /// # Example
-/// ```rust
+/// ```rust,no_run
+/// use opentelemetry::Context;
+/// use prosody::otel::SpanRelation;
 /// use prosody::related_span;
-/// let span = related_span!(self.timer_spans, context, "fetch_trigger", key = %key);
+/// let timer_spans = SpanRelation::Child;
+/// let context = Context::current();
+/// let key = "abc";
+/// let span = related_span!(timer_spans, context, "fetch_trigger", key = %key);
 /// ```
 #[macro_export]
 macro_rules! related_span {

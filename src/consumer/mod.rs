@@ -90,7 +90,7 @@
 //!
 //! let telemetry = Telemetry::new();
 //!
-//! let consumer = ProsodyConsumer::new(
+//! let consumer: ProsodyConsumer = ProsodyConsumer::new(
 //!     &config,
 //!     &TriggerStoreConfiguration::InMemory,
 //!     CloneProvider::new(MyHandler),
@@ -123,7 +123,6 @@
 //! - `heartbeat`: Monitoring for stalled processes
 //! - `probes`: HTTP endpoints for health and readiness checking
 
-use crate::Codec;
 use crate::cassandra::CassandraStore;
 pub use crate::consumer::event_context::EventContext;
 pub use crate::consumer::event_context::TerminationSignals;
@@ -158,7 +157,7 @@ use crate::consumer::middleware::timeout::{
     TimeoutConfiguration, TimeoutInitError, TimeoutMiddleware,
 };
 use crate::consumer::middleware::topic::{FailureTopicConfiguration, FailureTopicMiddleware};
-use crate::consumer::partition::{EventTypeExtractor, PartitionManager};
+use crate::consumer::partition::PartitionManager;
 use crate::consumer::poll::PollConfig;
 use crate::consumer::poll::poll;
 use crate::consumer::probes::ProbeServer;
@@ -178,6 +177,7 @@ use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
     from_option_env_with_fallback, from_optional_vec_env, from_vec_env,
 };
+use crate::{Codec, EventIdentity, EventType, JsonCodec, TimerReplayPayload};
 use crate::{MOCK_CLUSTER_BOOTSTRAP, Partition, Topic};
 use ahash::HashMap;
 use aho_corasick::{AhoCorasick, StartKind};
@@ -700,18 +700,18 @@ pub struct LowLatencyMiddlewareConfiguration {
 /// - Low-latency processing with failure topic
 /// - Best-effort processing with logging
 ///
-/// The `P` type parameter is the payload type carried by consumed messages.
-/// Pair the consumer with a [`Codec`] whose `Payload` matches `P`.
+/// The `C` type parameter is the [`Codec`] used to deserialize incoming
+/// payloads; the consumer's payload type is `C::Payload`.
 #[derive(Clone, Educe)]
 #[educe(Debug)]
-pub struct ProsodyConsumer<P: Send + Sync + 'static> {
+pub struct ProsodyConsumer<C: Codec = JsonCodec> {
     /// Flag to signal consumer shutdown.
     #[educe(Debug(ignore))]
     shutdown: Arc<AtomicBool>,
 
     /// Thread-safe storage for partition managers.
     #[educe(Debug(ignore))]
-    managers: Arc<Managers<P>>,
+    managers: Arc<Managers<C::Payload>>,
 
     /// Runtime state of the consumer.
     #[educe(Debug(ignore))]
@@ -765,24 +765,24 @@ struct PipelineMiddlewareStack<CM> {
 }
 
 impl<CM> PipelineMiddlewareStack<CM> {
-    fn build<T, MP, TP, DP, PP, L, C, P>(
+    fn build<T, MP, TP, DP, PP, L, C>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: DP,
         trigger_provider: PP,
         handler: T,
-    ) -> Result<ProsodyConsumer<P>, ConsumerError>
+    ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
-        CM: HandlerMiddleware<P>,
-        T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
+        CM: HandlerMiddleware<C::Payload>,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         MP: MessageDeferStoreProvider,
         TP: TimerDeferStoreProvider,
         DP: DeduplicationStoreProvider,
         PP: TriggerStoreProvider,
-        L: MessageLoader<Payload = P> + 'static,
-        C: Codec<Payload = P>,
-        P: Send + Sync + 'static + crate::EventIdentity + crate::EventTypeExtract + Clone,
+        L: MessageLoader<Payload = C::Payload> + 'static,
+        C: Codec,
+        C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
     {
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
@@ -837,19 +837,19 @@ fn build_common_middleware<P: Send + Sync + 'static>(
 /// Helper function to initialize a consumer with a trigger store provider.
 ///
 /// The provider creates per-partition stores with independent caches.
-fn initialize_consumer_with_provider<T, P, C>(
+fn initialize_consumer_with_provider<T, S, C>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
-    trigger_provider: P,
+    trigger_provider: S,
     telemetry: &Telemetry,
     heartbeats: HeartbeatRegistry,
-) -> Result<ProsodyConsumer<C::Payload>, ConsumerError>
+) -> Result<ProsodyConsumer<C>, ConsumerError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
-    P: TriggerStoreProvider,
+    S: TriggerStoreProvider,
     C: Codec,
-    C::Payload: crate::EventTypeExtract + Clone,
+    C::Payload: EventType + Clone,
 {
     // Validate the configuration
     consumer_config.validate()?;
@@ -871,17 +871,13 @@ where
         })
         .transpose()?;
 
-    let event_type_extractor: EventTypeExtractor<C::Payload> =
-        Some(<C::Payload as crate::EventTypeExtract>::event_type);
-
-    let (managers, runtime_state) = initialize_consumer::<T, P, C>(ConsumerInitParams {
+    let (managers, runtime_state) = initialize_consumer::<T, S, C>(ConsumerInitParams {
         config: consumer_config.clone(),
         handler_provider,
         trigger_provider,
         watermark_version: watermark_version.clone(),
         managers: managers.clone(),
         allowed_events,
-        event_type_extractor,
         telemetry: telemetry_sender,
         shutdown: shutdown.clone(),
         heartbeats: heartbeats.clone(),
@@ -895,9 +891,9 @@ where
     })
 }
 
-impl<P: Send + Sync + 'static> ProsodyConsumer<P>
+impl<C: Codec> ProsodyConsumer<C>
 where
-    P: crate::EventTypeExtract + Clone,
+    C::Payload: EventType + Clone,
 {
     /// Creates a new `ProsodyConsumer` with the given configuration and handler
     /// provider.
@@ -924,7 +920,7 @@ where
     /// - The hostname cannot be retrieved
     /// - The Kafka consumer cannot be created
     /// - The consumer fails to subscribe to the specified topics
-    pub async fn new<T, C>(
+    pub async fn new<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         handler_provider: T,
@@ -932,15 +928,14 @@ where
     ) -> Result<Self, ConsumerError>
     where
         T: HandlerProvider,
-        T::Handler: EventHandler<Payload = P>,
-        C: Codec<Payload = P>,
+        T::Handler: EventHandler<Payload = C::Payload>,
     {
         // Validate the configuration
         consumer_config.validate()?;
 
         // Initialize shared state
         let watermark_version: Arc<WatermarkVersion> = Arc::default();
-        let managers: Arc<Managers<P>> = Arc::default();
+        let managers: Arc<Managers<C::Payload>> = Arc::default();
         let shutdown: Arc<AtomicBool> = Arc::default();
         let telemetry_sender = telemetry.sender();
         let heartbeats = HeartbeatRegistry::new(
@@ -959,19 +954,15 @@ where
             })
             .transpose()?;
 
-        let event_type_extractor: EventTypeExtractor<P> =
-            Some(<P as crate::EventTypeExtract>::event_type);
-
         let (managers, runtime_state) = match trigger_store_config {
             TriggerStoreConfiguration::InMemory => {
-                initialize_consumer::<T, _, C>(ConsumerInitParams {
+                initialize_consumer::<T, _, C>(ConsumerInitParams::<T, _, C::Payload> {
                     config: consumer_config.clone(),
                     handler_provider,
                     trigger_provider: InMemoryTriggerStoreProvider::new(),
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,
-                    event_type_extractor,
                     telemetry: telemetry_sender,
                     shutdown: shutdown.clone(),
                     heartbeats: heartbeats.clone(),
@@ -987,14 +978,13 @@ where
                     consumer_config.timer_spans,
                 )
                 .await?;
-                initialize_consumer::<T, _, C>(ConsumerInitParams {
+                initialize_consumer::<T, _, C>(ConsumerInitParams::<T, _, C::Payload> {
                     config: consumer_config.clone(),
                     handler_provider,
                     trigger_provider,
                     watermark_version: watermark_version.clone(),
                     managers: managers.clone(),
                     allowed_events,
-                    event_type_extractor,
                     telemetry: telemetry_sender,
                     shutdown: shutdown.clone(),
                     heartbeats: heartbeats.clone(),
@@ -1035,7 +1025,7 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn pipeline_consumer<T, C>(
+    pub async fn pipeline_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         pipeline_config: PipelineMiddlewareConfiguration,
@@ -1044,9 +1034,8 @@ where
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
-        C: Codec<Payload = P>,
-        P: crate::EventIdentity + Clone,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        C::Payload: EventIdentity + Clone,
     {
         // Create both stores atomically - ensures trigger and defer stores match
         let stores = StorePair::new(
@@ -1081,7 +1070,7 @@ where
             defer_config,
             dedup_config,
             failure_tracker,
-            common_middleware: build_common_middleware::<P>(
+            common_middleware: build_common_middleware::<C::Payload>(
                 common_config,
                 consumer_config.stall_threshold,
                 telemetry.clone(),
@@ -1107,10 +1096,10 @@ where
                     &stack.consumer_config,
                     message_provider,
                     stack.failure_tracker.clone(),
-                    MemoryLoader::<P>::new(),
+                    MemoryLoader::<C::Payload>::new(),
                     &stack.telemetry,
                 )?;
-                stack.build::<T, _, _, _, _, _, C, _>(
+                stack.build::<_, _, _, _, _, _, C>(
                     message_defer_middleware,
                     timer_provider,
                     dedup_provider,
@@ -1138,7 +1127,7 @@ where
                     loader,
                     &stack.telemetry,
                 )?;
-                stack.build::<T, _, _, _, _, _, C, _>(
+                stack.build::<_, _, _, _, _, _, C>(
                     message_defer_middleware,
                     timer_provider,
                     dedup_provider,
@@ -1179,7 +1168,7 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn low_latency_consumer<T, C>(
+    pub async fn low_latency_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         low_latency_config: LowLatencyMiddlewareConfiguration,
@@ -1189,9 +1178,8 @@ where
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
-        C: Codec<Payload = P>,
-        P: crate::EventIdentity + crate::TimerReplayPayload + Clone,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        C::Payload: EventIdentity + TimerReplayPayload + Clone,
     {
         let LowLatencyMiddlewareConfiguration {
             retry: retry_config,
@@ -1200,7 +1188,7 @@ where
         let group_id = consumer_config.group_id.clone();
         let retry_middleware = RetryMiddleware::new(retry_config)?;
         let topic_middleware = FailureTopicMiddleware::new(topic_config, group_id, producer)?;
-        let common_middleware = build_common_middleware::<P>(
+        let common_middleware = build_common_middleware::<C::Payload>(
             common_config,
             consumer_config.stall_threshold,
             telemetry.clone(),
@@ -1213,7 +1201,7 @@ where
             .layer(retry_middleware) // retry writing to the failure topic indefinitely
             .into_provider(handler);
 
-        Self::new::<_, C>(consumer_config, trigger_store_config, provider, telemetry).await
+        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
     }
 
     /// Creates a new `ProsodyConsumer` with logging middleware for failure
@@ -1238,7 +1226,7 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub(crate) async fn best_effort_consumer<T, C>(
+    pub(crate) async fn best_effort_consumer<T>(
         consumer_config: &ConsumerConfiguration,
         trigger_store_config: &TriggerStoreConfiguration,
         common_config: &CommonMiddlewareConfiguration,
@@ -1246,10 +1234,9 @@ where
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        T: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
-        C: Codec<Payload = P>,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        let common_middleware = build_common_middleware::<P>(
+        let common_middleware = build_common_middleware::<C::Payload>(
             common_config,
             consumer_config.stall_threshold,
             telemetry.clone(),
@@ -1261,11 +1248,11 @@ where
             .layer(LogMiddleware::new())
             .into_provider(handler);
 
-        Self::new::<_, C>(consumer_config, trigger_store_config, provider, telemetry).await
+        Self::new(consumer_config, trigger_store_config, provider, telemetry).await
     }
 }
 
-impl<P: Send + Sync + 'static> ProsodyConsumer<P> {
+impl<C: Codec> ProsodyConsumer<C> {
     /// Returns the number of currently assigned partitions.
     ///
     /// This method is useful for monitoring how many partitions have been
@@ -1336,7 +1323,7 @@ impl<P: Send + Sync + 'static> ProsodyConsumer<P> {
 ///
 /// This implementation guarantees that resources are cleaned up even if
 /// the consumer is dropped without explicitly calling `shutdown()`.
-impl<P: Send + Sync + 'static> Drop for ProsodyConsumer<P> {
+impl<C: Codec> Drop for ProsodyConsumer<C> {
     fn drop(&mut self) {
         block_on(self.execute_shutdown());
     }
@@ -1376,8 +1363,6 @@ where
     managers: Arc<Managers<PL>>,
     /// Optional event type filter; `None` passes all events through.
     allowed_events: Option<AhoCorasick>,
-    /// Optional function to extract an event-type tag from a payload.
-    event_type_extractor: EventTypeExtractor<PL>,
     /// Sender for consumer-level telemetry events.
     telemetry: TelemetrySender,
     /// Atomic flag for coordinating consumer shutdown.
@@ -1412,7 +1397,7 @@ where
     T::Handler: EventHandler<Payload = C::Payload>,
     P: TriggerStoreProvider,
     C: Codec,
-    C::Payload: Clone,
+    C::Payload: Clone + EventType,
 {
     // Create the consumer context with the message handler and shared state
     let context = Context::new(
@@ -1421,7 +1406,7 @@ where
         params.trigger_provider,
         params.watermark_version.clone(),
         params.managers.clone(),
-        (params.allowed_events, params.event_type_extractor),
+        params.allowed_events,
         params.telemetry,
     );
 

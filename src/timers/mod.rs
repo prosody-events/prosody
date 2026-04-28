@@ -25,10 +25,12 @@
 //! struct MyHandler;
 //!
 //! impl EventHandler for MyHandler {
+//!     type Payload = serde_json::Value;
+//!
 //!     async fn on_message<C>(
 //!         &self,
 //!         _context: C,
-//!         _message: UncommittedMessage,
+//!         _message: UncommittedMessage<serde_json::Value>,
 //!         _demand_type: DemandType,
 //!     ) where
 //!         C: EventContext,

@@ -226,7 +226,7 @@ impl FallibleHandler for PermanentErrorHandler {
 
 /// Test environment that encapsulates setup and provides helper methods.
 struct DeferTestEnvironment {
-    consumer: ProsodyConsumer<Value>,
+    consumer: ProsodyConsumer<JsonCodec>,
     producer: ProsodyProducer<JsonCodec>,
     topic: Topic,
     event_rx: Receiver<HandlerEvent>,
@@ -296,7 +296,7 @@ impl DeferTestEnvironment {
             .layer(LogMiddleware::new())
             .into_provider(handler.clone());
 
-        let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
             handler_provider,
@@ -388,7 +388,7 @@ impl DeferTestEnvironment {
             .layer(LogMiddleware::new())
             .into_provider(permanent_handler);
 
-        let consumer = ProsodyConsumer::<Value>::new::<_, JsonCodec>(
+        let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
             &consumer_config,
             &common::create_cassandra_trigger_store_config(),
             handler_provider,

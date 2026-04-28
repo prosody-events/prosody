@@ -107,7 +107,7 @@
 //! # let retry_config = RetryConfiguration::builder().build().unwrap();
 //! # let topic_config = FailureTopicConfiguration::builder().build().unwrap();
 //! # let producer_config = ProducerConfiguration::builder().bootstrap_servers(vec!["kafka:9092".to_string()]).build().unwrap();
-//! # let producer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
+//! # let producer: ProsodyProducer = ProsodyProducer::new(&producer_config, Telemetry::new().sender()).unwrap();
 //! # let telemetry = Telemetry::default();
 //! # let handler = MyHandler;
 //!
