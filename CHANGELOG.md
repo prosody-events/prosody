@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1](https://github.com/prosody-events/prosody/compare/prosody-v0.2.0...prosody-v0.2.1) (2026-04-30)
+
+
+### Bug Fixes
+
+* **defer:** enforce no-entry-after-empty contract across defer stores ([#28](https://github.com/prosody-events/prosody/issues/28)) ([2b57a69](https://github.com/prosody-events/prosody/commit/2b57a6981712859cb64ad20ca2a9d9d5f738b703))
+
+
+### Performance Improvements
+
+* **codec:** take Payload by value in serialize for zero-copy binary path ([#27](https://github.com/prosody-events/prosody/issues/27)) ([0fc68b7](https://github.com/prosody-events/prosody/commit/0fc68b73458af068388ba54e96060fdba5775175))
+
 ## [0.2.0](https://github.com/prosody-events/prosody/compare/prosody-v0.1.2...prosody-v0.2.0) (2026-04-28)
 
 
