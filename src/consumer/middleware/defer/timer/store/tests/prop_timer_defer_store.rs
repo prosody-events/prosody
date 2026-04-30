@@ -332,15 +332,15 @@ impl TimerDeferModel {
                 key_index,
                 current_retry_count,
             } => {
-                let key = Arc::clone(&key_components[*key_index].key);
-                // Increment retry count (saturating_add)
-                // Note: Creates entry if doesn't exist (via set_retry_count)
+                let key = &key_components[*key_index].key;
+                // Increment retry count (saturating_add). No-op on a key with
+                // no timers — production never increments without an active
+                // timer, and creating an orphan entry violates the contract
+                // "no entry after all timers are processed."
                 let new_count = current_retry_count.saturating_add(1);
-                let entry = self
-                    .keys
-                    .entry(key)
-                    .or_insert_with(|| (BTreeSet::new(), None));
-                entry.1 = Some(new_count);
+                if let Some(entry) = self.keys.get_mut(key.as_ref()) {
+                    entry.1 = Some(new_count);
+                }
             }
 
             // Primitive operations
@@ -356,20 +356,29 @@ impl TimerDeferModel {
                 let key = &key_components[*key_index].key;
                 if let Some(entry) = self.keys.get_mut(key.as_ref()) {
                     entry.0.remove(time);
+                    if entry.0.is_empty() {
+                        // Once all timers for a key are processed, the entry
+                        // is dead state. retry_count = 0 ≡ retry_count
+                        // absent, so dropping the entry mirrors Cassandra's
+                        // delete_key on min-only-row removal.
+                        self.keys.remove(key.as_ref());
+                    }
                 }
             }
             TimerDeferOperation::SetRetryCount {
                 key_index,
                 retry_count,
             } => {
-                let key = Arc::clone(&key_components[*key_index].key);
-                // Match store behavior: set_retry_count creates entry even if no
-                // timers exist
-                let entry = self
-                    .keys
-                    .entry(key)
-                    .or_insert_with(|| (BTreeSet::new(), None));
-                entry.1 = Some(*retry_count);
+                let key = &key_components[*key_index].key;
+                // No-op on a key with no timers — production never sets
+                // retry_count without an active timer, and creating an
+                // orphan entry violates the contract "no entry after all
+                // timers are processed." Cassandra's blind UPDATE may still
+                // create a transient orphan static, but it gets wiped on the
+                // next defer_*_timer.
+                if let Some(entry) = self.keys.get_mut(key.as_ref()) {
+                    entry.1 = Some(*retry_count);
+                }
             }
             TimerDeferOperation::DeleteKey(key_index) => {
                 let key = &key_components[*key_index].key;
@@ -419,6 +428,14 @@ impl TimerDeferModel {
     #[must_use]
     pub fn is_deferred(&self, key: &Key) -> Option<u32> {
         self.get_next(key).map(|(_, retry_count)| retry_count)
+    }
+
+    /// Returns `true` when the model has no logical state for the key — no
+    /// timers and no retry count. Used by the no-orphan invariant to check
+    /// that Cassandra has fully wiped the partition.
+    #[must_use]
+    pub fn has_no_state(&self, key: &Key) -> bool {
+        !self.keys.contains_key(key.as_ref())
     }
 }
 
