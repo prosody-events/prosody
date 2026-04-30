@@ -254,7 +254,7 @@ pub enum FailureTopicOutput<O, E> {
 impl<Enc> HandlerMiddleware<Enc::Payload> for FailureTopicMiddleware<Enc>
 where
     Enc: Codec,
-    Enc::Payload: EventIdentity,
+    Enc::Payload: Clone + EventIdentity,
 {
     type Provider<T>
         = FailureTopicProvider<T, Enc>
@@ -280,7 +280,7 @@ impl<T, Enc> FallibleHandlerProvider for FailureTopicProvider<T, Enc>
 where
     T: FallibleHandlerProvider,
     Enc: Codec<Payload = <T::Handler as FallibleHandler>::Payload>,
-    Enc::Payload: EventIdentity,
+    Enc::Payload: Clone + EventIdentity,
 {
     type Handler = FailureTopicHandler<T::Handler, Enc>;
 
@@ -298,7 +298,7 @@ impl<T, Enc> FallibleHandler for FailureTopicHandler<T, Enc>
 where
     T: FallibleHandler,
     Enc: Codec<Payload = T::Payload>,
-    Enc::Payload: EventIdentity,
+    Enc::Payload: Clone + EventIdentity,
 {
     type Error = FailureTopicError<T::Error, Enc::Error>;
     /// Output for the DLQ middleware. The inner handler always ran when this
@@ -410,7 +410,7 @@ where
         // apply hook can fire on outer-retry re-dispatch.
         match self
             .producer
-            .send(headers, self.topic, key, message.payload())
+            .send(headers, self.topic, key, message.payload().clone())
             .await
         {
             Ok(()) => Ok(FailureTopicOutput::Routed(error)),

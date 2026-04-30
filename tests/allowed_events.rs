@@ -91,8 +91,10 @@ async fn test_allowed_events_filtering() -> Result<()> {
     });
 
     // Send both disallowed and allowed messages
-    producer.send([], topic, key, &payload_filtered).await?;
-    producer.send([], topic, key, &payload_allowed).await?;
+    producer.send([], topic, key, payload_filtered).await?;
+    producer
+        .send([], topic, key, payload_allowed.clone())
+        .await?;
 
     // Validate receipt of only the allowed message
     let received = timeout(Duration::from_secs(30), messages_rx.recv()).await?;

@@ -109,8 +109,8 @@ async fn run_scenario(
     let event_id = format!("unique-event-{event_suffix}");
     let payload = json!({ "id": event_id, "value": "test message" });
 
-    producer.send([], topic, key, &payload).await?;
-    producer.send([], topic, key, &Value::Null).await?;
+    producer.send([], topic, key, payload.clone()).await?;
+    producer.send([], topic, key, Value::Null).await?;
 
     // Check whether the messages are received or not, based on `expect_messages`.
     if expect_messages {

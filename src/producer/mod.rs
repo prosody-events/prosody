@@ -395,7 +395,7 @@ impl<C: Codec> ProsodyProducer<C> {
         headers: H,
         topic: Topic,
         key: &str,
-        payload: &C::Payload,
+        payload: C::Payload,
     ) -> Result<(), ProducerError<C::Error>>
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,

@@ -104,7 +104,7 @@ async fn quickstart() -> Result<()> {
     client.subscribe(MyHandler { sender }).await?;
 
     client
-        .send(topic, "message-key", &json!({"value": "Hello, Kafka!"}))
+        .send(topic, "message-key", json!({"value": "Hello, Kafka!"}))
         .await?;
 
     let message_key = timeout(Duration::from_secs(30), receiver.recv())

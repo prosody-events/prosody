@@ -146,7 +146,7 @@ async fn test_context_invalidation_prevents_cloned_usage() -> Result<()> {
 
     // Send a test message
     let test_payload = json!({ "test": "context_invalidation" });
-    producer.send([], topic, "test-key", &test_payload).await?;
+    producer.send([], topic, "test-key", test_payload).await?;
 
     info!("Sent test message, waiting for cloned context...");
 

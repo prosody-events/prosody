@@ -34,13 +34,16 @@ pub trait Codec: Default + Send + Sync + 'static {
     /// Returns an error if the bytes cannot be decoded into `Self::Payload`.
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error>;
 
-    /// Appends the serialized payload to `buf`. Callers are responsible for
-    /// clearing `buf` first if a fresh buffer is required.
+    /// Appends the serialized payload to `buf`, consuming the payload.
+    /// Callers are responsible for clearing `buf` first if a fresh buffer is
+    /// required; codecs that own a wire-format byte buffer (e.g.
+    /// [`BinaryCodec`]) may move it into `buf` directly when `buf` is empty,
+    /// avoiding a copy.
     ///
     /// # Errors
     ///
     /// Returns an error if `payload` cannot be encoded.
-    fn serialize(&mut self, payload: &Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error>;
+    fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error>;
 
     /// Runs `f` with a thread-local cached instance of this codec.
     ///

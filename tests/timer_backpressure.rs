@@ -166,7 +166,7 @@ async fn test_timer_backpressure() -> Result<()> {
                 "schedule_timer_delay_ms": 50 + (i * 10) // Stagger the timer delays
             });
 
-            if let Err(e) = producer.send([], topic, &i.to_string(), &payload).await {
+            if let Err(e) = producer.send([], topic, &i.to_string(), payload).await {
                 error!("Failed to send message: {e}");
             }
         }

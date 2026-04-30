@@ -152,7 +152,7 @@ async fn send_test_messages(
             "data": format!("from {} topic", topic.source_id)
         });
 
-        client.send(topic.name, TEST_KEY, &payload).await?;
+        client.send(topic.name, TEST_KEY, payload).await?;
 
         if topic.should_match_pattern {
             expected_messages += 1;

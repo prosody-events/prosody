@@ -93,9 +93,9 @@ async fn case_duplicate_id_same_key(
     let second = Payload::from(json!({"id": event_id, "value": "second"}));
     let eof = Payload::from(json!({"eof": true}));
 
-    producer.send([], *topic, key, &first).await?;
-    producer.send([], *topic, key, &second).await?;
-    producer.send([], *topic, key, &eof).await?;
+    producer.send([], *topic, key, first).await?;
+    producer.send([], *topic, key, second).await?;
+    producer.send([], *topic, key, eof).await?;
 
     // Only the first should be emitted; second is deduped; EOF proves it was
     // skipped
@@ -122,7 +122,7 @@ async fn case_same_id_different_keys(
     let payload = Payload::from(json!({"id": event_id, "value": "payload"}));
     let keys = ["key-A", "key-B"];
     for &k in &keys {
-        producer.send([], *topic, k, &payload).await?;
+        producer.send([], *topic, k, payload.clone()).await?;
     }
 
     let mut seen = Vec::new();
@@ -154,8 +154,8 @@ async fn case_distinct_ids_same_key(
     let one = Payload::from(json!({"id": "e1", "value": "one"}));
     let two = Payload::from(json!({"id": "e2", "value": "two"}));
 
-    producer.send([], *topic, key, &one).await?;
-    producer.send([], *topic, key, &two).await?;
+    producer.send([], *topic, key, one).await?;
+    producer.send([], *topic, key, two).await?;
 
     expect_message(
         rx,
@@ -190,10 +190,10 @@ async fn case_reset_after_none(
     let b = Payload::from(json!({"id": event_id, "value": "third"}));
     let eof = Payload::from(json!({"eof": true}));
 
-    producer.send([], *topic, key, &a).await?;
-    producer.send([], *topic, key, &none).await?;
-    producer.send([], *topic, key, &b).await?;
-    producer.send([], *topic, key, &eof).await?;
+    producer.send([], *topic, key, a).await?;
+    producer.send([], *topic, key, none).await?;
+    producer.send([], *topic, key, b).await?;
+    producer.send([], *topic, key, eof).await?;
 
     // First message delivered
     expect_message(
@@ -227,10 +227,10 @@ async fn case_return_to_original_id(
     let m3 = Payload::from(json!({"id": id1, "value": "three"}));
     let eof = Payload::from(json!({"eof": true}));
 
-    producer.send([], *topic, key, &m1).await?;
-    producer.send([], *topic, key, &m2).await?;
-    producer.send([], *topic, key, &m3).await?;
-    producer.send([], *topic, key, &eof).await?;
+    producer.send([], *topic, key, m1).await?;
+    producer.send([], *topic, key, m2).await?;
+    producer.send([], *topic, key, m3).await?;
+    producer.send([], *topic, key, eof).await?;
 
     // First two delivered (distinct IDs)
     expect_message(

@@ -102,8 +102,8 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     let payload = json!({ "id": event_id, "value": "first message" });
     let payload_duplicate = json!({ "id": event_id, "value": "duplicate message" });
 
-    producer.send([], topic, key, &payload).await?;
-    producer.send([], topic, key, &payload_duplicate).await?;
+    producer.send([], topic, key, payload.clone()).await?;
+    producer.send([], topic, key, payload_duplicate).await?;
 
     // Only the first message should be processed
     let received = collect_messages_with_timeout(&mut messages_rx, 1_usize, 30_u64).await?;

@@ -149,7 +149,7 @@ async fn produce_messages(
             "seq": seq,
             "content": "test message"
         });
-        producer.send([], topic, &key, &payload).await?;
+        producer.send([], topic, &key, payload).await?;
     }
     Ok(())
 }
