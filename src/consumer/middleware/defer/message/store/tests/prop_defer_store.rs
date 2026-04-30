@@ -417,6 +417,14 @@ impl DeferModel {
     pub fn is_deferred(&self, key: &Key) -> Option<u32> {
         self.get_next(key).map(|(_, retry_count)| retry_count)
     }
+
+    /// Returns `true` when the model has no logical state for the key — no
+    /// offsets and no retry count. Used by the no-orphan invariant to check
+    /// that Cassandra has fully wiped the partition.
+    #[must_use]
+    pub fn has_no_state(&self, key: &Key) -> bool {
+        !self.keys.contains_key(key.as_ref())
+    }
 }
 
 /// Verifies that model and store are equivalent for all key components.

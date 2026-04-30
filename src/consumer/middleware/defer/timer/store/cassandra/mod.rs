@@ -429,7 +429,14 @@ impl TimerDeferStore for CassandraTimerDeferStore {
     ) -> Result<TimerRetryCompletionResult, Self::Error> {
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
 
-        let cur_next_time = cached.as_ref().map(|e| e.time);
+        // Empty partition: precondition violation. delete_key wipes any
+        // orphan static (matching message store) and reports Completed.
+        let Some(entry) = cached else {
+            self.delete_key(key).await?;
+            return Ok(TimerRetryCompletionResult::Completed);
+        };
+
+        let cur_next_time = Some(entry.time);
 
         if cur_next_time == Some(time) {
             // FIFO hot path: probe for the successor before deleting
@@ -487,23 +494,17 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 .map_err(CassandraStoreError::from)?;
 
             // cur_next is unchanged; retry_count reset to 0
-            if let Some(entry) = cached {
-                let context = entry.context.clone();
-                let next_time = entry.time;
-                self.cache.insert(
-                    Arc::clone(key),
-                    Some(CachedTimerEntry {
-                        time: next_time,
-                        context: context.clone(),
-                        retry_count: 0,
-                    }),
-                );
-                Ok(TimerRetryCompletionResult::MoreTimers { next_time, context })
-            } else {
-                // Empty partition — contract violation, handle gracefully
-                let _ = self.cache.remove(key.as_ref());
-                Ok(TimerRetryCompletionResult::Completed)
-            }
+            let context = entry.context.clone();
+            let next_time = entry.time;
+            self.cache.insert(
+                Arc::clone(key),
+                Some(CachedTimerEntry {
+                    time: next_time,
+                    context: context.clone(),
+                    retry_count: 0,
+                }),
+            );
+            Ok(TimerRetryCompletionResult::MoreTimers { next_time, context })
         }
     }
 
@@ -672,7 +673,17 @@ impl TimerDeferStore for CassandraTimerDeferStore {
 
     #[instrument(level = "debug", skip(self), err)]
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        let segment_id = self.segment_id().await?;
+        // No-op on a partition with no live timers. Cassandra's blind UPDATE
+        // upserts a static-only row and leaves an orphan retry_count after
+        // all timers have been processed. resolve_cache_or_read also fires
+        // legacy repair, so a partition with clustering rows but a NULL
+        // next_timer still resolves as Some(_) here.
+        let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
+        let Some(entry) = cached else {
+            debug!(key = ?key, "set_retry_count on empty partition: no-op");
+            return Ok(());
+        };
+
         let ttl = self.store.base_ttl();
         let retry_count_i32: i32 = retry_count.try_into().unwrap_or(i32::MAX);
 
@@ -684,19 +695,14 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             .await
             .map_err(CassandraStoreError::from)?;
 
-        // Update retry_count in cache in-place
-        if let Some(Some(entry)) = self.cache.get(key.as_ref()) {
-            self.cache.insert(
-                Arc::clone(key),
-                Some(CachedTimerEntry {
-                    time: entry.time,
-                    context: entry.context.clone(),
-                    retry_count,
-                }),
-            );
-        } else {
-            self.cache.remove(key.as_ref());
-        }
+        self.cache.insert(
+            Arc::clone(key),
+            Some(CachedTimerEntry {
+                time: entry.time,
+                context: entry.context,
+                retry_count,
+            }),
+        );
 
         debug!(key = ?key, retry_count, "Updated retry count");
         Ok(())
@@ -738,6 +744,45 @@ impl CassandraTimerDeferStore {
             .into_rows_result()?
             .maybe_first_row::<(Option<DeferredNextTimer>, Option<i32>)>()?;
         Ok(row.and_then(|(udt_opt, _)| udt_opt.map(|udt| (udt.time, udt.span))))
+    }
+
+    /// Reads the raw partition state for the no-orphan invariant: any
+    /// clustering row, the static `next_timer`, and the static
+    /// `retry_count`. Returns `(has_clustering, next_timer_set,
+    /// retry_count_set)`.
+    async fn read_partition_liveness_for_invariant_check(
+        &self,
+        key: &Key,
+    ) -> color_eyre::Result<(bool, bool, bool)> {
+        let segment_id = self
+            .segment_id()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+
+        let static_row = self
+            .session()
+            .execute_unpaged(&self.queries.get_next_static, (&segment_id, key.as_ref()))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(Option<DeferredNextTimer>, Option<i32>)>()?;
+        let (next_set, rc_set) = match static_row {
+            None => (false, false),
+            Some((udt_opt, rc_opt)) => (udt_opt.is_some(), rc_opt.is_some()),
+        };
+
+        let probe = self
+            .session()
+            .execute_unpaged(&self.queries.probe_min, (&segment_id, key.as_ref()))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(
+                Option<CompactDateTime>,
+                Option<HashMap<String, String>>,
+                Option<i32>,
+            )>()?;
+        let has_clustering = matches!(probe, Some((Some(_), _, _)));
+
+        Ok((has_clustering, next_set, rc_set))
     }
 
     /// Seeds a pre-migration legacy partition for tests: inserts clustering
@@ -1001,6 +1046,24 @@ mod invariant_tests {
                         return Err(color_eyre::eyre::eyre!(
                             "I1 after op #{op_idx} key={key}: db={db_time:?} model={model_min:?}"
                         ));
+                    }
+
+                    // No-orphan invariant: if the model says the key has no
+                    // logical state, the Cassandra partition must also be
+                    // empty — no clustering rows, no static `next_timer`,
+                    // no static `retry_count`.
+                    if model.has_no_state(&key) {
+                        let (has_clustering, next_set, rc_set) = store
+                            .read_partition_liveness_for_invariant_check(&key)
+                            .await
+                            .map_err(|e| color_eyre::eyre::eyre!("op #{op_idx}: {e}"))?;
+                        if has_clustering || next_set || rc_set {
+                            return Err(color_eyre::eyre::eyre!(
+                                "no-orphan after op #{op_idx} key={key}: model empty but DB has \
+                                 clustering={has_clustering} next_timer={next_set} \
+                                 retry_count={rc_set}"
+                            ));
+                        }
                     }
                 }
                 Ok::<_, color_eyre::Report>(())
@@ -1387,20 +1450,21 @@ mod legacy_repair_tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_set_retry_count_preserves_legacy_then_repairs() -> color_eyre::Result<()> {
+    async fn test_legacy_set_retry_count_triggers_repair() -> color_eyre::Result<()> {
         let store = tests::build_test_store().await?;
         let k = key();
         let t = future_time(60);
         store.seed_legacy_for_test(&k, &[t], Some(2)).await?;
 
-        // set_retry_count does not read next_timer, so the legacy state
-        // survives this op: DB still has next_timer = NULL.
+        // set_retry_count now reads via resolve_cache_or_read so it can
+        // no-op on a truly empty partition (no orphan creation). On a
+        // legacy partition this triggers eager repair: next_timer is
+        // populated and retry_count is updated.
         store.set_retry_count(&k, 9).await?;
         let db_next_after_set = store.read_next_timer_for_invariant_check(&k).await?;
-        assert!(db_next_after_set.is_none());
+        assert!(matches!(db_next_after_set, Some((time, _)) if time == t));
 
-        // The first read path *after* set_retry_count must still trigger
-        // repair, observing the updated retry_count.
+        // Subsequent read serves from cache with the repaired state.
         let got = store.get_next_deferred_timer(&k).await?;
         let (trigger, rc) = got.ok_or_else(|| color_eyre::eyre::eyre!("expected timer"))?;
         assert_eq!(trigger.time, t);
