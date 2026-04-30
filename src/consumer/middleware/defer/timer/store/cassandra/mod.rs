@@ -515,34 +515,40 @@ impl TimerDeferStore for CassandraTimerDeferStore {
 
         match &cached {
             None => {
-                // Empty partition: INSERT + initialize next_timer in one BATCH so
-                // I1 holds from the first row. `retry_count` is untouched — it may
-                // already hold an orphan value from a prior `set_retry_count` on
-                // this key, which we must preserve. Invalidate the cache so the
-                // next read picks up the real static-column values from the DB.
+                // Empty partition: precondition violation (caller should have
+                // used defer_first_timer). Treat as a fresh first deferral —
+                // single INSERT writes original_time, span, retry_count = 0,
+                // and next_timer atomically. retry_count = 0 explicitly wipes
+                // any orphan static left by a prior set_retry_count.
                 let new_udt = DeferredNextTimer {
                     time: trigger.time,
                     span: span_map.clone(),
                 };
                 self.session()
                     .execute_unpaged(
-                        &self.queries.batch_append_with_next,
+                        &self.queries.insert_deferred_timer_with_retry_count,
                         (
                             &segment_id,
                             trigger.key.as_ref(),
                             trigger.time,
                             &span_map,
-                            ttl, // INSERT params
-                            ttl,
+                            0_i32,
                             &new_udt,
-                            &segment_id,
-                            trigger.key.as_ref(), // UPDATE params
+                            ttl,
                         ),
                     )
                     .await
                     .map_err(CassandraStoreError::from)?;
 
-                let _ = self.cache.remove(trigger.key.as_ref());
+                let context = self.extract_context(&new_udt.span);
+                self.cache.insert(
+                    Arc::clone(&trigger.key),
+                    Some(CachedTimerEntry {
+                        time: trigger.time,
+                        context,
+                        retry_count: 0,
+                    }),
+                );
             }
             Some(entry) if trigger.time < entry.time => {
                 // Out-of-order: lower next_timer in the same BATCH

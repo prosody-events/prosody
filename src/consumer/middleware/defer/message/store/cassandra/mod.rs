@@ -323,29 +323,20 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         // cached: Option<(Offset, u32)>
         match cached {
             None => {
-                // Empty partition: INSERT + initialize next_offset in one BATCH so
-                // I1 holds from the first row. `retry_count` is untouched — it may
-                // already hold an orphan value from a prior `set_retry_count` on
-                // this key, which we must preserve. Invalidate the cache so the
-                // next read picks up the real static-column values from the DB.
+                // Empty partition: precondition violation (caller should have
+                // used defer_first_message). Treat as a fresh first deferral —
+                // single INSERT writes offset, retry_count = 0, and
+                // next_offset atomically. retry_count = 0 explicitly wipes
+                // any orphan static left by a prior set_retry_count.
                 self.session()
                     .execute_unpaged(
-                        &self.queries.batch_append_with_next,
-                        (
-                            &segment_id,
-                            key.as_ref(),
-                            offset,
-                            ttl,
-                            ttl,
-                            offset,
-                            &segment_id,
-                            key.as_ref(),
-                        ),
+                        &self.queries.insert_deferred_message_with_retry_count,
+                        (&segment_id, key.as_ref(), offset, 0_i32, offset, ttl),
                     )
                     .await
                     .map_err(CassandraStoreError::from)?;
 
-                let _ = self.cache.remove(key.as_ref());
+                self.cache.insert(Arc::clone(key), Some((offset, 0)));
             }
             Some((cur_next, cur_rc)) if offset < cur_next => {
                 // Out-of-order: lower next_offset in the same BATCH as the INSERT
