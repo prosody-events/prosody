@@ -18,7 +18,7 @@ use quick_cache::sync::Cache;
 use scylla::client::session::Session;
 use std::fmt;
 use std::sync::Arc;
-use tracing::instrument;
+use tracing::{debug, instrument};
 
 pub mod queries;
 
@@ -195,6 +195,35 @@ impl CassandraMessageDeferStore {
         let db_val = self.read_next_static(&segment_id, key).await?;
         Ok((segment_id, db_val))
     }
+
+    /// First-deferral INSERT given pre-resolved partition state. Writes the
+    /// clustering row, `next_offset = min(offset, cur_next)`, and
+    /// `retry_count = 0` in a single statement, atomically wiping any orphan
+    /// static left by a prior `set_retry_count`. Shared by
+    /// `defer_first_message` and the empty-partition recovery branch of
+    /// `append_deferred_message`.
+    async fn defer_first_message_resolved(
+        &self,
+        segment_id: &uuid::Uuid,
+        key: &Key,
+        offset: Offset,
+        cached: Option<(Offset, u32)>,
+    ) -> Result<(), CassandraDeferStoreError> {
+        let ttl = self.store.base_ttl();
+        let new_next = cached.map_or(offset, |(cur_next, _)| cur_next.min(offset));
+
+        self.session()
+            .execute_unpaged(
+                &self.queries.insert_deferred_message_with_retry_count,
+                (segment_id, key.as_ref(), offset, 0_i32, new_next, ttl),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        self.cache.insert(Arc::clone(key), Some((new_next, 0)));
+
+        Ok(())
+    }
 }
 
 impl fmt::Debug for CassandraMessageDeferStore {
@@ -214,20 +243,8 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         // "fresh key" precondition is violated: the new row must not raise
         // `next_offset` above a lower live offset that already exists.
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
-        let ttl = self.store.base_ttl();
-        let new_next = cached.map_or(offset, |(cur_next, _)| cur_next.min(offset));
-
-        self.session()
-            .execute_unpaged(
-                &self.queries.insert_deferred_message_with_retry_count,
-                (&segment_id, key.as_ref(), offset, 0_i32, new_next, ttl),
-            )
+        self.defer_first_message_resolved(&segment_id, key, offset, cached)
             .await
-            .map_err(CassandraStoreError::from)?;
-
-        self.cache.insert(Arc::clone(key), Some((new_next, 0)));
-
-        Ok(())
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -324,19 +341,11 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         match cached {
             None => {
                 // Empty partition: precondition violation (caller should have
-                // used defer_first_message). Treat as a fresh first deferral —
-                // single INSERT writes offset, retry_count = 0, and
-                // next_offset atomically. retry_count = 0 explicitly wipes
-                // any orphan static left by a prior set_retry_count.
-                self.session()
-                    .execute_unpaged(
-                        &self.queries.insert_deferred_message_with_retry_count,
-                        (&segment_id, key.as_ref(), offset, 0_i32, offset, ttl),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-
-                self.cache.insert(Arc::clone(key), Some((offset, 0)));
+                // used defer_first_message). Recover via the shared
+                // first-deferral INSERT, which writes retry_count = 0 and so
+                // wipes any orphan static left by a prior set_retry_count.
+                self.defer_first_message_resolved(&segment_id, key, offset, None)
+                    .await?;
             }
             Some((cur_next, cur_rc)) if offset < cur_next => {
                 // Out-of-order: lower next_offset in the same BATCH as the INSERT
@@ -432,6 +441,7 @@ impl MessageDeferStore for CassandraMessageDeferStore {
         // next_offset still resolves as Some(_) here.
         let (segment_id, cached) = self.resolve_cache_or_read(key).await?;
         let Some((cur_next, _)) = cached else {
+            debug!(key = ?key, "set_retry_count on empty partition: no-op");
             return Ok(());
         };
 

@@ -302,25 +302,19 @@ impl CassandraTimerDeferStore {
             retry_count: 0,
         }
     }
-}
 
-impl fmt::Debug for CassandraTimerDeferStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CassandraTimerDeferStore")
-            .field("segment", &self.segment)
-            .finish_non_exhaustive()
-    }
-}
-
-impl TimerDeferStore for CassandraTimerDeferStore {
-    type Error = CassandraDeferStoreError;
-
-    #[instrument(level = "debug", skip(self), err)]
-    async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
-        // Consult current state so we don't violate I1 when the caller's
-        // "fresh key" precondition is violated: the new row must not raise
-        // `next_timer` above a lower live time that already exists.
-        let (segment_id, cached) = self.resolve_cache_or_read(&trigger.key).await?;
+    /// First-deferral INSERT given pre-resolved partition state. Writes the
+    /// clustering row (with span), `next_timer` (preserving any lower live
+    /// time), and `retry_count = 0` in a single statement, atomically wiping
+    /// any orphan static left by a prior `set_retry_count`. Shared by
+    /// `defer_first_timer` and the empty-partition recovery branch of
+    /// `append_deferred_timer`.
+    async fn defer_first_timer_resolved(
+        &self,
+        segment_id: &uuid::Uuid,
+        trigger: &Trigger,
+        cached: Option<CachedTimerEntry>,
+    ) -> Result<(), CassandraDeferStoreError> {
         let ttl = self.store.calculate_ttl(trigger.time);
         let span_map = self.inject_span_context(trigger);
 
@@ -341,7 +335,7 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             .execute_unpaged(
                 &self.queries.insert_deferred_timer_with_retry_count,
                 (
-                    &segment_id,
+                    segment_id,
                     trigger.key.as_ref(),
                     trigger.time,
                     &span_map,
@@ -362,6 +356,30 @@ impl TimerDeferStore for CassandraTimerDeferStore {
                 retry_count: 0,
             }),
         );
+
+        Ok(())
+    }
+}
+
+impl fmt::Debug for CassandraTimerDeferStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CassandraTimerDeferStore")
+            .field("segment", &self.segment)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TimerDeferStore for CassandraTimerDeferStore {
+    type Error = CassandraDeferStoreError;
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn defer_first_timer(&self, trigger: &Trigger) -> Result<(), Self::Error> {
+        // Consult current state so we don't violate I1 when the caller's
+        // "fresh key" precondition is violated: the new row must not raise
+        // `next_timer` above a lower live time that already exists.
+        let (segment_id, cached) = self.resolve_cache_or_read(&trigger.key).await?;
+        self.defer_first_timer_resolved(&segment_id, trigger, cached)
+            .await?;
 
         debug!(key = ?trigger.key, time = %trigger.time, "Stored first deferred timer");
         Ok(())
@@ -517,39 +535,11 @@ impl TimerDeferStore for CassandraTimerDeferStore {
         match &cached {
             None => {
                 // Empty partition: precondition violation (caller should have
-                // used defer_first_timer). Treat as a fresh first deferral —
-                // single INSERT writes original_time, span, retry_count = 0,
-                // and next_timer atomically. retry_count = 0 explicitly wipes
-                // any orphan static left by a prior set_retry_count.
-                let new_udt = DeferredNextTimer {
-                    time: trigger.time,
-                    span: span_map.clone(),
-                };
-                self.session()
-                    .execute_unpaged(
-                        &self.queries.insert_deferred_timer_with_retry_count,
-                        (
-                            &segment_id,
-                            trigger.key.as_ref(),
-                            trigger.time,
-                            &span_map,
-                            0_i32,
-                            &new_udt,
-                            ttl,
-                        ),
-                    )
-                    .await
-                    .map_err(CassandraStoreError::from)?;
-
-                let context = self.extract_context(&new_udt.span);
-                self.cache.insert(
-                    Arc::clone(&trigger.key),
-                    Some(CachedTimerEntry {
-                        time: trigger.time,
-                        context,
-                        retry_count: 0,
-                    }),
-                );
+                // used defer_first_timer). Recover via the shared
+                // first-deferral INSERT, which writes retry_count = 0 and so
+                // wipes any orphan static left by a prior set_retry_count.
+                self.defer_first_timer_resolved(&segment_id, trigger, None)
+                    .await?;
             }
             Some(entry) if trigger.time < entry.time => {
                 // Out-of-order: lower next_timer in the same BATCH
