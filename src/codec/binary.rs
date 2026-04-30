@@ -122,8 +122,16 @@ impl<E: BinaryExtractor> Codec for BinaryCodec<E> {
         })
     }
 
-    fn serialize(&mut self, payload: &Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
-        buf.extend_from_slice(&payload.bytes);
+    fn serialize(
+        &mut self,
+        mut payload: Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        if buf.is_empty() {
+            *buf = payload.bytes;
+        } else {
+            buf.append(&mut payload.bytes);
+        }
         Ok(())
     }
 
@@ -245,6 +253,7 @@ pub enum BinaryCodecError<E: StdError + Send + Sync + 'static> {
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
+    use std::ptr;
     use std::str;
 
     use super::*;
@@ -309,7 +318,33 @@ mod tests {
         );
         let mut buf = Vec::new();
         let mut codec = BinaryCodec::<PrefixExtractor>::default();
-        codec.serialize(&payload, &mut buf)?;
+        codec.serialize(payload, &mut buf)?;
+        assert_eq!(buf, b"hello world");
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_swaps_into_empty_buffer_without_copy() -> color_eyre::Result<()> {
+        let bytes = b"zero-copy payload".to_vec();
+        let bytes_ptr = bytes.as_ptr();
+        let payload = BinaryPayload::new(bytes, None::<String>, None::<String>);
+        let mut buf = Vec::new();
+        let mut codec = BinaryCodec::<PrefixExtractor>::default();
+        codec.serialize(payload, &mut buf)?;
+        assert_eq!(buf, b"zero-copy payload");
+        assert!(
+            ptr::eq(buf.as_ptr(), bytes_ptr),
+            "empty buf must adopt the payload's allocation, not memcpy"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_appends_when_buffer_non_empty() -> color_eyre::Result<()> {
+        let payload = BinaryPayload::new(b" world".to_vec(), None::<String>, None::<String>);
+        let mut buf = b"hello".to_vec();
+        let mut codec = BinaryCodec::<PrefixExtractor>::default();
+        codec.serialize(payload, &mut buf)?;
         assert_eq!(buf, b"hello world");
         Ok(())
     }

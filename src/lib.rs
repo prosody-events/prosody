@@ -99,7 +99,7 @@
 //!
 //!     client.subscribe(MyHandler).await?;
 //!
-//!     client.send("my-topic".into(), "message-key", &json!({"value": "Hello, Kafka!"})).await?;
+//!     client.send("my-topic".into(), "message-key", json!({"value": "Hello, Kafka!"})).await?;
 //!
 //!     // Run your application logic here
 //!

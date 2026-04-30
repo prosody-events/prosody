@@ -88,7 +88,7 @@ async fn test_backpressure() -> Result<()> {
     spawn(async move {
         for i in 0..total {
             let payload = json!({ "seq": i });
-            if let Err(e) = producer.send([], topic, &i.to_string(), &payload).await {
+            if let Err(e) = producer.send([], topic, &i.to_string(), payload).await {
                 error!("Failed to send message: {e}");
             }
         }

@@ -220,7 +220,7 @@ where
         &self,
         topic: Topic,
         key: &str,
-        payload: &C::Payload,
+        payload: C::Payload,
     ) -> Result<(), HighLevelClientError<C::Error>> {
         self.producer.send([], topic, key, payload).await?;
         Ok(())

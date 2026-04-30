@@ -436,7 +436,7 @@ impl DeferTestEnvironment {
     }
 
     /// Send a message to the test topic.
-    async fn send_message(&self, key: &str, payload: &Value) -> Result<()> {
+    async fn send_message(&self, key: &str, payload: Value) -> Result<()> {
         self.producer.send([], self.topic, key, payload).await?;
         Ok(())
     }
@@ -510,7 +510,7 @@ async fn run_first_failure_defers_and_retries() -> Result<()> {
     env.set_failing_values(vec![1]);
 
     // Send message that will fail
-    env.send_message("test-key", &json!({"value": 1_i64}))
+    env.send_message("test-key", json!({"value": 1_i64}))
         .await?;
 
     // Should receive transient failure event
@@ -561,11 +561,11 @@ async fn run_multiple_messages_queued_in_order() -> Result<()> {
     env.set_failing_values(vec![1]);
 
     // Send all 3 messages quickly (before timer fires)
-    env.send_message("test-key", &json!({"value": 1_i64}))
+    env.send_message("test-key", json!({"value": 1_i64}))
         .await?;
-    env.send_message("test-key", &json!({"value": 2_i64}))
+    env.send_message("test-key", json!({"value": 2_i64}))
         .await?;
-    env.send_message("test-key", &json!({"value": 3_i64}))
+    env.send_message("test-key", json!({"value": 3_i64}))
         .await?;
 
     // msg1 fails on the first attempt (retry_count=0 → immediate retry).
@@ -628,11 +628,11 @@ async fn run_permanent_errors_not_deferred() -> Result<()> {
     let mut env = DeferTestEnvironment::new_with_permanent_error_handler(999).await?;
 
     // Send a message that fails with permanent error (LogMiddleware logs it)
-    env.send_message("test-key-1", &json!({"value": 999_i64}))
+    env.send_message("test-key-1", json!({"value": 999_i64}))
         .await?;
 
     // Send a successful message with different key to verify consumer continues
-    env.send_message("test-key-2", &json!({"value": 1_i64}))
+    env.send_message("test-key-2", json!({"value": 1_i64}))
         .await?;
 
     // Should immediately get success for key-2 (not deferred)

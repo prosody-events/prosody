@@ -33,14 +33,14 @@ impl Codec for JsonCodec {
         }
     }
 
-    fn serialize(&mut self, payload: &Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
+    fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
         #[cfg(target_arch = "arm")]
         {
-            serde_json::to_writer(buf, payload).map_err(JsonCodecError::Serde)
+            serde_json::to_writer(buf, &payload).map_err(JsonCodecError::Serde)
         }
         #[cfg(not(target_arch = "arm"))]
         {
-            simd_json::to_writer(buf, payload).map_err(JsonCodecError::Simd)
+            simd_json::to_writer(buf, &payload).map_err(JsonCodecError::Simd)
         }
     }
 

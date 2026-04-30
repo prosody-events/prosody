@@ -246,7 +246,7 @@ impl TestEnvironment {
     }
 
     /// Send a message with the given key and payload
-    async fn send_message(&self, key: &str, payload: &Value) -> Result<()> {
+    async fn send_message(&self, key: &str, payload: Value) -> Result<()> {
         self.producer
             .send([], self.topic, key, payload)
             .await
@@ -259,7 +259,7 @@ impl TestEnvironment {
             "action": "schedule_timer",
             "delay_secs": delay_secs
         });
-        self.send_message(key, &message).await
+        self.send_message(key, message).await
     }
 
     /// Send a timer scheduling message with absolute time
@@ -268,7 +268,7 @@ impl TestEnvironment {
             "action": "schedule_timer",
             "target_time_secs": target_time_secs
         });
-        self.send_message(key, &message).await
+        self.send_message(key, message).await
     }
 
     /// Send a timer cancellation message
@@ -276,7 +276,7 @@ impl TestEnvironment {
         let message = json!({
             "action": "cancel_timer"
         });
-        self.send_message(key, &message).await
+        self.send_message(key, message).await
     }
 
     /// Wait for a message event with timeout

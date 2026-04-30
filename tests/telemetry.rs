@@ -1070,9 +1070,7 @@ async fn message_lifecycle_events_on_kafka() -> Result<()> {
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
-        client
-            .send(source, "test-key", &json!({"v": 1_i32}))
-            .await?;
+        client.send(source, "test-key", json!({"v": 1_i32})).await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
         let events = collect_message_events_for_key(
@@ -1109,7 +1107,7 @@ async fn producer_message_sent_on_kafka() -> Result<()> {
         let client = build_client(&dest_topic, &telemetry_topic, true)?;
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
-        client.send(dest, "sent-key", &json!({"v": 1_i32})).await?;
+        client.send(dest, "sent-key", json!({"v": 1_i32})).await?;
 
         let sent = consume_telemetry_event_by_type(
             &telemetry_consumer,
@@ -1186,7 +1184,7 @@ async fn emitter_disabled_no_events() -> Result<()> {
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
         client
-            .send(source, "no-emit-key", &json!({"v": 1_i32}))
+            .send(source, "no-emit-key", json!({"v": 1_i32}))
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
@@ -1222,7 +1220,7 @@ async fn json_payload_contract_validation() -> Result<()> {
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
         client
-            .send(source, "contract-key", &json!({"v": 1_i32}))
+            .send(source, "contract-key", json!({"v": 1_i32}))
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
@@ -1348,9 +1346,7 @@ async fn message_failed_event_on_kafka() -> Result<()> {
 
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
-        client
-            .send(source, "fail-key", &json!({"v": 1_i32}))
-            .await?;
+        client.send(source, "fail-key", json!({"v": 1_i32})).await?;
         let _ = timeout(RECEIVE_TIMEOUT, fail_rx.recv()).await?;
 
         let events = collect_message_events_for_key(
@@ -1396,7 +1392,7 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
         client
-            .send(source, "timer-key", &json!({"v": 1_i32}))
+            .send(source, "timer-key", json!({"v": 1_i32}))
             .await?;
 
         // Wait for message handler to complete (timer scheduled inside)
@@ -1452,7 +1448,7 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
         client
-            .send(source, "timer-fail-key", &json!({"v": 1_i32}))
+            .send(source, "timer-fail-key", json!({"v": 1_i32}))
             .await?;
 
         // Wait for message handler to complete (timer scheduled inside)
@@ -1512,13 +1508,13 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
         // the transient failure arrives and deferral is enabled.
         for i in 0_i32..3_i32 {
             client
-                .send(source, &format!("warmup-{i}"), &json!({"v": 0_i32}))
+                .send(source, &format!("warmup-{i}"), json!({"v": 0_i32}))
                 .await?;
             let _ = timeout(RECEIVE_TIMEOUT, done_rx.recv()).await?;
         }
 
         client
-            .send(source, "defer-msg-key", &json!({"v": 1_i32}))
+            .send(source, "defer-msg-key", json!({"v": 1_i32}))
             .await?;
 
         // Wait for the retry to succeed
@@ -1578,13 +1574,13 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
         // the transient timer failure arrives and deferral is enabled.
         for i in 0_i32..3_i32 {
             client
-                .send(source, &format!("warmup-{i}"), &json!({"v": 0_i32}))
+                .send(source, &format!("warmup-{i}"), json!({"v": 0_i32}))
                 .await?;
             let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
         }
 
         client
-            .send(source, "defer-timer-key", &json!({"v": 1_i32}))
+            .send(source, "defer-timer-key", json!({"v": 1_i32}))
             .await?;
 
         // Wait for the message handler to schedule the application timer
@@ -1642,7 +1638,7 @@ async fn timer_cancelled_event_on_kafka() -> Result<()> {
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
         client
-            .send(source, "cancel-key", &json!({"v": 1_i32}))
+            .send(source, "cancel-key", json!({"v": 1_i32}))
             .await?;
 
         // Wait for message handler to complete (schedule + cancel inside)
@@ -1716,13 +1712,13 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
 
         // First message: schedule a timer at t+60
         client
-            .send(source, "cas-key", &json!({"step": 1_i32}))
+            .send(source, "cas-key", json!({"step": 1_i32}))
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
         // Second message (same key): clear_and_schedule at t+120
         client
-            .send(source, "cas-key", &json!({"step": 2_i32}))
+            .send(source, "cas-key", json!({"step": 2_i32}))
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
@@ -1800,13 +1796,13 @@ async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
 
         // Step 1: schedule at t+3s
         client
-            .send(source, "replace-key", &json!({"step": 1_i32}))
+            .send(source, "replace-key", json!({"step": 1_i32}))
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 
         // Step 2: clear_and_schedule at t+5s (replaces the original)
         client
-            .send(source, "replace-key", &json!({"step": 2_i32}))
+            .send(source, "replace-key", json!({"step": 2_i32}))
             .await?;
         let _ = timeout(RECEIVE_TIMEOUT, msg_rx.recv()).await?;
 

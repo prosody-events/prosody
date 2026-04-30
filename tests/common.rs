@@ -221,9 +221,9 @@ pub fn spawn_producers(
             for (key, messages) in producer_messages {
                 let key = key.to_string();
                 for message in messages {
-                    producer.send([], topic, &key, &json!(message)).await?; // Send each message
+                    producer.send([], topic, &key, json!(message)).await?; // Send each message
                 }
-                producer.send([], topic, &key, &Value::Null).await?; // Send the end-of-stream marker
+                producer.send([], topic, &key, Value::Null).await?; // Send the end-of-stream marker
             }
             Ok(())
         });
