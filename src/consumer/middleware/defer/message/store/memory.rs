@@ -114,27 +114,34 @@ impl MessageDeferStore for MemoryMessageDeferStore {
     }
 
     async fn remove_deferred_message(&self, key: &Key, offset: Offset) -> Result<(), Self::Error> {
+        // Drop the entry when its last offset is removed. Once all deferred
+        // messages for a key are processed, the entry is dead state
+        // (retry_count = 0 ≡ retry_count absent), matching Cassandra's
+        // delete_key on min-only-row removal. Atomic via remove_if_async.
         let _ = self
             .inner
             .deferred
-            .entry_async(Arc::clone(key))
-            .await
-            .and_modify(|(offsets, _)| {
+            .remove_if_async(key.as_ref(), |(offsets, _)| {
                 offsets.remove(&offset);
-            });
+                offsets.is_empty()
+            })
+            .await;
 
         Ok(())
     }
 
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        self.inner
+        // No-op on a key with no offsets. Production only calls this with an
+        // active deferred message present; creating an entry here would leave
+        // an orphan, violating "no entry after all messages are processed."
+        let _ = self
+            .inner
             .deferred
             .entry_async(Arc::clone(key))
             .await
             .and_modify(|(_, current)| {
                 *current = retry_count;
-            })
-            .or_insert_with(|| (BTreeSet::new(), retry_count));
+            });
 
         Ok(())
     }

@@ -179,27 +179,35 @@ impl TimerDeferStore for MemoryTimerDeferStore {
         key: &Key,
         time: CompactDateTime,
     ) -> Result<(), Self::Error> {
+        // Remove the timer; if it was the last one, drop the entry. Once all
+        // deferred timers for a key are processed, the entry is dead state
+        // (retry_count = 0 ≡ retry_count absent), matching Cassandra's
+        // delete_key on min-only-row removal. Atomic via remove_if_async.
         let _ = self
             .inner
             .deferred
-            .entry_async(key.clone())
-            .await
-            .and_modify(|(timers, _)| {
+            .remove_if_async(key.as_ref(), |(timers, _)| {
                 timers.remove(&time);
-            });
+                timers.is_empty()
+            })
+            .await;
 
         Ok(())
     }
 
     async fn set_retry_count(&self, key: &Key, retry_count: u32) -> Result<(), Self::Error> {
-        self.inner
+        // No-op on a key with no timers. Production only calls this with an
+        // active timer present; creating an entry here would leave an orphan
+        // (entry with empty BTreeMap), violating "no entry after all timers
+        // are processed."
+        let _ = self
+            .inner
             .deferred
             .entry_async(key.clone())
             .await
             .and_modify(|(_, current)| {
                 *current = retry_count;
-            })
-            .or_insert_with(|| (BTreeMap::new(), retry_count));
+            });
 
         Ok(())
     }
