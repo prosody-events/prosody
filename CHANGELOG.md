@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0](https://github.com/prosody-events/prosody/compare/prosody-v0.1.2...prosody-v0.2.0) (2026-04-28)
+
+
+### Features
+
+* **codec:** support custom wire formats via Codec trait ([#26](https://github.com/prosody-events/prosody/issues/26)) ([f98eeb2](https://github.com/prosody-events/prosody/commit/f98eeb2a716f7600187bdc1a6b948d79d31add76))
+* **middleware:** apply hooks (after_commit / after_abort) on FallibleHandler ([#24](https://github.com/prosody-events/prosody/issues/24)) ([4b0f2de](https://github.com/prosody-events/prosody/commit/4b0f2de6fa21f30e2c4a64ec6ce4262ad7a4f0ad))
+
+
+### Bug Fixes
+
+* use client-side monotonic timestamps for Cassandra writes ([#25](https://github.com/prosody-events/prosody/issues/25)) ([f4a4ba2](https://github.com/prosody-events/prosody/commit/f4a4ba2fb60c285e3031562c464b3c1f543df62c))
+
+
+### Performance Improvements
+
+* **telemetry:** increase broadcast channel capacity to 32768 ([#19](https://github.com/prosody-events/prosody/issues/19)) ([9850295](https://github.com/prosody-events/prosody/commit/9850295d935086e134980f52fb3e44c624f1b537))
+
 ## [0.1.2](https://github.com/prosody-events/prosody/compare/prosody-v0.1.1...prosody-v0.1.2) (2026-04-20)
 
 
