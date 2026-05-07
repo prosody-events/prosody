@@ -65,8 +65,22 @@ use ahash::HashMap;
 use scc::hash_map::Entry;
 use std::sync::Arc;
 
-/// Maps (time, type) tuples to their lifecycle state for a single key.
-type TriggerStateMap = HashMap<(CompactDateTime, TimerType), TimerState>;
+/// Per-timer entry combining lifecycle state with the oracle tag.
+///
+/// `state` and `tag` must be mutated together under the trigger-lock.
+/// Per-key linearization (`KeyManager`) makes this coherent: no two
+/// `EventContext` operations for the same key run concurrently.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ActiveTriggerEntry {
+    /// Lifecycle state of the timer.
+    pub state: TimerState,
+    /// Random 32-bit identity; `0` for legacy/inline timers without a stored
+    /// tag.
+    pub tag: i32,
+}
+
+/// Maps (time, type) tuples to their lifecycle entry for a single key.
+type TriggerStateMap = HashMap<(CompactDateTime, TimerType), ActiveTriggerEntry>;
 
 /// Lifecycle state of a timer in the in-memory scheduler.
 ///
@@ -111,26 +125,27 @@ pub struct ActiveTriggers(Arc<scc::HashMap<Key, TriggerStateMap>>);
 
 impl ActiveTriggers {
     /// Inserts a trigger into the active registry with
-    /// [`TimerState::Scheduled`] state.
+    /// [`TimerState::Scheduled`] state and the trigger's `tag`.
     ///
-    /// Creates a new map of (time, type) to state if no entry exists for the
+    /// Creates a new map of (time, type) to entry if no entry exists for the
     /// trigger's key. Duplicate insertions are ignored if the trigger already
     /// exists.
     ///
     /// # Arguments
     ///
-    /// * `trigger` - The [`Trigger`] containing the key, time, and type to
-    ///   insert.
+    /// * `trigger` - The [`Trigger`] containing the key, time, type, and tag.
     pub async fn insert(&self, trigger: Trigger) {
-        // Obtain or create the entry for this key, then insert the (time, type) with
-        // Scheduled state.
+        let entry = ActiveTriggerEntry {
+            state: TimerState::Scheduled,
+            tag: trigger.tag,
+        };
         self.0
             .entry_async(trigger.key)
             .await
             .or_default()
             .get_mut()
             .entry((trigger.time, trigger.timer_type))
-            .or_insert(TimerState::Scheduled);
+            .or_insert(entry);
     }
 
     /// Removes a trigger time for a specific key and timer type.
@@ -158,27 +173,60 @@ impl ActiveTriggers {
 
     /// Returns the state of a given trigger time and type for a key.
     ///
-    /// # Arguments
-    ///
-    /// * `key` - The [`Key`] to query.
-    /// * `time` - The [`CompactDateTime`] to check.
-    /// * `timer_type` - The [`TimerType`] to check.
-    ///
     /// # Returns
     ///
-    /// `Some(TimerState)` if the registry contains the specified (time, type)
-    /// entry for the key, `None` otherwise.
+    /// `Some(TimerState)` if the registry contains the entry, `None` otherwise.
     pub async fn get_state(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Option<TimerState> {
-        // Read the entry for the key, returning None if absent.
         self.0
-            .read_async(key, |_, states| states.get(&(time, timer_type)).copied())
+            .read_async(key, |_, states| {
+                states.get(&(time, timer_type)).map(|e| e.state)
+            })
             .await
             .flatten()
+    }
+
+    /// Returns the tag of a given trigger time and type for a key.
+    ///
+    /// # Returns
+    ///
+    /// `Some(tag)` if the registry contains the entry, `None` if absent.
+    pub async fn get_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Option<i32> {
+        self.0
+            .read_async(key, |_, states| {
+                states.get(&(time, timer_type)).map(|e| e.tag)
+            })
+            .await
+            .flatten()
+    }
+
+    /// Atomically updates the tag for a given trigger entry.
+    ///
+    /// Returns `true` if the entry existed and was updated.
+    pub async fn set_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        tag: i32,
+    ) -> bool {
+        if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await {
+            let states = occupied.get_mut();
+            if let Some(entry) = states.get_mut(&(time, timer_type)) {
+                entry.tag = tag;
+                return true;
+            }
+        }
+        false
     }
 
     /// Checks whether a given trigger time and type is active for a key.
@@ -230,14 +278,7 @@ impl ActiveTriggers {
             })
     }
 
-    /// Atomically sets the state of a timer.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The [`Key`] of the timer.
-    /// * `time` - The [`CompactDateTime`] of the timer.
-    /// * `timer_type` - The [`TimerType`] of the timer.
-    /// * `state` - The new [`TimerState`] to set.
+    /// Atomically sets the state of a timer (preserves tag).
     ///
     /// # Returns
     ///
@@ -249,11 +290,10 @@ impl ActiveTriggers {
         timer_type: TimerType,
         state: TimerState,
     ) -> bool {
-        // Update the state if the entry exists.
         if let Entry::Occupied(mut occupied) = self.0.entry_async(key.clone()).await {
             let states = occupied.get_mut();
-            if let Some(current_state) = states.get_mut(&(time, timer_type)) {
-                *current_state = state;
+            if let Some(entry) = states.get_mut(&(time, timer_type)) {
+                entry.state = state;
                 return true;
             }
         }

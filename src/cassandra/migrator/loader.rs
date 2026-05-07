@@ -235,6 +235,14 @@ mod tests {
                 "20260319_create_deduplication.cql",
                 "72568cda66e2055d552b5da9310ed518aed82fdbfe2b69db4c460cf7fb37a516",
             ),
+            (
+                "20260506_add_tag.cql",
+                "7e6d001c9b7093fde645dc912323608b2bb665d977e35e7358b04a94257fd73a",
+            ),
+            (
+                "20260507_add_tag_to_udt.cql",
+                "7a90ffff0603fc7563e039a3a0027fc109dddffc231ce42dd15ec0af8f8d34bf",
+            ),
         ]
         .into();
 

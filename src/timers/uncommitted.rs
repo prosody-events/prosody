@@ -193,21 +193,33 @@ where
     /// `Firing` state. If the timer was cancelled while queued, returns
     /// `None` and the timer is marked as completed.
     ///
+    /// The `FiringTimer`'s trigger carries the canonical tag from
+    /// `ActiveTriggers` at the moment of dispatch. This tag may differ from
+    /// the tag on the queue-popped trigger if a `complete()`-from-
+    /// `FiringRescheduled` rotation occurred while this entry was in the
+    /// delay queue.
+    ///
     /// # Returns
     ///
     /// `Some(FiringTimer)` if the timer is still active and can be processed,
     /// `None` if the timer was cancelled while waiting in the queue.
-    pub async fn fire(mut self) -> Option<FiringTimer<T>> {
-        // Attempt to transition from Scheduled → Firing
-        if !self.uncommitted.fire().await {
-            // Timer was cancelled or not in Scheduled state; mark as completed
-            self.uncommitted.completed = true;
-            return None;
-        }
+    pub async fn fire(self) -> Option<FiringTimer<T>> {
+        // Attempt to transition from Scheduled → Firing, reading the canonical
+        // tag from ActiveTriggers under the trigger-lock.
+        let canonical_tag = self.uncommitted.fire_with_tag().await?;
 
-        // Transfer ownership to FiringTimer
+        // Re-stamp the trigger with the canonical tag so WAL writers can embed
+        // the observed-at-dispatch value.
+        let trigger = Trigger::with_tag(
+            self.trigger.key.clone(),
+            self.trigger.time,
+            self.trigger.timer_type,
+            canonical_tag,
+            self.trigger.span(),
+        );
+
         Some(FiringTimer {
-            trigger: self.trigger,
+            trigger,
             uncommitted: self.uncommitted,
         })
     }
@@ -217,6 +229,15 @@ impl<T> FiringTimer<T>
 where
     T: TriggerStore,
 {
+    /// Returns a reference to the underlying [`Trigger`].
+    ///
+    /// The trigger's `tag` field carries the canonical commit-oracle identity
+    /// at the moment this timer was dispatched via [`PendingTimer::fire()`].
+    #[must_use]
+    pub fn trigger(&self) -> &Trigger {
+        &self.trigger
+    }
+
     /// Replaces the trigger's tracing span with a `"trigger"` dispatch span.
     ///
     /// Creates the dispatch span from the trigger's current span context,
@@ -315,15 +336,15 @@ impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Attempt to transition the timer from `Scheduled` to `Firing` state.
+    /// Attempt to transition the timer from `Scheduled` to `Firing` state,
+    /// returning the canonical tag if successful.
     ///
-    /// # Returns
-    ///
-    /// `true` if the transition succeeded, `false` if the timer is not in
-    /// `Scheduled` state (e.g., cancelled or already firing).
-    pub async fn fire(&self) -> bool {
+    /// Returns `None` if the transition failed (timer was cancelled or is not
+    /// in `Scheduled` state). The returned tag is the value stored in
+    /// `ActiveTriggers` at the moment of the state transition.
+    pub async fn fire_with_tag(&self) -> Option<i32> {
         self.manager
-            .fire(&self.key, self.time, self.timer_type)
+            .fire_with_tag(&self.key, self.time, self.timer_type)
             .await
     }
 

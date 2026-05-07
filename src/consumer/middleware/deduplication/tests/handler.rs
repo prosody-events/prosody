@@ -5,8 +5,8 @@ use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::deduplication::{
-    DeduplicationConfiguration, DeduplicationHandler, DeduplicationMiddleware,
-    MemoryDeduplicationStore, MemoryDeduplicationStoreProvider,
+    CachedDeduplicationStore, DeduplicationConfiguration, DeduplicationHandler,
+    DeduplicationMiddleware, MemoryDeduplicationStore, MemoryDeduplicationStoreProvider,
 };
 use crate::consumer::middleware::test_support::MockEventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
@@ -136,11 +136,13 @@ fn create_handler_with(
     group_id: &str,
     topic: &str,
     partition: i32,
-) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
+) -> DeduplicationHandler<MockHandler, CachedDeduplicationStore<MemoryDeduplicationStore>> {
     DeduplicationHandler {
         inner,
-        cache: Arc::new(Cache::new(100)),
-        store: MemoryDeduplicationStore::new(),
+        store: CachedDeduplicationStore::new(
+            Arc::new(Cache::new(100)),
+            MemoryDeduplicationStore::new(),
+        ),
         version: version.to_owned(),
         group_id: Arc::from(group_id),
         topic: Topic::from(topic),
@@ -150,7 +152,7 @@ fn create_handler_with(
 
 fn create_handler(
     inner: MockHandler,
-) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
+) -> DeduplicationHandler<MockHandler, CachedDeduplicationStore<MemoryDeduplicationStore>> {
     create_handler_with(inner, "1", "test-group", "test-topic", 0)
 }
 
@@ -594,11 +596,13 @@ async fn dedup_passthrough_forwards_after_commit_for_handler_err() {
 
 fn create_handler_apply(
     inner: ApplyProbe,
-) -> DeduplicationHandler<ApplyProbe, MemoryDeduplicationStore> {
+) -> DeduplicationHandler<ApplyProbe, CachedDeduplicationStore<MemoryDeduplicationStore>> {
     DeduplicationHandler {
         inner,
-        cache: Arc::new(Cache::new(100)),
-        store: MemoryDeduplicationStore::new(),
+        store: CachedDeduplicationStore::new(
+            Arc::new(Cache::new(100)),
+            MemoryDeduplicationStore::new(),
+        ),
         version: "1".to_owned(),
         group_id: Arc::from("test-group"),
         topic: Topic::from("test-topic"),

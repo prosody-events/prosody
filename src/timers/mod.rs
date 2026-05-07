@@ -58,6 +58,7 @@ pub use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::ParseError;
 use arc_swap::ArcSwap;
 use educe::Educe;
+use rand::RngExt;
 use serde::Serialize;
 use std::sync::Arc;
 use strum::EnumCount;
@@ -137,9 +138,14 @@ pub type TimerSemaphores = [Arc<Semaphore>; TimerType::COUNT];
 /// Scheduled timer event containing execution metadata.
 ///
 /// Contains the key, execution time, timer type, and tracing context for a
-/// timer that will fire at a specific moment. The `span` field is excluded from
-/// equality and ordering comparisons to ensure consistent behavior across
-/// different tracing contexts.
+/// timer that will fire at a specific moment. The `span` and `tag` fields are
+/// excluded from equality and ordering comparisons.
+///
+/// `tag` is excluded from `Hash/Eq/Ord` to preserve the schema's primary-key
+/// invariant `(key, time, timer_type)`: two `Trigger`s for the same logical
+/// timer compare equal regardless of their tag, so `queue_keys`' occupied-entry
+/// upsert continues to work correctly when the tag is rotated after a
+/// `complete()`-from-`FiringRescheduled`.
 #[derive(Clone, Debug, Educe)]
 #[educe(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Trigger {
@@ -152,6 +158,11 @@ pub struct Trigger {
     /// Timer type classification.
     pub timer_type: TimerType,
 
+    /// Random 32-bit identity rotated by `complete()` from `FiringRescheduled`.
+    /// Excluded from `Hash/Eq/Ord` — see struct doc.
+    #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
+    pub tag: i32,
+
     /// Tracing span for distributed observability context.
     #[educe(Hash(ignore), PartialEq(ignore), PartialOrd(ignore))]
     span: Arc<ArcSwap<Span>>,
@@ -160,9 +171,8 @@ pub struct Trigger {
 impl Trigger {
     /// Creates a new timer trigger for scheduled execution.
     ///
-    /// The span is wrapped in an [`ArcSwap`] for thread-safe access during
-    /// concurrent timer operations while preserving distributed tracing
-    /// context.
+    /// Generates a fresh random `tag` via `rand::rng().random::<i32>()` so
+    /// every newly constructed trigger has a unique identity.
     ///
     /// # Arguments
     ///
@@ -170,39 +180,43 @@ impl Trigger {
     /// * `time` – When this timer should execute
     /// * `timer_type` – Timer type classification
     /// * `span` – Tracing span for distributed observability context
-    ///
-    /// # Returns
-    ///
-    /// A new [`Trigger`] instance ready for scheduling.
     #[must_use]
     pub fn new(key: Key, time: CompactDateTime, timer_type: TimerType, span: Span) -> Self {
+        Self::with_tag(key, time, timer_type, rand::rng().random::<i32>(), span)
+    }
+
+    /// Restore-from-store constructor. Preserves the loaded `tag`.
+    ///
+    /// Use this when deserializing a trigger from persistent storage so the
+    /// stored tag value is kept intact rather than replaced with a fresh
+    /// random.
+    #[must_use]
+    pub fn with_tag(
+        key: Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        tag: i32,
+        span: Span,
+    ) -> Self {
         Self {
             key,
             time,
             timer_type,
+            tag,
             span: ArcSwap::from_pointee(span).into(),
         }
     }
 
     /// Create a test trigger with minimal dependencies.
     ///
-    /// Creates a `Trigger` suitable for unit testing without requiring
-    /// complex span setup. Uses the current span context.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - Entity key
-    /// * `time` - Execution time
-    /// * `timer_type` - Timer classification
+    /// Uses `tag = 0` for reproducibility in tests.
     #[cfg(test)]
     #[must_use]
     pub fn for_testing(key: Key, time: CompactDateTime, timer_type: TimerType) -> Self {
-        Self::new(key, time, timer_type, Span::current())
+        Self::with_tag(key, time, timer_type, 0, Span::current())
     }
 
     /// Returns the tracing span associated with this trigger.
-    ///
-    /// Returns the current span for tracing operations or span linking.
     #[must_use]
     pub fn span(&self) -> Span {
         let span = self.span.load();

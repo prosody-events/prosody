@@ -192,6 +192,34 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
+    // Tag Operations (2 methods)
+    // =========================================================================
+
+    /// Updates the `tag` on a key-index clustering row.
+    ///
+    /// No-op if the row is absent (`IF EXISTS` semantics). Used exclusively by
+    /// `complete()`-from-`FiringRescheduled` to rotate the tag so the commit
+    /// oracle can detect the transition.
+    fn update_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        new_tag: i32,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Reads the `tag` from a key-index clustering row.
+    ///
+    /// Returns `None` if the row is absent ("committed" in oracle terms).
+    /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
+    fn current_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send;
+
+    // =========================================================================
     // Version Management (1 method)
     // =========================================================================
 

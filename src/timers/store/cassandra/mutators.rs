@@ -38,8 +38,8 @@ use tracing::instrument;
 
 /// Bind values for `batch_promote_and_set_overflow` (TTL variant).
 ///
-/// The TTL variant requires 17 bind values which exceeds the 16-element
-/// `SerializeRow` tuple limit, so a named-marker struct is used instead.
+/// Named markers are required because the bind value count exceeds the
+/// 16-element `SerializeRow` tuple limit.
 #[derive(SerializeRow)]
 struct PromoteOverflowParams<'a> {
     // INSERT 1: promoted timer
@@ -48,6 +48,7 @@ struct PromoteOverflowParams<'a> {
     p_timer_type: TimerType,
     p_time: CompactDateTime,
     p_span: &'a HashMap<String, String>,
+    p_tag: i32,
     p_ttl: i32,
     // INSERT 2: new timer
     n_segment_id: &'a SegmentId,
@@ -55,6 +56,7 @@ struct PromoteOverflowParams<'a> {
     n_timer_type: TimerType,
     n_time: CompactDateTime,
     n_span: &'a HashMap<String, String>,
+    n_tag: i32,
     n_ttl: i32,
     // UPDATE: state
     s_ttl: i32,
@@ -478,8 +480,8 @@ impl CassandraTriggerStore {
                 // Stale slab entry — no clustering rows exist, nothing to do.
             }
             [remaining_time] => {
-                // Exactly 1 row: fetch the span and normalize to inline state.
-                let Some((confirmed_time, span_map)) = self
+                // Exactly 1 row: fetch span + tag and normalize to inline state.
+                let Some((confirmed_time, span_map, tag_opt)) = self
                     .peek_first_key_trigger(segment_id, key, timer_type)
                     .await?
                 else {
@@ -490,6 +492,7 @@ impl CassandraTriggerStore {
                 let state = TimerState::Inline(InlineTimer {
                     time: *remaining_time,
                     span: span_map,
+                    tag: tag_opt.unwrap_or(0_i32),
                 });
 
                 // Atomic batch: write inline state + delete clustering row.
@@ -542,9 +545,8 @@ impl CassandraTriggerStore {
         let ttl_time = promoted.time.max(new.time);
         let key_ref = key.as_ref();
 
-        // The TTL variant has 17 bind values which exceeds the 16-element
-        // `SerializeRow` tuple limit, so `PromoteOverflowParams` is used
-        // instead of `execute_with_optional_ttl`.
+        // `PromoteOverflowParams` is used for both TTL and no-TTL because
+        // the bind value count exceeds the 16-element `SerializeRow` tuple limit.
         match self.calculate_ttl(ttl_time) {
             Some(ttl) => {
                 self.execute_unpaged_discard(
@@ -555,12 +557,14 @@ impl CassandraTriggerStore {
                         p_timer_type: timer_type,
                         p_time: promoted.time,
                         p_span: promoted.span,
+                        p_tag: promoted.tag,
                         p_ttl: ttl,
                         n_segment_id: segment_id,
                         n_key: key_ref,
                         n_timer_type: timer_type,
                         n_time: new.time,
                         n_span: new.span,
+                        n_tag: new.tag,
                         n_ttl: ttl,
                         s_ttl: ttl,
                         s_timer_type: timer_type,
@@ -580,11 +584,13 @@ impl CassandraTriggerStore {
                         timer_type,
                         promoted.time,
                         promoted.span,
+                        promoted.tag,
                         segment_id,
                         key_ref,
                         timer_type,
                         new.time,
                         new.span,
+                        new.tag,
                         timer_type,
                         &overflow_state,
                         segment_id,
@@ -615,13 +621,14 @@ impl CassandraTriggerStore {
         let key = trigger.key.as_ref();
         let time = trigger.time;
         let timer_type = trigger.timer_type;
+        let tag = trigger.tag;
 
         self.execute_with_optional_ttl(
             trigger.time,
             &self.queries().insert_key_trigger_clustering,
             &self.queries().insert_key_trigger_clustering_no_ttl,
-            |ttl| (segment_id, key, timer_type, time, &span_map, ttl),
-            || (segment_id, key, timer_type, time, &span_map),
+            |ttl| (segment_id, key, timer_type, time, &span_map, tag, ttl),
+            || (segment_id, key, timer_type, time, &span_map, tag),
         )
         .await
     }

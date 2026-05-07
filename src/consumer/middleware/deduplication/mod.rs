@@ -38,8 +38,6 @@ use uuid::Uuid;
 use validator::Validate;
 use xxhash_rust::xxh3::Xxh3Default;
 
-type DeduplicationCache = Cache<Uuid, ()>;
-
 use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
@@ -56,7 +54,10 @@ pub use self::config::{
     DeduplicationConfigurationBuilderError,
 };
 pub use self::memory::{MemoryDeduplicationStore, MemoryDeduplicationStoreProvider};
-pub use self::store::{DeduplicationStore, DeduplicationStoreProvider};
+pub use self::store::{
+    CachedDeduplicationStore, CachedDeduplicationStoreProvider, DeduplicationStore,
+    DeduplicationStoreProvider,
+};
 
 /// Shared state for the deduplication middleware.
 #[derive(Clone, Debug)]
@@ -64,20 +65,20 @@ struct DeduplicationShared<S> {
     config: DeduplicationConfiguration,
     group_id: Arc<str>,
     store_provider: S,
-    cache: Arc<DeduplicationCache>,
 }
 
 /// Deduplication middleware.
 ///
 /// Wraps the inner middleware stack and checks incoming messages against a
-/// two-tier cache (local + persistent store). Duplicates are filtered out
+/// write-through cache backed by persistent store. Duplicates are filtered out
 /// before reaching the handler.
 ///
 /// The `P` parameter is the handler payload type, fixed by the chain it is
-/// composed into.
+/// composed into. `S` is the underlying (uncached) store provider; the cache
+/// is wired in internally.
 #[derive(Clone, Debug)]
 pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
-    shared: Arc<DeduplicationShared<S>>,
+    shared: Arc<DeduplicationShared<CachedDeduplicationStoreProvider<S>>>,
     _payload: PhantomData<fn() -> P>,
 }
 
@@ -99,12 +100,12 @@ impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
         }
 
         let cache = Arc::new(Cache::new(config.cache_capacity));
+        let cached_provider = CachedDeduplicationStoreProvider::new(store_provider, cache);
         Ok(Some(Self {
             shared: Arc::new(DeduplicationShared {
                 config,
                 group_id: Arc::from(group_id),
-                store_provider,
-                cache,
+                store_provider: cached_provider,
             }),
             _payload: PhantomData,
         }))
@@ -115,7 +116,7 @@ impl<S: DeduplicationStoreProvider, P: Send + Sync + 'static + EventIdentity> Ha
     for DeduplicationMiddleware<S, P>
 {
     type Provider<T>
-        = DeduplicationProvider<T, S>
+        = DeduplicationProvider<T, CachedDeduplicationStoreProvider<S>>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;
@@ -149,7 +150,6 @@ where
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let inner = self.inner.handler_for_partition(topic, partition);
-        let cache = self.shared.cache.clone();
         let store =
             self.shared
                 .store_provider
@@ -157,7 +157,6 @@ where
 
         DeduplicationHandler {
             inner,
-            cache,
             store,
             version: self.shared.config.version.clone(),
             group_id: self.shared.group_id.clone(),
@@ -167,15 +166,54 @@ where
     }
 }
 
-/// Handler that checks messages against the shared dedup cache.
+/// Handler that checks messages against the shared dedup store (with cache).
 pub struct DeduplicationHandler<T, S: DeduplicationStore> {
     inner: T,
-    cache: Arc<DeduplicationCache>,
     store: S,
     version: String,
     group_id: Arc<str>,
     topic: Topic,
     partition: Partition,
+}
+
+/// Computes the dedup UUID for a message.
+///
+/// Length-prefixes each field before hashing so that adjacent fields cannot
+/// be confused — the prefix is load-bearing for canonical equality. Both
+/// the deduplication middleware and any future state-middleware WAL writer
+/// must call this function with the same arguments to produce the same UUID.
+#[must_use]
+pub fn dedup_uuid(
+    version: &str,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+    key: &[u8],
+    event_id: Option<&[u8]>,
+    offset: i64,
+) -> Uuid {
+    let mut hasher = Xxh3Default::new();
+    hasher.write_u32(version.len() as u32);
+    hasher.write(version.as_bytes());
+    hasher.write_u32(group_id.len() as u32);
+    hasher.write(group_id.as_bytes());
+    hasher.write_u32(topic.len() as u32);
+    hasher.write(topic.as_bytes());
+    hasher.write_i32(partition);
+    hasher.write_u32(key.len() as u32);
+    hasher.write(key);
+
+    if let Some(id) = event_id {
+        hasher.write_u8(1);
+        hasher.write_u32(id.len() as u32);
+        hasher.write(id);
+    } else {
+        hasher.write_u8(0);
+        hasher.write_i64(offset);
+    }
+
+    let hash = hasher.digest128();
+    uuid::Builder::from_custom_bytes(hash.to_le_bytes()).into_uuid()
 }
 
 impl<T, S> DeduplicationHandler<T, S>
@@ -184,31 +222,16 @@ where
     T::Payload: EventIdentity,
     S: DeduplicationStore,
 {
-    /// Computes the dedup UUID for a message, incorporating the `event_id`
-    /// (from payload) or falling back to writing the offset directly.
     fn dedup_uuid_for_message(&self, message: &ConsumerMessage<T::Payload>) -> Uuid {
-        let mut hasher = Xxh3Default::new();
-        hasher.write_u32(self.version.len() as u32);
-        hasher.write(self.version.as_bytes());
-        hasher.write_u32(self.group_id.len() as u32);
-        hasher.write(self.group_id.as_bytes());
-        hasher.write_u32(self.topic.len() as u32);
-        hasher.write(self.topic.as_bytes());
-        hasher.write_i32(self.partition);
-        hasher.write_u32(message.key().len() as u32);
-        hasher.write(message.key().as_bytes());
-
-        if let Some(id) = message.payload().event_id() {
-            hasher.write_u8(1);
-            hasher.write_u32(id.len() as u32);
-            hasher.write(id.as_bytes());
-        } else {
-            hasher.write_u8(0);
-            hasher.write_i64(message.offset());
-        }
-
-        let hash = hasher.digest128();
-        uuid::Builder::from_custom_bytes(hash.to_le_bytes()).into_uuid()
+        dedup_uuid(
+            &self.version,
+            &self.group_id,
+            &self.topic,
+            self.partition,
+            message.key().as_bytes(),
+            message.payload().event_id().map(str::as_bytes),
+            message.offset(),
+        )
     }
 }
 
@@ -233,53 +256,34 @@ where
     where
         C: EventContext,
     {
-        let dedup_uuid = self.dedup_uuid_for_message(&message);
+        let id = self.dedup_uuid_for_message(&message);
 
-        // 1. Check local cache
-        if self.cache.get(&dedup_uuid).is_some() {
-            info_span!(
-                parent: message.span(),
-                "message.filtered",
-                reason = "deduplicated"
-            )
-            .in_scope(|| {
-                debug!("message deduplicated via local cache");
-            });
-            return Ok(None);
-        }
-
-        // 2. Check persistent store
+        // Check cache then store (CachedDeduplicationStore handles both).
         if self
             .store
-            .exists(dedup_uuid)
+            .exists(id)
             .await
             .map_err(|e| DeduplicationError::Store(Box::new(e)))?
         {
-            self.cache.insert(dedup_uuid, ());
             info_span!(
                 parent: message.span(),
                 "message.filtered",
                 reason = "deduplicated"
             )
             .in_scope(|| {
-                debug!("message deduplicated via persistent store");
+                debug!("message deduplicated");
             });
             return Ok(None);
         }
 
-        // 3. Process message
+        // Process message.
         let result = self
             .inner
             .on_message(context, message, demand_type)
             .await
             .map_err(DeduplicationError::Inner);
 
-        // 4. Record in local cache and persistent store on success or permanent error.
-        // Permanent errors are any message-level failures that won't succeed on retry
-        // (e.g., corruption, serialization/invalid data, non-retryable business
-        // rejections). Transient and terminal errors are left un-deduplicated:
-        // transient so the retry layer can reattempt, terminal because
-        // processing is being aborted.
+        // Record on success or permanent error.
         let should_dedup = match &result {
             Ok(_) => true,
             Err(e) => matches!(e.classify_error(), ErrorCategory::Permanent),
@@ -287,10 +291,9 @@ where
 
         if should_dedup {
             self.store
-                .insert(dedup_uuid)
+                .insert(id)
                 .await
                 .map_err(|e| DeduplicationError::Store(Box::new(e)))?;
-            self.cache.insert(dedup_uuid, ());
         }
 
         result.map(Some)

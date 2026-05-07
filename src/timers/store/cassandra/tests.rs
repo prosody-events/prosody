@@ -437,10 +437,12 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
     let inline_t1 = TimerState::Inline(InlineTimer {
         time: t1,
         span: HashMap::new(),
+        tag: 0,
     });
     let inline_t2 = TimerState::Inline(InlineTimer {
         time: t2,
         span: HashMap::new(),
+        tag: 0,
     });
 
     // Absent (0 timers)
@@ -498,10 +500,12 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
     let inline_t2 = TimerState::Inline(InlineTimer {
         time: t2,
         span: HashMap::new(),
+        tag: 0,
     });
     let inline_t3 = TimerState::Inline(InlineTimer {
         time: t3,
         span: HashMap::new(),
+        tag: 0,
     });
 
     // Overflow → Inline via clear_and_schedule_key
@@ -591,6 +595,7 @@ async fn test_state_transitions_insert_and_delete() -> Result<()> {
     let inline_t1 = TimerState::Inline(InlineTimer {
         time: t1,
         span: HashMap::new(),
+        tag: 0,
     });
 
     // Post-V3: cold insert with Absent state → set_state_inline directly.
@@ -971,6 +976,52 @@ async fn test_inline_state_round_trip() -> Result<()> {
 
     store.delete_segment().await?;
 
+    Ok(())
+}
+
+/// Regression test: `current_tag` must return the correct tag for Inline
+/// timers (single trigger stored in `state` static column).
+///
+/// The quickcheck property test found that after `insert_key_trigger` (which
+/// stores the trigger as Inline in the `state` column), `current_tag` returned
+/// `None` (only checked clustering rows). This test pins the fix: Inline
+/// triggers must be queryable via `current_tag`.
+#[tokio::test]
+async fn test_current_tag_inline_trigger() -> Result<()> {
+    use crate::timers::store::TriggerStore;
+    use crate::timers::store::adapter::TableAdapter;
+    init_test_logging();
+    let (store, _segment_id) = setup_test_store("current_tag_inline").await?;
+    let store = TableAdapter::new(store);
+
+    let key: Key = format!("tag-inline-{}", Uuid::new_v4()).into();
+    let time = CompactDateTime::from(1_500_000u32);
+    let timer_type = TimerType::Application;
+    let trigger = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
+    let expected_tag = trigger.tag;
+
+    // add_trigger produces an Inline state (first trigger for this key/type).
+    store.add_trigger(trigger).await?;
+
+    // current_tag must return Some(expected_tag), not None.
+    let actual_tag = store.current_tag(&key, time, timer_type).await?;
+    assert_eq!(
+        actual_tag,
+        Some(expected_tag),
+        "current_tag must return the tag for an Inline trigger"
+    );
+
+    // update_tag must update the tag even in Inline mode.
+    let new_tag = expected_tag.wrapping_add(1);
+    store.update_tag(&key, time, timer_type, new_tag).await?;
+    let updated = store.current_tag(&key, time, timer_type).await?;
+    assert_eq!(
+        updated,
+        Some(new_tag),
+        "update_tag must rotate the tag for an Inline trigger"
+    );
+
+    store.remove_trigger(&key, time, timer_type).await?;
     Ok(())
 }
 

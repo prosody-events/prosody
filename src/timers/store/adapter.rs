@@ -6,12 +6,13 @@
 //! operations.
 
 use crate::Key;
+use crate::timers::TimerType;
+use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use crate::timers::{TimerType, Trigger};
 use futures::Stream;
 use futures::future::try_join_all;
 use std::future::Future;
@@ -172,6 +173,27 @@ where
             self.operations.delete_key_trigger(timer_type, key, time),
         )?;
         Ok(())
+    }
+
+    async fn update_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        new_tag: i32,
+    ) -> Result<(), Self::Error> {
+        self.operations
+            .update_tag(key, time, timer_type, new_tag)
+            .await
+    }
+
+    async fn current_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<Option<i32>, Self::Error> {
+        self.operations.current_tag(key, time, timer_type).await
     }
 
     #[instrument(level = "debug", skip(self, trigger), err)]

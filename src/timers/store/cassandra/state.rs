@@ -36,11 +36,12 @@ pub(super) type StateCacheKey = (Key, TimerType);
 pub(super) struct ClusteringEntry<'a> {
     pub(super) time: CompactDateTime,
     pub(super) span: &'a HashMap<String, String>,
+    pub(super) tag: i32,
 }
 
-/// A single row returned by `peek_first_key_trigger`: trigger time and span
-/// context.
-pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>);
+/// A single row returned by `peek_first_key_trigger`: trigger time, span, and
+/// tag.
+pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>, Option<i32>);
 
 /// Capacity for the per-partition state cache.
 ///
@@ -63,12 +64,16 @@ pub(super) type CachedState = Arc<AsyncMutex<TimerState>>;
 /// Timer data for a single inlined timer.
 ///
 /// This is the resolved domain type for a key with exactly one timer.
+/// The `tag` field mirrors the commit-oracle tag stored on the `Trigger`.
+/// Pre-migration rows have `tag = NULL` which normalises to `0`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlineTimer {
     /// Timer trigger time.
     pub time: CompactDateTime,
     /// OpenTelemetry span context for trace continuity.
     pub span: HashMap<String, String>,
+    /// Commit-oracle tag. `0` for pre-migration rows (tag column absent).
+    pub tag: i32,
 }
 
 /// Resolved three-state enum for a `(key, timer_type)` pair within a partition.
@@ -101,6 +106,9 @@ struct RawTimerState {
     time: Option<CompactDateTime>,
     /// Span context (present only when `inline = true`).
     span: Option<HashMap<String, String>>,
+    /// Commit-oracle tag (added by `20260507_add_tag_to_udt` migration).
+    /// `None` for rows written before migration; normalised to `0`.
+    tag: Option<i32>,
 }
 
 impl SerializeValue for TimerState {
@@ -114,11 +122,13 @@ impl SerializeValue for TimerState {
                 inline: Some(true),
                 time: Some(timer.time),
                 span: Some(timer.span.clone()),
+                tag: Some(timer.tag),
             },
             Self::Overflow => RawTimerState {
                 inline: Some(false),
                 time: None,
                 span: None,
+                tag: None,
             },
             Self::Absent => {
                 return Err(SerializationError::new(
@@ -145,6 +155,7 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for TimerState {
                 Some(time) => Ok(Self::Inline(InlineTimer {
                     time,
                     span: raw.span.unwrap_or_default(),
+                    tag: raw.tag.unwrap_or(0_i32),
                 })),
                 None => Ok(Self::Overflow),
             }
