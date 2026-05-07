@@ -1188,4 +1188,34 @@ mod tests {
         assert_eq!(s.overdue, 2); // past + past_firing
         assert_eq!(s.oldest_overdue_secs, 200); // now(2000) - past_firing(1800)
     }
+
+    #[test]
+    async fn test_snapshot_firing_rescheduled_counts_in_flight() {
+        let active_triggers = ActiveTriggers::default();
+        let time = CompactDateTime::from(1000u32);
+        let now = CompactDateTime::from(1000u32);
+        let key = Key::from("k");
+
+        active_triggers
+            .insert(Trigger::new(
+                key.clone(),
+                time,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+        active_triggers
+            .set_state(
+                &key,
+                time,
+                TimerType::Application,
+                TimerState::FiringRescheduled,
+            )
+            .await;
+
+        let s = active_triggers.snapshot(now).await;
+        assert_eq!(s.active, 1);
+        assert_eq!(s.in_flight, 1);
+        assert_eq!(s.overdue, 1);
+    }
 }
