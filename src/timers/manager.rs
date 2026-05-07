@@ -20,7 +20,7 @@ use crate::Key;
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::partition::TelemetryPartitionSender;
-use crate::timers::active::TimerState;
+use crate::timers::active::{TimerSnapshot, TimerState};
 use crate::timers::datetime::CompactDateTime;
 
 pub use crate::timers::error::TimerManagerError;
@@ -691,6 +691,24 @@ where
             .map_err(TimerManagerError::Store)?;
 
         Ok(())
+    }
+
+    /// Returns a point-in-time [`TimerSnapshot`] of the in-memory scheduler.
+    ///
+    /// Returns `None` if the system clock is outside the 1970–2106 range
+    /// (extreme edge case); callers should skip that tick.
+    pub async fn snapshot(&self) -> Option<TimerSnapshot> {
+        let now = CompactDateTime::now().ok()?;
+        Some(
+            self.0
+                .state
+                .trigger_lock()
+                .await
+                .scheduler
+                .active_triggers()
+                .snapshot(now)
+                .await,
+        )
     }
 
     /// Aborts a timer delivery.

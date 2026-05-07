@@ -6,8 +6,12 @@
 //! no-op tracer. This provides functionality to create a customizable tracing
 //! setup with optional additional layers.
 
+use opentelemetry::global::set_meter_provider;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::{ExporterBuildError, Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{
+    ExporterBuildError, MetricExporter, Protocol, SpanExporter, WithExportConfig,
+};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer};
 use std::env;
 use thiserror::Error;
@@ -88,6 +92,19 @@ where
     // Set the subscriber as the global default
     set_global_default(subscriber)?;
 
+    // Initialize the OTel meter provider alongside the tracer provider.
+    #[allow(clippy::print_stderr, reason = "tracing is not initialized yet")]
+    let meter_provider = match build_metric_exporter() {
+        Ok(exporter) => SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter).build())
+            .build(),
+        Err(e) => {
+            eprintln!("failed to initialize OpenTelemetry OTLP metric exporter: {e}");
+            SdkMeterProvider::builder().build()
+        }
+    };
+    set_meter_provider(meter_provider);
+
     Ok(())
 }
 
@@ -129,6 +146,38 @@ fn build_exporter() -> Result<SpanExporter, TracingError> {
             .with_protocol(Protocol::HttpJson)
             .build()?,
         "grpc" => SpanExporter::builder()
+            .with_tonic()
+            .with_protocol(Protocol::Grpc)
+            .build()?,
+        _ => return Err(TracingError::UnknownOtlpProtocol),
+    };
+
+    Ok(exporter)
+}
+
+/// Builds the OTLP metric exporter for OpenTelemetry.
+///
+/// Mirrors [`build_exporter`] but uses `MetricExporter` instead of
+/// `SpanExporter`. The protocol is determined by
+/// `OTEL_EXPORTER_OTLP_PROTOCOL` (defaults to "http/protobuf").
+fn build_metric_exporter() -> Result<MetricExporter, TracingError> {
+    if env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
+        return Err(TracingError::MissingOtlpEndpoint);
+    }
+
+    let protocol =
+        env::var("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_else(|_| "http/protobuf".to_owned());
+
+    let exporter = match protocol.as_str() {
+        "http/protobuf" => MetricExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .build()?,
+        "http/json" => MetricExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpJson)
+            .build()?,
+        "grpc" => MetricExporter::builder()
             .with_tonic()
             .with_protocol(Protocol::Grpc)
             .build()?,

@@ -36,7 +36,7 @@ humantime = "2.3"
 internment = "0.8"
 intervallum = "1.4"
 nohash-hasher = "0.2"
-opentelemetry = "0.31"
+opentelemetry = { version = "0.31", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.31", features = [
     "grpc-tonic",
     "http-json",
