@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/prosody-events/prosody/compare/prosody-v0.2.1...prosody-v0.3.0) (2026-05-07)
+
+
+### Features
+
+* **metrics:** add per-partition timer lag gauges ([#30](https://github.com/prosody-events/prosody/issues/30)) ([1ef9f00](https://github.com/prosody-events/prosody/commit/1ef9f005507f4478d46d6718c2cdf24be35321c0))
+
 ## [0.2.1](https://github.com/prosody-events/prosody/compare/prosody-v0.2.0...prosody-v0.2.1) (2026-04-30)
 
 
