@@ -651,7 +651,6 @@ impl TriggerOperations for CassandraTriggerStore {
                 // Promote: old inline → clustering, new → clustering, state → Overflow.
                 // All three writes are issued as a single UNLOGGED BATCH so the
                 // transition is atomic at the partition level.
-                // Promoted entry uses tag=0 since inline timers have no stored tag.
                 let new_span_map = extract_span_map(self.propagator(), &trigger);
 
                 self.batch_promote_and_set_overflow(
@@ -661,7 +660,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     ClusteringEntry {
                         time: old_timer.time,
                         span: &old_timer.span.clone(),
-                        tag: 0,
+                        tag: old_timer.tag,
                     },
                     ClusteringEntry {
                         time: trigger.time,
