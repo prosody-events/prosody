@@ -12,12 +12,24 @@ use crate::timers::{TimerType, Trigger};
 use ahash::HashMap;
 use futures::TryStreamExt;
 use quickcheck::{Arbitrary, Gen};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::Debug;
 use strum::VariantArray;
 use tracing::Span;
 use uuid::Uuid;
+
+fn derive_tag(key: &Key, time: CompactDateTime, timer_type: TimerType) -> i32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in key.as_ref().as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash ^= time.epoch_seconds();
+    hash = hash.wrapping_mul(0x0100_0193);
+    hash ^= timer_type as u32;
+    i32::from_le_bytes(hash.to_le_bytes())
+}
 
 /// Test input containing isolated segment IDs and operations.
 ///
@@ -140,7 +152,8 @@ impl Arbitrary for KeyTriggerTestInput {
             let op = match u8::arbitrary(g) % 8 {
                 0 => {
                     // Insert operation
-                    let trigger = Trigger::new(key, time, timer_type, Span::current());
+                    let tag = derive_tag(&key, time, timer_type);
+                    let trigger = Trigger::with_tag(key, time, timer_type, tag, Span::current());
                     KeyTriggerOperation::Insert {
                         segment_id,
                         trigger,
@@ -169,7 +182,8 @@ impl Arbitrary for KeyTriggerTestInput {
                     key,
                 },
                 6 => {
-                    let trigger = Trigger::new(key, time, timer_type, Span::current());
+                    let tag = derive_tag(&key, time, timer_type);
+                    let trigger = Trigger::with_tag(key, time, timer_type, tag, Span::current());
                     KeyTriggerOperation::ClearAndSchedule {
                         segment_id,
                         trigger,
@@ -190,12 +204,12 @@ impl Arbitrary for KeyTriggerTestInput {
 
 /// Reference model for key trigger table behavior.
 ///
-/// Uses `HashMap<(SegmentId, Key), BTreeSet<(TimerType, CompactDateTime)>>`
-/// to track triggers for each key. [`BTreeSet`] provides natural ordering
+/// Uses `HashMap<(SegmentId, Key), BTreeMap<(TimerType, CompactDateTime), i32>>`
+/// to track triggers for each key. [`BTreeMap`] provides natural ordering
 /// and set semantics.
 #[derive(Clone, Debug)]
 pub struct KeyTriggerModel {
-    triggers: HashMap<(SegmentId, Key), BTreeSet<(TimerType, CompactDateTime)>>,
+    triggers: HashMap<(SegmentId, Key), BTreeMap<(TimerType, CompactDateTime), i32>>,
 }
 
 impl Default for KeyTriggerModel {
@@ -223,7 +237,8 @@ impl KeyTriggerModel {
                 self.triggers
                     .entry((*segment_id, trigger.key.clone()))
                     .or_default()
-                    .insert((trigger.timer_type, trigger.time));
+                    .entry((trigger.timer_type, trigger.time))
+                    .or_insert(trigger.tag);
             }
             KeyTriggerOperation::GetTimes { .. }
             | KeyTriggerOperation::GetTriggers { .. }
@@ -246,7 +261,7 @@ impl KeyTriggerModel {
                 key,
             } => {
                 if let Some(set) = self.triggers.get_mut(&(*segment_id, key.clone())) {
-                    set.retain(|(tt, _)| *tt != *timer_type);
+                    set.retain(|(tt, _), _| *tt != *timer_type);
                 }
             }
             KeyTriggerOperation::ClearAllTypes { segment_id, key } => {
@@ -261,8 +276,8 @@ impl KeyTriggerModel {
                     .triggers
                     .entry((*segment_id, trigger.key.clone()))
                     .or_default();
-                entry.retain(|(tt, _)| *tt != trigger.timer_type);
-                entry.insert((trigger.timer_type, trigger.time));
+                entry.retain(|(tt, _), _| *tt != trigger.timer_type);
+                entry.insert((trigger.timer_type, trigger.time), trigger.tag);
             }
         }
     }
@@ -279,8 +294,8 @@ impl KeyTriggerModel {
             .get(&(*segment_id, key.clone()))
             .map(|set| {
                 set.iter()
-                    .filter(|(tt, _)| *tt == timer_type)
-                    .map(|(_, time)| *time)
+                    .filter(|((tt, _), _)| *tt == timer_type)
+                    .map(|((_, time), _)| *time)
                     .collect()
             })
             .unwrap_or_default()
@@ -293,13 +308,13 @@ impl KeyTriggerModel {
         segment_id: &SegmentId,
         timer_type: TimerType,
         key: &Key,
-    ) -> Vec<(TimerType, CompactDateTime)> {
+    ) -> Vec<(TimerType, CompactDateTime, i32)> {
         self.triggers
             .get(&(*segment_id, key.clone()))
             .map(|set| {
                 set.iter()
-                    .filter(|(tt, _)| *tt == timer_type)
-                    .copied()
+                    .filter(|((tt, _), _)| *tt == timer_type)
+                    .map(|((tt, time), tag)| (*tt, *time, *tag))
                     .collect()
             })
             .unwrap_or_default()
@@ -311,10 +326,14 @@ impl KeyTriggerModel {
         &self,
         segment_id: &SegmentId,
         key: &Key,
-    ) -> Vec<(TimerType, CompactDateTime)> {
+    ) -> Vec<(TimerType, CompactDateTime, i32)> {
         self.triggers
             .get(&(*segment_id, key.clone()))
-            .map(|set| set.iter().copied().collect())
+            .map(|set| {
+                set.iter()
+                    .map(|((tt, time), tag)| (*tt, *time, *tag))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -392,9 +411,9 @@ where
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Get key triggers failed: {e:?}"))?;
 
-    let store_tuples: Vec<(TimerType, CompactDateTime)> = store_triggers
+    let store_tuples: Vec<(TimerType, CompactDateTime, i32)> = store_triggers
         .iter()
-        .map(|t| (t.timer_type, t.time))
+        .map(|t| (t.timer_type, t.time, t.tag))
         .collect();
 
     if model_triggers != store_tuples {
@@ -462,8 +481,10 @@ where
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Get key triggers all types failed: {e:?}"))?;
 
-    let store_all_tuples: Vec<(TimerType, CompactDateTime)> =
-        store_all.iter().map(|t| (t.timer_type, t.time)).collect();
+    let store_all_tuples: Vec<(TimerType, CompactDateTime, i32)> = store_all
+        .iter()
+        .map(|t| (t.timer_type, t.time, t.tag))
+        .collect();
 
     if model_all != store_all_tuples {
         return Err(color_eyre::eyre::eyre!(
@@ -474,7 +495,7 @@ where
 
     // Verify ordering in all-types query
     for window in store_all_tuples.windows(2) {
-        if window[0] >= window[1] {
+        if (window[0].0, window[0].1) >= (window[1].0, window[1].1) {
             return Err(color_eyre::eyre::eyre!(
                 "Ordering violation in all-types for key ({segment_id}, {key}): {window:?}"
             ));

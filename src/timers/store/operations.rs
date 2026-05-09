@@ -195,14 +195,14 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     // Tag Operations (2 methods)
     // =========================================================================
 
-    /// Rotates the `tag` on an existing scheduled timer.
+    /// Rotates the `tag` on an existing scheduled timer in every persisted
+    /// index maintained by this operation implementation.
     ///
     /// **Precondition:** the caller must have observed the timer at `(key,
     /// time, timer_type)` as currently scheduled. Today's only caller is
     /// `complete()`-from-`FiringRescheduled`, which has just loaded the timer
-    /// from storage. Implementations may treat a missing row as a no-op (the
-    /// in-memory store does) or as undefined (the Cassandra store would write
-    /// a partial row), so callers must not depend on either behaviour.
+    /// from storage. Implementations may treat a missing row as a no-op or as
+    /// undefined, so callers must not depend on either behaviour.
     fn update_tag(
         &self,
         key: &Key,

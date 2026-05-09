@@ -631,7 +631,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
                         let context = self.propagator().extract(&timer.span);
                         let span = related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
-                        yield Trigger::new(key_clone.clone(), timer.time, tt, span);
+                        yield Trigger::with_tag(key_clone.clone(), timer.time, tt, timer.tag, span);
                     }
                 }
             }
@@ -1004,8 +1004,10 @@ impl TriggerOperations for CassandraTriggerStore {
                     span: timer.span.clone(),
                     tag: new_tag,
                 });
-                self.set_state_inline(&segment_id, key, timer_type, &new_state)
-                    .await?;
+                tokio::try_join!(
+                    self.set_state_inline(&segment_id, key, timer_type, &new_state),
+                    self.update_slab_tag(key, time, timer_type, new_tag),
+                )?;
                 *guard = new_state;
             }
             // Concurrent `clear_and_schedule` won the lock first and rewrote
@@ -1015,11 +1017,13 @@ impl TriggerOperations for CassandraTriggerStore {
             // this race is legitimate under normal reschedule contention.
             TimerState::Inline(_) | TimerState::Absent => {}
             TimerState::Overflow => {
-                self.execute_unpaged_discard(
-                    &self.queries().update_tag,
-                    (new_tag, &segment_id, key.as_ref(), timer_type, time),
-                )
-                .await?;
+                tokio::try_join!(
+                    self.execute_unpaged_discard(
+                        &self.queries().update_tag,
+                        (new_tag, &segment_id, key.as_ref(), timer_type, time),
+                    ),
+                    self.update_slab_tag(key, time, timer_type, new_tag),
+                )?;
             }
         }
         Ok(())

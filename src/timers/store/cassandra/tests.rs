@@ -1085,7 +1085,81 @@ async fn test_current_tag_inline_trigger() -> Result<()> {
         "update_tag must rotate the tag for an Inline trigger"
     );
 
+    let all_type_triggers: Vec<Trigger> = store
+        .operations()
+        .get_key_triggers_all_types(&key)
+        .try_collect()
+        .await?;
+    assert_eq!(all_type_triggers.len(), 1);
+    assert_eq!(
+        all_type_triggers[0].tag, new_tag,
+        "get_key_triggers_all_types must preserve the stored Inline tag"
+    );
+
+    let slab_id = Slab::from_time(store.slab_size(), time).id();
+    let slab_triggers: Vec<Trigger> = store
+        .get_slab_triggers_all_types(slab_id)
+        .try_collect()
+        .await?;
+    let slab_tag = slab_triggers
+        .iter()
+        .find(|t| t.key == key && t.time == time && t.timer_type == timer_type)
+        .map(|t| t.tag);
+    assert_eq!(
+        slab_tag,
+        Some(new_tag),
+        "update_tag must rotate the tag in the slab index"
+    );
+
     store.remove_trigger(&key, time, timer_type).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
+    use crate::timers::store::TriggerStore;
+    use crate::timers::store::adapter::TableAdapter;
+    init_test_logging();
+    let (store, _segment_id) = setup_test_store("all_types_inline_tags").await?;
+    let store = TableAdapter::new(store);
+
+    let key: Key = format!("all-types-inline-tags-{}", Uuid::new_v4()).into();
+    let base_time = 1_600_000u32;
+    let mut expected_tags = HashMap::new();
+
+    for (idx, &timer_type) in TimerType::VARIANTS.iter().enumerate() {
+        let idx_seconds = u32::try_from(idx)?;
+        let time = CompactDateTime::from(base_time + idx_seconds);
+        let trigger = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
+        expected_tags.insert(timer_type, trigger.tag);
+        store.add_trigger(trigger).await?;
+    }
+
+    let actual: Vec<Trigger> = store
+        .operations()
+        .get_key_triggers_all_types(&key)
+        .try_collect()
+        .await?;
+    assert_eq!(
+        actual.len(),
+        expected_tags.len(),
+        "get_key_triggers_all_types must return one inline trigger per timer type"
+    );
+
+    for trigger in &actual {
+        assert_eq!(trigger.key, key);
+        assert_eq!(
+            expected_tags.get(&trigger.timer_type).copied(),
+            Some(trigger.tag),
+            "get_key_triggers_all_types must preserve inline tags"
+        );
+    }
+
+    for trigger in actual {
+        store
+            .remove_trigger(&trigger.key, trigger.time, trigger.timer_type)
+            .await?;
+    }
     Ok(())
 }
 

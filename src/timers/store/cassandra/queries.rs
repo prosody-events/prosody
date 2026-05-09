@@ -446,12 +446,20 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
-        /// Updates tag on an existing clustering row. Caller must guarantee
+        /// Updates tag on an existing key-index clustering row. Caller must guarantee
         /// the row exists (see `update_tag`'s precondition); a missed target
         /// would write a partial row.
         update_tag: (
             "UPDATE $keyspace.{} SET tag = ? WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?",
             TABLE_TYPED_KEYS
+        ),
+
+        /// Updates tag on an existing slab-index clustering row. Caller must
+        /// guarantee the row exists (see `update_tag`'s precondition); a
+        /// missed target would write a partial row.
+        update_slab_tag: (
+            "UPDATE $keyspace.{} SET tag = ? WHERE segment_id = ? AND slab_size = ? AND id = ? AND timer_type = ? AND key = ? AND time = ?",
+            TABLE_TYPED_SLABS
         ),
 
         /// Reads the tag from a single clustering row.

@@ -328,11 +328,12 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     // Tag Operations (2 methods) - Used by TimerManager commit oracle
     // ===================================================================
 
-    /// Updates the `tag` on a key-index row.
+    /// Updates the `tag` on both persisted timer indices.
     ///
     /// No-op if the row is absent. Used by
     /// `complete()`-from-`FiringRescheduled` to rotate the tag so the
-    /// commit oracle can detect the round-trip.
+    /// commit oracle can detect the round-trip after in-memory operation and
+    /// after slab reloads.
     fn update_tag(
         &self,
         key: &Key,

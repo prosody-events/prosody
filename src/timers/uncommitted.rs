@@ -203,10 +203,13 @@ where
     ///
     /// `Some(FiringTimer)` if the timer is still active and can be processed,
     /// `None` if the timer was cancelled while waiting in the queue.
-    pub async fn fire(self) -> Option<FiringTimer<T>> {
+    pub async fn fire(mut self) -> Option<FiringTimer<T>> {
         // Attempt to transition from Scheduled → Firing, reading the canonical
         // tag from ActiveTriggers under the trigger-lock.
-        let canonical_tag = self.uncommitted.fire_with_tag().await?;
+        let Some(canonical_tag) = self.uncommitted.fire_with_tag().await else {
+            self.uncommitted.completed = true;
+            return None;
+        };
 
         // Re-stamp the trigger with the canonical tag so WAL writers can embed
         // the observed-at-dispatch value.
@@ -476,11 +479,65 @@ mod tests {
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, pin_mut};
     use std::array::from_fn;
+    use std::fmt::Debug;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Semaphore, watch};
+    use tracing::dispatcher::set_default;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
 
     const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+    const DROPPED_UNCOMMITTED_WARNING: &str = "timer was dropped without committing or aborting";
+
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl CapturedWarnings {
+        fn contains(&self, needle: &str) -> bool {
+            self.0.lock().iter().any(|event| event.contains(needle))
+        }
+    }
+
+    struct WarningCaptureLayer {
+        warnings: CapturedWarnings,
+    }
+
+    impl<S> Layer<S> for WarningCaptureLayer
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn enabled(&self, metadata: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = WarningVisitor::default();
+            event.record(&mut visitor);
+            self.warnings.0.lock().push(visitor.output);
+        }
+
+        fn on_new_span(&self, _attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {}
+
+        fn on_record(&self, _span: &Id, _values: &Record<'_>, _ctx: Context<'_, S>) {}
+    }
+
+    #[derive(Default)]
+    struct WarningVisitor {
+        output: String,
+    }
+
+    impl Visit for WarningVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            use std::fmt::Write;
+
+            let _ = write!(&mut self.output, "{}={value:?};", field.name());
+        }
+    }
 
     fn test_semaphores() -> Arc<TimerSemaphores> {
         Arc::new(from_fn(|_| {
@@ -582,6 +639,47 @@ mod tests {
 
         // Clean up by committing
         firing_timer.commit().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_pending_timer_fire_completes_without_drop_warning() -> Result<()> {
+        time::pause();
+
+        let warnings = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(WarningCaptureLayer {
+            warnings: warnings.clone(),
+        });
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let _guard = set_default(&dispatcher);
+
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+        let trigger = create_test_trigger("cancelled-fire-test", 1, TimerType::Application)?;
+
+        manager.schedule(trigger.clone()).await?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        let pending_timer = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("Expected a pending timer"))?;
+
+        manager
+            .unschedule(&trigger.key, trigger.time, trigger.timer_type)
+            .await?;
+
+        assert!(
+            pending_timer.fire().await.is_none(),
+            "cancelled pending timer should not transition to firing"
+        );
+        assert!(
+            !warnings.contains(DROPPED_UNCOMMITTED_WARNING),
+            "cancelled pending timer should be marked completed before drop"
+        );
 
         Ok(())
     }

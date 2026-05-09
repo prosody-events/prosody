@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 /// Type alias for trigger tuple (key, time, `timer_type`).
 type TriggerTuple = (Key, CompactDateTime, TimerType);
+type StoreTriggerTuple = (Key, CompactDateTime, TimerType, SegmentId);
 
 /// High-level operations that coordinate across dual indices.
 /// Only uses the 9 public `TriggerStore` methods.
@@ -153,6 +154,26 @@ fn random_timer_type(g: &mut Gen) -> TimerType {
     }
 }
 
+fn derive_tag(key: &Key, time: CompactDateTime, timer_type: TimerType) -> i32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in key.as_ref().as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash ^= time.epoch_seconds();
+    hash = hash.wrapping_mul(0x0100_0193);
+    hash ^= timer_type as u32;
+    i32::from_le_bytes(hash.to_le_bytes())
+}
+
+fn model_tag_for_trigger(
+    model: &HighLevelModel,
+    segment_id: SegmentId,
+    trigger: &Trigger,
+) -> Option<i32> {
+    model.get_tag(segment_id, &trigger.key, trigger.timer_type, trigger.time)
+}
+
 /// Generates an `AddTrigger` operation.
 fn generate_add_trigger(
     g: &mut Gen,
@@ -160,15 +181,20 @@ fn generate_add_trigger(
     existing_triggers: &mut ExistingTriggers,
 ) -> HighLevelOperation {
     let key = random_key(g);
-    let time = CompactDateTime::arbitrary(g);
     let timer_type = random_timer_type(g);
-    let slab_id = Slab::from_time(segment.slab_size, time).id();
+    let mut time = CompactDateTime::arbitrary(g);
+    let mut slab_id = Slab::from_time(segment.slab_size, time).id();
+    while existing_triggers.contains(&(segment.id, slab_id, key.clone(), time, timer_type)) {
+        time = CompactDateTime::arbitrary(g);
+        slab_id = Slab::from_time(segment.slab_size, time).id();
+    }
 
     existing_triggers.insert((segment.id, slab_id, key.clone(), time, timer_type));
 
+    let tag = derive_tag(&key, time, timer_type);
     HighLevelOperation::AddTrigger {
         segment: segment.clone(),
-        trigger: Trigger::new(key, time, timer_type, Span::current()),
+        trigger: Trigger::with_tag(key, time, timer_type, tag, Span::current()),
     }
 }
 
@@ -270,9 +296,10 @@ fn generate_clear_and_schedule(
     time_set.clear();
     time_set.insert(new_time);
 
+    let tag = derive_tag(&key, new_time, timer_type);
     HighLevelOperation::ClearAndSchedule {
         segment: segment.clone(),
-        new_trigger: Trigger::new(key, new_time, timer_type, Span::current()),
+        new_trigger: Trigger::with_tag(key, new_time, timer_type, tag, Span::current()),
     }
 }
 
@@ -710,6 +737,49 @@ where
              {actual_tuples:?}"
         ));
     }
+
+    for trigger in &actual {
+        let key_tag = store
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "Op #{op_idx} GetSlabTriggersAllTypes current_tag failed: {e:?}"
+                )
+            })?;
+        let Some(key_tag) = key_tag else {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetSlabTriggersAllTypes returned slab trigger without key tag: \
+                 key={:?} time={:?} type={:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type
+            ));
+        };
+        if trigger.tag != key_tag {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetSlabTriggersAllTypes tag mismatch: key={:?} time={:?} \
+                 type={:?} expected key tag {key_tag:?}, got {:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type,
+                trigger.tag
+            ));
+        }
+
+        if let Some(expected_tag) = model_tag_for_trigger(model, store.segment_id(), trigger)
+            && trigger.tag != expected_tag
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetSlabTriggersAllTypes model tag mismatch: key={:?} time={:?} \
+                 type={:?} expected {expected_tag:?}, got {:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type,
+                trigger.tag
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -783,6 +853,28 @@ where
         return Err(color_eyre::eyre::eyre!(
             "Op #{op_idx} GetKeyTriggers mismatch: expected {expected:?}, got {actual_tuples:?}"
         ));
+    }
+
+    for trigger in &actual {
+        let Some(expected_tag) = model_tag_for_trigger(model, *segment_id, trigger) else {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetKeyTriggers returned unmodeled trigger: key={:?} time={:?} \
+                 type={:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type
+            ));
+        };
+        if trigger.tag != expected_tag {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetKeyTriggers tag mismatch: key={:?} time={:?} type={:?} \
+                 expected {expected_tag:?}, got {:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type,
+                trigger.tag
+            ));
+        }
     }
     Ok(())
 }
@@ -864,6 +956,15 @@ where
     S::Error: Debug,
 {
     for (op_idx, op) in operations.iter().enumerate() {
+        let mutating = matches!(
+            op,
+            HighLevelOperation::AddTrigger { .. }
+                | HighLevelOperation::RemoveTrigger { .. }
+                | HighLevelOperation::DeleteSlab { .. }
+                | HighLevelOperation::ClearAndSchedule { .. }
+                | HighLevelOperation::UpdateTag { .. }
+        );
+
         match op {
             HighLevelOperation::AddTrigger { trigger, .. } => {
                 model.apply(op);
@@ -942,6 +1043,12 @@ where
                 verify_current_tag(store, model, segment, key, *time, *timer_type, op_idx).await?;
             }
         }
+
+        if mutating {
+            verify_dual_index_consistency(store, model)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} consistency check: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -978,23 +1085,18 @@ where
 ///
 /// This is the critical verification that high-level operations maintain
 /// consistency across both indices.
-async fn verify_dual_index_consistency<S>(
+async fn collect_slab_trigger_set<S>(
     store: &S,
     model: &HighLevelModel,
-) -> color_eyre::Result<()>
+) -> color_eyre::Result<HashSet<StoreTriggerTuple>>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    use std::collections::HashSet;
-
-    // Collect all triggers from slab indices using get_slab_triggers_all_types
     let mut slab_triggers = HashSet::new();
     let mut processed_slabs = HashSet::new();
 
     for (segment_id, slab_id, _timer_type) in model.slab_index.keys() {
-        // Only process each slab once (since get_slab_triggers_all_types returns all
-        // timer types)
         if !processed_slabs.insert((*segment_id, *slab_id)) {
             continue;
         }
@@ -1017,7 +1119,17 @@ where
         }
     }
 
-    // Collect all triggers from key indices
+    Ok(slab_triggers)
+}
+
+async fn collect_key_trigger_set<S>(
+    store: &S,
+    model: &HighLevelModel,
+) -> color_eyre::Result<HashSet<StoreTriggerTuple>>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
     let mut key_triggers = HashSet::new();
     for (segment_id, key, timer_type) in model.key_index.keys() {
         let triggers: Vec<Trigger> = store
@@ -1038,10 +1150,27 @@ where
         }
     }
 
-    // Verify both indices contain exactly the same triggers
+    Ok(key_triggers)
+}
+
+fn collect_model_trigger_set(model: &HighLevelModel) -> HashSet<StoreTriggerTuple> {
+    let mut model_triggers = HashSet::new();
+    for ((segment_id, _slab_id, _timer_type), trigger_set) in &model.slab_index {
+        for (key, time, timer_type) in trigger_set {
+            model_triggers.insert((key.clone(), *time, *timer_type, *segment_id));
+        }
+    }
+    model_triggers
+}
+
+fn verify_trigger_sets(
+    slab_triggers: &HashSet<StoreTriggerTuple>,
+    key_triggers: &HashSet<StoreTriggerTuple>,
+    model_triggers: &HashSet<StoreTriggerTuple>,
+) -> color_eyre::Result<()> {
     if slab_triggers != key_triggers {
-        let slab_only: Vec<_> = slab_triggers.difference(&key_triggers).collect();
-        let key_only: Vec<_> = key_triggers.difference(&slab_triggers).collect();
+        let slab_only: Vec<_> = slab_triggers.difference(key_triggers).collect();
+        let key_only: Vec<_> = key_triggers.difference(slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
             "Dual-index consistency violation!\nTriggers in slab index but not key index: \
@@ -1049,18 +1178,9 @@ where
         ));
     }
 
-    // Verify store matches model - collect all triggers from model
-    let mut model_triggers = HashSet::new();
-    for ((segment_id, _slab_id, _timer_type), trigger_set) in &model.slab_index {
-        for (key, time, timer_type) in trigger_set {
-            model_triggers.insert((key.clone(), *time, *timer_type, *segment_id));
-        }
-    }
-
-    // Compare store vs model
     if slab_triggers != model_triggers {
-        let store_only: Vec<_> = slab_triggers.difference(&model_triggers).collect();
-        let model_only: Vec<_> = model_triggers.difference(&slab_triggers).collect();
+        let store_only: Vec<_> = slab_triggers.difference(model_triggers).collect();
+        let model_only: Vec<_> = model_triggers.difference(slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
             "Store does not match model!\nTriggers in store but not model: \
@@ -1069,6 +1189,91 @@ where
     }
 
     Ok(())
+}
+
+async fn verify_tag_consistency<S>(store: &S, model: &HighLevelModel) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    for ((segment_id, key, timer_type, time), expected_tag) in &model.tag_index {
+        let current_tag = store
+            .current_tag(key, *time, *timer_type)
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "Failed to read current_tag during consistency check: {e:?}"
+                )
+            })?;
+
+        if current_tag != Some(*expected_tag) {
+            return Err(color_eyre::eyre::eyre!(
+                "Key-index current_tag mismatch: key={key:?} time={time:?} type={timer_type:?} \
+                 expected Some({expected_tag}), got {current_tag:?}"
+            ));
+        }
+
+        let key_triggers: Vec<Trigger> = store
+            .get_key_triggers(*timer_type, key)
+            .try_collect()
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "Failed to read key triggers during tag consistency check: {e:?}"
+                )
+            })?;
+        let key_tag = key_triggers
+            .iter()
+            .find(|t| t.time == *time && t.timer_type == *timer_type)
+            .map(|t| t.tag);
+
+        if key_tag != Some(*expected_tag) {
+            return Err(color_eyre::eyre::eyre!(
+                "Key-index trigger tag mismatch: segment={segment_id} key={key:?} time={time:?} \
+                 type={timer_type:?} expected Some({expected_tag}), got {key_tag:?}"
+            ));
+        }
+
+        let slab_id = Slab::from_time(store.slab_size(), *time).id();
+        let slab_tags: Vec<Trigger> = store
+            .get_slab_triggers_all_types(slab_id)
+            .try_collect()
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "Failed to read slab triggers during tag consistency check: {e:?}"
+                )
+            })?;
+        let slab_tag = slab_tags
+            .iter()
+            .find(|t| t.key == *key && t.time == *time && t.timer_type == *timer_type)
+            .map(|t| t.tag);
+
+        if slab_tag != Some(*expected_tag) {
+            return Err(color_eyre::eyre::eyre!(
+                "Slab-index trigger tag mismatch: segment={segment_id} slab={slab_id} key={key:?} \
+                 time={time:?} type={timer_type:?} expected Some({expected_tag}), got {slab_tag:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+async fn verify_dual_index_consistency<S>(
+    store: &S,
+    model: &HighLevelModel,
+) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let slab_triggers = collect_slab_trigger_set(store, model).await?;
+    let key_triggers = collect_key_trigger_set(store, model).await?;
+    let model_triggers = collect_model_trigger_set(model);
+
+    verify_trigger_sets(&slab_triggers, &key_triggers, &model_triggers)?;
+    verify_tag_consistency(store, model).await
 }
 
 /// Verifies that high-level operations maintain dual-index consistency.

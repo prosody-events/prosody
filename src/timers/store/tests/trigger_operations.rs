@@ -4,7 +4,6 @@
 )]
 
 use crate::timers::slab::Slab;
-use crate::timers::store::TriggerStore;
 use crate::timers::store::tests::common::{
     add_trigger, clear_triggers_for_key, get_key_triggers, get_slab_triggers, insert_segment,
     remove_trigger,
@@ -12,11 +11,55 @@ use crate::timers::store::tests::common::{
 use crate::timers::store::tests::{
     TestStoreResult, TriggerOperation, TriggerSequence, TriggerTestInput,
 };
+use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::HashSet;
 use std::fmt::Debug;
 
 use tracing::Span;
+
+async fn verify_update_tag_rotates_both_indices<S>(
+    store: &S,
+    segment: &Segment,
+    trigger: &Trigger,
+) -> TestStoreResult
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let new_tag = trigger.tag.wrapping_add(1);
+    store
+        .update_tag(&trigger.key, trigger.time, trigger.timer_type, new_tag)
+        .await
+        .map_err(|e| format!("update_tag failed: {e:?}"))?;
+
+    let current_tag = store
+        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+        .await
+        .map_err(|e| format!("current_tag failed: {e:?}"))?;
+    if current_tag != Some(new_tag) {
+        return Err(format!(
+            "current_tag did not reflect rotated tag. Expected: {new_tag:?}, got: {current_tag:?}"
+        ));
+    }
+
+    let slab_id = Slab::from_time(segment.slab_size, trigger.time).id();
+    let slab_triggers = get_slab_triggers(store, slab_id).await?;
+    let slab_tag = slab_triggers
+        .iter()
+        .find(|t| {
+            t.key == trigger.key && t.time == trigger.time && t.timer_type == trigger.timer_type
+        })
+        .map(|t| t.tag);
+
+    if slab_tag != Some(new_tag) {
+        return Err(format!(
+            "slab trigger did not reflect rotated tag. Expected: {new_tag:?}, got: {slab_tag:?}"
+        ));
+    }
+
+    Ok(())
+}
 
 /// Tests basic trigger operations: add, get, remove, clear
 ///
@@ -86,6 +129,13 @@ where
                  {expected_slab_triggers:?}, Got: {slab_triggers:?}"
             ));
         }
+    }
+
+    // Tag rotation is part of the dual-index contract: the key index is used
+    // by `current_tag`, while slab loading rebuilds active timers from the
+    // slab index after restarts and ownership transfers.
+    if let Some(trigger) = input.triggers.first() {
+        verify_update_tag_rotates_both_indices(store, &input.segment, trigger).await?;
     }
 
     // Test remove_trigger

@@ -21,6 +21,7 @@
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::slab::Slab;
 use crate::timers::store::SegmentId;
 use crate::timers::store::cassandra::CassandraTriggerStore;
 use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
@@ -343,6 +344,42 @@ impl CassandraTriggerStore {
         .await
     }
 
+    /// Rotates the commit-oracle tag on the slab index for an existing timer.
+    ///
+    /// Callers must only invoke this for timers they have observed as
+    /// scheduled. Like the key-index clustering update, a missed target would
+    /// write a partial row in Cassandra.
+    #[instrument(level = "debug", skip(self), err)]
+    pub(super) async fn update_slab_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        new_tag: i32,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        let slab = Slab::from_time(self.segment.slab_size, time);
+        let slab_size = slab.size().seconds() as i32;
+        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
+
+        self.session()
+            .execute_unpaged(
+                &self.queries().update_slab_tag,
+                (
+                    new_tag,
+                    &self.segment.id,
+                    slab_size,
+                    slab_id,
+                    timer_type,
+                    key.as_ref(),
+                    time,
+                ),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?;
+
+        Ok(())
+    }
+
     /// Removes a state entry for a single timer type (returns to Absent).
     ///
     /// # Errors
@@ -504,7 +541,13 @@ impl CassandraTriggerStore {
         self.execute_unpaged_discard(
             &self.queries().batch_delete_to_absent,
             (
-                segment_id, key_ref, timer_type, target_time, timer_type, segment_id, key_ref,
+                segment_id,
+                key_ref,
+                timer_type,
+                target_time,
+                timer_type,
+                segment_id,
+                key_ref,
             ),
         )
         .await

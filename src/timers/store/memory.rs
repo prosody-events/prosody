@@ -572,10 +572,27 @@ impl TriggerOperations for InMemoryTriggerStore {
     ) -> Result<(), Self::Error> {
         let partition_key = (self.segment.id, key.clone());
         let clustering_key = (timer_type, time);
+        let mut target_exists = false;
         if let Some(mut entry) = self.inner.key_triggers.get_async(&partition_key).await
             && let Some(t) = entry.get_mut().get_mut(&clustering_key)
         {
             t.tag = new_tag;
+            target_exists = true;
+        }
+
+        if target_exists {
+            let slab = Slab::from_time(self.segment.slab_size, time);
+            let slab_partition_key = (self.segment.id, slab.size(), slab.id());
+            let slab_clustering_key = (timer_type, key.clone(), time);
+            if let Some(mut entry) = self
+                .inner
+                .slab_triggers
+                .get_async(&slab_partition_key)
+                .await
+                && let Some(t) = entry.get_mut().get_mut(&slab_clustering_key)
+            {
+                t.tag = new_tag;
+            }
         }
         Ok(())
     }

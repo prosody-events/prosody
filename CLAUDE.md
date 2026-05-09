@@ -135,6 +135,13 @@ pub struct Configuration {
 - Persistent storage via `TriggerStore` trait (Cassandra/Memory)
 - In-memory scheduler with background preloading
 
+**Concurrency invariants — load-bearing for correctness:**
+
+- **One handler per key, system-wide.** `KeyManager` ensures at most one message or timer handler for a given key is executing anywhere in the cluster at any moment. This is enforced by Kafka partition ownership (one consumer group member owns each partition) plus in-process per-key serialization. Never design for concurrent writers on the same key — that scenario cannot occur.
+- **Zero or one `PartitionManager` per Kafka partition, system-wide.** Kafka's partition assignment guarantees at most one consumer group member holds a partition at a time; the `PartitionManager` is the single owner of both the message stream and the timers that hang off that partition. Timer storage is scoped to the partition's segment; no two `PartitionManager`s for the same partition can be live simultaneously.
+
+These invariants are why LWTs, distributed locks, and optimistic concurrency are never needed for per-key or per-partition state. The framework provides the exclusivity; code inside it can assume it.
+
 ## Cassandra
 
 **CRITICAL Anti-Patterns - NEVER USE:**
