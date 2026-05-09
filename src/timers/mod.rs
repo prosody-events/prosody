@@ -239,5 +239,6 @@ const LOAD_CONCURRENCY: usize = 16;
 pub const DELETE_CONCURRENCY: usize = 16;
 
 // Re-export primary APIs for convenient access to timer functionality
+pub use active::TimerSnapshot;
 pub use manager::{TimerManager, TimerManagerConfig};
 pub use uncommitted::{FiringTimer, PendingTimer, UncommittedTimer};

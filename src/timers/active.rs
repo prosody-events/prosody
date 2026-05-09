@@ -79,6 +79,19 @@ pub struct ActiveTriggerEntry {
     pub tag: i32,
 }
 
+/// Point-in-time counts of active timers for metrics reporting.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimerSnapshot {
+    /// Timers in any state in the loaded scheduling window.
+    pub active: u32,
+    /// Timers in `Firing` or `FiringRescheduled` state.
+    pub in_flight: u32,
+    /// Timers whose `fire_time <= now` (any state).
+    pub overdue: u32,
+    /// Age in seconds of the oldest overdue timer; 0 when none.
+    pub oldest_overdue_secs: u32,
+}
+
 /// Maps (time, type) tuples to their lifecycle entry for a single key.
 type TriggerStateMap = HashMap<(CompactDateTime, TimerType), ActiveTriggerEntry>;
 
@@ -323,6 +336,36 @@ impl ActiveTriggers {
                 true // Continue iteration over all entries
             })
             .await;
+    }
+
+    /// Computes a point-in-time [`TimerSnapshot`] of this registry.
+    ///
+    /// Scans all active timers once and accumulates counts and ages relative to
+    /// `now`. Saturating arithmetic prevents wrapping under pathological loads.
+    pub async fn snapshot(&self, now: CompactDateTime) -> TimerSnapshot {
+        let mut s = TimerSnapshot::default();
+        self.0
+            .iter_async(|_, states| {
+                for (&(time, _), &entry) in states {
+                    s.active = s.active.saturating_add(1);
+                    if matches!(
+                        entry.state,
+                        TimerState::Firing | TimerState::FiringRescheduled
+                    ) {
+                        s.in_flight = s.in_flight.saturating_add(1);
+                    }
+                    if time <= now {
+                        s.overdue = s.overdue.saturating_add(1);
+                        let age = now.epoch_seconds().saturating_sub(time.epoch_seconds());
+                        if age > s.oldest_overdue_secs {
+                            s.oldest_overdue_secs = age;
+                        }
+                    }
+                }
+                true
+            })
+            .await;
+        s
     }
 }
 
@@ -1050,5 +1093,172 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    // =========================================================================
+    // TimerSnapshot tests
+    // =========================================================================
+
+    #[test]
+    async fn test_snapshot_empty() {
+        let active_triggers = ActiveTriggers::default();
+        let now = CompactDateTime::from(10000u32);
+        let s = active_triggers.snapshot(now).await;
+        assert_eq!(s.active, 0);
+        assert_eq!(s.in_flight, 0);
+        assert_eq!(s.overdue, 0);
+        assert_eq!(s.oldest_overdue_secs, 0);
+    }
+
+    #[test]
+    async fn test_snapshot_scheduled_future() {
+        let active_triggers = ActiveTriggers::default();
+        let now = CompactDateTime::from(1000u32);
+        let future_time = CompactDateTime::from(2000u32);
+        let key = Key::from("k");
+
+        active_triggers
+            .insert(Trigger::new(
+                key,
+                future_time,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+
+        let s = active_triggers.snapshot(now).await;
+        assert_eq!(s.active, 1);
+        assert_eq!(s.in_flight, 0);
+        assert_eq!(s.overdue, 0);
+        assert_eq!(s.oldest_overdue_secs, 0);
+    }
+
+    #[test]
+    async fn test_snapshot_scheduled_overdue() {
+        let active_triggers = ActiveTriggers::default();
+        let past_time = CompactDateTime::from(1000u32);
+        let now = CompactDateTime::from(1030u32);
+        let key = Key::from("k");
+
+        active_triggers
+            .insert(Trigger::new(
+                key,
+                past_time,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+
+        let s = active_triggers.snapshot(now).await;
+        assert_eq!(s.active, 1);
+        assert_eq!(s.in_flight, 0);
+        assert_eq!(s.overdue, 1);
+        assert_eq!(s.oldest_overdue_secs, 30);
+    }
+
+    #[test]
+    async fn test_snapshot_firing_counts_in_flight_and_overdue() {
+        let active_triggers = ActiveTriggers::default();
+        let time = CompactDateTime::from(1000u32);
+        let now = CompactDateTime::from(1000u32);
+        let key = Key::from("k");
+
+        active_triggers
+            .insert(Trigger::new(
+                key.clone(),
+                time,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+        active_triggers
+            .set_state(&key, time, TimerType::Application, TimerState::Firing)
+            .await;
+
+        let s = active_triggers.snapshot(now).await;
+        assert_eq!(s.active, 1);
+        assert_eq!(s.in_flight, 1);
+        assert_eq!(s.overdue, 1);
+        assert_eq!(s.oldest_overdue_secs, 0);
+    }
+
+    #[test]
+    async fn test_snapshot_mixed_states() {
+        let active_triggers = ActiveTriggers::default();
+        let now = CompactDateTime::from(2000u32);
+        // overdue scheduled
+        let past = CompactDateTime::from(1900u32);
+        // future scheduled
+        let future = CompactDateTime::from(3000u32);
+        // overdue firing
+        let past_firing = CompactDateTime::from(1800u32);
+
+        let k1 = Key::from("k1");
+        let k2 = Key::from("k2");
+        let k3 = Key::from("k3");
+
+        active_triggers
+            .insert(Trigger::new(
+                k1.clone(),
+                past,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+        active_triggers
+            .insert(Trigger::new(
+                k2,
+                future,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+        active_triggers
+            .insert(Trigger::new(
+                k3.clone(),
+                past_firing,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+        active_triggers
+            .set_state(&k3, past_firing, TimerType::Application, TimerState::Firing)
+            .await;
+
+        let s = active_triggers.snapshot(now).await;
+        assert_eq!(s.active, 3);
+        assert_eq!(s.in_flight, 1);
+        assert_eq!(s.overdue, 2); // past + past_firing
+        assert_eq!(s.oldest_overdue_secs, 200); // now(2000) - past_firing(1800)
+    }
+
+    #[test]
+    async fn test_snapshot_firing_rescheduled_counts_in_flight() {
+        let active_triggers = ActiveTriggers::default();
+        let time = CompactDateTime::from(1000u32);
+        let now = CompactDateTime::from(1000u32);
+        let key = Key::from("k");
+
+        active_triggers
+            .insert(Trigger::new(
+                key.clone(),
+                time,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+        active_triggers
+            .set_state(
+                &key,
+                time,
+                TimerType::Application,
+                TimerState::FiringRescheduled,
+            )
+            .await;
+
+        let s = active_triggers.snapshot(now).await;
+        assert_eq!(s.active, 1);
+        assert_eq!(s.in_flight, 1);
+        assert_eq!(s.overdue, 1);
     }
 }

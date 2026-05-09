@@ -47,6 +47,7 @@ use tracing::{debug, debug_span, error, info_span, instrument};
 use uuid::Uuid;
 
 mod keyed;
+mod metrics;
 pub mod offsets;
 mod util;
 
@@ -558,6 +559,14 @@ async fn run_partition<T, S, P>(
     else {
         return;
     };
+
+    spawn(metrics::run(
+        timer_manager.clone(),
+        group_id.clone(),
+        partition_info.topic,
+        partition_info.partition,
+        shutdown_rx.clone(),
+    ));
 
     let timer_events = stream! {
         pin_mut!(timer_stream);
