@@ -399,9 +399,11 @@ cassandra_queries! {
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
-        /// Updates tag on a clustering row (IF EXISTS guards against drift).
+        /// Updates tag on an existing clustering row. Caller must guarantee
+        /// the row exists (see `update_tag`'s precondition); a missed target
+        /// would write a partial row.
         update_tag: (
-            "UPDATE $keyspace.{} SET tag = ? WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ? IF EXISTS",
+            "UPDATE $keyspace.{} SET tag = ? WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?",
             TABLE_TYPED_KEYS
         ),
 

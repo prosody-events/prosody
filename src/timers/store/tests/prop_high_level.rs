@@ -315,32 +315,30 @@ fn generate_get_slab_range(g: &mut Gen, segment: &Segment) -> HighLevelOperation
     }
 }
 
-/// Generates an `UpdateTag` operation targeting an existing trigger (or
-/// random).
+/// Generates an `UpdateTag` operation targeting an existing trigger.
+///
+/// `update_tag` requires the caller to have observed the target as
+/// currently scheduled — the Cassandra store would write a partial row
+/// otherwise. The generator encodes this precondition by only picking from
+/// `existing_triggers`; if none exist, no `UpdateTag` op is generated.
 fn generate_update_tag(
     g: &mut Gen,
     segment: &Segment,
     existing_triggers: &ExistingTriggers,
-) -> HighLevelOperation {
+) -> Option<HighLevelOperation> {
+    if existing_triggers.is_empty() {
+        return None;
+    }
     let new_tag = i32::arbitrary(g);
-    if !existing_triggers.is_empty() && bool::arbitrary(g) {
-        let keys: Vec<_> = existing_triggers.iter().cloned().collect();
-        let (_, _, key, time, timer_type) = &keys[usize::arbitrary(g) % keys.len()];
-        return HighLevelOperation::UpdateTag {
-            segment: segment.clone(),
-            key: key.clone(),
-            time: *time,
-            timer_type: *timer_type,
-            new_tag,
-        };
-    }
-    HighLevelOperation::UpdateTag {
+    let keys: Vec<_> = existing_triggers.iter().cloned().collect();
+    let (_, _, key, time, timer_type) = &keys[usize::arbitrary(g) % keys.len()];
+    Some(HighLevelOperation::UpdateTag {
         segment: segment.clone(),
-        key: random_key(g),
-        time: CompactDateTime::arbitrary(g),
-        timer_type: random_timer_type(g),
+        key: key.clone(),
+        time: *time,
+        timer_type: *timer_type,
         new_tag,
-    }
+    })
 }
 
 /// Generates a `CurrentTag` query operation.
@@ -438,7 +436,12 @@ impl Arbitrary for HighLevelTestInput {
                 5 => generate_get_key_times(g, segment),
                 6 => generate_get_key_triggers(g, segment),
                 7 => generate_get_slab_range(g, segment),
-                8 => generate_update_tag(g, segment, &existing_triggers),
+                8 => match generate_update_tag(g, segment, &existing_triggers) {
+                    Some(op) => op,
+                    // No existing triggers yet — fall back to a query op so this
+                    // iteration still produces something useful.
+                    None => generate_current_tag(g, segment, &existing_triggers),
+                },
                 _ => generate_current_tag(g, segment, &existing_triggers),
             };
 

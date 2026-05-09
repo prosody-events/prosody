@@ -5,6 +5,15 @@
 //! operation: a plain `UPDATE` for the common inline path, or a tombstone-free
 //! BATCH only when clustering rows actually need to change.
 //!
+//! **Locking contract.** State-mutating methods call `resolve_state` to obtain
+//! the per-`(key, timer_type)` [`CachedState`] mutex (see
+//! [`crate::timers::store::cassandra::state`]) and hold it from the state
+//! check through the DB write — that is what makes the read-decide-write
+//! sequence linearisable against concurrent callers on the same
+//! `(key, timer_type)`. Read-only stream methods take the same lock briefly
+//! to snapshot the state, then release before any DB I/O: a concurrent
+//! transition just shifts the snapshot, which is acceptable for a stream.
+//!
 //! `get_key_triggers_all_types` is the most complex method: it reads the full
 //! `state` map in one query, then merges inline entries (sorted by
 //! `TimerType` discriminant) with a clustering-row stream in a single pass,
@@ -425,7 +434,9 @@ impl TriggerOperations for CassandraTriggerStore {
             let (handle, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
-            // Lock briefly to read the state, then release before any DB I/O.
+            // Snapshot the state and release the lock before any DB I/O — a
+            // concurrent transition would just shift the snapshot, which is
+            // fine for a read-only stream.
             let state = handle.lock().await.clone();
             match state {
                 TimerState::Inline(timer) => {
@@ -474,7 +485,9 @@ impl TriggerOperations for CassandraTriggerStore {
             let (handle, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
-            // Lock briefly to read the state, then release before any DB I/O.
+            // Snapshot the state and release the lock before any DB I/O — a
+            // concurrent transition would just shift the snapshot, which is
+            // fine for a read-only stream.
             let state = handle.lock().await.clone();
             match state {
                 TimerState::Inline(timer) => {
@@ -841,9 +854,9 @@ impl TriggerOperations for CassandraTriggerStore {
     ///   delete.
     /// - **Overflow**: BATCH (DELETE clustering + UPDATE state).
     ///
-    /// `resolve_state` returns a per-key `Arc<AsyncMutex<TimerState>>`; holding
-    /// the `handle.lock().await` guard serializes the read-decide-write
-    /// sequence.
+    /// `resolve_state` returns the per-`(key, timer_type)` mutex; holding
+    /// `handle.lock().await` for the entire match serialises the
+    /// read-decide-write sequence against concurrent same-key writers.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn clear_and_schedule_key(
         &self,
@@ -960,7 +973,21 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    /// Rotates the commit-oracle tag on an existing timer at `time`.
+    ///
+    /// **Precondition:** the caller must have observed the timer at `(key,
+    /// time, timer_type)` as currently scheduled (today: from
+    /// `complete()`-from-`FiringRescheduled`, where the row was just loaded
+    /// into the active scheduler). Holding the per-key mutex serialises
+    /// against concurrent in-process writers, so the row is guaranteed to
+    /// exist for the duration of the write.
+    ///
+    /// Uses `resolve_state` (cache-first):
+    /// - **Inline(timer), time matches**: rewrite the UDT in place.
+    /// - **Inline(_), time mismatch** or **Absent**: no-op (target absent).
+    /// - **Overflow**: bare `UPDATE` on the clustering row — no LWT, no
+    ///   existence check.
+    #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn update_tag(
         &self,
         key: &Key,
@@ -968,71 +995,79 @@ impl TriggerOperations for CassandraTriggerStore {
         timer_type: TimerType,
         new_tag: i32,
     ) -> Result<(), Self::Error> {
-        // First attempt: UPDATE the clustering row (Overflow path).
-        // IF EXISTS guards against racing deletes; LWT cost is acceptable
-        // since this fires only for complete()-from-FiringRescheduled.
-        self.execute_unpaged_discard(
-            &self.queries().update_tag,
-            (new_tag, &self.segment.id, key.as_ref(), timer_type, time),
-        )
-        .await?;
+        let segment_id = self.segment.id;
+        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
+        Span::current().record("state_cached", cached);
 
-        // Second: also update the Inline state column if the timer is Inline.
-        // For Overflow timers the clustering UPDATE above sufficed; for Inline
-        // timers there is no clustering row, so the tag lives only in the UDT.
-        let (handle, _) = self
-            .resolve_state(&self.segment.id, key, timer_type)
-            .await?;
         let mut guard = handle.lock().await;
-        if let TimerState::Inline(timer) = &*guard
-            && timer.time == time
-        {
-            let new_state = TimerState::Inline(InlineTimer {
-                time: timer.time,
-                span: timer.span.clone(),
-                tag: new_tag,
-            });
-            self.set_state_inline(&self.segment.id, key, timer_type, &new_state)
+        match &*guard {
+            TimerState::Inline(timer) if timer.time == time => {
+                let new_state = TimerState::Inline(InlineTimer {
+                    time: timer.time,
+                    span: timer.span.clone(),
+                    tag: new_tag,
+                });
+                self.set_state_inline(&segment_id, key, timer_type, &new_state)
+                    .await?;
+                *guard = new_state;
+            }
+            // Concurrent `clear_and_schedule` won the lock first and rewrote
+            // the UDT to a different timer (or cleared it entirely). The new
+            // Inline timer carries its own freshly-minted tag from
+            // `Trigger::new`, so our rotation is moot. Do NOT assert/warn —
+            // this race is legitimate under normal reschedule contention.
+            TimerState::Inline(_) | TimerState::Absent => {}
+            TimerState::Overflow => {
+                self.execute_unpaged_discard(
+                    &self.queries().update_tag,
+                    (new_tag, &segment_id, key.as_ref(), timer_type, time),
+                )
                 .await?;
-            *guard = new_state;
+            }
         }
-
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self), err)]
+    /// Reads the commit-oracle tag for a single timer at `time`.
+    ///
+    /// Uses `resolve_state` (cache-first):
+    /// - **Inline(timer), time matches**: tag from cache (0 DB reads).
+    /// - **Inline(_), time mismatch** or **Absent**: `None` (Inline guarantees
+    ///   no other timers; post-V3 Absent is unambiguous).
+    /// - **Overflow**: SELECT the clustering row's tag column under the
+    ///   per-key mutex so a concurrent promote/demote cannot interleave
+    ///   between the state check and the row read.
+    #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn current_tag(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
     ) -> Result<Option<i32>, Self::Error> {
-        // Fast path: clustering row exists (Overflow mode).
-        let row = self
-            .session()
-            .execute_unpaged(
-                &self.queries().current_tag_key,
-                (&self.segment.id, key.as_ref(), timer_type, time),
-            )
-            .await
-            .map_err(CassandraStoreError::from)?
-            .into_rows_result()
-            .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(Option<i32>,)>()
-            .map_err(CassandraStoreError::from)?;
+        let segment_id = self.segment.id;
+        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
+        Span::current().record("state_cached", cached);
 
-        if let Some((tag_opt,)) = row {
-            return Ok(Some(tag_opt.unwrap_or(0_i32)));
+        let guard = handle.lock().await;
+        match &*guard {
+            TimerState::Inline(timer) if timer.time == time => Ok(Some(timer.tag)),
+            TimerState::Inline(_) | TimerState::Absent => Ok(None),
+            TimerState::Overflow => {
+                let row = self
+                    .session()
+                    .execute_unpaged(
+                        &self.queries().current_tag_key,
+                        (&segment_id, key.as_ref(), timer_type, time),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .into_rows_result()
+                    .map_err(CassandraStoreError::from)?
+                    .maybe_first_row::<(Option<i32>,)>()
+                    .map_err(CassandraStoreError::from)?;
+                Ok(row.map(|(tag_opt,)| tag_opt.unwrap_or(0_i32)))
+            }
         }
-
-        // No clustering row — check Inline state (single-timer path).
-        // resolve_state reads the state static column; Inline means the
-        // trigger is present with its tag stored in the UDT.
-        let state = self.fetch_state(&self.segment.id, key, timer_type).await?;
-        Ok(match state {
-            TimerState::Inline(timer) if timer.time == time => Some(timer.tag),
-            _ => None, // Absent or wrong-time Inline → row absent
-        })
     }
 
     // -- V1 migration methods --

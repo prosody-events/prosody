@@ -195,11 +195,14 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     // Tag Operations (2 methods)
     // =========================================================================
 
-    /// Updates the `tag` on a key-index clustering row.
+    /// Rotates the `tag` on an existing scheduled timer.
     ///
-    /// No-op if the row is absent (`IF EXISTS` semantics). Used exclusively by
-    /// `complete()`-from-`FiringRescheduled` to rotate the tag so the commit
-    /// oracle can detect the transition.
+    /// **Precondition:** the caller must have observed the timer at `(key,
+    /// time, timer_type)` as currently scheduled. Today's only caller is
+    /// `complete()`-from-`FiringRescheduled`, which has just loaded the timer
+    /// from storage. Implementations may treat a missing row as a no-op (the
+    /// in-memory store does) or as undefined (the Cassandra store would write
+    /// a partial row), so callers must not depend on either behaviour.
     fn update_tag(
         &self,
         key: &Key,
