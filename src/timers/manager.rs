@@ -2624,13 +2624,15 @@ mod tests {
         Ok(())
     }
 
-    /// Inv #8 (reload parity): after `complete()`-from-`FiringRescheduled`, the
-    /// tag in the store (persistent) matches the in-memory `ActiveTriggers`
-    /// tag.
+    /// Inv #8 (reload parity): after `complete()`-from-`FiringRescheduled`,
+    /// the tag persisted in the store equals the tag held in
+    /// `ActiveTriggers`, and both equal the rotated post-commit value.
     ///
-    /// This exercises the full round-trip: UPDATE tag → rotate in
-    /// `ActiveTriggers` → fall through to `store.current_tag` on cache
-    /// miss.
+    /// `TimerManager::current_tag` consults `ActiveTriggers` first and only
+    /// falls through to the store on miss, so this test bypasses the manager
+    /// helper and queries the store directly via the held trigger-lock —
+    /// otherwise both reads would hit the in-memory path and a store/memory
+    /// divergence would go undetected.
     #[tokio::test]
     async fn tag_inv8_reload_parity() -> Result<()> {
         time::pause();
@@ -2638,6 +2640,10 @@ mod tests {
         pin_mut!(stream);
         let trigger = create_test_trigger("k", 1, TimerType::Application)?;
         manager.schedule(trigger.clone()).await?;
+        let tag_initial = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?
+            .ok_or_else(|| eyre!("no tag before fire"))?;
 
         advance(Duration::from_secs(2)).await;
         task::yield_now().await;
@@ -2652,17 +2658,25 @@ mod tests {
             .await?
             .ok_or_else(|| eyre!("in-memory tag absent"))?;
 
-        // Store path: directly query the underlying store.
-        // (For InMemoryTriggerStore, the two paths are the same data structure,
-        // but this exercises the API contract used by state recovery.)
-        let tag_store = manager
-            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
-            .await?
-            .ok_or_else(|| eyre!("store tag absent"))?;
+        // Store path: query the persistent store directly under the
+        // trigger-lock, skipping the ActiveTriggers cache that
+        // `manager.current_tag` consults first.
+        let tag_store = {
+            let state = manager.0.state.trigger_lock().await;
+            state
+                .store
+                .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+                .await?
+        }
+        .ok_or_else(|| eyre!("store tag absent"))?;
 
         assert_eq!(
             tag_active, tag_store,
             "inv #8: reload parity — in-memory tag must equal store tag after rotation"
+        );
+        assert_ne!(
+            tag_store, tag_initial,
+            "inv #8: store tag must reflect the post-commit rotation, not the pre-fire value"
         );
         Ok(())
     }
