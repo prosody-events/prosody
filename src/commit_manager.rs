@@ -135,7 +135,6 @@ mod tests {
 
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, pin_mut};
-    use rand::RngExt;
     use tokio::sync::{Semaphore, watch};
     use tokio::task;
     use tokio::time::{self, advance};
@@ -319,25 +318,5 @@ mod tests {
             "mismatching tag → committed-and-rescheduled"
         );
         Ok(())
-    }
-
-    /// Collision-resistance probe: `fresh_tag_distinct_from` always != current.
-    #[test]
-    fn fresh_tag_never_equals_current() {
-        for _ in 0..200_u32 {
-            let current = rand::rng().random::<i32>();
-            let mut found_different = false;
-            for _ in 0..10_u32 {
-                let t = rand::rng().random::<i32>();
-                if t != current {
-                    found_different = true;
-                    break;
-                }
-            }
-            assert!(
-                found_different,
-                "no distinct value in 10 draws for current={current}"
-            );
-        }
     }
 }
