@@ -142,8 +142,11 @@ pub struct Configuration {
 1. **ALLOW FILTERING** - Full table scans destroy cluster
 2. **Secondary Indices** - Coordinator bottlenecks
 3. **Materialized Views** - Breaks under write load
+4. **LWTs (Lightweight Transactions / `IF [NOT] EXISTS` / `IF <cond>`)** - Paxos round-trips serialize all writes to a partition; latency and contention scale catastrophically
 
-**Instead:** Proper partition keys, clustering columns for ranges, `Option<T>` for NULLs (filter in code)
+**Instead:** Proper partition keys, clustering columns for ranges, `Option<T>` for NULLs (filter in code). For "insert-if-new" semantics, prefer idempotent writes or app-level coordination over LWTs.
+
+**Batching:** When multiple statements target the **same partition (same row key)**, group them into an `UNLOGGED BATCH` whenever possible. Same-partition unlogged batches are atomic on the replica and execute as a single mutation, eliminating extra coordinator round-trips. Never use `LOGGED BATCH` for performance reasons, and never batch across partitions to "reduce round-trips" — that's an anti-pattern that overloads the coordinator.
 
 **Handling NULLs from static columns:**
 
