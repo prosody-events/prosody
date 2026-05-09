@@ -7,12 +7,12 @@
 //! at all — the common single-timer path never issues a clustering scan.
 //!
 //! The in-memory cache (`CachedState` — an `Arc<AsyncMutex<TimerState>>`)
-//! keeps the resolved state hot between operations. Wrapping in
-//! `Arc<AsyncMutex>` lets callers clone the handle out of the cache before
-//! awaiting the lock, so no shard lock is held across any async boundary.
-//! All read-modify-write sequences hold this mutex for their full duration,
-//! eliminating the TOCTOU window that existed before per-key serialisation was
-//! added.
+//! keeps the resolved state hot between operations and serialises mutations
+//! per `(key, timer_type)`. Callers clone the handle out of the cache before
+//! awaiting the mutex, so no `quick_cache` shard lock is held across an await.
+//! Every state-mutating operation in the trigger store holds this mutex for
+//! its full read-decide-write sequence; that is the only synchronisation
+//! point that makes those operations linearisable against each other.
 
 use crate::Key;
 use crate::timers::TimerType;
@@ -52,13 +52,15 @@ pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>, Optio
 /// correctly via the re-created mutex.
 pub(super) const STATE_CACHE_CAPACITY: usize = 8_192;
 
-/// Cached value type: an async mutex wrapping the resolved timer state.
+/// Per-`(key, timer_type)` mutex wrapping the resolved timer state.
 ///
-/// Wrapping in `Arc<AsyncMutex<…>>` allows callers to clone the handle out of
-/// the cache (dropping the internal shard lock), then `.lock().await` without
-/// holding any cache internals across an await point.  All state-mutating
-/// operations hold this lock for their entire read-then-write sequence,
-/// preventing TOCTOU races between concurrent `EventContext` callers.
+/// Callers obtain the handle via `resolve_state` (which drops `quick_cache`'s
+/// internal shard lock as soon as the `Arc` is cloned), then `.lock().await`
+/// without holding any cache internals across an await. State-mutating
+/// `TriggerOperations` methods hold this mutex from the state read through
+/// the DB write, so concurrent operations on the same `(key, timer_type)`
+/// linearise; operations on different `(key, timer_type)` pairs do not block
+/// each other.
 pub(super) type CachedState = Arc<AsyncMutex<TimerState>>;
 
 /// Timer data for a single inlined timer.

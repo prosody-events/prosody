@@ -15,8 +15,8 @@
 //!
 //! `resolve_state` is the cache-first entry point used by all higher-level
 //! operations: it returns an `Arc<AsyncMutex<TimerState>>` that callers lock
-//! before reading and hold through the write, serialising per-key mutations
-//! without a global lock.
+//! before reading and hold through the write, serialising mutations per
+//! `(key, timer_type)` without a global lock.
 
 use crate::Key;
 use crate::cassandra::errors::CassandraStoreError;
