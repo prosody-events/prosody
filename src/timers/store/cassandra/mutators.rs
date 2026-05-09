@@ -442,6 +442,142 @@ impl CassandraTriggerStore {
             .map_err(CassandraStoreError::from)?)
     }
 
+    /// Reads up to 3 clustering rows (time, span, tag) for a key/type.
+    ///
+    /// Used by `delete_key_trigger`'s Overflow branch as a single pre-delete
+    /// read: the caller filters the target time out and inspects what remains
+    /// to choose between three post-delete states (Absent / Inline / Overflow).
+    /// Returning a third row signals "≥2 survivors" without needing its data.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the database query fails.
+    #[instrument(level = "debug", skip(self), err)]
+    pub(super) async fn peek_three_key_triggers(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+    ) -> Result<Vec<PeekedTrigger>, CassandraTriggerStoreError> {
+        let rows_result = self
+            .session()
+            .execute_unpaged(
+                &self.queries().peek_three_key_triggers,
+                (segment_id, key.as_ref(), timer_type),
+            )
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?;
+
+        let mut out = Vec::with_capacity(3);
+        for row in rows_result
+            .rows::<PeekedTrigger>()
+            .map_err(CassandraStoreError::from)?
+        {
+            out.push(row.map_err(|e| {
+                CassandraStoreError::from(MaybeFirstRowError::DeserializationFailed(e))
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// Atomic batch: DELETE target clustering row + DELETE state[type].
+    ///
+    /// Used by `delete_key_trigger`'s Overflow branch when the pre-delete
+    /// read shows zero non-target rows. Both statements target the same
+    /// `(segment_id, key)` partition so the unlogged batch carries no
+    /// cross-partition coordination overhead and is atomic on the replica.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the database batch execution fails.
+    #[instrument(level = "debug", skip(self), err)]
+    pub(super) async fn batch_delete_to_absent(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+        target_time: CompactDateTime,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        let key_ref = key.as_ref();
+        self.execute_unpaged_discard(
+            &self.queries().batch_delete_to_absent,
+            (
+                segment_id, key_ref, timer_type, target_time, timer_type, segment_id, key_ref,
+            ),
+        )
+        .await
+    }
+
+    /// Atomic batch: DELETE target clustering + DELETE surviving clustering +
+    /// UPDATE state Inline.
+    ///
+    /// Used by `delete_key_trigger`'s Overflow branch when the pre-delete
+    /// read shows exactly one non-target row will survive. The survivor's
+    /// time/span/tag has already been captured into `state` so the UPDATE
+    /// writes Inline state in the same round-trip — eliminating both the
+    /// separate target DELETE and the separate demote BATCH that the
+    /// pre-restructure code issued.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the database batch execution fails.
+    #[instrument(level = "debug", skip(self), err)]
+    pub(super) async fn batch_delete_to_inline(
+        &self,
+        segment_id: &SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+        target_time: CompactDateTime,
+        surviving_time: CompactDateTime,
+        state: &TimerState,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        let TimerState::Inline(timer) = state else {
+            return Err(CassandraTriggerStoreError::AbsentStateNotSerializable);
+        };
+        let key_ref = key.as_ref();
+        self.execute_with_optional_ttl(
+            timer.time,
+            &self.queries().batch_delete_to_inline,
+            &self.queries().batch_delete_to_inline_no_ttl,
+            |ttl| {
+                (
+                    segment_id,
+                    key_ref,
+                    timer_type,
+                    target_time,
+                    segment_id,
+                    key_ref,
+                    timer_type,
+                    surviving_time,
+                    ttl,
+                    timer_type,
+                    state,
+                    segment_id,
+                    key_ref,
+                )
+            },
+            || {
+                (
+                    segment_id,
+                    key_ref,
+                    timer_type,
+                    target_time,
+                    segment_id,
+                    key_ref,
+                    timer_type,
+                    surviving_time,
+                    timer_type,
+                    state,
+                    segment_id,
+                    key_ref,
+                )
+            },
+        )
+        .await
+    }
+
     /// Backfills the key state MAP entry for a single `(key, timer_type)` pair.
     ///
     /// Used during V2→V3 migration. For keys that have clustering rows but no

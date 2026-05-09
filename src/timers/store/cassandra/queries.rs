@@ -318,6 +318,16 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
+        /// Reads up to 3 clustering rows (time, span, tag) for a key/type.
+        /// Used by `delete_key_trigger`'s Overflow branch: a single
+        /// pre-delete read drives the post-delete state decision (0 / 1 /
+        /// 2+ surviving rows after filtering the target out) and supplies
+        /// the surviving row's data when the post-delete state is Inline.
+        peek_three_key_triggers: (
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 3",
+            TABLE_TYPED_KEYS
+        ),
+
         /// BATCH: Clear clustering rows and set inline state with TTL
         batch_clear_and_set_inline: (
             "BEGIN UNLOGGED BATCH \
@@ -397,6 +407,43 @@ cassandra_queries! {
              DELETE state FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: DELETE target clustering row + DELETE state[type].
+        /// Used by `delete_key_trigger`'s Overflow branch when the
+        /// pre-delete read shows the target is the only row → Absent.
+        /// Both statements target the same `(segment_id, key)` partition.
+        batch_delete_to_absent: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             DELETE state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: DELETE target clustering + DELETE surviving clustering +
+        /// UPDATE state Inline (with TTL).
+        /// Used by `delete_key_trigger`'s Overflow branch when exactly one
+        /// non-target row survives — that row's data is captured into the
+        /// static state column in a single round-trip → Inline.
+        batch_delete_to_inline: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: DELETE target clustering + DELETE surviving clustering +
+        /// UPDATE state Inline (no TTL).
+        batch_delete_to_inline_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
         ),
 
         /// Updates tag on an existing clustering row. Caller must guarantee
