@@ -1042,6 +1042,7 @@ where
             trigger_store_config,
             consumer_config.mock,
             pipeline_config.dedup.ttl,
+            pipeline_config.dedup.cache_capacity,
             consumer_config.timer_spans,
         )
         .await?;

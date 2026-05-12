@@ -80,26 +80,6 @@ mod prop_tests {
 }
 
 #[cfg(test)]
-mod prop_tests_cached {
-    use std::convert::Infallible;
-    use std::sync::Arc;
-
-    use quick_cache::sync::Cache;
-    use uuid::Uuid;
-
-    use super::MemoryDeduplicationStore;
-    use crate::consumer::middleware::deduplication::store::CachedDeduplicationStore;
-
-    // Parity: cache-then-store coherence for CachedDeduplicationStore.
-    crate::dedup_store_tests!(async {
-        Ok::<_, Infallible>(CachedDeduplicationStore::<MemoryDeduplicationStore>::new(
-            Arc::new(Cache::<Uuid, ()>::new(128)),
-            MemoryDeduplicationStore::new(),
-        ))
-    });
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

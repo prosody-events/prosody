@@ -31,7 +31,6 @@ use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use quick_cache::sync::Cache;
 use thiserror::Error;
 use tracing::{debug, info_span};
 use uuid::Uuid;
@@ -54,10 +53,7 @@ pub use self::config::{
     DeduplicationConfigurationBuilderError,
 };
 pub use self::memory::{MemoryDeduplicationStore, MemoryDeduplicationStoreProvider};
-pub use self::store::{
-    CachedDeduplicationStore, CachedDeduplicationStoreProvider, DeduplicationStore,
-    DeduplicationStoreProvider,
-};
+pub use self::store::{DeduplicationStore, DeduplicationStoreProvider};
 
 /// Shared state for the deduplication middleware.
 #[derive(Clone, Debug)]
@@ -70,15 +66,14 @@ struct DeduplicationShared<S> {
 /// Deduplication middleware.
 ///
 /// Wraps the inner middleware stack and checks incoming messages against a
-/// write-through cache backed by persistent store. Duplicates are filtered out
-/// before reaching the handler.
+/// persistent store. Duplicates are filtered out before reaching the handler.
 ///
 /// The `P` parameter is the handler payload type, fixed by the chain it is
-/// composed into. `S` is the underlying (uncached) store provider; the cache
-/// is wired in internally.
+/// composed into. `S` is the store provider; any caching is the provider's
+/// responsibility.
 #[derive(Clone, Debug)]
 pub struct DeduplicationMiddleware<S: DeduplicationStoreProvider, P> {
-    shared: Arc<DeduplicationShared<CachedDeduplicationStoreProvider<S>>>,
+    shared: Arc<DeduplicationShared<S>>,
     _payload: PhantomData<fn() -> P>,
 }
 
@@ -99,13 +94,11 @@ impl<S: DeduplicationStoreProvider, P> DeduplicationMiddleware<S, P> {
             return Ok(None);
         }
 
-        let cache = Arc::new(Cache::new(config.cache_capacity));
-        let cached_provider = CachedDeduplicationStoreProvider::new(store_provider, cache);
         Ok(Some(Self {
             shared: Arc::new(DeduplicationShared {
                 config,
                 group_id: Arc::from(group_id),
-                store_provider: cached_provider,
+                store_provider,
             }),
             _payload: PhantomData,
         }))
@@ -116,7 +109,7 @@ impl<S: DeduplicationStoreProvider, P: Send + Sync + 'static + EventIdentity> Ha
     for DeduplicationMiddleware<S, P>
 {
     type Provider<T>
-        = DeduplicationProvider<T, CachedDeduplicationStoreProvider<S>>
+        = DeduplicationProvider<T, S>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;
@@ -258,7 +251,6 @@ where
     {
         let id = self.dedup_uuid_for_message(&message);
 
-        // Check cache then store (CachedDeduplicationStore handles both).
         if self
             .store
             .exists(id)

@@ -24,6 +24,7 @@ use crate::consumer::middleware::defer::timer::store::{
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -137,6 +138,7 @@ impl StorageBackend {
 ///     &config,
 ///     false,
 ///     Duration::from_secs(7 * 24 * 3600),
+///     8192,
 ///     SpanRelation::FollowsFrom,
 /// )
 /// .await?;
@@ -255,6 +257,7 @@ impl StorePair {
     ///     &TriggerStoreConfiguration::InMemory,
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
+    ///     8192,
     ///     SpanRelation::FollowsFrom,
     /// )
     /// .await?;
@@ -265,6 +268,7 @@ impl StorePair {
         config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
+        dedup_cache_capacity: usize,
         timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
         let backend = StorageBackend::new(config, mock).await?;
@@ -323,6 +327,7 @@ impl StorePair {
                     store.clone(),
                     dedup_queries,
                     dedup_ttl_secs,
+                    NonZeroUsize::new(dedup_cache_capacity).unwrap_or(NonZeroUsize::MIN),
                 );
 
                 Ok(Self::Cassandra {

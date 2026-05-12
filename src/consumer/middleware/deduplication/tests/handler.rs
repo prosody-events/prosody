@@ -5,15 +5,14 @@ use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::deduplication::{
-    CachedDeduplicationStore, DeduplicationConfiguration, DeduplicationHandler,
-    DeduplicationMiddleware, MemoryDeduplicationStore, MemoryDeduplicationStoreProvider,
+    DeduplicationConfiguration, DeduplicationHandler, DeduplicationMiddleware,
+    MemoryDeduplicationStore, MemoryDeduplicationStoreProvider,
 };
 use crate::consumer::middleware::test_support::MockEventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
-use quick_cache::sync::Cache;
 use serde_json::json;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -136,13 +135,10 @@ fn create_handler_with(
     group_id: &str,
     topic: &str,
     partition: i32,
-) -> DeduplicationHandler<MockHandler, CachedDeduplicationStore<MemoryDeduplicationStore>> {
+) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
     DeduplicationHandler {
         inner,
-        store: CachedDeduplicationStore::new(
-            Arc::new(Cache::new(100)),
-            MemoryDeduplicationStore::new(),
-        ),
+        store: MemoryDeduplicationStore::new(),
         version: version.to_owned(),
         group_id: Arc::from(group_id),
         topic: Topic::from(topic),
@@ -152,7 +148,7 @@ fn create_handler_with(
 
 fn create_handler(
     inner: MockHandler,
-) -> DeduplicationHandler<MockHandler, CachedDeduplicationStore<MemoryDeduplicationStore>> {
+) -> DeduplicationHandler<MockHandler, MemoryDeduplicationStore> {
     create_handler_with(inner, "1", "test-group", "test-topic", 0)
 }
 
@@ -596,13 +592,10 @@ async fn dedup_passthrough_forwards_after_commit_for_handler_err() {
 
 fn create_handler_apply(
     inner: ApplyProbe,
-) -> DeduplicationHandler<ApplyProbe, CachedDeduplicationStore<MemoryDeduplicationStore>> {
+) -> DeduplicationHandler<ApplyProbe, MemoryDeduplicationStore> {
     DeduplicationHandler {
         inner,
-        store: CachedDeduplicationStore::new(
-            Arc::new(Cache::new(100)),
-            MemoryDeduplicationStore::new(),
-        ),
+        store: MemoryDeduplicationStore::new(),
         version: "1".to_owned(),
         group_id: Arc::from("test-group"),
         topic: Topic::from("test-topic"),
