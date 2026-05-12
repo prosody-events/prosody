@@ -237,11 +237,7 @@ mod tests {
             ),
             (
                 "20260506_add_tag.cql",
-                "7e6d001c9b7093fde645dc912323608b2bb665d977e35e7358b04a94257fd73a",
-            ),
-            (
-                "20260507_add_tag_to_udt.cql",
-                "7a90ffff0603fc7563e039a3a0027fc109dddffc231ce42dd15ec0af8f8d34bf",
+                "bd2708438d6214cc21d2398b15878862a00e22f3f980a0e49a17effd28d20ff6",
             ),
         ]
         .into();

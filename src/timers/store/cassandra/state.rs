@@ -108,7 +108,7 @@ struct RawTimerState {
     time: Option<CompactDateTime>,
     /// Span context (present only when `inline = true`).
     span: Option<HashMap<String, String>>,
-    /// Commit-oracle tag (added by `20260507_add_tag_to_udt` migration).
+    /// Commit-oracle tag (added by the `20260506_add_tag` migration).
     /// `None` for rows written before migration; normalised to `0`.
     tag: Option<i32>,
 }
