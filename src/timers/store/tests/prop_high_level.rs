@@ -3,6 +3,7 @@
 //! Tests the high-level operations that coordinate updates across both slab
 //! and key indices, verifying dual-index consistency.
 
+use super::common::derive_tag;
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -152,18 +153,6 @@ fn random_timer_type(g: &mut Gen) -> TimerType {
         1 => TimerType::DeferredMessage,
         _ => TimerType::DeferredTimer,
     }
-}
-
-fn derive_tag(key: &Key, time: CompactDateTime, timer_type: TimerType) -> i32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in key.as_ref().as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash ^= time.epoch_seconds();
-    hash = hash.wrapping_mul(0x0100_0193);
-    hash ^= timer_type as u32;
-    i32::from_le_bytes(hash.to_le_bytes())
 }
 
 fn model_tag_for_trigger(
@@ -758,8 +747,8 @@ where
         };
         if trigger.tag != key_tag {
             return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} GetSlabTriggersAllTypes tag mismatch: key={:?} time={:?} \
-                 type={:?} expected key tag {key_tag:?}, got {:?}",
+                "Op #{op_idx} GetSlabTriggersAllTypes tag mismatch: key={:?} time={:?} type={:?} \
+                 expected key tag {key_tag:?}, got {:?}",
                 trigger.key,
                 trigger.time,
                 trigger.timer_type,
@@ -867,8 +856,8 @@ where
         };
         if trigger.tag != expected_tag {
             return Err(color_eyre::eyre::eyre!(
-                "Op #{op_idx} GetKeyTriggers tag mismatch: key={:?} time={:?} type={:?} \
-                 expected {expected_tag:?}, got {:?}",
+                "Op #{op_idx} GetKeyTriggers tag mismatch: key={:?} time={:?} type={:?} expected \
+                 {expected_tag:?}, got {:?}",
                 trigger.key,
                 trigger.time,
                 trigger.timer_type,
@@ -1060,20 +1049,29 @@ where
     S::Error: Debug,
 {
     // Remove all triggers from the model
-    for ((_segment_id, _slab_id, _timer_type), trigger_set) in &model.slab_index {
+    for ((segment_id, slab_id, _timer_type), trigger_set) in &model.slab_index {
         for (key, time, timer_type) in trigger_set {
-            // Ignore errors during cleanup - triggers may have been removed by test
-            // operations
-            let _ = store.remove_trigger(key, *time, *timer_type).await;
+            store
+                .remove_trigger(key, *time, *timer_type)
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!(
+                        "cleanup remove_trigger failed: segment={segment_id:?} slab={slab_id:?} \
+                         key={key:?} time={time:?} type={timer_type:?}: {e:?}"
+                    )
+                })?;
         }
     }
 
     // Delete all slabs that were created
     let mut deleted_slabs = HashSet::new();
-    for (_segment_id, slab_id, _timer_type) in model.slab_index.keys() {
+    for (segment_id, slab_id, _timer_type) in model.slab_index.keys() {
         if deleted_slabs.insert(*slab_id) {
-            // Ignore errors - slabs may have been deleted by test operations
-            let _ = store.delete_slab(*slab_id).await;
+            store.delete_slab(*slab_id).await.map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "cleanup delete_slab failed: segment={segment_id:?} slab={slab_id:?}: {e:?}"
+                )
+            })?;
         }
     }
 

@@ -715,12 +715,12 @@ impl TriggerOperations for CassandraTriggerStore {
     /// - **Inline(timer), time matches**: Remove state entry → `Absent`
     /// - **Inline(timer), time mismatch**: No-op (Inline guarantees zero
     ///   clustering rows) → stays `Inline`
-    /// - **Overflow**: One pre-delete read (LIMIT 3) drives a single
-    ///   atomic batch:
+    /// - **Overflow**: One pre-delete read (LIMIT 3) drives a single atomic
+    ///   batch:
     ///   - 0 surviving rows → batch DELETE target + DELETE `state[type]` →
     ///     `Absent`
-    ///   - 1 surviving row → batch DELETE target + DELETE survivor +
-    ///     UPDATE state Inline → `Inline(survivor)`
+    ///   - 1 surviving row → batch DELETE target + DELETE survivor + UPDATE
+    ///     state Inline → `Inline(survivor)`
     ///   - 2+ surviving rows → single DELETE target → stays `Overflow`
     /// - **Absent**: No-op (post-V3 Absent is unambiguous: 0 timers, no rows)
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
@@ -1035,9 +1035,9 @@ impl TriggerOperations for CassandraTriggerStore {
     /// - **Inline(timer), time matches**: tag from cache (0 DB reads).
     /// - **Inline(_), time mismatch** or **Absent**: `None` (Inline guarantees
     ///   no other timers; post-V3 Absent is unambiguous).
-    /// - **Overflow**: SELECT the clustering row's tag column under the
-    ///   per-key mutex so a concurrent promote/demote cannot interleave
-    ///   between the state check and the row read.
+    /// - **Overflow**: SELECT the clustering row's tag column under the per-key
+    ///   mutex so a concurrent promote/demote cannot interleave between the
+    ///   state check and the row read.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn current_tag(
         &self,

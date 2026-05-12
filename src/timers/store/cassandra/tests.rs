@@ -127,25 +127,8 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
     init_test_logging();
 
     let slab_size = CompactDuration::new(60); // 1 minute slabs
-    let segment_id = SegmentId::from(Uuid::new_v4());
-    let segment = Segment {
-        id: segment_id,
-        name: "test_segment".to_owned(),
-        slab_size,
-        version: SegmentVersion::V1,
-    };
-    let config = test_cassandra_config("prosody_test");
-    let cassandra_store = CassandraStore::new(&config).await?;
-    let store = CassandraTriggerStore::with_store(
-        cassandra_store,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
-
-    // Insert the test segment
-    store.insert_segment().await?;
+    let (store, _segment_id) =
+        setup_test_store_with_version("test_segment", SegmentVersion::V1).await?;
 
     // Test SlabId values that will cause wrap-around issues
     let boundary = 2_147_483_648u32; // 2^31, becomes negative in i32
@@ -160,7 +143,7 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
 
     // Insert test slabs
     for &slab_id in &test_slab_ids {
-        let slab = Slab::new(slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, slab_size);
         store.insert_slab(slab).await?;
     }
 
@@ -221,24 +204,8 @@ async fn test_simple_wrap_around() -> Result<()> {
     init_test_logging();
 
     let slab_size = CompactDuration::new(60);
-    let segment_id = SegmentId::from(Uuid::new_v4());
-    let segment = Segment {
-        id: segment_id,
-        name: "simple_test".to_owned(),
-        slab_size,
-        version: SegmentVersion::V1,
-    };
-    let config = test_cassandra_config("prosody_test");
-    let cassandra_store = CassandraStore::new(&config).await?;
-    let store = CassandraTriggerStore::with_store(
-        cassandra_store,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
-
-    store.insert_segment().await?;
+    let (store, _segment_id) =
+        setup_test_store_with_version("simple_test", SegmentVersion::V1).await?;
 
     // The critical boundary: 2^31 = 2,147,483,648
     // Values below this are positive i32, values at/above are negative i32
@@ -247,7 +214,7 @@ async fn test_simple_wrap_around() -> Result<()> {
 
     // Insert test slabs
     for &slab_id in &test_ids {
-        let slab = Slab::new(slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, slab_size);
         store.insert_slab(slab).await?;
     }
 
