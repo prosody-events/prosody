@@ -33,7 +33,7 @@ use crate::timers::store::TriggerStore;
 use crate::{Key, ProcessScope};
 use arc_swap::ArcSwap;
 use educe::Educe;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
@@ -42,6 +42,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
+
+/// Shared no-op span used to release processing resources without allocating
+/// a fresh `Arc` on every [`TriggerProcessGuard`] drop.
+static NONE_SPAN: LazyLock<Arc<Span>> = LazyLock::new(|| Arc::new(Span::none()));
 
 /// A trait for uncommitted timer operations.
 ///
@@ -212,17 +216,13 @@ where
         };
 
         // Re-stamp the trigger with the canonical tag so WAL writers can embed
-        // the observed-at-dispatch value.
-        let trigger = Trigger::with_tag(
-            self.trigger.key.clone(),
-            self.trigger.time,
-            self.trigger.timer_type,
-            canonical_tag,
-            self.trigger.span(),
-        );
+        // the observed-at-dispatch value. `tag` is excluded from `Hash/Eq/Ord`
+        // (see `Trigger` doc), so the in-place write preserves the
+        // `(key, time, timer_type)` identity used by any downstream map keys.
+        self.trigger.tag = canonical_tag;
 
         Some(FiringTimer {
-            trigger,
+            trigger: self.trigger,
             uncommitted: self.uncommitted,
         })
     }
@@ -447,7 +447,7 @@ pub struct TriggerProcessGuard(Arc<ArcSwap<Span>>);
 
 impl Drop for TriggerProcessGuard {
     fn drop(&mut self) {
-        self.0.store(Arc::new(Span::none()));
+        self.0.store(Arc::clone(&NONE_SPAN));
     }
 }
 
