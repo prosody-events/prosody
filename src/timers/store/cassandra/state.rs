@@ -7,12 +7,12 @@
 //! at all — the common single-timer path never issues a clustering scan.
 //!
 //! The in-memory cache (`CachedState` — an `Arc<AsyncMutex<TimerState>>`)
-//! keeps the resolved state hot between operations. Wrapping in
-//! `Arc<AsyncMutex>` lets callers clone the handle out of the cache before
-//! awaiting the lock, so no shard lock is held across any async boundary.
-//! All read-modify-write sequences hold this mutex for their full duration,
-//! eliminating the TOCTOU window that existed before per-key serialisation was
-//! added.
+//! keeps the resolved state hot between operations and serialises mutations
+//! per `(key, timer_type)`. Callers clone the handle out of the cache before
+//! awaiting the mutex, so no `quick_cache` shard lock is held across an await.
+//! Every state-mutating operation in the trigger store holds this mutex for
+//! its full read-decide-write sequence; that is the only synchronisation
+//! point that makes those operations linearisable against each other.
 
 use crate::Key;
 use crate::timers::TimerType;
@@ -36,11 +36,12 @@ pub(super) type StateCacheKey = (Key, TimerType);
 pub(super) struct ClusteringEntry<'a> {
     pub(super) time: CompactDateTime,
     pub(super) span: &'a HashMap<String, String>,
+    pub(super) tag: i32,
 }
 
-/// A single row returned by `peek_first_key_trigger`: trigger time and span
-/// context.
-pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>);
+/// A single row returned by `peek_first_key_trigger`: trigger time, span, and
+/// tag.
+pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>, Option<i32>);
 
 /// Capacity for the per-partition state cache.
 ///
@@ -51,24 +52,30 @@ pub(super) type PeekedTrigger = (CompactDateTime, HashMap<String, String>);
 /// correctly via the re-created mutex.
 pub(super) const STATE_CACHE_CAPACITY: usize = 8_192;
 
-/// Cached value type: an async mutex wrapping the resolved timer state.
+/// Per-`(key, timer_type)` mutex wrapping the resolved timer state.
 ///
-/// Wrapping in `Arc<AsyncMutex<…>>` allows callers to clone the handle out of
-/// the cache (dropping the internal shard lock), then `.lock().await` without
-/// holding any cache internals across an await point.  All state-mutating
-/// operations hold this lock for their entire read-then-write sequence,
-/// preventing TOCTOU races between concurrent `EventContext` callers.
+/// Callers obtain the handle via `resolve_state` (which drops `quick_cache`'s
+/// internal shard lock as soon as the `Arc` is cloned), then `.lock().await`
+/// without holding any cache internals across an await. State-mutating
+/// `TriggerOperations` methods hold this mutex from the state read through
+/// the DB write, so concurrent operations on the same `(key, timer_type)`
+/// linearise; operations on different `(key, timer_type)` pairs do not block
+/// each other.
 pub(super) type CachedState = Arc<AsyncMutex<TimerState>>;
 
 /// Timer data for a single inlined timer.
 ///
 /// This is the resolved domain type for a key with exactly one timer.
+/// The `tag` field mirrors the commit-oracle tag stored on the `Trigger`.
+/// Pre-migration rows have `tag = NULL` which normalises to `0`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlineTimer {
     /// Timer trigger time.
     pub time: CompactDateTime,
     /// OpenTelemetry span context for trace continuity.
     pub span: HashMap<String, String>,
+    /// Commit-oracle tag. `0` for pre-migration rows (tag column absent).
+    pub tag: i32,
 }
 
 /// Resolved three-state enum for a `(key, timer_type)` pair within a partition.
@@ -101,6 +108,9 @@ struct RawTimerState {
     time: Option<CompactDateTime>,
     /// Span context (present only when `inline = true`).
     span: Option<HashMap<String, String>>,
+    /// Commit-oracle tag (added by the `20260506_add_tag` migration).
+    /// `None` for rows written before migration; normalised to `0`.
+    tag: Option<i32>,
 }
 
 impl SerializeValue for TimerState {
@@ -114,11 +124,13 @@ impl SerializeValue for TimerState {
                 inline: Some(true),
                 time: Some(timer.time),
                 span: Some(timer.span.clone()),
+                tag: Some(timer.tag),
             },
             Self::Overflow => RawTimerState {
                 inline: Some(false),
                 time: None,
                 span: None,
+                tag: None,
             },
             Self::Absent => {
                 return Err(SerializationError::new(
@@ -145,6 +157,7 @@ impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for TimerState {
                 Some(time) => Ok(Self::Inline(InlineTimer {
                     time,
                     span: raw.span.unwrap_or_default(),
+                    tag: raw.tag.unwrap_or(0_i32),
                 })),
                 None => Ok(Self::Overflow),
             }

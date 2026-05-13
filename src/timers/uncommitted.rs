@@ -33,7 +33,7 @@ use crate::timers::store::TriggerStore;
 use crate::{Key, ProcessScope};
 use arc_swap::ArcSwap;
 use educe::Educe;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
@@ -42,6 +42,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Delay between retry attempts when commits fail.
 const RETRY_DURATION: Duration = Duration::from_secs(1);
+
+/// Shared no-op span used to release processing resources without allocating
+/// a fresh `Arc` on every [`TriggerProcessGuard`] drop.
+static NONE_SPAN: LazyLock<Arc<Span>> = LazyLock::new(|| Arc::new(Span::none()));
 
 /// A trait for uncommitted timer operations.
 ///
@@ -193,19 +197,30 @@ where
     /// `Firing` state. If the timer was cancelled while queued, returns
     /// `None` and the timer is marked as completed.
     ///
+    /// The `FiringTimer`'s trigger carries the canonical tag from
+    /// `ActiveTriggers` at the moment of dispatch. This tag may differ from
+    /// the tag on the queue-popped trigger if a `complete()`-from-
+    /// `FiringRescheduled` rotation occurred while this entry was in the
+    /// delay queue.
+    ///
     /// # Returns
     ///
     /// `Some(FiringTimer)` if the timer is still active and can be processed,
     /// `None` if the timer was cancelled while waiting in the queue.
     pub async fn fire(mut self) -> Option<FiringTimer<T>> {
-        // Attempt to transition from Scheduled → Firing
-        if !self.uncommitted.fire().await {
-            // Timer was cancelled or not in Scheduled state; mark as completed
+        // Attempt to transition from Scheduled → Firing, reading the canonical
+        // tag from ActiveTriggers under the trigger-lock.
+        let Some(canonical_tag) = self.uncommitted.fire_with_tag().await else {
             self.uncommitted.completed = true;
             return None;
-        }
+        };
 
-        // Transfer ownership to FiringTimer
+        // Re-stamp the trigger with the canonical tag so WAL writers can embed
+        // the observed-at-dispatch value. `tag` is excluded from `Hash/Eq/Ord`
+        // (see `Trigger` doc), so the in-place write preserves the
+        // `(key, time, timer_type)` identity used by any downstream map keys.
+        self.trigger.tag = canonical_tag;
+
         Some(FiringTimer {
             trigger: self.trigger,
             uncommitted: self.uncommitted,
@@ -217,6 +232,15 @@ impl<T> FiringTimer<T>
 where
     T: TriggerStore,
 {
+    /// Returns a reference to the underlying [`Trigger`].
+    ///
+    /// The trigger's `tag` field carries the canonical commit-oracle identity
+    /// at the moment this timer was dispatched via [`PendingTimer::fire()`].
+    #[must_use]
+    pub fn trigger(&self) -> &Trigger {
+        &self.trigger
+    }
+
     /// Replaces the trigger's tracing span with a `"trigger"` dispatch span.
     ///
     /// Creates the dispatch span from the trigger's current span context,
@@ -315,15 +339,15 @@ impl<T> UncommittedTrigger<T>
 where
     T: TriggerStore,
 {
-    /// Attempt to transition the timer from `Scheduled` to `Firing` state.
+    /// Attempt to transition the timer from `Scheduled` to `Firing` state,
+    /// returning the canonical tag if successful.
     ///
-    /// # Returns
-    ///
-    /// `true` if the transition succeeded, `false` if the timer is not in
-    /// `Scheduled` state (e.g., cancelled or already firing).
-    pub async fn fire(&self) -> bool {
+    /// Returns `None` if the transition failed (timer was cancelled or is not
+    /// in `Scheduled` state). The returned tag is the value stored in
+    /// `ActiveTriggers` at the moment of the state transition.
+    pub async fn fire_with_tag(&self) -> Option<i32> {
         self.manager
-            .fire(&self.key, self.time, self.timer_type)
+            .fire_with_tag(&self.key, self.time, self.timer_type)
             .await
     }
 
@@ -423,7 +447,7 @@ pub struct TriggerProcessGuard(Arc<ArcSwap<Span>>);
 
 impl Drop for TriggerProcessGuard {
     fn drop(&mut self) {
-        self.0.store(Arc::new(Span::none()));
+        self.0.store(Arc::clone(&NONE_SPAN));
     }
 }
 
@@ -455,11 +479,65 @@ mod tests {
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, pin_mut};
     use std::array::from_fn;
+    use std::fmt::Debug;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{Semaphore, watch};
+    use tracing::dispatcher::set_default;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
 
     const TEST_TIMER_SEMAPHORE_SIZE: usize = 64;
+    const DROPPED_UNCOMMITTED_WARNING: &str = "timer was dropped without committing or aborting";
+
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl CapturedWarnings {
+        fn contains(&self, needle: &str) -> bool {
+            self.0.lock().iter().any(|event| event.contains(needle))
+        }
+    }
+
+    struct WarningCaptureLayer {
+        warnings: CapturedWarnings,
+    }
+
+    impl<S> Layer<S> for WarningCaptureLayer
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn enabled(&self, metadata: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = WarningVisitor::default();
+            event.record(&mut visitor);
+            self.warnings.0.lock().push(visitor.output);
+        }
+
+        fn on_new_span(&self, _attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {}
+
+        fn on_record(&self, _span: &Id, _values: &Record<'_>, _ctx: Context<'_, S>) {}
+    }
+
+    #[derive(Default)]
+    struct WarningVisitor {
+        output: String,
+    }
+
+    impl Visit for WarningVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            use std::fmt::Write;
+
+            let _ = write!(&mut self.output, "{}={value:?};", field.name());
+        }
+    }
 
     fn test_semaphores() -> Arc<TimerSemaphores> {
         Arc::new(from_fn(|_| {
@@ -561,6 +639,47 @@ mod tests {
 
         // Clean up by committing
         firing_timer.commit().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_pending_timer_fire_completes_without_drop_warning() -> Result<()> {
+        time::pause();
+
+        let warnings = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(WarningCaptureLayer {
+            warnings: warnings.clone(),
+        });
+        let dispatcher = tracing::Dispatch::new(subscriber);
+        let _guard = set_default(&dispatcher);
+
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+        let trigger = create_test_trigger("cancelled-fire-test", 1, TimerType::Application)?;
+
+        manager.schedule(trigger.clone()).await?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+
+        let pending_timer = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("Expected a pending timer"))?;
+
+        manager
+            .unschedule(&trigger.key, trigger.time, trigger.timer_type)
+            .await?;
+
+        assert!(
+            pending_timer.fire().await.is_none(),
+            "cancelled pending timer should not transition to firing"
+        );
+        assert!(
+            !warnings.contains(DROPPED_UNCOMMITTED_WARNING),
+            "cancelled pending timer should be marked completed before drop"
+        );
 
         Ok(())
     }

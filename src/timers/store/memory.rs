@@ -563,6 +563,55 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(())
     }
 
+    async fn update_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        new_tag: i32,
+    ) -> Result<(), Self::Error> {
+        let partition_key = (self.segment.id, key.clone());
+        let clustering_key = (timer_type, time);
+        let mut target_exists = false;
+        if let Some(mut entry) = self.inner.key_triggers.get_async(&partition_key).await
+            && let Some(t) = entry.get_mut().get_mut(&clustering_key)
+        {
+            t.tag = new_tag;
+            target_exists = true;
+        }
+
+        if target_exists {
+            let slab = Slab::from_time(self.segment.slab_size, time);
+            let slab_partition_key = (self.segment.id, slab.size(), slab.id());
+            let slab_clustering_key = (timer_type, key.clone(), time);
+            if let Some(mut entry) = self
+                .inner
+                .slab_triggers
+                .get_async(&slab_partition_key)
+                .await
+                && let Some(t) = entry.get_mut().get_mut(&slab_clustering_key)
+            {
+                t.tag = new_tag;
+            }
+        }
+        Ok(())
+    }
+
+    async fn current_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<Option<i32>, Self::Error> {
+        let partition_key = (self.segment.id, key.clone());
+        let clustering_key = (timer_type, time);
+        let Some(entry) = self.inner.key_triggers.get_async(&partition_key).await else {
+            return Ok(None);
+        };
+        // entry.get() returns &BTreeMap<...>; then look up by clustering key.
+        Ok(entry.get().get(&clustering_key).map(|t| t.tag))
+    }
+
     // -- V1 migration methods --
 
     /// Update segment metadata including version and slab size.

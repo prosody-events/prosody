@@ -769,7 +769,7 @@ impl<CM> PipelineMiddlewareStack<CM> {
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
-        dedup_provider: DP,
+        dedup_provider: Option<DP>,
         trigger_provider: PP,
         handler: T,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
@@ -792,11 +792,14 @@ impl<CM> PipelineMiddlewareStack<CM> {
             &self.telemetry,
         );
 
-        let dedup_middleware = DeduplicationMiddleware::new(
-            self.dedup_config,
-            self.consumer_config.group_id.as_str(),
-            dedup_provider,
-        )?;
+        let dedup_middleware = match dedup_provider {
+            Some(provider) => DeduplicationMiddleware::new(
+                self.dedup_config,
+                self.consumer_config.group_id.as_str(),
+                provider,
+            )?,
+            None => None,
+        };
 
         let provider = self
             .common_middleware
@@ -1037,11 +1040,14 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         C::Payload: EventIdentity + Clone,
     {
-        // Create both stores atomically - ensures trigger and defer stores match
+        // Create both stores atomically - ensures trigger and defer stores match.
+        // A `cache_capacity` of zero disables deduplication; `StorePair::new`
+        // skips dedup wiring entirely in that case.
         let stores = StorePair::new(
             trigger_store_config,
             consumer_config.mock,
             pipeline_config.dedup.ttl,
+            pipeline_config.dedup.cache_capacity,
             consumer_config.timer_spans,
         )
         .await?;

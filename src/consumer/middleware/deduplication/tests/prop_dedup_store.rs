@@ -1,10 +1,15 @@
 //! Property-based tests for deduplication store operations.
 //!
-//! Tests the [`DeduplicationStore`] trait using a simple reference model to
-//! verify correctness across both memory and Cassandra implementations.
+//! Tests the [`DeduplicationStore`] trait against
+//! [`MemoryDeduplicationStore`] as the reference implementation. Any store
+//! under test (notably [`CassandraDeduplicationStore`] with its in-process
+//! write-through cache) must produce identical `exists` answers to a fresh
+//! `MemoryDeduplicationStore` driven by the same operation sequence.
+//!
+//! [`CassandraDeduplicationStore`]: super::super::cassandra::CassandraDeduplicationStore
 
+use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStore;
 use crate::consumer::middleware::deduplication::store::DeduplicationStore;
-use ahash::HashSet;
 use color_eyre::eyre::eyre;
 use quickcheck::{Arbitrary, Gen};
 use std::error::Error;
@@ -52,36 +57,22 @@ impl Arbitrary for DeduplicationTestInput {
     }
 }
 
-/// Reference model for deduplication store behavior.
-///
-/// Tracks which UUIDs have been inserted using a simple hash set.
-#[derive(Clone, Debug, Default)]
-pub struct DeduplicationModel {
-    inserted: HashSet<Uuid>,
-}
-
-impl DeduplicationModel {
-    fn exists(&self, id: Uuid) -> bool {
-        self.inserted.contains(&id)
-    }
-
-    fn insert(&mut self, id: Uuid) {
-        self.inserted.insert(id);
-    }
-}
-
-/// Verifies that deduplication store operations match the reference model.
+/// Verifies that the store under test matches a fresh
+/// [`MemoryDeduplicationStore`] reference driven by the same operations.
 ///
 /// # Test Strategy
 ///
-/// 1. Start with empty store and model
-/// 2. Apply sequence of random operations to both
-/// 3. After each `Exists` query, verify the store result matches the model
-/// 4. After all operations, verify final state for all IDs
+/// 1. Start with an empty subject store and a fresh `MemoryDeduplicationStore`
+///    reference.
+/// 2. Apply the operation sequence to both.
+/// 3. After every `Exists` query, assert the subject's answer equals the
+///    reference's answer.
+/// 4. After all operations, re-check every ID in the pool against both stores.
 ///
 /// # Errors
 ///
-/// Returns an error if store operations fail or state diverges from the model.
+/// Returns an error if store operations fail or any answer diverges from the
+/// reference.
 pub async fn prop_dedup_store_model_equivalence<S>(
     store: &S,
     input: DeduplicationTestInput,
@@ -90,13 +81,16 @@ where
     S: DeduplicationStore,
     S::Error: Error + Send + Sync + 'static,
 {
-    let mut model = DeduplicationModel::default();
+    let reference = MemoryDeduplicationStore::new();
 
     for (op_idx, op) in input.operations.iter().enumerate() {
         match op {
             DeduplicationOperation::Exists(id_index) => {
                 let id = input.ids[*id_index];
-                let expected = model.exists(id);
+                let expected = reference
+                    .exists(id)
+                    .await
+                    .map_err(|e| eyre!("Op #{op_idx} reference Exists failed: {e:?}"))?;
                 let actual = store
                     .exists(id)
                     .await
@@ -104,14 +98,17 @@ where
 
                 if expected != actual {
                     return Err(eyre!(
-                        "Op #{op_idx} Exists mismatch for id={id}: expected {expected}, got \
-                         {actual}"
+                        "Op #{op_idx} Exists mismatch for id={id}: reference={expected}, \
+                         store={actual}"
                     ));
                 }
             }
             DeduplicationOperation::Insert(id_index) => {
                 let id = input.ids[*id_index];
-                model.insert(id);
+                reference
+                    .insert(id)
+                    .await
+                    .map_err(|e| eyre!("Op #{op_idx} reference Insert failed: {e:?}"))?;
                 store
                     .insert(id)
                     .await
@@ -120,9 +117,11 @@ where
         }
     }
 
-    // Verify final state for all IDs
     for (i, &id) in input.ids.iter().enumerate() {
-        let expected = model.exists(id);
+        let expected = reference
+            .exists(id)
+            .await
+            .map_err(|e| eyre!("Final reference Exists for id[{i}]={id}: {e:?}"))?;
         let actual = store
             .exists(id)
             .await
@@ -130,7 +129,7 @@ where
 
         if expected != actual {
             return Err(eyre!(
-                "Final state mismatch for id[{i}]={id}: expected {expected}, got {actual}"
+                "Final state mismatch for id[{i}]={id}: reference={expected}, store={actual}"
             ));
         }
     }

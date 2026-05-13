@@ -20,7 +20,7 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::tests::prop_key_triggers::KeyTriggerTestInput;
+use crate::timers::store::tests::prop_key_triggers::{KeyTriggerOperation, KeyTriggerTestInput};
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::tracing::init_test_logging;
 use crate::trigger_store_tests;
@@ -127,25 +127,8 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
     init_test_logging();
 
     let slab_size = CompactDuration::new(60); // 1 minute slabs
-    let segment_id = SegmentId::from(Uuid::new_v4());
-    let segment = Segment {
-        id: segment_id,
-        name: "test_segment".to_owned(),
-        slab_size,
-        version: SegmentVersion::V1,
-    };
-    let config = test_cassandra_config("prosody_test");
-    let cassandra_store = CassandraStore::new(&config).await?;
-    let store = CassandraTriggerStore::with_store(
-        cassandra_store,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
-
-    // Insert the test segment
-    store.insert_segment().await?;
+    let (store, _segment_id) =
+        setup_test_store_with_version("test_segment", SegmentVersion::V1).await?;
 
     // Test SlabId values that will cause wrap-around issues
     let boundary = 2_147_483_648u32; // 2^31, becomes negative in i32
@@ -160,7 +143,7 @@ async fn test_slab_range_wrap_around_edge_cases() -> Result<()> {
 
     // Insert test slabs
     for &slab_id in &test_slab_ids {
-        let slab = Slab::new(slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, slab_size);
         store.insert_slab(slab).await?;
     }
 
@@ -221,24 +204,8 @@ async fn test_simple_wrap_around() -> Result<()> {
     init_test_logging();
 
     let slab_size = CompactDuration::new(60);
-    let segment_id = SegmentId::from(Uuid::new_v4());
-    let segment = Segment {
-        id: segment_id,
-        name: "simple_test".to_owned(),
-        slab_size,
-        version: SegmentVersion::V1,
-    };
-    let config = test_cassandra_config("prosody_test");
-    let cassandra_store = CassandraStore::new(&config).await?;
-    let store = CassandraTriggerStore::with_store(
-        cassandra_store,
-        &config.keyspace,
-        segment.clone(),
-        SpanRelation::default(),
-    )
-    .await?;
-
-    store.insert_segment().await?;
+    let (store, _segment_id) =
+        setup_test_store_with_version("simple_test", SegmentVersion::V1).await?;
 
     // The critical boundary: 2^31 = 2,147,483,648
     // Values below this are positive i32, values at/above are negative i32
@@ -247,7 +214,7 @@ async fn test_simple_wrap_around() -> Result<()> {
 
     // Insert test slabs
     for &slab_id in &test_ids {
-        let slab = Slab::new(slab_id, segment.slab_size);
+        let slab = Slab::new(slab_id, slab_size);
         store.insert_slab(slab).await?;
     }
 
@@ -437,10 +404,12 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
     let inline_t1 = TimerState::Inline(InlineTimer {
         time: t1,
         span: HashMap::new(),
+        tag: 0,
     });
     let inline_t2 = TimerState::Inline(InlineTimer {
         time: t2,
         span: HashMap::new(),
+        tag: 0,
     });
 
     // Absent (0 timers)
@@ -479,6 +448,70 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
     Ok(())
 }
 
+/// Regression: `Inline→Overflow` promotion must preserve the old timer's
+/// tag, and the tag must survive a subsequent `Overflow→Inline` demotion.
+///
+/// The commit oracle classifies a WAL entry by comparing its tag against
+/// the live row's tag. If promotion zeroes the old tag, `current_tag` will
+/// return `0` for a still-pending timer — the oracle reads "tag mismatch"
+/// and (incorrectly) concludes the timer was committed-and-rescheduled.
+/// Demotion then bakes the wrong tag back into Inline state, making the
+/// loss permanent.
+#[tokio::test]
+async fn test_promote_preserves_tag() -> Result<()> {
+    use crate::timers::store::TriggerStore;
+    use crate::timers::store::adapter::TableAdapter;
+    init_test_logging();
+    let (store, _segment_id) = setup_test_store("promote_tag").await?;
+    let store = TableAdapter::new(store);
+
+    let key: Key = format!("promote-tag-{}", Uuid::new_v4()).into();
+    let tt = TimerType::Application;
+    let t1 = CompactDateTime::from(1_000_000u32);
+    let t2 = CompactDateTime::from(2_000_000u32);
+
+    // First trigger lands Inline with random tag1.
+    let trigger1 = Trigger::new(key.clone(), t1, tt, tracing::Span::current());
+    let tag1 = trigger1.tag;
+    store.add_trigger(trigger1).await?;
+    assert_eq!(
+        store.current_tag(&key, t1, tt).await?,
+        Some(tag1),
+        "tag1 must be queryable while Inline"
+    );
+
+    // Second trigger triggers Inline→Overflow promotion. The old (t1)
+    // timer is moved into a clustering row; this is where the bug zeroed
+    // the tag.
+    let trigger2 = Trigger::new(key.clone(), t2, tt, tracing::Span::current());
+    let tag2 = trigger2.tag;
+    store.add_trigger(trigger2).await?;
+
+    assert_eq!(
+        store.current_tag(&key, t1, tt).await?,
+        Some(tag1),
+        "promotion must preserve tag1 in the clustering row"
+    );
+    assert_eq!(
+        store.current_tag(&key, t2, tt).await?,
+        Some(tag2),
+        "new clustering row must carry tag2"
+    );
+
+    // Demoting back to Inline (delete t2) reads the t1 clustering row's
+    // tag into Inline state. If promotion wrote 0 above, that 0 is now
+    // permanently stamped into Inline.
+    store.remove_trigger(&key, t2, tt).await?;
+    assert_eq!(
+        store.current_tag(&key, t1, tt).await?,
+        Some(tag1),
+        "demotion must round-trip tag1 from clustering row back to Inline state"
+    );
+
+    store.remove_trigger(&key, t1, tt).await?;
+    Ok(())
+}
+
 /// Overflow→Inline via `clear_and_schedule_key`, `clear_key_triggers`
 /// paths, Inline→Inline reschedule.
 ///
@@ -498,10 +531,12 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
     let inline_t2 = TimerState::Inline(InlineTimer {
         time: t2,
         span: HashMap::new(),
+        tag: 0,
     });
     let inline_t3 = TimerState::Inline(InlineTimer {
         time: t3,
         span: HashMap::new(),
+        tag: 0,
     });
 
     // Overflow → Inline via clear_and_schedule_key
@@ -591,6 +626,7 @@ async fn test_state_transitions_insert_and_delete() -> Result<()> {
     let inline_t1 = TimerState::Inline(InlineTimer {
         time: t1,
         span: HashMap::new(),
+        tag: 0,
     });
 
     // Post-V3: cold insert with Absent state → set_state_inline directly.
@@ -974,6 +1010,126 @@ async fn test_inline_state_round_trip() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: `current_tag` must return the correct tag for Inline
+/// timers (single trigger stored in `state` static column).
+///
+/// The quickcheck property test found that after `insert_key_trigger` (which
+/// stores the trigger as Inline in the `state` column), `current_tag` returned
+/// `None` (only checked clustering rows). This test pins the fix: Inline
+/// triggers must be queryable via `current_tag`.
+#[tokio::test]
+async fn test_current_tag_inline_trigger() -> Result<()> {
+    use crate::timers::store::TriggerStore;
+    use crate::timers::store::adapter::TableAdapter;
+    init_test_logging();
+    let (store, _segment_id) = setup_test_store("current_tag_inline").await?;
+    let store = TableAdapter::new(store);
+
+    let key: Key = format!("tag-inline-{}", Uuid::new_v4()).into();
+    let time = CompactDateTime::from(1_500_000u32);
+    let timer_type = TimerType::Application;
+    let trigger = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
+    let expected_tag = trigger.tag;
+
+    // add_trigger produces an Inline state (first trigger for this key/type).
+    store.add_trigger(trigger).await?;
+
+    // current_tag must return Some(expected_tag), not None.
+    let actual_tag = store.current_tag(&key, time, timer_type).await?;
+    assert_eq!(
+        actual_tag,
+        Some(expected_tag),
+        "current_tag must return the tag for an Inline trigger"
+    );
+
+    // update_tag must update the tag even in Inline mode.
+    let new_tag = expected_tag.wrapping_add(1);
+    store.update_tag(&key, time, timer_type, new_tag).await?;
+    let updated = store.current_tag(&key, time, timer_type).await?;
+    assert_eq!(
+        updated,
+        Some(new_tag),
+        "update_tag must rotate the tag for an Inline trigger"
+    );
+
+    let all_type_triggers: Vec<Trigger> = store
+        .operations()
+        .get_key_triggers_all_types(&key)
+        .try_collect()
+        .await?;
+    assert_eq!(all_type_triggers.len(), 1);
+    assert_eq!(
+        all_type_triggers[0].tag, new_tag,
+        "get_key_triggers_all_types must preserve the stored Inline tag"
+    );
+
+    let slab_id = Slab::from_time(store.slab_size(), time).id();
+    let slab_triggers: Vec<Trigger> = store
+        .get_slab_triggers_all_types(slab_id)
+        .try_collect()
+        .await?;
+    let slab_tag = slab_triggers
+        .iter()
+        .find(|t| t.key == key && t.time == time && t.timer_type == timer_type)
+        .map(|t| t.tag);
+    assert_eq!(
+        slab_tag,
+        Some(new_tag),
+        "update_tag must rotate the tag in the slab index"
+    );
+
+    store.remove_trigger(&key, time, timer_type).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_key_triggers_all_types_preserves_inline_tags() -> Result<()> {
+    use crate::timers::store::TriggerStore;
+    use crate::timers::store::adapter::TableAdapter;
+    init_test_logging();
+    let (store, _segment_id) = setup_test_store("all_types_inline_tags").await?;
+    let store = TableAdapter::new(store);
+
+    let key: Key = format!("all-types-inline-tags-{}", Uuid::new_v4()).into();
+    let base_time = 1_600_000u32;
+    let mut expected_tags = HashMap::new();
+
+    for (idx, &timer_type) in TimerType::VARIANTS.iter().enumerate() {
+        let idx_seconds = u32::try_from(idx)?;
+        let time = CompactDateTime::from(base_time + idx_seconds);
+        let trigger = Trigger::new(key.clone(), time, timer_type, tracing::Span::current());
+        expected_tags.insert(timer_type, trigger.tag);
+        store.add_trigger(trigger).await?;
+    }
+
+    let actual: Vec<Trigger> = store
+        .operations()
+        .get_key_triggers_all_types(&key)
+        .try_collect()
+        .await?;
+    assert_eq!(
+        actual.len(),
+        expected_tags.len(),
+        "get_key_triggers_all_types must return one inline trigger per timer type"
+    );
+
+    for trigger in &actual {
+        assert_eq!(trigger.key, key);
+        assert_eq!(
+            expected_tags.get(&trigger.timer_type).copied(),
+            Some(trigger.tag),
+            "get_key_triggers_all_types must preserve inline tags"
+        );
+    }
+
+    for trigger in actual {
+        store
+            .remove_trigger(&trigger.key, trigger.time, trigger.timer_type)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Property test verifying the timer state invariant:
 ///
 /// - **1 timer** for a `(segment_id, key, timer_type)` → state must be `Inline`
@@ -1119,13 +1275,129 @@ async fn test_provider_creates_independent_stores() -> Result<()> {
     Ok(())
 }
 
+/// Asserts `current_tag` matches `expected_tags` for every entry on the
+/// given `(key, timer_type)`. Used by the property test to catch any
+/// write path that drops or rewrites a tag.
+async fn verify_tags_for_key_type(
+    store: &CassandraTriggerStore,
+    expected_tags: &HashMap<(Key, TimerType, CompactDateTime), i32>,
+    key: &Key,
+    timer_type: TimerType,
+) -> Result<()> {
+    for ((k, tt, time), expected_tag) in expected_tags {
+        if k != key || *tt != timer_type {
+            continue;
+        }
+        let observed = store.current_tag(key, *time, timer_type).await?;
+        assert_eq!(
+            observed,
+            Some(*expected_tag),
+            "current_tag mismatch: key={key:?} time={time:?} type={timer_type:?} expected \
+             Some({expected_tag}) got {observed:?}",
+        );
+    }
+    Ok(())
+}
+
+/// Applies a single property-test operation to `store`, updates
+/// `expected_tags`, and re-verifies every known tag on the affected
+/// `(key, timer_type)` pair after writes.
+///
+/// We snapshot the tag the store *actually* holds right after each write
+/// (rather than the trigger's constructed tag) so the invariant pins
+/// tag-stability between writes — catching any path that silently drops
+/// or rewrites the tag of an unrelated, untouched timer (e.g. the OLD
+/// inline timer during Inline→Overflow promotion). Recording the
+/// trigger-constructed tag instead would over-specify against the
+/// production contract: in real usage the trigger queue dedups duplicate
+/// `(key, time, type)` via `Hash`/`Eq` excluding tag, so this layer's
+/// behavior on duplicate-insert is undefined.
+async fn apply_op_and_verify_tags(
+    store: &CassandraTriggerStore,
+    op: &KeyTriggerOperation,
+    expected_tags: &mut HashMap<(Key, TimerType, CompactDateTime), i32>,
+) -> Result<()> {
+    match op {
+        KeyTriggerOperation::Insert { trigger, .. } => {
+            store.insert_key_trigger(trigger.clone()).await?;
+            snapshot_tag(
+                store,
+                expected_tags,
+                &trigger.key,
+                trigger.timer_type,
+                trigger.time,
+            )
+            .await?;
+            verify_tags_for_key_type(store, expected_tags, &trigger.key, trigger.timer_type)
+                .await?;
+        }
+        KeyTriggerOperation::Delete {
+            timer_type,
+            key,
+            time,
+            ..
+        } => {
+            store.delete_key_trigger(*timer_type, key, *time).await?;
+            expected_tags.remove(&(key.clone(), *timer_type, *time));
+            verify_tags_for_key_type(store, expected_tags, key, *timer_type).await?;
+        }
+        KeyTriggerOperation::ClearByType {
+            timer_type, key, ..
+        } => {
+            store.clear_key_triggers(*timer_type, key).await?;
+            expected_tags.retain(|(k, tt, _), _| !(k == key && *tt == *timer_type));
+        }
+        KeyTriggerOperation::ClearAllTypes { key, .. } => {
+            store.clear_key_triggers_all_types(key).await?;
+            expected_tags.retain(|(k, ..), _| k != key);
+        }
+        KeyTriggerOperation::ClearAndSchedule { trigger, .. } => {
+            store.clear_and_schedule_key(trigger.clone()).await?;
+            expected_tags.retain(|(k, tt, _), _| !(k == &trigger.key && *tt == trigger.timer_type));
+            snapshot_tag(
+                store,
+                expected_tags,
+                &trigger.key,
+                trigger.timer_type,
+                trigger.time,
+            )
+            .await?;
+            verify_tags_for_key_type(store, expected_tags, &trigger.key, trigger.timer_type)
+                .await?;
+        }
+        KeyTriggerOperation::GetTimes { .. }
+        | KeyTriggerOperation::GetTriggers { .. }
+        | KeyTriggerOperation::GetAllTypes { .. } => {}
+    }
+    Ok(())
+}
+
+/// Reads the store's current tag for `(key, timer_type, time)` and
+/// records it in `expected_tags`. Used immediately after a write so the
+/// invariant pins what the store actually has, not what the caller asked
+/// for.
+async fn snapshot_tag(
+    store: &CassandraTriggerStore,
+    expected_tags: &mut HashMap<(Key, TimerType, CompactDateTime), i32>,
+    key: &Key,
+    timer_type: TimerType,
+    time: CompactDateTime,
+) -> Result<()> {
+    let tag = store
+        .current_tag(key, time, timer_type)
+        .await?
+        .ok_or_else(|| color_eyre::eyre::eyre!("current_tag returned None right after write"))?;
+    expected_tags.insert((key.clone(), timer_type, time), tag);
+    Ok(())
+}
+
 /// Applies operations from [`KeyTriggerTestInput`] and verifies the
 /// timer state invariant holds for every `(segment_id, key, timer_type)`.
 async fn prop_timer_state_invariant(
     store: &CassandraTriggerStore,
     input: KeyTriggerTestInput,
 ) -> Result<()> {
-    use crate::timers::store::tests::prop_key_triggers::{KeyTriggerModel, KeyTriggerOperation};
+    use crate::timers::store::tests::prop_key_triggers::KeyTriggerModel;
 
     let key_pool = ["key-a", "key-b", "key-c"];
 
@@ -1137,37 +1409,12 @@ async fn prop_timer_state_invariant(
         }
     }
 
-    // Apply all operations to both model and store
+    // Apply all operations to both model and store, verifying tags as we go.
     let mut model = KeyTriggerModel::new();
+    let mut expected_tags: HashMap<(Key, TimerType, CompactDateTime), i32> = HashMap::new();
     for op in &input.operations {
         model.apply(op);
-        match op {
-            KeyTriggerOperation::Insert { trigger, .. } => {
-                store.insert_key_trigger(trigger.clone()).await?;
-            }
-            KeyTriggerOperation::Delete {
-                timer_type,
-                key,
-                time,
-                ..
-            } => {
-                store.delete_key_trigger(*timer_type, key, *time).await?;
-            }
-            KeyTriggerOperation::ClearByType {
-                timer_type, key, ..
-            } => {
-                store.clear_key_triggers(*timer_type, key).await?;
-            }
-            KeyTriggerOperation::ClearAllTypes { key, .. } => {
-                store.clear_key_triggers_all_types(key).await?;
-            }
-            KeyTriggerOperation::ClearAndSchedule { trigger, .. } => {
-                store.clear_and_schedule_key(trigger.clone()).await?;
-            }
-            KeyTriggerOperation::GetTimes { .. }
-            | KeyTriggerOperation::GetTriggers { .. }
-            | KeyTriggerOperation::GetAllTypes { .. } => {}
-        }
+        apply_op_and_verify_tags(store, op, &mut expected_tags).await?;
     }
 
     // Verify timer state invariant for every (segment_id, key, timer_type)

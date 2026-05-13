@@ -3,6 +3,7 @@
 //! Tests the high-level operations that coordinate updates across both slab
 //! and key indices, verifying dual-index consistency.
 
+use super::common::derive_tag;
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
@@ -20,6 +21,7 @@ use uuid::Uuid;
 
 /// Type alias for trigger tuple (key, time, `timer_type`).
 type TriggerTuple = (Key, CompactDateTime, TimerType);
+type StoreTriggerTuple = (Key, CompactDateTime, TimerType, SegmentId);
 
 /// High-level operations that coordinate across dual indices.
 /// Only uses the 9 public `TriggerStore` methods.
@@ -89,6 +91,30 @@ pub enum HighLevelOperation {
         /// The replacement trigger.
         new_trigger: Trigger,
     },
+    /// Update the tag on a specific trigger (`update_tag`).
+    UpdateTag {
+        /// The segment.
+        segment: Segment,
+        /// The key of the trigger to update.
+        key: Key,
+        /// The scheduled time.
+        time: CompactDateTime,
+        /// The timer type.
+        timer_type: TimerType,
+        /// The new tag value to write.
+        new_tag: i32,
+    },
+    /// Query the current tag for a trigger (`current_tag`).
+    CurrentTag {
+        /// The segment.
+        segment: Segment,
+        /// The key.
+        key: Key,
+        /// The scheduled time.
+        time: CompactDateTime,
+        /// The timer type.
+        timer_type: TimerType,
+    },
 }
 
 /// Test input containing isolated segment IDs and high-level operations.
@@ -129,6 +155,14 @@ fn random_timer_type(g: &mut Gen) -> TimerType {
     }
 }
 
+fn model_tag_for_trigger(
+    model: &HighLevelModel,
+    segment_id: SegmentId,
+    trigger: &Trigger,
+) -> Option<i32> {
+    model.get_tag(segment_id, &trigger.key, trigger.timer_type, trigger.time)
+}
+
 /// Generates an `AddTrigger` operation.
 fn generate_add_trigger(
     g: &mut Gen,
@@ -136,15 +170,20 @@ fn generate_add_trigger(
     existing_triggers: &mut ExistingTriggers,
 ) -> HighLevelOperation {
     let key = random_key(g);
-    let time = CompactDateTime::arbitrary(g);
     let timer_type = random_timer_type(g);
-    let slab_id = Slab::from_time(segment.slab_size, time).id();
+    let mut time = CompactDateTime::arbitrary(g);
+    let mut slab_id = Slab::from_time(segment.slab_size, time).id();
+    while existing_triggers.contains(&(segment.id, slab_id, key.clone(), time, timer_type)) {
+        time = CompactDateTime::arbitrary(g);
+        slab_id = Slab::from_time(segment.slab_size, time).id();
+    }
 
     existing_triggers.insert((segment.id, slab_id, key.clone(), time, timer_type));
 
+    let tag = derive_tag(&key, time, timer_type);
     HighLevelOperation::AddTrigger {
         segment: segment.clone(),
-        trigger: Trigger::new(key, time, timer_type, Span::current()),
+        trigger: Trigger::with_tag(key, time, timer_type, tag, Span::current()),
     }
 }
 
@@ -246,9 +285,10 @@ fn generate_clear_and_schedule(
     time_set.clear();
     time_set.insert(new_time);
 
+    let tag = derive_tag(&key, new_time, timer_type);
     HighLevelOperation::ClearAndSchedule {
         segment: segment.clone(),
-        new_trigger: Trigger::new(key, new_time, timer_type, Span::current()),
+        new_trigger: Trigger::with_tag(key, new_time, timer_type, tag, Span::current()),
     }
 }
 
@@ -291,6 +331,56 @@ fn generate_get_slab_range(g: &mut Gen, segment: &Segment) -> HighLevelOperation
     }
 }
 
+/// Generates an `UpdateTag` operation targeting an existing trigger.
+///
+/// `update_tag` requires the caller to have observed the target as
+/// currently scheduled — the Cassandra store would write a partial row
+/// otherwise. The generator encodes this precondition by only picking from
+/// `existing_triggers`; if none exist, no `UpdateTag` op is generated.
+fn generate_update_tag(
+    g: &mut Gen,
+    segment: &Segment,
+    existing_triggers: &ExistingTriggers,
+) -> Option<HighLevelOperation> {
+    if existing_triggers.is_empty() {
+        return None;
+    }
+    let new_tag = i32::arbitrary(g);
+    let keys: Vec<_> = existing_triggers.iter().cloned().collect();
+    let (_, _, key, time, timer_type) = &keys[usize::arbitrary(g) % keys.len()];
+    Some(HighLevelOperation::UpdateTag {
+        segment: segment.clone(),
+        key: key.clone(),
+        time: *time,
+        timer_type: *timer_type,
+        new_tag,
+    })
+}
+
+/// Generates a `CurrentTag` query operation.
+fn generate_current_tag(
+    g: &mut Gen,
+    segment: &Segment,
+    existing_triggers: &ExistingTriggers,
+) -> HighLevelOperation {
+    if !existing_triggers.is_empty() && bool::arbitrary(g) {
+        let keys: Vec<_> = existing_triggers.iter().cloned().collect();
+        let (_, _, key, time, timer_type) = &keys[usize::arbitrary(g) % keys.len()];
+        return HighLevelOperation::CurrentTag {
+            segment: segment.clone(),
+            key: key.clone(),
+            time: *time,
+            timer_type: *timer_type,
+        };
+    }
+    HighLevelOperation::CurrentTag {
+        segment: segment.clone(),
+        key: random_key(g),
+        time: CompactDateTime::arbitrary(g),
+        timer_type: random_timer_type(g),
+    }
+}
+
 impl Arbitrary for HighLevelTestInput {
     fn arbitrary(g: &mut Gen) -> Self {
         // Generate a slab size for this test (60-660 seconds for faster tests)
@@ -319,10 +409,9 @@ impl Arbitrary for HighLevelTestInput {
             let segment_idx = usize::from(u8::arbitrary(g)) % segments.len();
             let segment = &segments[segment_idx];
 
-            let op = match u8::arbitrary(g) % 8 {
+            let op = match u8::arbitrary(g) % 10 {
                 0 => {
                     let op = generate_add_trigger(g, segment, &mut existing_triggers);
-                    // Mirror add into time tracker
                     if let HighLevelOperation::AddTrigger { ref trigger, .. } = op {
                         let map_key = (segment.id, trigger.key.clone(), trigger.timer_type);
                         key_trigger_times
@@ -334,7 +423,6 @@ impl Arbitrary for HighLevelTestInput {
                 }
                 1 => {
                     let op = generate_remove_trigger(g, segment, &segments, &mut existing_triggers);
-                    // Mirror remove: update time tracker
                     if let HighLevelOperation::RemoveTrigger {
                         ref segment,
                         ref key,
@@ -344,7 +432,6 @@ impl Arbitrary for HighLevelTestInput {
                     } = op
                     {
                         let map_key = (segment.id, key.clone(), timer_type);
-                        // Remove time if no more triggers at this time for key/type
                         let has_time = existing_triggers.iter().any(|(seg, _, k, t, tt)| {
                             *seg == segment.id && k == key && *tt == timer_type && *t == time
                         });
@@ -364,7 +451,14 @@ impl Arbitrary for HighLevelTestInput {
                 4 => generate_get_slab_triggers_all_types(g, segment),
                 5 => generate_get_key_times(g, segment),
                 6 => generate_get_key_triggers(g, segment),
-                _ => generate_get_slab_range(g, segment),
+                7 => generate_get_slab_range(g, segment),
+                8 => match generate_update_tag(g, segment, &existing_triggers) {
+                    Some(op) => op,
+                    // No existing triggers yet — fall back to a query op so this
+                    // iteration still produces something useful.
+                    None => generate_current_tag(g, segment, &existing_triggers),
+                },
+                _ => generate_current_tag(g, segment, &existing_triggers),
             };
 
             operations.push(op);
@@ -389,6 +483,9 @@ pub struct HighLevelModel {
     /// via `insert_slab`. `delete_slab` removes entries here, mirroring the
     /// real store where slab metadata is separate from trigger data.
     slab_registry: HashMap<SegmentId, BTreeSet<SlabId>>,
+    /// Tag for each key-table row: `(segment_id, key, timer_type, time)` → tag.
+    /// Only present for triggers currently in the key index.
+    tag_index: HashMap<(SegmentId, Key, TimerType, CompactDateTime), i32>,
 }
 
 impl Default for HighLevelModel {
@@ -405,7 +502,45 @@ impl HighLevelModel {
             slab_index: HashMap::default(),
             key_index: HashMap::default(),
             slab_registry: HashMap::default(),
+            tag_index: HashMap::default(),
         }
+    }
+
+    /// Returns the model's current tag for a row, or `None` if absent.
+    #[must_use]
+    pub fn get_tag(
+        &self,
+        segment_id: SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+        time: CompactDateTime,
+    ) -> Option<i32> {
+        self.tag_index
+            .get(&(segment_id, key.clone(), timer_type, time))
+            .copied()
+    }
+
+    fn set_tag(
+        &mut self,
+        segment_id: SegmentId,
+        key: Key,
+        timer_type: TimerType,
+        time: CompactDateTime,
+        tag: i32,
+    ) {
+        self.tag_index
+            .insert((segment_id, key, timer_type, time), tag);
+    }
+
+    fn remove_tag(
+        &mut self,
+        segment_id: SegmentId,
+        key: &Key,
+        timer_type: TimerType,
+        time: CompactDateTime,
+    ) {
+        self.tag_index
+            .remove(&(segment_id, key.clone(), timer_type, time));
     }
 
     /// Applies an operation to the model.
@@ -414,24 +549,25 @@ impl HighLevelModel {
             HighLevelOperation::AddTrigger { segment, trigger } => {
                 let slab_id = Slab::from_time(segment.slab_size, trigger.time).id();
                 let tuple = (trigger.key.clone(), trigger.time, trigger.timer_type);
-
-                // Add to slab index
                 self.slab_index
                     .entry((segment.id, slab_id, trigger.timer_type))
                     .or_default()
                     .insert(tuple.clone());
-
-                // Add to key index
                 self.key_index
                     .entry((segment.id, trigger.key.clone(), trigger.timer_type))
                     .or_default()
                     .insert(tuple);
-
-                // Register slab metadata
                 self.slab_registry
                     .entry(segment.id)
                     .or_default()
                     .insert(slab_id);
+                self.set_tag(
+                    segment.id,
+                    trigger.key.clone(),
+                    trigger.timer_type,
+                    trigger.time,
+                    trigger.tag,
+                );
             }
             HighLevelOperation::RemoveTrigger {
                 segment,
@@ -441,66 +577,38 @@ impl HighLevelModel {
             } => {
                 let slab_id = Slab::from_time(segment.slab_size, *time).id();
                 let tuple = (key.clone(), *time, *timer_type);
-
-                // Remove from slab index
-                if let Some(triggers) = self.slab_index.get_mut(&(segment.id, slab_id, *timer_type))
-                {
-                    triggers.remove(&tuple);
+                if let Some(t) = self.slab_index.get_mut(&(segment.id, slab_id, *timer_type)) {
+                    t.remove(&tuple);
                 }
-
-                // Remove from key index
-                if let Some(triggers) =
-                    self.key_index
-                        .get_mut(&(segment.id, key.clone(), *timer_type))
+                if let Some(t) = self
+                    .key_index
+                    .get_mut(&(segment.id, key.clone(), *timer_type))
                 {
-                    triggers.remove(&tuple);
+                    t.remove(&tuple);
                 }
+                self.remove_tag(segment.id, key, *timer_type, *time);
             }
             HighLevelOperation::ClearAndSchedule {
                 segment,
                 new_trigger,
             } => {
-                let key = &new_trigger.key;
-                let timer_type = new_trigger.timer_type;
-                let new_slab_id = Slab::from_time(segment.slab_size, new_trigger.time).id();
-                let index_key = (segment.id, key.clone(), timer_type);
-
-                // Step 1: Take ownership of old key entry (yields old times for
-                // slab cleanup). unwrap_or_default is safe — no error channel,
-                // None means no existing triggers (fresh schedule).
-                let old_entry = self.key_index.remove(&index_key).unwrap_or_default();
-
-                // Step 2 (write new first — at-least-once invariant):
-                // Add new trigger to slab index and install singleton in key index.
-                let tuple = (key.clone(), new_trigger.time, timer_type);
-                self.slab_index
-                    .entry((segment.id, new_slab_id, timer_type))
-                    .or_default()
-                    .insert(tuple.clone());
-                self.key_index.insert(index_key, BTreeSet::from([tuple]));
-                self.slab_registry
-                    .entry(segment.id)
-                    .or_default()
-                    .insert(new_slab_id);
-
-                // Step 3: Remove old trigger tuples from their slab partitions.
-                for (_, old_time, _) in old_entry {
-                    let old_slab_id = Slab::from_time(segment.slab_size, old_time).id();
-                    if let Some(set) =
-                        self.slab_index
-                            .get_mut(&(segment.id, old_slab_id, timer_type))
-                    {
-                        set.retain(|(k, t, _)| k != key || *t != old_time);
-                    }
+                self.apply_clear_and_schedule(segment, new_trigger);
+            }
+            HighLevelOperation::UpdateTag {
+                segment,
+                key,
+                time,
+                timer_type,
+                new_tag,
+            } => {
+                if self.get_tag(segment.id, key, *timer_type, *time).is_some() {
+                    self.set_tag(segment.id, key.clone(), *timer_type, *time, *new_tag);
                 }
             }
             HighLevelOperation::DeleteSlab {
                 segment_id,
                 slab_id,
             } => {
-                // delete_slab only removes slab metadata, NOT triggers.
-                // Triggers remain in both slab_triggers and key_triggers tables
-                // until explicitly removed with remove_trigger.
                 if let Some(slabs) = self.slab_registry.get_mut(segment_id) {
                     slabs.remove(slab_id);
                 }
@@ -508,10 +616,46 @@ impl HighLevelModel {
             HighLevelOperation::GetSlabTriggersAllTypes { .. }
             | HighLevelOperation::GetKeyTimes { .. }
             | HighLevelOperation::GetKeyTriggers { .. }
-            | HighLevelOperation::GetSlabRange { .. } => {
-                // Query operations don't modify state
+            | HighLevelOperation::GetSlabRange { .. }
+            | HighLevelOperation::CurrentTag { .. } => {}
+        }
+    }
+
+    fn apply_clear_and_schedule(&mut self, segment: &Segment, new_trigger: &Trigger) {
+        let key = &new_trigger.key;
+        let timer_type = new_trigger.timer_type;
+        let new_slab_id = Slab::from_time(segment.slab_size, new_trigger.time).id();
+        let index_key = (segment.id, key.clone(), timer_type);
+        let old_entry = self.key_index.remove(&index_key).unwrap_or_default();
+
+        let tuple = (key.clone(), new_trigger.time, timer_type);
+        self.slab_index
+            .entry((segment.id, new_slab_id, timer_type))
+            .or_default()
+            .insert(tuple.clone());
+        self.key_index.insert(index_key, BTreeSet::from([tuple]));
+        self.slab_registry
+            .entry(segment.id)
+            .or_default()
+            .insert(new_slab_id);
+
+        for (_, old_time, _) in &old_entry {
+            self.remove_tag(segment.id, key, timer_type, *old_time);
+            let old_slab_id = Slab::from_time(segment.slab_size, *old_time).id();
+            if let Some(s) = self
+                .slab_index
+                .get_mut(&(segment.id, old_slab_id, timer_type))
+            {
+                s.retain(|(k, t, _)| k != key || *t != *old_time);
             }
         }
+        self.set_tag(
+            segment.id,
+            key.clone(),
+            timer_type,
+            new_trigger.time,
+            new_trigger.tag,
+        );
     }
 
     /// Gets triggers from slab index.
@@ -581,6 +725,49 @@ where
             "Op #{op_idx} GetSlabTriggersAllTypes mismatch: expected {expected:?}, got \
              {actual_tuples:?}"
         ));
+    }
+
+    for trigger in &actual {
+        let key_tag = store
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "Op #{op_idx} GetSlabTriggersAllTypes current_tag failed: {e:?}"
+                )
+            })?;
+        let Some(key_tag) = key_tag else {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetSlabTriggersAllTypes returned slab trigger without key tag: \
+                 key={:?} time={:?} type={:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type
+            ));
+        };
+        if trigger.tag != key_tag {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetSlabTriggersAllTypes tag mismatch: key={:?} time={:?} type={:?} \
+                 expected key tag {key_tag:?}, got {:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type,
+                trigger.tag
+            ));
+        }
+
+        if let Some(expected_tag) = model_tag_for_trigger(model, store.segment_id(), trigger)
+            && trigger.tag != expected_tag
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetSlabTriggersAllTypes model tag mismatch: key={:?} time={:?} \
+                 type={:?} expected {expected_tag:?}, got {:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type,
+                trigger.tag
+            ));
+        }
     }
     Ok(())
 }
@@ -656,6 +843,28 @@ where
             "Op #{op_idx} GetKeyTriggers mismatch: expected {expected:?}, got {actual_tuples:?}"
         ));
     }
+
+    for trigger in &actual {
+        let Some(expected_tag) = model_tag_for_trigger(model, *segment_id, trigger) else {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetKeyTriggers returned unmodeled trigger: key={:?} time={:?} \
+                 type={:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type
+            ));
+        };
+        if trigger.tag != expected_tag {
+            return Err(color_eyre::eyre::eyre!(
+                "Op #{op_idx} GetKeyTriggers tag mismatch: key={:?} time={:?} type={:?} expected \
+                 {expected_tag:?}, got {:?}",
+                trigger.key,
+                trigger.time,
+                trigger.timer_type,
+                trigger.tag
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -696,6 +905,35 @@ where
     Ok(())
 }
 
+/// Verifies `current_tag` against the model's tag index.
+async fn verify_current_tag<S>(
+    store: &S,
+    model: &HighLevelModel,
+    segment: &Segment,
+    key: &Key,
+    time: CompactDateTime,
+    timer_type: TimerType,
+    op_idx: usize,
+) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let expected = model.get_tag(segment.id, key, timer_type, time);
+    let actual = store
+        .current_tag(key, time, timer_type)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} CurrentTag failed: {e:?}"))?;
+
+    if expected != actual {
+        return Err(color_eyre::eyre::eyre!(
+            "Op #{op_idx} CurrentTag mismatch key={key} time={time:?} type={timer_type:?}: \
+             model={expected:?}, store={actual:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Applies high-level operations with inline verification.
 async fn apply_high_level_operations<S>(
     store: &S,
@@ -707,6 +945,15 @@ where
     S::Error: Debug,
 {
     for (op_idx, op) in operations.iter().enumerate() {
+        let mutating = matches!(
+            op,
+            HighLevelOperation::AddTrigger { .. }
+                | HighLevelOperation::RemoveTrigger { .. }
+                | HighLevelOperation::DeleteSlab { .. }
+                | HighLevelOperation::ClearAndSchedule { .. }
+                | HighLevelOperation::UpdateTag { .. }
+        );
+
         match op {
             HighLevelOperation::AddTrigger { trigger, .. } => {
                 model.apply(op);
@@ -763,6 +1010,33 @@ where
             HighLevelOperation::GetSlabRange { segment_id, range } => {
                 verify_slab_range(store, model, segment_id, range, op_idx).await?;
             }
+            HighLevelOperation::UpdateTag {
+                key,
+                time,
+                timer_type,
+                new_tag,
+                ..
+            } => {
+                model.apply(op);
+                store
+                    .update_tag(key, *time, *timer_type, *new_tag)
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} UpdateTag failed: {e:?}"))?;
+            }
+            HighLevelOperation::CurrentTag {
+                segment,
+                key,
+                time,
+                timer_type,
+            } => {
+                verify_current_tag(store, model, segment, key, *time, *timer_type, op_idx).await?;
+            }
+        }
+
+        if mutating {
+            verify_dual_index_consistency(store, model)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("Op #{op_idx} consistency check: {e}"))?;
         }
     }
     Ok(())
@@ -775,20 +1049,29 @@ where
     S::Error: Debug,
 {
     // Remove all triggers from the model
-    for ((_segment_id, _slab_id, _timer_type), trigger_set) in &model.slab_index {
+    for ((segment_id, slab_id, _timer_type), trigger_set) in &model.slab_index {
         for (key, time, timer_type) in trigger_set {
-            // Ignore errors during cleanup - triggers may have been removed by test
-            // operations
-            let _ = store.remove_trigger(key, *time, *timer_type).await;
+            store
+                .remove_trigger(key, *time, *timer_type)
+                .await
+                .map_err(|e| {
+                    color_eyre::eyre::eyre!(
+                        "cleanup remove_trigger failed: segment={segment_id:?} slab={slab_id:?} \
+                         key={key:?} time={time:?} type={timer_type:?}: {e:?}"
+                    )
+                })?;
         }
     }
 
     // Delete all slabs that were created
     let mut deleted_slabs = HashSet::new();
-    for (_segment_id, slab_id, _timer_type) in model.slab_index.keys() {
+    for (segment_id, slab_id, _timer_type) in model.slab_index.keys() {
         if deleted_slabs.insert(*slab_id) {
-            // Ignore errors - slabs may have been deleted by test operations
-            let _ = store.delete_slab(*slab_id).await;
+            store.delete_slab(*slab_id).await.map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "cleanup delete_slab failed: segment={segment_id:?} slab={slab_id:?}: {e:?}"
+                )
+            })?;
         }
     }
 
@@ -800,23 +1083,18 @@ where
 ///
 /// This is the critical verification that high-level operations maintain
 /// consistency across both indices.
-async fn verify_dual_index_consistency<S>(
+async fn collect_slab_trigger_set<S>(
     store: &S,
     model: &HighLevelModel,
-) -> color_eyre::Result<()>
+) -> color_eyre::Result<HashSet<StoreTriggerTuple>>
 where
     S: TriggerStore + Send + Sync,
     S::Error: Debug,
 {
-    use std::collections::HashSet;
-
-    // Collect all triggers from slab indices using get_slab_triggers_all_types
     let mut slab_triggers = HashSet::new();
     let mut processed_slabs = HashSet::new();
 
     for (segment_id, slab_id, _timer_type) in model.slab_index.keys() {
-        // Only process each slab once (since get_slab_triggers_all_types returns all
-        // timer types)
         if !processed_slabs.insert((*segment_id, *slab_id)) {
             continue;
         }
@@ -839,7 +1117,17 @@ where
         }
     }
 
-    // Collect all triggers from key indices
+    Ok(slab_triggers)
+}
+
+async fn collect_key_trigger_set<S>(
+    store: &S,
+    model: &HighLevelModel,
+) -> color_eyre::Result<HashSet<StoreTriggerTuple>>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
     let mut key_triggers = HashSet::new();
     for (segment_id, key, timer_type) in model.key_index.keys() {
         let triggers: Vec<Trigger> = store
@@ -860,10 +1148,27 @@ where
         }
     }
 
-    // Verify both indices contain exactly the same triggers
+    Ok(key_triggers)
+}
+
+fn collect_model_trigger_set(model: &HighLevelModel) -> HashSet<StoreTriggerTuple> {
+    let mut model_triggers = HashSet::new();
+    for ((segment_id, _slab_id, _timer_type), trigger_set) in &model.slab_index {
+        for (key, time, timer_type) in trigger_set {
+            model_triggers.insert((key.clone(), *time, *timer_type, *segment_id));
+        }
+    }
+    model_triggers
+}
+
+fn verify_trigger_sets(
+    slab_triggers: &HashSet<StoreTriggerTuple>,
+    key_triggers: &HashSet<StoreTriggerTuple>,
+    model_triggers: &HashSet<StoreTriggerTuple>,
+) -> color_eyre::Result<()> {
     if slab_triggers != key_triggers {
-        let slab_only: Vec<_> = slab_triggers.difference(&key_triggers).collect();
-        let key_only: Vec<_> = key_triggers.difference(&slab_triggers).collect();
+        let slab_only: Vec<_> = slab_triggers.difference(key_triggers).collect();
+        let key_only: Vec<_> = key_triggers.difference(slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
             "Dual-index consistency violation!\nTriggers in slab index but not key index: \
@@ -871,18 +1176,9 @@ where
         ));
     }
 
-    // Verify store matches model - collect all triggers from model
-    let mut model_triggers = HashSet::new();
-    for ((segment_id, _slab_id, _timer_type), trigger_set) in &model.slab_index {
-        for (key, time, timer_type) in trigger_set {
-            model_triggers.insert((key.clone(), *time, *timer_type, *segment_id));
-        }
-    }
-
-    // Compare store vs model
     if slab_triggers != model_triggers {
-        let store_only: Vec<_> = slab_triggers.difference(&model_triggers).collect();
-        let model_only: Vec<_> = model_triggers.difference(&slab_triggers).collect();
+        let store_only: Vec<_> = slab_triggers.difference(model_triggers).collect();
+        let model_only: Vec<_> = model_triggers.difference(slab_triggers).collect();
 
         return Err(color_eyre::eyre::eyre!(
             "Store does not match model!\nTriggers in store but not model: \
@@ -891,6 +1187,91 @@ where
     }
 
     Ok(())
+}
+
+async fn verify_tag_consistency<S>(store: &S, model: &HighLevelModel) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    for ((segment_id, key, timer_type, time), expected_tag) in &model.tag_index {
+        let current_tag = store
+            .current_tag(key, *time, *timer_type)
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "Failed to read current_tag during consistency check: {e:?}"
+                )
+            })?;
+
+        if current_tag != Some(*expected_tag) {
+            return Err(color_eyre::eyre::eyre!(
+                "Key-index current_tag mismatch: key={key:?} time={time:?} type={timer_type:?} \
+                 expected Some({expected_tag}), got {current_tag:?}"
+            ));
+        }
+
+        let key_triggers: Vec<Trigger> = store
+            .get_key_triggers(*timer_type, key)
+            .try_collect()
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "Failed to read key triggers during tag consistency check: {e:?}"
+                )
+            })?;
+        let key_tag = key_triggers
+            .iter()
+            .find(|t| t.time == *time && t.timer_type == *timer_type)
+            .map(|t| t.tag);
+
+        if key_tag != Some(*expected_tag) {
+            return Err(color_eyre::eyre::eyre!(
+                "Key-index trigger tag mismatch: segment={segment_id} key={key:?} time={time:?} \
+                 type={timer_type:?} expected Some({expected_tag}), got {key_tag:?}"
+            ));
+        }
+
+        let slab_id = Slab::from_time(store.slab_size(), *time).id();
+        let slab_tags: Vec<Trigger> = store
+            .get_slab_triggers_all_types(slab_id)
+            .try_collect()
+            .await
+            .map_err(|e| {
+                color_eyre::eyre::eyre!(
+                    "Failed to read slab triggers during tag consistency check: {e:?}"
+                )
+            })?;
+        let slab_tag = slab_tags
+            .iter()
+            .find(|t| t.key == *key && t.time == *time && t.timer_type == *timer_type)
+            .map(|t| t.tag);
+
+        if slab_tag != Some(*expected_tag) {
+            return Err(color_eyre::eyre::eyre!(
+                "Slab-index trigger tag mismatch: segment={segment_id} slab={slab_id} key={key:?} \
+                 time={time:?} type={timer_type:?} expected Some({expected_tag}), got {slab_tag:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+async fn verify_dual_index_consistency<S>(
+    store: &S,
+    model: &HighLevelModel,
+) -> color_eyre::Result<()>
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let slab_triggers = collect_slab_trigger_set(store, model).await?;
+    let key_triggers = collect_key_trigger_set(store, model).await?;
+    let model_triggers = collect_model_trigger_set(model);
+
+    verify_trigger_sets(&slab_triggers, &key_triggers, &model_triggers)?;
+    verify_tag_consistency(store, model).await
 }
 
 /// Verifies that high-level operations maintain dual-index consistency.

@@ -24,6 +24,7 @@ use crate::consumer::middleware::defer::timer::store::{
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -137,6 +138,7 @@ impl StorageBackend {
 ///     &config,
 ///     false,
 ///     Duration::from_secs(7 * 24 * 3600),
+///     8192,
 ///     SpanRelation::FollowsFrom,
 /// )
 /// .await?;
@@ -173,8 +175,9 @@ pub enum StorePair {
         message_provider: MemoryMessageDeferStoreProvider,
         /// Timer defer store provider (Memory).
         timer_provider: MemoryTimerDeferStoreProvider,
-        /// Deduplication store provider (Memory).
-        dedup_provider: MemoryDeduplicationStoreProvider,
+        /// Deduplication store provider (Memory). `None` when deduplication
+        /// is disabled (cache capacity of zero).
+        dedup_provider: Option<MemoryDeduplicationStoreProvider>,
     },
     /// All stores use Cassandra storage with a shared session.
     Cassandra {
@@ -185,8 +188,10 @@ pub enum StorePair {
         message_provider: CassandraMessageDeferStoreProvider,
         /// Timer defer store provider (Cassandra with resources).
         timer_provider: CassandraTimerDeferStoreProvider,
-        /// Deduplication store provider (Cassandra).
-        dedup_provider: CassandraDeduplicationStoreProvider,
+        /// Deduplication store provider (Cassandra). `None` when
+        /// deduplication is disabled (cache capacity of zero); in that case
+        /// no `DeduplicationQueries` are prepared against the session.
+        dedup_provider: Option<CassandraDeduplicationStoreProvider>,
     },
 }
 
@@ -238,6 +243,12 @@ impl StorePair {
     ///
     /// * `config` - Trigger store configuration (`InMemory` or `Cassandra`)
     /// * `mock` - If true, uses in-memory storage regardless of config
+    /// * `dedup_ttl` - TTL for deduplication records (only consulted when
+    ///   deduplication is enabled)
+    /// * `dedup_cache_capacity` - Capacity of the deduplication cache. A value
+    ///   of `0` disables deduplication entirely; no `DeduplicationQueries` are
+    ///   prepared and `dedup_provider` is set to `None` on both variants.
+    /// * `timer_spans` - How timer spans relate to their producer span
     ///
     /// # Errors
     ///
@@ -255,6 +266,7 @@ impl StorePair {
     ///     &TriggerStoreConfiguration::InMemory,
     ///     false,
     ///     Duration::from_secs(7 * 24 * 3600),
+    ///     8192,
     ///     SpanRelation::FollowsFrom,
     /// )
     /// .await?;
@@ -265,15 +277,21 @@ impl StorePair {
         config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
+        dedup_cache_capacity: usize,
         timer_spans: SpanRelation,
     ) -> Result<Self, StoreCreationError> {
+        // `NonZeroUsize::new` doubles as the "enabled?" gate: `None` skips all
+        // dedup wiring; `Some(capacity)` carries the validated capacity forward.
+        let dedup_cache_capacity = NonZeroUsize::new(dedup_cache_capacity);
+
         let backend = StorageBackend::new(config, mock).await?;
         match &backend {
             StorageBackend::InMemory => Ok(Self::Memory {
                 trigger_provider: InMemoryTriggerStoreProvider::new(),
                 message_provider: MemoryMessageDeferStoreProvider::new(),
                 timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
-                dedup_provider: MemoryDeduplicationStoreProvider::new(),
+                dedup_provider: dedup_cache_capacity
+                    .map(|_| MemoryDeduplicationStoreProvider::new()),
             }),
 
             StorageBackend::Cassandra { store, keyspace } => {
@@ -293,19 +311,6 @@ impl StorePair {
                 // Prepare queries for timer defer stores
                 let timer_queries = Arc::new(TimerQueries::new(store.session(), keyspace).await?);
 
-                // Prepare queries for deduplication stores
-                let dedup_queries =
-                    Arc::new(DeduplicationQueries::new(store.session(), keyspace).await?);
-
-                let dedup_ttl_secs: i32 = dedup_ttl
-                    .as_secs()
-                    .try_into()
-                    .map_err(|_| StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()))?;
-                if i64::from(dedup_ttl_secs) > MAX_CASSANDRA_TTL_SECS {
-                    return Err(StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()));
-                }
-                debug!(ttl_secs = dedup_ttl_secs, "deduplication store TTL");
-
                 let message_provider = CassandraMessageDeferStoreProvider::new(
                     store.clone(),
                     message_queries,
@@ -319,11 +324,29 @@ impl StorePair {
                     timer_spans,
                 );
 
-                let dedup_provider = CassandraDeduplicationStoreProvider::new(
-                    store.clone(),
-                    dedup_queries,
-                    dedup_ttl_secs,
-                );
+                let dedup_provider = if let Some(capacity) = dedup_cache_capacity {
+                    let dedup_ttl_secs: i32 = dedup_ttl
+                        .as_secs()
+                        .try_into()
+                        .map_err(|_| StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()))?;
+
+                    if i64::from(dedup_ttl_secs) > MAX_CASSANDRA_TTL_SECS {
+                        return Err(StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()));
+                    }
+                    debug!(ttl_secs = dedup_ttl_secs, "deduplication store TTL");
+
+                    let dedup_queries =
+                        Arc::new(DeduplicationQueries::new(store.session(), keyspace).await?);
+
+                    Some(CassandraDeduplicationStoreProvider::new(
+                        store.clone(),
+                        dedup_queries,
+                        dedup_ttl_secs,
+                        capacity,
+                    ))
+                } else {
+                    None
+                };
 
                 Ok(Self::Cassandra {
                     trigger_provider,

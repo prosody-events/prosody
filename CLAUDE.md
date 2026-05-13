@@ -135,6 +135,13 @@ pub struct Configuration {
 - Persistent storage via `TriggerStore` trait (Cassandra/Memory)
 - In-memory scheduler with background preloading
 
+**Concurrency invariants — load-bearing for correctness:**
+
+- **One handler per key, system-wide.** `KeyManager` ensures at most one message or timer handler for a given key is executing anywhere in the cluster at any moment. This is enforced by Kafka partition ownership (one consumer group member owns each partition) plus in-process per-key serialization. Never design for concurrent writers on the same key — that scenario cannot occur.
+- **Zero or one `PartitionManager` per Kafka partition, system-wide.** Kafka's partition assignment guarantees at most one consumer group member holds a partition at a time; the `PartitionManager` is the single owner of both the message stream and the timers that hang off that partition. Timer storage is scoped to the partition's segment; no two `PartitionManager`s for the same partition can be live simultaneously.
+
+These invariants are why LWTs, distributed locks, and optimistic concurrency are never needed for per-key or per-partition state. The framework provides the exclusivity; code inside it can assume it.
+
 ## Cassandra
 
 **CRITICAL Anti-Patterns - NEVER USE:**
@@ -142,8 +149,11 @@ pub struct Configuration {
 1. **ALLOW FILTERING** - Full table scans destroy cluster
 2. **Secondary Indices** - Coordinator bottlenecks
 3. **Materialized Views** - Breaks under write load
+4. **LWTs (Lightweight Transactions / `IF [NOT] EXISTS` / `IF <cond>`)** - Paxos round-trips serialize all writes to a partition; latency and contention scale catastrophically
 
-**Instead:** Proper partition keys, clustering columns for ranges, `Option<T>` for NULLs (filter in code)
+**Instead:** Proper partition keys, clustering columns for ranges, `Option<T>` for NULLs (filter in code). For "insert-if-new" semantics, prefer idempotent writes or app-level coordination over LWTs.
+
+**Batching:** When multiple statements target the **same partition (same row key)**, group them into an `UNLOGGED BATCH` whenever possible. Same-partition unlogged batches are atomic on the replica and execute as a single mutation, eliminating extra coordinator round-trips. Never use `LOGGED BATCH` for performance reasons, and never batch across partitions to "reduce round-trips" — that's an anti-pattern that overloads the coordinator.
 
 **Handling NULLs from static columns:**
 

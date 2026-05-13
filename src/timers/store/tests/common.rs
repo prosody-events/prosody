@@ -34,6 +34,23 @@ use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 
+/// Deterministic FNV-1a tag derived from `(key, time, timer_type)`.
+///
+/// Property tests rely on this to keep model-and-store tag comparisons
+/// reproducible across runs.
+#[must_use]
+pub fn derive_tag(key: &Key, time: CompactDateTime, timer_type: TimerType) -> i32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in key.as_ref().as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash ^= time.epoch_seconds();
+    hash = hash.wrapping_mul(0x0100_0193);
+    hash ^= timer_type as u32;
+    i32::from_le_bytes(hash.to_le_bytes())
+}
+
 /// Helper function to insert a segment.
 ///
 /// # Errors

@@ -76,13 +76,13 @@ cassandra_queries! {
 
         /// Gets all triggers of a specific type in a slab
         get_slab_triggers: (
-            "SELECT key, time, timer_type, span FROM $keyspace.{} WHERE segment_id = ? AND slab_size = ? AND id = ? AND timer_type = ?",
+            "SELECT key, time, timer_type, span, tag FROM $keyspace.{} WHERE segment_id = ? AND slab_size = ? AND id = ? AND timer_type = ?",
             TABLE_TYPED_SLABS
         ),
 
         /// Inserts a trigger into a slab with TTL
         insert_slab_trigger: (
-            "INSERT INTO $keyspace.{} (segment_id, slab_size, id, timer_type, key, time, span) VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?",
+            "INSERT INTO $keyspace.{} (segment_id, slab_size, id, timer_type, key, time, span, tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?",
             TABLE_TYPED_SLABS
         ),
 
@@ -106,25 +106,25 @@ cassandra_queries! {
 
         /// Gets all triggers for a key and timer type
         get_key_triggers: (
-            "SELECT key, time, timer_type, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
+            "SELECT key, time, timer_type, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ?",
             TABLE_TYPED_KEYS
         ),
 
         /// Gets ALL triggers in a slab across all timer types
         get_slab_triggers_all_types: (
-            "SELECT key, time, timer_type, span FROM $keyspace.{} WHERE segment_id = ? AND slab_size = ? AND id = ?",
+            "SELECT key, time, timer_type, span, tag FROM $keyspace.{} WHERE segment_id = ? AND slab_size = ? AND id = ?",
             TABLE_TYPED_SLABS
         ),
 
         /// Gets ALL triggers for a key across all timer types
         get_key_triggers_all_types: (
-            "SELECT key, time, timer_type, span FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            "SELECT key, time, timer_type, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
             TABLE_TYPED_KEYS
         ),
 
         /// Inserts a trigger into the key index with TTL
         insert_key_trigger: (
-            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?",
+            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?) USING TTL ?",
             TABLE_TYPED_KEYS
         ),
 
@@ -154,13 +154,13 @@ cassandra_queries! {
 
         /// Inserts a trigger into a slab without TTL
         insert_slab_trigger_no_ttl: (
-            "INSERT INTO $keyspace.{} (segment_id, slab_size, id, timer_type, key, time, span) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO $keyspace.{} (segment_id, slab_size, id, timer_type, key, time, span, tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             TABLE_TYPED_SLABS
         ),
 
         /// Inserts a trigger into the key index without TTL
         insert_key_trigger_no_ttl: (
-            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?)",
             TABLE_TYPED_KEYS
         ),
 
@@ -260,13 +260,13 @@ cassandra_queries! {
 
         /// Inserts a trigger into clustering columns with TTL
         insert_key_trigger_clustering: (
-            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?) USING TTL ?",
+            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?) USING TTL ?",
             TABLE_TYPED_KEYS
         ),
 
         /// Inserts a trigger into clustering columns without TTL
         insert_key_trigger_clustering_no_ttl: (
-            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?)",
             TABLE_TYPED_KEYS
         ),
 
@@ -312,9 +312,19 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
-        /// Reads the first remaining trigger (time + span) for a key/type (inline demotion)
+        /// Reads the first remaining trigger (time, span, tag) for a key/type (inline demotion)
         peek_first_key_trigger: (
-            "SELECT time, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 1",
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 1",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Reads up to 3 clustering rows (time, span, tag) for a key/type.
+        /// Used by `delete_key_trigger`'s Overflow branch: a single
+        /// pre-delete read drives the post-delete state decision (0 / 1 /
+        /// 2+ surviving rows after filtering the target out) and supplies
+        /// the surviving row's data when the post-delete state is Inline.
+        peek_three_key_triggers: (
+            "SELECT time, span, tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? LIMIT 3",
             TABLE_TYPED_KEYS
         ),
 
@@ -359,11 +369,11 @@ cassandra_queries! {
         /// BATCH: Insert two clustering rows (promoted + new) and set overflow state with TTL.
         /// Per-statement USING TTL on each INSERT and the UPDATE so all three expire together,
         /// preventing zombie markers if those rows expire via TTL without explicit deletion.
-        /// Uses named markers because the 17 bind values exceed the 16-element tuple limit.
+        /// Uses named markers because the bind value count exceeds the 16-element tuple limit.
         batch_promote_and_set_overflow: (
             "BEGIN UNLOGGED BATCH \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (:p_segment_id, :p_key, :p_timer_type, :p_time, :p_span) USING TTL :p_ttl; \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (:n_segment_id, :n_key, :n_timer_type, :n_time, :n_span) USING TTL :n_ttl; \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (:p_segment_id, :p_key, :p_timer_type, :p_time, :p_span, :p_tag) USING TTL :p_ttl; \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (:n_segment_id, :n_key, :n_timer_type, :n_time, :n_span, :n_tag) USING TTL :n_ttl; \
              UPDATE $keyspace.{} USING TTL :s_ttl SET state[:s_timer_type] = :s_state WHERE segment_id = :s_segment_id AND key = :s_key; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
@@ -372,8 +382,8 @@ cassandra_queries! {
         /// BATCH: Insert two clustering rows (promoted + new) and set overflow state without TTL
         batch_promote_and_set_overflow_no_ttl: (
             "BEGIN UNLOGGED BATCH \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
-             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span) VALUES (?, ?, ?, ?, ?); \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?); \
+             INSERT INTO $keyspace.{} (segment_id, key, timer_type, time, span, tag) VALUES (?, ?, ?, ?, ?, ?); \
              UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
@@ -397,6 +407,65 @@ cassandra_queries! {
              DELETE state FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
              APPLY BATCH",
             TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: DELETE target clustering row + DELETE state[type].
+        /// Used by `delete_key_trigger`'s Overflow branch when the
+        /// pre-delete read shows the target is the only row → Absent.
+        /// Both statements target the same `(segment_id, key)` partition.
+        batch_delete_to_absent: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             DELETE state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: DELETE target clustering + DELETE surviving clustering +
+        /// UPDATE state Inline (with TTL).
+        /// Used by `delete_key_trigger`'s Overflow branch when exactly one
+        /// non-target row survives — that row's data is captured into the
+        /// static state column in a single round-trip → Inline.
+        batch_delete_to_inline: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             UPDATE $keyspace.{} USING TTL ? SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// BATCH: DELETE target clustering + DELETE surviving clustering +
+        /// UPDATE state Inline (no TTL).
+        batch_delete_to_inline_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             DELETE FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?; \
+             UPDATE $keyspace.{} SET state[?] = ? WHERE segment_id = ? AND key = ?; \
+             APPLY BATCH",
+            TABLE_TYPED_KEYS, TABLE_TYPED_KEYS, TABLE_TYPED_KEYS
+        ),
+
+        /// Updates tag on an existing key-index clustering row. Caller must guarantee
+        /// the row exists (see `update_tag`'s precondition); a missed target
+        /// would write a partial row.
+        update_tag: (
+            "UPDATE $keyspace.{} SET tag = ? WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ?",
+            TABLE_TYPED_KEYS
+        ),
+
+        /// Updates tag on an existing slab-index clustering row. Caller must
+        /// guarantee the row exists (see `update_tag`'s precondition); a
+        /// missed target would write a partial row.
+        update_slab_tag: (
+            "UPDATE $keyspace.{} SET tag = ? WHERE segment_id = ? AND slab_size = ? AND id = ? AND timer_type = ? AND key = ? AND time = ?",
+            TABLE_TYPED_SLABS
+        ),
+
+        /// Reads the tag from a single clustering row.
+        current_tag_key: (
+            "SELECT tag FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND timer_type = ? AND time = ? LIMIT 1",
+            TABLE_TYPED_KEYS
         ),
 
     }

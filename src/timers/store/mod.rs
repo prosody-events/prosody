@@ -323,4 +323,33 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         &self,
         trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    // ===================================================================
+    // Tag Operations (2 methods) - Used by TimerManager commit oracle
+    // ===================================================================
+
+    /// Updates the `tag` on both persisted timer indices.
+    ///
+    /// No-op if the row is absent. Used by
+    /// `complete()`-from-`FiringRescheduled` to rotate the tag so the
+    /// commit oracle can detect the round-trip after in-memory operation and
+    /// after slab reloads.
+    fn update_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        new_tag: i32,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Reads the `tag` from a key-index row.
+    ///
+    /// Returns `None` if the row is absent (commit oracle: "committed").
+    /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
+    fn current_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send;
 }

@@ -192,6 +192,37 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
+    // Tag Operations (2 methods)
+    // =========================================================================
+
+    /// Rotates the `tag` on an existing scheduled timer in every persisted
+    /// index maintained by this operation implementation.
+    ///
+    /// **Precondition:** the caller must have observed the timer at `(key,
+    /// time, timer_type)` as currently scheduled. Today's only caller is
+    /// `complete()`-from-`FiringRescheduled`, which has just loaded the timer
+    /// from storage. Implementations may treat a missing row as a no-op or as
+    /// undefined, so callers must not depend on either behaviour.
+    fn update_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        new_tag: i32,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Reads the `tag` from a key-index clustering row.
+    ///
+    /// Returns `None` if the row is absent ("committed" in oracle terms).
+    /// Returns `Some(0)` for rows with a `NULL` tag (pre-migration rows).
+    fn current_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> impl Future<Output = Result<Option<i32>, Self::Error>> + Send;
+
+    // =========================================================================
     // Version Management (1 method)
     // =========================================================================
 

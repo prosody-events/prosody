@@ -5,6 +5,15 @@
 //! operation: a plain `UPDATE` for the common inline path, or a tombstone-free
 //! BATCH only when clustering rows actually need to change.
 //!
+//! **Locking contract.** State-mutating methods call `resolve_state` to obtain
+//! the per-`(key, timer_type)` [`CachedState`] mutex (see
+//! [`crate::timers::store::cassandra::state`]) and hold it from the state
+//! check through the DB write — that is what makes the read-decide-write
+//! sequence linearisable against concurrent callers on the same
+//! `(key, timer_type)`. Read-only stream methods take the same lock briefly
+//! to snapshot the state, then release before any DB I/O: a concurrent
+//! transition just shifts the snapshot, which is acceptable for a stream.
+//!
 //! `get_key_triggers_all_types` is the most complex method: it reads the full
 //! `state` map in one query, then merges inline entries (sorted by
 //! `TimerType` discriminant) with a clustering-row stream in a single pass,
@@ -288,16 +297,17 @@ impl TriggerOperations for CassandraTriggerStore {
                     (segment_id, slab_size, slab_id, timer_type),
                 )
                 .await.map_err(CassandraStoreError::from)?
-                .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>)>().map_err(CassandraStoreError::from)?;
+                .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>, Option<i32>)>().map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((key, time, timer_type, span_map)) =
+            while let Some((key, time, timer_type, span_map, tag_opt)) =
                 cooperative(stream.try_next()).await.map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
                 let span = related_span!(SpanRelation::Child, context.clone(), "fetch_slab_trigger");
+                let tag = tag_opt.unwrap_or(0_i32);
 
-                yield Trigger::new(key.into(), time, timer_type, span);
+                yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
             }
         }
     }
@@ -320,19 +330,20 @@ impl TriggerOperations for CassandraTriggerStore {
                 )
                 .await
                 .map_err(CassandraStoreError::from)?
-                .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>)>()
+                .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>, Option<i32>)>()
                 .map_err(CassandraStoreError::from)?;
 
             pin_mut!(stream);
-            while let Some((key, time, timer_type, span_map)) =
+            while let Some((key, time, timer_type, span_map, tag_opt)) =
                 cooperative(stream.try_next())
                     .await
                     .map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
                 let span = related_span!(SpanRelation::Child, context.clone(), "fetch_slab_trigger_all_types");
+                let tag = tag_opt.unwrap_or(0_i32);
 
-                yield Trigger::new(key.into(), time, timer_type, span);
+                yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
             }
         }
     }
@@ -347,6 +358,7 @@ impl TriggerOperations for CassandraTriggerStore {
         let key = trigger.key.as_ref();
         let time = trigger.time;
         let timer_type = trigger.timer_type;
+        let tag = trigger.tag;
 
         self.execute_with_optional_ttl(
             slab.range().end,
@@ -354,12 +366,12 @@ impl TriggerOperations for CassandraTriggerStore {
             &self.queries().insert_slab_trigger_no_ttl,
             |ttl| {
                 (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, ttl,
+                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag, ttl,
                 )
             },
             || {
                 (
-                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map,
+                    segment_id, slab_size, slab_id, timer_type, key, time, &span_map, tag,
                 )
             },
         )
@@ -422,7 +434,9 @@ impl TriggerOperations for CassandraTriggerStore {
             let (handle, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
-            // Lock briefly to read the state, then release before any DB I/O.
+            // Snapshot the state and release the lock before any DB I/O — a
+            // concurrent transition would just shift the snapshot, which is
+            // fine for a read-only stream.
             let state = handle.lock().await.clone();
             match state {
                 TimerState::Inline(timer) => {
@@ -471,14 +485,16 @@ impl TriggerOperations for CassandraTriggerStore {
             let (handle, cached) = self.resolve_state(&segment_id, &key_clone, timer_type).await?;
             Span::current().record("state_cached", cached);
 
-            // Lock briefly to read the state, then release before any DB I/O.
+            // Snapshot the state and release the lock before any DB I/O — a
+            // concurrent transition would just shift the snapshot, which is
+            // fine for a read-only stream.
             let state = handle.lock().await.clone();
             match state {
                 TimerState::Inline(timer) => {
                     // Inline: yield trigger from cache (0 clustering query).
                     let context = self.propagator().extract(&timer.span);
                     let span = related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
-                    yield Trigger::new(key_clone.clone(), timer.time, timer_type, span);
+                    yield Trigger::with_tag(key_clone.clone(), timer.time, timer_type, timer.tag, span);
                 }
                 TimerState::Overflow => {
                     // Overflow: scan clustering rows.
@@ -490,18 +506,19 @@ impl TriggerOperations for CassandraTriggerStore {
                         )
                         .await
                         .map_err(CassandraStoreError::from)?
-                        .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>)>()
+                        .rows_stream::<(String, CompactDateTime, TimerType, HashMap<String, String>, Option<i32>)>()
                         .map_err(CassandraStoreError::from)?;
 
                     pin_mut!(stream);
-                    while let Some((_key_str, time, _timer_type, span_map)) =
+                    while let Some((_key_str, time, _timer_type, span_map, tag_opt)) =
                         cooperative(stream.try_next())
                             .await
                             .map_err(CassandraStoreError::from)?
                     {
                         let context = self.propagator().extract(&span_map);
                         let span = related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger");
-                        yield Trigger::new(key_clone.clone(), time, timer_type, span);
+                        let tag = tag_opt.unwrap_or(0_i32);
+                        yield Trigger::with_tag(key_clone.clone(), time, timer_type, tag, span);
                     }
                 }
                 TimerState::Absent => {
@@ -563,7 +580,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     )
                     .await
                     .map_err(CassandraStoreError::from)?
-                    .rows_stream()
+                    .rows_stream::<(Option<String>, Option<CompactDateTime>, Option<TimerType>, Option<HashMap<String, String>>, Option<i32>)>()
                     .map_err(CassandraStoreError::from)?;
 
                 pin_mut!(clustering_stream);
@@ -614,7 +631,7 @@ impl TriggerOperations for CassandraTriggerStore {
                     if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
                         let context = self.propagator().extract(&timer.span);
                         let span = related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
-                        yield Trigger::new(key_clone.clone(), timer.time, tt, span);
+                        yield Trigger::with_tag(key_clone.clone(), timer.time, tt, timer.tag, span);
                     }
                 }
             }
@@ -656,10 +673,12 @@ impl TriggerOperations for CassandraTriggerStore {
                     ClusteringEntry {
                         time: old_timer.time,
                         span: &old_timer.span.clone(),
+                        tag: old_timer.tag,
                     },
                     ClusteringEntry {
                         time: trigger.time,
                         span: &new_span_map,
+                        tag: trigger.tag,
                     },
                 )
                 .await?;
@@ -678,6 +697,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 let new_state = TimerState::Inline(InlineTimer {
                     time: trigger.time,
                     span: span_map,
+                    tag: trigger.tag,
                 });
                 self.set_state_inline(&segment_id, &key, timer_type, &new_state)
                     .await?;
@@ -695,11 +715,13 @@ impl TriggerOperations for CassandraTriggerStore {
     /// - **Inline(timer), time matches**: Remove state entry → `Absent`
     /// - **Inline(timer), time mismatch**: No-op (Inline guarantees zero
     ///   clustering rows) → stays `Inline`
-    /// - **Overflow**: Delete clustering row + peek remaining (LIMIT 2):
-    ///   - 0 remaining → remove state entry → `Absent`
-    ///   - 1 remaining → set inline state + delete clustering row →
-    ///     `Inline(remaining)`
-    ///   - 2+ remaining → no state change → stays `Overflow`
+    /// - **Overflow**: One pre-delete read (LIMIT 3) drives a single atomic
+    ///   batch:
+    ///   - 0 surviving rows → batch DELETE target + DELETE `state[type]` →
+    ///     `Absent`
+    ///   - 1 surviving row → batch DELETE target + DELETE survivor + UPDATE
+    ///     state Inline → `Inline(survivor)`
+    ///   - 2+ surviving rows → single DELETE target → stays `Overflow`
     /// - **Absent**: No-op (post-V3 Absent is unambiguous: 0 timers, no rows)
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn delete_key_trigger(
@@ -723,58 +745,54 @@ impl TriggerOperations for CassandraTriggerStore {
                 *guard = TimerState::Absent;
             }
             TimerState::Overflow => {
-                // Delete the clustering row first.
-                self.execute_unpaged_discard(
-                    &self.queries().delete_key_trigger,
-                    (&segment_id, key.as_ref(), timer_type, time),
-                )
-                .await?;
-
-                // Count remaining times (LIMIT 2, no span — cheap).
-                let times = self
-                    .peek_trigger_times(&segment_id, key, timer_type)
+                // Read pre-delete clustering rows (LIMIT 3) in one round-trip.
+                // After filtering the target out, the survivor count drives
+                // the post-delete state — and any survivor's data is already
+                // in hand to feed straight into the atomic write batch below.
+                let triggers = self
+                    .peek_three_key_triggers(&segment_id, key, timer_type)
                     .await?;
+                let mut survivors = triggers.into_iter().filter(|(t, ..)| *t != time);
 
-                match times.as_slice() {
-                    [] => {
-                        // 0 remaining → Absent.
-                        self.remove_state_entry(&segment_id, key, timer_type)
+                match (survivors.next(), survivors.next()) {
+                    (None, _) => {
+                        // No survivor → atomic DELETE target + DELETE state[type].
+                        self.batch_delete_to_absent(&segment_id, key, timer_type, time)
                             .await?;
                         *guard = TimerState::Absent;
                     }
-                    [remaining_time] => {
-                        // 1 remaining → fetch span and demote to Inline.
-                        let Some((confirmed_time, span_map)) = self
-                            .peek_first_key_trigger(&segment_id, key, timer_type)
-                            .await?
-                        else {
-                            // Row vanished between count and read — treat as Absent.
-                            self.remove_state_entry(&segment_id, key, timer_type)
-                                .await?;
-                            *guard = TimerState::Absent;
-                            return Ok(());
-                        };
-
+                    (Some((survivor_time, span_map, tag_opt)), None) => {
+                        // Exactly one survivor → atomic DELETE target +
+                        // DELETE survivor's clustering row + UPDATE state
+                        // Inline(survivor). Heals any cross-process drift
+                        // (e.g. cache says Overflow but DB has only the
+                        // survivor) by promoting the survivor to Inline.
                         let new_state = TimerState::Inline(InlineTimer {
-                            time: *remaining_time,
+                            time: survivor_time,
                             span: span_map,
+                            tag: tag_opt.unwrap_or(0_i32),
                         });
-
-                        // Atomic batch: set inline state + delete remaining clustering row.
-                        self.batch_demote_to_inline(
+                        self.batch_delete_to_inline(
                             &segment_id,
                             key,
                             timer_type,
-                            confirmed_time,
+                            time,
+                            survivor_time,
                             &new_state,
                         )
                         .await?;
-
                         *guard = new_state;
                     }
-                    _ => {
-                        // 2+ remaining → stays Overflow, no state change
-                        // needed.
+                    (Some(_), Some(_)) => {
+                        // 2+ survivors → state stays Overflow, just delete
+                        // the target row. Some target rows past clustering
+                        // position 3 won't appear in the LIMIT 3 read — the
+                        // DELETE is correct regardless (idempotent if absent).
+                        self.execute_unpaged_discard(
+                            &self.queries().delete_key_trigger,
+                            (&segment_id, key.as_ref(), timer_type, time),
+                        )
+                        .await?;
                     }
                 }
             }
@@ -833,9 +851,9 @@ impl TriggerOperations for CassandraTriggerStore {
     ///   delete.
     /// - **Overflow**: BATCH (DELETE clustering + UPDATE state).
     ///
-    /// `resolve_state` returns a per-key `Arc<AsyncMutex<TimerState>>`; holding
-    /// the `handle.lock().await` guard serializes the read-decide-write
-    /// sequence.
+    /// `resolve_state` returns the per-`(key, timer_type)` mutex; holding
+    /// `handle.lock().await` for the entire match serialises the
+    /// read-decide-write sequence against concurrent same-key writers.
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
     async fn clear_and_schedule_key(
         &self,
@@ -848,6 +866,7 @@ impl TriggerOperations for CassandraTriggerStore {
         let new_state = TimerState::Inline(InlineTimer {
             time: trigger.time,
             span: span_map,
+            tag: trigger.tag,
         });
 
         let (handle, cached) = self
@@ -951,6 +970,107 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
+    /// Rotates the commit-oracle tag on an existing timer at `time`.
+    ///
+    /// **Precondition:** the caller must have observed the timer at `(key,
+    /// time, timer_type)` as currently scheduled (today: from
+    /// `complete()`-from-`FiringRescheduled`, where the row was just loaded
+    /// into the active scheduler). Holding the per-key mutex serialises
+    /// against concurrent in-process writers, so the row is guaranteed to
+    /// exist for the duration of the write.
+    ///
+    /// Uses `resolve_state` (cache-first):
+    /// - **Inline(timer), time matches**: rewrite the UDT in place.
+    /// - **Inline(_), time mismatch** or **Absent**: no-op (target absent).
+    /// - **Overflow**: bare `UPDATE` on the clustering row — no LWT, no
+    ///   existence check.
+    #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
+    async fn update_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+        new_tag: i32,
+    ) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
+        Span::current().record("state_cached", cached);
+
+        let mut guard = handle.lock().await;
+        match &*guard {
+            TimerState::Inline(timer) if timer.time == time => {
+                let new_state = TimerState::Inline(InlineTimer {
+                    time: timer.time,
+                    span: timer.span.clone(),
+                    tag: new_tag,
+                });
+                tokio::try_join!(
+                    self.set_state_inline(&segment_id, key, timer_type, &new_state),
+                    self.update_slab_tag(key, time, timer_type, new_tag),
+                )?;
+                *guard = new_state;
+            }
+            // Concurrent `clear_and_schedule` won the lock first and rewrote
+            // the UDT to a different timer (or cleared it entirely). The new
+            // Inline timer carries its own freshly-minted tag from
+            // `Trigger::new`, so our rotation is moot. Do NOT assert/warn —
+            // this race is legitimate under normal reschedule contention.
+            TimerState::Inline(_) | TimerState::Absent => {}
+            TimerState::Overflow => {
+                tokio::try_join!(
+                    self.execute_unpaged_discard(
+                        &self.queries().update_tag,
+                        (new_tag, &segment_id, key.as_ref(), timer_type, time),
+                    ),
+                    self.update_slab_tag(key, time, timer_type, new_tag),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the commit-oracle tag for a single timer at `time`.
+    ///
+    /// Uses `resolve_state` (cache-first):
+    /// - **Inline(timer), time matches**: tag from cache (0 DB reads).
+    /// - **Inline(_), time mismatch** or **Absent**: `None` (Inline guarantees
+    ///   no other timers; post-V3 Absent is unambiguous).
+    /// - **Overflow**: SELECT the clustering row's tag column under the per-key
+    ///   mutex so a concurrent promote/demote cannot interleave between the
+    ///   state check and the row read.
+    #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
+    async fn current_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<Option<i32>, Self::Error> {
+        let segment_id = self.segment.id;
+        let (handle, cached) = self.resolve_state(&segment_id, key, timer_type).await?;
+        Span::current().record("state_cached", cached);
+
+        let guard = handle.lock().await;
+        match &*guard {
+            TimerState::Inline(timer) if timer.time == time => Ok(Some(timer.tag)),
+            TimerState::Inline(_) | TimerState::Absent => Ok(None),
+            TimerState::Overflow => {
+                let row = self
+                    .session()
+                    .execute_unpaged(
+                        &self.queries().current_tag_key,
+                        (&segment_id, key.as_ref(), timer_type, time),
+                    )
+                    .await
+                    .map_err(CassandraStoreError::from)?
+                    .into_rows_result()
+                    .map_err(CassandraStoreError::from)?
+                    .maybe_first_row::<(Option<i32>,)>()
+                    .map_err(CassandraStoreError::from)?;
+                Ok(row.map(|(tag_opt,)| tag_opt.unwrap_or(0_i32)))
+            }
+        }
+    }
+
     // -- V1 migration methods --
 
     /// Updates the segment's version field after v1 to v2 migration.
@@ -1006,7 +1126,13 @@ fn advance_inline<'a>(
         context.clone(),
         "fetch_key_trigger_all_types_inline"
     );
-    Some(Trigger::new(key.clone(), timer.time, timer_type, span))
+    Some(Trigger::with_tag(
+        key.clone(),
+        timer.time,
+        timer_type,
+        timer.tag,
+        span,
+    ))
 }
 
 /// Returns the next clustering trigger, skipping NULL static-only rows.
@@ -1020,6 +1146,7 @@ pub(super) async fn advance_clustering(
                 Option<CompactDateTime>,
                 Option<TimerType>,
                 Option<HashMap<String, String>>,
+                Option<i32>,
             ),
             impl Into<CassandraStoreError>,
         >,
@@ -1027,13 +1154,14 @@ pub(super) async fn advance_clustering(
          ),
     propagator: &TextMapCompositePropagator,
 ) -> Result<Option<Trigger>, CassandraTriggerStoreError> {
-    while let Some((_key, time_opt, type_opt, span_opt)) =
+    while let Some((_key, time_opt, type_opt, span_opt, tag_opt)) =
         cooperative(stream.try_next()).await.map_err(Into::into)?
     {
         // Skip static-only rows (NULL clustering columns).
         let (Some(time), Some(timer_type), Some(span_map)) = (time_opt, type_opt, span_opt) else {
             continue;
         };
+        let tag = tag_opt.unwrap_or(0_i32);
 
         let context = propagator.extract(&span_map);
         let span = related_span!(
@@ -1042,7 +1170,13 @@ pub(super) async fn advance_clustering(
             "fetch_key_trigger_all_types"
         );
 
-        return Ok(Some(Trigger::new(key.clone(), time, timer_type, span)));
+        return Ok(Some(Trigger::with_tag(
+            key.clone(),
+            time,
+            timer_type,
+            tag,
+            span,
+        )));
     }
     Ok(None)
 }

@@ -22,6 +22,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::telemetry::partition::TelemetryPartitionSender;
 use crate::timers::active::{TimerSnapshot, TimerState};
 use crate::timers::datetime::CompactDateTime;
+use rand::RngExt;
 
 pub use crate::timers::error::TimerManagerError;
 use crate::timers::loader::{State, get_or_create_segment, slab_loader};
@@ -601,32 +602,27 @@ where
         Ok(())
     }
 
-    /// Transitions a timer from `Scheduled` to `Firing` state.
+    /// Transitions a timer from `Scheduled` to `Firing` state, returning the
+    /// canonical tag at the moment of transition.
     ///
-    /// Called when a timer is delivered from the queue and about to be
-    /// processed by a handler. Returns `true` if the transition succeeded.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The entity key of the timer.
-    /// * `time` - The scheduled execution time.
-    /// * `timer_type` - The timer type classification.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the timer was successfully transitioned to `Firing`.
-    pub(crate) async fn fire(
+    /// Returns `None` if the transition failed (timer absent or not Scheduled).
+    /// Reading the tag under the same trigger-lock as the state transition
+    /// guarantees the tag is coherent with the Scheduled→Firing transition.
+    pub(crate) async fn fire_with_tag(
         &self,
         key: &Key,
         time: CompactDateTime,
         timer_type: TimerType,
-    ) -> bool {
-        self.0
-            .state
-            .trigger_lock()
-            .await
+    ) -> Option<i32> {
+        let state = self.0.state.trigger_lock().await;
+        if !state.scheduler.fire(key, time, timer_type).await {
+            return None;
+        }
+        // Read tag under the same lock so it reflects the state at dispatch.
+        state
             .scheduler
-            .fire(key, time, timer_type)
+            .active_triggers()
+            .get_tag(key, time, timer_type)
             .await
     }
 
@@ -667,12 +663,33 @@ where
             .get_state(key, time, timer_type)
             .await;
 
-        // FIRING_RESCHEDULED → SCHEDULED: keep DB row, timer fires again
+        // FIRING_RESCHEDULED → SCHEDULED: keep DB row, rotate tag, timer fires again
         if current_state == Some(TimerState::FiringRescheduled) {
+            // Read current tag under the trigger-lock (same guard held until return).
+            // The read-modify-write is per-key linearized — no TOCTOU window.
+            let current_tag = state
+                .scheduler
+                .active_triggers()
+                .get_tag(key, time, timer_type)
+                .await
+                .unwrap_or(0_i32);
+            let new_tag = fresh_tag_distinct_from(current_tag);
+
+            state
+                .store
+                .update_tag(key, time, timer_type, new_tag)
+                .await
+                .map_err(TimerManagerError::Store)?;
+
             state
                 .scheduler
                 .active_triggers()
                 .set_state(key, time, timer_type, TimerState::Scheduled)
+                .await;
+            state
+                .scheduler
+                .active_triggers()
+                .set_tag(key, time, timer_type, new_tag)
                 .await;
             return Ok(());
         }
@@ -757,6 +774,52 @@ where
                     state.scheduler.deactivate(key, time, timer_type).await;
                 }
             }
+        }
+    }
+
+    /// Returns the current `tag` for a timer, consulting `ActiveTriggers` first
+    /// and falling back to the store.
+    ///
+    /// Returns `None` if the timer is absent from both in-memory state and the
+    /// store (oracle interpretation: "committed"). Returns `Some(0)` for legacy
+    /// rows without a stored tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerManagerError::Store`] if the store read fails.
+    pub async fn current_tag(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        timer_type: TimerType,
+    ) -> Result<Option<i32>, TimerManagerError<T::Error>> {
+        let state = self.0.state.trigger_lock().await;
+        if let Some(tag) = state
+            .scheduler
+            .active_triggers()
+            .get_tag(key, time, timer_type)
+            .await
+        {
+            return Ok(Some(tag));
+        }
+        state
+            .store
+            .current_tag(key, time, timer_type)
+            .await
+            .map_err(TimerManagerError::Store)
+    }
+}
+
+/// Generates a fresh tag guaranteed != `current`.
+///
+/// Required by `complete()`-from-`FiringRescheduled`: a same-value re-roll
+/// would conflate "not yet committed" with "rotation happened but landed on
+/// the same value," which the oracle must not confuse.
+pub(crate) fn fresh_tag_distinct_from(current: i32) -> i32 {
+    loop {
+        let t = rand::rng().random::<i32>();
+        if t != current {
+            return t;
         }
     }
 }
@@ -2419,6 +2482,202 @@ mod tests {
         assert_eq!(refired_trigger.time, trigger.time);
         guard2.commit().await;
 
+        Ok(())
+    }
+
+    // =========================================================================
+    // prop_tag_rotation: timer tag invariants
+    // =========================================================================
+
+    /// Inv #6: after `schedule`, `current_tag` returns `Some(_)`.
+    #[tokio::test]
+    async fn tag_inv6_schedule_gives_tag() -> Result<()> {
+        time::pause();
+        let (_stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        let trigger = create_test_trigger("k", 10, TimerType::Application)?;
+        manager.schedule(trigger.clone()).await?;
+        let tag = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?;
+        assert!(tag.is_some(), "expected Some tag after schedule");
+        Ok(())
+    }
+
+    /// Inv #7: Scheduled→Firing does NOT rotate the tag.
+    #[tokio::test]
+    async fn tag_inv7_fire_does_not_rotate() -> Result<()> {
+        time::pause();
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+        let trigger = create_test_trigger("k", 1, TimerType::Application)?;
+        manager.schedule(trigger.clone()).await?;
+        let tag_before = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?
+            .ok_or_else(|| eyre!("tag missing before fire"))?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+        let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
+        let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
+
+        // Tag must be identical at dispatch.
+        assert_eq!(
+            firing.trigger().tag,
+            tag_before,
+            "inv #7: Scheduled→Firing must not rotate tag"
+        );
+        firing.commit().await;
+        Ok(())
+    }
+
+    /// Inv #2: complete()-from-FiringRescheduled rotates tag; new != old.
+    #[tokio::test]
+    async fn tag_inv2_firing_rescheduled_commit_rotates() -> Result<()> {
+        time::pause();
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+        let trigger = create_test_trigger("k", 1, TimerType::Application)?;
+        manager.schedule(trigger.clone()).await?;
+        let tag_initial = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?
+            .ok_or_else(|| eyre!("no tag before fire"))?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+        let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
+        let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
+
+        // Re-schedule same trigger (Firing → FiringRescheduled).
+        manager.schedule(trigger.clone()).await?;
+
+        // Commit while FiringRescheduled → must rotate tag.
+        firing.commit().await;
+
+        let tag_after = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?
+            .ok_or_else(|| {
+                eyre!("tag absent after FiringRescheduled commit (row should remain)")
+            })?;
+        assert_ne!(
+            tag_after, tag_initial,
+            "inv #2: complete()-from-FiringRescheduled must rotate tag"
+        );
+        Ok(())
+    }
+
+    /// Inv #3: `complete()`-from-`Firing` removes the row; `current_tag` →
+    /// `None`.
+    #[tokio::test]
+    async fn tag_inv3_firing_commit_removes_row() -> Result<()> {
+        time::pause();
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+        let trigger = create_test_trigger("k", 1, TimerType::Application)?;
+        manager.schedule(trigger.clone()).await?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+        let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
+        let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
+        firing.commit().await;
+
+        let tag_after = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?;
+        assert!(
+            tag_after.is_none(),
+            "inv #3: complete()-from-Firing must leave no row (current_tag → None)"
+        );
+        Ok(())
+    }
+
+    /// Inv #10: FiringTimer.trigger().tag equals the canonical tag at dispatch,
+    /// even if a complete()-from-FiringRescheduled rotation ran while the entry
+    /// sat in the delay queue.
+    #[tokio::test]
+    async fn tag_inv10_firing_timer_tag_frozen_at_dispatch() -> Result<()> {
+        time::pause();
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+        let trigger = create_test_trigger("k", 1, TimerType::Application)?;
+        manager.schedule(trigger.clone()).await?;
+        let dispatch_tag = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?
+            .ok_or_else(|| eyre!("no tag"))?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+        let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
+        let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
+
+        // Tag on FiringTimer must equal the pre-dispatch canonical tag.
+        assert_eq!(
+            firing.trigger().tag,
+            dispatch_tag,
+            "inv #10: FiringTimer.trigger().tag must be the canonical tag at dispatch"
+        );
+        firing.commit().await;
+        Ok(())
+    }
+
+    /// Inv #8 (reload parity): after `complete()`-from-`FiringRescheduled`,
+    /// the tag persisted in the store equals the tag held in
+    /// `ActiveTriggers`, and both equal the rotated post-commit value.
+    ///
+    /// `TimerManager::current_tag` consults `ActiveTriggers` first and only
+    /// falls through to the store on miss, so this test bypasses the manager
+    /// helper and queries the store directly via the held trigger-lock —
+    /// otherwise both reads would hit the in-memory path and a store/memory
+    /// divergence would go undetected.
+    #[tokio::test]
+    async fn tag_inv8_reload_parity() -> Result<()> {
+        time::pause();
+        let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
+        pin_mut!(stream);
+        let trigger = create_test_trigger("k", 1, TimerType::Application)?;
+        manager.schedule(trigger.clone()).await?;
+        let tag_initial = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?
+            .ok_or_else(|| eyre!("no tag before fire"))?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+        let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
+        let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
+        manager.schedule(trigger.clone()).await?; // → FiringRescheduled
+        firing.commit().await; // → rotates tag
+
+        // In-memory path: ActiveTriggers has the new tag.
+        let tag_active = manager
+            .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+            .await?
+            .ok_or_else(|| eyre!("in-memory tag absent"))?;
+
+        // Store path: query the persistent store directly under the
+        // trigger-lock, skipping the ActiveTriggers cache that
+        // `manager.current_tag` consults first.
+        let tag_store = {
+            let state = manager.0.state.trigger_lock().await;
+            state
+                .store
+                .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+                .await?
+        }
+        .ok_or_else(|| eyre!("store tag absent"))?;
+
+        assert_eq!(
+            tag_active, tag_store,
+            "inv #8: reload parity — in-memory tag must equal store tag after rotation"
+        );
+        assert_ne!(
+            tag_store, tag_initial,
+            "inv #8: store tag must reflect the post-commit rotation, not the pre-fire value"
+        );
         Ok(())
     }
 }
