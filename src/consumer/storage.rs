@@ -329,6 +329,7 @@ impl StorePair {
                         .as_secs()
                         .try_into()
                         .map_err(|_| StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()))?;
+
                     if i64::from(dedup_ttl_secs) > MAX_CASSANDRA_TTL_SECS {
                         return Err(StoreCreationError::DeduplicationTtl(dedup_ttl.as_secs()));
                     }
