@@ -43,6 +43,7 @@ use futures::{
     Stream, TryStreamExt,
     future::{join_all, ready},
     pin_mut,
+    stream::iter as stream_iter,
 };
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use smallvec::SmallVec;
@@ -55,6 +56,9 @@ use tokio::task::coop::cooperative;
 use tracing::field::Empty;
 use tracing::{Span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// Maximum concurrent slab loads when fanning out a range scan.
+const LOAD_CONCURRENCY: usize = 16;
 
 impl TriggerOperations for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
@@ -279,6 +283,71 @@ impl TriggerOperations for CassandraTriggerStore {
         Ok(())
     }
 
+    #[instrument(level = "debug", skip(self), err)]
+    async fn get_slab_watermark(&self) -> Result<Option<SlabId>, Self::Error> {
+        let segment_id = self.segment.id;
+        let row = self
+            .session()
+            .execute_unpaged(&self.queries().get_slab_watermark, (segment_id,))
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<(Option<i32>,)>()
+            .map_err(CassandraStoreError::from)?;
+
+        Ok(row
+            .and_then(|(w,)| w)
+            .map(|w| SlabId::from_le_bytes(w.to_le_bytes())))
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn set_slab_watermark(&self, watermark: Option<SlabId>) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
+
+        // TTL anchor uses the natural slab end; `calculate_ttl` adds the
+        // configured `base_ttl` grace period (default 1 year), matching the
+        // same lifetime as `insert_slab` and slab triggers.
+        let anchor_time = anchor_after_watermark(watermark, self.segment.slab_size);
+
+        self.execute_with_optional_ttl(
+            anchor_time,
+            &self.queries().set_slab_watermark,
+            &self.queries().set_slab_watermark_no_ttl,
+            |ttl| (ttl, watermark_i32, segment_id),
+            || (watermark_i32, segment_id),
+        )
+        .await
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn batch_insert_slab_with_watermark(
+        &self,
+        slab: Slab,
+        watermark: Option<SlabId>,
+    ) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
+        let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
+
+        // Same anchor as `insert_slab` so the slab row and watermark hint
+        // share a lifetime. `calculate_ttl` adds the configured `base_ttl`
+        // grace period (default 1 year) on top of `slab.range().end` — that
+        // grace is what lets a lagging client process past-time slabs
+        // without finding them already TTL'd out.
+        let anchor_time = slab.range().end;
+
+        self.execute_with_optional_ttl(
+            anchor_time,
+            &self.queries().batch_insert_slab_with_watermark,
+            &self.queries().batch_insert_slab_with_watermark_no_ttl,
+            |ttl| (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
+            || (segment_id, slab_id, watermark_i32, segment_id),
+        )
+        .await
+    }
+
     #[instrument(level = "debug", skip(self))]
     fn get_slab_triggers(
         &self,
@@ -346,6 +415,30 @@ impl TriggerOperations for CassandraTriggerStore {
                 yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
             }
         }
+    }
+
+    fn get_slab_triggers_in_range(
+        &self,
+        range: RangeInclusive<SlabId>,
+    ) -> impl Stream<Item = Result<(SlabId, Trigger), Self::Error>> + Send {
+        let slab_size = self.segment.slab_size;
+        let store = self.clone();
+        self.get_slab_range(range)
+            .map_ok(move |slab_id| {
+                let store = store.clone();
+                async move {
+                    let slab = Slab::new(slab_id, slab_size);
+                    let triggers: Vec<Trigger> = store
+                        .get_slab_triggers_all_types(slab)
+                        .try_collect()
+                        .await?;
+                    Ok::<_, Self::Error>(stream_iter(
+                        triggers.into_iter().map(move |t| Ok((slab_id, t))),
+                    ))
+                }
+            })
+            .try_buffer_unordered(LOAD_CONCURRENCY)
+            .try_flatten()
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -1091,6 +1184,21 @@ impl TriggerOperations for CassandraTriggerStore {
 
         Ok(())
     }
+}
+
+/// Returns the TTL anchor time for a watermark update.
+///
+/// Anchors on the natural end of the slab at `watermark + 1`. The actual
+/// TTL is `(anchor - now) + base_ttl` because `calculate_ttl` adds the
+/// configured grace period (default 1 year) — slabs and the watermark hint
+/// deliberately outlive their natural end so a lagging consumer can still
+/// process past-time slabs.
+fn anchor_after_watermark(
+    watermark: Option<SlabId>,
+    slab_size: CompactDuration,
+) -> CompactDateTime {
+    let next_id = watermark.map_or(0, |w| w.saturating_add(1));
+    Slab::new(next_id, slab_size).range().end
 }
 
 /// Injects the trigger's span context into a new `HashMap` for Cassandra

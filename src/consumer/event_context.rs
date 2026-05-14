@@ -242,14 +242,14 @@ pub trait TerminationSignals {
 /// * `T`: The `TriggerStore` implementation backing the timer manager.
 
 #[derive(Debug, Clone)]
-pub struct TimerContext<T> {
+pub struct TimerContext<T: TriggerStore> {
     /// Context state
     inner: Arc<ArcSwapOption<Inner<T>>>,
 }
 
 #[derive(Educe)]
 #[educe(Debug)]
-struct Inner<T> {
+struct Inner<T: TriggerStore> {
     /// Key for which timers are scoped.
     key: Key,
 

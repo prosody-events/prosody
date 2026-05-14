@@ -121,8 +121,41 @@ where
         self.operations.get_slab_triggers_all_types(slab)
     }
 
+    fn get_slab_triggers_in_range(
+        &self,
+        range: RangeInclusive<SlabId>,
+    ) -> impl Stream<Item = Result<(SlabId, Trigger), Self::Error>> + Send {
+        self.operations.get_slab_triggers_in_range(range)
+    }
+
+    fn insert_slab(&self, slab: Slab) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.operations.insert_slab(slab)
+    }
+
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.operations.delete_slab(slab_id)
+    }
+
+    fn get_slab_watermark(
+        &self,
+    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send {
+        self.operations.get_slab_watermark()
+    }
+
+    fn set_slab_watermark(
+        &self,
+        watermark: Option<SlabId>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.operations.set_slab_watermark(watermark)
+    }
+
+    fn batch_insert_slab_with_watermark(
+        &self,
+        slab: Slab,
+        watermark: Option<SlabId>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.operations
+            .batch_insert_slab_with_watermark(slab, watermark)
     }
 
     fn get_key_times(
@@ -149,9 +182,10 @@ where
     #[instrument(level = "debug", skip(self, trigger), err)]
     async fn add_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
         let slab = Slab::from_time(self.slab_size(), trigger.time);
-        // Coordinate: slab metadata + slab trigger + key trigger
+        // Coordinate the two trigger-row writes; slab metadata is owned by
+        // the scheduler actor (which short-circuits the round-trip when the
+        // slab is already known).
         try_join!(
-            self.operations.insert_slab(slab.clone()),
             self.operations.insert_slab_trigger(slab, trigger.clone()),
             self.operations.insert_key_trigger(trigger),
         )?;
@@ -210,15 +244,14 @@ where
         let key = trigger.key.clone();
         let timer_type = trigger.timer_type;
 
-        // Step 1 (DUAL-INDEX WRITE): Write new timer to both indices concurrently.
-        // `clear_and_schedule_key` atomically clears the key index entry and
-        // returns the old trigger times it replaced — no separate pre-read needed.
-        // The key index operation uses singleton slot optimization (for Cassandra):
-        // - Atomically DELETEs all clustering rows for this key/type
-        // - UPDATEs the static singleton slot with the new timer
-        // For singleton→singleton replacement, no tombstones are created.
-        let ((), (), old_times) = try_join!(
-            self.operations.insert_slab(new_slab.clone()),
+        // Step 1 (DUAL-INDEX WRITE): write the new timer to both indices in
+        // parallel. `clear_and_schedule_key` atomically clears the key index
+        // entry and returns the old trigger times it replaced — no separate
+        // pre-read needed. The key index uses the Cassandra singleton-slot
+        // optimisation: a single atomic op DELETEs all clustering rows and
+        // UPDATEs the static slot, so singleton→singleton replacement
+        // creates zero tombstones.
+        let ((), old_times) = try_join!(
             self.operations
                 .insert_slab_trigger(new_slab, trigger.clone()),
             self.operations.clear_and_schedule_key(trigger),

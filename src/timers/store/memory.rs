@@ -92,6 +92,11 @@ struct Inner {
     /// Maps each segment ID to its active set of slab IDs.
     segment_slabs: HashMap<SegmentId, BTreeSet<SlabId>>,
 
+    /// Persisted `slab_watermark` per segment. Mirrors the static column on
+    /// the Cassandra `timer_segments` table. `None` (or absent) means no
+    /// watermark has been set yet → callers scan from slab 0.
+    slab_watermarks: HashMap<SegmentId, SlabId>,
+
     /// V2 time-based index: maps (`segment_id`, `slab_size`, `slab_id`) to a
     /// map of triggers organized by (`timer_type`, `key`, `time`). Matches v2
     /// `timer_typed_slabs` table structure: partition key + clustering key.
@@ -224,6 +229,42 @@ impl TriggerOperations for InMemoryTriggerStore {
         Ok(())
     }
 
+    async fn get_slab_watermark(&self) -> Result<Option<SlabId>, Self::Error> {
+        let segment_id = self.segment.id;
+        Ok(self
+            .inner
+            .slab_watermarks
+            .get_async(&segment_id)
+            .await
+            .map(|entry| *entry.get()))
+    }
+
+    async fn set_slab_watermark(&self, watermark: Option<SlabId>) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        match watermark {
+            Some(w) => {
+                self.inner.slab_watermarks.upsert_async(segment_id, w).await;
+            }
+            None => {
+                self.inner.slab_watermarks.remove_async(&segment_id).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn batch_insert_slab_with_watermark(
+        &self,
+        slab: Slab,
+        watermark: Option<SlabId>,
+    ) -> Result<(), Self::Error> {
+        // In-memory mirror of the Cassandra UNLOGGED BATCH: insert the slab
+        // clustering row, then lower the watermark. The memory store has no
+        // crashes to atomise against, so sequential ops are equivalent.
+        self.insert_slab(slab).await?;
+        self.set_slab_watermark(watermark).await?;
+        Ok(())
+    }
+
     // -- Slab trigger operations (time index) --
 
     /// Stream all triggers of a specific type within a given slab.
@@ -287,6 +328,36 @@ impl TriggerOperations for InMemoryTriggerStore {
             // Stream all triggers from the partition
             for (_clustering_key, trigger) in triggers_map.iter() {
                 yield trigger.clone();
+            }
+        }
+    }
+
+    /// Stream every trigger across all timer types for slabs in `range`.
+    ///
+    /// The in-memory store has no I/O latency to amortise, so it scans each
+    /// slab serially. Matches the Cassandra impl's `(SlabId, Trigger)` shape
+    /// so consumers can track which slabs they have observed triggers for.
+    fn get_slab_triggers_in_range(
+        &self,
+        range: RangeInclusive<SlabId>,
+    ) -> impl Stream<Item = Result<(SlabId, Trigger), Self::Error>> + Send {
+        let segment_id = self.segment.id;
+        let slab_size = self.segment.slab_size;
+        try_stream! {
+            let Some(slabs) = self.inner.segment_slabs.get_async(&segment_id).await else {
+                return;
+            };
+            let slab_ids: Vec<SlabId> = slabs.range(range).copied().collect();
+            drop(slabs);
+
+            for slab_id in slab_ids {
+                let partition_key = (segment_id, slab_size, slab_id);
+                let Some(triggers_map) = self.inner.slab_triggers.get_async(&partition_key).await else {
+                    continue;
+                };
+                for (_clustering_key, trigger) in triggers_map.iter() {
+                    yield (slab_id, trigger.clone());
+                }
             }
         }
     }

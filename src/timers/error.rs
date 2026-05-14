@@ -20,7 +20,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TimerManagerError<T>
 where
-    T: ClassifyError + Error + Debug,
+    T: ClassifyError + Error + Debug + Send + Sync + 'static,
 {
     /// An error occurred in the persistent store layer.
     #[error("Timer store error: {0:#}")]
@@ -28,7 +28,7 @@ where
 
     /// Failed to schedule or unschedule a timer in the in-memory scheduler.
     #[error("Failed to schedule timer: {0:#}")]
-    Scheduler(#[from] TimerSchedulerError),
+    Scheduler(#[from] TimerSchedulerError<T>),
 
     /// A datetime conversion or arithmetic operation failed.
     #[error(transparent)]
@@ -62,7 +62,7 @@ pub enum ParseError {
 
 impl<T> ClassifyError for TimerManagerError<T>
 where
-    T: ClassifyError + Error + Debug,
+    T: ClassifyError + Error + Debug + Send + Sync + 'static,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {

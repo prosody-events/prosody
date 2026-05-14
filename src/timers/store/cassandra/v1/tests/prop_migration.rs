@@ -305,6 +305,13 @@ async fn setup_v3_state(
         .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 segment: {e:?}"))?;
 
     for trigger_data in &input.triggers {
+        let slab = Slab::from_time(input.initial_slab_size, trigger_data.time);
+        // Slab metadata is normally written by the scheduler actor; this
+        // fixture writes it directly so the migration test sees the slabs.
+        Box::pin(store.insert_slab(slab))
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to insert V3 slab: {e:?}"))?;
+
         let trigger = Trigger::new(
             trigger_data.key.clone(),
             trigger_data.time,
