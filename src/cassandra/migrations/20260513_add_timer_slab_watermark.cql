@@ -8,8 +8,7 @@
 --
 -- Invariant: when `slab_watermark` is non-NULL, it is strictly less than
 -- every `slab_id` clustering row present for the same `id`. NULL means
--- pre-migration / fresh segment; new code treats this as 0 (legacy
--- scan-from-zero).
+-- the column was never written; readers treat it as "scan from slab 0".
 --
 -- Rollback compatibility:
 --   Forward-only. Pre-PR code never reads `slab_watermark`, so stale
