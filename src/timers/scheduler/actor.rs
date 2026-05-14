@@ -205,10 +205,10 @@ async fn process_command<T>(
 ///   lowers the watermark (invariant I6) — the only way the actor can pull a
 ///   slab back below its own high-water without violating I1.
 /// - A **pending** slab sits above the load high-water and has never been
-///   touched by the actor. The trigger row (written first by the manager
-///   via [`TriggerStore::add_trigger`]) waits in storage; the actor just
-///   persists slab metadata so `load_step` can find it later. Keeps the
-///   in-memory queue bounded to the preload window.
+///   touched by the actor. The trigger row (written first by the manager via
+///   [`TriggerStore::add_trigger`]) waits in storage; the actor just persists
+///   slab metadata so `load_step` can find it later. Keeps the in-memory queue
+///   bounded to the preload window.
 pub(super) async fn handle_add<T>(
     state: &mut ActorState<T>,
     triggers: &mut TriggerQueue,

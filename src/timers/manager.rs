@@ -551,8 +551,8 @@ where
     /// Each prior state has its own forward move:
     /// - `Firing` → `FiringRescheduled` and re-queue (the store row already
     ///   exists; we only need the queue update).
-    /// - `Aborted` → `Scheduled` (the new schedule revives a previously
-    ///   aborted slot; the actor's `Add` call will run post-persistence).
+    /// - `Aborted` → `Scheduled` (the new schedule revives a previously aborted
+    ///   slot; the actor's `Add` call will run post-persistence).
     /// - `FiringRescheduled` is idempotent.
     /// - `Scheduled` and absent both defer to the post-persistence `Add`.
     async fn apply_clear_pre_persist(
@@ -613,8 +613,8 @@ where
     /// - `Aborted`: revive the cached tag (so the oracle's reload check is
     ///   coherent with the new trigger) and run the deferred `Add`.
     /// - `Scheduled` / absent: just the deferred `Add`.
-    /// - `Firing` / `FiringRescheduled`: pre-persistence already handled
-    ///   the in-memory side; nothing left to do here.
+    /// - `Firing` / `FiringRescheduled`: pre-persistence already handled the
+    ///   in-memory side; nothing left to do here.
     async fn apply_clear_post_persist(
         &self,
         trigger: &Trigger,
@@ -773,7 +773,8 @@ where
     /// Aborts a timer delivery.
     ///
     /// **State-aware behavior:**
-    /// - From `Firing`: transitions to `Aborted` (DB row preserved; not queued).
+    /// - From `Firing`: transitions to `Aborted` (DB row preserved; not
+    ///   queued).
     /// - From `FiringRescheduled`: transitions to `Scheduled` (timer already in
     ///   `DelayQueue`, will fire again without restart).
     /// - From `Scheduled`: transitions to `Aborted` and removes from

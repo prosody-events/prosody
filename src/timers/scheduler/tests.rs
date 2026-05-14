@@ -505,11 +505,17 @@ impl Fixture {
                 .is_none_or(|h| h < old_watermark)
         {
             return Err(format!(
-                "past-watermark schedule: highest_loaded_slab_id {:?} did not preserve ownership through old watermark {old_watermark}",
+                "past-watermark schedule: highest_loaded_slab_id {:?} did not preserve ownership \
+                 through old watermark {old_watermark}",
                 self.state.highest_loaded_slab_id
             ));
         }
-        if !self.triggers.active_triggers().contains(key, time, ty).await {
+        if !self
+            .triggers
+            .active_triggers()
+            .contains(key, time, ty)
+            .await
+        {
             return Err(format!(
                 "past-watermark schedule: trigger ({key}, {time:?}, {ty:?}) was not active"
             ));
@@ -705,15 +711,15 @@ impl Fixture {
                 .transpose()?;
             if actual_model_state != expected.active_state {
                 return Err(format!(
-                    "Active mismatch for ({key}, {time:?}, {ty:?}): \
-                     active={actual_model_state:?} expected={:?} \
-                     (in_store={}, owned={owned})",
+                    "Active mismatch for ({key}, {time:?}, {ty:?}): active={actual_model_state:?} \
+                     expected={:?} (in_store={}, owned={owned})",
                     expected.active_state, expected.in_store
                 ));
             }
             if expected.in_store && owned && expected.active_state.is_none() {
                 return Err(format!(
-                    "Model mismatch for ({key}, {time:?}, {ty:?}): owned stored timer is not active"
+                    "Model mismatch for ({key}, {time:?}, {ty:?}): owned stored timer is not \
+                     active"
                 ));
             }
         }
