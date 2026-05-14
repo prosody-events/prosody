@@ -332,36 +332,6 @@ impl TriggerOperations for InMemoryTriggerStore {
         }
     }
 
-    /// Stream every trigger across all timer types for persisted slabs in
-    /// `range`.
-    ///
-    /// The in-memory store has no I/O latency to amortise, so it scans each
-    /// slab serially.
-    fn get_slab_triggers_in_range(
-        &self,
-        range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        let segment_id = self.segment.id;
-        let slab_size = self.segment.slab_size;
-        try_stream! {
-            let Some(slabs) = self.inner.segment_slabs.get_async(&segment_id).await else {
-                return;
-            };
-            let slab_ids: Vec<SlabId> = slabs.range(range).copied().collect();
-            drop(slabs);
-
-            for slab_id in slab_ids {
-                let partition_key = (segment_id, slab_size, slab_id);
-                let Some(triggers_map) = self.inner.slab_triggers.get_async(&partition_key).await else {
-                    continue;
-                };
-                for (_clustering_key, trigger) in triggers_map.iter() {
-                    yield trigger.clone();
-                }
-            }
-        }
-    }
-
     /// Insert a trigger into a slab's time index.
     ///
     /// # Arguments

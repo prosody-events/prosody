@@ -56,9 +56,6 @@ use tracing::field::Empty;
 use tracing::{Span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// Maximum concurrent slab loads when fanning out a range scan.
-const LOAD_CONCURRENCY: usize = 16;
-
 impl TriggerOperations for CassandraTriggerStore {
     type Error = CassandraTriggerStoreError;
 
@@ -414,30 +411,6 @@ impl TriggerOperations for CassandraTriggerStore {
                 yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
             }
         }
-    }
-
-    fn get_slab_triggers_in_range(
-        &self,
-        range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        let slab_size = self.segment.slab_size;
-        let store = self.clone();
-        self.get_slab_range(range)
-            .map_ok(move |slab_id| {
-                let store = store.clone();
-                async move {
-                    Ok::<_, Self::Error>(try_stream! {
-                        let slab = Slab::new(slab_id, slab_size);
-                        let stream = store.get_slab_triggers_all_types(slab);
-                        pin_mut!(stream);
-                        while let Some(trigger) = cooperative(stream.try_next()).await? {
-                            yield trigger;
-                        }
-                    })
-                }
-            })
-            .try_buffer_unordered(LOAD_CONCURRENCY)
-            .try_flatten()
     }
 
     #[instrument(level = "debug", skip(self), err)]

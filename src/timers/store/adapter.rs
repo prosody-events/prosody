@@ -121,13 +121,6 @@ where
         self.operations.get_slab_triggers_all_types(slab)
     }
 
-    fn get_slab_triggers_in_range(
-        &self,
-        range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
-        self.operations.get_slab_triggers_in_range(range)
-    }
-
     fn insert_slab(&self, slab: Slab) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.operations.insert_slab(slab)
     }

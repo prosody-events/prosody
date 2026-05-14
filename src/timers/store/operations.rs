@@ -112,7 +112,7 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // =========================================================================
-    // Slab Trigger Operations (5 methods)
+    // Slab Trigger Operations (4 methods)
     // =========================================================================
 
     /// Streams all triggers of a specific type within a slab's time range.
@@ -126,16 +126,6 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     fn get_slab_triggers_all_types(
         &self,
         slab: Slab,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
-
-    /// Streams every trigger across all timer types for persisted slabs in
-    /// `range`.
-    ///
-    /// Implementations are expected to fan out per-slab scans concurrently so
-    /// startup load doesn't serialise on Cassandra latency.
-    fn get_slab_triggers_in_range(
-        &self,
-        range: RangeInclusive<SlabId>,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     /// Inserts a trigger into the slab index.

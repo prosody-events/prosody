@@ -10,15 +10,15 @@
 use super::{Command, CommandOperation};
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
-use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::queue::TriggerQueue;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, TriggerStore};
-use ahash::HashSet;
-use futures::TryStreamExt;
+use crate::timers::{DELETE_CONCURRENCY, Trigger};
+use futures::{StreamExt, TryStreamExt, stream};
 use rand::RngExt;
+use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 use std::pin::pin;
 use std::time::Duration;
@@ -36,6 +36,9 @@ pub(super) const MIN_PRELOAD: CompactDuration = CompactDuration::new(60);
 /// Backoff used when no further load work can currently be scheduled.
 const LOAD_IDLE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Maximum concurrent per-slab trigger scans during a load tick.
+const LOAD_CONCURRENCY: usize = 16;
+
 /// Backoff after a Cassandra-side failure inside the actor's load/cleanup
 /// arms — these errors are typically transient.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -47,12 +50,13 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 pub(super) struct ActorState<T> {
     pub(super) store: T,
     pub(super) segment: Segment,
-    /// Slab metadata rows this actor knows it has written or observed.
+    /// Slab metadata rows this actor has written or observed in the loaded
+    /// prefix.
     ///
-    /// This is only a write-deduplication memo. It is not ownership state:
-    /// ownership is the compact numeric range represented by the persisted
-    /// watermark and `highest_loaded_slab_id`.
-    pub(super) known_slab_ids: HashSet<SlabId>,
+    /// Within `..=highest_loaded_slab_id`, this set is the actor's source of
+    /// truth for which persisted slab rows still need cleanup. The load loop
+    /// is the only code path that discovers preexisting rows from storage.
+    pub(super) known_slab_ids: BTreeSet<SlabId>,
     /// Last persisted value of `slab_watermark` for this segment.
     ///
     /// Invariant I1: when `Some(w)`, every clustering row in `timer_segments`
@@ -86,7 +90,7 @@ pub(super) async fn run_actor<T>(
     let mut state: ActorState<T> = ActorState {
         store,
         segment,
-        known_slab_ids: HashSet::default(),
+        known_slab_ids: BTreeSet::new(),
         last_persisted_watermark: None,
         highest_loaded_slab_id: None,
         preload_window,
@@ -283,95 +287,91 @@ where
     };
 
     let active_slab_ids = collect_active_slab_ids(state.segment.slab_size, triggers).await;
+    let completed_slabs = completed_slab_ids(state, now_slab_id, &active_slab_ids);
 
-    loop {
-        let candidate = match cleanup_candidate(state, now_slab_id, &active_slab_ids).await {
-            Ok(candidate) => candidate,
-            Err(e) => {
-                warn!("cleanup_step: failed to find cleanup candidate: {e:#}");
-                return;
+    match delete_completed_slabs(&state.store, &completed_slabs).await {
+        Ok(()) => {
+            for slab_id in completed_slabs {
+                state.known_slab_ids.remove(&slab_id);
             }
-        };
-
-        if let Some(slab_id) = candidate {
-            if let Err(e) = state.store.delete_slab(slab_id).await {
-                warn!(
-                    slab_id,
-                    "cleanup_step: failed to delete slab: {e:#}; will retry"
-                );
-                return;
-            }
-            state.known_slab_ids.remove(&slab_id);
-        } else {
-            if let Err(e) = maybe_advance_watermark(state, now_slab_id).await {
-                warn!("cleanup_step: failed to advance watermark: {e:#}");
-            }
+        }
+        Err(e) => {
+            warn!("cleanup_step: failed to delete slab: {e:#}; will retry");
             return;
         }
     }
+
+    if let Err(e) = maybe_advance_watermark(state, now_slab_id, &active_slab_ids).await {
+        warn!("cleanup_step: failed to advance watermark: {e:#}");
+    }
 }
 
-async fn cleanup_candidate<T>(
+fn cleanable_slab_end<T>(state: &ActorState<T>, now_slab_id: SlabId) -> Option<SlabId> {
+    state
+        .highest_loaded_slab_id
+        .and_then(|highest_loaded| now_slab_id.checked_sub(1).map(|s| s.min(highest_loaded)))
+}
+
+fn completed_slab_ids<T>(
     state: &ActorState<T>,
     now_slab_id: SlabId,
-    active_slab_ids: &HashSet<SlabId>,
-) -> Result<Option<SlabId>, T::Error>
+    active_slab_ids: &BTreeSet<SlabId>,
+) -> Vec<SlabId> {
+    cleanable_slab_end(state, now_slab_id)
+        .map(|end| {
+            state
+                .known_slab_ids
+                .range(..=end)
+                .filter(|slab_id| !active_slab_ids.contains(slab_id))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn delete_completed_slabs<T>(store: &T, slab_ids: &[SlabId]) -> Result<(), T::Error>
 where
     T: TriggerStore,
 {
-    let Some(highest_loaded) = state.highest_loaded_slab_id else {
-        return Ok(None);
-    };
-    let Some(end) = now_slab_id.checked_sub(1).map(|s| s.min(highest_loaded)) else {
-        return Ok(None);
-    };
-    let start = state
-        .last_persisted_watermark
-        .map_or(0, |w| w.saturating_add(1));
-    if start > end {
-        return Ok(None);
-    }
-
-    let mut slabs = pin!(state.store.get_slab_range(start..=end));
-    while let Some(slab_id) = cooperative(slabs.try_next()).await? {
-        if !active_slab_ids.contains(&slab_id) {
-            return Ok(Some(slab_id));
-        }
-    }
-    Ok(None)
+    stream::iter(slab_ids.iter().copied())
+        .map(|slab_id| async move {
+            store.delete_slab(slab_id).await?;
+            Ok(())
+        })
+        .buffer_unordered(DELETE_CONCURRENCY)
+        .try_collect::<()>()
+        .await
 }
 
-/// Raises `slab_watermark` to one below the lowest slab still represented
-/// in the store, when the new value would be a meaningful increase over
-/// what we already persisted.
+/// Raises `slab_watermark` using only actor-owned state.
 ///
-/// When the store has no slabs at all, fall back to `now_slab_id - 1` —
-/// genuinely safe because nothing's persisted to step on.
+/// After [`cleanup_step`] has found no more deletable slabs, every persisted
+/// slab in the cleanable owned prefix is active. The actor can therefore
+/// advance to one below the lowest active slab in that prefix, or to the end
+/// of the prefix when it is empty, without asking storage to rediscover the
+/// partition's low end.
 pub(super) async fn maybe_advance_watermark<T>(
     state: &mut ActorState<T>,
     now_slab_id: SlabId,
+    active_slab_ids: &BTreeSet<SlabId>,
 ) -> Result<(), T::Error>
 where
     T: TriggerStore,
 {
-    let lowest_in_store = pin!(state.store.get_slab_range(0..=SlabId::MAX))
-        .try_next()
-        .await?;
-
-    let candidate = match lowest_in_store {
-        Some(first_slab) => first_slab.checked_sub(1),
-        None => now_slab_id.checked_sub(1),
-    };
-
-    let Some(candidate) = candidate else {
+    let Some(end) = cleanable_slab_end(state, now_slab_id) else {
         return Ok(());
     };
 
-    let should_persist = match state.last_persisted_watermark {
-        Some(current) => candidate > current,
-        None => true,
+    let lowest_active = active_slab_ids.range(..=end).next().copied();
+
+    let Some(candidate) = lowest_active.map_or(Some(end), |slab_id| slab_id.checked_sub(1)) else {
+        return Ok(());
     };
-    if !should_persist {
+
+    if state
+        .last_persisted_watermark
+        .is_some_and(|current| candidate <= current)
+    {
         return Ok(());
     }
 
@@ -381,13 +381,13 @@ where
     Ok(())
 }
 
-/// Load tick: record and drain every persisted slab from the current load
-/// high-water up to the slab containing `now + preload_window`, then push the
-/// high-water forward.
+/// Load tick: read slab metadata from the current load high-water up to the
+/// slab containing `now + preload_window`, drain each registered slab's
+/// triggers, then push the high-water forward.
 ///
-/// The store fans the per-slab scans out concurrently via
-/// [`TriggerStore::get_slab_triggers_in_range`], so startup catch-up runs at
-/// up to `LOAD_CONCURRENCY` slabs in flight.
+/// This is the actor's only slab-table read path after startup. Cleanup and
+/// watermark advancement consume the slab IDs learned here rather than
+/// re-scanning metadata.
 pub(super) async fn load_step<T>(state: &mut ActorState<T>, triggers: &mut TriggerQueue)
 where
     T: TriggerStore,
@@ -450,24 +450,44 @@ where
     }
 }
 
-/// Drains a [`TriggerStore::get_slab_triggers_in_range`] stream into the
-/// trigger queue. Isolated as a helper so the caller can let the stream's
-/// borrow on `store` end before mutating other actor state.
+/// Drains registered slabs and their triggers into the trigger queue.
+///
+/// The slab metadata scan happens here, in the load loop. Empty slab rows are
+/// still returned in `registered` so cleanup can delete them later without
+/// reading the slab table again.
 async fn drain_slab_range<T>(
     store: &T,
     range: RangeInclusive<SlabId>,
     triggers: &mut TriggerQueue,
-) -> Result<(HashSet<SlabId>, usize), T::Error>
+) -> Result<(BTreeSet<SlabId>, usize), T::Error>
 where
     T: TriggerStore,
 {
-    let mut stream = pin!(store.get_slab_triggers_in_range(range));
-    let mut registered = HashSet::default();
+    let store_for_tasks = store.clone();
+    let mut stream = pin!(
+        store
+            .get_slab_range(range)
+            .map_ok(move |slab_id| {
+                let store = store_for_tasks.clone();
+                async move {
+                    let mut slab_triggers = Vec::new();
+                    let mut triggers = pin!(store.get_slab_triggers_all_types(slab_id));
+                    while let Some(trigger) = cooperative(triggers.try_next()).await? {
+                        slab_triggers.push(trigger);
+                    }
+                    Ok::<_, T::Error>((slab_id, slab_triggers))
+                }
+            })
+            .try_buffer_unordered(LOAD_CONCURRENCY)
+    );
+    let mut registered = BTreeSet::new();
     let mut count = 0_usize;
-    while let Some(trigger) = cooperative(stream.try_next()).await? {
-        registered.insert(Slab::from_time(store.slab_size(), trigger.time).id());
-        triggers.insert(trigger).await;
-        count = count.saturating_add(1);
+    while let Some((slab_id, slab_triggers)) = cooperative(stream.try_next()).await? {
+        registered.insert(slab_id);
+        for trigger in slab_triggers {
+            triggers.insert(trigger).await;
+            count = count.saturating_add(1);
+        }
     }
     Ok((registered, count))
 }
@@ -507,8 +527,8 @@ fn schedule_next_load<T>(state: &mut ActorState<T>, target_slab: &Slab) {
 pub(super) async fn collect_active_slab_ids(
     slab_size: CompactDuration,
     triggers: &TriggerQueue,
-) -> HashSet<SlabId> {
-    let mut active = HashSet::default();
+) -> BTreeSet<SlabId> {
+    let mut active = BTreeSet::new();
     triggers
         .active_triggers()
         .scan_active_times(|time, _timer_type| {

@@ -68,7 +68,7 @@ fn fresh_state(store: TestStore, segment: Segment) -> ActorState<TestStore> {
     ActorState {
         store,
         segment,
-        known_slab_ids: ahash::HashSet::default(),
+        known_slab_ids: BTreeSet::new(),
         last_persisted_watermark: None,
         highest_loaded_slab_id: None,
         preload_window: CompactDuration::new(PRELOAD_SECS),
@@ -574,7 +574,6 @@ impl Fixture {
         };
 
         let expected_deletes = cleanup_candidates_for_test(
-            before_watermark,
             self.state.highest_loaded_slab_id,
             now_slab,
             &before_active,
@@ -627,18 +626,15 @@ impl Fixture {
             }
         }
 
-        let candidate = match after_store_slabs.iter().next().copied() {
-            Some(first_slab) => first_slab.checked_sub(1),
-            None => now_slab.checked_sub(1),
-        };
-        let should_advance = match (before_watermark, candidate) {
-            (_, None) => false,
-            (Some(current), Some(candidate)) => candidate > current,
-            (None, Some(_)) => true,
-        };
-        if should_advance && self.state.last_persisted_watermark != candidate {
+        let expected_watermark = expected_watermark_after_cleanup_for_test(
+            before_watermark,
+            self.state.highest_loaded_slab_id,
+            now_slab,
+            &before_active,
+        );
+        if self.state.last_persisted_watermark != expected_watermark {
             return Err(format!(
-                "watermark progress: expected {candidate:?}, got {:?}",
+                "watermark progress: expected {expected_watermark:?}, got {:?}",
                 self.state.last_persisted_watermark
             ));
         }
@@ -729,10 +725,9 @@ impl Fixture {
 }
 
 fn cleanup_candidates_for_test(
-    watermark: Option<SlabId>,
     highest_loaded: Option<SlabId>,
     now_slab: SlabId,
-    active: &ahash::HashSet<SlabId>,
+    active: &BTreeSet<SlabId>,
     store_slabs: &BTreeSet<SlabId>,
 ) -> Vec<SlabId> {
     let Some(highest_loaded) = highest_loaded else {
@@ -741,16 +736,41 @@ fn cleanup_candidates_for_test(
     let Some(end) = now_slab.checked_sub(1).map(|s| s.min(highest_loaded)) else {
         return Vec::new();
     };
-    let start = watermark.map_or(0, |w| w.saturating_add(1));
-    if start > end {
-        return Vec::new();
-    }
-
     store_slabs
-        .range(start..=end)
+        .range(..=end)
         .copied()
         .filter(|slab_id| !active.contains(slab_id))
         .collect()
+}
+
+fn watermark_candidate_for_test(
+    highest_loaded: Option<SlabId>,
+    now_slab: SlabId,
+    active: &BTreeSet<SlabId>,
+) -> Option<SlabId> {
+    let highest_loaded = highest_loaded?;
+    let end = now_slab.checked_sub(1)?.min(highest_loaded);
+
+    active
+        .range(..=end)
+        .next()
+        .copied()
+        .and_then(|first_active| first_active.checked_sub(1))
+        .or(Some(end))
+}
+
+fn expected_watermark_after_cleanup_for_test(
+    current_watermark: Option<SlabId>,
+    highest_loaded: Option<SlabId>,
+    now_slab: SlabId,
+    active: &BTreeSet<SlabId>,
+) -> Option<SlabId> {
+    let candidate = watermark_candidate_for_test(highest_loaded, now_slab, active);
+    match (current_watermark, candidate) {
+        (_, None) => current_watermark,
+        (Some(current), Some(candidate)) if candidate <= current => Some(current),
+        (_, Some(candidate)) => Some(candidate),
+    }
 }
 
 /// Enumerates every `(key, time, type)` that the generator can produce

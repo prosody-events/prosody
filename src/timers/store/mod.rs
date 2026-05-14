@@ -257,13 +257,6 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
         slab_id: SlabId,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
-    /// Streams every trigger across all timer types for persisted slabs in
-    /// `range`, fanning out the per-slab scans concurrently.
-    fn get_slab_triggers_in_range(
-        &self,
-        range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
-
     // ===================================================================
     // Slab Metadata Writes (2 methods) - Used by SchedulerActor
     // ===================================================================
