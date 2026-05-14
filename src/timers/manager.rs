@@ -181,6 +181,8 @@ where
     /// - Includes timers in `Scheduled` state (waiting to fire).
     /// - Includes timers in `FiringRescheduled` state (will fire again after
     ///   current handler completes).
+    /// - Includes timers in `Aborted` state (persisted for recovery, but not
+    ///   currently queued in this process).
     ///
     /// # Arguments
     ///
@@ -208,6 +210,7 @@ where
         // - Not in ActiveTriggers (timer not loaded yet, will fire when slab loads)
         // - In Scheduled state (waiting to fire)
         // - In FiringRescheduled state (will fire again after commit)
+        // - In Aborted state (persisted for recovery/requeue)
         // Exclude if:
         // - In Firing state (currently being processed, won't fire again unless
         //   rescheduled)
@@ -223,7 +226,12 @@ where
                 async move {
                     match state.await {
                         Some(TimerState::Firing) => false,
-                        Some(TimerState::Scheduled | TimerState::FiringRescheduled) | None => true,
+                        Some(
+                            TimerState::Scheduled
+                            | TimerState::FiringRescheduled
+                            | TimerState::Aborted,
+                        )
+                        | None => true,
                     }
                 }
             })
@@ -241,6 +249,8 @@ where
     ///   to `FiringRescheduled` and adds to `DelayQueue` without DB write.
     /// - If the timer is in `FiringRescheduled` state, this is idempotent
     ///   (no-op).
+    /// - If the timer is in `Aborted` state, transitions to `Scheduled` and
+    ///   re-adds only to the in-memory queue, preserving the stored tag.
     /// - Otherwise, performs normal scheduling with DB write.
     ///
     /// **Singleton vs Overflow routing:**
@@ -289,6 +299,29 @@ where
             // Already FIRING_RESCHEDULED: idempotent no-op
             Some(TimerState::FiringRescheduled) => Ok(()),
 
+            // ABORTED → SCHEDULED: DB row and active tag are already present;
+            // only requeue the timer.
+            Some(TimerState::Aborted) => {
+                self.0
+                    .scheduler
+                    .active_triggers()
+                    .set_state(
+                        &trigger.key,
+                        trigger.time,
+                        trigger.timer_type,
+                        TimerState::Scheduled,
+                    )
+                    .await;
+                self.0.scheduler.add_to_queue(trigger.clone()).await?;
+                self.0.telemetry.timer_scheduled(
+                    trigger.key.clone(),
+                    trigger.time,
+                    trigger.timer_type,
+                    self.0.source.clone(),
+                );
+                Ok(())
+            }
+
             // SCHEDULED or UNSCHEDULED: normal scheduling path.
             //
             // The trigger row writes happen before the scheduler is told
@@ -328,6 +361,8 @@ where
     /// - If the timer is in `FiringRescheduled` state, transitions back to
     ///   `Firing` and removes from `DelayQueue`. The timer will complete
     ///   normally without firing again.
+    /// - If the timer is in `Aborted` state, removes from `ActiveTriggers` and
+    ///   persistent storage through the normal unschedule path.
     /// - Otherwise, performs normal unscheduling with DB and scheduler removal.
     ///
     /// # Arguments
@@ -371,7 +406,7 @@ where
                 Ok(())
             }
 
-            // SCHEDULED or UNSCHEDULED: normal unscheduling path.
+            // SCHEDULED, ABORTED, or UNSCHEDULED: normal unscheduling path.
             //
             // The scheduler's `unschedule` is idempotent: if the slab is not
             // owned in-memory, the actor has nothing to remove and returns
@@ -442,7 +477,7 @@ where
     /// For each existing timer at a different time:
     /// - `Firing` → no-op (timer is being processed)
     /// - `FiringRescheduled` → transitions to `Firing` (cancels reschedule)
-    /// - `Scheduled` → unscheduled from `DelayQueue`
+    /// - `Scheduled`/`Aborted` → unscheduled from active state/`DelayQueue`
     ///
     /// For the new timer:
     /// - If same time as existing `Firing` → transitions to `FiringRescheduled`
@@ -517,6 +552,24 @@ where
                     "clear_and_schedule: new timer already FiringRescheduled, no-op"
                 );
             }
+            Some(TimerState::Aborted) => {
+                debug!(
+                    key = %trigger.key,
+                    timer_type = ?trigger.timer_type,
+                    time = ?trigger.time,
+                    "clear_and_schedule: new timer is Aborted, transitioning to Scheduled"
+                );
+                self.0
+                    .scheduler
+                    .active_triggers()
+                    .set_state(
+                        &trigger.key,
+                        trigger.time,
+                        trigger.timer_type,
+                        TimerState::Scheduled,
+                    )
+                    .await;
+            }
             _ => {
                 // Defer the scheduler `Add` until after persistence (Step 3
                 // below) so the scheduler's own slab metadata write doesn't
@@ -540,10 +593,21 @@ where
             .await
             .map_err(TimerManagerError::Store)?;
 
+        if new_timer_state == Some(TimerState::Aborted) {
+            self.0
+                .scheduler
+                .active_triggers()
+                .set_tag(&trigger.key, trigger.time, trigger.timer_type, trigger.tag)
+                .await;
+        }
+
         // Step 3: Tell the scheduler about the new trigger now that its
         // store row exists. The Firing / FiringRescheduled branches handled
         // their queue updates in Step 1 and skip this.
-        if matches!(new_timer_state, None | Some(TimerState::Scheduled)) {
+        if matches!(
+            new_timer_state,
+            None | Some(TimerState::Scheduled | TimerState::Aborted)
+        ) {
             debug!(
                 key = %trigger.key,
                 timer_type = ?trigger.timer_type,
@@ -605,6 +669,8 @@ where
     /// - From `Firing`: deletes from DB and removes from `ActiveTriggers`.
     /// - From `FiringRescheduled`: transitions to `Scheduled` (keeps DB row,
     ///   timer will fire again).
+    /// - From `Aborted`: deletes from DB and removes from `ActiveTriggers`,
+    ///   matching existing non-firing idempotent completion behavior.
     ///
     /// Typically invoked by [`crate::timers::uncommitted::FiringTimer`]'s
     /// [`crate::consumer::Uncommitted::commit()`] impl.
@@ -671,15 +737,14 @@ where
     /// Aborts a timer delivery.
     ///
     /// **State-aware behavior:**
-    /// - From `Firing`: removes from `ActiveTriggers` (DB row preserved for
-    ///   recovery via the scheduler actor).
+    /// - From `Firing`: transitions to `Aborted` (DB row preserved; not queued).
     /// - From `FiringRescheduled`: transitions to `Scheduled` (timer already in
     ///   `DelayQueue`, will fire again without restart).
+    /// - From `Scheduled`: transitions to `Aborted` and removes from
+    ///   `DelayQueue` (DB row preserved).
     ///
-    /// Does not delete the timer from persistent storage; it can be reloaded
-    /// and retried later by the scheduler actor (from `Firing`) or fires again at
-    /// its scheduled time via the existing queue entry (from
-    /// `FiringRescheduled`).
+    /// Does not delete the timer from persistent storage; aborted timers can be
+    /// requeued explicitly or recovered as `Scheduled` after scheduler restart.
     ///
     /// # Arguments
     ///
@@ -698,10 +763,24 @@ where
                     .await;
             }
 
-            // FIRING or anything else: remove from ActiveTriggers, DB preserved.
-            _ => {
-                self.0.scheduler.deactivate(key, time, timer_type).await;
+            // SCHEDULED → ABORTED: DB row preserved, queue entry removed.
+            Some(TimerState::Scheduled) => {
+                active
+                    .set_state(key, time, timer_type, TimerState::Aborted)
+                    .await;
+                let trigger = Trigger::new(key.clone(), time, timer_type, Span::current());
+                let _ = self.0.scheduler.remove_from_queue(trigger).await;
             }
+
+            // FIRING → ABORTED: delivery was already removed from DelayQueue.
+            Some(TimerState::Firing) => {
+                active
+                    .set_state(key, time, timer_type, TimerState::Aborted)
+                    .await;
+            }
+
+            // Already aborted, or absent: idempotent no-op. DB is preserved.
+            Some(TimerState::Aborted) | None => {}
         }
     }
 
@@ -760,7 +839,7 @@ pub(crate) fn fresh_tag_distinct_from(current: i32) -> i32 {
 /// current state without introducing new transition paths:
 /// - `Firing` → no-op (being processed)
 /// - `FiringRescheduled` → `Firing` (cancels reschedule)
-/// - `Scheduled`/absent → removed from `DelayQueue`
+/// - `Scheduled`/`Aborted`/absent → removed from active state/`DelayQueue`
 async fn unschedule_replaced_timers<E>(
     scheduler: &TriggerScheduler<E>,
     new_trigger: &Trigger,
@@ -2285,7 +2364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_abort_firing_preserves_db() -> Result<()> {
-        // Verify abort from Firing state keeps DB row but removes from ActiveTriggers
+        // Verify abort from Firing state keeps DB row and protects active slab state.
         time::pause();
 
         let (stream, manager, _shutdown_tx) = setup_timer_manager().await?;
@@ -2314,13 +2393,24 @@ mod tests {
             "Timer in Firing state should be excluded from scheduled_times()"
         );
 
-        // Abort the timer (removes from ActiveTriggers, DB preserved for recovery)
+        // Abort the timer (transitions to Aborted, DB preserved for recovery)
         let (_, guard) = firing.into_inner();
         guard.abort().await;
 
-        // Verify timer is removed from ActiveTriggers but still in DB.
-        // After abort, timer is no longer in ActiveTriggers, so scheduled_times()
-        // returns it (DB-only timers are included).
+        let state_after_abort = manager
+            .0
+            .scheduler
+            .active_triggers()
+            .get_state(&trigger.key, trigger.time, trigger.timer_type)
+            .await;
+        assert_eq!(
+            state_after_abort,
+            Some(TimerState::Aborted),
+            "Timer should remain active as Aborted after abort"
+        );
+
+        // Verify timer is still visible through scheduled_times because its DB
+        // row is preserved for recovery/requeue.
         let times_after_abort = manager
             .scheduled_times(&trigger.key, TimerType::Application)
             .await?;
