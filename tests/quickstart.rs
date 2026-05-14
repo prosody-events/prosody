@@ -5,6 +5,8 @@
 //! for observability, a unique topic and group ID for test isolation, and
 //! a disabled probe server to avoid port conflicts with parallel tests.
 
+#![recursion_limit = "256"]
+
 use color_eyre::eyre::{Result, eyre};
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::prelude::*;
