@@ -91,7 +91,7 @@ mod tests {
         let segment1 = get_or_create_segment(&store, "first-segment").await?;
         let segment2 = get_or_create_segment(&store, "second-segment").await?;
 
-        // Should return the first segment (existing one — name unchanged)
+        // Should return the first segment (existing one; name unchanged).
         assert_eq!(segment1.id, segment2.id);
         assert_eq!(segment1.name, segment2.name);
         Ok(())

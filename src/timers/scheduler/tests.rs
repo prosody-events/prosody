@@ -14,6 +14,9 @@
 //!   P5 (restart preserves): the property holds across actor restart, so no
 //!       timer rows can be lost when the in-memory state is discarded and
 //!       rebuilt against the same store.
+//!   P6 (loaded metadata tracked): every persisted slab at or below the load
+//!       high-water is present in `loaded_slab_ids`, even when it has no
+//!       trigger rows.
 
 use super::actor::{
     ActorState, MIN_PRELOAD, calculate_preload, calculate_wait_time, cleanup_step,
@@ -333,7 +336,7 @@ impl Fixture {
                 load_step(&mut self.state, &mut self.triggers).await;
             }
             Op::CleanupStep => {
-                self.check_cleanup_safety().await?;
+                self.check_cleanup_effects().await?;
             }
             Op::Restart => {
                 self.state = fresh_state(self.store.clone(), self.segment.clone());
@@ -348,21 +351,40 @@ impl Fixture {
         Ok(())
     }
 
-    /// Wraps `cleanup_step` so we can verify P4 (no active or now-slab
-    /// deletion) by diffing snapshots.
-    async fn check_cleanup_safety(&mut self) -> StdResult<(), String> {
+    /// Wraps `cleanup_step` so we can verify P4 (safety) plus the progress
+    /// properties that keep slab metadata and the watermark from getting
+    /// pinned behind empty rows.
+    async fn check_cleanup_effects(&mut self) -> StdResult<(), String> {
         let before_loaded = self.state.loaded_slab_ids.clone();
         let before_active = collect_active_slab_ids(self.segment.slab_size, &self.triggers).await;
-
-        cleanup_step(&mut self.state, &self.triggers).await;
-
-        let after_loaded = &self.state.loaded_slab_ids;
-        let deleted: BTreeSet<SlabId> = before_loaded.difference(after_loaded).copied().collect();
+        let before_store_slabs: BTreeSet<SlabId> = self
+            .store
+            .get_slab_range(0..=SlabId::MAX)
+            .try_collect()
+            .await
+            .map_err(|e| format!("get_slab_range before cleanup: {e:?}"))?;
+        let before_watermark = self.state.last_persisted_watermark;
 
         let now_slab = match CompactDateTime::now() {
             Ok(t) => Slab::from_time(self.segment.slab_size, t).id(),
             Err(_) => self.now_slab,
         };
+
+        let expected_delete = before_loaded
+            .iter()
+            .copied()
+            .find(|slab_id| *slab_id < now_slab && !before_active.contains(slab_id));
+
+        cleanup_step(&mut self.state, &self.triggers).await;
+
+        let after_loaded = &self.state.loaded_slab_ids;
+        let after_store_slabs: BTreeSet<SlabId> = self
+            .store
+            .get_slab_range(0..=SlabId::MAX)
+            .try_collect()
+            .await
+            .map_err(|e| format!("get_slab_range after cleanup: {e:?}"))?;
+        let deleted: BTreeSet<SlabId> = before_loaded.difference(after_loaded).copied().collect();
 
         for &slab_id in &deleted {
             if before_active.contains(&slab_id) {
@@ -376,6 +398,32 @@ impl Fixture {
                 ));
             }
         }
+
+        if let Some(slab_id) = expected_delete {
+            if after_loaded.contains(&slab_id) || after_store_slabs.contains(&slab_id) {
+                return Err(format!(
+                    "cleanup progress: eligible slab {slab_id} was not deleted"
+                ));
+            }
+            return Ok(());
+        }
+
+        let candidate = match before_store_slabs.iter().next().copied() {
+            Some(first_slab) => first_slab.checked_sub(1),
+            None => now_slab.checked_sub(1),
+        };
+        let should_advance = match (before_watermark, candidate) {
+            (_, None) => false,
+            (Some(current), Some(candidate)) => candidate > current,
+            (None, Some(_)) => true,
+        };
+        if should_advance && self.state.last_persisted_watermark != candidate {
+            return Err(format!(
+                "watermark progress: expected {candidate:?}, got {:?}",
+                self.state.last_persisted_watermark
+            ));
+        }
+
         Ok(())
     }
 
@@ -411,6 +459,20 @@ impl Fixture {
         // directions (every triple's actual state matches the expected
         // state derived from `expected` + `loaded_slab_ids`).
         let loaded = &self.state.loaded_slab_ids;
+        if let Some(highest_loaded) = self.state.highest_loaded_slab_id {
+            let missing_loaded: Vec<_> = store_slabs
+                .iter()
+                .copied()
+                .filter(|slab_id| *slab_id <= highest_loaded && !loaded.contains(slab_id))
+                .collect();
+            if !missing_loaded.is_empty() {
+                return Err(format!(
+                    "P6 violated: persisted slabs <= high-water {highest_loaded} \
+                     missing from loaded_slab_ids: {missing_loaded:?}"
+                ));
+            }
+        }
+
         for (key, time, ty) in &self.universe {
             let in_expected = self.expected.contains(&(key.clone(), *time, *ty));
             let slab_id = Slab::from_time(self.segment.slab_size, *time).id();

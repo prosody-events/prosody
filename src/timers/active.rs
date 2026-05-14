@@ -47,7 +47,7 @@
 //! | `FIRING_RESCHEDULED` | `commit()`         | `SCHEDULED`          | → `Scheduled`         | -              | -          |
 //! | `FIRING_RESCHEDULED` | `abort()`          | `SCHEDULED`          | → `Scheduled`         | -              | -          |
 //!
-//! *Database row preserved; slab loader restores on restart.
+//! *Database row preserved; the scheduler actor restores on restart.
 //!
 //! # API Behavior by State
 //!

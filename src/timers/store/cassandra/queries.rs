@@ -475,7 +475,7 @@ cassandra_queries! {
         /// Reads the static `slab_watermark` column for a segment.
         ///
         /// Returns `Option<i32>` (Cassandra static columns are NULL until set).
-        /// `None` = pre-migration / fresh segment → loader scans from `slab_id = 0`.
+        /// `None` = pre-migration / fresh segment → scheduler scans from `slab_id = 0`.
         get_slab_watermark: (
             "SELECT slab_watermark FROM $keyspace.{} WHERE id = ? LIMIT 1",
             TABLE_SEGMENTS

@@ -28,8 +28,8 @@ use std::error::Error;
 use std::fmt::Debug;
 
 pub use crate::timers::error::TimerManagerError;
-use crate::timers::loader::get_or_create_segment;
 use crate::timers::scheduler::TriggerScheduler;
+use crate::timers::segment::get_or_create_segment;
 use crate::timers::store::TriggerStore;
 use crate::timers::{DELETE_CONCURRENCY, PendingTimer, TimerSemaphores, TimerType, Trigger};
 use async_stream::stream;
@@ -102,16 +102,15 @@ where
     /// Initializes:
     /// 1. A persistent segment record (creating or retrieving it).
     /// 2. An in-memory scheduler and its command processing task.
-    /// 3. A background slab loader task for preloading upcoming timers.
+    /// 3. A background scheduler actor for preloading upcoming timers.
     ///
     /// # Arguments
     ///
     /// * `config` - Stable configuration: segment identity, store, and
     ///   telemetry context.
-    /// * `heartbeats` - Registry for monitoring timer loader and scheduler
-    ///   liveness.
-    /// * `shutdown_rx` - Watch channel signaling partition shutdown; the slab
-    ///   loader exits at `>= ShutdownPhase::Draining`.
+    /// * `heartbeats` - Registry for monitoring timer scheduler liveness.
+    /// * `shutdown_rx` - Watch channel signaling partition shutdown; the
+    ///   scheduler actor exits at `>= ShutdownPhase::Draining`.
     /// * `semaphores` - Per-type semaphores bounding in-flight timer events
     ///   across all partitions; the timer stream blocks when all permits for
     ///   the trigger's type are held and terminates if the semaphore is closed.
@@ -673,12 +672,12 @@ where
     ///
     /// **State-aware behavior:**
     /// - From `Firing`: removes from `ActiveTriggers` (DB row preserved for
-    ///   recovery via slab loader).
+    ///   recovery via the scheduler actor).
     /// - From `FiringRescheduled`: transitions to `Scheduled` (timer already in
     ///   `DelayQueue`, will fire again without restart).
     ///
     /// Does not delete the timer from persistent storage; it can be reloaded
-    /// and retried later by the slab loader (from `Firing`) or fires again at
+    /// and retried later by the scheduler actor (from `Firing`) or fires again at
     /// its scheduled time via the existing queue entry (from
     /// `FiringRescheduled`).
     ///
@@ -885,7 +884,7 @@ mod tests {
     ///
     /// Returns `(stream, manager, shutdown_tx)`. The caller holds
     /// `shutdown_tx` and can send `ShutdownPhase::Draining` to stop the
-    /// background slab loader.
+    /// background scheduler actor.
     async fn setup_timer_manager() -> Result<(
         impl Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,

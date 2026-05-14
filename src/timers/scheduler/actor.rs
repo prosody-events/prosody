@@ -55,9 +55,9 @@ pub(super) struct ActorState<T> {
     ///
     /// Invariant I1: when `Some(w)`, every clustering row in `timer_segments`
     /// for this segment has `slab_id > w`. `None` means the column was never
-    /// written; treated as "scan from slab 0" by the loader.
+    /// written; treated as "scan from slab 0" by the scheduler.
     pub(super) last_persisted_watermark: Option<SlabId>,
-    /// Highest slab ID `load_step` has scanned to. Tracks loader progress
+    /// Highest slab ID `load_step` has scanned to. Tracks loading progress
     /// so we know where to resume next tick.
     pub(super) highest_loaded_slab_id: Option<SlabId>,
     /// Jittered preload window — re-rolled after each load cycle.
@@ -360,9 +360,9 @@ where
     Ok(())
 }
 
-/// Load tick: drain triggers for every slab from the current load high-water
-/// up to the slab containing `now + preload_window`, then push the high-water
-/// forward.
+/// Load tick: record and drain every persisted slab from the current load
+/// high-water up to the slab containing `now + preload_window`, then push the
+/// high-water forward.
 ///
 /// The store fans the per-slab scans out concurrently via
 /// [`TriggerStore::get_slab_triggers_in_range`], so startup catch-up runs at
@@ -403,12 +403,19 @@ where
         return;
     }
 
-    let load_result =
-        drain_slab_range(&state.store, start_slab_id..=target_slab_id, triggers).await;
+    let slab_range = start_slab_id..=target_slab_id;
+    let load_result = async {
+        let persisted = pin!(state.store.get_slab_range(slab_range.clone()))
+            .try_collect::<BTreeSet<_>>()
+            .await?;
+        let loaded = drain_slab_range(&state.store, slab_range, triggers).await?;
+        Ok::<_, T::Error>((persisted, loaded))
+    }
+    .await;
 
     match load_result {
-        Ok(LoadOutcome { seen, count }) => {
-            for slab_id in seen {
+        Ok((persisted, LoadOutcome { seen, count })) => {
+            for slab_id in persisted.into_iter().chain(seen) {
                 state.loaded_slab_ids.insert(slab_id);
             }
             state.highest_loaded_slab_id = Some(target_slab_id);

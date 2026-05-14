@@ -1,7 +1,7 @@
 -- Migration: add_timer_slab_watermark
 -- Timestamp: 20260513
 -- Purpose: Add a static `slab_watermark` column to timer_segments so the slab
---          loader can start its scan from `slab_watermark + 1` rather than 0
+--          scheduler can start its scan from `slab_watermark + 1` rather than 0
 --          on every fresh partition startup. This eliminates the tombstone
 --          scan that grows linearly with the number of completed-and-deleted
 --          slabs.
