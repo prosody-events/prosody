@@ -186,7 +186,11 @@ impl TriggerSpec {
         let signed = i64::from(now_slab) + i64::from(self.slab_offset);
         let slab_id: SlabId = signed.max(0).try_into().unwrap_or(0);
         let time = CompactDateTime::from(slab_id.saturating_mul(SLAB_SIZE_SECS));
-        (Key::from(format!("k{}", self.key_idx)), time, self.timer_type)
+        (
+            Key::from(format!("k{}", self.key_idx)),
+            time,
+            self.timer_type,
+        )
     }
 }
 
@@ -267,8 +271,7 @@ impl Fixture {
             .await
             .map_err(|e| format!("insert_segment: {e:?}"))?;
 
-        let now = CompactDateTime::now()
-            .map_err(|e| format!("wall-clock now: {e:?}"))?;
+        let now = CompactDateTime::now().map_err(|e| format!("wall-clock now: {e:?}"))?;
         let now_slab = Slab::from_time(segment.slab_size, now).id();
 
         let universe = build_universe(now_slab);
@@ -306,8 +309,7 @@ impl Fixture {
                     .remove_trigger(&key, time, ty)
                     .await
                     .map_err(|e| format!("remove_trigger: {e:?}"))?;
-                let trigger =
-                    Trigger::new(key.clone(), time, ty, Span::current());
+                let trigger = Trigger::new(key.clone(), time, ty, Span::current());
                 self.triggers.remove(&trigger).await;
                 self.expected.remove(&(key, time, ty));
             }
@@ -350,14 +352,12 @@ impl Fixture {
     /// deletion) by diffing snapshots.
     async fn check_cleanup_safety(&mut self) -> StdResult<(), String> {
         let before_loaded = self.state.loaded_slab_ids.clone();
-        let before_active =
-            collect_active_slab_ids(self.segment.slab_size, &self.triggers).await;
+        let before_active = collect_active_slab_ids(self.segment.slab_size, &self.triggers).await;
 
         cleanup_step(&mut self.state, &self.triggers).await;
 
         let after_loaded = &self.state.loaded_slab_ids;
-        let deleted: BTreeSet<SlabId> =
-            before_loaded.difference(after_loaded).copied().collect();
+        let deleted: BTreeSet<SlabId> = before_loaded.difference(after_loaded).copied().collect();
 
         let now_slab = match CompactDateTime::now() {
             Ok(t) => Slab::from_time(self.segment.slab_size, t).id(),
@@ -493,10 +493,7 @@ async fn run_property(ops: Vec<Op>) -> StdResult<(), String> {
 #[test]
 fn prop_scheduler_invariants() {
     fn property(seq: OpSequence) -> TestResult {
-        let runtime = match RuntimeBuilder::new_current_thread()
-            .enable_all()
-            .build()
-        {
+        let runtime = match RuntimeBuilder::new_current_thread().enable_all().build() {
             Ok(r) => r,
             Err(e) => return TestResult::error(format!("runtime build: {e:?}")),
         };

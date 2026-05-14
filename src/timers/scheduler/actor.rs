@@ -10,12 +10,12 @@
 use super::{Command, CommandOperation};
 use crate::consumer::partition::ShutdownPhase;
 use crate::heartbeat::Heartbeat;
+use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::queue::TriggerQueue;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::{Segment, TriggerStore};
-use crate::timers::Trigger;
 use futures::TryStreamExt;
 use rand::RngExt;
 use std::collections::BTreeSet;
