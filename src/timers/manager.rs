@@ -496,7 +496,6 @@ where
         &self,
         trigger: Trigger,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        // Get all existing times for this key/type.
         let existing_times: Vec<CompactDateTime> = self
             .0
             .store
@@ -513,18 +512,56 @@ where
             "clear_and_schedule: read existing times, preparing state transitions"
         );
 
-        // Step 1: Pre-persistence in-memory transitions. These touch only
-        // ActiveTriggers state for the NEW timer and unschedule the old
-        // timers from the queue — neither requires a store write to be
-        // visible first.
-        let new_timer_state = self
+        let prior_state = self
             .0
             .scheduler
             .active_triggers()
             .get_state(&trigger.key, trigger.time, trigger.timer_type)
             .await;
 
-        match new_timer_state {
+        // In-memory transitions that don't depend on the new store row being
+        // visible: the new timer's `ActiveTriggers` state and the
+        // unscheduling of old timers from the queue.
+        self.apply_clear_pre_persist(&trigger, prior_state).await?;
+        unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_times).await?;
+
+        debug!(
+            key = %trigger.key,
+            timer_type = ?trigger.timer_type,
+            new_time = ?trigger.time,
+            "clear_and_schedule: persisting to store"
+        );
+        self.0
+            .store
+            .clear_and_schedule(trigger.clone())
+            .await
+            .map_err(TimerManagerError::Store)?;
+
+        // Post-persistence transitions that require the new store row to
+        // be visible — tag rotation for Aborted→Scheduled and the scheduler
+        // `Add` for states that deferred it.
+        self.apply_clear_post_persist(&trigger, prior_state).await?;
+        self.emit_clear_telemetry(&trigger, &existing_times);
+
+        Ok(())
+    }
+
+    /// In-memory state transitions to run before the atomic store write.
+    ///
+    /// Each prior state has its own forward move:
+    /// - `Firing` → `FiringRescheduled` and re-queue (the store row already
+    ///   exists; we only need the queue update).
+    /// - `Aborted` → `Scheduled` (the new schedule revives a previously
+    ///   aborted slot; the actor's `Add` call will run post-persistence).
+    /// - `FiringRescheduled` is idempotent.
+    /// - `Scheduled` and absent both defer to the post-persistence `Add`.
+    async fn apply_clear_pre_persist(
+        &self,
+        trigger: &Trigger,
+        prior_state: Option<TimerState>,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        let active = self.0.scheduler.active_triggers();
+        match prior_state {
             Some(TimerState::Firing) => {
                 debug!(
                     key = %trigger.key,
@@ -532,9 +569,7 @@ where
                     time = ?trigger.time,
                     "clear_and_schedule: new timer is Firing, transitioning to FiringRescheduled"
                 );
-                self.0
-                    .scheduler
-                    .active_triggers()
+                active
                     .set_state(
                         &trigger.key,
                         trigger.time,
@@ -559,9 +594,7 @@ where
                     time = ?trigger.time,
                     "clear_and_schedule: new timer is Aborted, transitioning to Scheduled"
                 );
-                self.0
-                    .scheduler
-                    .active_triggers()
+                active
                     .set_state(
                         &trigger.key,
                         trigger.time,
@@ -570,56 +603,61 @@ where
                     )
                     .await;
             }
-            _ => {
-                // Defer the scheduler `Add` until after persistence (Step 3
-                // below) so the scheduler's own slab metadata write doesn't
-                // race load_step against an un-written trigger row.
-            }
+            Some(TimerState::Scheduled) | None => {}
         }
+        Ok(())
+    }
 
-        unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_times).await?;
+    /// In-memory state transitions to run after the store row is written.
+    ///
+    /// - `Aborted`: revive the cached tag (so the oracle's reload check is
+    ///   coherent with the new trigger) and run the deferred `Add`.
+    /// - `Scheduled` / absent: just the deferred `Add`.
+    /// - `Firing` / `FiringRescheduled`: pre-persistence already handled
+    ///   the in-memory side; nothing left to do here.
+    async fn apply_clear_post_persist(
+        &self,
+        trigger: &Trigger,
+        prior_state: Option<TimerState>,
+    ) -> Result<(), TimerManagerError<T::Error>> {
+        match prior_state {
+            Some(TimerState::Aborted) => {
+                self.0
+                    .scheduler
+                    .active_triggers()
+                    .set_tag(&trigger.key, trigger.time, trigger.timer_type, trigger.tag)
+                    .await;
+                self.schedule_after_clear(trigger, prior_state).await
+            }
+            Some(TimerState::Scheduled) | None => {
+                self.schedule_after_clear(trigger, prior_state).await
+            }
+            Some(TimerState::Firing | TimerState::FiringRescheduled) => Ok(()),
+        }
+    }
 
-        // Step 2: Persist atomically — writes the new trigger row and
-        // tombstone-free clears the old key-index entries.
+    /// Runs the scheduler `Add` deferred from `apply_clear_pre_persist` and
+    /// logs the dispatch reason for diagnostic traces.
+    async fn schedule_after_clear(
+        &self,
+        trigger: &Trigger,
+        prior_state: Option<TimerState>,
+    ) -> Result<(), TimerManagerError<T::Error>> {
         debug!(
             key = %trigger.key,
             timer_type = ?trigger.timer_type,
-            new_time = ?trigger.time,
-            "clear_and_schedule: persisting to store"
+            time = ?trigger.time,
+            state = ?prior_state,
+            "clear_and_schedule: scheduling new timer via actor"
         );
-        self.0
-            .store
-            .clear_and_schedule(trigger.clone())
-            .await
-            .map_err(TimerManagerError::Store)?;
+        self.0.scheduler.schedule(trigger.clone()).await?;
+        Ok(())
+    }
 
-        if new_timer_state == Some(TimerState::Aborted) {
-            self.0
-                .scheduler
-                .active_triggers()
-                .set_tag(&trigger.key, trigger.time, trigger.timer_type, trigger.tag)
-                .await;
-        }
-
-        // Step 3: Tell the scheduler about the new trigger now that its
-        // store row exists. The Firing / FiringRescheduled branches handled
-        // their queue updates in Step 1 and skip this.
-        if matches!(
-            new_timer_state,
-            None | Some(TimerState::Scheduled | TimerState::Aborted)
-        ) {
-            debug!(
-                key = %trigger.key,
-                timer_type = ?trigger.timer_type,
-                time = ?trigger.time,
-                state = ?new_timer_state,
-                "clear_and_schedule: scheduling new timer via actor"
-            );
-            self.0.scheduler.schedule(trigger.clone()).await?;
-        }
-
-        // Emit telemetry after successful atomic persistence.
-        for &old_time in &existing_times {
+    /// Emits one `timer_cancelled` event per replaced time (excluding the
+    /// new time) and one `timer_scheduled` event for the new trigger.
+    fn emit_clear_telemetry(&self, trigger: &Trigger, existing_times: &[CompactDateTime]) {
+        for &old_time in existing_times {
             if old_time != trigger.time {
                 self.0.telemetry.timer_cancelled(
                     trigger.key.clone(),
@@ -635,8 +673,6 @@ where
             trigger.timer_type,
             self.0.source.clone(),
         );
-
-        Ok(())
     }
 
     /// Transitions a timer from `Scheduled` to `Firing` state, returning the

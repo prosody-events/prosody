@@ -322,168 +322,197 @@ impl Fixture {
 
     async fn apply(&mut self, op: Op) -> StdResult<(), String> {
         match op {
-            Op::Schedule(spec) => {
-                let (key, time, ty) = spec.resolve(self.now_slab);
-                let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-                let current_model = self.model_for(&key, time, ty);
-                if current_model.active_state == Some(ModelActiveState::Aborted) {
-                    self.triggers
-                        .active_triggers()
-                        .set_state(&key, time, ty, TimerState::Scheduled)
-                        .await;
-                    self.triggers.insert_queue_only(trigger);
-                    self.set_model(
-                        key,
-                        time,
-                        ty,
-                        TriggerModel {
-                            in_store: true,
-                            active_state: Some(ModelActiveState::Scheduled),
-                        },
-                    );
-                    return Ok(());
-                }
-
-                let slab_id = Slab::from_time(self.segment.slab_size, time).id();
-                let past_unregistered = self
-                    .state
-                    .last_persisted_watermark
-                    .is_some_and(|w| slab_id <= w)
-                    && !self.state.known_slab_ids.contains(&slab_id);
-                let old_watermark = self.state.last_persisted_watermark;
-                self.store
-                    .add_trigger(trigger.clone())
-                    .await
-                    .map_err(|e| format!("add_trigger: {e:?}"))?;
-                handle_add(&mut self.state, &mut self.triggers, trigger)
-                    .await
-                    .map_err(|e| format!("handle_add: {e:?}"))?;
-                if past_unregistered {
-                    let expected_watermark = slab_id.checked_sub(1);
-                    if self.state.last_persisted_watermark != expected_watermark {
-                        return Err(format!(
-                            "past-watermark schedule: expected watermark {expected_watermark:?}, got {:?}",
-                            self.state.last_persisted_watermark
-                        ));
-                    }
-                    if let Some(old_watermark) = old_watermark
-                        && self
-                            .state
-                            .highest_loaded_slab_id
-                            .is_none_or(|h| h < old_watermark)
-                    {
-                        return Err(format!(
-                            "past-watermark schedule: highest_loaded_slab_id {:?} did not preserve ownership through old watermark {old_watermark}",
-                            self.state.highest_loaded_slab_id
-                        ));
-                    }
-                    if !self
-                        .triggers
-                        .active_triggers()
-                        .contains(&key, time, ty)
-                        .await
-                    {
-                        return Err(format!(
-                            "past-watermark schedule: trigger ({key}, {time:?}, {ty:?}) was not active"
-                        ));
-                    }
-                }
-                let mut model = current_model;
-                model.in_store = true;
-                if owns_slab(&self.state, slab_id) && model.active_state.is_none() {
-                    model.active_state = Some(ModelActiveState::Scheduled);
-                }
-                self.set_model(key, time, ty, model);
-            }
-            Op::Unschedule(spec) => {
-                let (key, time, ty) = spec.resolve(self.now_slab);
-                self.store
-                    .remove_trigger(&key, time, ty)
-                    .await
-                    .map_err(|e| format!("remove_trigger: {e:?}"))?;
-                let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-                self.triggers.remove(&trigger).await;
-                self.set_model(
-                    key,
-                    time,
-                    ty,
-                    TriggerModel {
-                        in_store: false,
-                        active_state: None,
-                    },
-                );
-            }
-            Op::Fire(spec) => {
-                // Only a state transition — does not change membership.
-                let (key, time, ty) = spec.resolve(self.now_slab);
-                if matches!(
-                    self.triggers
-                        .active_triggers()
-                        .get_state(&key, time, ty)
-                        .await,
-                    Some(TimerState::Scheduled)
-                ) {
-                    let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-                    self.triggers.remove_queue_only(&trigger);
-                    self.triggers
-                        .active_triggers()
-                        .set_state(&key, time, ty, TimerState::Firing)
-                        .await;
-                    let mut model = self.model_for(&key, time, ty);
-                    model.active_state = Some(ModelActiveState::Firing);
-                    self.set_model(key, time, ty, model);
-                }
-            }
-            Op::Abort(spec) => {
-                let (key, time, ty) = spec.resolve(self.now_slab);
-                let current_state = self
-                    .triggers
-                    .active_triggers()
-                    .get_state(&key, time, ty)
-                    .await;
-                match current_state {
-                    Some(TimerState::Scheduled) => {
-                        self.triggers
-                            .active_triggers()
-                            .set_state(&key, time, ty, TimerState::Aborted)
-                            .await;
-                        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
-                        self.triggers.remove_queue_only(&trigger);
-                        let mut model = self.model_for(&key, time, ty);
-                        model.active_state = Some(ModelActiveState::Aborted);
-                        self.set_model(key, time, ty, model);
-                    }
-                    Some(TimerState::Firing) => {
-                        self.triggers
-                            .active_triggers()
-                            .set_state(&key, time, ty, TimerState::Aborted)
-                            .await;
-                        let mut model = self.model_for(&key, time, ty);
-                        model.active_state = Some(ModelActiveState::Aborted);
-                        self.set_model(key, time, ty, model);
-                    }
-                    Some(TimerState::Aborted) | Some(TimerState::FiringRescheduled) | None => {}
-                }
-            }
+            Op::Schedule(spec) => self.apply_schedule(spec).await,
+            Op::Unschedule(spec) => self.apply_unschedule(spec).await,
+            Op::Fire(spec) => self.apply_fire(spec).await,
+            Op::Abort(spec) => self.apply_abort(spec).await,
             Op::LoadStep => {
                 load_step(&mut self.state, &mut self.triggers).await;
                 self.reconcile_loaded_models();
+                Ok(())
             }
-            Op::CleanupStep => {
-                self.check_cleanup_effects().await?;
-            }
-            Op::Restart => {
-                self.state = fresh_state(self.store.clone(), self.segment.clone());
-                self.state.last_persisted_watermark = self
-                    .store
-                    .get_slab_watermark()
-                    .await
-                    .map_err(|e| format!("get_slab_watermark on restart: {e:?}"))?;
-                self.triggers = TriggerQueue::new();
-                for model in self.expected.values_mut() {
-                    model.active_state = None;
-                }
-            }
+            Op::CleanupStep => self.check_cleanup_effects().await,
+            Op::Restart => self.apply_restart().await,
+        }
+    }
+
+    async fn apply_schedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
+        let (key, time, ty) = spec.resolve(self.now_slab);
+        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        let current_model = self.model_for(&key, time, ty);
+
+        // Reviving an Aborted timer with the same identity is an in-memory
+        // state transition: the store row already exists, so just flip the
+        // state back to Scheduled and re-queue.
+        if current_model.active_state == Some(ModelActiveState::Aborted) {
+            self.triggers
+                .active_triggers()
+                .set_state(&key, time, ty, TimerState::Scheduled)
+                .await;
+            self.triggers.insert_queue_only(trigger);
+            self.set_model(
+                key,
+                time,
+                ty,
+                TriggerModel {
+                    in_store: true,
+                    active_state: Some(ModelActiveState::Scheduled),
+                },
+            );
+            return Ok(());
+        }
+
+        let slab_id = Slab::from_time(self.segment.slab_size, time).id();
+        let past_unregistered = self
+            .state
+            .last_persisted_watermark
+            .is_some_and(|w| slab_id <= w)
+            && !self.state.known_slab_ids.contains(&slab_id);
+        let old_watermark = self.state.last_persisted_watermark;
+
+        self.store
+            .add_trigger(trigger.clone())
+            .await
+            .map_err(|e| format!("add_trigger: {e:?}"))?;
+        handle_add(&mut self.state, &mut self.triggers, trigger)
+            .await
+            .map_err(|e| format!("handle_add: {e:?}"))?;
+
+        if past_unregistered {
+            self.assert_past_watermark_pull(&key, time, ty, slab_id, old_watermark)
+                .await?;
+        }
+
+        let mut model = current_model;
+        model.in_store = true;
+        if owns_slab(&self.state, slab_id) && model.active_state.is_none() {
+            model.active_state = Some(ModelActiveState::Scheduled);
+        }
+        self.set_model(key, time, ty, model);
+        Ok(())
+    }
+
+    async fn apply_unschedule(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
+        let (key, time, ty) = spec.resolve(self.now_slab);
+        self.store
+            .remove_trigger(&key, time, ty)
+            .await
+            .map_err(|e| format!("remove_trigger: {e:?}"))?;
+        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        self.triggers.remove(&trigger).await;
+        self.set_model(
+            key,
+            time,
+            ty,
+            TriggerModel {
+                in_store: false,
+                active_state: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn apply_fire(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
+        let (key, time, ty) = spec.resolve(self.now_slab);
+        if !matches!(
+            self.triggers
+                .active_triggers()
+                .get_state(&key, time, ty)
+                .await,
+            Some(TimerState::Scheduled)
+        ) {
+            return Ok(());
+        }
+
+        let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+        self.triggers.remove_queue_only(&trigger);
+        self.triggers
+            .active_triggers()
+            .set_state(&key, time, ty, TimerState::Firing)
+            .await;
+        let mut model = self.model_for(&key, time, ty);
+        model.active_state = Some(ModelActiveState::Firing);
+        self.set_model(key, time, ty, model);
+        Ok(())
+    }
+
+    async fn apply_abort(&mut self, spec: TriggerSpec) -> StdResult<(), String> {
+        let (key, time, ty) = spec.resolve(self.now_slab);
+        // Only `Scheduled` and `Firing` are abortable; `Scheduled` also has
+        // a `DelayQueue` entry that needs explicit removal.
+        let needs_dequeue = match self
+            .triggers
+            .active_triggers()
+            .get_state(&key, time, ty)
+            .await
+        {
+            Some(TimerState::Scheduled) => true,
+            Some(TimerState::Firing) => false,
+            Some(TimerState::Aborted | TimerState::FiringRescheduled) | None => return Ok(()),
+        };
+
+        self.triggers
+            .active_triggers()
+            .set_state(&key, time, ty, TimerState::Aborted)
+            .await;
+        if needs_dequeue {
+            let trigger = Trigger::new(key.clone(), time, ty, Span::current());
+            self.triggers.remove_queue_only(&trigger);
+        }
+
+        let mut model = self.model_for(&key, time, ty);
+        model.active_state = Some(ModelActiveState::Aborted);
+        self.set_model(key, time, ty, model);
+        Ok(())
+    }
+
+    async fn apply_restart(&mut self) -> StdResult<(), String> {
+        self.state = fresh_state(self.store.clone(), self.segment.clone());
+        self.state.last_persisted_watermark = self
+            .store
+            .get_slab_watermark()
+            .await
+            .map_err(|e| format!("get_slab_watermark on restart: {e:?}"))?;
+        self.triggers = TriggerQueue::new();
+        for model in self.expected.values_mut() {
+            model.active_state = None;
+        }
+        Ok(())
+    }
+
+    /// Verifies that the BATCH-driven past-watermark insert lowered the
+    /// watermark to `slab_id - 1`, preserved ownership through the prior
+    /// watermark, and landed the trigger in `ActiveTriggers`.
+    async fn assert_past_watermark_pull(
+        &self,
+        key: &Key,
+        time: CompactDateTime,
+        ty: TimerType,
+        slab_id: SlabId,
+        old_watermark: Option<SlabId>,
+    ) -> StdResult<(), String> {
+        let expected_watermark = slab_id.checked_sub(1);
+        if self.state.last_persisted_watermark != expected_watermark {
+            return Err(format!(
+                "past-watermark schedule: expected watermark {expected_watermark:?}, got {:?}",
+                self.state.last_persisted_watermark
+            ));
+        }
+        if let Some(old_watermark) = old_watermark
+            && self
+                .state
+                .highest_loaded_slab_id
+                .is_none_or(|h| h < old_watermark)
+        {
+            return Err(format!(
+                "past-watermark schedule: highest_loaded_slab_id {:?} did not preserve ownership through old watermark {old_watermark}",
+                self.state.highest_loaded_slab_id
+            ));
+        }
+        if !self.triggers.active_triggers().contains(key, time, ty).await {
+            return Err(format!(
+                "past-watermark schedule: trigger ({key}, {time:?}, {ty:?}) was not active"
+            ));
         }
         Ok(())
     }
