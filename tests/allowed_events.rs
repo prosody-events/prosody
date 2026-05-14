@@ -2,6 +2,8 @@
 //! filtering in the Prosody application. It ensures that the consumer can
 //! correctly filter out disallowed events and only process allowed ones.
 
+#![recursion_limit = "256"]
+
 use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;

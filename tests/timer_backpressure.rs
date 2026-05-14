@@ -4,6 +4,8 @@
 //! messages while the consumer processes them slowly, demonstrating the
 //! backpressure handling capabilities of the timer system.
 
+#![recursion_limit = "256"]
+
 use color_eyre::eyre::Result;
 use prosody::tracing::init_test_logging;
 use prosody::{

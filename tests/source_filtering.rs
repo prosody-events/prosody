@@ -6,6 +6,8 @@
 //! message handling via Kafka, and this module tests specific subscription
 //! scenarios to validate that only expected messages are received.
 
+#![recursion_limit = "256"]
+
 use crate::common::TestHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;
