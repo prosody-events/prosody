@@ -36,14 +36,13 @@ use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::migration;
 use crate::timers::store::cassandra::state::{ClusteringEntry, InlineTimer, TimerState};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::{
     Stream, TryStreamExt,
     future::{join_all, ready},
     pin_mut,
-    stream::iter as stream_iter,
 };
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use smallvec::SmallVec;
@@ -420,21 +419,21 @@ impl TriggerOperations for CassandraTriggerStore {
     fn get_slab_triggers_in_range(
         &self,
         range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<(SlabId, Trigger), Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let slab_size = self.segment.slab_size;
         let store = self.clone();
         self.get_slab_range(range)
             .map_ok(move |slab_id| {
                 let store = store.clone();
                 async move {
-                    let slab = Slab::new(slab_id, slab_size);
-                    let triggers: Vec<Trigger> = store
-                        .get_slab_triggers_all_types(slab)
-                        .try_collect()
-                        .await?;
-                    Ok::<_, Self::Error>(stream_iter(
-                        triggers.into_iter().map(move |t| Ok((slab_id, t))),
-                    ))
+                    Ok::<_, Self::Error>(try_stream! {
+                        let slab = Slab::new(slab_id, slab_size);
+                        let stream = store.get_slab_triggers_all_types(slab);
+                        pin_mut!(stream);
+                        while let Some(trigger) = cooperative(stream.try_next()).await? {
+                            yield trigger;
+                        }
+                    })
                 }
             })
             .try_buffer_unordered(LOAD_CONCURRENCY)
@@ -988,39 +987,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 }
             }
             TimerState::Overflow => {
-                Box::pin(async {
-                    // Overflow: fetch clustering times directly (we hold the lock; state is
-                    // known Overflow, so we skip resolve_state to avoid a self-deadlock).
-                    // Reuses the same prepared statement as `get_key_times` Overflow path.
-                    let times = self
-                        .session()
-                        .execute_iter(
-                            self.queries().get_key_times.clone(),
-                            (segment_id, trigger.key.as_ref(), trigger.timer_type),
-                        )
-                        .await
-                        .map_err(CassandraStoreError::from)?
-                        .rows_stream::<(CompactDateTime,)>()
-                        .map_err(CassandraStoreError::from)?
-                        .map_err(CassandraStoreError::from)
-                        .map_ok(|(time,)| time)
-                        .try_filter(|&time| ready(time != trigger.time))
-                        .try_collect()
-                        .await?;
-
-                    // BATCH (DELETE clustering + UPDATE state). Runs after the SELECT
-                    // while the lock is still held — no TOCTOU window.
-                    self.batch_clear_and_set_inline(
-                        &segment_id,
-                        &trigger.key,
-                        trigger.timer_type,
-                        &new_state,
-                    )
-                    .await?;
-
-                    Result::<_, CassandraTriggerStoreError>::Ok(times)
-                })
-                .await?
+                clear_overflow_and_schedule_key(self, &segment_id, &trigger, &new_state).await?
             }
         };
 
@@ -1184,6 +1151,40 @@ impl TriggerOperations for CassandraTriggerStore {
 
         Ok(())
     }
+}
+
+async fn clear_overflow_and_schedule_key(
+    store: &CassandraTriggerStore,
+    segment_id: &SegmentId,
+    trigger: &Trigger,
+    new_state: &TimerState,
+) -> Result<SmallVec<[CompactDateTime; 1]>, CassandraTriggerStoreError> {
+    // Overflow: fetch clustering times directly while the caller holds the
+    // per-key state lock. State is known Overflow, so skip resolve_state to
+    // avoid a self-deadlock. Reuses the get_key_times prepared statement.
+    let times = store
+        .session()
+        .execute_iter(
+            store.queries().get_key_times.clone(),
+            (segment_id, trigger.key.as_ref(), trigger.timer_type),
+        )
+        .await
+        .map_err(CassandraStoreError::from)?
+        .rows_stream::<(CompactDateTime,)>()
+        .map_err(CassandraStoreError::from)?
+        .map_err(CassandraStoreError::from)
+        .map_ok(|(time,)| time)
+        .try_filter(|&time| ready(time != trigger.time))
+        .try_collect()
+        .await?;
+
+    // BATCH (DELETE clustering + UPDATE state). Runs after the SELECT while
+    // the lock is still held, so there is no TOCTOU window.
+    store
+        .batch_clear_and_set_inline(segment_id, &trigger.key, trigger.timer_type, new_state)
+        .await?;
+
+    Ok(times)
 }
 
 /// Returns the TTL anchor time for a watermark update.

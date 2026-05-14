@@ -243,41 +243,13 @@ impl ActiveTriggers {
     }
 
     /// Checks whether a given trigger time and type is active for a key.
-    ///
-    /// This is a convenience wrapper around [`get_state`](Self::get_state)
-    /// that returns `true` if any state exists.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The [`Key`] to query.
-    /// * `time` - The [`CompactDateTime`] to check.
-    /// * `timer_type` - The [`TimerType`] to check.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the registry contains the specified (time, type) entry for the
-    /// key.
+    #[cfg(test)]
     pub async fn contains(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) -> bool {
         self.get_state(key, time, timer_type).await.is_some()
     }
 
-    /// Checks whether a trigger is considered scheduled (will fire in the
-    /// future).
-    ///
-    /// A timer is scheduled if it is in [`TimerState::Scheduled`] or
-    /// [`TimerState::FiringRescheduled`] state. Timers in
-    /// [`TimerState::Firing`] are currently being processed but not scheduled
-    /// to fire again.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The [`Key`] to query.
-    /// * `time` - The [`CompactDateTime`] to check.
-    /// * `timer_type` - The [`TimerType`] to check.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the timer is in `Scheduled` or `FiringRescheduled` state.
+    /// Checks whether a trigger is currently scheduled to fire.
+    #[cfg(test)]
     pub async fn is_scheduled(
         &self,
         key: &Key,

@@ -219,12 +219,12 @@ where
 
         stream
             .try_filter(|&time| {
-                let is_scheduled = active_triggers.is_scheduled(key, time, timer_type);
-                let not_active = active_triggers.contains(key, time, timer_type);
+                let state = active_triggers.get_state(key, time, timer_type);
                 async move {
-                    let is_scheduled = is_scheduled.await;
-                    let not_active = !not_active.await;
-                    is_scheduled || not_active
+                    match state.await {
+                        Some(TimerState::Firing) => false,
+                        Some(TimerState::Scheduled | TimerState::FiringRescheduled) | None => true,
+                    }
                 }
             })
             .try_collect()
@@ -461,11 +461,11 @@ where
         &self,
         trigger: Trigger,
     ) -> Result<(), TimerManagerError<T::Error>> {
-        // Get all existing triggers for this key/type
-        let existing_triggers: Vec<Trigger> = self
+        // Get all existing times for this key/type.
+        let existing_times: Vec<CompactDateTime> = self
             .0
             .store
-            .get_key_triggers(trigger.timer_type, &trigger.key)
+            .get_key_times(trigger.timer_type, &trigger.key)
             .map_err(TimerManagerError::Store)
             .try_collect()
             .await?;
@@ -474,8 +474,8 @@ where
             key = %trigger.key,
             timer_type = ?trigger.timer_type,
             new_time = ?trigger.time,
-            existing_count = existing_triggers.len(),
-            "clear_and_schedule: read existing triggers, preparing state transitions"
+            existing_count = existing_times.len(),
+            "clear_and_schedule: read existing times, preparing state transitions"
         );
 
         // Step 1: Pre-persistence in-memory transitions. These touch only
@@ -524,7 +524,7 @@ where
             }
         }
 
-        unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_triggers).await?;
+        unschedule_replaced_timers(&self.0.scheduler, &trigger, &existing_times).await?;
 
         // Step 2: Persist atomically — writes the new trigger row and
         // tombstone-free clears the old key-index entries.
@@ -555,12 +555,12 @@ where
         }
 
         // Emit telemetry after successful atomic persistence.
-        for old in &existing_triggers {
-            if old.time != trigger.time {
+        for &old_time in &existing_times {
+            if old_time != trigger.time {
                 self.0.telemetry.timer_cancelled(
-                    old.key.clone(),
-                    old.time,
-                    old.timer_type,
+                    trigger.key.clone(),
+                    old_time,
+                    trigger.timer_type,
                     self.0.source.clone(),
                 );
             }
@@ -764,58 +764,70 @@ pub(crate) fn fresh_tag_distinct_from(current: i32) -> i32 {
 async fn unschedule_replaced_timers<E>(
     scheduler: &TriggerScheduler<E>,
     new_trigger: &Trigger,
-    existing_triggers: &[Trigger],
+    existing_times: &[CompactDateTime],
 ) -> Result<(), TimerManagerError<E>>
 where
     E: ClassifyError + Error + Debug + Send + Sync + 'static,
 {
-    for old_trigger in existing_triggers {
-        if old_trigger.time == new_trigger.time {
+    for &old_time in existing_times {
+        if old_time == new_trigger.time {
             continue; // Same time as new - already handled by caller
         }
 
         let active = scheduler.active_triggers();
         let old_state = active
-            .get_state(&old_trigger.key, old_trigger.time, old_trigger.timer_type)
+            .get_state(&new_trigger.key, old_time, new_trigger.timer_type)
             .await;
 
         match old_state {
             Some(TimerState::Firing) => {
                 debug!(
-                    key = %old_trigger.key,
-                    timer_type = ?old_trigger.timer_type,
-                    old_time = ?old_trigger.time,
+                    key = %new_trigger.key,
+                    timer_type = ?new_trigger.timer_type,
+                    old_time = ?old_time,
                     "clear_and_schedule: old timer is Firing, skipping (no-op)"
                 );
             }
             Some(TimerState::FiringRescheduled) => {
                 debug!(
-                    key = %old_trigger.key,
-                    timer_type = ?old_trigger.timer_type,
-                    old_time = ?old_trigger.time,
+                    key = %new_trigger.key,
+                    timer_type = ?new_trigger.timer_type,
+                    old_time = ?old_time,
                     "clear_and_schedule: old timer FiringRescheduled, cancelling reschedule"
                 );
                 active
                     .set_state(
-                        &old_trigger.key,
-                        old_trigger.time,
-                        old_trigger.timer_type,
+                        &new_trigger.key,
+                        old_time,
+                        new_trigger.timer_type,
                         TimerState::Firing,
                     )
                     .await;
-                scheduler.remove_from_queue(old_trigger.clone()).await?;
+                let trigger = Trigger::new(
+                    new_trigger.key.clone(),
+                    old_time,
+                    new_trigger.timer_type,
+                    Span::current(),
+                );
+                scheduler.remove_from_queue(trigger).await?;
             }
             _ => {
                 // Always issue the unschedule — actor finds nothing if slab
                 // isn't loaded, equivalent to the old `is_owned` no-op gate.
                 debug!(
-                    key = %old_trigger.key,
-                    timer_type = ?old_trigger.timer_type,
-                    old_time = ?old_trigger.time,
+                    key = %new_trigger.key,
+                    timer_type = ?new_trigger.timer_type,
+                    old_time = ?old_time,
                     state = ?old_state,
                     "clear_and_schedule: unscheduling old timer from DelayQueue"
                 );
-                scheduler.unschedule(old_trigger.clone()).await?;
+                let trigger = Trigger::new(
+                    new_trigger.key.clone(),
+                    old_time,
+                    new_trigger.timer_type,
+                    Span::current(),
+                );
+                scheduler.unschedule(trigger).await?;
             }
         }
     }

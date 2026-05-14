@@ -6,6 +6,7 @@
 //! operations.
 
 use crate::Key;
+use crate::timers::DELETE_CONCURRENCY;
 use crate::timers::TimerType;
 use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
@@ -13,8 +14,7 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::slab::{Slab, SlabId};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, TriggerStore};
-use futures::Stream;
-use futures::future::try_join_all;
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -124,7 +124,7 @@ where
     fn get_slab_triggers_in_range(
         &self,
         range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<(SlabId, Trigger), Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         self.operations.get_slab_triggers_in_range(range)
     }
 
@@ -270,23 +270,26 @@ where
         // the new timer is guaranteed to exist before old entries are removed.
         // Each delete targets a different clustering row, so concurrent deletes
         // to the same partition are safe.
-        let delete_futures = old_times.iter().map(|&old_time| {
-            let old_slab = Slab::from_time(slab_size, old_time);
-            let ops = &self.operations;
-            let key = &key;
-            async move {
-                debug!(
-                    key = %key,
-                    timer_type = ?timer_type,
-                    old_time = ?old_time,
-                    old_slab_id = ?old_slab.id(),
-                    "clear_and_schedule: deleting old slab entry"
-                );
-                ops.delete_slab_trigger(&old_slab, timer_type, key, old_time)
-                    .await
-            }
-        });
-        try_join_all(delete_futures).await?;
+        stream::iter(old_times.iter().copied())
+            .map(|old_time| {
+                let old_slab = Slab::from_time(slab_size, old_time);
+                let ops = &self.operations;
+                let key = &key;
+                async move {
+                    debug!(
+                        key = %key,
+                        timer_type = ?timer_type,
+                        old_time = ?old_time,
+                        old_slab_id = ?old_slab.id(),
+                        "clear_and_schedule: deleting old slab entry"
+                    );
+                    ops.delete_slab_trigger(&old_slab, timer_type, key, old_time)
+                        .await
+                }
+            })
+            .buffer_unordered(DELETE_CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
 
         debug!(
             key = %key,

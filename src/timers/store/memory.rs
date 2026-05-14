@@ -332,15 +332,15 @@ impl TriggerOperations for InMemoryTriggerStore {
         }
     }
 
-    /// Stream every trigger across all timer types for slabs in `range`.
+    /// Stream every trigger across all timer types for persisted slabs in
+    /// `range`.
     ///
     /// The in-memory store has no I/O latency to amortise, so it scans each
-    /// slab serially. Matches the Cassandra impl's `(SlabId, Trigger)` shape
-    /// so consumers can track which slabs they have observed triggers for.
+    /// slab serially.
     fn get_slab_triggers_in_range(
         &self,
         range: RangeInclusive<SlabId>,
-    ) -> impl Stream<Item = Result<(SlabId, Trigger), Self::Error>> + Send {
+    ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send {
         let segment_id = self.segment.id;
         let slab_size = self.segment.slab_size;
         try_stream! {
@@ -356,7 +356,7 @@ impl TriggerOperations for InMemoryTriggerStore {
                     continue;
                 };
                 for (_clustering_key, trigger) in triggers_map.iter() {
-                    yield (slab_id, trigger.clone());
+                    yield trigger.clone();
                 }
             }
         }
