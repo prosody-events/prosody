@@ -156,7 +156,8 @@ mod tests {
     use crate::timers::store::adapter::TableAdapter;
     use crate::timers::store::memory::{InMemoryTriggerStore, memory_store};
     use crate::timers::{
-        PendingTimer, TimerManager, TimerManagerConfig, TimerSemaphores, TimerType, Trigger,
+        PendingTimer, TimerManager, TimerManagerConfig, TimerRequest, TimerSemaphores, TimerType,
+        Trigger,
     };
 
     use super::CommitManager;
@@ -174,6 +175,16 @@ mod tests {
         TestManager,
         watch::Sender<ShutdownPhase>,
     )> {
+        let (stream, manager, shutdown_tx, _store) = setup_with_store().await?;
+        Ok((stream, manager, shutdown_tx))
+    }
+
+    async fn setup_with_store() -> Result<(
+        impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
+        TestManager,
+        watch::Sender<ShutdownPhase>,
+        TableAdapter<InMemoryTriggerStore>,
+    )> {
         let segment = Segment {
             id: Uuid::new_v4(),
             name: "test".to_owned(),
@@ -185,7 +196,7 @@ mod tests {
         let telemetry = Telemetry::new();
         let config = TimerManagerConfig {
             name: "test".to_owned(),
-            store,
+            store: store.clone(),
             telemetry: telemetry.partition_sender(Topic::from("test"), 0),
             source: Arc::from(""),
         };
@@ -197,7 +208,7 @@ mod tests {
         )
         .await
         .map_err(|e| eyre!("{e}"))?;
-        Ok((stream, manager, shutdown_tx))
+        Ok((stream, manager, shutdown_tx, store))
     }
 
     fn test_trigger(key: &str, offset: u32) -> Result<Trigger> {
@@ -212,6 +223,28 @@ mod tests {
 
     fn commit_manager(timers: TestManager) -> TestCommitManager {
         CommitManager::new(MemoryDeduplicationStore::new(), timers)
+    }
+
+    async fn fresh_commit_manager(
+        store: TableAdapter<InMemoryTriggerStore>,
+    ) -> Result<TestCommitManager> {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+        let telemetry = Telemetry::new();
+        let config = TimerManagerConfig {
+            name: "test".to_owned(),
+            store,
+            telemetry: telemetry.partition_sender(Topic::from("test"), 0),
+            source: Arc::from(""),
+        };
+        let (_stream, manager) = TimerManager::new(
+            config,
+            HeartbeatRegistry::test(),
+            shutdown_rx,
+            test_semaphores(),
+        )
+        .await
+        .map_err(|e| eyre!("{e}"))?;
+        Ok(commit_manager(manager))
     }
 
     /// Oracle: message not inserted → not committed.
@@ -250,7 +283,7 @@ mod tests {
         let (stream, manager, _tx) = setup().await?;
         pin_mut!(stream);
         let trigger = test_trigger("k", 1)?;
-        manager.schedule(trigger.clone()).await?;
+        manager.schedule_trigger(trigger.clone()).await?;
 
         advance(Duration::from_secs(2)).await;
         task::yield_now().await;
@@ -275,7 +308,7 @@ mod tests {
         time::pause();
         let (_stream, manager, _tx) = setup().await?;
         let trigger = test_trigger("k", 10)?;
-        manager.schedule(trigger.clone()).await?;
+        manager.schedule_trigger(trigger.clone()).await?;
 
         let current_tag = manager
             .current_tag(&trigger.key, trigger.time, trigger.timer_type)
@@ -299,7 +332,7 @@ mod tests {
         let (stream, manager, _tx) = setup().await?;
         pin_mut!(stream);
         let trigger = test_trigger("k", 1)?;
-        manager.schedule(trigger.clone()).await?;
+        manager.schedule_trigger(trigger.clone()).await?;
 
         advance(Duration::from_secs(2)).await;
         task::yield_now().await;
@@ -307,7 +340,7 @@ mod tests {
         let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
         let wal_tag = firing.trigger().tag;
 
-        manager.schedule(trigger.clone()).await?; // → FiringRescheduled
+        manager.schedule_trigger(trigger.clone()).await?; // → FiringRescheduled
         firing.commit().await; // → rotates tag
 
         let oracle = commit_manager(manager);
@@ -316,6 +349,83 @@ mod tests {
                 .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, wal_tag)
                 .await?,
             "mismatching tag → committed-and-rescheduled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timer_same_coordinate_clear_not_committed_until_commit() -> Result<()> {
+        time::pause();
+        let (stream, manager, _tx, store) = setup_with_store().await?;
+        pin_mut!(stream);
+        let trigger = test_trigger("k", 1)?;
+        manager.schedule_trigger(trigger.clone()).await?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+        let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
+        let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
+        let wal_tag = firing.trigger().tag;
+
+        manager
+            .clear_and_schedule(TimerRequest::new(
+                trigger.key.clone(),
+                trigger.time,
+                trigger.timer_type,
+                Span::current(),
+            ))
+            .await?;
+
+        let before_commit = fresh_commit_manager(store.clone()).await?;
+        assert!(
+            !before_commit
+                .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, wal_tag)
+                .await?,
+            "store-only oracle must stay false after same-coordinate clear before commit"
+        );
+
+        firing.commit().await;
+
+        let after_commit = fresh_commit_manager(store).await?;
+        assert!(
+            after_commit
+                .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, wal_tag)
+                .await?,
+            "store-only oracle must become true after commit rotates the tag"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timer_same_coordinate_clear_abort_preserves_wal_tag() -> Result<()> {
+        time::pause();
+        let (stream, manager, _tx, store) = setup_with_store().await?;
+        pin_mut!(stream);
+        let trigger = test_trigger("k", 1)?;
+        manager.schedule_trigger(trigger.clone()).await?;
+
+        advance(Duration::from_secs(2)).await;
+        task::yield_now().await;
+        let pending = stream.next().await.ok_or_else(|| eyre!("no pending"))?;
+        let firing = pending.fire().await.ok_or_else(|| eyre!("not active"))?;
+        let wal_tag = firing.trigger().tag;
+
+        manager
+            .clear_and_schedule(TimerRequest::new(
+                trigger.key.clone(),
+                trigger.time,
+                trigger.timer_type,
+                Span::current(),
+            ))
+            .await?;
+        firing.abort().await;
+
+        let oracle = fresh_commit_manager(store).await?;
+        assert!(
+            !oracle
+                .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, wal_tag)
+                .await?,
+            "abort after same-coordinate clear must keep the WAL tag current"
         );
         Ok(())
     }

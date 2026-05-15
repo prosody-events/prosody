@@ -20,7 +20,7 @@
 //! use prosody::consumer::message::UncommittedMessage;
 //! use prosody::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 //! use prosody::timers::store::TriggerStore;
-//! use prosody::timers::{Trigger, UncommittedTimer};
+//! use prosody::timers::UncommittedTimer;
 //!
 //! struct MyHandler;
 //!
@@ -133,6 +133,53 @@ impl TryFrom<i8> for TimerType {
 
 /// One semaphore per [`TimerType`] variant, indexed by `timer_type as usize`.
 pub type TimerSemaphores = [Arc<Semaphore>; TimerType::COUNT];
+
+/// Application request to schedule a timer.
+///
+/// This is the public scheduling shape: callers provide the logical timer
+/// identity and tracing context, while the timer system owns the commit-oracle
+/// tag. Persisted and delivered timers use [`Trigger`] internally.
+#[derive(Clone, Educe)]
+#[educe(Debug)]
+pub struct TimerRequest {
+    /// Entity key identifying what this timer belongs to.
+    pub key: Key,
+
+    /// When this timer should execute.
+    pub time: CompactDateTime,
+
+    /// Timer type classification.
+    pub timer_type: TimerType,
+
+    /// Tracing span for distributed observability context.
+    #[educe(Debug(ignore))]
+    pub span: Span,
+}
+
+impl TimerRequest {
+    /// Creates a tagless timer scheduling request.
+    #[must_use]
+    pub fn new(key: Key, time: CompactDateTime, timer_type: TimerType, span: Span) -> Self {
+        Self {
+            key,
+            time,
+            timer_type,
+            span,
+        }
+    }
+
+    /// Converts this request into a tagged internal trigger with a fresh tag.
+    #[must_use]
+    pub(crate) fn into_trigger(self) -> Trigger {
+        Trigger::new(self.key, self.time, self.timer_type, self.span)
+    }
+
+    /// Converts this request into a tagged internal trigger with `tag`.
+    #[must_use]
+    pub(crate) fn into_trigger_with_tag(self, tag: i32) -> Trigger {
+        Trigger::with_tag(self.key, self.time, self.timer_type, tag, self.span)
+    }
+}
 
 /// Scheduled timer event containing execution metadata.
 ///

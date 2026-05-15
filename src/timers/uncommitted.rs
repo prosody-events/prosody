@@ -614,7 +614,7 @@ mod tests {
         pin_mut!(stream);
         let trigger = create_test_trigger("fire-test", 1, TimerType::Application)?;
 
-        manager.schedule(trigger.clone()).await?;
+        manager.schedule_trigger(trigger.clone()).await?;
 
         // Advance time to trigger emission
         advance(Duration::from_secs(2)).await;
@@ -658,7 +658,7 @@ mod tests {
         pin_mut!(stream);
         let trigger = create_test_trigger("cancelled-fire-test", 1, TimerType::Application)?;
 
-        manager.schedule(trigger.clone()).await?;
+        manager.schedule_trigger(trigger.clone()).await?;
 
         advance(Duration::from_secs(2)).await;
         task::yield_now().await;
@@ -692,7 +692,7 @@ mod tests {
         pin_mut!(stream);
         let trigger = create_test_trigger("commit-test", 1, TimerType::Application)?;
 
-        manager.schedule(trigger.clone()).await?;
+        manager.schedule_trigger(trigger.clone()).await?;
 
         // Advance time to trigger emission
         advance(Duration::from_secs(2)).await;
@@ -728,7 +728,7 @@ mod tests {
         pin_mut!(stream);
         let trigger = create_test_trigger("abort-test", 1, TimerType::Application)?;
 
-        manager.schedule(trigger.clone()).await?;
+        manager.schedule_trigger(trigger.clone()).await?;
 
         // Advance time to trigger emission
         advance(Duration::from_secs(2)).await;
