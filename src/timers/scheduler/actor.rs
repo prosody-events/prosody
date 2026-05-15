@@ -426,10 +426,9 @@ where
         return;
     }
 
-    let slab_range = start_slab_id..=target_slab_id;
     let load_result = drain_slab_range(
         &state.store,
-        slab_range.clone(),
+        start_slab_id..=target_slab_id,
         triggers,
         &mut state.known_slab_ids,
     )
