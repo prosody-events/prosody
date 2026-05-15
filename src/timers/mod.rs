@@ -170,9 +170,9 @@ pub struct Trigger {
 /// Logical identity of a timer.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub(crate) struct TriggerId {
-    pub(crate) key: Key,
-    pub(crate) time: CompactDateTime,
-    pub(crate) timer_type: TimerType,
+    key: Key,
+    time: CompactDateTime,
+    timer_type: TimerType,
 }
 
 impl Trigger {
