@@ -31,6 +31,7 @@
 //! | `SCHEDULED`          | `Scheduled`         | ✓            | ✓          |
 //! | `FIRING`             | `Firing`            | -            | ✓          |
 //! | `FIRING_RESCHEDULED` | `FiringRescheduled` | ✓            | ✓          |
+//! | `ABORTED`            | `Aborted`           | -            | ✓          |
 //!
 //! # Transition Effects
 //!
@@ -42,21 +43,25 @@
 //! | `FIRING`             | `schedule(same)`   | `FIRING_RESCHEDULED` | → `FiringRescheduled` | insert         | -          |
 //! | `FIRING`             | `unschedule(same)` | `FIRING`             | -                     | -              | -          |
 //! | `FIRING`             | `commit()`         | `UNSCHEDULED`        | remove                | -              | delete     |
-//! | `FIRING`             | `abort()`          | `SCHEDULED`*         | remove                | -              | -          |
+//! | `FIRING`             | `abort()`          | `ABORTED`            | → `Aborted`           | -              | -          |
 //! | `FIRING_RESCHEDULED` | `unschedule(same)` | `FIRING`             | → `Firing`            | remove         | -          |
 //! | `FIRING_RESCHEDULED` | `commit()`         | `SCHEDULED`          | → `Scheduled`         | -              | -          |
 //! | `FIRING_RESCHEDULED` | `abort()`          | `SCHEDULED`          | → `Scheduled`         | -              | -          |
+//! | `ABORTED`            | `schedule(same)`   | `SCHEDULED`          | → `Scheduled`         | insert         | -          |
+//! | `ABORTED`            | `unschedule(same)` | `UNSCHEDULED`        | remove                | -              | delete     |
+//! | `ABORTED`            | `commit()`         | `UNSCHEDULED`        | remove                | -              | delete     |
 //!
-//! *Database row preserved; slab loader restores on restart.
+//! Aborted state is in-memory only; persisted rows load as `Scheduled` after
+//! restart.
 //!
 //! # API Behavior by State
 //!
-//! | Operation            | `SCHEDULED` | `FIRING`   | `FIRING_RESCHEDULED` |
-//! |----------------------|-------------|------------|----------------------|
-//! | `schedule(T)`        | no-op       | reschedule | no-op (idempotent)   |
-//! | `unschedule(T)`      | remove      | no-op      | cancel reschedule    |
-//! | `scheduled_times()`  | include     | exclude    | include              |
-//! | `commit(T)`          | N/A         | delete DB  | keep DB              |
+//! | Operation            | `SCHEDULED` | `FIRING`   | `FIRING_RESCHEDULED` | `ABORTED` |
+//! |----------------------|-------------|------------|----------------------|-----------|
+//! | `schedule(T)`        | no-op       | reschedule | no-op (idempotent)   | requeue   |
+//! | `unschedule(T)`      | remove      | no-op      | cancel reschedule    | remove    |
+//! | `scheduled_times()`  | include     | exclude    | include              | include   |
+//! | `commit(T)`          | N/A         | delete DB  | keep DB              | delete DB |
 
 use crate::Key;
 use crate::timers::datetime::CompactDateTime;
@@ -115,7 +120,7 @@ pub enum TimerState {
     /// - `schedule(same)` transitions to `FiringRescheduled`
     /// - `unschedule(same)` is a no-op
     /// - `commit()` deletes the database row and removes from `ActiveTriggers`
-    /// - `abort()` keeps the database row and removes from `ActiveTriggers`
+    /// - `abort()` keeps the database row and transitions to `Aborted`
     Firing,
 
     /// Handler is processing this timer; timer will fire again after commit.
@@ -126,6 +131,18 @@ pub enum TimerState {
     /// - `commit()` keeps the database row and transitions to `Scheduled`
     /// - `abort()` keeps the database row and transitions to `Scheduled`
     FiringRescheduled,
+
+    /// Delivery was aborted and the persisted timer row is retained.
+    ///
+    /// In this state:
+    /// - the timer remains in `ActiveTriggers` and persistent storage
+    /// - the timer is not in the `DelayQueue`
+    /// - `schedule(same)` transitions to `Scheduled` and requeues it
+    /// - `unschedule(same)` deletes the database row and removes it from
+    ///   `ActiveTriggers`
+    /// - `complete()` preserves the current idempotent delete behavior for
+    ///   non-firing timers
+    Aborted,
 }
 
 /// A concurrent registry of active timer triggers.
@@ -243,41 +260,13 @@ impl ActiveTriggers {
     }
 
     /// Checks whether a given trigger time and type is active for a key.
-    ///
-    /// This is a convenience wrapper around [`get_state`](Self::get_state)
-    /// that returns `true` if any state exists.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The [`Key`] to query.
-    /// * `time` - The [`CompactDateTime`] to check.
-    /// * `timer_type` - The [`TimerType`] to check.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the registry contains the specified (time, type) entry for the
-    /// key.
+    #[cfg(test)]
     pub async fn contains(&self, key: &Key, time: CompactDateTime, timer_type: TimerType) -> bool {
         self.get_state(key, time, timer_type).await.is_some()
     }
 
-    /// Checks whether a trigger is considered scheduled (will fire in the
-    /// future).
-    ///
-    /// A timer is scheduled if it is in [`TimerState::Scheduled`] or
-    /// [`TimerState::FiringRescheduled`] state. Timers in
-    /// [`TimerState::Firing`] are currently being processed but not scheduled
-    /// to fire again.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The [`Key`] to query.
-    /// * `time` - The [`CompactDateTime`] to check.
-    /// * `timer_type` - The [`TimerType`] to check.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the timer is in `Scheduled` or `FiringRescheduled` state.
+    /// Checks whether a trigger is currently scheduled to fire.
+    #[cfg(test)]
     pub async fn is_scheduled(
         &self,
         key: &Key,
@@ -928,6 +917,19 @@ mod tests {
             Some(TimerState::FiringRescheduled)
         );
 
+        // Transition to Aborted
+        assert!(
+            active_triggers
+                .set_state(&key, time, TimerType::Application, TimerState::Aborted)
+                .await
+        );
+        assert_eq!(
+            active_triggers
+                .get_state(&key, time, TimerType::Application)
+                .await,
+            Some(TimerState::Aborted)
+        );
+
         // Transition back to Scheduled (after commit with reschedule)
         assert!(
             active_triggers
@@ -1058,6 +1060,16 @@ mod tests {
             .await;
         assert!(
             active_triggers
+                .is_scheduled(&key, time, TimerType::Application)
+                .await
+        );
+
+        // Transition to Aborted - is_scheduled returns false
+        active_triggers
+            .set_state(&key, time, TimerType::Application, TimerState::Aborted)
+            .await;
+        assert!(
+            !active_triggers
                 .is_scheduled(&key, time, TimerType::Application)
                 .await
         );
@@ -1260,5 +1272,31 @@ mod tests {
         assert_eq!(s.active, 1);
         assert_eq!(s.in_flight, 1);
         assert_eq!(s.overdue, 1);
+    }
+
+    #[test]
+    async fn test_snapshot_aborted_counts_active_and_overdue_not_in_flight() {
+        let active_triggers = ActiveTriggers::default();
+        let time = CompactDateTime::from(1000u32);
+        let now = CompactDateTime::from(1030u32);
+        let key = Key::from("k");
+
+        active_triggers
+            .insert(Trigger::new(
+                key.clone(),
+                time,
+                TimerType::Application,
+                tracing::Span::current(),
+            ))
+            .await;
+        active_triggers
+            .set_state(&key, time, TimerType::Application, TimerState::Aborted)
+            .await;
+
+        let s = active_triggers.snapshot(now).await;
+        assert_eq!(s.active, 1);
+        assert_eq!(s.in_flight, 0);
+        assert_eq!(s.overdue, 1);
+        assert_eq!(s.oldest_overdue_secs, 30);
     }
 }

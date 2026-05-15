@@ -92,6 +92,11 @@ struct Inner {
     /// Maps each segment ID to its active set of slab IDs.
     segment_slabs: HashMap<SegmentId, BTreeSet<SlabId>>,
 
+    /// Persisted `slab_watermark` per segment. Mirrors the static column on
+    /// the Cassandra `timer_segments` table. `None` (or absent) means no
+    /// watermark has been set yet → callers scan from slab 0.
+    slab_watermarks: HashMap<SegmentId, SlabId>,
+
     /// V2 time-based index: maps (`segment_id`, `slab_size`, `slab_id`) to a
     /// map of triggers organized by (`timer_type`, `key`, `time`). Matches v2
     /// `timer_typed_slabs` table structure: partition key + clustering key.
@@ -221,6 +226,42 @@ impl TriggerOperations for InMemoryTriggerStore {
             let _ = entry.remove();
         }
 
+        Ok(())
+    }
+
+    async fn get_slab_watermark(&self) -> Result<Option<SlabId>, Self::Error> {
+        let segment_id = self.segment.id;
+        Ok(self
+            .inner
+            .slab_watermarks
+            .get_async(&segment_id)
+            .await
+            .map(|entry| *entry.get()))
+    }
+
+    async fn set_slab_watermark(&self, watermark: Option<SlabId>) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        match watermark {
+            Some(w) => {
+                self.inner.slab_watermarks.upsert_async(segment_id, w).await;
+            }
+            None => {
+                self.inner.slab_watermarks.remove_async(&segment_id).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn batch_insert_slab_with_watermark(
+        &self,
+        slab: Slab,
+        watermark: Option<SlabId>,
+    ) -> Result<(), Self::Error> {
+        // In-memory mirror of the Cassandra UNLOGGED BATCH: insert the slab
+        // clustering row, then lower the watermark. The memory store has no
+        // crashes to atomise against, so sequential ops are equivalent.
+        self.insert_slab(slab).await?;
+        self.set_slab_watermark(watermark).await?;
         Ok(())
     }
 

@@ -79,8 +79,40 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
     /// Unregisters (deletes) a slab ID from this store's segment.
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Reads the persisted `slab_watermark` for this segment.
+    ///
+    /// `None` = pre-migration / fresh segment → callers should treat as
+    /// "scan from slab 0". When `Some(w)`, every slab clustering row in this
+    /// segment has `slab_id > w` (invariant I1).
+    fn get_slab_watermark(
+        &self,
+    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send;
+
+    /// Persists `slab_watermark` for this segment as a single UPDATE.
+    ///
+    /// Used by the cleanup path to *raise* the watermark when older slabs
+    /// have been deleted. The plain `set` path never lowers the watermark
+    /// during cleanup — that combined write goes through
+    /// [`Self::batch_insert_slab_with_watermark`].
+    fn set_slab_watermark(
+        &self,
+        watermark: Option<SlabId>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Atomically inserts a slab clustering row **and** lowers
+    /// `slab_watermark` in one UNLOGGED BATCH on the segment partition.
+    ///
+    /// Used on the past-time insert path — `slab.id() <= current_watermark`.
+    /// Atomicity guarantees I1 across crashes: after this returns, either
+    /// both writes are visible or neither is.
+    fn batch_insert_slab_with_watermark(
+        &self,
+        slab: Slab,
+        watermark: Option<SlabId>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     // =========================================================================
-    // Slab Trigger Operations (5 methods)
+    // Slab Trigger Operations (4 methods)
     // =========================================================================
 
     /// Streams all triggers of a specific type within a slab's time range.

@@ -36,7 +36,7 @@ use crate::timers::store::cassandra::error::CassandraTriggerStoreError;
 use crate::timers::store::cassandra::migration;
 use crate::timers::store::cassandra::state::{ClusteringEntry, InlineTimer, TimerState};
 use crate::timers::store::operations::TriggerOperations;
-use crate::timers::store::{Segment, SegmentVersion};
+use crate::timers::store::{Segment, SegmentId, SegmentVersion};
 use crate::timers::{TimerType, Trigger};
 use async_stream::try_stream;
 use futures::{
@@ -277,6 +277,71 @@ impl TriggerOperations for CassandraTriggerStore {
             .map_err(CassandraStoreError::from)?;
 
         Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn get_slab_watermark(&self) -> Result<Option<SlabId>, Self::Error> {
+        let segment_id = self.segment.id;
+        let row = self
+            .session()
+            .execute_unpaged(&self.queries().get_slab_watermark, (segment_id,))
+            .await
+            .map_err(CassandraStoreError::from)?
+            .into_rows_result()
+            .map_err(CassandraStoreError::from)?
+            .maybe_first_row::<(Option<i32>,)>()
+            .map_err(CassandraStoreError::from)?;
+
+        Ok(row
+            .and_then(|(w,)| w)
+            .map(|w| SlabId::from_le_bytes(w.to_le_bytes())))
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn set_slab_watermark(&self, watermark: Option<SlabId>) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
+
+        // TTL anchor uses the natural slab end; `calculate_ttl` adds the
+        // configured `base_ttl` grace period (default 1 year), matching the
+        // same lifetime as `insert_slab` and slab triggers.
+        let anchor_time = anchor_after_watermark(watermark, self.segment.slab_size);
+
+        self.execute_with_optional_ttl(
+            anchor_time,
+            &self.queries().set_slab_watermark,
+            &self.queries().set_slab_watermark_no_ttl,
+            |ttl| (ttl, watermark_i32, segment_id),
+            || (watermark_i32, segment_id),
+        )
+        .await
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    async fn batch_insert_slab_with_watermark(
+        &self,
+        slab: Slab,
+        watermark: Option<SlabId>,
+    ) -> Result<(), Self::Error> {
+        let segment_id = self.segment.id;
+        let slab_id = i32::from_le_bytes(slab.id().to_le_bytes());
+        let watermark_i32 = watermark.map(|w| i32::from_le_bytes(w.to_le_bytes()));
+
+        // Same anchor as `insert_slab` so the slab row and watermark hint
+        // share a lifetime. `calculate_ttl` adds the configured `base_ttl`
+        // grace period (default 1 year) on top of `slab.range().end` — that
+        // grace is what lets a lagging client process past-time slabs
+        // without finding them already TTL'd out.
+        let anchor_time = slab.range().end;
+
+        self.execute_with_optional_ttl(
+            anchor_time,
+            &self.queries().batch_insert_slab_with_watermark,
+            &self.queries().batch_insert_slab_with_watermark_no_ttl,
+            |ttl| (segment_id, slab_id, ttl, ttl, watermark_i32, segment_id),
+            || (segment_id, slab_id, watermark_i32, segment_id),
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -895,39 +960,7 @@ impl TriggerOperations for CassandraTriggerStore {
                 }
             }
             TimerState::Overflow => {
-                Box::pin(async {
-                    // Overflow: fetch clustering times directly (we hold the lock; state is
-                    // known Overflow, so we skip resolve_state to avoid a self-deadlock).
-                    // Reuses the same prepared statement as `get_key_times` Overflow path.
-                    let times = self
-                        .session()
-                        .execute_iter(
-                            self.queries().get_key_times.clone(),
-                            (segment_id, trigger.key.as_ref(), trigger.timer_type),
-                        )
-                        .await
-                        .map_err(CassandraStoreError::from)?
-                        .rows_stream::<(CompactDateTime,)>()
-                        .map_err(CassandraStoreError::from)?
-                        .map_err(CassandraStoreError::from)
-                        .map_ok(|(time,)| time)
-                        .try_filter(|&time| ready(time != trigger.time))
-                        .try_collect()
-                        .await?;
-
-                    // BATCH (DELETE clustering + UPDATE state). Runs after the SELECT
-                    // while the lock is still held — no TOCTOU window.
-                    self.batch_clear_and_set_inline(
-                        &segment_id,
-                        &trigger.key,
-                        trigger.timer_type,
-                        &new_state,
-                    )
-                    .await?;
-
-                    Result::<_, CassandraTriggerStoreError>::Ok(times)
-                })
-                .await?
+                clear_overflow_and_schedule_key(self, &segment_id, &trigger, &new_state).await?
             }
         };
 
@@ -1091,6 +1124,55 @@ impl TriggerOperations for CassandraTriggerStore {
 
         Ok(())
     }
+}
+
+async fn clear_overflow_and_schedule_key(
+    store: &CassandraTriggerStore,
+    segment_id: &SegmentId,
+    trigger: &Trigger,
+    new_state: &TimerState,
+) -> Result<SmallVec<[CompactDateTime; 1]>, CassandraTriggerStoreError> {
+    // Overflow: fetch clustering times directly while the caller holds the
+    // per-key state lock. State is known Overflow, so skip resolve_state to
+    // avoid a self-deadlock. Reuses the get_key_times prepared statement.
+    let times = store
+        .session()
+        .execute_iter(
+            store.queries().get_key_times.clone(),
+            (segment_id, trigger.key.as_ref(), trigger.timer_type),
+        )
+        .await
+        .map_err(CassandraStoreError::from)?
+        .rows_stream::<(CompactDateTime,)>()
+        .map_err(CassandraStoreError::from)?
+        .map_err(CassandraStoreError::from)
+        .map_ok(|(time,)| time)
+        .try_filter(|&time| ready(time != trigger.time))
+        .try_collect()
+        .await?;
+
+    // BATCH (DELETE clustering + UPDATE state). Runs after the SELECT while
+    // the lock is still held, so there is no TOCTOU window.
+    store
+        .batch_clear_and_set_inline(segment_id, &trigger.key, trigger.timer_type, new_state)
+        .await?;
+
+    Ok(times)
+}
+
+/// Returns the TTL anchor time for a watermark update.
+///
+/// Anchors on the natural end of the slab at `watermark + 1`. The actual
+/// TTL is `(anchor - now) + base_ttl` because `calculate_ttl` adds the
+/// configured grace period (default 1 year) — slabs and the watermark hint
+/// deliberately outlive their natural end so a lagging consumer can still
+/// process past-time slabs.
+fn anchor_after_watermark(
+    watermark: Option<SlabId>,
+    slab_size: CompactDuration,
+) -> CompactDateTime {
+    let next_id = watermark.map_or(0, |w| w.saturating_add(1));
+    Slab::new(next_id, slab_size).range().end
 }
 
 /// Injects the trigger's span context into a new `HashMap` for Cassandra

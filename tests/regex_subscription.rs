@@ -4,6 +4,8 @@
 //! subscriptions (topics prefixed with "^") and that consumers can dynamically
 //! subscribe to topics matching patterns.
 
+#![recursion_limit = "256"]
+
 use crate::common::{FallibleTestHandler, collect_messages_with_timeout};
 use color_eyre::eyre::{Result, ensure};
 use prosody::tracing::init_test_logging;

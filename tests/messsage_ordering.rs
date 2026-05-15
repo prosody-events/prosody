@@ -3,6 +3,8 @@
 //! received in the order they were produced per key, utilizing integration
 //! tests with Kafka, via the Prosody library.
 
+#![recursion_limit = "256"]
+
 use std::collections::BTreeSet;
 use std::env;
 

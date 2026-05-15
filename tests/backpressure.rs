@@ -4,6 +4,8 @@
 //! while the consumer processes them slowly, demonstrating the backpressure
 //! handling capabilities of the system.
 
+#![recursion_limit = "256"]
+
 use crate::common::SlowTestHandler;
 use color_eyre::eyre::Result;
 use prosody::tracing::init_test_logging;

@@ -69,12 +69,11 @@ mod active;
 pub mod datetime;
 pub mod duration;
 pub mod error;
-mod loader;
 mod manager;
 mod queue;
 mod scheduler;
+mod segment;
 mod slab;
-mod slab_lock;
 pub mod store;
 pub mod uncommitted;
 
@@ -231,9 +230,6 @@ impl Trigger {
         self.span.store(Arc::new(span));
     }
 }
-
-/// Maximum concurrent slab loading operations.
-const LOAD_CONCURRENCY: usize = 16;
 
 /// Maximum concurrent timer deletion operations.
 pub const DELETE_CONCURRENCY: usize = 16;

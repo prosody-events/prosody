@@ -5,6 +5,8 @@
 //! from message handlers, triggered at the correct times, and properly
 //! canceled when needed.
 
+#![recursion_limit = "256"]
+
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::consumer::event_context::EventContext;

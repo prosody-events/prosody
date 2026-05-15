@@ -23,6 +23,8 @@
 //! cargo test --test defer_middleware
 //! ```
 
+#![recursion_limit = "256"]
+
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::{CassandraConfiguration, CassandraStore};
 use prosody::consumer::event_context::EventContext;

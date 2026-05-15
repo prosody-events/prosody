@@ -33,6 +33,11 @@ Development patterns and practices for Prosody: distributed Kafka consumer with 
 - Prefer `use` statements over fully qualified prefixes
 - Methods without `self` should be functions (except `new` and similar)
 - Ask before large structural changes
+- Keep trait constraints as local as possible. If a constraint can sit on a
+  function instead of a struct, put it on the function. Include only the
+  constraints that function actually needs — not a superset for the whole
+  type. The struct should compile and be usable without the bound unless
+  every reachable method requires it.
 
 **Git:**
 
@@ -78,6 +83,29 @@ trait ClassifyError {
 ## Testing
 
 **Organization:** Integration (`tests/`), Unit (`#[cfg(test)]`), Property (`src/timers/store/tests/`)
+
+**Prefer property tests over example tests when invariants are identifiable.**
+When you can name the load-bearing invariants a piece of code must preserve
+(round-trips, parity between two structures, monotonicity, idempotence,
+crash-recovery equivalence), drive them with a property test that generates
+random op sequences and asserts the invariants after each op. Example tests
+catch obvious paths; property tests catch the corners. They are how silent
+bugs (state that drifts, watermarks that leap, invariants that break only on
+specific interleavings) get caught before they ship.
+
+**Property-test iteration count must come from `QUICKCHECK_TESTS`** (or the
+equivalent env var for your generator). Never hardcode a count in the test
+body — `QuickCheck::new().quickcheck(...)` reads `QUICKCHECK_TESTS`
+automatically, with a sensible default when unset. CI can crank this up; dev
+loops stay fast.
+
+**Module promotion when tests grow.** If a module's `#[cfg(test)] mod tests`
+block becomes substantial — i.e. comparable to or larger than the production
+code, or contains a property-test rig with its own fixtures — promote the
+module from `foo.rs` to a `foo/` directory and move the tests into a sibling
+`foo/tests.rs` file declared as `#[cfg(test)] mod tests;`. The production
+code is easier to read without the test scaffolding inline, and the tests
+get their own headers and structure.
 
 **Synchronization - never use `sleep` except for backpressure simulation:**
 

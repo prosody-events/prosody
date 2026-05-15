@@ -23,7 +23,7 @@ use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::slab::SlabId;
+use crate::timers::slab::{Slab, SlabId};
 use crate::timers::{TimerType, Trigger};
 use educe::Educe;
 use futures::Stream;
@@ -258,11 +258,45 @@ pub trait TriggerStore: Clone + Send + Sync + 'static {
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
     // ===================================================================
-    // Slab Cleanup (1 method) - Used by Loader
+    // Slab Metadata Writes (2 methods) - Used by SchedulerActor
     // ===================================================================
+
+    /// Inserts slab metadata (the `(id, slab_id)` clustering row). Used by
+    /// the scheduler actor when it observes a slab it has not registered yet
+    /// and the slab is above `slab_watermark`. Past-time slabs route through
+    /// [`Self::batch_insert_slab_with_watermark`] instead so the slab row
+    /// and the watermark lower together atomically.
+    fn insert_slab(&self, slab: Slab) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Deletes slab metadata (does not delete triggers).
     fn delete_slab(&self, slab_id: SlabId) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    // ===================================================================
+    // Slab Watermark Operations (3 methods) - Used by SchedulerActor
+    // ===================================================================
+
+    /// Reads the persisted `slab_watermark` for this segment.
+    ///
+    /// `None` = pre-migration / fresh segment → callers should treat as
+    /// "scan from slab 0". When `Some(w)`, every slab clustering row in this
+    /// segment has `slab_id > w`.
+    fn get_slab_watermark(
+        &self,
+    ) -> impl Future<Output = Result<Option<SlabId>, Self::Error>> + Send;
+
+    /// Persists `slab_watermark` for this segment.
+    fn set_slab_watermark(
+        &self,
+        watermark: Option<SlabId>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Atomically inserts a slab clustering row and lowers
+    /// `slab_watermark` in one UNLOGGED BATCH on the segment partition.
+    fn batch_insert_slab_with_watermark(
+        &self,
+        slab: Slab,
+        watermark: Option<SlabId>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     // ===================================================================
     // Key Query Operations (2 methods) - Used by TimerManager

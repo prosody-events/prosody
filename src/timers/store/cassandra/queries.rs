@@ -468,5 +468,51 @@ cassandra_queries! {
             TABLE_TYPED_KEYS
         ),
 
+        // =========================================================================
+        // Slab Watermark Operations
+        // =========================================================================
+
+        /// Reads the static `slab_watermark` column for a segment.
+        ///
+        /// Returns `Option<i32>` (Cassandra static columns are NULL until set).
+        /// `None` = pre-migration / fresh segment → scheduler scans from `slab_id = 0`.
+        get_slab_watermark: (
+            "SELECT slab_watermark FROM $keyspace.{} WHERE id = ? LIMIT 1",
+            TABLE_SEGMENTS
+        ),
+
+        /// Updates `slab_watermark` (static column) with TTL.
+        set_slab_watermark: (
+            "UPDATE $keyspace.{} USING TTL ? SET slab_watermark = ? WHERE id = ?",
+            TABLE_SEGMENTS
+        ),
+
+        /// Updates `slab_watermark` (static column) without TTL.
+        set_slab_watermark_no_ttl: (
+            "UPDATE $keyspace.{} SET slab_watermark = ? WHERE id = ?",
+            TABLE_SEGMENTS
+        ),
+
+        /// BATCH: atomically inserts a slab clustering row and lowers
+        /// `slab_watermark` (with TTL). Used on the past-time path —
+        /// guarantees I1 holds across a crash between the two statements.
+        batch_insert_slab_with_watermark: (
+            "BEGIN UNLOGGED BATCH \
+             INSERT INTO $keyspace.{} (id, slab_id) VALUES (?, ?) USING TTL ?; \
+             UPDATE $keyspace.{} USING TTL ? SET slab_watermark = ? WHERE id = ?; \
+             APPLY BATCH",
+            TABLE_SEGMENTS, TABLE_SEGMENTS
+        ),
+
+        /// BATCH: atomically inserts a slab clustering row and lowers
+        /// `slab_watermark` (no TTL).
+        batch_insert_slab_with_watermark_no_ttl: (
+            "BEGIN UNLOGGED BATCH \
+             INSERT INTO $keyspace.{} (id, slab_id) VALUES (?, ?); \
+             UPDATE $keyspace.{} SET slab_watermark = ? WHERE id = ?; \
+             APPLY BATCH",
+            TABLE_SEGMENTS, TABLE_SEGMENTS
+        ),
+
     }
 }

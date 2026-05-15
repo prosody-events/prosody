@@ -3,6 +3,8 @@
 //! Verifies that messages with identical event IDs are deduplicated when
 //! processed through the pipeline consumer with the deduplication middleware.
 
+#![recursion_limit = "256"]
+
 use crate::common::{FallibleTestHandler, collect_messages_with_timeout};
 use color_eyre::eyre::{Result, ensure};
 use prosody::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;

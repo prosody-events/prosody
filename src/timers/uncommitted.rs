@@ -562,7 +562,7 @@ mod tests {
     ///
     /// Returns `(stream, manager, shutdown_tx)`. The caller holds
     /// `shutdown_tx` and can send `ShutdownPhase::Draining` to stop the
-    /// background slab loader.
+    /// background scheduler actor.
     async fn setup_timer_manager() -> Result<(
         impl futures::Stream<Item = PendingTimer<TableAdapter<InMemoryTriggerStore>>>,
         TimerManager<TableAdapter<InMemoryTriggerStore>>,

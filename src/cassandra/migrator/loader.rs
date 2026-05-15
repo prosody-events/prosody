@@ -239,6 +239,10 @@ mod tests {
                 "20260506_add_tag.cql",
                 "bd2708438d6214cc21d2398b15878862a00e22f3f980a0e49a17effd28d20ff6",
             ),
+            (
+                "20260513_add_timer_slab_watermark.cql",
+                "8b5d3472e1f016610c57c40264e4ecaf317eb2b5529706b9fd4d49a588a66799",
+            ),
         ]
         .into();
 
