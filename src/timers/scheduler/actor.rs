@@ -307,9 +307,11 @@ where
 }
 
 fn cleanable_slab_end<T>(state: &ActorState<T>, now_slab_id: SlabId) -> Option<SlabId> {
-    state
-        .highest_loaded_slab_id
-        .and_then(|highest_loaded| now_slab_id.checked_sub(1).map(|s| s.min(highest_loaded)))
+    Some(
+        now_slab_id
+            .checked_sub(1)?
+            .min(state.highest_loaded_slab_id?),
+    )
 }
 
 fn completed_slab_ids<T>(
@@ -317,16 +319,16 @@ fn completed_slab_ids<T>(
     now_slab_id: SlabId,
     active_slab_ids: &BTreeSet<SlabId>,
 ) -> Vec<SlabId> {
-    cleanable_slab_end(state, now_slab_id)
-        .map(|end| {
-            state
-                .known_slab_ids
-                .range(..=end)
-                .filter(|slab_id| !active_slab_ids.contains(slab_id))
-                .copied()
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(end) = cleanable_slab_end(state, now_slab_id) else {
+        return Vec::new();
+    };
+
+    state
+        .known_slab_ids
+        .range(..=end)
+        .filter(|slab_id| !active_slab_ids.contains(slab_id))
+        .copied()
+        .collect()
 }
 
 async fn delete_completed_slabs<T>(store: &T, slab_ids: &[SlabId]) -> Result<(), T::Error>
