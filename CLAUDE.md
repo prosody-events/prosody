@@ -42,7 +42,7 @@ Development patterns and practices for Prosody: distributed Kafka consumer with 
 **Git:**
 
 - Never add self-attribution to commits, PR descriptions, or code comments
-- Use conventional commits (e.g., `fix:`, `feat:`, `docs:`, `refactor:`)
+- Use conventional commits for commit titles and PR titles (e.g., `fix:`, `feat:`, `docs:`, `refactor:`)
 
 ## Code Organization
 
