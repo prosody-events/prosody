@@ -2,6 +2,32 @@
 
 Distributed Kafka consumer framework with a timer system and pluggable storage backends. This file documents the patterns and practices coding agents should follow when working in this repository.
 
+## Design Principles
+
+These come before everything else. Every change is judged against them.
+
+**Write code that is simple, clear, well-factored, elegant, beautiful, easy to understand, correct, and idiomatic.** A reader should grasp the intent without effort. If a change makes the code harder to read, the change is wrong, even if it's faster or shorter. If two designs are correct, pick the one that's easier to delete.
+
+**Make invalid states unrepresentable in the type system.** When the compiler can prove a contract, no test, comment, or convention has to. Prefer:
+- Distinct types for distinct concepts (`TimerRequest` vs `Trigger`) over flag fields and "set this when X" rules.
+- Restricted constructors (`pub(in crate::foo)`) over public ones with documented preconditions.
+- Sum types (`enum`) over `Option<T>` plus a separate boolean.
+- Newtypes over raw primitives at API boundaries when the primitive carries semantic meaning the type system can capture.
+
+If a bug class can be made uncompilable, do that instead of writing a runtime check.
+
+**Delete more than you add.** Every change should leave the codebase smaller, simpler, or both — measured by lines, types, indirections, or cognitive load. If you must add code, look first for duplication you can fold, abstractions that no longer pay rent, dead branches, and stale comments. The end-state diff should net negative whenever the task allows. Bloat compounds; aggressively prune.
+
+**Identify, document, and enforce invariants.** For every load-bearing piece of state:
+1. Name the invariant.
+2. Write it down — preferably as a doc comment near the type or function that owns it.
+3. Enforce it in the type system if you can; otherwise enforce it with an assertion at the boundary that establishes it.
+4. Cover it with a property test. Example tests catch the path you thought of; property tests catch the corners.
+
+If you can't name the invariant, you don't yet understand the code well enough to change it.
+
+**Leave the codebase better than you found it.** Drive-by simplifications are encouraged when they're scoped to the area you're already touching. Don't sprawl — but don't walk past obvious cleanup either.
+
 ## Critical Rules
 
 **Error Handling:**
@@ -41,8 +67,10 @@ Distributed Kafka consumer framework with a timer system and pluggable storage b
 
 **Git:**
 
-- Never add self-attribution to commits, PR descriptions, or code comments
-- Use conventional commits for commit titles and PR titles (e.g., `fix:`, `feat:`, `docs:`, `refactor:`)
+- Never add self-attribution to branch names, commits, PR titles, PR descriptions, or code comments.
+- Use conventional commits for commit titles and PR titles (e.g., `fix:`, `feat:`, `docs:`, `refactor:`).
+- PR titles and descriptions are written for a reader who is **not** intimately familiar with the project. Be readable, well written, and well styled. Lead with what changed and why; assume nothing about the reader's session context.
+- **PR descriptions never include a test plan or a list of verification steps.** Reviewers don't need a checklist of what you ran — they need to understand what changed and why. Test coverage belongs in the tests themselves.
 
 ## Code Organization
 
@@ -84,28 +112,30 @@ trait ClassifyError {
 
 **Organization:** Integration (`tests/`), Unit (`#[cfg(test)]`), Property (`src/timers/store/tests/`)
 
-**Prefer property tests over example tests when invariants are identifiable.**
-When you can name the load-bearing invariants a piece of code must preserve
-(round-trips, parity between two structures, monotonicity, idempotence,
-crash-recovery equivalence), drive them with a property test that generates
-random op sequences and asserts the invariants after each op. Example tests
-catch obvious paths; property tests catch the corners. They are how silent
-bugs (state that drifts, watermarks that leap, invariants that break only on
-specific interleavings) get caught before they ship.
+**Tests live in their own modules.** Default to a sibling `tests.rs` (or
+`foo/tests.rs` if `foo.rs` becomes a directory), declared as
+`#[cfg(test)] mod tests;`. Inline `#[cfg(test)] mod tests { ... }` blocks
+are acceptable only for a handful of tiny tests on a small file; promote
+to a sibling file as soon as the block has fixtures, helpers, or starts
+to dominate the read of the production code. Production code reads better
+without the scaffolding inline; tests get their own headers and structure.
+
+**Drive tests by invariants, not by paths.** For a piece of code, ask
+"what must remain true here?" and write that down. Then write the test
+that proves it across random inputs. Example tests catch obvious paths;
+property tests catch the corners — silent bugs (state that drifts,
+watermarks that leap, invariants that break only on specific interleavings)
+do not get caught any other way. If you can identify the invariant
+(round-trip, parity between two structures, monotonicity, idempotence,
+crash-recovery equivalence, oracle correctness), use a property test.
+Reach for an example test only when the invariant is too narrow to
+generalize, or as a fast smoke alongside the prop test.
 
 **Property-test iteration count must come from `QUICKCHECK_TESTS`** (or the
 equivalent env var for your generator). Never hardcode a count in the test
 body — `QuickCheck::new().quickcheck(...)` reads `QUICKCHECK_TESTS`
 automatically, with a sensible default when unset. CI can crank this up; dev
 loops stay fast.
-
-**Module promotion when tests grow.** If a module's `#[cfg(test)] mod tests`
-block becomes substantial — i.e. comparable to or larger than the production
-code, or contains a property-test rig with its own fixtures — promote the
-module from `foo.rs` to a `foo/` directory and move the tests into a sibling
-`foo/tests.rs` file declared as `#[cfg(test)] mod tests;`. The production
-code is easier to read without the test scaffolding inline, and the tests
-get their own headers and structure.
 
 **Synchronization - never use `sleep` except for backpressure simulation:**
 
