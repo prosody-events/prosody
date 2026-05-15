@@ -425,11 +425,16 @@ where
     }
 
     let slab_range = start_slab_id..=target_slab_id;
-    let load_result = drain_slab_range(&state.store, slab_range.clone(), triggers).await;
+    let load_result = drain_slab_range(
+        &state.store,
+        slab_range.clone(),
+        triggers,
+        &mut state.known_slab_ids,
+    )
+    .await;
 
     match load_result {
-        Ok((registered, count)) => {
-            state.known_slab_ids.extend(registered);
+        Ok(count) => {
             state.highest_loaded_slab_id = Some(target_slab_id);
             debug!(
                 start_slab_id,
@@ -453,13 +458,14 @@ where
 /// Drains registered slabs and their triggers into the trigger queue.
 ///
 /// The slab metadata scan happens here, in the load loop. Empty slab rows are
-/// still returned in `registered` so cleanup can delete them later without
+/// still recorded in `known_slab_ids` so cleanup can delete them later without
 /// reading the slab table again.
 async fn drain_slab_range<T>(
     store: &T,
     range: RangeInclusive<SlabId>,
     triggers: &mut TriggerQueue,
-) -> Result<(BTreeSet<SlabId>, usize), T::Error>
+    known_slab_ids: &mut BTreeSet<SlabId>,
+) -> Result<usize, T::Error>
 where
     T: TriggerStore,
 {
@@ -470,26 +476,23 @@ where
             .map_ok(move |slab_id| {
                 let store = store_for_tasks.clone();
                 async move {
-                    let mut slab_triggers = Vec::new();
-                    let mut triggers = pin!(store.get_slab_triggers_all_types(slab_id));
-                    while let Some(trigger) = cooperative(triggers.try_next()).await? {
-                        slab_triggers.push(trigger);
-                    }
+                    let triggers = pin!(store.get_slab_triggers_all_types(slab_id));
+                    let slab_triggers = cooperative(triggers.try_collect::<Vec<_>>()).await?;
                     Ok::<_, T::Error>((slab_id, slab_triggers))
                 }
             })
             .try_buffer_unordered(LOAD_CONCURRENCY)
     );
-    let mut registered = BTreeSet::new();
+
     let mut count = 0_usize;
     while let Some((slab_id, slab_triggers)) = cooperative(stream.try_next()).await? {
-        registered.insert(slab_id);
+        known_slab_ids.insert(slab_id);
         for trigger in slab_triggers {
             triggers.insert(trigger).await;
             count = count.saturating_add(1);
         }
     }
-    Ok((registered, count))
+    Ok(count)
 }
 
 pub(super) fn owns_slab<T>(state: &ActorState<T>, slab_id: SlabId) -> bool {
