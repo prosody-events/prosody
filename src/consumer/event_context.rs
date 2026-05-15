@@ -16,7 +16,7 @@ use crate::error::ClassifyError;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
-use crate::timers::{TimerManager, TimerType, Trigger};
+use crate::timers::{TimerManager, TimerRequest, TimerType};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -392,8 +392,8 @@ where
         timer_type: TimerType,
     ) -> Result<(), Self::Error> {
         self.run_cancellable(async |inner| {
-            let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
-            inner.timers.schedule(trigger).await
+            let request = TimerRequest::new(inner.key.clone(), time, timer_type, Span::current());
+            inner.timers.schedule(request).await
         })
         .await
     }
@@ -404,8 +404,8 @@ where
         timer_type: TimerType,
     ) -> Result<(), TimerManagerError<T::Error>> {
         self.run_cancellable(async |inner| {
-            let trigger = Trigger::new(inner.key.clone(), time, timer_type, Span::current());
-            inner.timers.clear_and_schedule(trigger).await
+            let request = TimerRequest::new(inner.key.clone(), time, timer_type, Span::current());
+            inner.timers.clear_and_schedule(request).await
         })
         .await
     }
