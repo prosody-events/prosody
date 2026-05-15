@@ -1,15 +1,18 @@
 //! Provides functionality for administrative operations on Kafka topics.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use derive_builder::Builder;
 use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication};
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
+use rdkafka::metadata::{Metadata, MetadataPartition};
 use thiserror::Error;
+use tokio::task::{JoinError, spawn_blocking};
 use tokio::time::sleep;
 use validator::Validate;
 pub use validator::ValidationErrors;
@@ -152,10 +155,10 @@ impl TopicConfiguration {
     }
 }
 
-/// How long `create_topic` will poll for the topic to become visible after
-/// the broker accepts the creation request.
+/// How long `create_topic` will poll for a newly-created topic to become
+/// visible through ordinary client metadata.
 const TOPIC_READY_TIMEOUT: Duration = Duration::from_secs(10);
-/// Per-attempt timeout for each `describe_configs` poll.
+/// Per-attempt timeout for each metadata fetch while waiting for readiness.
 const TOPIC_READY_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 /// Sleep between poll attempts to avoid spinning on fast-failing calls.
 const TOPIC_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -164,6 +167,7 @@ const TOPIC_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct ProsodyAdminClient {
     client: AdminClient<DefaultClientContext>,
     options: AdminOptions,
+    bootstrap_servers: Vec<String>,
 }
 
 impl ProsodyAdminClient {
@@ -189,6 +193,7 @@ impl ProsodyAdminClient {
         Ok(Self {
             client: client_config.create()?,
             options,
+            bootstrap_servers: config.bootstrap_servers.clone(),
         })
     }
 
@@ -262,28 +267,48 @@ impl ProsodyAdminClient {
             new_topic = new_topic.set("retention.ms", &retention_str);
         }
 
-        self.client
+        let results = self
+            .client
             .create_topics([&new_topic], &self.options)
             .await?;
 
-        // create_topics returns as soon as the broker accepts the request, but
-        // metadata propagation can lag. Poll describe_configs until the topic
-        // is visible to the controller, or the deadline elapses.
-        let resource = ResourceSpecifier::Topic(&config.name);
-        let poll_opts = AdminOptions::new().operation_timeout(Some(TOPIC_READY_POLL_TIMEOUT));
+        for result in results {
+            result.map_err(|(_, code)| KafkaError::AdminOp(code))?;
+        }
+
+        self.wait_for_topic_metadata(&config.name, config.partition_count)
+            .await
+    }
+
+    /// Waits until regular Kafka clients can observe a newly-created topic.
+    async fn wait_for_topic_metadata(
+        &self,
+        name: &str,
+        expected_partitions: Option<u16>,
+    ) -> Result<(), ProsodyAdminClientError> {
+        let consumer: Arc<BaseConsumer> = Arc::new(
+            ClientConfig::new()
+                .set("bootstrap.servers", self.bootstrap_servers.join(","))
+                .create()?,
+        );
         let deadline = Instant::now() + TOPIC_READY_TIMEOUT;
         loop {
-            let results = self
-                .client
-                .describe_configs([&resource], &poll_opts)
-                .await?;
+            let metadata = spawn_blocking({
+                let consumer = Arc::clone(&consumer);
+                let name = name.to_owned();
+                move || consumer.fetch_metadata(Some(&name), TOPIC_READY_POLL_TIMEOUT)
+            })
+            .await?;
 
-            if results.first().is_some_and(Result::is_ok) {
+            if metadata
+                .as_ref()
+                .is_ok_and(|metadata| topic_metadata_ready(metadata, name, expected_partitions))
+            {
                 return Ok(());
             }
 
             if Instant::now() >= deadline {
-                return Err(ProsodyAdminClientError::TopicNotReady(config.name.clone()));
+                return Err(ProsodyAdminClientError::TopicNotReady(name.to_owned()));
             }
 
             sleep(TOPIC_READY_POLL_INTERVAL).await;
@@ -337,6 +362,26 @@ impl ProsodyAdminClient {
     }
 }
 
+fn topic_metadata_ready(metadata: &Metadata, name: &str, expected_partitions: Option<u16>) -> bool {
+    metadata.topics().iter().any(|topic| {
+        topic.name() == name
+            && topic.error().is_none()
+            && partitions_ready(topic.partitions(), expected_partitions)
+    })
+}
+
+fn partitions_ready(partitions: &[MetadataPartition], expected_partitions: Option<u16>) -> bool {
+    let partition_count_matches = expected_partitions.map_or_else(
+        || !partitions.is_empty(),
+        |expected| partitions.len() == usize::from(expected),
+    );
+
+    partition_count_matches
+        && partitions
+            .iter()
+            .all(|partition| partition.error().is_none())
+}
+
 /// Errors that can occur during Prosody admin client operations.
 #[derive(Debug, Error)]
 pub enum ProsodyAdminClientError {
@@ -351,4 +396,8 @@ pub enum ProsodyAdminClientError {
     /// Topic was created but did not become visible within the deadline.
     #[error("topic {0:?} was not ready within {TOPIC_READY_TIMEOUT:?} of creation")]
     TopicNotReady(String),
+
+    /// Topic readiness check failed while running on the blocking pool.
+    #[error("topic readiness check failed: {0}")]
+    TopicReadyCheck(#[from] JoinError),
 }

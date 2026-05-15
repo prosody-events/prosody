@@ -60,49 +60,7 @@ async fn create_topic_with_partitions(name: &str, partitions: u16) -> color_eyre
         .partition_count(partitions)
         .build()?;
     admin.create_topic(&topic_config).await?;
-    wait_for_topic(name, partitions).await?;
     Ok(())
-}
-
-/// Polls Kafka metadata until the topic is visible with the expected number of
-/// partitions. Replaces the fixed 2-second sleep that previously preceded every
-/// test, cutting topic-creation overhead from ~2 s to the actual broker
-/// propagation time (~50–200 ms locally).
-///
-/// Each `fetch_metadata` call has a built-in 500ms timeout that yields the
-/// async runtime while the blocking call is in-flight — no extra sleep needed.
-async fn wait_for_topic(name: &str, expected_partitions: u16) -> color_eyre::Result<()> {
-    let consumer: Arc<BaseConsumer> = Arc::new(
-        ClientConfig::new()
-            .set("bootstrap.servers", "localhost:9094")
-            .set("group.id", "prosody-test-setup")
-            .create()?,
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let meta = spawn_blocking({
-            let name = name.to_owned();
-            let consumer = Arc::clone(&consumer);
-            move || consumer.fetch_metadata(Some(&name), Duration::from_millis(500))
-        })
-        .await?;
-
-        if let Ok(meta) = meta {
-            let ready = meta.topics().iter().any(|t| {
-                t.name() == name
-                    && t.partitions().len() == usize::from(expected_partitions)
-                    && t.partitions().iter().all(|p| p.error().is_none())
-            });
-            if ready {
-                return Ok(());
-            }
-        }
-
-        if Instant::now() >= deadline {
-            color_eyre::eyre::bail!("topic {name} did not become ready within 10s");
-        }
-    }
 }
 
 async fn delete_topic(name: &str) -> color_eyre::Result<()> {
