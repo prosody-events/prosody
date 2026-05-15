@@ -14,6 +14,7 @@ use crate::timers::store::tests::{
 use crate::timers::store::{Segment, TriggerStore};
 use crate::timers::{TimerType, Trigger};
 use ahash::HashSet;
+use futures::TryStreamExt;
 use std::fmt::Debug;
 
 use tracing::Span;
@@ -56,6 +57,66 @@ where
         return Err(format!(
             "slab trigger did not reflect rotated tag. Expected: {new_tag:?}, got: {slab_tag:?}"
         ));
+    }
+
+    Ok(())
+}
+
+async fn verify_duplicate_add_replaces_metadata<S>(
+    store: &S,
+    segment: &Segment,
+    trigger: &Trigger,
+) -> TestStoreResult
+where
+    S: TriggerStore + Send + Sync,
+    S::Error: Debug,
+{
+    let replacement_tag = trigger.tag.wrapping_add(17);
+    let replacement = Trigger::with_tag(
+        trigger.key.clone(),
+        trigger.time,
+        trigger.timer_type,
+        replacement_tag,
+        Span::current(),
+    );
+    store
+        .add_trigger(replacement)
+        .await
+        .map_err(|e| format!("duplicate add failed: {e:?}"))?;
+
+    let current_tag = store
+        .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+        .await
+        .map_err(|e| format!("current_tag after duplicate add failed: {e:?}"))?;
+    let key_triggers: Vec<Trigger> = store
+        .get_key_triggers(trigger.timer_type, &trigger.key)
+        .try_collect()
+        .await
+        .map_err(|e| format!("get_key_triggers after duplicate add failed: {e:?}"))?;
+    let key_tag = key_triggers
+        .iter()
+        .find(|t| t.time == trigger.time && t.timer_type == trigger.timer_type)
+        .map(|t| t.tag);
+    let slab_id = Slab::from_time(segment.slab_size, trigger.time).id();
+    let slab_triggers = get_slab_triggers(store, slab_id).await?;
+    let slab_tag = slab_triggers
+        .iter()
+        .find(|t| {
+            t.key == trigger.key && t.time == trigger.time && t.timer_type == trigger.timer_type
+        })
+        .map(|t| t.tag);
+
+    for (surface, tag) in [
+        ("current_tag", current_tag),
+        ("key trigger", key_tag),
+        ("slab trigger", slab_tag),
+    ] {
+        if tag != Some(replacement_tag) {
+            return Err(format!(
+                "duplicate add did not replace {surface} tag. Expected: {replacement_tag:?}, \
+                 got: {tag:?}"
+            ));
+        }
     }
 
     Ok(())
@@ -136,6 +197,7 @@ where
     // slab index after restarts and ownership transfers.
     if let Some(trigger) = input.triggers.first() {
         verify_update_tag_rotates_both_indices(store, &input.segment, trigger).await?;
+        verify_duplicate_add_replaces_metadata(store, &input.segment, trigger).await?;
     }
 
     // Test remove_trigger

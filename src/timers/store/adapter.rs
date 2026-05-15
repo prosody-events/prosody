@@ -180,7 +180,7 @@ where
         // slab is already known).
         try_join!(
             self.operations.insert_slab_trigger(slab, trigger.clone()),
-            self.operations.insert_key_trigger(trigger),
+            self.operations.upsert_key_trigger(trigger),
         )?;
         Ok(())
     }

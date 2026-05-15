@@ -174,8 +174,13 @@ pub trait TriggerOperations: Clone + Send + Sync + 'static {
         key: &Key,
     ) -> impl Stream<Item = Result<Trigger, Self::Error>> + Send;
 
-    /// Inserts a trigger into the key-based index.
-    fn insert_key_trigger(
+    /// Upserts a trigger into the key-based index.
+    ///
+    /// The logical identity is `(key, time, timer_type)`. If that identity is
+    /// already present, implementations must replace mutable metadata such as
+    /// `tag` and span context rather than treating the call as a distinct
+    /// timer.
+    fn upsert_key_trigger(
         &self,
         trigger: Trigger,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;

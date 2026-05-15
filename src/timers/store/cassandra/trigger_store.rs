@@ -37,7 +37,7 @@ use crate::timers::store::cassandra::migration;
 use crate::timers::store::cassandra::state::{ClusteringEntry, InlineTimer, TimerState};
 use crate::timers::store::operations::TriggerOperations;
 use crate::timers::store::{Segment, SegmentId, SegmentVersion};
-use crate::timers::{TimerType, Trigger};
+use crate::timers::{TimerType, Trigger, TriggerId};
 use async_stream::try_stream;
 use futures::{
     Stream, TryStreamExt,
@@ -405,7 +405,8 @@ impl TriggerOperations for CassandraTriggerStore {
                     .map_err(CassandraStoreError::from)?
             {
                 let context = self.propagator().extract(&span_map);
-                let span = related_span!(SpanRelation::Child, context.clone(), "fetch_slab_trigger_all_types");
+                let span =
+                    related_span!(SpanRelation::Child, context.clone(), "fetch_slab_trigger_all_types");
                 let tag = tag_opt.unwrap_or(0_i32);
 
                 yield Trigger::with_tag(key.into(), time, timer_type, tag, span);
@@ -558,7 +559,8 @@ impl TriggerOperations for CassandraTriggerStore {
                 TimerState::Inline(timer) => {
                     // Inline: yield trigger from cache (0 clustering query).
                     let context = self.propagator().extract(&timer.span);
-                    let span = related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
+                    let span =
+                        related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
                     yield Trigger::with_tag(key_clone.clone(), timer.time, timer_type, timer.tag, span);
                 }
                 TimerState::Overflow => {
@@ -581,7 +583,8 @@ impl TriggerOperations for CassandraTriggerStore {
                             .map_err(CassandraStoreError::from)?
                     {
                         let context = self.propagator().extract(&span_map);
-                        let span = related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger");
+                        let span =
+                            related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger");
                         let tag = tag_opt.unwrap_or(0_i32);
                         yield Trigger::with_tag(key_clone.clone(), time, timer_type, tag, span);
                     }
@@ -695,7 +698,8 @@ impl TriggerOperations for CassandraTriggerStore {
                 for &tt in TimerType::VARIANTS {
                     if let Some(TimerState::Inline(timer)) = state_map.get(&tt) {
                         let context = self.propagator().extract(&timer.span);
-                        let span = related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
+                        let span =
+                            related_span!(SpanRelation::Child, context.clone(), "fetch_key_trigger_inline");
                         yield Trigger::with_tag(key_clone.clone(), timer.time, tt, timer.tag, span);
                     }
                 }
@@ -703,7 +707,7 @@ impl TriggerOperations for CassandraTriggerStore {
         }
     }
 
-    /// Inserts a trigger into the key index with state-aware transitions.
+    /// Upserts a trigger into the key index with state-aware transitions.
     ///
     /// Uses `resolve_state` (cache-first, warms all types on miss):
     /// - **Inline(old)**: Promote old timer to clustering + write new to
@@ -712,63 +716,18 @@ impl TriggerOperations for CassandraTriggerStore {
     /// - **Absent**: Set inline state with new timer directly → `Inline(new)`
     ///   (post-V3 Absent is unambiguous: 0 timers, no clustering rows)
     #[instrument(level = "debug", skip(self), fields(state_cached = Empty), err)]
-    async fn insert_key_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
+    async fn upsert_key_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
-        let timer_type = trigger.timer_type;
-        let key = trigger.key.clone();
+        let pending = PendingKeyTrigger::from_trigger(self.propagator(), &trigger);
 
-        let (handle, cached) = self.resolve_state(&segment_id, &key, timer_type).await?;
+        let (handle, cached) = self
+            .resolve_state(&segment_id, &pending.id.key, pending.id.timer_type)
+            .await?;
         Span::current().record("state_cached", cached);
 
         let mut guard = handle.lock().await;
-        match &*guard {
-            TimerState::Inline(old_timer) if old_timer.time == trigger.time => {
-                // Same time already stored inline — no-op.
-            }
-            TimerState::Inline(old_timer) => {
-                // Promote: old inline → clustering, new → clustering, state → Overflow.
-                // All three writes are issued as a single UNLOGGED BATCH so the
-                // transition is atomic at the partition level.
-                let new_span_map = extract_span_map(self.propagator(), &trigger);
-
-                self.batch_promote_and_set_overflow(
-                    &segment_id,
-                    &key,
-                    timer_type,
-                    ClusteringEntry {
-                        time: old_timer.time,
-                        span: &old_timer.span.clone(),
-                        tag: old_timer.tag,
-                    },
-                    ClusteringEntry {
-                        time: trigger.time,
-                        span: &new_span_map,
-                        tag: trigger.tag,
-                    },
-                )
-                .await?;
-                *guard = TimerState::Overflow;
-            }
-            TimerState::Overflow => {
-                // Already overflow: write clustering only. State is unchanged.
-                self.add_key_trigger_clustering(&segment_id, trigger)
-                    .await?;
-            }
-            TimerState::Absent => {
-                // Post-V3 Absent is unambiguous: 0 timers, no clustering rows.
-                // Set inline state directly.
-                let span_map = extract_span_map(self.propagator(), &trigger);
-
-                let new_state = TimerState::Inline(InlineTimer {
-                    time: trigger.time,
-                    span: span_map,
-                    tag: trigger.tag,
-                });
-                self.set_state_inline(&segment_id, &key, timer_type, &new_state)
-                    .await?;
-                *guard = new_state;
-            }
-        }
+        let transition = KeyUpsertTransition::from_state(&guard, pending);
+        *guard = transition.apply(self, &segment_id).await?;
 
         Ok(())
     }
@@ -1158,6 +1117,135 @@ async fn clear_overflow_and_schedule_key(
         .await?;
 
     Ok(times)
+}
+
+#[derive(Debug)]
+struct PendingKeyTrigger {
+    id: TriggerId,
+    span_map: HashMap<String, String>,
+    tag: i32,
+}
+
+impl PendingKeyTrigger {
+    fn from_trigger(propagator: &TextMapCompositePropagator, trigger: &Trigger) -> Self {
+        Self {
+            id: trigger.id(),
+            span_map: extract_span_map(propagator, trigger),
+            tag: trigger.tag,
+        }
+    }
+
+    fn into_inline_state(self) -> (TriggerId, TimerState) {
+        let state = TimerState::Inline(InlineTimer {
+            time: self.id.time,
+            span: self.span_map,
+            tag: self.tag,
+        });
+        (self.id, state)
+    }
+
+    fn clustering_entry(&self) -> ClusteringEntry<'_> {
+        ClusteringEntry {
+            time: self.id.time,
+            span: &self.span_map,
+            tag: self.tag,
+        }
+    }
+
+    async fn insert_clustering(
+        &self,
+        store: &CassandraTriggerStore,
+        segment_id: &SegmentId,
+    ) -> Result<(), CassandraTriggerStoreError> {
+        store
+            .execute_with_optional_ttl(
+                self.id.time,
+                &store.queries().insert_key_trigger_clustering,
+                &store.queries().insert_key_trigger_clustering_no_ttl,
+                |ttl| {
+                    (
+                        segment_id,
+                        self.id.key.as_ref(),
+                        self.id.timer_type,
+                        self.id.time,
+                        &self.span_map,
+                        self.tag,
+                        ttl,
+                    )
+                },
+                || {
+                    (
+                        segment_id,
+                        self.id.key.as_ref(),
+                        self.id.timer_type,
+                        self.id.time,
+                        &self.span_map,
+                        self.tag,
+                    )
+                },
+            )
+            .await
+    }
+}
+
+#[derive(Debug)]
+enum KeyUpsertTransition {
+    WriteInline(PendingKeyTrigger),
+    PromoteToOverflow {
+        existing: InlineTimer,
+        new: PendingKeyTrigger,
+    },
+    UpsertClustering(PendingKeyTrigger),
+}
+
+impl KeyUpsertTransition {
+    fn from_state(state: &TimerState, new: PendingKeyTrigger) -> Self {
+        match state {
+            TimerState::Absent => Self::WriteInline(new),
+            TimerState::Inline(existing) if existing.time == new.id.time => Self::WriteInline(new),
+            TimerState::Inline(existing) => Self::PromoteToOverflow {
+                existing: existing.clone(),
+                new,
+            },
+            TimerState::Overflow => Self::UpsertClustering(new),
+        }
+    }
+
+    async fn apply(
+        self,
+        store: &CassandraTriggerStore,
+        segment_id: &SegmentId,
+    ) -> Result<TimerState, CassandraTriggerStoreError> {
+        match self {
+            Self::WriteInline(new) => {
+                let (id, new_state) = new.into_inline_state();
+                store
+                    .set_state_inline(segment_id, &id.key, id.timer_type, &new_state)
+                    .await?;
+                Ok(new_state)
+            }
+            Self::PromoteToOverflow { existing, new } => {
+                store
+                    .batch_promote_and_set_overflow(
+                        segment_id,
+                        &new.id.key,
+                        new.id.timer_type,
+                        ClusteringEntry {
+                            time: existing.time,
+                            span: &existing.span,
+                            tag: existing.tag,
+                        },
+                        new.clustering_entry(),
+                    )
+                    .await?;
+                Ok(TimerState::Overflow)
+            }
+            Self::UpsertClustering(new) => {
+                new.insert_clustering(store, segment_id).await?;
+                Ok(TimerState::Overflow)
+            }
+        }
+    }
 }
 
 /// Returns the TTL anchor time for a watermark update.

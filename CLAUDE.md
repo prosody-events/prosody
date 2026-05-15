@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Prosody
 
-Development patterns and practices for Prosody: distributed Kafka consumer with timer system and storage abstractions.
+Distributed Kafka consumer framework with a timer system and pluggable storage backends. This file documents the patterns and practices coding agents should follow when working in this repository.
 
 ## Critical Rules
 
@@ -42,7 +42,7 @@ Development patterns and practices for Prosody: distributed Kafka consumer with 
 **Git:**
 
 - Never add self-attribution to commits, PR descriptions, or code comments
-- Use conventional commits (e.g., `fix:`, `feat:`, `docs:`, `refactor:`)
+- Use conventional commits for commit titles and PR titles (e.g., `fix:`, `feat:`, `docs:`, `refactor:`)
 
 ## Code Organization
 
@@ -265,13 +265,9 @@ See `CachedTimerDeferStore` for the reference implementation.
 - Automatically use context7 for code generation and library documentation.
 
 ## Active Technologies
-- Rust Edition 2024 (stable) + scylla 1.5 (Cassandra driver), tokio 1.50, parking_lot, scc, quick_cache 0.6, tracing, tracing-opentelemetry 0.32, opentelemetry 0.31 (001-reduce-timer-tombstones)
-- Apache Cassandra (via scylla-rust-driver) - `timer_typed_keys` and `timer_typed_slabs` tables (001-reduce-timer-tombstones)
 - Rust Edition 2024 (stable) + scylla 1.5 (Cassandra driver), tokio 1.50, parking_lot 0.12, quick_cache 0.6, scc 3.6, tracing 0.1, tracing-opentelemetry 0.32, opentelemetry 0.31, thiserror 2.0, async-stream 0.3, smallvec 1.15, strum 0.28 (001-reduce-timer-tombstones)
 - Apache Cassandra via scylla-rust-driver — `timer_typed_keys` and `timer_typed_slabs` tables (001-reduce-timer-tombstones)
-
-- Rust Edition 2024 (stable) + rdkafka 0.39, tokio 1.49, futures 0.3, serde 1.0, simd-json 0.17 (non-ARM), serde_json
-  1.0 (ARM fallback), opentelemetry 0.31, tracing 0.1, tracing-opentelemetry 0.32, whoami 2.1 (002-kafka-telemetry)
+- Rust Edition 2024 (stable) + rdkafka 0.39, tokio 1.49, futures 0.3, serde 1.0, simd-json 0.17 (non-ARM), serde_json 1.0 (ARM fallback), opentelemetry 0.31, tracing 0.1, tracing-opentelemetry 0.32, whoami 2.1 (002-kafka-telemetry)
 
 ## Recent Changes
 
