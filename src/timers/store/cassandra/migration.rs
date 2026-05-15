@@ -229,7 +229,7 @@ pub(crate) async fn migrate_segment_version(
                         let target_slab = Slab::from_time(slab_size, v2_trigger.time);
 
                         // Write to V2 tables (slab and key indices).
-                        // Use add_key_trigger_clustering (not insert_key_trigger) to
+                        // Use add_key_trigger_clustering (not upsert_key_trigger) to
                         // write directly to clustering rows without touching the state
                         // column. V2→V3 migration (migrate_key_states) will backfill
                         // the state column afterward, which handles the case of multiple

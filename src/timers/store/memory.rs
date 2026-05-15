@@ -475,12 +475,15 @@ impl TriggerOperations for InMemoryTriggerStore {
         }
     }
 
-    /// Insert a trigger into the key-based index.
+    /// Upsert a trigger into the key-based index.
+    ///
+    /// Duplicate logical timers replace mutable metadata by construction
+    /// because the map key is `(timer_type, time)`.
     ///
     /// # Errors
     ///
     /// Never returns an error.
-    async fn insert_key_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
+    async fn upsert_key_trigger(&self, trigger: Trigger) -> Result<(), Self::Error> {
         let segment_id = self.segment.id;
         let partition_key = (segment_id, trigger.key.clone());
         let clustering_key = (trigger.timer_type, trigger.time);

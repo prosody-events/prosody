@@ -167,6 +167,14 @@ pub struct Trigger {
     span: Arc<ArcSwap<Span>>,
 }
 
+/// Logical identity of a timer.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub(crate) struct TriggerId {
+    pub(crate) key: Key,
+    pub(crate) time: CompactDateTime,
+    pub(crate) timer_type: TimerType,
+}
+
 impl Trigger {
     /// Creates a new timer trigger for scheduled execution.
     ///
@@ -228,6 +236,16 @@ impl Trigger {
     /// the most recent caller's trace context is preserved.
     pub fn set_span(&self, span: Span) {
         self.span.store(Arc::new(span));
+    }
+
+    /// Returns the immutable logical identity for this trigger.
+    #[must_use]
+    pub(crate) fn id(&self) -> TriggerId {
+        TriggerId {
+            key: self.key.clone(),
+            time: self.time,
+            timer_type: self.timer_type,
+        }
     }
 }
 

@@ -421,9 +421,9 @@ async fn test_state_transitions_schedule_promote_demote() -> Result<()> {
         .await?;
     assert_state_and_reads(&store, &segment_id, tt, &key, &inline_t1, &[t1], "schedule").await?;
 
-    // Inline → Overflow via insert_key_trigger (promotion)
+    // Inline → Overflow via upsert_key_trigger (promotion)
     store
-        .insert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
+        .upsert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
         .await?;
     assert_state_and_reads(
         &store,
@@ -544,7 +544,7 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
         .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     store
-        .insert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
+        .upsert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
         .await?;
     assert_key_reads(&store, tt, &key, &[t1, t2], "overflow setup").await?;
 
@@ -571,7 +571,7 @@ async fn test_state_transitions_clear_and_reschedule() -> Result<()> {
         .clear_and_schedule_key(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     store
-        .insert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
+        .upsert_key_trigger(Trigger::for_testing(key.clone(), t2, tt))
         .await?;
     store.clear_key_triggers(tt, &key).await?;
     assert_state_and_reads(
@@ -632,7 +632,7 @@ async fn test_state_transitions_insert_and_delete() -> Result<()> {
     // Post-V3: cold insert with Absent state → set_state_inline directly.
     // State becomes Inline (not clustering-only).
     store
-        .insert_key_trigger(Trigger::for_testing(key.clone(), t1, tt))
+        .upsert_key_trigger(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     assert_state_and_reads(
         &store,
@@ -649,9 +649,9 @@ async fn test_state_transitions_insert_and_delete() -> Result<()> {
     store.delete_key_trigger(tt, &key, t1).await?;
     assert_state_and_reads(&store, &segment_id, tt, &key, &absent, &[], "delete inline").await?;
 
-    // Absent (cached) → Inline via insert_key_trigger
+    // Absent (cached) → Inline via upsert_key_trigger
     store
-        .insert_key_trigger(Trigger::for_testing(key.clone(), t1, tt))
+        .upsert_key_trigger(Trigger::for_testing(key.clone(), t1, tt))
         .await?;
     assert_state_and_reads(
         &store,
@@ -786,7 +786,7 @@ async fn test_pre_migration_mutations() -> Result<()> {
         .clear_and_schedule_key(Trigger::for_testing(key_d.clone(), t1, tt))
         .await?;
     store
-        .insert_key_trigger(Trigger::for_testing(key_d.clone(), t2, tt))
+        .upsert_key_trigger(Trigger::for_testing(key_d.clone(), t2, tt))
         .await?;
     store.clear_key_triggers(tt, &key_d).await?;
     assert_key_reads(&store, tt, &key_d, &[], "D cleared").await?;
@@ -803,10 +803,10 @@ async fn test_pre_migration_mutations() -> Result<()> {
         .clear_and_schedule_key(Trigger::for_testing(key_e.clone(), t1, tt))
         .await?;
     store
-        .insert_key_trigger(Trigger::for_testing(key_e.clone(), t2, tt))
+        .upsert_key_trigger(Trigger::for_testing(key_e.clone(), t2, tt))
         .await?;
     store
-        .insert_key_trigger(Trigger::for_testing(key_e.clone(), t3, tt))
+        .upsert_key_trigger(Trigger::for_testing(key_e.clone(), t3, tt))
         .await?;
     assert_key_reads(&store, tt, &key_e, &[t1, t2, t3], "E overflow setup").await?;
     store.delete_key_trigger(tt, &key_e, t1).await?;
@@ -852,7 +852,7 @@ async fn test_clear_all_types_clears_inline_and_overflow() -> Result<()> {
         ))
         .await?;
     store
-        .insert_key_trigger(Trigger::for_testing(
+        .upsert_key_trigger(Trigger::for_testing(
             key.clone(),
             t2,
             TimerType::DeferredMessage,
@@ -944,10 +944,10 @@ async fn test_inline_state_round_trip() -> Result<()> {
         "phase 3: expected Inline(t2), got {state:?}"
     );
 
-    // Phase 4: insert_key_trigger(t3) promotes inline to clustering → state
+    // Phase 4: upsert_key_trigger(t3) promotes inline to clustering → state
     // becomes Overflow
     let trigger3 = Trigger::for_testing(key.clone(), t3, TimerType::Application);
-    store.insert_key_trigger(trigger3).await?;
+    store.upsert_key_trigger(trigger3).await?;
 
     let (handle, _) = store
         .resolve_state(&segment_id, &key, TimerType::Application)
@@ -1013,7 +1013,7 @@ async fn test_inline_state_round_trip() -> Result<()> {
 /// Regression test: `current_tag` must return the correct tag for Inline
 /// timers (single trigger stored in `state` static column).
 ///
-/// The quickcheck property test found that after `insert_key_trigger` (which
+/// The quickcheck property test found that after `upsert_key_trigger` (which
 /// stores the trigger as Inline in the `state` column), `current_tag` returned
 /// `None` (only checked clustering rows). This test pins the fix: Inline
 /// triggers must be queryable via `current_tag`.
@@ -1309,9 +1309,8 @@ async fn verify_tags_for_key_type(
 /// or rewrites the tag of an unrelated, untouched timer (e.g. the OLD
 /// inline timer during Inline→Overflow promotion). Recording the
 /// trigger-constructed tag instead would over-specify against the
-/// production contract: in real usage the trigger queue dedups duplicate
-/// `(key, time, type)` via `Hash`/`Eq` excluding tag, so this layer's
-/// behavior on duplicate-insert is undefined.
+/// production contract: duplicate `(key, time, type)` writes are upserts, so
+/// this records the replacement metadata chosen by the store.
 async fn apply_op_and_verify_tags(
     store: &CassandraTriggerStore,
     op: &KeyTriggerOperation,
@@ -1319,7 +1318,7 @@ async fn apply_op_and_verify_tags(
 ) -> Result<()> {
     match op {
         KeyTriggerOperation::Insert { trigger, .. } => {
-            store.insert_key_trigger(trigger.clone()).await?;
+            store.upsert_key_trigger(trigger.clone()).await?;
             snapshot_tag(
                 store,
                 expected_tags,

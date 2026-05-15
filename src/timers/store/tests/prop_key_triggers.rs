@@ -519,7 +519,7 @@ where
         KeyTriggerOperation::Insert { trigger, .. } => {
             model.apply(op);
             operations
-                .insert_key_trigger(trigger.clone())
+                .upsert_key_trigger(trigger.clone())
                 .await
                 .map_err(|e| {
                     color_eyre::eyre::eyre!("Op #{op_idx} Insert trigger failed: {e:?}")
