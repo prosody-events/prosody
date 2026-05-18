@@ -63,12 +63,12 @@ jobs:
         run: |
           # Run the producer test first to initialize Cassandra migrations
           # This test successfully runs migrations as seen in the logs
-          cargo test --test producer -- --test-threads=1
+          cargo test --test producer
         env:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
       - name: Run code coverage
         run: |
-          cargo tarpaulin --skip-clean --timeout 3600 --out Json --output-dir coverage -- --test-threads=1
+          cargo tarpaulin --skip-clean --timeout 3600 --out Json --output-dir coverage
           echo "COVERAGE=$(jq -r '.coverage | round' coverage/tarpaulin-report.json)" >> $GITHUB_ENV
           echo "BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_ENV
           echo "BADGE_PATH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}/coverage-badge.svg" >> $GITHUB_ENV
