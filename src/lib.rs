@@ -243,6 +243,7 @@ pub mod otel;
 pub mod prelude;
 pub mod producer;
 pub mod propagator;
+pub mod state;
 pub mod telemetry;
 pub mod timers;
 pub mod tracing;
