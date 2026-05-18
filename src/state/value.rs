@@ -90,12 +90,20 @@ where
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
     /// Returns ordered compacted pending operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if pending operations cannot be read.
     fn pending_ops(
         &self,
         collection: &CollectionId<K>,
     ) -> Result<impl Iterator<Item = K::Op> + Send, Self::Error>;
 
     /// Clears compacted pending operations for the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if pending operations cannot be cleared.
     fn clear_pending_ops(&self, collection: &CollectionId<K>) -> Result<(), Self::Error>;
 }
 
@@ -369,7 +377,7 @@ where
 
     async fn apply_dirty_directly(&self) -> Result<CommitDecision, TxError<S, D>> {
         let ops = self.pending_ops_vec()?;
-        if ops.len() == 0 {
+        if ops.is_empty() {
             return Ok(CommitDecision::NotCommitted);
         }
 
@@ -384,7 +392,7 @@ where
         Ok(decision)
     }
 
-    async fn mark_dirty(&self) -> Result<(), TxError<S, D>> {
+    fn mark_dirty(&self) -> Result<(), TxError<S, D>> {
         let ops = self.pending_ops_vec()?;
         let dirty =
             DirtyCollection::try_from_count(CollectionRef::new(self.collection.clone()), ops.len())
@@ -461,7 +469,7 @@ where
             .set(collection, payload)
             .await
             .map_err(TransactionValueStoreError::Dirty)?;
-        self.mark_dirty().await
+        self.mark_dirty()
     }
 
     async fn clear<'a>(
@@ -477,7 +485,7 @@ where
             .clear(collection)
             .await
             .map_err(TransactionValueStoreError::Dirty)?;
-        self.mark_dirty().await
+        self.mark_dirty()
     }
 }
 
