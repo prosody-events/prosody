@@ -6,7 +6,7 @@ use super::value::{
 };
 use super::{
     CollectionId, CollectionRef, CommitDecision, DirtyCollection, DurableState,
-    EmptyOperationsError, EventRef, Read, SealedCollection,
+    EmptyOperationsError, EventRef, Read, SealedCollection, SealedWal,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use ahash::RandomState;
@@ -201,12 +201,11 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
     ) -> Result<DurableState<ValueKind>, Self::Error> {
         let inner = self.inner.lock();
         let state = inner.entries.get(collection);
-        if let Some(sealed) = state.and_then(|entry| entry.sealed.clone()) {
-            return Ok(DurableState::Sealed(sealed));
+        if let Some(wal) = state.and_then(|entry| entry.wal.clone()) {
+            return Ok(DurableState::Sealed { wal });
         }
 
         Ok(DurableState::Idle {
-            collection: collection.clone(),
             applied: state.and_then(|entry| entry.applied.clone()),
         })
     }
@@ -222,19 +221,17 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
     {
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
-        if entry.sealed.is_some() {
+        if entry.wal.is_some() {
             return Err(MemoryStateError::AlreadySealed);
         }
 
-        let sealed = SealedCollection::try_new(
+        let wal = SealedWal::try_new(event, entry.applied.clone(), ops.into_iter().collect())
+            .map_err(MemoryStateError::EmptyOperations)?;
+        entry.wal = Some(wal);
+        Ok(SealedCollection::new(
             CollectionRef::new(collection.clone()),
             event,
-            entry.applied.clone(),
-            ops.into_iter().collect(),
-        )
-        .map_err(MemoryStateError::EmptyOperations)?;
-        entry.sealed = Some(sealed.clone());
-        Ok(sealed)
+        ))
     }
 
     async fn apply_sealed<'a>(
@@ -244,7 +241,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
     ) -> Result<CommitDecision, Self::Error> {
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
-        let Some(sealed) = entry.sealed.clone() else {
+        let Some(sealed) = entry.wal.clone() else {
             return Ok(CommitDecision::NotCommitted);
         };
         if sealed.event() != expected_event {
@@ -256,7 +253,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
 
         let (applied, ops) = sealed.into_applied_and_ops();
         entry.applied = fold_value_ops(applied, &ops);
-        entry.sealed = None;
+        entry.wal = None;
         Ok(CommitDecision::Committed)
     }
 
@@ -267,7 +264,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
     ) -> Result<CommitDecision, Self::Error> {
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
-        let Some(sealed) = entry.sealed.clone() else {
+        let Some(sealed) = entry.wal.clone() else {
             return Ok(CommitDecision::NotCommitted);
         };
         if sealed.event() != expected_event {
@@ -278,7 +275,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         }
 
         entry.applied.clone_from(sealed.applied());
-        entry.sealed = None;
+        entry.wal = None;
         Ok(CommitDecision::NotCommitted)
     }
 }
@@ -324,7 +321,7 @@ struct DurableInner {
 #[derive(Debug, Default)]
 struct DurableValueEntry {
     applied: Option<Bytes>,
-    sealed: Option<SealedCollection<ValueKind>>,
+    wal: Option<SealedWal<ValueKind>>,
 }
 
 /// Error returned by memory keyed-state stores.

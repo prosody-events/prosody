@@ -19,8 +19,8 @@
 //! use prosody::consumer::event_context::EventContext;
 //! use prosody::consumer::message::UncommittedMessage;
 //! use prosody::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
-//! use prosody::timers::store::TriggerStore;
 //! use prosody::timers::UncommittedTimer;
+//! use prosody::timers::store::TriggerStore;
 //!
 //! struct MyHandler;
 //!

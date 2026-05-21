@@ -113,8 +113,8 @@ where
     ] {
         if tag != Some(replacement_tag) {
             return Err(format!(
-                "duplicate add did not replace {surface} tag. Expected: {replacement_tag:?}, \
-                 got: {tag:?}"
+                "duplicate add did not replace {surface} tag. Expected: {replacement_tag:?}, got: \
+                 {tag:?}"
             ));
         }
     }

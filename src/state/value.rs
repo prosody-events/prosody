@@ -3,7 +3,6 @@
 use super::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, CommitDecision, CommitMode,
     DirtyCollection, DurableState, EventRef, LocalTx, Read, SealedCollection,
-    StatefulCollectionKind,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
@@ -25,22 +24,29 @@ pub type StoredPayload = Bytes;
 pub type ValueApplied = Option<Bytes>;
 
 /// Dirty Value overlay.
-///
-/// `None` means untouched, `Some(None)` means a clear is buffered, and
-/// `Some(Some(payload))` means a set is buffered.
-pub type ValueOverlay = Option<Option<Bytes>>;
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ValueOverlay {
+    /// No buffered operation has been observed for this collection.
+    #[default]
+    Untouched,
+
+    /// A clear is buffered.
+    BufferedClear,
+
+    /// A set is buffered.
+    BufferedSet(Bytes),
+}
 
 /// Type marker for Value collections.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct ValueKind;
 
 impl CollectionKind for ValueKind {
-    const ID: CollectionKindId = CollectionKindId::Value;
-}
-
-impl StatefulCollectionKind for ValueKind {
     type Applied = ValueApplied;
     type Op = ValueOp;
+    type Overlay = ValueOverlay;
+
+    const ID: CollectionKindId = CollectionKindId::Value;
 }
 
 /// Ordered operation for a Value collection.
@@ -57,7 +63,7 @@ pub enum ValueOp {
 }
 
 /// Store interface for normal Value reads and writes.
-pub trait ValueStore: Clone + Send + Sync + 'static {
+pub trait ValueStore: Send + Sync + 'static {
     /// Error type for Value store operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
@@ -84,7 +90,7 @@ pub trait ValueStore: Clone + Send + Sync + 'static {
 /// Source of compacted pending operations for a collection kind.
 pub trait PendingOpSource<K>: Clone + Send + Sync + 'static
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
     /// Error type for pending operation access.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -110,7 +116,7 @@ where
 /// Durable write-ahead storage for a collection kind.
 pub trait DurableWalStore<K>: Clone + Send + Sync + 'static
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
     /// Error type for durable WAL operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -149,7 +155,7 @@ where
 /// Durable direct-apply storage for a collection kind.
 pub trait DirectApplyStore<K>: Clone + Send + Sync + 'static
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
     /// Error type for direct apply operations.
     type Error: ClassifyError + Error + Send + Sync + 'static;
@@ -165,7 +171,7 @@ where
 }
 
 /// Value transaction backed by dirty local state and durable state.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TransactionValueStore<D, S> {
     durable: D,
     dirty: S,
@@ -503,8 +509,8 @@ where
 
 fn read_value_from_durable(state: DurableState<ValueKind>) -> Read<StoredPayload> {
     let applied = match state {
-        DurableState::Idle { applied, .. } => applied,
-        DurableState::Sealed(sealed) => sealed.applied().clone(),
+        DurableState::Idle { applied } => applied,
+        DurableState::Sealed { wal } => wal.applied().clone(),
     };
 
     applied.map_or(Read::Absent, Read::Present)

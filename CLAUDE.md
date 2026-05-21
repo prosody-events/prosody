@@ -71,6 +71,7 @@ If you can't name the invariant, you don't yet understand the code well enough t
 - Use conventional commits for commit titles and PR titles (e.g., `fix:`, `feat:`, `docs:`, `refactor:`).
 - PR titles and descriptions are written for a reader who is **not** intimately familiar with the project. Be readable, well written, and well styled. Lead with what changed and why; assume nothing about the reader's session context.
 - **PR descriptions never include a test plan or a list of verification steps.** Reviewers don't need a checklist of what you ran — they need to understand what changed and why. Test coverage belongs in the tests themselves.
+- **Never run `git reset` or `git checkout` that would destroy uncommitted or committed changes without explicit human permission.** This includes `git reset --hard`, `git checkout -- <path>`, and switching branches over a dirty working tree. Prefer `git stash`, an explicit commit, or `git restore --staged <path>` when the goal is just to unstage. Read-only git commands (`status`, `diff`, `log`) are always fine.
 
 ## Code Organization
 

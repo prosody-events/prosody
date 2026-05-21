@@ -5,8 +5,8 @@ use super::value::{
 };
 use super::{
     CollectionId, CollectionKindId, CollectionRef, CommitDecision, CommitMode, DirtyCollection,
-    DurableState, EventRef, EventScopeId, LocalTx, Read, StateKey, StateName, StateType, ValueKind,
-    ValueOp, ValueOverlay,
+    DurableState, EventRef, LocalTx, Read, StateKey, StateName, StateType, ValueKind, ValueOp,
+    ValueOverlay, WalEnvelope,
 };
 use crate::Key;
 use bytes::Bytes;
@@ -32,7 +32,9 @@ fn collection() -> Result<CollectionId<ValueKind>> {
 }
 
 fn event(id: u128) -> EventRef {
-    EventRef::Message(EventScopeId::new(id))
+    EventRef::Message {
+        dedup_id: Uuid::from_u128(id),
+    }
 }
 
 fn payload(value: u8) -> Bytes {
@@ -77,8 +79,8 @@ fn collection_identity_carries_value_kind() -> Result<()> {
     let collection = collection()?;
     assert_eq!(collection.kind(), CollectionKindId::Value);
 
-    let blob = super::WalBlob::<ValueKind>::new(collection, event(1), vec![ValueOp::Clear]);
-    assert_eq!(blob.kind(), CollectionKindId::Value);
+    let envelope = WalEnvelope::<ValueKind>::try_from_ops(vec![ValueOp::Clear])?;
+    assert_eq!(envelope.operation_count().get(), 1);
     Ok(())
 }
 
@@ -136,10 +138,13 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
             }],
         )
         .await?;
-    assert_eq!(sealed.applied(), &Some(payload(1)));
+    assert_eq!(sealed.event(), event(1));
 
     match durable.read_partition(&collection).await? {
-        DurableState::Sealed(sealed) => assert_eq!(sealed.event(), event(1)),
+        DurableState::Sealed { wal } => {
+            assert_eq!(wal.event(), event(1));
+            assert_eq!(wal.applied(), &Some(payload(1)));
+        }
         DurableState::Idle { .. } => return Err(eyre::eyre!("expected sealed durable state")),
     }
 
@@ -276,8 +281,8 @@ async fn flush_applies_dirty_without_creating_sealed_wal() -> Result<()> {
     assert_eq!(durable.get(&collection).await?, Read::Present(payload(1)));
 
     match durable.read_partition(&collection).await? {
-        DurableState::Idle { applied, .. } => assert_eq!(applied, Some(payload(1))),
-        DurableState::Sealed(_) => return Err(eyre::eyre!("flush must not create sealed WAL")),
+        DurableState::Idle { applied } => assert_eq!(applied, Some(payload(1))),
+        DurableState::Sealed { .. } => return Err(eyre::eyre!("flush must not create sealed WAL")),
     }
     Ok(())
 }
@@ -299,8 +304,8 @@ async fn direct_mode_applies_without_sealed_wal() -> Result<()> {
     assert_eq!(durable.get(&collection).await?, Read::Present(payload(1)));
 
     match durable.read_partition(&collection).await? {
-        DurableState::Idle { applied, .. } => assert_eq!(applied, Some(payload(1))),
-        DurableState::Sealed(_) => return Err(eyre::eyre!("direct mode must not create WAL")),
+        DurableState::Idle { applied } => assert_eq!(applied, Some(payload(1))),
+        DurableState::Sealed { .. } => return Err(eyre::eyre!("direct mode must not create WAL")),
     }
     Ok(())
 }
@@ -420,7 +425,7 @@ async fn apply_trace_set(
             model.dirty_ops.push(ValueOp::Set {
                 payload: payload(byte),
             });
-            model.overlay = Some(Some(payload(byte)));
+            model.overlay = ValueOverlay::BufferedSet(payload(byte));
             model.phase = ModelPhase::Dirty;
             Ok(true)
         }
@@ -444,7 +449,7 @@ async fn apply_trace_clear(
             }
             model.dirty_ops.clear();
             model.dirty_ops.push(ValueOp::Clear);
-            model.overlay = Some(None);
+            model.overlay = ValueOverlay::BufferedClear;
             model.phase = ModelPhase::Dirty;
             Ok(true)
         }
@@ -605,12 +610,16 @@ struct Model {
 
 impl Model {
     fn visible(&self) -> Option<Bytes> {
-        self.overlay.clone().unwrap_or_else(|| self.applied.clone())
+        match &self.overlay {
+            ValueOverlay::BufferedSet(payload) => Some(payload.clone()),
+            ValueOverlay::BufferedClear => None,
+            ValueOverlay::Untouched => self.applied.clone(),
+        }
     }
 
     fn clear_dirty(&mut self) {
         self.dirty_ops.clear();
-        self.overlay = None;
+        self.overlay = ValueOverlay::Untouched;
     }
 }
 

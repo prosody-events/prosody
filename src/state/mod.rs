@@ -7,12 +7,17 @@
 
 use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::timers::TimerType;
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::SegmentId;
+use bytes::Bytes;
 use std::fmt;
+use std::iter;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use thiserror::Error;
+use uuid::Uuid;
 
 pub mod memory;
 pub mod value;
@@ -34,15 +39,15 @@ pub enum CollectionKindId {
 pub trait CollectionKind: Clone + Copy + fmt::Debug + Send + Sync + 'static {
     /// Runtime discriminator stored beside durable identity.
     const ID: CollectionKindId;
-}
 
-/// Collection kind with typed operations and applied state.
-pub trait StatefulCollectionKind: CollectionKind {
     /// Ordered operation persisted for this collection kind.
     type Op: Clone + fmt::Debug + Eq + Send + Sync + 'static;
 
     /// Authoritative applied state for this collection kind.
     type Applied: Clone + fmt::Debug + Eq + Send + Sync + 'static;
+
+    /// Dirty read overlay for this collection kind.
+    type Overlay: Clone + fmt::Debug + Eq + Send + Sync + 'static;
 }
 
 /// Key qualified by the timer segment that owns the Kafka partition.
@@ -114,8 +119,7 @@ where
     state_key: StateKey,
     state_type: StateType,
     name: StateName,
-    kind: CollectionKindId,
-    marker: PhantomData<K>,
+    _kind: PhantomData<K>,
 }
 
 impl<K> CollectionId<K>
@@ -129,8 +133,7 @@ where
             state_key,
             state_type,
             name,
-            kind: K::ID,
-            marker: PhantomData,
+            _kind: PhantomData,
         }
     }
 
@@ -155,7 +158,7 @@ where
     /// Returns the runtime collection kind discriminator.
     #[must_use]
     pub fn kind(&self) -> CollectionKindId {
-        self.kind
+        K::ID
     }
 }
 
@@ -177,14 +180,42 @@ impl EventScopeId {
     }
 }
 
-/// Event kind associated with a local transaction.
+/// Durable reference to the upstream event that owns a sealed WAL.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum EventRef {
-    /// Kafka message event.
-    Message(EventScopeId),
+    /// Kafka message event identified by its deduplication marker.
+    Message {
+        /// Deduplication row identifier written at the event commit point.
+        dedup_id: Uuid,
+    },
 
-    /// Timer event.
-    Timer(EventScopeId),
+    /// Timer event identified by its durable timer row coordinates.
+    Timer(TimerEventRef),
+}
+
+/// Durable timer identity stored in a sealed WAL.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct TimerEventRef {
+    /// Timer namespace.
+    pub timer_type: TimerType,
+
+    /// Scheduled fire time.
+    pub time: CompactDateTime,
+
+    /// Timer row tag observed when the WAL was sealed.
+    pub tag: i32,
+}
+
+impl TimerEventRef {
+    /// Creates a durable timer event reference.
+    #[must_use]
+    pub fn new(timer_type: TimerType, time: CompactDateTime, tag: i32) -> Self {
+        Self {
+            timer_type,
+            time,
+            tag,
+        }
+    }
 }
 
 /// Result of resolving a sealed durable transaction.
@@ -238,26 +269,26 @@ impl<T> Read<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableState<K>
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
     /// No sealed operations are pending; `applied` is authoritative.
     Idle {
-        /// Collection identity.
-        collection: CollectionId<K>,
-
         /// Authoritative applied state.
         applied: K::Applied,
     },
 
-    /// A non-empty ordered operation list is sealed for recovery.
-    Sealed(SealedCollection<K>),
+    /// A non-empty WAL is sealed for recovery.
+    Sealed {
+        /// Durable sealed WAL.
+        wal: SealedWal<K>,
+    },
 }
 
 /// Local transaction state for one collection and event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalTx<K>
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
     /// No dirty operations are pending.
     Clean(CollectionRef<K>),
@@ -273,6 +304,13 @@ where
 }
 
 /// Lightweight typed reference to a collection.
+///
+/// Today this carries only the collection identity; later slices will extend
+/// it with the per-event `commit_mode` and `EventScopeId` described in
+/// `docs/keyed-state/design-summary.md` §"Local State". Keep the scaffold so
+/// the next slice has somewhere to put those fields without re-flattening
+/// callers back into [`CollectionId`].
+// TODO(slice-8): carry commit_mode and scope per design-summary §Local State
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct CollectionRef<K>
 where
@@ -350,51 +388,42 @@ where
     }
 }
 
-/// Durable sealed state for one event and non-empty ordered operation list.
+/// Durable sealed state for one event and non-empty WAL.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SealedCollection<K>
+pub struct SealedWal<K>
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
-    collection: CollectionRef<K>,
     event: EventRef,
     applied: K::Applied,
-    ops: Vec<K::Op>,
-    operation_count: NonZeroU64,
+    wal: WalEnvelope<K>,
 }
 
-impl<K> SealedCollection<K>
+impl<K> SealedWal<K>
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
-    /// Creates sealed state from a non-empty ordered operation list.
+    /// Creates durable sealed state from applied state and a non-empty WAL.
+    #[must_use]
+    pub fn new(event: EventRef, applied: K::Applied, wal: WalEnvelope<K>) -> Self {
+        Self {
+            event,
+            applied,
+            wal,
+        }
+    }
+
+    /// Creates durable sealed state from a non-empty ordered operation list.
     ///
     /// # Errors
     ///
     /// Returns [`EmptyOperationsError`] when `ops` is empty.
     pub fn try_new(
-        collection: CollectionRef<K>,
         event: EventRef,
         applied: K::Applied,
         ops: Vec<K::Op>,
     ) -> Result<Self, EmptyOperationsError> {
-        let Some(operation_count) = NonZeroU64::new(ops.len() as u64) else {
-            return Err(EmptyOperationsError);
-        };
-
-        Ok(Self {
-            collection,
-            event,
-            applied,
-            ops,
-            operation_count,
-        })
-    }
-
-    /// Returns the collection reference.
-    #[must_use]
-    pub fn collection(&self) -> &CollectionRef<K> {
-        &self.collection
+        Ok(Self::new(event, applied, WalEnvelope::try_from_ops(ops)?))
     }
 
     /// Returns the event that owns the sealed operations.
@@ -409,74 +438,232 @@ where
         &self.applied
     }
 
+    /// Returns the sealed WAL.
+    #[must_use]
+    pub fn wal(&self) -> &WalEnvelope<K> {
+        &self.wal
+    }
+
     /// Returns ordered sealed operations.
     #[must_use]
-    pub fn ops(&self) -> &[K::Op] {
-        &self.ops
+    pub fn ops(&self) -> NonEmptyOpsSlice<'_, K::Op> {
+        self.wal.ops()
     }
 
     /// Decomposes sealed state into its pre-seal state and operation list.
     #[must_use]
     pub fn into_applied_and_ops(self) -> (K::Applied, Vec<K::Op>) {
-        (self.applied, self.ops)
+        (self.applied, self.wal.into_ops())
     }
 
     /// Returns the number of sealed operations.
     #[must_use]
     pub fn operation_count(&self) -> NonZeroU64 {
+        self.wal.operation_count()
+    }
+}
+
+/// Local proof that dirty operations were sealed for an event.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SealedCollection<K>
+where
+    K: CollectionKind,
+{
+    collection: CollectionRef<K>,
+    event: EventRef,
+}
+
+impl<K> SealedCollection<K>
+where
+    K: CollectionKind,
+{
+    /// Creates a sealed local transition marker.
+    #[must_use]
+    pub fn new(collection: CollectionRef<K>, event: EventRef) -> Self {
+        Self { collection, event }
+    }
+
+    /// Returns the collection reference.
+    #[must_use]
+    pub fn collection(&self) -> &CollectionRef<K> {
+        &self.collection
+    }
+
+    /// Returns the event that owns the sealed operations.
+    #[must_use]
+    pub fn event(&self) -> EventRef {
+        self.event
+    }
+}
+
+/// Non-empty ordered operation list.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct NonEmptyOps<T> {
+    first: T,
+    rest: Vec<T>,
+    operation_count: NonZeroU64,
+}
+
+impl<T> NonEmptyOps<T> {
+    /// Creates a non-empty operation list.
+    #[must_use]
+    pub fn new(first: T, rest: Vec<T>) -> Self {
+        let operation_count = NonZeroU64::MIN.saturating_add(rest.len() as u64);
+        Self {
+            first,
+            rest,
+            operation_count,
+        }
+    }
+
+    /// Creates a non-empty operation list from a vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptyOperationsError`] when `ops` is empty.
+    pub fn try_from_vec(ops: Vec<T>) -> Result<Self, EmptyOperationsError> {
+        let mut iter = ops.into_iter();
+        let first = iter.next().ok_or(EmptyOperationsError)?;
+        Ok(Self::new(first, iter.collect()))
+    }
+
+    /// Returns ordered operations.
+    #[must_use]
+    pub fn as_slice(&self) -> NonEmptyOpsSlice<'_, T> {
+        NonEmptyOpsSlice {
+            first: &self.first,
+            rest: &self.rest,
+        }
+    }
+
+    /// Decomposes the list into a vector.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<T> {
+        let mut ops = Vec::with_capacity(1 + self.rest.len());
+        ops.push(self.first);
+        ops.extend(self.rest);
+        ops
+    }
+
+    /// Returns the number of operations.
+    #[must_use]
+    pub fn len(&self) -> NonZeroU64 {
         self.operation_count
+    }
+}
+
+/// Borrowed view of a non-empty operation list.
+#[derive(Clone, Copy, Debug)]
+pub struct NonEmptyOpsSlice<'a, T> {
+    first: &'a T,
+    rest: &'a [T],
+}
+
+impl<'a, T> NonEmptyOpsSlice<'a, T> {
+    /// Returns the first operation.
+    #[must_use]
+    pub fn first(self) -> &'a T {
+        self.first
+    }
+
+    /// Returns operations after the first.
+    #[must_use]
+    pub fn rest(self) -> &'a [T] {
+        self.rest
+    }
+
+    /// Iterates over every operation in order.
+    pub fn iter(self) -> impl Iterator<Item = &'a T> {
+        iter::once(self.first).chain(self.rest.iter())
     }
 }
 
 /// Typed WAL payload shape before final byte encoding exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WalBlob<K>
+pub struct WalEnvelope<K>
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
-    collection: CollectionId<K>,
-    kind: CollectionKindId,
-    event: EventRef,
-    ops: Vec<K::Op>,
+    ops: NonEmptyOps<K::Op>,
+    _kind: PhantomData<K>,
 }
 
-impl<K> WalBlob<K>
+impl<K> WalEnvelope<K>
 where
-    K: StatefulCollectionKind,
+    K: CollectionKind,
 {
-    /// Creates a typed WAL payload.
+    /// Creates a typed WAL payload from a non-empty operation list.
     #[must_use]
-    pub fn new(collection: CollectionId<K>, event: EventRef, ops: Vec<K::Op>) -> Self {
+    pub fn new(ops: NonEmptyOps<K::Op>) -> Self {
         Self {
-            collection,
-            kind: K::ID,
-            event,
             ops,
+            _kind: PhantomData,
         }
     }
 
-    /// Returns the collection identity.
-    #[must_use]
-    pub fn collection(&self) -> &CollectionId<K> {
-        &self.collection
-    }
-
-    /// Returns the runtime collection kind discriminator.
-    #[must_use]
-    pub fn kind(&self) -> CollectionKindId {
-        self.kind
-    }
-
-    /// Returns the event that owns this WAL payload.
-    #[must_use]
-    pub fn event(&self) -> EventRef {
-        self.event
+    /// Creates a typed WAL payload from ordered operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptyOperationsError`] when `ops` is empty.
+    pub fn try_from_ops(ops: Vec<K::Op>) -> Result<Self, EmptyOperationsError> {
+        Ok(Self::new(NonEmptyOps::try_from_vec(ops)?))
     }
 
     /// Returns ordered WAL operations.
     #[must_use]
-    pub fn ops(&self) -> &[K::Op] {
-        &self.ops
+    pub fn ops(&self) -> NonEmptyOpsSlice<'_, K::Op> {
+        self.ops.as_slice()
+    }
+
+    /// Decomposes this WAL into ordered operations.
+    #[must_use]
+    pub fn into_ops(self) -> Vec<K::Op> {
+        self.ops.into_vec()
+    }
+
+    /// Returns the number of WAL operations.
+    #[must_use]
+    pub fn operation_count(&self) -> NonZeroU64 {
+        self.ops.len()
+    }
+}
+
+/// Encoded WAL bytes tagged with their collection kind.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct WalBlob<K>
+where
+    K: CollectionKind,
+{
+    bytes: Bytes,
+    operation_count: NonZeroU64,
+    _kind: PhantomData<K>,
+}
+
+impl<K> WalBlob<K>
+where
+    K: CollectionKind,
+{
+    /// Creates an encoded typed WAL.
+    #[must_use]
+    pub fn new(bytes: Bytes, operation_count: NonZeroU64) -> Self {
+        Self {
+            bytes,
+            operation_count,
+            _kind: PhantomData,
+        }
+    }
+
+    /// Returns the encoded WAL bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    /// Returns the number of encoded operations.
+    #[must_use]
+    pub fn operation_count(&self) -> NonZeroU64 {
+        self.operation_count
     }
 }
 
