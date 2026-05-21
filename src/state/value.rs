@@ -1,8 +1,8 @@
 //! Value collection contracts and transaction wrapper.
 
 use super::{
-    CollectionId, CollectionKind, CollectionKindId, CollectionRef, CommitDecision, CommitMode,
-    DirtyCollection, DurableState, EventRef, FlushOutcome, LocalTx, Read, SealedCollection,
+    CollectionId, CollectionKind, CollectionKindId, CollectionRef, CommitMode, DirtyCollection,
+    DurableState, EventRef, LocalTx, PendingOps, Read, SealedCollection, StoreOutcome,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
@@ -94,15 +94,30 @@ where
     /// Error type for pending operation access.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Returns ordered compacted pending operations.
+    /// Iterator returned alongside the operation count.
+    ///
+    /// `'a` is the borrow lifetime of `&self` at the call site; concrete
+    /// implementations may own the iterator (`Send + 'static`) or borrow
+    /// from the store's internal state.
+    type Ops<'a>: Iterator<Item = K::Op> + Send + 'a
+    where
+        Self: 'a;
+
+    /// Returns the pending operation stream for a collection when any exist.
+    ///
+    /// `None` means no operations are buffered for this collection;
+    /// `Some(PendingOps { count, ops })` means `count` ordered operations
+    /// are available and `ops` will yield exactly that many. The non-zero
+    /// count lets callers construct a [`DirtyCollection`] without
+    /// materializing the iterator.
     ///
     /// # Errors
     ///
     /// Returns a store error if pending operations cannot be read.
-    fn pending_ops(
-        &self,
-        collection: &CollectionId<K>,
-    ) -> Result<impl Iterator<Item = K::Op> + Send, Self::Error>;
+    fn pending_ops<'a>(
+        &'a self,
+        collection: &'a CollectionId<K>,
+    ) -> Result<Option<PendingOps<Self::Ops<'a>>>, Self::Error>;
 
     /// Clears compacted pending operations for the collection.
     ///
@@ -137,18 +152,27 @@ where
         I: IntoIterator<Item = K::Op> + Send + 'a;
 
     /// Applies sealed operations when they belong to `expected_event`.
+    ///
+    /// Returns [`StoreOutcome::Applied`] when a sealed WAL for
+    /// `expected_event` was folded into authoritative state and cleared,
+    /// or [`StoreOutcome::NoOp`] when no WAL is present (the call is a
+    /// safe idempotent no-op after a prior resolution).
     fn apply_sealed<'a>(
         &'a self,
         collection: &'a CollectionId<K>,
         expected_event: EventRef,
-    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send + 'a;
 
     /// Rolls back sealed operations when they belong to `expected_event`.
+    ///
+    /// Returns [`StoreOutcome::Applied`] when a sealed WAL for
+    /// `expected_event` was cleared, or [`StoreOutcome::NoOp`] when no
+    /// WAL is present.
     fn rollback_sealed<'a>(
         &'a self,
         collection: &'a CollectionId<K>,
         expected_event: EventRef,
-    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send + 'a;
 }
 
 /// Durable direct-apply storage for a collection kind.
@@ -160,11 +184,15 @@ where
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
     /// Applies ordered operations directly to authoritative state.
+    ///
+    /// Returns [`StoreOutcome::Applied`] when at least one operation was
+    /// folded into authoritative state, or [`StoreOutcome::NoOp`] when
+    /// `ops` is empty.
     fn direct_apply<'a, I>(
         &'a self,
         collection: &'a CollectionId<K>,
         ops: I,
-    ) -> impl Future<Output = Result<FlushOutcome, Self::Error>> + Send + 'a
+    ) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send + 'a
     where
         I: IntoIterator<Item = K::Op> + Send + 'a;
 }
@@ -237,7 +265,9 @@ where
         match self.local_tx_snapshot() {
             LocalTx::Clean(_) => Err(TransactionValueStoreError::NoPendingOps),
             LocalTx::Dirty(_) => {
-                let ops = self.pending_ops_vec()?;
+                let ops = self
+                    .collect_pending_ops()?
+                    .ok_or(TransactionValueStoreError::NoPendingOps)?;
                 let sealed = self
                     .durable
                     .seal(&self.collection, self.event, ops)
@@ -260,18 +290,18 @@ where
     ///
     /// Returns a transaction error if the transaction is finished or durable
     /// storage rejects the sealed event.
-    pub async fn apply_sealed(&mut self) -> Result<CommitDecision, TxError<S, D>> {
+    pub async fn apply_sealed(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
         if self.local_tx_snapshot() == LocalTx::Finished {
             return Err(TransactionValueStoreError::Finished);
         }
 
-        let decision = self
+        let outcome = self
             .durable
             .apply_sealed(&self.collection, self.event)
             .await
             .map_err(TransactionValueStoreError::Durable)?;
         self.set_local_tx(LocalTx::Finished);
-        Ok(decision)
+        Ok(outcome)
     }
 
     /// Rolls back sealed WAL state for this transaction event.
@@ -280,18 +310,18 @@ where
     ///
     /// Returns a transaction error if the transaction is finished or durable
     /// storage rejects the sealed event.
-    pub async fn rollback_sealed(&mut self) -> Result<CommitDecision, TxError<S, D>> {
+    pub async fn rollback_sealed(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
         if self.local_tx_snapshot() == LocalTx::Finished {
             return Err(TransactionValueStoreError::Finished);
         }
 
-        let decision = self
+        let outcome = self
             .durable
             .rollback_sealed(&self.collection, self.event)
             .await
             .map_err(TransactionValueStoreError::Durable)?;
         self.set_local_tx(LocalTx::Finished);
-        Ok(decision)
+        Ok(outcome)
     }
 
     /// Applies dirty operations directly and leaves the transaction clean.
@@ -300,9 +330,9 @@ where
     ///
     /// Returns a transaction error if the transaction is sealed, finished, or a
     /// backing store fails.
-    pub async fn flush(&mut self) -> Result<FlushOutcome, TxError<S, D>> {
+    pub async fn flush(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
         match self.local_tx_snapshot() {
-            LocalTx::Clean(_) => Ok(FlushOutcome::NoOp),
+            LocalTx::Clean(_) => Ok(StoreOutcome::NoOp),
             LocalTx::Dirty(_) => {
                 let outcome = self.apply_dirty_directly().await?;
                 self.set_local_tx(LocalTx::Clean(CollectionRef::new(self.collection.clone())));
@@ -319,7 +349,7 @@ where
     ///
     /// Returns a transaction error if the mode is not [`CommitMode::Direct`],
     /// the transaction is sealed or finished, or a backing store fails.
-    pub async fn direct_apply(&mut self) -> Result<FlushOutcome, TxError<S, D>> {
+    pub async fn direct_apply(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
         if self.mode != CommitMode::Direct {
             return Err(TransactionValueStoreError::WrongCommitMode {
                 expected: CommitMode::Direct,
@@ -328,7 +358,7 @@ where
         }
 
         let outcome = match self.local_tx_snapshot() {
-            LocalTx::Clean(_) => FlushOutcome::NoOp,
+            LocalTx::Clean(_) => StoreOutcome::NoOp,
             LocalTx::Dirty(_) => self.apply_dirty_directly().await?,
             LocalTx::Sealed(_) => return Err(TransactionValueStoreError::AlreadySealed),
             LocalTx::Finished => return Err(TransactionValueStoreError::Finished),
@@ -343,29 +373,28 @@ where
     ///
     /// Returns a transaction error if a backing store fails or the local state
     /// cannot transition.
-    pub async fn abort(&mut self) -> Result<CommitDecision, TxError<S, D>> {
+    pub async fn abort(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
         match self.local_tx_snapshot() {
             LocalTx::Clean(_) => {
                 self.set_local_tx(LocalTx::Finished);
-                Ok(CommitDecision::NotCommitted)
+                Ok(StoreOutcome::NoOp)
             }
             LocalTx::Dirty(_) => {
                 self.dirty
                     .clear_pending_ops(&self.collection)
                     .map_err(TransactionValueStoreError::Dirty)?;
                 self.set_local_tx(LocalTx::Finished);
-                Ok(CommitDecision::NotCommitted)
+                Ok(StoreOutcome::NoOp)
             }
             LocalTx::Sealed(_) => self.rollback_sealed().await,
             LocalTx::Finished => Err(TransactionValueStoreError::Finished),
         }
     }
 
-    async fn apply_dirty_directly(&self) -> Result<FlushOutcome, TxError<S, D>> {
-        let ops = self.pending_ops_vec()?;
-        if ops.is_empty() {
-            return Ok(FlushOutcome::NoOp);
-        }
+    async fn apply_dirty_directly(&self) -> Result<StoreOutcome, TxError<S, D>> {
+        let Some(ops) = self.collect_pending_ops()? else {
+            return Ok(StoreOutcome::NoOp);
+        };
 
         let outcome = self
             .durable
@@ -378,6 +407,23 @@ where
         Ok(outcome)
     }
 
+    /// Collects pending operations into an owned `Vec`.
+    ///
+    /// Returns `None` when no operations are buffered. Owning the ops as
+    /// a `'static` `Vec` decouples them from any borrow the dirty store
+    /// held, so the durable seal / direct-apply call can run before
+    /// `clear_pending_ops` releases the dirty workspace.
+    fn collect_pending_ops(&self) -> Result<Option<Vec<ValueOp>>, TxError<S, D>> {
+        let Some(pending) = self
+            .dirty
+            .pending_ops(&self.collection)
+            .map_err(TransactionValueStoreError::Dirty)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(pending.ops.collect()))
+    }
+
     fn local_tx_snapshot(&self) -> LocalTx<ValueKind> {
         self.tx.lock().clone()
     }
@@ -386,21 +432,16 @@ where
         *self.tx.get_mut() = tx;
     }
 
-    fn mark_dirty_locked(&self) -> Result<(), TxError<S, D>> {
-        let ops = self.pending_ops_vec()?;
-        let dirty =
-            DirtyCollection::try_from_count(CollectionRef::new(self.collection.clone()), ops.len())
-                .map_err(|_| TransactionValueStoreError::NoPendingOps)?;
-        *self.tx.lock() = LocalTx::Dirty(dirty);
-        Ok(())
-    }
-
-    fn pending_ops_vec(&self) -> Result<Vec<ValueOp>, TxError<S, D>> {
-        Ok(self
+    fn mark_dirty(&self) -> Result<(), TxError<S, D>> {
+        let pending = self
             .dirty
             .pending_ops(&self.collection)
             .map_err(TransactionValueStoreError::Dirty)?
-            .collect())
+            .ok_or(TransactionValueStoreError::NoPendingOps)?;
+        let dirty =
+            DirtyCollection::new(CollectionRef::new(self.collection.clone()), pending.count);
+        *self.tx.lock() = LocalTx::Dirty(dirty);
+        Ok(())
     }
 
     fn can_write(&self) -> Result<(), TxError<S, D>> {
@@ -463,7 +504,7 @@ where
             .set(collection, payload)
             .await
             .map_err(TransactionValueStoreError::Dirty)?;
-        self.mark_dirty_locked()
+        self.mark_dirty()
     }
 
     async fn clear<'a>(
@@ -479,7 +520,7 @@ where
             .clear(collection)
             .await
             .map_err(TransactionValueStoreError::Dirty)?;
-        self.mark_dirty_locked()
+        self.mark_dirty()
     }
 }
 

@@ -227,10 +227,18 @@ impl TimerEventRef {
 
 /// Oracle verdict on a sealed WAL for one event.
 ///
-/// Returned by [`value::DurableWalStore::apply_sealed`] and
-/// [`value::DurableWalStore::rollback_sealed`]. Distinct from
-/// [`FlushOutcome`], which describes whether a storage step applied any
-/// operations.
+/// Returned by the commit oracle when it resolves a [`SealedWal`]'s
+/// [`EventRef`] against the upstream commit source (deduplication store
+/// for messages, timer-row tag for timers per
+/// `docs/keyed-state/design-summary.md` §"Recovery"). Distinct from
+/// [`StoreOutcome`], which is the durable store's "did this call mutate
+/// state" signal: the oracle decides, the store acts on the decision.
+///
+/// Pre-staged for Slice 7+/8: Slice 1 has no oracle (`CommitManager`),
+/// so `CommitDecision` is unconstructed today; first-touch recovery
+/// (Slice 7) and middleware hooks (Slice 8) consult the oracle and pass
+/// the decision into store calls.
+// TODO(slice-7,8): construct via `CommitManager::resolve_event`.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitDecision {
     /// The sealed operations were committed.
@@ -240,19 +248,24 @@ pub enum CommitDecision {
     NotCommitted,
 }
 
-/// Result of a storage step that applies dirty operations.
+/// Did this store call mutate authoritative state.
 ///
-/// Returned by [`value::DirectApplyStore::direct_apply`],
-/// [`value::TransactionValueStore::flush`], and
-/// [`value::TransactionValueStore::direct_apply`]. Carries the
-/// "did this step apply anything" signal that used to overload
-/// [`CommitDecision`].
+/// Returned by store-side methods that may or may not have work to do:
+/// [`value::DurableWalStore::apply_sealed`] (WAL present → folded),
+/// [`value::DurableWalStore::rollback_sealed`] (WAL present → cleared),
+/// [`value::DirectApplyStore::direct_apply`] (ops non-empty → folded),
+/// and the [`value::TransactionValueStore`] wrappers around them.
+///
+/// Distinct from [`CommitDecision`]: the oracle decides whether a sealed
+/// WAL should be committed, the store reports whether it actually
+/// changed durable state when called. A second call with the same
+/// arguments observes [`StoreOutcome::NoOp`].
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum FlushOutcome {
-    /// At least one operation was applied to authoritative state.
+pub enum StoreOutcome {
+    /// The call mutated authoritative state.
     Applied,
 
-    /// No operations were applied.
+    /// No durable state changed (idempotent no-op).
     NoOp,
 }
 
@@ -510,6 +523,26 @@ where
     pub fn event(&self) -> EventRef {
         self.event
     }
+}
+
+/// Pending operations for one collection, with a typed non-empty proof.
+///
+/// Returned by [`value::PendingOpSource::pending_ops`] wrapped in
+/// [`Option`]: `None` means no dirty work is buffered for the collection,
+/// `Some(PendingOps { count, ops })` means at least one operation exists
+/// and `count` matches the iterator. The [`NonZeroU64`] count lets callers
+/// construct a [`DirtyCollection`] without materializing `ops` first; the
+/// iterator yields the operations themselves in order when the seal or
+/// direct-apply path needs them.
+pub struct PendingOps<I>
+where
+    I: Iterator + Send,
+{
+    /// Number of operations the iterator will yield.
+    pub count: NonZeroU64,
+
+    /// Ordered pending operations.
+    pub ops: I,
 }
 
 /// Non-empty ordered operation list.

@@ -5,14 +5,16 @@ use super::value::{
     ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionRef, CommitDecision, DurableState, EmptyOperationsError, EventRef,
-    FlushOutcome, Read, SealedCollection, SealedWal,
+    CollectionId, CollectionRef, DurableState, EmptyOperationsError, EventRef, PendingOps, Read,
+    SealedCollection, SealedWal, StoreOutcome,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use ahash::RandomState;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
+use std::option::IntoIter as OptionIntoIter;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -86,18 +88,22 @@ impl ValueStore for MemoryDirtyValueStore {
 
 impl PendingOpSource<ValueKind> for MemoryDirtyValueStore {
     type Error = MemoryStateError;
+    type Ops<'a> = OptionIntoIter<ValueOp>;
 
-    fn pending_ops(
-        &self,
-        collection: &CollectionId<ValueKind>,
-    ) -> Result<impl Iterator<Item = ValueOp> + Send, Self::Error> {
-        Ok(self
+    fn pending_ops<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+    ) -> Result<Option<PendingOps<Self::Ops<'a>>>, Self::Error> {
+        let op = self
             .inner
             .lock()
             .entries
             .get(collection)
-            .and_then(|entry| entry.op.clone())
-            .into_iter())
+            .and_then(|entry| entry.op.clone());
+        Ok(op.map(|op| PendingOps {
+            count: NonZeroU64::MIN,
+            ops: Some(op).into_iter(),
+        }))
     }
 
     fn clear_pending_ops(&self, collection: &CollectionId<ValueKind>) -> Result<(), Self::Error> {
@@ -177,11 +183,11 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
         expected_event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
+    ) -> Result<StoreOutcome, Self::Error> {
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
         let Some(sealed) = entry.wal.clone() else {
-            return Ok(CommitDecision::NotCommitted);
+            return Ok(StoreOutcome::NoOp);
         };
         if sealed.event() != expected_event {
             return Err(MemoryStateError::EventMismatch {
@@ -193,18 +199,18 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         let ops = sealed.into_ops();
         entry.applied = fold_value_ops(entry.applied.clone(), &ops);
         entry.wal = None;
-        Ok(CommitDecision::Committed)
+        Ok(StoreOutcome::Applied)
     }
 
     async fn rollback_sealed<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
         expected_event: EventRef,
-    ) -> Result<CommitDecision, Self::Error> {
+    ) -> Result<StoreOutcome, Self::Error> {
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
         let Some(sealed) = entry.wal.clone() else {
-            return Ok(CommitDecision::NotCommitted);
+            return Ok(StoreOutcome::NoOp);
         };
         if sealed.event() != expected_event {
             return Err(MemoryStateError::EventMismatch {
@@ -214,7 +220,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         }
 
         entry.wal = None;
-        Ok(CommitDecision::NotCommitted)
+        Ok(StoreOutcome::Applied)
     }
 }
 
@@ -225,19 +231,19 @@ impl DirectApplyStore<ValueKind> for MemoryDurableValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
         ops: I,
-    ) -> Result<FlushOutcome, Self::Error>
+    ) -> Result<StoreOutcome, Self::Error>
     where
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
         let ops = ops.into_iter().collect::<Vec<_>>();
         if ops.is_empty() {
-            return Ok(FlushOutcome::NoOp);
+            return Ok(StoreOutcome::NoOp);
         }
 
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
         entry.applied = fold_value_ops(entry.applied.clone(), &ops);
-        Ok(FlushOutcome::Applied)
+        Ok(StoreOutcome::Applied)
     }
 }
 
