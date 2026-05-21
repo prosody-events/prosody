@@ -6,7 +6,7 @@ use super::value::{
 };
 use super::{
     CollectionId, CollectionRef, CommitDecision, DirtyCollection, DurableState,
-    EmptyOperationsError, EventRef, Read, SealedCollection, SealedWal,
+    EmptyOperationsError, EventRef, FlushOutcome, Read, SealedCollection, SealedWal,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use ahash::RandomState;
@@ -156,42 +156,6 @@ impl Default for MemoryDurableValueStore {
     }
 }
 
-impl ValueStore for MemoryDurableValueStore {
-    type Error = MemoryStateError;
-
-    async fn get<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-    ) -> Result<Read<StoredPayload>, Self::Error> {
-        Ok(self
-            .inner
-            .lock()
-            .entries
-            .get(collection)
-            .and_then(|entry| entry.applied.clone())
-            .map_or(Read::Absent, Read::Present))
-    }
-
-    async fn set<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
-    ) -> Result<(), Self::Error> {
-        let mut inner = self.inner.lock();
-        inner.entries.entry(collection.clone()).or_default().applied = Some(payload);
-        Ok(())
-    }
-
-    async fn clear<'a>(
-        &'a self,
-        collection: &'a CollectionId<ValueKind>,
-    ) -> Result<(), Self::Error> {
-        let mut inner = self.inner.lock();
-        inner.entries.entry(collection.clone()).or_default().applied = None;
-        Ok(())
-    }
-}
-
 impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
     type Error = MemoryStateError;
 
@@ -200,14 +164,13 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<DurableState<ValueKind>, Self::Error> {
         let inner = self.inner.lock();
-        let state = inner.entries.get(collection);
-        if let Some(wal) = state.and_then(|entry| entry.wal.clone()) {
-            return Ok(DurableState::Sealed { wal });
+        let entry = inner.entries.get(collection);
+        let applied = entry.and_then(|entry| entry.applied.clone());
+        if let Some(wal) = entry.and_then(|entry| entry.wal.clone()) {
+            return Ok(DurableState::Sealed { applied, wal });
         }
 
-        Ok(DurableState::Idle {
-            applied: state.and_then(|entry| entry.applied.clone()),
-        })
+        Ok(DurableState::Idle { applied })
     }
 
     async fn seal<'a, I>(
@@ -225,7 +188,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
             return Err(MemoryStateError::AlreadySealed);
         }
 
-        let wal = SealedWal::try_new(event, entry.applied.clone(), ops.into_iter().collect())
+        let wal = SealedWal::try_new(event, ops.into_iter().collect())
             .map_err(MemoryStateError::EmptyOperations)?;
         entry.wal = Some(wal);
         Ok(SealedCollection::new(
@@ -251,8 +214,8 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
             });
         }
 
-        let (applied, ops) = sealed.into_applied_and_ops();
-        entry.applied = fold_value_ops(applied, &ops);
+        let ops = sealed.into_ops();
+        entry.applied = fold_value_ops(entry.applied.clone(), &ops);
         entry.wal = None;
         Ok(CommitDecision::Committed)
     }
@@ -274,7 +237,6 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
             });
         }
 
-        entry.applied.clone_from(sealed.applied());
         entry.wal = None;
         Ok(CommitDecision::NotCommitted)
     }
@@ -287,19 +249,19 @@ impl DirectApplyStore<ValueKind> for MemoryDurableValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
         ops: I,
-    ) -> Result<CommitDecision, Self::Error>
+    ) -> Result<FlushOutcome, Self::Error>
     where
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
         let ops = ops.into_iter().collect::<Vec<_>>();
         if ops.is_empty() {
-            return Ok(CommitDecision::NotCommitted);
+            return Ok(FlushOutcome::NoOp);
         }
 
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
         entry.applied = fold_value_ops(entry.applied.clone(), &ops);
-        Ok(CommitDecision::Committed)
+        Ok(FlushOutcome::Applied)
     }
 }
 

@@ -2,7 +2,7 @@
 
 use super::{
     CollectionId, CollectionKind, CollectionKindId, CollectionRef, CommitDecision, CommitMode,
-    DirtyCollection, DurableState, EventRef, LocalTx, Read, SealedCollection,
+    DirtyCollection, DurableState, EventRef, FlushOutcome, LocalTx, Read, SealedCollection,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
@@ -10,7 +10,6 @@ use parking_lot::Mutex;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
 use thiserror::Error;
 
 type DirtyStoreError<S> = <S as ValueStore>::Error;
@@ -165,12 +164,18 @@ where
         &'a self,
         collection: &'a CollectionId<K>,
         ops: I,
-    ) -> impl Future<Output = Result<CommitDecision, Self::Error>> + Send + 'a
+    ) -> impl Future<Output = Result<FlushOutcome, Self::Error>> + Send + 'a
     where
         I: IntoIterator<Item = K::Op> + Send + 'a;
 }
 
 /// Value transaction backed by dirty local state and durable state.
+///
+/// State-machine methods take `&mut self` so the single-writer-per-key
+/// invariant becomes a type-level fact for transaction-side callers. The
+/// `ValueStore` trait methods still take `&self` and use [`Mutex`] to
+/// coordinate the [`LocalTx`] transition; this lock is the only reason the
+/// field is wrapped — there is no cross-thread sharing of a transaction.
 #[derive(Debug)]
 pub struct TransactionValueStore<D, S> {
     durable: D,
@@ -178,7 +183,7 @@ pub struct TransactionValueStore<D, S> {
     collection: CollectionId<ValueKind>,
     event: EventRef,
     mode: CommitMode,
-    tx: Arc<Mutex<LocalTx<ValueKind>>>,
+    tx: Mutex<LocalTx<ValueKind>>,
 }
 
 impl<D, S> TransactionValueStore<D, S> {
@@ -198,7 +203,7 @@ impl<D, S> TransactionValueStore<D, S> {
             collection,
             event,
             mode,
-            tx: Arc::new(Mutex::new(LocalTx::Clean(reference))),
+            tx: Mutex::new(LocalTx::Clean(reference)),
         }
     }
 
@@ -221,7 +226,7 @@ where
     ///
     /// Returns a transaction error if the mode or local state does not permit
     /// sealing, or if either backing store fails.
-    pub async fn seal(&self) -> Result<SealedCollection<ValueKind>, TxError<S, D>> {
+    pub async fn seal(&mut self) -> Result<SealedCollection<ValueKind>, TxError<S, D>> {
         if self.mode != CommitMode::Wal {
             return Err(TransactionValueStoreError::WrongCommitMode {
                 expected: CommitMode::Wal,
@@ -229,11 +234,10 @@ where
             });
         }
 
-        match self.local_tx() {
+        match self.local_tx_snapshot() {
             LocalTx::Clean(_) => Err(TransactionValueStoreError::NoPendingOps),
             LocalTx::Dirty(_) => {
                 let ops = self.pending_ops_vec()?;
-
                 let sealed = self
                     .durable
                     .seal(&self.collection, self.event, ops)
@@ -242,7 +246,7 @@ where
                 self.dirty
                     .clear_pending_ops(&self.collection)
                     .map_err(TransactionValueStoreError::Dirty)?;
-                *self.tx.lock() = LocalTx::Sealed(sealed.clone());
+                self.set_local_tx(LocalTx::Sealed(sealed.clone()));
                 Ok(sealed)
             }
             LocalTx::Sealed(_) => Err(TransactionValueStoreError::AlreadySealed),
@@ -256,8 +260,8 @@ where
     ///
     /// Returns a transaction error if the transaction is finished or durable
     /// storage rejects the sealed event.
-    pub async fn apply_sealed(&self) -> Result<CommitDecision, TxError<S, D>> {
-        if self.local_tx() == LocalTx::Finished {
+    pub async fn apply_sealed(&mut self) -> Result<CommitDecision, TxError<S, D>> {
+        if self.local_tx_snapshot() == LocalTx::Finished {
             return Err(TransactionValueStoreError::Finished);
         }
 
@@ -266,7 +270,7 @@ where
             .apply_sealed(&self.collection, self.event)
             .await
             .map_err(TransactionValueStoreError::Durable)?;
-        *self.tx.lock() = LocalTx::Finished;
+        self.set_local_tx(LocalTx::Finished);
         Ok(decision)
     }
 
@@ -276,8 +280,8 @@ where
     ///
     /// Returns a transaction error if the transaction is finished or durable
     /// storage rejects the sealed event.
-    pub async fn rollback_sealed(&self) -> Result<CommitDecision, TxError<S, D>> {
-        if self.local_tx() == LocalTx::Finished {
+    pub async fn rollback_sealed(&mut self) -> Result<CommitDecision, TxError<S, D>> {
+        if self.local_tx_snapshot() == LocalTx::Finished {
             return Err(TransactionValueStoreError::Finished);
         }
 
@@ -286,7 +290,7 @@ where
             .rollback_sealed(&self.collection, self.event)
             .await
             .map_err(TransactionValueStoreError::Durable)?;
-        *self.tx.lock() = LocalTx::Finished;
+        self.set_local_tx(LocalTx::Finished);
         Ok(decision)
     }
 
@@ -296,13 +300,13 @@ where
     ///
     /// Returns a transaction error if the transaction is sealed, finished, or a
     /// backing store fails.
-    pub async fn flush(&self) -> Result<CommitDecision, TxError<S, D>> {
-        match self.local_tx() {
-            LocalTx::Clean(_) => Ok(CommitDecision::NotCommitted),
+    pub async fn flush(&mut self) -> Result<FlushOutcome, TxError<S, D>> {
+        match self.local_tx_snapshot() {
+            LocalTx::Clean(_) => Ok(FlushOutcome::NoOp),
             LocalTx::Dirty(_) => {
-                let decision = self.apply_dirty_directly().await?;
-                *self.tx.lock() = LocalTx::Clean(CollectionRef::new(self.collection.clone()));
-                Ok(decision)
+                let outcome = self.apply_dirty_directly().await?;
+                self.set_local_tx(LocalTx::Clean(CollectionRef::new(self.collection.clone())));
+                Ok(outcome)
             }
             LocalTx::Sealed(_) => Err(TransactionValueStoreError::AlreadySealed),
             LocalTx::Finished => Err(TransactionValueStoreError::Finished),
@@ -315,7 +319,7 @@ where
     ///
     /// Returns a transaction error if the mode is not [`CommitMode::Direct`],
     /// the transaction is sealed or finished, or a backing store fails.
-    pub async fn direct_apply(&self) -> Result<CommitDecision, TxError<S, D>> {
+    pub async fn direct_apply(&mut self) -> Result<FlushOutcome, TxError<S, D>> {
         if self.mode != CommitMode::Direct {
             return Err(TransactionValueStoreError::WrongCommitMode {
                 expected: CommitMode::Direct,
@@ -323,38 +327,14 @@ where
             });
         }
 
-        let decision = match self.local_tx() {
-            LocalTx::Clean(_) => CommitDecision::NotCommitted,
+        let outcome = match self.local_tx_snapshot() {
+            LocalTx::Clean(_) => FlushOutcome::NoOp,
             LocalTx::Dirty(_) => self.apply_dirty_directly().await?,
             LocalTx::Sealed(_) => return Err(TransactionValueStoreError::AlreadySealed),
             LocalTx::Finished => return Err(TransactionValueStoreError::Finished),
         };
-        *self.tx.lock() = LocalTx::Finished;
-        Ok(decision)
-    }
-
-    /// Resolves this transaction as committed according to its commit mode.
-    ///
-    /// # Errors
-    ///
-    /// Returns a transaction error if a backing store fails or the local state
-    /// cannot transition.
-    pub async fn commit(&self) -> Result<CommitDecision, TxError<S, D>> {
-        match self.mode {
-            CommitMode::Wal => match self.local_tx() {
-                LocalTx::Clean(_) => {
-                    *self.tx.lock() = LocalTx::Finished;
-                    Ok(CommitDecision::NotCommitted)
-                }
-                LocalTx::Dirty(_) => {
-                    let _sealed = self.seal().await?;
-                    self.apply_sealed().await
-                }
-                LocalTx::Sealed(_) => self.apply_sealed().await,
-                LocalTx::Finished => Err(TransactionValueStoreError::Finished),
-            },
-            CommitMode::Direct => self.direct_apply().await,
-        }
+        self.set_local_tx(LocalTx::Finished);
+        Ok(outcome)
     }
 
     /// Resolves this transaction as aborted.
@@ -363,17 +343,17 @@ where
     ///
     /// Returns a transaction error if a backing store fails or the local state
     /// cannot transition.
-    pub async fn abort(&self) -> Result<CommitDecision, TxError<S, D>> {
-        match self.local_tx() {
+    pub async fn abort(&mut self) -> Result<CommitDecision, TxError<S, D>> {
+        match self.local_tx_snapshot() {
             LocalTx::Clean(_) => {
-                *self.tx.lock() = LocalTx::Finished;
+                self.set_local_tx(LocalTx::Finished);
                 Ok(CommitDecision::NotCommitted)
             }
             LocalTx::Dirty(_) => {
                 self.dirty
                     .clear_pending_ops(&self.collection)
                     .map_err(TransactionValueStoreError::Dirty)?;
-                *self.tx.lock() = LocalTx::Finished;
+                self.set_local_tx(LocalTx::Finished);
                 Ok(CommitDecision::NotCommitted)
             }
             LocalTx::Sealed(_) => self.rollback_sealed().await,
@@ -381,13 +361,13 @@ where
         }
     }
 
-    async fn apply_dirty_directly(&self) -> Result<CommitDecision, TxError<S, D>> {
+    async fn apply_dirty_directly(&self) -> Result<FlushOutcome, TxError<S, D>> {
         let ops = self.pending_ops_vec()?;
         if ops.is_empty() {
-            return Ok(CommitDecision::NotCommitted);
+            return Ok(FlushOutcome::NoOp);
         }
 
-        let decision = self
+        let outcome = self
             .durable
             .direct_apply(&self.collection, ops)
             .await
@@ -395,10 +375,18 @@ where
         self.dirty
             .clear_pending_ops(&self.collection)
             .map_err(TransactionValueStoreError::Dirty)?;
-        Ok(decision)
+        Ok(outcome)
     }
 
-    fn mark_dirty(&self) -> Result<(), TxError<S, D>> {
+    fn local_tx_snapshot(&self) -> LocalTx<ValueKind> {
+        self.tx.lock().clone()
+    }
+
+    fn set_local_tx(&mut self, tx: LocalTx<ValueKind>) {
+        *self.tx.get_mut() = tx;
+    }
+
+    fn mark_dirty_locked(&self) -> Result<(), TxError<S, D>> {
         let ops = self.pending_ops_vec()?;
         let dirty =
             DirtyCollection::try_from_count(CollectionRef::new(self.collection.clone()), ops.len())
@@ -416,7 +404,7 @@ where
     }
 
     fn can_write(&self) -> Result<(), TxError<S, D>> {
-        match self.local_tx() {
+        match self.local_tx_snapshot() {
             LocalTx::Clean(_) | LocalTx::Dirty(_) => Ok(()),
             LocalTx::Sealed(_) => Err(TransactionValueStoreError::AlreadySealed),
             LocalTx::Finished => Err(TransactionValueStoreError::Finished),
@@ -440,7 +428,7 @@ where
         if collection != &self.collection {
             return Err(TransactionValueStoreError::WrongCollection);
         }
-        if matches!(self.local_tx(), LocalTx::Finished) {
+        if matches!(self.local_tx_snapshot(), LocalTx::Finished) {
             return Err(TransactionValueStoreError::Finished);
         }
 
@@ -475,7 +463,7 @@ where
             .set(collection, payload)
             .await
             .map_err(TransactionValueStoreError::Dirty)?;
-        self.mark_dirty()
+        self.mark_dirty_locked()
     }
 
     async fn clear<'a>(
@@ -491,17 +479,20 @@ where
             .clear(collection)
             .await
             .map_err(TransactionValueStoreError::Dirty)?;
-        self.mark_dirty()
+        self.mark_dirty_locked()
     }
 }
 
 /// Folds ordered Value operations into applied state.
+///
+/// Value operations are last-writer-wins, so only the final op in the slice
+/// affects the applied state.
 #[must_use]
 pub fn fold_value_ops<'a, I>(applied: ValueApplied, ops: I) -> ValueApplied
 where
     I: IntoIterator<Item = &'a ValueOp>,
 {
-    ops.into_iter().fold(applied, |_, op| match op {
+    ops.into_iter().last().map_or(applied, |op| match op {
         ValueOp::Set { payload } => Some(payload.clone()),
         ValueOp::Clear => None,
     })
@@ -509,8 +500,7 @@ where
 
 fn read_value_from_durable(state: DurableState<ValueKind>) -> Read<StoredPayload> {
     let applied = match state {
-        DurableState::Idle { applied } => applied,
-        DurableState::Sealed { wal } => wal.applied().clone(),
+        DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => applied,
     };
 
     applied.map_or(Read::Absent, Read::Present)

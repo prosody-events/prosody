@@ -218,7 +218,12 @@ impl TimerEventRef {
     }
 }
 
-/// Result of resolving a sealed durable transaction.
+/// Oracle verdict on a sealed WAL for one event.
+///
+/// Returned by [`value::DurableWalStore::apply_sealed`] and
+/// [`value::DurableWalStore::rollback_sealed`]. Distinct from
+/// [`FlushOutcome`], which describes whether a storage step applied any
+/// operations.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitDecision {
     /// The sealed operations were committed.
@@ -226,6 +231,22 @@ pub enum CommitDecision {
 
     /// No sealed operations were committed.
     NotCommitted,
+}
+
+/// Result of a storage step that applies dirty operations.
+///
+/// Returned by [`value::DirectApplyStore::direct_apply`],
+/// [`value::TransactionValueStore::flush`], and
+/// [`value::TransactionValueStore::direct_apply`]. Carries the
+/// "did this step apply anything" signal that used to overload
+/// [`CommitDecision`].
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// At least one operation was applied to authoritative state.
+    Applied,
+
+    /// No operations were applied.
+    NoOp,
 }
 
 /// Persistence mode for local state changes.
@@ -279,6 +300,9 @@ where
 
     /// A non-empty WAL is sealed for recovery.
     Sealed {
+        /// Authoritative applied state observed before the WAL was sealed.
+        applied: K::Applied,
+
         /// Durable sealed WAL.
         wal: SealedWal<K>,
     },
@@ -395,7 +419,6 @@ where
     K: CollectionKind,
 {
     event: EventRef,
-    applied: K::Applied,
     wal: WalEnvelope<K>,
 }
 
@@ -403,14 +426,10 @@ impl<K> SealedWal<K>
 where
     K: CollectionKind,
 {
-    /// Creates durable sealed state from applied state and a non-empty WAL.
+    /// Creates durable sealed state from a non-empty WAL.
     #[must_use]
-    pub fn new(event: EventRef, applied: K::Applied, wal: WalEnvelope<K>) -> Self {
-        Self {
-            event,
-            applied,
-            wal,
-        }
+    pub fn new(event: EventRef, wal: WalEnvelope<K>) -> Self {
+        Self { event, wal }
     }
 
     /// Creates durable sealed state from a non-empty ordered operation list.
@@ -418,24 +437,14 @@ where
     /// # Errors
     ///
     /// Returns [`EmptyOperationsError`] when `ops` is empty.
-    pub fn try_new(
-        event: EventRef,
-        applied: K::Applied,
-        ops: Vec<K::Op>,
-    ) -> Result<Self, EmptyOperationsError> {
-        Ok(Self::new(event, applied, WalEnvelope::try_from_ops(ops)?))
+    pub fn try_new(event: EventRef, ops: Vec<K::Op>) -> Result<Self, EmptyOperationsError> {
+        Ok(Self::new(event, WalEnvelope::try_from_ops(ops)?))
     }
 
     /// Returns the event that owns the sealed operations.
     #[must_use]
     pub fn event(&self) -> EventRef {
         self.event
-    }
-
-    /// Returns the state that was authoritative before sealing.
-    #[must_use]
-    pub fn applied(&self) -> &K::Applied {
-        &self.applied
     }
 
     /// Returns the sealed WAL.
@@ -450,10 +459,10 @@ where
         self.wal.ops()
     }
 
-    /// Decomposes sealed state into its pre-seal state and operation list.
+    /// Decomposes sealed state into the ordered operation list.
     #[must_use]
-    pub fn into_applied_and_ops(self) -> (K::Applied, Vec<K::Op>) {
-        (self.applied, self.wal.into_ops())
+    pub fn into_ops(self) -> Vec<K::Op> {
+        self.wal.into_ops()
     }
 
     /// Returns the number of sealed operations.

@@ -1,12 +1,12 @@
 use super::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
 use super::value::{
-    DurableWalStore, PendingOpSource, TransactionValueStore, TransactionValueStoreError,
-    ValueStore, fold_value_ops,
+    DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore,
+    TransactionValueStoreError, ValueStore, fold_value_ops,
 };
 use super::{
     CollectionId, CollectionKindId, CollectionRef, CommitDecision, CommitMode, DirtyCollection,
-    DurableState, EventRef, LocalTx, Read, StateKey, StateName, StateType, ValueKind, ValueOp,
-    ValueOverlay, WalEnvelope,
+    DurableState, EventRef, FlushOutcome, LocalTx, Read, StateKey, StateName, StateType, ValueKind,
+    ValueOp, ValueOverlay, WalEnvelope,
 };
 use crate::Key;
 use bytes::Bytes;
@@ -46,6 +46,24 @@ fn read_applied(read: Read<Bytes>) -> Option<Bytes> {
         Read::Present(bytes) => Some(bytes),
         Read::Absent | Read::Unknown => None,
     }
+}
+
+async fn durable_applied(
+    durable: &MemoryDurableValueStore,
+    collection: &CollectionId<ValueKind>,
+) -> Result<Option<Bytes>> {
+    Ok(match durable.read_partition(collection).await? {
+        DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => applied,
+    })
+}
+
+async fn seed_durable(
+    durable: &MemoryDurableValueStore,
+    collection: &CollectionId<ValueKind>,
+    op: ValueOp,
+) -> Result<()> {
+    durable.direct_apply(collection, vec![op]).await?;
+    Ok(())
 }
 
 #[test]
@@ -125,9 +143,19 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
     let collection = collection()?;
 
-    assert_eq!(durable.get(&collection).await?, Read::Absent);
-    durable.set(&collection, payload(1)).await?;
-    assert_eq!(durable.get(&collection).await?, Read::Present(payload(1)));
+    assert_eq!(durable_applied(&durable, &collection).await?, None);
+    seed_durable(
+        &durable,
+        &collection,
+        ValueOp::Set {
+            payload: payload(1),
+        },
+    )
+    .await?;
+    assert_eq!(
+        durable_applied(&durable, &collection).await?,
+        Some(payload(1))
+    );
 
     let sealed = durable
         .seal(
@@ -141,9 +169,9 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
     assert_eq!(sealed.event(), event(1));
 
     match durable.read_partition(&collection).await? {
-        DurableState::Sealed { wal } => {
+        DurableState::Sealed { applied, wal } => {
             assert_eq!(wal.event(), event(1));
-            assert_eq!(wal.applied(), &Some(payload(1)));
+            assert_eq!(applied, Some(payload(1)));
         }
         DurableState::Idle { .. } => return Err(eyre::eyre!("expected sealed durable state")),
     }
@@ -152,7 +180,10 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
         durable.apply_sealed(&collection, event(1)).await?,
         CommitDecision::Committed
     );
-    assert_eq!(durable.get(&collection).await?, Read::Present(payload(2)));
+    assert_eq!(
+        durable_applied(&durable, &collection).await?,
+        Some(payload(2))
+    );
 
     let _sealed = durable
         .seal(&collection, event(2), vec![ValueOp::Clear])
@@ -161,7 +192,10 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
         durable.rollback_sealed(&collection, event(2)).await?,
         CommitDecision::NotCommitted
     );
-    assert_eq!(durable.get(&collection).await?, Read::Present(payload(2)));
+    assert_eq!(
+        durable_applied(&durable, &collection).await?,
+        Some(payload(2))
+    );
     Ok(())
 }
 
@@ -193,7 +227,14 @@ async fn transaction_dirty_reads_override_durable_reads() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection()?;
-    durable.set(&collection, payload(1)).await?;
+    seed_durable(
+        &durable,
+        &collection,
+        ValueOp::Set {
+            payload: payload(1),
+        },
+    )
+    .await?;
 
     let tx = TransactionValueStore::new(
         durable,
@@ -217,7 +258,7 @@ async fn transaction_wal_commit_applies_and_abort_rolls_back() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
     let collection = collection()?;
 
-    let commit_tx = TransactionValueStore::new(
+    let mut commit_tx = TransactionValueStore::new(
         durable.clone(),
         MemoryDirtyValueStore::new(),
         collection.clone(),
@@ -225,10 +266,14 @@ async fn transaction_wal_commit_applies_and_abort_rolls_back() -> Result<()> {
         CommitMode::Wal,
     );
     commit_tx.set(&collection, payload(1)).await?;
-    assert_eq!(commit_tx.commit().await?, CommitDecision::Committed);
-    assert_eq!(durable.get(&collection).await?, Read::Present(payload(1)));
+    let _sealed = commit_tx.seal().await?;
+    assert_eq!(commit_tx.apply_sealed().await?, CommitDecision::Committed);
+    assert_eq!(
+        durable_applied(&durable, &collection).await?,
+        Some(payload(1))
+    );
 
-    let abort_tx = TransactionValueStore::new(
+    let mut abort_tx = TransactionValueStore::new(
         durable.clone(),
         MemoryDirtyValueStore::new(),
         collection.clone(),
@@ -238,7 +283,10 @@ async fn transaction_wal_commit_applies_and_abort_rolls_back() -> Result<()> {
     abort_tx.set(&collection, payload(2)).await?;
     let _sealed = abort_tx.seal().await?;
     assert_eq!(abort_tx.abort().await?, CommitDecision::NotCommitted);
-    assert_eq!(durable.get(&collection).await?, Read::Present(payload(1)));
+    assert_eq!(
+        durable_applied(&durable, &collection).await?,
+        Some(payload(1))
+    );
     Ok(())
 }
 
@@ -248,7 +296,7 @@ async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection()?;
 
-    let tx = TransactionValueStore::new(
+    let mut tx = TransactionValueStore::new(
         durable.clone(),
         dirty.clone(),
         collection.clone(),
@@ -257,7 +305,7 @@ async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
     );
     tx.set(&collection, payload(1)).await?;
     assert_eq!(tx.abort().await?, CommitDecision::NotCommitted);
-    assert_eq!(durable.get(&collection).await?, Read::Absent);
+    assert_eq!(durable_applied(&durable, &collection).await?, None);
     assert_eq!(dirty.get(&collection).await?, Read::Unknown);
     Ok(())
 }
@@ -266,7 +314,7 @@ async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
 async fn flush_applies_dirty_without_creating_sealed_wal() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
     let collection = collection()?;
-    let tx = TransactionValueStore::new(
+    let mut tx = TransactionValueStore::new(
         durable.clone(),
         MemoryDirtyValueStore::new(),
         collection.clone(),
@@ -275,10 +323,13 @@ async fn flush_applies_dirty_without_creating_sealed_wal() -> Result<()> {
     );
 
     tx.set(&collection, payload(1)).await?;
-    assert_eq!(tx.flush().await?, CommitDecision::Committed);
+    assert_eq!(tx.flush().await?, FlushOutcome::Applied);
     assert!(matches!(tx.local_tx(), LocalTx::Clean(_)));
     assert_eq!(tx.abort().await?, CommitDecision::NotCommitted);
-    assert_eq!(durable.get(&collection).await?, Read::Present(payload(1)));
+    assert_eq!(
+        durable_applied(&durable, &collection).await?,
+        Some(payload(1))
+    );
 
     match durable.read_partition(&collection).await? {
         DurableState::Idle { applied } => assert_eq!(applied, Some(payload(1))),
@@ -291,7 +342,7 @@ async fn flush_applies_dirty_without_creating_sealed_wal() -> Result<()> {
 async fn direct_mode_applies_without_sealed_wal() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
     let collection = collection()?;
-    let tx = TransactionValueStore::new(
+    let mut tx = TransactionValueStore::new(
         durable.clone(),
         MemoryDirtyValueStore::new(),
         collection.clone(),
@@ -300,8 +351,11 @@ async fn direct_mode_applies_without_sealed_wal() -> Result<()> {
     );
 
     tx.set(&collection, payload(1)).await?;
-    assert_eq!(tx.direct_apply().await?, CommitDecision::Committed);
-    assert_eq!(durable.get(&collection).await?, Read::Present(payload(1)));
+    assert_eq!(tx.direct_apply().await?, FlushOutcome::Applied);
+    assert_eq!(
+        durable_applied(&durable, &collection).await?,
+        Some(payload(1))
+    );
 
     match durable.read_partition(&collection).await? {
         DurableState::Idle { applied } => assert_eq!(applied, Some(payload(1))),
@@ -314,7 +368,7 @@ async fn direct_mode_applies_without_sealed_wal() -> Result<()> {
 async fn finished_transaction_rejects_further_transitions() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
     let collection = collection()?;
-    let tx = TransactionValueStore::new(
+    let mut tx = TransactionValueStore::new(
         durable,
         MemoryDirtyValueStore::new(),
         collection.clone(),
@@ -322,7 +376,7 @@ async fn finished_transaction_rejects_further_transitions() -> Result<()> {
         CommitMode::Wal,
     );
 
-    assert_eq!(tx.commit().await?, CommitDecision::NotCommitted);
+    assert_eq!(tx.abort().await?, CommitDecision::NotCommitted);
     let error = tx
         .set(&collection, payload(1))
         .await
@@ -357,11 +411,11 @@ async fn run_trace(trace: Trace) -> Result<bool> {
     for op in trace.ops {
         restart_finished_transaction(&durable, &collection, &mut model, &mut tx_id, &mut tx);
 
-        if !apply_trace_op(&tx, &collection, &mut model, op).await? {
+        if !apply_trace_op(&mut tx, &collection, &mut model, op).await? {
             return Ok(false);
         }
 
-        let durable_visible = read_applied(durable.get(&collection).await?);
+        let durable_visible = durable_applied(&durable, &collection).await?;
         if durable_visible != model.applied {
             return Ok(false);
         }
@@ -391,7 +445,7 @@ fn restart_finished_transaction(
 }
 
 async fn apply_trace_op(
-    tx: &MemoryTx,
+    tx: &mut MemoryTx,
     collection: &CollectionId<ValueKind>,
     model: &mut Model,
     op: TraceOp,
@@ -411,7 +465,7 @@ async fn apply_trace_op(
 }
 
 async fn apply_trace_set(
-    tx: &MemoryTx,
+    tx: &mut MemoryTx,
     collection: &CollectionId<ValueKind>,
     model: &mut Model,
     byte: u8,
@@ -438,7 +492,7 @@ async fn apply_trace_set(
 }
 
 async fn apply_trace_clear(
-    tx: &MemoryTx,
+    tx: &mut MemoryTx,
     collection: &CollectionId<ValueKind>,
     model: &mut Model,
 ) -> Result<bool> {
@@ -461,7 +515,7 @@ async fn apply_trace_clear(
     }
 }
 
-async fn apply_trace_seal(tx: &MemoryTx, model: &mut Model) -> Result<bool> {
+async fn apply_trace_seal(tx: &mut MemoryTx, model: &mut Model) -> Result<bool> {
     match model.phase {
         ModelPhase::Clean => Ok(matches!(
             tx.seal().await,
@@ -484,17 +538,20 @@ async fn apply_trace_seal(tx: &MemoryTx, model: &mut Model) -> Result<bool> {
     }
 }
 
-async fn apply_trace_commit(tx: &MemoryTx, model: &mut Model) -> Result<bool> {
+async fn apply_trace_commit(tx: &mut MemoryTx, model: &mut Model) -> Result<bool> {
     match model.phase {
         ModelPhase::Clean => {
-            if tx.commit().await? != CommitDecision::NotCommitted {
+            if tx.abort().await? != CommitDecision::NotCommitted {
                 return Ok(false);
             }
             model.phase = ModelPhase::Finished;
             Ok(true)
         }
         ModelPhase::Dirty => {
-            if tx.commit().await? != CommitDecision::Committed {
+            if tx.seal().await.is_err() {
+                return Ok(false);
+            }
+            if tx.apply_sealed().await? != CommitDecision::Committed {
                 return Ok(false);
             }
             model.applied = fold_value_ops(model.applied.clone(), &model.dirty_ops);
@@ -503,7 +560,7 @@ async fn apply_trace_commit(tx: &MemoryTx, model: &mut Model) -> Result<bool> {
             Ok(true)
         }
         ModelPhase::Sealed => {
-            if tx.commit().await? != CommitDecision::Committed {
+            if tx.apply_sealed().await? != CommitDecision::Committed {
                 return Ok(false);
             }
             let Some((applied, ops)) = model.sealed.take() else {
@@ -517,7 +574,7 @@ async fn apply_trace_commit(tx: &MemoryTx, model: &mut Model) -> Result<bool> {
     }
 }
 
-async fn apply_trace_abort(tx: &MemoryTx, model: &mut Model) -> Result<bool> {
+async fn apply_trace_abort(tx: &mut MemoryTx, model: &mut Model) -> Result<bool> {
     match model.phase {
         ModelPhase::Clean | ModelPhase::Dirty => {
             if tx.abort().await? != CommitDecision::NotCommitted {
@@ -542,11 +599,11 @@ async fn apply_trace_abort(tx: &MemoryTx, model: &mut Model) -> Result<bool> {
     }
 }
 
-async fn apply_trace_flush(tx: &MemoryTx, model: &mut Model) -> Result<bool> {
+async fn apply_trace_flush(tx: &mut MemoryTx, model: &mut Model) -> Result<bool> {
     match model.phase {
-        ModelPhase::Clean => Ok(tx.flush().await? == CommitDecision::NotCommitted),
+        ModelPhase::Clean => Ok(tx.flush().await? == FlushOutcome::NoOp),
         ModelPhase::Dirty => {
-            if tx.flush().await? != CommitDecision::Committed {
+            if tx.flush().await? != FlushOutcome::Applied {
                 return Ok(false);
             }
             model.applied = fold_value_ops(model.applied.clone(), &model.dirty_ops);
