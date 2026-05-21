@@ -292,20 +292,6 @@ pub enum Read<T> {
     Unknown,
 }
 
-impl<T> Read<T> {
-    /// Maps a present value while preserving absence and unknown.
-    pub fn map<U, F>(self, f: F) -> Read<U>
-    where
-        F: FnOnce(T) -> U,
-    {
-        match self {
-            Self::Present(value) => Read::Present(f(value)),
-            Self::Absent => Read::Absent,
-            Self::Unknown => Read::Unknown,
-        }
-    }
-}
-
 /// Durable collection state is either idle or sealed for one event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableState<K>
