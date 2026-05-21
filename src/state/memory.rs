@@ -280,6 +280,12 @@ struct DurableInner {
     entries: HashMap<CollectionId<ValueKind>, DurableValueEntry, RandomState>,
 }
 
+/// Authoritative state for one durable Value collection.
+///
+/// Invariant: `applied` always reflects the pre-seal authoritative state.
+/// `seal` writes only `wal`; `applied` is mutated solely by `apply_sealed`
+/// and `direct_apply`. This is what lets `rollback_sealed` resolve a
+/// sealed event with `entry.wal = None` and no `applied` restoration.
 #[derive(Debug, Default)]
 struct DurableValueEntry {
     applied: Option<Bytes>,
