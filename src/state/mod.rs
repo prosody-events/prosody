@@ -163,6 +163,13 @@ where
 }
 
 /// Per-event scope identity used by commit recovery.
+///
+/// Pre-staged for Slice 6+ (Fjall dirty workspace keys scoped by
+/// `EventScopeId`) and Slice 8 (middleware assigns a fresh scope per
+/// event). Today nothing reads this; it lives on the public surface so
+/// the next slices can attach it to [`CollectionRef`] and the Fjall
+/// keyspace without churning callers.
+// TODO(slice-6,8): wire into CollectionRef and the Fjall dirty workspace.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct EventScopeId(u128);
 
@@ -639,6 +646,13 @@ where
 }
 
 /// Encoded WAL bytes tagged with their collection kind.
+///
+/// Pre-staged for Slice 2 (`MsgPack` payload + WAL encoding). Slice 2 will
+/// add `format: WalFormat` per `docs/keyed-state/design-summary.md`
+/// §Encoding and swap `SealedWal::wal` from [`WalEnvelope`] (materialized
+/// ops) to this byte-form. Today nothing constructs a `WalBlob`; the type
+/// is here so the encoding work doesn't churn callers.
+// TODO(slice-2): add `format: WalFormat`; swap SealedWal::wal to WalBlob.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct WalBlob<K>
 where

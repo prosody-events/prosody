@@ -14,5 +14,8 @@ Thumbs.db
 *.swp
 .vscode/
 .ai/
-docs/
+docs/*
+!docs/keyed-state/
+docs/keyed-state/*
+!docs/keyed-state/design-summary.md
 specs/

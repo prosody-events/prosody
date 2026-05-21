@@ -5,8 +5,8 @@ use super::value::{
     ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionRef, CommitDecision, DirtyCollection, DurableState,
-    EmptyOperationsError, EventRef, FlushOutcome, Read, SealedCollection, SealedWal,
+    CollectionId, CollectionRef, CommitDecision, DurableState, EmptyOperationsError, EventRef,
+    FlushOutcome, Read, SealedCollection, SealedWal,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use ahash::RandomState;
@@ -30,30 +30,6 @@ impl MemoryDirtyValueStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Returns the typed dirty marker for a collection when it has operations.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MemoryStateError`] if the stored operation count cannot form a
-    /// dirty marker.
-    pub fn dirty_collection(
-        &self,
-        collection: &CollectionId<ValueKind>,
-    ) -> Result<Option<DirtyCollection<ValueKind>>, MemoryStateError> {
-        self.inner
-            .lock()
-            .entries
-            .get(collection)
-            .map(|entry| {
-                DirtyCollection::try_from_count(
-                    CollectionRef::new(collection.clone()),
-                    usize::from(entry.op.is_some()),
-                )
-                .map_err(MemoryStateError::EmptyOperations)
-            })
-            .transpose()
     }
 }
 
