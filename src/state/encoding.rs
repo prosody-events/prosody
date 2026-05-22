@@ -210,14 +210,12 @@ where
     K: CollectionKind,
     K::Op: EncodableOp,
 {
-    let bytes = blob.bytes();
-    let raw = if blob.format().is_compressed() {
-        decode_all(bytes.as_ref()).map_err(EncodingError::BadZstd)?
+    if blob.format().is_compressed() {
+        let raw = decode_all(blob.bytes().as_ref()).map_err(EncodingError::BadZstd)?;
+        decode_wal_stream::<K>(&raw)
     } else {
-        bytes.to_vec()
-    };
-
-    decode_wal_stream::<K>(&raw)
+        decode_wal_stream::<K>(blob.bytes().as_ref())
+    }
 }
 
 fn decode_wal_stream<K>(raw: &[u8]) -> Result<WalEnvelope<K>, EncodingError>
@@ -274,10 +272,6 @@ pub enum EncodingError {
     #[error("unknown WAL format: {0}")]
     UnknownWalFormat(i16),
 
-    /// A required payload encoding column was missing.
-    #[error("payload encoding required but missing")]
-    MissingPayloadEncoding,
-
     /// The decoded WAL header named a different collection kind.
     #[error("WAL kind mismatch: header {header:?}, expected {expected:?}")]
     KindMismatch {
@@ -302,15 +296,6 @@ pub enum EncodingError {
         /// Header version expected by the decoder.
         expected: u16,
     },
-
-    /// The decoded WAL header advertised zero operations.
-    ///
-    /// Reserved for future relaxed header formats that encode `op_count`
-    /// out-of-band. Today the field is [`NonZeroU64`] and the `MsgPack`
-    /// deserializer rejects zero before this variant could be produced;
-    /// such payloads surface as [`Self::BadMsgPack`].
-    #[error("WAL stream is empty")]
-    EmptyWalStream,
 
     /// `MsgPack` decoding failed.
     #[error("bad MsgPack decode: {0}")]

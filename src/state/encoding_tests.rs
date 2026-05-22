@@ -263,6 +263,36 @@ fn wal_empty_stream_rejected_by_msgpack() -> Result<()> {
 }
 
 #[test]
+fn wal_unsupported_header_version_is_rejected() -> Result<()> {
+    #[derive(Serialize)]
+    struct CraftedHeader {
+        version: u16,
+        kind: CollectionKindId,
+        op_count: u64,
+    }
+
+    let header = CraftedHeader {
+        version: 2,
+        kind: CollectionKindId::Value,
+        op_count: 1,
+    };
+    let mut bytes = rmp_serde::to_vec_named(&header)?;
+    bytes.extend(rmp_serde::to_vec_named(&ValueOp::Clear)?);
+    let blob: WalBlob<ValueKind> = WalBlob::new(Bytes::from(bytes), WalFormat::MsgpackStreamV1);
+
+    match decode_wal::<ValueKind>(&blob) {
+        Err(EncodingError::UnsupportedWalHeaderVersion { header, expected }) => {
+            assert_eq!(header, 2);
+            assert_eq!(expected, 1);
+            Ok(())
+        }
+        other => Err(eyre::eyre!(
+            "expected UnsupportedWalHeaderVersion, got {other:?}"
+        )),
+    }
+}
+
+#[test]
 fn zstd_payload_at_most_plain_size_on_compressible_input() -> Result<()> {
     let inline = StoredPayload::Inline(Bytes::from(vec![0_u8; 4096]));
     let raw = encode_payload(&inline, PayloadEncoding::MsgpackV1)?;

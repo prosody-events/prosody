@@ -28,6 +28,8 @@ pub mod value;
 mod encoding_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod value_test_suite;
 
 pub use encoding::{EncodingError, PayloadEncoding, WalFormat};
 pub use value::{KafkaMessageRef, StoredPayload, ValueApplied, ValueKind, ValueOp, ValueOverlay};
