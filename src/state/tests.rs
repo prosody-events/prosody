@@ -1,6 +1,6 @@
 use super::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
 use super::value::{
-    DirectApplyStore, DurableWalStore, PendingOpSource, TransactionValueStore,
+    DirectApplyStore, DurableWalStore, PendingOpSource, StoredPayload, TransactionValueStore,
     TransactionValueStoreError, ValueStore, fold_value_ops,
 };
 use super::{
@@ -41,9 +41,13 @@ fn payload(value: u8) -> Bytes {
     Bytes::from(vec![value])
 }
 
-fn read_applied(read: Read<Bytes>) -> Option<Bytes> {
+fn inline(value: u8) -> StoredPayload {
+    StoredPayload::Inline(payload(value))
+}
+
+fn read_applied(read: Read<StoredPayload>) -> Option<StoredPayload> {
     match read {
-        Read::Present(bytes) => Some(bytes),
+        Read::Present(payload) => Some(payload),
         Read::Absent | Read::Unknown => None,
     }
 }
@@ -51,7 +55,7 @@ fn read_applied(read: Read<Bytes>) -> Option<Bytes> {
 async fn durable_applied(
     durable: &MemoryDurableValueStore,
     collection: &CollectionId<ValueKind>,
-) -> Result<Option<Bytes>> {
+) -> Result<Option<StoredPayload>> {
     Ok(match durable.read_partition(collection).await? {
         DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => applied,
     })
@@ -68,27 +72,18 @@ async fn seed_durable(
 
 #[test]
 fn value_folding_uses_last_ordered_op() {
-    let initial = Some(payload(1));
+    let initial = Some(inline(1));
     let ops = vec![
-        ValueOp::Set {
-            payload: payload(2),
-        },
+        ValueOp::Set { payload: inline(2) },
         ValueOp::Clear,
-        ValueOp::Set {
-            payload: payload(3),
-        },
+        ValueOp::Set { payload: inline(3) },
     ];
 
-    assert_eq!(fold_value_ops(initial, &ops), Some(payload(3)));
-    assert_eq!(fold_value_ops(Some(payload(1)), &[ValueOp::Clear]), None);
+    assert_eq!(fold_value_ops(initial, &ops), Some(inline(3)));
+    assert_eq!(fold_value_ops(Some(inline(1)), &[ValueOp::Clear]), None);
     assert_eq!(
-        fold_value_ops(
-            None,
-            &[ValueOp::Set {
-                payload: payload(9)
-            }]
-        ),
-        Some(payload(9))
+        fold_value_ops(None, &[ValueOp::Set { payload: inline(9) }]),
+        Some(inline(9))
     );
 }
 
@@ -123,8 +118,8 @@ async fn dirty_memory_store_tracks_overlay_and_compacted_op() -> Result<()> {
     assert_eq!(dirty.get(&collection).await?, Read::Unknown);
     assert!(dirty.pending_ops(&collection)?.is_none());
 
-    dirty.set(&collection, payload(7)).await?;
-    assert_eq!(dirty.get(&collection).await?, Read::Present(payload(7)));
+    dirty.set(&collection, inline(7)).await?;
+    assert_eq!(dirty.get(&collection).await?, Read::Present(inline(7)));
 
     dirty.clear(&collection).await?;
     assert_eq!(dirty.get(&collection).await?, Read::Absent);
@@ -147,26 +142,17 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
     let collection = collection()?;
 
     assert_eq!(durable_applied(&durable, &collection).await?, None);
-    seed_durable(
-        &durable,
-        &collection,
-        ValueOp::Set {
-            payload: payload(1),
-        },
-    )
-    .await?;
+    seed_durable(&durable, &collection, ValueOp::Set { payload: inline(1) }).await?;
     assert_eq!(
         durable_applied(&durable, &collection).await?,
-        Some(payload(1))
+        Some(inline(1))
     );
 
     let sealed = durable
         .seal(
             &collection,
             event(1),
-            vec![ValueOp::Set {
-                payload: payload(2),
-            }],
+            vec![ValueOp::Set { payload: inline(2) }],
         )
         .await?;
     assert_eq!(sealed.event(), event(1));
@@ -174,7 +160,7 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
     match durable.read_partition(&collection).await? {
         DurableState::Sealed { applied, wal } => {
             assert_eq!(wal.event(), event(1));
-            assert_eq!(applied, Some(payload(1)));
+            assert_eq!(applied, Some(inline(1)));
         }
         DurableState::Idle { .. } => return Err(eyre::eyre!("expected sealed durable state")),
     }
@@ -185,7 +171,7 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
     );
     assert_eq!(
         durable_applied(&durable, &collection).await?,
-        Some(payload(2))
+        Some(inline(2))
     );
 
     let _sealed = durable
@@ -197,7 +183,7 @@ async fn durable_memory_store_seals_applies_and_rolls_back() -> Result<()> {
     );
     assert_eq!(
         durable_applied(&durable, &collection).await?,
-        Some(payload(2))
+        Some(inline(2))
     );
     Ok(())
 }
@@ -211,9 +197,7 @@ async fn durable_memory_store_applies_idempotently() -> Result<()> {
         .seal(
             &collection,
             event(1),
-            vec![ValueOp::Set {
-                payload: payload(1),
-            }],
+            vec![ValueOp::Set { payload: inline(1) }],
         )
         .await?;
 
@@ -231,7 +215,7 @@ async fn durable_memory_store_applies_idempotently() -> Result<()> {
     );
     assert_eq!(
         durable_applied(&durable, &collection).await?,
-        Some(payload(1))
+        Some(inline(1))
     );
     Ok(())
 }
@@ -249,13 +233,13 @@ async fn durable_memory_store_rejects_mismatched_event_resolution() -> Result<()
         .await
         .err()
         .ok_or_else(|| eyre::eyre!("expected mismatched event error"))?;
-    assert_eq!(
-        error,
-        MemoryStateError::EventMismatch {
-            expected: event(2),
-            actual: event(1)
+    match error {
+        MemoryStateError::EventMismatch { expected, actual } => {
+            assert_eq!(expected, event(2));
+            assert_eq!(actual, event(1));
         }
-    );
+        other => return Err(eyre::eyre!("expected EventMismatch, got {other:?}")),
+    }
     Ok(())
 }
 
@@ -264,14 +248,7 @@ async fn transaction_dirty_reads_override_durable_reads() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection()?;
-    seed_durable(
-        &durable,
-        &collection,
-        ValueOp::Set {
-            payload: payload(1),
-        },
-    )
-    .await?;
+    seed_durable(&durable, &collection, ValueOp::Set { payload: inline(1) }).await?;
 
     let tx = TransactionValueStore::new(
         durable,
@@ -280,10 +257,10 @@ async fn transaction_dirty_reads_override_durable_reads() -> Result<()> {
         event(1),
         CommitMode::Wal,
     );
-    assert_eq!(tx.get(&collection).await?, Read::Present(payload(1)));
+    assert_eq!(tx.get(&collection).await?, Read::Present(inline(1)));
 
-    tx.set(&collection, payload(2)).await?;
-    assert_eq!(tx.get(&collection).await?, Read::Present(payload(2)));
+    tx.set(&collection, inline(2)).await?;
+    assert_eq!(tx.get(&collection).await?, Read::Present(inline(2)));
 
     tx.clear(&collection).await?;
     assert_eq!(tx.get(&collection).await?, Read::Absent);
@@ -302,12 +279,12 @@ async fn transaction_wal_commit_applies_and_abort_rolls_back() -> Result<()> {
         event(1),
         CommitMode::Wal,
     );
-    commit_tx.set(&collection, payload(1)).await?;
+    commit_tx.set(&collection, inline(1)).await?;
     let _sealed = commit_tx.seal().await?;
     assert_eq!(commit_tx.apply_sealed().await?, StoreOutcome::Applied);
     assert_eq!(
         durable_applied(&durable, &collection).await?,
-        Some(payload(1))
+        Some(inline(1))
     );
 
     let mut abort_tx = TransactionValueStore::new(
@@ -317,12 +294,12 @@ async fn transaction_wal_commit_applies_and_abort_rolls_back() -> Result<()> {
         event(2),
         CommitMode::Wal,
     );
-    abort_tx.set(&collection, payload(2)).await?;
+    abort_tx.set(&collection, inline(2)).await?;
     let _sealed = abort_tx.seal().await?;
     assert_eq!(abort_tx.abort().await?, StoreOutcome::Applied);
     assert_eq!(
         durable_applied(&durable, &collection).await?,
-        Some(payload(1))
+        Some(inline(1))
     );
     Ok(())
 }
@@ -340,7 +317,7 @@ async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
         event(1),
         CommitMode::Wal,
     );
-    tx.set(&collection, payload(1)).await?;
+    tx.set(&collection, inline(1)).await?;
     assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
     assert_eq!(durable_applied(&durable, &collection).await?, None);
     assert_eq!(dirty.get(&collection).await?, Read::Unknown);
@@ -359,17 +336,17 @@ async fn flush_applies_dirty_without_creating_sealed_wal() -> Result<()> {
         CommitMode::Wal,
     );
 
-    tx.set(&collection, payload(1)).await?;
+    tx.set(&collection, inline(1)).await?;
     assert_eq!(tx.flush().await?, StoreOutcome::Applied);
     assert!(matches!(tx.local_tx(), LocalTx::Clean(_)));
     assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
     assert_eq!(
         durable_applied(&durable, &collection).await?,
-        Some(payload(1))
+        Some(inline(1))
     );
 
     match durable.read_partition(&collection).await? {
-        DurableState::Idle { applied } => assert_eq!(applied, Some(payload(1))),
+        DurableState::Idle { applied } => assert_eq!(applied, Some(inline(1))),
         DurableState::Sealed { .. } => return Err(eyre::eyre!("flush must not create sealed WAL")),
     }
     Ok(())
@@ -387,15 +364,15 @@ async fn direct_mode_applies_without_sealed_wal() -> Result<()> {
         CommitMode::Direct,
     );
 
-    tx.set(&collection, payload(1)).await?;
+    tx.set(&collection, inline(1)).await?;
     assert_eq!(tx.direct_apply().await?, StoreOutcome::Applied);
     assert_eq!(
         durable_applied(&durable, &collection).await?,
-        Some(payload(1))
+        Some(inline(1))
     );
 
     match durable.read_partition(&collection).await? {
-        DurableState::Idle { applied } => assert_eq!(applied, Some(payload(1))),
+        DurableState::Idle { applied } => assert_eq!(applied, Some(inline(1))),
         DurableState::Sealed { .. } => return Err(eyre::eyre!("direct mode must not create WAL")),
     }
     Ok(())
@@ -415,7 +392,7 @@ async fn finished_transaction_rejects_further_transitions() -> Result<()> {
 
     assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
     let error = tx
-        .set(&collection, payload(1))
+        .set(&collection, inline(1))
         .await
         .err()
         .ok_or_else(|| eyre::eyre!("expected finished transaction error"))?;
@@ -509,19 +486,19 @@ async fn apply_trace_set(
 ) -> Result<bool> {
     match model.phase {
         ModelPhase::Clean | ModelPhase::Dirty => {
-            if tx.set(collection, payload(byte)).await.is_err() {
+            if tx.set(collection, inline(byte)).await.is_err() {
                 return Ok(false);
             }
             model.dirty_ops.clear();
             model.dirty_ops.push(ValueOp::Set {
-                payload: payload(byte),
+                payload: inline(byte),
             });
-            model.overlay = ValueOverlay::BufferedSet(payload(byte));
+            model.overlay = ValueOverlay::BufferedSet(inline(byte));
             model.phase = ModelPhase::Dirty;
             Ok(true)
         }
         ModelPhase::Sealed => Ok(matches!(
-            tx.set(collection, payload(byte)).await,
+            tx.set(collection, inline(byte)).await,
             Err(TransactionValueStoreError::AlreadySealed)
         )),
         ModelPhase::Finished => Ok(false),
@@ -695,15 +672,15 @@ impl Arbitrary for TraceOp {
 
 #[derive(Default)]
 struct Model {
-    applied: Option<Bytes>,
+    applied: Option<StoredPayload>,
     dirty_ops: Vec<ValueOp>,
     overlay: ValueOverlay,
-    sealed: Option<(Option<Bytes>, Vec<ValueOp>)>,
+    sealed: Option<(Option<StoredPayload>, Vec<ValueOp>)>,
     phase: ModelPhase,
 }
 
 impl Model {
-    fn visible(&self) -> Option<Bytes> {
+    fn visible(&self) -> Option<StoredPayload> {
         match &self.overlay {
             ValueOverlay::BufferedSet(payload) => Some(payload.clone()),
             ValueOverlay::BufferedClear => None,

@@ -1,16 +1,16 @@
 //! In-memory keyed-state stores.
 
+use super::encoding::{EncodingError, decode_wal};
 use super::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, StoredPayload, ValueKind, ValueOp,
     ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionRef, DurableState, EmptyOperationsError, EventRef, PendingOps, Read,
-    SealedCollection, SealedWal, StoreOutcome,
+    CollectionId, CollectionRef, DurableState, EventRef, PayloadEncoding, PendingOps, Read,
+    SealedCollection, SealedWal, StoreOutcome, WalFormat,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use ahash::RandomState;
-use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -65,13 +65,11 @@ impl ValueStore for MemoryDirtyValueStore {
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
+        payload: StoredPayload,
     ) -> Result<(), Self::Error> {
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
-        entry.op = Some(ValueOp::Set {
-            payload: payload.clone(),
-        });
+        entry.op = Some(ValueOp::Set { payload });
         Ok(())
     }
 
@@ -164,14 +162,21 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
     where
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
+        let collected: Vec<ValueOp> = ops.into_iter().collect();
+        let wal = SealedWal::try_new(
+            event,
+            collected,
+            WalFormat::MsgpackStreamV1,
+            PayloadEncoding::MsgpackV1,
+        )
+        .map_err(MemoryStateError::Encoding)?;
+
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.clone()).or_default();
         if entry.wal.is_some() {
             return Err(MemoryStateError::AlreadySealed);
         }
 
-        let wal = SealedWal::try_new(event, ops.into_iter().collect())
-            .map_err(MemoryStateError::EmptyOperations)?;
         entry.wal = Some(wal);
         Ok(SealedCollection::new(
             CollectionRef::new(collection.clone()),
@@ -196,7 +201,8 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
             });
         }
 
-        let ops = sealed.into_ops();
+        let envelope = decode_wal::<ValueKind>(sealed.wal()).map_err(MemoryStateError::Encoding)?;
+        let ops = envelope.into_ops();
         entry.applied = fold_value_ops(entry.applied.clone(), &ops);
         entry.wal = None;
         Ok(StoreOutcome::Applied)
@@ -270,20 +276,20 @@ struct DurableInner {
 /// sealed event with `entry.wal = None` and no `applied` restoration.
 #[derive(Debug, Default)]
 struct DurableValueEntry {
-    applied: Option<Bytes>,
+    applied: Option<StoredPayload>,
     wal: Option<SealedWal<ValueKind>>,
 }
 
 /// Error returned by memory keyed-state stores.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum MemoryStateError {
     /// A seal was requested while another event is already sealed.
     #[error("state collection is already sealed")]
     AlreadySealed,
 
-    /// A non-empty operation list was required.
+    /// WAL encoding or decoding failed.
     #[error(transparent)]
-    EmptyOperations(#[from] EmptyOperationsError),
+    Encoding(#[from] EncodingError),
 
     /// The sealed event did not match the event being resolved.
     #[error("sealed event mismatch: expected {expected:?}, actual {actual:?}")]

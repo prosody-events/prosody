@@ -24,7 +24,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
 axum-extra = { version = "0.12", features = ["routing"] }
 base16ct = "1.0"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 chrono = "0.4"
 crossbeam-utils = "0.8"
 derive_builder = "0.20"
@@ -33,7 +33,7 @@ educe = "0.6"
 fixedstr = { version = "0.5", features = ["flex-str"] }
 futures = "0.3"
 humantime = "2.3"
-internment = "0.8"
+internment = { version = "0.8", features = ["serde"] }
 intervallum = "1.4"
 nohash-hasher = "0.2"
 opentelemetry = { version = "0.31", features = ["metrics"] }
@@ -53,6 +53,7 @@ rand = "0.10"
 # SAFETY-AUDIT: src/consumer/decode.rs uses `unsafe { payload_mut() }` whose
 # soundness argument is pinned to rdkafka 0.39.x. Re-audit on any bump.
 rdkafka = { version = "0.39", features = ["tracing"] }
+rmp-serde = "1"
 rust-embed = { version = "8.11", features = ["include-exclude"] }
 scc = "3.6"
 scylla = { version = "1.5", features = ["chrono-04"] }
@@ -75,6 +76,7 @@ uuid = { version = "1.23", features = ["v5", "v8"] }
 validator = { version = "0.20", features = ["derive"] }
 whoami = "2.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
 
 [features]
 default = ["cmake-build"]

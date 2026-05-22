@@ -11,6 +11,7 @@ use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::SegmentId;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::iter;
 use std::marker::PhantomData;
@@ -19,20 +20,30 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod encoding;
 pub mod memory;
 pub mod value;
 
 #[cfg(test)]
+mod encoding_tests;
+#[cfg(test)]
 mod tests;
 
-pub use value::{StoredPayload, ValueApplied, ValueKind, ValueOp, ValueOverlay};
+pub use encoding::{EncodingError, PayloadEncoding, WalFormat};
+pub use value::{KafkaMessageRef, StoredPayload, ValueApplied, ValueKind, ValueOp, ValueOverlay};
 
 /// Stable runtime discriminator for a collection kind.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CollectionKindId {
     /// A single optional byte payload.
     Value = 1,
+
+    /// Test-only fixture kind used by the encoding property tests to
+    /// exercise WAL kind-mismatch detection before any production kind
+    /// other than [`Self::Value`] exists.
+    #[cfg(test)]
+    TestSecondary = 2,
 }
 
 /// Type-level marker for a keyed-state collection family.
@@ -425,26 +436,22 @@ where
     K: CollectionKind,
 {
     event: EventRef,
-    wal: WalEnvelope<K>,
+    wal: WalBlob<K>,
+    payload_encoding: PayloadEncoding,
 }
 
 impl<K> SealedWal<K>
 where
     K: CollectionKind,
 {
-    /// Creates durable sealed state from a non-empty WAL.
+    /// Creates durable sealed state from an encoded WAL blob.
     #[must_use]
-    pub fn new(event: EventRef, wal: WalEnvelope<K>) -> Self {
-        Self { event, wal }
-    }
-
-    /// Creates durable sealed state from a non-empty ordered operation list.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EmptyOperationsError`] when `ops` is empty.
-    pub fn try_new(event: EventRef, ops: Vec<K::Op>) -> Result<Self, EmptyOperationsError> {
-        Ok(Self::new(event, WalEnvelope::try_from_ops(ops)?))
+    pub fn new(event: EventRef, wal: WalBlob<K>, payload_encoding: PayloadEncoding) -> Self {
+        Self {
+            event,
+            wal,
+            payload_encoding,
+        }
     }
 
     /// Returns the event that owns the sealed operations.
@@ -453,28 +460,39 @@ where
         self.event
     }
 
-    /// Returns the sealed WAL.
+    /// Returns the sealed WAL blob.
     #[must_use]
-    pub fn wal(&self) -> &WalEnvelope<K> {
+    pub fn wal(&self) -> &WalBlob<K> {
         &self.wal
     }
 
-    /// Returns ordered sealed operations.
+    /// Returns the payload encoding for stored payload cells in this partition.
     #[must_use]
-    pub fn ops(&self) -> NonEmptyOpsSlice<'_, K::Op> {
-        self.wal.ops()
+    pub fn payload_encoding(&self) -> PayloadEncoding {
+        self.payload_encoding
     }
+}
 
-    /// Decomposes sealed state into the ordered operation list.
-    #[must_use]
-    pub fn into_ops(self) -> Vec<K::Op> {
-        self.wal.into_ops()
-    }
-
-    /// Returns the number of sealed operations.
-    #[must_use]
-    pub fn operation_count(&self) -> NonZeroU64 {
-        self.wal.operation_count()
+impl<K> SealedWal<K>
+where
+    K: CollectionKind,
+    K::Op: encoding::EncodableOp,
+{
+    /// Creates durable sealed state by encoding a non-empty ordered operation
+    /// list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncodingError`] when `ops` is empty or the WAL encoder fails.
+    pub fn try_new(
+        event: EventRef,
+        ops: Vec<K::Op>,
+        format: WalFormat,
+        payload_encoding: PayloadEncoding,
+    ) -> Result<Self, EncodingError> {
+        let envelope = WalEnvelope::<K>::try_from_ops(ops)?;
+        let wal = encoding::encode_wal::<K>(&envelope, format)?;
+        Ok(Self::new(event, wal, payload_encoding))
     }
 }
 
@@ -613,7 +631,13 @@ impl<'a, T> NonEmptyOpsSlice<'a, T> {
     }
 }
 
-/// Typed WAL payload shape before final byte encoding exists.
+/// Materialized typed WAL payload.
+///
+/// The on-wire WAL header (`version`, `kind`, `op_count`) is an encoding
+/// detail owned by [`encoding::encode_wal`] and [`encoding::decode_wal`].
+/// Persisting it here would create two operation-count sources that could
+/// disagree; instead the header is constructed at encode time from
+/// [`Self::operation_count`] and validated and discarded at decode time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalEnvelope<K>
 where
@@ -666,19 +690,17 @@ where
 
 /// Encoded WAL bytes tagged with their collection kind.
 ///
-/// Pre-staged for Slice 2 (`MsgPack` payload + WAL encoding). Slice 2 will
-/// add `format: WalFormat` per `docs/keyed-state/design-summary.md`
-/// §Encoding and swap `SealedWal::wal` from [`WalEnvelope`] (materialized
-/// ops) to this byte-form. Today nothing constructs a `WalBlob`; the type
-/// is here so the encoding work doesn't churn callers.
-// TODO(slice-2): add `format: WalFormat`; swap SealedWal::wal to WalBlob.
+/// The encoded body owns the operation count via its [`WalFormat`]-specific
+/// header frame, so this type carries only the bytes and the format
+/// discriminator. Callers needing the materialized op stream call
+/// [`encoding::decode_wal`] to recover a [`WalEnvelope`].
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct WalBlob<K>
 where
     K: CollectionKind,
 {
     bytes: Bytes,
-    operation_count: NonZeroU64,
+    format: WalFormat,
     _kind: PhantomData<K>,
 }
 
@@ -688,10 +710,10 @@ where
 {
     /// Creates an encoded typed WAL.
     #[must_use]
-    pub fn new(bytes: Bytes, operation_count: NonZeroU64) -> Self {
+    pub fn new(bytes: Bytes, format: WalFormat) -> Self {
         Self {
             bytes,
-            operation_count,
+            format,
             _kind: PhantomData,
         }
     }
@@ -702,10 +724,10 @@ where
         &self.bytes
     }
 
-    /// Returns the number of encoded operations.
+    /// Returns the encoded WAL format discriminator.
     #[must_use]
-    pub fn operation_count(&self) -> NonZeroU64 {
-        self.operation_count
+    pub fn format(&self) -> WalFormat {
+        self.format
     }
 }
 

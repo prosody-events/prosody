@@ -5,8 +5,10 @@ use super::{
     DurableState, EventRef, LocalTx, PendingOps, Read, SealedCollection, StoreOutcome,
 };
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::{Offset, Partition, Topic};
 use bytes::Bytes;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -17,10 +19,58 @@ type DurableStoreError<D> = <D as DurableWalStore<ValueKind>>::Error;
 type TxError<S, D> = TransactionValueStoreError<DirtyStoreError<S>, DurableStoreError<D>>;
 
 /// Opaque payload stored in a Value collection.
-pub type StoredPayload = Bytes;
+///
+/// Either an inline byte blob (the common case) or a typed reference to a
+/// Kafka message body that the framework will load on demand. `MsgPack`
+/// serialization is adjacently tagged (`{"v": "inline", "d": <bytes>}` or
+/// `{"v": "kafka_message", "d": {...}}`); new variants get new tags rather
+/// than repurposing existing ones.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "v", content = "d", rename_all = "snake_case")]
+pub enum StoredPayload {
+    /// Inline byte payload.
+    Inline(Bytes),
+
+    /// Reference to a Kafka message body.
+    KafkaMessage(KafkaMessageRef),
+}
+
+/// Durable pointer to a Kafka message body.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KafkaMessageRef {
+    /// Kafka topic.
+    #[serde(with = "topic_serde")]
+    pub topic: Topic,
+
+    /// Kafka partition.
+    pub partition: Partition,
+
+    /// Kafka offset within the partition.
+    pub offset: Offset,
+}
+
+mod topic_serde {
+    use crate::Topic;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(topic: &Topic, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(topic.as_ref())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Topic, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = <String as Deserialize<'de>>::deserialize(deserializer)?;
+        Ok(Topic::from(value.as_str()))
+    }
+}
 
 /// Applied Value state.
-pub type ValueApplied = Option<Bytes>;
+pub type ValueApplied = Option<StoredPayload>;
 
 /// Dirty Value overlay.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -33,7 +83,7 @@ pub enum ValueOverlay {
     BufferedClear,
 
     /// A set is buffered.
-    BufferedSet(Bytes),
+    BufferedSet(StoredPayload),
 }
 
 /// Type marker for Value collections.
@@ -49,12 +99,13 @@ impl CollectionKind for ValueKind {
 }
 
 /// Ordered operation for a Value collection.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum ValueOp {
     /// Replace the current payload.
     Set {
-        /// Opaque payload bytes.
-        payload: Bytes,
+        /// Stored payload.
+        payload: StoredPayload,
     },
 
     /// Remove the current payload.
@@ -76,7 +127,7 @@ pub trait ValueStore: Send + Sync + 'static {
     fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
+        payload: StoredPayload,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 
     /// Buffers or applies a Value clear.
@@ -493,7 +544,7 @@ where
     async fn set<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
-        payload: Bytes,
+        payload: StoredPayload,
     ) -> Result<(), Self::Error> {
         if collection != &self.collection {
             return Err(TransactionValueStoreError::WrongCollection);
