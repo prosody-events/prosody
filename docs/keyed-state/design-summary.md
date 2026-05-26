@@ -23,7 +23,8 @@ Three properties of the existing harness shape the design:
   after the framework decides whether the dispatch is final. Hook firing is best-effort: process crash or storage outage
   can skip it. Hooks are the fast path, never the source of truth.
 
-The durable source of truth is Cassandra. A collection partition may contain an applied value plus a sealed WAL. Recovery
+The durable source of truth is Cassandra. A collection partition may contain an applied value plus a sealed WAL.
+Recovery
 asks the upstream commit oracle whether the event that sealed the WAL committed, then applies or rolls back from that
 answer.
 
@@ -62,7 +63,8 @@ Durable may be:
 The Fjall dirty tracker and Fjall write-through cache may share one assignment-scoped Fjall keyspace, but they use
 different namespaces and are composed in different places:
 
-- Dirty implementation failures before seal/direct apply fail the handler, because the current attempt's buffered operations
+- Dirty implementation failures before seal/direct apply fail the handler, because the current attempt's buffered
+  operations
   would otherwise be lost.
 - Fjall write-through cache failures after the backing durable store succeeds degrade to invalidation or cache
   disablement; they do not change durable semantics.
@@ -249,6 +251,7 @@ Inside one handler invocation, each touched collection is in exactly one local s
 ```rust
 struct CollectionRef<K: CollectionKind> {
     id: CollectionId<K>,
+    ttl: Option<CompactDuration>,
     commit_mode: CommitMode,
     scope: EventScopeId,
 }
@@ -278,12 +281,19 @@ data. Applied state lives in Cassandra, the write-through committed cache, or an
 
 These types are transition capabilities, not data containers:
 
-- `CollectionRef<K>` proves the collection kind, identity, commit mode, and event scope.
+- `CollectionRef<K>` proves the collection kind, identity, commit mode, event scope, and the application's
+  per-collection TTL.
 - `DirtyCollection<K>` proves a non-empty dirty op stream exists in the dirty workspace for that collection.
 - `SealedCollection<K>` proves the dirty stream was sealed to Cassandra under one `EventRef`.
 - `Finished` invalidates handles after the event scope ends.
 
 No local type stores committed collection data. That keeps stale committed state out of the transaction state machine.
+
+The application supplies `CollectionRef::ttl` at the handler boundary. Cassandra carries the TTL via `USING TTL ?` on
+every durable write that creates or refreshes a cell. Reads do not return the TTL — recovery callers re-supply it from
+the application's collection-definition registry (Slice 7+); the row does not retain the original TTL value. Identity
+and equality of `CollectionRef<K>` ignore the TTL field: two refs that point at the same collection compare equal even
+when their TTLs differ. `ttl: None` writes without `USING TTL`.
 
 ---
 
@@ -414,7 +424,8 @@ field meanings are never repurposed. Breaking changes use a new `WalFormat`.
 - `PayloadEncoding::MsgpackZstdV1` compresses the serialized `StoredPayload` envelope. Cassandra table compression may
   still compress the row again; payload-level compression is useful when values are copied through WAL or cache layers.
 - WAL blobs default to `WalFormat::MsgpackStreamZstdV1`.
-- Dirty op values are already MsgPack frames. Seal streams those frames into the WAL encoder and compresses as it writes.
+- Dirty op values are already MsgPack frames. Seal streams those frames into the WAL encoder and compresses as it
+  writes.
 
 This avoids accumulating an uncompressed WAL in memory. The final compressed WAL blob still must fit in the Cassandra
 cell until chunked WAL storage is added.
@@ -454,25 +465,25 @@ trait PendingOpSource<K: CollectionKind>: Clone + Send + Sync + 'static {
 trait DurableWalStore<K: CollectionKind>: Clone + Send + Sync + 'static {
     type Error;
 
-    async fn read_partition(&self, id: CollectionId<K>) -> Result<DurableState<K>, Self::Error>;
+    async fn read_partition(&self, id: &CollectionId<K>) -> Result<DurableState<K>, Self::Error>;
     async fn seal(
         &self,
-        id: CollectionId<K>,
+        collection: &CollectionRef<K>,
         event: EventRef,
-        wal: WalBlob<K>,
-    ) -> Result<(), Self::Error>;
+        ops: impl IntoIterator<Item=K::Op>,
+    ) -> Result<SealedCollection<K>, Self::Error>;
 
     async fn apply_sealed(
         &self,
-        id: CollectionId<K>,
+        collection: &CollectionRef<K>,
         expected_event: EventRef,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<StoreOutcome, Self::Error>;
 
     async fn rollback_sealed(
         &self,
-        id: CollectionId<K>,
+        collection: &CollectionRef<K>,
         expected_event: EventRef,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<StoreOutcome, Self::Error>;
 }
 
 trait DirectApplyStore<K: CollectionKind>: Clone + Send + Sync + 'static {
@@ -480,30 +491,33 @@ trait DirectApplyStore<K: CollectionKind>: Clone + Send + Sync + 'static {
 
     async fn direct_apply(
         &self,
-        id: CollectionId<K>,
-        ops: OpStream<K>,
-    ) -> Result<(), Self::Error>;
+        collection: &CollectionRef<K>,
+        ops: impl IntoIterator<Item=K::Op>,
+    ) -> Result<StoreOutcome, Self::Error>;
 }
 ```
+
+Write methods take `&CollectionRef<K>` so the TTL supplied at handler construction reaches durable storage on every
+mutating call. Read paths stay on `&CollectionId<K>` because reads do not need the TTL.
 
 Concrete datatype traits are named per kind:
 
 ```rust
 trait MapStore: Clone + Send + Sync + 'static {
     type Error;
-    type RangeStream: Stream<Item = Result<MapReadEntry, Self::Error>> + Send;
+    type RangeStream: Stream<Item=Result<MapReadEntry, Self::Error>> + Send;
 
     async fn get(&self, id: CollectionId<MapKind>, key: EncodedMapKey)
-        -> Result<Read<StoredPayload>, Self::Error>;
+                 -> Result<Read<StoredPayload>, Self::Error>;
 
     async fn range(&self, id: CollectionId<MapKind>, range: MapKeyRange)
-        -> Result<MapRangeRead<Self::RangeStream>, Self::Error>;
+                   -> Result<MapRangeRead<Self::RangeStream>, Self::Error>;
 
     async fn put(&self, id: CollectionId<MapKind>, key: EncodedMapKey, value: StoredPayload)
-        -> Result<(), Self::Error>;
+                 -> Result<(), Self::Error>;
 
     async fn remove(&self, id: CollectionId<MapKind>, key: EncodedMapKey)
-        -> Result<(), Self::Error>;
+                    -> Result<(), Self::Error>;
 
     async fn clear(&self, id: CollectionId<MapKind>) -> Result<(), Self::Error>;
 }
@@ -532,7 +546,8 @@ Range and iteration APIs are always streaming. A Cassandra range query, Fjall ra
 reference implementation may buffer small implementation details, but it must not realize an unbounded range as a
 collection before returning results. Deque range and iteration APIs follow the same shape with indexed entries.
 
-Cassandra emits `Complete` streams with only `Present` entries and never returns `Unknown` for point reads. A dirty Fjall
+Cassandra emits `Complete` streams with only `Present` entries and never returns `Unknown` for point reads. A dirty
+Fjall
 map returns `Overlay` for ranges, may return `Unknown` for untouched point keys, and may emit `Removed` entries. A
 committed Fjall cache returns `Complete` only when coverage metadata proves the whole requested range is covered;
 otherwise it returns `Unknown`, and `LayeredMapStore` consults the backing store.
@@ -681,6 +696,10 @@ Fjall implements the same datatype store traits as Cassandra and memory. It is n
 not know Cassandra's physical table invariants. Higher-level combinators decide whether a Fjall-backed datatype store is
 being used as a dirty tracker, a committed cache, or a plain local test store.
 
+Slice 6 lands `FjallValueStore` in the **committed cache** role only. The dirty Value workspace remains the in-memory
+`MemoryDirtyValueStore`; a Fjall dirty tracker is design Slice 7+ territory. The cache fronts an authoritative
+`MemoryDurableValueStore` or `CassandraValueStore` through `LayeredValueStore<FjallValueStore, _>`.
+
 ```rust
 struct FjallMapStore {
     keyspace: FjallKeyspace,
@@ -690,6 +709,24 @@ struct FjallMapStore {
 `FjallMapStore` implements `MapStore`. When it is used as the dirty tracker, it is paired with
 `PendingOpSource<MapKind>`. When it is used as the committed cache, it is paired with an authoritative store through
 `LayeredMapStore<FjallMapStore, CassandraMapStore>` or `LayeredMapStore<FjallMapStore, MemoryMapStore>`.
+
+### Cache Key Layout
+
+The Fjall cache lays out each cached cell as:
+
+```text
+[16-byte collection hash][inner key bytes]
+```
+
+The collection hash is `xxh3_128(segment_id || 0x00 || key_bytes || 0x00 || state_type || 0x00 || name_bytes)`,
+serialized big-endian for stable cross-platform ordering. Inner key bytes are empty for Value; Map and Deque (future
+slices) append their kind-specific inner key. This layout supports point reads (Value), prefix scans (collection-wide
+invalidation), and ordered range scans (Map/Deque). See `src/state/fjall/codec.rs::collection_prefix` for the
+rationale.
+
+Each cached value cell is a single tag byte (`0x00 = Absent`, `0x01 = Present`) optionally followed by an
+`encode_payload(StoredPayload, MsgpackZstdV1)` blob. A missing entry decodes as `Read::Unknown`; the absent tag
+distinguishes "known absent" from "never observed."
 
 The write-through behavior belongs to the layered combinator:
 
@@ -976,7 +1013,8 @@ CREATE TABLE keyed_state_pending (
 **Payload encoding.** `payload_encoding` is required whenever a collection contains any `data` / `value` cells or a
 sealed WAL. It is row-local for Value and STATIC for Map and Deque. The encoded cell is a `StoredPayload`; the enum
 discriminant inside the blob determines whether the value is inline bytes or a Kafka message reference. Unknown encoding
-discriminants are permanent decode errors.
+discriminants are permanent decode errors. When `CollectionRef::ttl()` is `Some(_)`, the store binds the TTL via
+`USING TTL ?` on writes; `None` writes the columns without a TTL clause.
 
 **WAL columns.** `wal_event`, `wal_ops`, `wal_format`, and `payload_encoding` are written together in one partition
 update when sealing. Rust decodes them into `DurableState<K>`; callers do not handle independent `Option`s.
@@ -987,7 +1025,8 @@ before deleting the pending-index row. A crash mid-pair can leave a stale index 
 **Map keys.** `map_key` is an encoded byte key whose lexicographic order matches the user's `Ord`. A custom `MapKey`
 implementation must prove canonical encoding, lossless decoding, and order preservation by property test.
 
-**Map count.** Map stores a STATIC `count`. Seal writes the post-apply count to `wal_count`; apply lifts `wal_count` into
+**Map count.** Map stores a STATIC `count`. Seal writes the post-apply count to `wal_count`; apply lifts `wal_count`
+into
 `count` while applying mutations and clearing WAL.
 
 **Deque cursors.** Deque stores STATIC `first` and `last`. Empty deque means both are null. Non-empty deque means both
@@ -1016,15 +1055,15 @@ the same way they occur with Cassandra.
 
 ### WAL Mode
 
-| Crash point | Durable shape | Resolution |
-| --- | --- | --- |
-| During handler body | Dirty implementation only, no Cassandra WAL | Event retries and recomputes local ops. |
-| After some seals, before durability marker | Some collections SEALED | Oracle says not committed; recovery rolls them back. |
-| After durability marker, before `after_commit` | SEALED WAL | Oracle says committed; recovery applies it. |
-| During `after_commit` | Some applied, some SEALED | Remaining SEALED collections apply through recovery. |
-| During `after_abort` | Some rolled back, some SEALED | Remaining SEALED collections roll back through recovery. |
-| Pending index written, WAL not written | Stale pending row + IDLE partition | Recovery deletes the stale pending row. |
-| WAL written, pending index not visible | SEALED partition | First-touch recovery resolves it; seal ordering avoids this in normal writes. |
+| Crash point                                    | Durable shape                               | Resolution                                                                    |
+|------------------------------------------------|---------------------------------------------|-------------------------------------------------------------------------------|
+| During handler body                            | Dirty implementation only, no Cassandra WAL | Event retries and recomputes local ops.                                       |
+| After some seals, before durability marker     | Some collections SEALED                     | Oracle says not committed; recovery rolls them back.                          |
+| After durability marker, before `after_commit` | SEALED WAL                                  | Oracle says committed; recovery applies it.                                   |
+| During `after_commit`                          | Some applied, some SEALED                   | Remaining SEALED collections apply through recovery.                          |
+| During `after_abort`                           | Some rolled back, some SEALED               | Remaining SEALED collections roll back through recovery.                      |
+| Pending index written, WAL not written         | Stale pending row + IDLE partition          | Recovery deletes the stale pending row.                                       |
+| WAL written, pending index not visible         | SEALED partition                            | First-touch recovery resolves it; seal ordering avoids this in normal writes. |
 
 The event's durability marker is the cross-collection commit point. Keyed state never decides whether that marker
 landed; it asks the commit oracle identified by `EventRef`.
@@ -1033,10 +1072,10 @@ landed; it asks the commit oracle identified by `EventRef`.
 
 Direct apply has no rollback protocol:
 
-| Crash point | Result |
-| --- | --- |
-| Before direct apply starts | Dirty ops are lost; event may retry. |
-| During direct apply | Storage may or may not contain the mutation. |
+| Crash point                                     | Result                                                |
+|-------------------------------------------------|-------------------------------------------------------|
+| Before direct apply starts                      | Dirty ops are lost; event may retry.                  |
+| During direct apply                             | Storage may or may not contain the mutation.          |
 | After direct apply, before response is observed | Event may retry and user code may direct-apply again. |
 
 This is correct by contract. Direct mode and `flush()` are for users who intentionally want an early or WAL-free
@@ -1044,13 +1083,13 @@ durability boundary and can make their handler logic idempotent at the applicati
 
 ### Local Workspace
 
-| Event | Behavior |
-| --- | --- |
-| Process restart | Delete old workspaces; Cassandra recovers truth. |
-| Partition revocation | Stop handlers, drop workspace, delete assignment data. |
-| Cache format mismatch | Delete workspace and reload from Cassandra. |
-| Committed-cache corruption | Invalidate affected prefix or disable cache. |
-| Dirty implementation corruption before seal | Fail handler; redelivery recomputes dirty ops. |
+| Event                                       | Behavior                                               |
+|---------------------------------------------|--------------------------------------------------------|
+| Process restart                             | Delete old workspaces; Cassandra recovers truth.       |
+| Partition revocation                        | Stop handlers, drop workspace, delete assignment data. |
+| Cache format mismatch                       | Delete workspace and reload from Cassandra.            |
+| Committed-cache corruption                  | Invalidate affected prefix or disable cache.           |
+| Dirty implementation corruption before seal | Fail handler; redelivery recomputes dirty ops.         |
 
 Fjall is never a recovery authority.
 
@@ -1121,14 +1160,25 @@ Implement in thin slices so invariants are testable before full middleware integ
    `WalBlob<ValueKind>`, streaming encode/decode, and property tests for malformed and mismatched kind/format cases.
 3. **Datatype and capability traits.** Add the Value datatype trait plus `PendingOpSource`, `DurableWalStore`, and
    `DirectApplyStore`. Implement memory as both dirty tracker and durable reference store.
-4. **Shared property tests.** Drive random traces against the memory store and a pure model. Assert recovery idempotence,
+4. **Shared property tests.** Drive random traces against the memory store and a pure model. Assert recovery
+   idempotence,
    stale-index cleanup, WAL/direct behavior, dirty-workspace behavior, and visible state after every transition.
-5. **Cassandra Value store.** Add schema migration and Cassandra implementation of the same typed store trait. Reuse the
-   memory-store property suite to prove memory/Cassandra equivalence.
-6. **Fjall Value store and combinators.** Add `FjallValueStore`, `LayeredValueStore`, and `TransactionValueStore`.
-   Prove layering is behavior-preserving over memory and Cassandra.
+5. **Cassandra Value store.** (**Complete.**) Schema migration, `CassandraValueStore`, `event_ref` UDT serde, row
+   decoder, per-collection TTL on `CollectionRef<K>`, and a write-side `PendingIndexStore` trait. The shared
+   memory/Cassandra property suite drives equivalence by construction.
+6. **Fjall Value store and combinators.** (**Complete for cache role.**) `FjallValueStore` implements
+   `ValueStore` over a fjall partition; `LayeredValueStore<Cache, Backing>` patches the cache on
+   `apply_sealed`/`direct_apply` and leaves it untouched on `seal`/`rollback_sealed`. Cache failures never surface
+   as the outer error: a failed cache read falls through to the backing store (and auto-repairs the cell via the
+   miss-then-populate cycle); a failed cache write after a successful backing write is logged at WARN and the entry
+   is invalidated. This keeps the layered store's `ValueStore::Error` equal to the backing's error type, which the
+   shared `DurableBundle` requires. The `value_test_suite::run_*` runners exercise
+   `LayeredValueStore<FjallValueStore, MemoryDurableValueStore>` (default CI) and
+   `LayeredValueStore<FjallValueStore, CassandraValueStore>` (gated on `INTEGRATION_TESTS`) so layering is
+   behavior-preserving by construction. The Fjall dirty workspace is deferred to a later slice.
 7. **First-touch integration.** Resolve SEALED Value partitions before reads return.
-8. **Middleware and recovery timer.** Wire handler success/abort hooks and durable `StateRecovery` timers.
+8. **Middleware and recovery timer.** Wire handler success/abort hooks and durable `StateRecovery` timers. Recovery
+   timer should not be created for dirty mode.
 9. **Map and Deque.** Add kind-specific modules after the protocol is proven for Value.
 
 Seal writes the full compacted WAL into one Cassandra row mutation. Apply drains the WAL incrementally (see

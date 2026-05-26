@@ -9,10 +9,12 @@ use crate::Key;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::iter;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
@@ -20,8 +22,12 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod cassandra;
 pub mod encoding;
+pub mod fjall;
+pub mod layered;
 pub mod memory;
+pub mod pending;
 pub mod value;
 
 #[cfg(test)]
@@ -346,36 +352,79 @@ where
     Finished,
 }
 
-/// Lightweight typed reference to a collection.
+/// Lightweight typed reference to a collection plus the application's
+/// per-collection TTL.
 ///
-/// Today this carries only the collection identity; later slices will extend
-/// it with the per-event `commit_mode` and `EventScopeId` described in
-/// `docs/keyed-state/design-summary.md` §"Local State". Keep the scaffold so
-/// the next slice has somewhere to put those fields without re-flattening
-/// callers back into [`CollectionId`].
+/// The TTL is carried verbatim onto every Cassandra `USING TTL ?` write the
+/// store issues for this collection. Reads do not see it; recovery callers
+/// re-supply it from the application's collection-definition registry
+/// (Slice 7+). Later slices will extend this struct with the per-event
+/// `commit_mode` and `EventScopeId` described in
+/// `docs/keyed-state/design-summary.md` §"Local State".
+///
+/// # Identity invariant
+///
+/// Equality, hashing, and ordering use **only** the inner [`CollectionId`].
+/// Two refs to the same logical collection compare equal regardless of TTL;
+/// the TTL is a per-write hint, not part of the collection's identity. The
+/// `Hash`/`Eq` impls are hand-rolled (not derived) to keep a future change
+/// to the struct from silently folding `ttl` into equality.
 // TODO(slice-8): carry commit_mode and scope per design-summary §Local State
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct CollectionRef<K>
 where
     K: CollectionKind,
 {
     id: CollectionId<K>,
+    ttl: Option<CompactDuration>,
 }
 
 impl<K> CollectionRef<K>
 where
     K: CollectionKind,
 {
-    /// Creates a typed collection reference.
+    /// Creates a typed collection reference with no TTL.
     #[must_use]
     pub fn new(id: CollectionId<K>) -> Self {
-        Self { id }
+        Self { id, ttl: None }
+    }
+
+    /// Creates a typed collection reference with an explicit TTL.
+    #[must_use]
+    pub fn with_ttl(id: CollectionId<K>, ttl: CompactDuration) -> Self {
+        Self { id, ttl: Some(ttl) }
     }
 
     /// Returns the typed collection identity.
     #[must_use]
     pub fn id(&self) -> &CollectionId<K> {
         &self.id
+    }
+
+    /// Returns the per-collection TTL, if any.
+    #[must_use]
+    pub fn ttl(&self) -> Option<CompactDuration> {
+        self.ttl
+    }
+}
+
+impl<K> PartialEq for CollectionRef<K>
+where
+    K: CollectionKind + PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl<K> Eq for CollectionRef<K> where K: CollectionKind + Eq {}
+
+impl<K> Hash for CollectionRef<K>
+where
+    K: CollectionKind + Hash,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
     }
 }
 

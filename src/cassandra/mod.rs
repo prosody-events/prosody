@@ -71,6 +71,12 @@ pub const TABLE_DEFERRED_TIMERS: &str = "deferred_timers";
 /// Table name for message deduplication records.
 pub const TABLE_DEDUPLICATION: &str = "deduplication";
 
+/// Table name for keyed-state Value collection partitions.
+pub const TABLE_KEYED_STATE_VALUE: &str = "keyed_state_value";
+
+/// Table name for the shared keyed-state pending-WAL index.
+pub const TABLE_KEYED_STATE_PENDING: &str = "keyed_state_pending";
+
 /// Cassandra's maximum TTL in seconds (~20 years).
 pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;
 

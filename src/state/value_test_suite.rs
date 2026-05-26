@@ -22,8 +22,8 @@ use super::value::{
     TransactionValueStoreError, ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CommitMode, DurableState, EventRef, LocalTx, Read, StateKey, StateName,
-    StateType, StoreOutcome, TimerEventRef, ValueKind, ValueOp, ValueOverlay,
+    CollectionId, CollectionRef, CommitMode, DurableState, EventRef, LocalTx, Read, StateKey,
+    StateName, StateType, StoreOutcome, TimerEventRef, ValueKind, ValueOp, ValueOverlay,
 };
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
@@ -49,7 +49,8 @@ const MAX_TRACE_EVENTS: usize = 20;
 // `TransactionValueStore` impl block demands the full set), so the
 // bundles are sugar, not an over-bound.
 pub(crate) trait DurableBundle:
-    DurableWalStore<ValueKind>
+    ValueStore<Error = <Self as DurableWalStore<ValueKind>>::Error>
+    + DurableWalStore<ValueKind>
     + DirectApplyStore<ValueKind, Error = <Self as DurableWalStore<ValueKind>>::Error>
     + Clone
     + fmt::Debug
@@ -57,7 +58,8 @@ pub(crate) trait DurableBundle:
 }
 
 impl<T> DurableBundle for T where
-    T: DurableWalStore<ValueKind>
+    T: ValueStore<Error = <T as DurableWalStore<ValueKind>>::Error>
+        + DurableWalStore<ValueKind>
         + DirectApplyStore<ValueKind, Error = <T as DurableWalStore<ValueKind>>::Error>
         + Clone
         + fmt::Debug
@@ -126,13 +128,14 @@ where
     F: Fn() -> S,
 {
     let DirectTrace { ops, events } = trace;
-    let collection_id = collection()?;
+    let collection_ref = collection_ref()?;
+    let collection_id = collection_ref.id().clone();
     let mut tx_id = 1_u128;
     let mut event_idx = 0_usize;
     let mut tx = TransactionValueStore::new(
         durable.clone(),
         dirty_factory(),
-        collection_id.clone(),
+        collection_ref.clone(),
         build_event_ref(event_at(&events, event_idx), tx_id),
         CommitMode::Direct,
     );
@@ -144,7 +147,7 @@ where
             tx = TransactionValueStore::new(
                 durable.clone(),
                 dirty_factory(),
-                collection_id.clone(),
+                collection_ref.clone(),
                 build_event_ref(event_at(&events, event_idx), tx_id),
                 CommitMode::Direct,
             );
@@ -161,12 +164,12 @@ where
     Ok(true)
 }
 
-pub(crate) fn collection() -> Result<CollectionId<ValueKind>> {
-    Ok(CollectionId::new(
+pub(crate) fn collection_ref() -> Result<CollectionRef<ValueKind>> {
+    Ok(CollectionRef::new(CollectionId::new(
         StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
         StateType::Application,
         StateName::try_new("profile")?,
-    ))
+    )))
 }
 
 pub(crate) fn inline(value: u8) -> StoredPayload {
@@ -185,7 +188,8 @@ where
     F: Fn() -> S,
 {
     let Trace { ops, events } = trace;
-    let collection_id = collection()?;
+    let collection_ref = collection_ref()?;
+    let collection_id = collection_ref.id().clone();
     let mut model = Model::default();
     let mut tx_id = 1_u128;
     let mut event_idx = 0_usize;
@@ -194,7 +198,7 @@ where
     let mut tx = TransactionValueStore::new(
         durable.clone(),
         dirty.clone(),
-        collection_id.clone(),
+        collection_ref.clone(),
         current_event,
         CommitMode::Wal,
     );
@@ -209,7 +213,7 @@ where
             tx = TransactionValueStore::new(
                 durable.clone(),
                 dirty.clone(),
-                collection_id.clone(),
+                collection_ref.clone(),
                 current_event,
                 CommitMode::Wal,
             );
@@ -225,7 +229,7 @@ where
 
         if check_idempotence
             && matches!(model.phase, ModelPhase::Finished)
-            && !idempotent_resolution(&durable, &collection_id, current_event).await?
+            && !idempotent_resolution(&durable, &collection_ref, current_event).await?
         {
             return Ok(false);
         }
@@ -236,7 +240,7 @@ where
 
 async fn idempotent_resolution<D>(
     durable: &D,
-    collection: &CollectionId<ValueKind>,
+    collection: &CollectionRef<ValueKind>,
     event: EventRef,
 ) -> Result<bool>
 where

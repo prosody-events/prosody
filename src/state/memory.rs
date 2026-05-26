@@ -1,13 +1,14 @@
 //! In-memory keyed-state stores.
 
 use super::encoding::{EncodingError, decode_wal};
+use super::pending::PendingIndexStore;
 use super::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, StoredPayload, ValueKind, ValueOp,
     ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionRef, DurableState, EventRef, PayloadEncoding, PendingOps, Read,
-    SealedCollection, SealedWal, StoreOutcome, WalFormat,
+    CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, PayloadEncoding,
+    PendingOps, Read, SealedCollection, SealedWal, StoreOutcome, WalFormat,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use ahash::RandomState;
@@ -136,6 +137,43 @@ impl Default for MemoryDurableValueStore {
     }
 }
 
+impl ValueStore for MemoryDurableValueStore {
+    type Error = MemoryStateError;
+
+    async fn get<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+    ) -> Result<Read<StoredPayload>, Self::Error> {
+        let state = self.read_partition(collection).await?;
+        Ok(match state {
+            DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => {
+                applied.map_or(Read::Absent, Read::Present)
+            }
+        })
+    }
+
+    async fn set<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        payload: StoredPayload,
+    ) -> Result<(), Self::Error> {
+        let collection_ref = CollectionRef::new(collection.clone());
+        self.direct_apply(&collection_ref, vec![ValueOp::Set { payload }])
+            .await?;
+        Ok(())
+    }
+
+    async fn clear<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+    ) -> Result<(), Self::Error> {
+        let collection_ref = CollectionRef::new(collection.clone());
+        self.direct_apply(&collection_ref, vec![ValueOp::Clear])
+            .await?;
+        Ok(())
+    }
+}
+
 impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
     type Error = MemoryStateError;
 
@@ -155,7 +193,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
 
     async fn seal<'a, I>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
+        collection: &'a CollectionRef<ValueKind>,
         event: EventRef,
         ops: I,
     ) -> Result<SealedCollection<ValueKind>, Self::Error>
@@ -172,25 +210,18 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         .map_err(MemoryStateError::Encoding)?;
 
         let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.clone()).or_default();
-        if entry.wal.is_some() {
-            return Err(MemoryStateError::AlreadySealed);
-        }
-
+        let entry = inner.entries.entry(collection.id().clone()).or_default();
         entry.wal = Some(wal);
-        Ok(SealedCollection::new(
-            CollectionRef::new(collection.clone()),
-            event,
-        ))
+        Ok(SealedCollection::new(collection.clone(), event))
     }
 
     async fn apply_sealed<'a>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
+        collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
         let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.clone()).or_default();
+        let entry = inner.entries.entry(collection.id().clone()).or_default();
         let Some(sealed) = entry.wal.clone() else {
             return Ok(StoreOutcome::NoOp);
         };
@@ -210,11 +241,11 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
 
     async fn rollback_sealed<'a>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
+        collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
         let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.clone()).or_default();
+        let entry = inner.entries.entry(collection.id().clone()).or_default();
         let Some(sealed) = entry.wal.clone() else {
             return Ok(StoreOutcome::NoOp);
         };
@@ -235,7 +266,7 @@ impl DirectApplyStore<ValueKind> for MemoryDurableValueStore {
 
     async fn direct_apply<'a, I>(
         &'a self,
-        collection: &'a CollectionId<ValueKind>,
+        collection: &'a CollectionRef<ValueKind>,
         ops: I,
     ) -> Result<StoreOutcome, Self::Error>
     where
@@ -247,9 +278,30 @@ impl DirectApplyStore<ValueKind> for MemoryDurableValueStore {
         }
 
         let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.clone()).or_default();
+        let entry = inner.entries.entry(collection.id().clone()).or_default();
         entry.applied = fold_value_ops(entry.applied.clone(), &ops);
         Ok(StoreOutcome::Applied)
+    }
+}
+
+impl PendingIndexStore for MemoryDurableValueStore {
+    type Error = MemoryStateError;
+
+    async fn insert_pending<'a, K>(&'a self, _id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    where
+        K: CollectionKind,
+    {
+        // The memory backend's HashMap already encodes pending collections
+        // via `entry.wal.is_some()`; a separate index is unnecessary. Tests
+        // do not inspect the memory pending store directly.
+        Ok(())
+    }
+
+    async fn delete_pending<'a, K>(&'a self, _id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    where
+        K: CollectionKind,
+    {
+        Ok(())
     }
 }
 
@@ -283,10 +335,6 @@ struct DurableValueEntry {
 /// Error returned by memory keyed-state stores.
 #[derive(Debug, Error)]
 pub enum MemoryStateError {
-    /// A seal was requested while another event is already sealed.
-    #[error("state collection is already sealed")]
-    AlreadySealed,
-
     /// WAL encoding or decoding failed.
     #[error(transparent)]
     Encoding(#[from] EncodingError),

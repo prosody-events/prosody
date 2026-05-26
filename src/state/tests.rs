@@ -2,7 +2,7 @@ use super::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateE
 use super::value::{
     DurableWalStore, TransactionValueStore, TransactionValueStoreError, ValueStore, fold_value_ops,
 };
-use super::value_test_suite::{self, DirectTrace, Trace, collection, inline};
+use super::value_test_suite::{self, DirectTrace, Trace, collection_ref, inline};
 use super::{
     CollectionId, CollectionKindId, CollectionRef, CommitMode, DirtyCollection, EventRef, Read,
     StateKey, StateName, StateType, StoreOutcome, ValueKind, ValueOp, WalEnvelope,
@@ -76,7 +76,7 @@ fn dirty_collection_requires_non_zero_operations() -> Result<()> {
 #[tokio::test]
 async fn durable_memory_store_rejects_mismatched_event_resolution() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
-    let collection = collection()?;
+    let collection = collection_ref()?;
     let _sealed = durable
         .seal(&collection, event(1), vec![ValueOp::Clear])
         .await?;
@@ -91,7 +91,9 @@ async fn durable_memory_store_rejects_mismatched_event_resolution() -> Result<()
             assert_eq!(expected, event(2));
             assert_eq!(actual, event(1));
         }
-        other => return Err(eyre::eyre!("expected EventMismatch, got {other:?}")),
+        other @ MemoryStateError::Encoding(_) => {
+            return Err(eyre::eyre!("expected EventMismatch, got {other:?}"));
+        }
     }
     Ok(())
 }
@@ -100,43 +102,45 @@ async fn durable_memory_store_rejects_mismatched_event_resolution() -> Result<()
 async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
     let dirty = MemoryDirtyValueStore::new();
-    let collection = collection()?;
+    let collection = collection_ref()?;
+    let collection_id = collection.id().clone();
 
     let mut tx = TransactionValueStore::new(
         durable.clone(),
         dirty.clone(),
-        collection.clone(),
+        collection,
         event(1),
         CommitMode::Wal,
     );
-    tx.set(&collection, inline(1)).await?;
+    tx.set(&collection_id, inline(1)).await?;
     assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
 
-    let applied = match durable.read_partition(&collection).await? {
+    let applied = match durable.read_partition(&collection_id).await? {
         super::DurableState::Idle { applied } | super::DurableState::Sealed { applied, .. } => {
             applied
         }
     };
     assert_eq!(applied, None);
-    assert_eq!(dirty.get(&collection).await?, Read::Unknown);
+    assert_eq!(dirty.get(&collection_id).await?, Read::Unknown);
     Ok(())
 }
 
 #[tokio::test]
 async fn finished_transaction_rejects_further_transitions() -> Result<()> {
     let durable = MemoryDurableValueStore::new();
-    let collection = collection()?;
+    let collection = collection_ref()?;
+    let collection_id = collection.id().clone();
     let mut tx = TransactionValueStore::new(
         durable,
         MemoryDirtyValueStore::new(),
-        collection.clone(),
+        collection,
         event(1),
         CommitMode::Wal,
     );
 
     assert_eq!(tx.abort().await?, StoreOutcome::NoOp);
     let error = tx
-        .set(&collection, inline(1))
+        .set(&collection_id, inline(1))
         .await
         .err()
         .ok_or_else(|| eyre::eyre!("expected finished transaction error"))?;

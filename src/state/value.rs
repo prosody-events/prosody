@@ -193,9 +193,12 @@ where
     ) -> impl Future<Output = Result<DurableState<K>, Self::Error>> + Send + 'a;
 
     /// Seals non-empty ordered operations for an event.
+    ///
+    /// The collection ref's TTL is bound onto the durable write that creates
+    /// the WAL cells.
     fn seal<'a, I>(
         &'a self,
-        collection: &'a CollectionId<K>,
+        collection: &'a CollectionRef<K>,
         event: EventRef,
         ops: I,
     ) -> impl Future<Output = Result<SealedCollection<K>, Self::Error>> + Send + 'a
@@ -207,10 +210,12 @@ where
     /// Returns [`StoreOutcome::Applied`] when a sealed WAL for
     /// `expected_event` was folded into authoritative state and cleared,
     /// or [`StoreOutcome::NoOp`] when no WAL is present (the call is a
-    /// safe idempotent no-op after a prior resolution).
+    /// safe idempotent no-op after a prior resolution). The collection
+    /// ref's TTL is bound onto the durable write that refreshes the
+    /// applied cells.
     fn apply_sealed<'a>(
         &'a self,
-        collection: &'a CollectionId<K>,
+        collection: &'a CollectionRef<K>,
         expected_event: EventRef,
     ) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send + 'a;
 
@@ -221,7 +226,7 @@ where
     /// WAL is present.
     fn rollback_sealed<'a>(
         &'a self,
-        collection: &'a CollectionId<K>,
+        collection: &'a CollectionRef<K>,
         expected_event: EventRef,
     ) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send + 'a;
 }
@@ -238,10 +243,11 @@ where
     ///
     /// Returns [`StoreOutcome::Applied`] when at least one operation was
     /// folded into authoritative state, or [`StoreOutcome::NoOp`] when
-    /// `ops` is empty.
+    /// `ops` is empty. The collection ref's TTL is bound onto the
+    /// durable write that refreshes the applied cells.
     fn direct_apply<'a, I>(
         &'a self,
-        collection: &'a CollectionId<K>,
+        collection: &'a CollectionRef<K>,
         ops: I,
     ) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send + 'a
     where
@@ -259,7 +265,7 @@ where
 pub struct TransactionValueStore<D, S> {
     durable: D,
     dirty: S,
-    collection: CollectionId<ValueKind>,
+    collection: CollectionRef<ValueKind>,
     event: EventRef,
     mode: CommitMode,
     tx: Mutex<LocalTx<ValueKind>>,
@@ -271,18 +277,18 @@ impl<D, S> TransactionValueStore<D, S> {
     pub fn new(
         durable: D,
         dirty: S,
-        collection: CollectionId<ValueKind>,
+        collection: CollectionRef<ValueKind>,
         event: EventRef,
         mode: CommitMode,
     ) -> Self {
-        let reference = CollectionRef::new(collection.clone());
+        let initial = LocalTx::Clean(collection.clone());
         Self {
             durable,
             dirty,
             collection,
             event,
             mode,
-            tx: Mutex::new(LocalTx::Clean(reference)),
+            tx: Mutex::new(initial),
         }
     }
 
@@ -291,11 +297,18 @@ impl<D, S> TransactionValueStore<D, S> {
     pub fn local_tx(&self) -> LocalTx<ValueKind> {
         self.tx.lock().clone()
     }
+
+    /// Returns the typed collection identity.
+    #[must_use]
+    pub fn collection_id(&self) -> &CollectionId<ValueKind> {
+        self.collection.id()
+    }
 }
 
 impl<D, S> TransactionValueStore<D, S>
 where
-    D: DurableWalStore<ValueKind>
+    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
+        + DurableWalStore<ValueKind>
         + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>,
     S: ValueStore + PendingOpSource<ValueKind, Error = <S as ValueStore>::Error>,
 {
@@ -325,7 +338,7 @@ where
                     .await
                     .map_err(TransactionValueStoreError::Durable)?;
                 self.dirty
-                    .clear_pending_ops(&self.collection)
+                    .clear_pending_ops(self.collection.id())
                     .map_err(TransactionValueStoreError::Dirty)?;
                 self.set_local_tx(LocalTx::Sealed(sealed.clone()));
                 Ok(sealed)
@@ -386,7 +399,7 @@ where
             LocalTx::Clean(_) => Ok(StoreOutcome::NoOp),
             LocalTx::Dirty(_) => {
                 let outcome = self.apply_dirty_directly().await?;
-                self.set_local_tx(LocalTx::Clean(CollectionRef::new(self.collection.clone())));
+                self.set_local_tx(LocalTx::Clean(self.collection.clone()));
                 Ok(outcome)
             }
             LocalTx::Sealed(_) => Err(TransactionValueStoreError::AlreadySealed),
@@ -432,7 +445,7 @@ where
             }
             LocalTx::Dirty(_) => {
                 self.dirty
-                    .clear_pending_ops(&self.collection)
+                    .clear_pending_ops(self.collection.id())
                     .map_err(TransactionValueStoreError::Dirty)?;
                 self.set_local_tx(LocalTx::Finished);
                 Ok(StoreOutcome::NoOp)
@@ -453,7 +466,7 @@ where
             .await
             .map_err(TransactionValueStoreError::Durable)?;
         self.dirty
-            .clear_pending_ops(&self.collection)
+            .clear_pending_ops(self.collection.id())
             .map_err(TransactionValueStoreError::Dirty)?;
         Ok(outcome)
     }
@@ -467,7 +480,7 @@ where
     fn collect_pending_ops(&self) -> Result<Option<Vec<ValueOp>>, TxError<S, D>> {
         let Some(pending) = self
             .dirty
-            .pending_ops(&self.collection)
+            .pending_ops(self.collection.id())
             .map_err(TransactionValueStoreError::Dirty)?
         else {
             return Ok(None);
@@ -486,11 +499,10 @@ where
     fn mark_dirty(&self) -> Result<(), TxError<S, D>> {
         let pending = self
             .dirty
-            .pending_ops(&self.collection)
+            .pending_ops(self.collection.id())
             .map_err(TransactionValueStoreError::Dirty)?
             .ok_or(TransactionValueStoreError::NoPendingOps)?;
-        let dirty =
-            DirtyCollection::new(CollectionRef::new(self.collection.clone()), pending.count);
+        let dirty = DirtyCollection::new(self.collection.clone(), pending.count);
         *self.tx.lock() = LocalTx::Dirty(dirty);
         Ok(())
     }
@@ -506,7 +518,8 @@ where
 
 impl<D, S> ValueStore for TransactionValueStore<D, S>
 where
-    D: DurableWalStore<ValueKind>
+    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
+        + DurableWalStore<ValueKind>
         + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
         + fmt::Debug,
     S: ValueStore + PendingOpSource<ValueKind, Error = <S as ValueStore>::Error> + fmt::Debug,
@@ -517,7 +530,7 @@ where
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<Read<StoredPayload>, Self::Error> {
-        if collection != &self.collection {
+        if collection != self.collection.id() {
             return Err(TransactionValueStoreError::WrongCollection);
         }
         if matches!(self.local_tx_snapshot(), LocalTx::Finished) {
@@ -534,9 +547,8 @@ where
             Read::Absent => Ok(Read::Absent),
             Read::Unknown => self
                 .durable
-                .read_partition(collection)
+                .get(collection)
                 .await
-                .map(read_value_from_durable)
                 .map_err(TransactionValueStoreError::Durable),
         }
     }
@@ -546,7 +558,7 @@ where
         collection: &'a CollectionId<ValueKind>,
         payload: StoredPayload,
     ) -> Result<(), Self::Error> {
-        if collection != &self.collection {
+        if collection != self.collection.id() {
             return Err(TransactionValueStoreError::WrongCollection);
         }
 
@@ -562,7 +574,7 @@ where
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        if collection != &self.collection {
+        if collection != self.collection.id() {
             return Err(TransactionValueStoreError::WrongCollection);
         }
 
@@ -588,14 +600,6 @@ where
         ValueOp::Set { payload } => Some(payload.clone()),
         ValueOp::Clear => None,
     })
-}
-
-fn read_value_from_durable(state: DurableState<ValueKind>) -> Read<StoredPayload> {
-    let applied = match state {
-        DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => applied,
-    };
-
-    applied.map_or(Read::Absent, Read::Present)
 }
 
 /// Error returned by [`TransactionValueStore`].
