@@ -62,7 +62,7 @@ fn collection_identity_carries_value_kind() -> Result<()> {
 
 #[test]
 fn dirty_collection_requires_non_zero_operations() -> Result<()> {
-    let reference = CollectionRef::new(collection_id()?);
+    let reference = CollectionRef::new(collection_id()?, None);
     assert!(DirtyCollection::try_from_count(reference.clone(), 0).is_err());
 
     let Some(count) = NonZeroU64::new(1) else {
@@ -75,7 +75,7 @@ fn dirty_collection_requires_non_zero_operations() -> Result<()> {
 
 #[tokio::test]
 async fn durable_memory_store_rejects_mismatched_event_resolution() -> Result<()> {
-    let durable = MemoryDurableValueStore::new();
+    let durable = MemoryDurableValueStore::for_tests();
     let collection = collection_ref()?;
     let _sealed = durable
         .seal(&collection, event(1), vec![ValueOp::Clear])
@@ -100,7 +100,7 @@ async fn durable_memory_store_rejects_mismatched_event_resolution() -> Result<()
 
 #[tokio::test]
 async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
-    let durable = MemoryDurableValueStore::new();
+    let durable = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
     let collection_id = collection.id().clone();
@@ -127,7 +127,7 @@ async fn transaction_unsealed_abort_clears_dirty_only() -> Result<()> {
 
 #[tokio::test]
 async fn finished_transaction_rejects_further_transitions() -> Result<()> {
-    let durable = MemoryDurableValueStore::new();
+    let durable = MemoryDurableValueStore::for_tests();
     let collection = collection_ref()?;
     let collection_id = collection.id().clone();
     let mut tx = TransactionValueStore::new(
@@ -152,7 +152,7 @@ async fn finished_transaction_rejects_further_transitions() -> Result<()> {
 fn prop_value_transaction_trace_matches_model() {
     fn property(trace: Trace) -> bool {
         executor::block_on(value_test_suite::run_trace(
-            MemoryDurableValueStore::new(),
+            MemoryDurableValueStore::for_tests(),
             MemoryDirtyValueStore::new,
             trace,
         ))
@@ -166,7 +166,7 @@ fn prop_value_transaction_trace_matches_model() {
 fn prop_durable_resolution_is_idempotent() {
     fn property(trace: Trace) -> bool {
         executor::block_on(value_test_suite::run_idempotence_trace(
-            MemoryDurableValueStore::new(),
+            MemoryDurableValueStore::for_tests(),
             MemoryDirtyValueStore::new,
             trace,
         ))
@@ -180,7 +180,7 @@ fn prop_durable_resolution_is_idempotent() {
 fn prop_direct_mode_never_creates_wal() {
     fn property(trace: DirectTrace) -> bool {
         executor::block_on(value_test_suite::run_direct_trace(
-            MemoryDurableValueStore::new(),
+            MemoryDurableValueStore::for_tests(),
             MemoryDirtyValueStore::new,
             trace,
         ))

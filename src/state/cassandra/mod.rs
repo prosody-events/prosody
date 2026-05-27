@@ -39,6 +39,7 @@
 mod decode;
 mod error;
 mod queries;
+mod scanner;
 mod udt;
 
 #[cfg(test)]
@@ -47,6 +48,7 @@ mod tests;
 pub use decode::{CorruptReason, WalColumnMask};
 pub use error::{CassandraValueStoreError, CorruptUdtError};
 pub use queries::ValueQueries;
+pub use scanner::ScanPendingError;
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
@@ -78,18 +80,39 @@ const VALUE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::MsgpackZstdV1;
 const VALUE_WAL_FORMAT: WalFormat = WalFormat::MsgpackStreamZstdV1;
 
 /// Cassandra-backed durable Value store.
+///
+/// The constructor-supplied `default_ttl` is threaded through every
+/// [`CollectionRef`] built by [`ValueStore::set`] / [`ValueStore::clear`]
+/// so production writes carry the application's configured TTL via
+/// `USING TTL ?`. `None` is reserved for indefinite retention or the
+/// Cassandra over-20-year overflow fallback; production wiring sources it
+/// once from [`crate::cassandra::CassandraStore::base_ttl`] at build
+/// time.
 #[derive(Clone, Debug)]
 pub struct CassandraValueStore {
     store: CassandraStore,
     queries: Arc<ValueQueries>,
+    default_ttl: Option<CompactDuration>,
 }
 
 impl CassandraValueStore {
     /// Creates a Cassandra Value store backed by an existing
-    /// [`CassandraStore`] session and a prepared [`ValueQueries`] set.
+    /// [`CassandraStore`] session, a prepared [`ValueQueries`] set, and
+    /// a default TTL applied to every [`ValueStore::set`] /
+    /// [`ValueStore::clear`] write. Pass `Some(d)` to bind a TTL via
+    /// `USING TTL ?`; pass `None` for indefinite retention or as the
+    /// over-20-year overflow fallback.
     #[must_use]
-    pub fn new(store: CassandraStore, queries: Arc<ValueQueries>) -> Self {
-        Self { store, queries }
+    pub fn new(
+        store: CassandraStore,
+        queries: Arc<ValueQueries>,
+        default_ttl: Option<CompactDuration>,
+    ) -> Self {
+        Self {
+            store,
+            queries,
+            default_ttl,
+        }
     }
 
     fn session(&self) -> &Session {
@@ -334,7 +357,7 @@ impl ValueStore for CassandraValueStore {
         collection: &'a CollectionId<ValueKind>,
         payload: StoredPayload,
     ) -> Result<(), Self::Error> {
-        let collection_ref = CollectionRef::new(collection.clone());
+        let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
         self.direct_apply(&collection_ref, vec![ValueOp::Set { payload }])
             .await?;
         Ok(())
@@ -344,7 +367,7 @@ impl ValueStore for CassandraValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        let collection_ref = CollectionRef::new(collection.clone());
+        let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
         self.direct_apply(&collection_ref, vec![ValueOp::Clear])
             .await?;
         Ok(())

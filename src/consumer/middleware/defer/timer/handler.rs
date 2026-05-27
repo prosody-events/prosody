@@ -138,7 +138,10 @@ where
                 self.handle_application_timer(wrapped_context, trigger, demand_type)
                     .await
             }
-            TimerType::DeferredMessage => self
+            // `DeferredMessage` and `StateRecovery` are middleware-internal
+            // timer types owned by other middleware; the defer middleware
+            // forwards them unchanged so the owning middleware can act.
+            TimerType::DeferredMessage | TimerType::StateRecovery => self
                 .handler
                 .on_timer(wrapped_context, trigger, demand_type)
                 .await

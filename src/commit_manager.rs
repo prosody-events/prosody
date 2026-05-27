@@ -24,6 +24,9 @@
 use crate::Key;
 use crate::consumer::middleware::deduplication::DeduplicationStore;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::oracle::CommitOracle;
+use crate::state::value::ValueKind;
+use crate::state::{CollectionId, CommitDecision, EventRef, TimerEventRef};
 use crate::timers::TimerManager;
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
@@ -98,6 +101,38 @@ where
             None => Ok(true),
             Some(cur) => Ok(cur != wal_tag),
         }
+    }
+}
+
+impl<D, T> CommitOracle for CommitManager<D, T>
+where
+    D: DeduplicationStore,
+    T: TriggerStore,
+    T::Error: ClassifyError,
+{
+    type Error = CommitManagerError<D::Error, T::Error>;
+
+    async fn resolve<'a>(
+        &'a self,
+        collection: &'a CollectionId<ValueKind>,
+        event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        let committed = match event {
+            EventRef::Message { dedup_id } => self.is_message_committed(dedup_id).await?,
+            EventRef::Timer(TimerEventRef {
+                timer_type,
+                time,
+                tag,
+            }) => {
+                self.is_timer_committed(&collection.state_key().key, timer_type, time, tag)
+                    .await?
+            }
+        };
+        Ok(if committed {
+            CommitDecision::Committed
+        } else {
+            CommitDecision::NotCommitted
+        })
     }
 }
 
@@ -394,6 +429,64 @@ mod tests {
             "store-only oracle must become true after commit rotates the tag"
         );
         Ok(())
+    }
+
+    /// Smoke test that `impl CommitOracle for CommitManager` plugs into
+    /// `RecoveringValueStore::get` end-to-end on the message arm. We seal
+    /// a Value WAL under a message event, insert the dedup row so the
+    /// oracle answers `Committed`, then call `get` and assert recovery
+    /// applied the WAL.
+    #[tokio::test]
+    async fn commit_manager_drives_recovering_value_store_get() -> Result<()> {
+        use std::sync::Arc as StdArc;
+
+        use crate::state::memory::MemoryDurableValueStore;
+        use crate::state::recovering::RecoveringValueStore;
+        use crate::state::value::{DurableWalStore, StoredPayload, ValueOp, ValueStore};
+        use crate::state::{
+            CollectionId, CollectionRef, DurableState, EventRef, Read, StateKey, StateName,
+            StateType,
+        };
+        use bytes::Bytes;
+
+        time::pause();
+        let (_stream, manager, _tx) = setup().await?;
+        let dedup = MemoryDeduplicationStore::new();
+        let dedup_id = Uuid::new_v4();
+        dedup.insert(dedup_id).await.map_err(|e| eyre!("{e}"))?;
+        let oracle = CommitManager::new(dedup, manager);
+
+        let inner = MemoryDurableValueStore::for_tests();
+        let collection = CollectionRef::new(
+            CollectionId::new(
+                StateKey::new(Uuid::new_v4(), StdArc::from("commit-manager-test-key")),
+                StateType::Application,
+                StateName::try_new("commit-manager-smoke").map_err(|e| eyre!("{e}"))?,
+            ),
+            None,
+        );
+        let id = collection.id().clone();
+        let payload = StoredPayload::Inline(Bytes::from_static(b"recovered"));
+        inner
+            .seal(
+                &collection,
+                EventRef::Message { dedup_id },
+                vec![ValueOp::Set {
+                    payload: payload.clone(),
+                }],
+            )
+            .await
+            .map_err(|e| eyre!("{e}"))?;
+
+        let store = RecoveringValueStore::new(inner.clone(), oracle, None);
+        let visible = store.get(&id).await.map_err(|e| eyre!("{e}"))?;
+        assert_eq!(visible, Read::Present(payload));
+
+        // Partition transitions to Idle after first-touch recovery.
+        match inner.read_partition(&id).await.map_err(|e| eyre!("{e}"))? {
+            DurableState::Idle { .. } => Ok(()),
+            DurableState::Sealed { .. } => Err(eyre!("expected Idle post-recovery")),
+        }
     }
 
     #[tokio::test]

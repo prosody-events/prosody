@@ -130,5 +130,16 @@ cassandra_queries! {
              WHERE segment_id = ? AND key = ? AND state_type = ? AND kind = ? AND name = ?",
             TABLE_KEYED_STATE_PENDING
         ),
+
+        /// Streams the pending-index rows for one `(segment, key)`
+        /// partition. Used by the keyed-state middleware's `StateRecovery`
+        /// sweep — partition key is `(segment_id, key)`, so the scan is
+        /// confined to a single partition and avoids the ALLOW FILTERING
+        /// anti-pattern.
+        scan_pending: (
+            "SELECT state_type, kind, name FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ?",
+            TABLE_KEYED_STATE_PENDING
+        ),
     }
 }

@@ -16,10 +16,13 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::{CassandraValueStore, ValueQueries};
 use crate::state::layered::LayeredValueStore;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
+use crate::state::oracle::CommitOracle;
+use crate::state::recovering::RecoveringValueStore;
 use crate::state::value::{StoredPayload, TransactionValueStore, ValueKind, ValueStore};
-use crate::state::value_test_suite::{self, DirectTrace, Trace, collection_ref, inline};
+use crate::state::value_test_suite::{self, DirectTrace, TEST_TTL, Trace, collection_ref, inline};
 use crate::state::{
-    CollectionId, CommitMode, EventRef, Read, StateKey, StateName, StateType, StoreOutcome,
+    CollectionId, CommitDecision, CommitMode, EventRef, Read, StateKey, StateName, StateType,
+    StoreOutcome,
 };
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -120,7 +123,7 @@ async fn cache_present_with_inline_empty_bytes_round_trips() -> Result<()> {
 #[tokio::test]
 async fn cache_populated_on_miss() -> Result<()> {
     let (_dir, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let id = collection_id("populated")?;
     let payload = inline(3);
     backing.set(&id, payload.clone()).await?;
@@ -138,7 +141,7 @@ async fn cache_populated_on_miss() -> Result<()> {
 #[tokio::test]
 async fn cache_patched_after_apply_sealed() -> Result<()> {
     let (_dir, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
     let collection_id = collection.id().clone();
@@ -164,7 +167,7 @@ async fn cache_patched_after_apply_sealed() -> Result<()> {
 #[tokio::test]
 async fn cache_patched_after_direct_apply() -> Result<()> {
     let (_dir, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
     let collection_id = collection.id().clone();
@@ -186,7 +189,7 @@ async fn cache_patched_after_direct_apply() -> Result<()> {
 #[tokio::test]
 async fn cache_untouched_after_seal() -> Result<()> {
     let (_dir, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
     let collection_id = collection.id().clone();
@@ -205,7 +208,7 @@ async fn cache_untouched_after_seal() -> Result<()> {
 #[tokio::test]
 async fn cache_untouched_after_rollback_sealed() -> Result<()> {
     let (_dir, cache) = make_cache()?;
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let dirty = MemoryDirtyValueStore::new();
     let collection = collection_ref()?;
     let collection_id = collection.id().clone();
@@ -224,7 +227,7 @@ async fn cache_untouched_after_rollback_sealed() -> Result<()> {
 
 #[tokio::test]
 async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let collection = collection_ref()?;
     let collection_id = collection.id().clone();
 
@@ -265,7 +268,7 @@ fn prop_layered_memory_wal(trace: Trace) -> bool {
     let Ok((_dir, cache)) = make_cache() else {
         return false;
     };
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let layered = LayeredValueStore::new(cache, backing);
     TEST_RUNTIME
         .block_on(value_test_suite::run_trace(
@@ -280,7 +283,7 @@ fn prop_layered_memory_idempotence(trace: Trace) -> bool {
     let Ok((_dir, cache)) = make_cache() else {
         return false;
     };
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let layered = LayeredValueStore::new(cache, backing);
     TEST_RUNTIME
         .block_on(value_test_suite::run_idempotence_trace(
@@ -295,7 +298,7 @@ fn prop_layered_memory_direct(trace: DirectTrace) -> bool {
     let Ok((_dir, cache)) = make_cache() else {
         return false;
     };
-    let backing = MemoryDurableValueStore::new();
+    let backing = MemoryDurableValueStore::for_tests();
     let layered = LayeredValueStore::new(cache, backing);
     TEST_RUNTIME
         .block_on(value_test_suite::run_direct_trace(
@@ -319,6 +322,29 @@ fn prop_layered_fjall_memory_idempotence_trace() {
 #[test]
 fn prop_layered_fjall_memory_direct_trace() {
     QuickCheck::new().quickcheck(prop_layered_memory_direct as fn(DirectTrace) -> bool);
+}
+
+// ---- property runners: Layered<Fjall, Recovering<Memory, AlwaysCommitted>> --
+
+fn prop_layered_fjall_recovering_memory(trace: Trace) -> bool {
+    let Ok((_dir, cache)) = make_cache() else {
+        return false;
+    };
+    let inner = MemoryDurableValueStore::for_tests();
+    let recovering = RecoveringValueStore::new(inner, AlwaysCommittedOracle, TEST_TTL);
+    let layered = LayeredValueStore::new(cache, recovering);
+    TEST_RUNTIME
+        .block_on(value_test_suite::run_trace(
+            layered,
+            MemoryDirtyValueStore::new,
+            trace,
+        ))
+        .unwrap_or(false)
+}
+
+#[test]
+fn prop_layered_fjall_recovering_memory_trace() {
+    QuickCheck::new().quickcheck(prop_layered_fjall_recovering_memory as fn(Trace) -> bool);
 }
 
 // ---- property runners: LayeredValueStore<FjallValueStore, Cassandra> --------
@@ -346,7 +372,7 @@ async fn setup_cassandra_value_store() -> Result<CassandraValueStore> {
     let config = test_cassandra_config("prosody_test");
     let cassandra = CassandraStore::new(&config).await?;
     let queries = Arc::new(ValueQueries::new(cassandra.session(), &config.keyspace).await?);
-    Ok(CassandraValueStore::new(cassandra, queries))
+    Ok(CassandraValueStore::new(cassandra, queries, TEST_TTL))
 }
 
 fn cassandra_wal_property(trace: Trace) -> TestResult {
@@ -511,6 +537,58 @@ fn prop_layered_fjall_cassandra_direct_trace() {
         .quickcheck(cassandra_direct_property as fn(DirectTrace) -> TestResult);
 }
 
+fn cassandra_recovering_wal_property(trace: Trace) -> TestResult {
+    let runtime = &*TEST_RUNTIME;
+    let span = tracing::Span::current();
+    let input_dbg = format!("{trace:#?}");
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            return TestResult::error(format!("tempdir failed: {e}\nFailing input:\n{input_dbg}"));
+        }
+    };
+    let cache = match FjallValueStore::for_test(&dir) {
+        Ok(c) => c,
+        Err(e) => {
+            return TestResult::error(format!(
+                "cache open failed: {e}\nFailing input:\n{input_dbg}"
+            ));
+        }
+    };
+
+    let backing = match runtime
+        .block_on(async { setup_cassandra_value_store().await }.instrument(span.clone()))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return TestResult::error(format!(
+                "cassandra setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
+    };
+
+    let recovering = RecoveringValueStore::new(backing, AlwaysCommittedOracle, TEST_TTL);
+    let layered = LayeredValueStore::new(cache, recovering);
+    let result = runtime.block_on(
+        async { value_test_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
+            .instrument(span),
+    );
+    drop(dir);
+    match result {
+        Ok(true) => TestResult::passed(),
+        Ok(false) => TestResult::error(format!("model mismatch.\nFailing input:\n{input_dbg}")),
+        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
+    }
+}
+
+#[test]
+fn prop_layered_fjall_recovering_cassandra_trace() {
+    init_test_logging();
+    QuickCheck::new()
+        .tests(get_test_count())
+        .quickcheck(cassandra_recovering_wal_property as fn(Trace) -> TestResult);
+}
+
 // ---- fault-injection cache --------------------------------------------------
 
 /// Cache that errors on writes but tracks which methods were called so
@@ -589,4 +667,30 @@ where
     E: Error + Send + Sync + 'static,
 {
     eyre::eyre!(e)
+}
+
+// ---- always-committed oracle for the recovering combinator runners ----------
+
+#[derive(Clone, Copy, Debug)]
+struct AlwaysCommittedOracle;
+
+impl CommitOracle for AlwaysCommittedOracle {
+    type Error = AlwaysCommittedOracleError;
+
+    async fn resolve<'a>(
+        &'a self,
+        _collection: &'a CollectionId<ValueKind>,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        Ok(CommitDecision::Committed)
+    }
+}
+
+#[derive(Debug, Error)]
+enum AlwaysCommittedOracleError {}
+
+impl ClassifyError for AlwaysCommittedOracleError {
+    fn classify_error(&self) -> ErrorCategory {
+        match *self {}
+    }
 }

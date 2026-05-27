@@ -27,7 +27,10 @@ pub mod encoding;
 pub mod fjall;
 pub mod layered;
 pub mod memory;
+pub mod middleware;
+pub mod oracle;
 pub mod pending;
+pub mod recovering;
 pub mod value;
 
 #[cfg(test)]
@@ -183,12 +186,12 @@ where
 
 /// Per-event scope identity used by commit recovery.
 ///
-/// Pre-staged for Slice 6+ (Fjall dirty workspace keys scoped by
-/// `EventScopeId`) and Slice 8 (middleware assigns a fresh scope per
-/// event). Today nothing reads this; it lives on the public surface so
-/// the next slices can attach it to [`CollectionRef`] and the Fjall
-/// keyspace without churning callers.
-// TODO(slice-6,8): wire into CollectionRef and the Fjall dirty workspace.
+/// The keyed-state middleware mints a fresh scope per handler invocation
+/// (via [`Self::fresh`]) so dirty workspaces can be keyed by scope without
+/// colliding across events. The Fjall dirty workspace will key on
+/// [`EventScopeId`] in a later slice; today this identity is consumed by
+/// the in-memory middleware workspace and is sufficient to distinguish
+/// concurrent events at the type level.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct EventScopeId(u128);
 
@@ -203,6 +206,13 @@ impl EventScopeId {
     #[must_use]
     pub fn get(self) -> u128 {
         self.0
+    }
+
+    /// Mints a fresh random scope identifier. Used by the keyed-state
+    /// middleware to scope per-event dirty workspaces.
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self(Uuid::new_v4().as_u128())
     }
 }
 
@@ -252,12 +262,6 @@ impl TimerEventRef {
 /// `docs/keyed-state/design-summary.md` §"Recovery"). Distinct from
 /// [`StoreOutcome`], which is the durable store's "did this call mutate
 /// state" signal: the oracle decides, the store acts on the decision.
-///
-/// Pre-staged for Slice 7+/8: Slice 1 has no oracle (`CommitManager`),
-/// so `CommitDecision` is unconstructed today; first-touch recovery
-/// (Slice 7) and middleware hooks (Slice 8) consult the oracle and pass
-/// the decision into store calls.
-// TODO(slice-7,8): construct via `CommitManager::resolve_event`.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CommitDecision {
     /// The sealed operations were committed.
@@ -355,12 +359,25 @@ where
 /// Lightweight typed reference to a collection plus the application's
 /// per-collection TTL.
 ///
-/// The TTL is carried verbatim onto every Cassandra `USING TTL ?` write the
-/// store issues for this collection. Reads do not see it; recovery callers
-/// re-supply it from the application's collection-definition registry
-/// (Slice 7+). Later slices will extend this struct with the per-event
-/// `commit_mode` and `EventScopeId` described in
-/// `docs/keyed-state/design-summary.md` §"Local State".
+/// The TTL is `Option<CompactDuration>`: `Some(d)` binds a TTL via
+/// `USING TTL ?` on every Cassandra write the store issues for this
+/// collection; `None` writes via the `*_no_ttl` query variants. `None`
+/// covers two first-class cases:
+///
+/// 1. The application opted into indefinite retention.
+/// 2. The Cassandra over-20-year overflow fallback collapsed a computed TTL
+///    into `None` at the wiring layer (Cassandra rejects `USING TTL ?` values
+///    above `630_720_000` seconds).
+///
+/// Production callers either supply a per-write TTL explicitly or read it
+/// from a store's `default_ttl` field (set once at construction from
+/// `CassandraStore::base_ttl()`). The keyed-state stores never reach into
+/// a sibling type for TTL: each store owns its own `default_ttl` and
+/// threads it through `ValueStore::set` / `clear` and through recovery
+/// writes. `None` is therefore a deliberate value, not a forgotten one.
+/// Reads do not see the TTL; recovery callers re-supply it from the
+/// store-owned default (Slice 7+; per-collection registry overrides land
+/// in Slice 8).
 ///
 /// # Identity invariant
 ///
@@ -369,7 +386,6 @@ where
 /// the TTL is a per-write hint, not part of the collection's identity. The
 /// `Hash`/`Eq` impls are hand-rolled (not derived) to keep a future change
 /// to the struct from silently folding `ttl` into equality.
-// TODO(slice-8): carry commit_mode and scope per design-summary §Local State
 #[derive(Clone, Debug)]
 pub struct CollectionRef<K>
 where
@@ -383,16 +399,13 @@ impl<K> CollectionRef<K>
 where
     K: CollectionKind,
 {
-    /// Creates a typed collection reference with no TTL.
+    /// Creates a typed collection reference. Pass `Some(ttl)` to bind a
+    /// TTL on every write; pass `None` for indefinite retention or the
+    /// Cassandra over-20-year overflow fallback. The TTL choice is
+    /// always explicit at the callsite.
     #[must_use]
-    pub fn new(id: CollectionId<K>) -> Self {
-        Self { id, ttl: None }
-    }
-
-    /// Creates a typed collection reference with an explicit TTL.
-    #[must_use]
-    pub fn with_ttl(id: CollectionId<K>, ttl: CompactDuration) -> Self {
-        Self { id, ttl: Some(ttl) }
+    pub fn new(id: CollectionId<K>, ttl: Option<CompactDuration>) -> Self {
+        Self { id, ttl }
     }
 
     /// Returns the typed collection identity.

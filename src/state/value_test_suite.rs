@@ -27,6 +27,7 @@ use super::{
 };
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
+use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use quickcheck::{Arbitrary, Gen};
@@ -43,6 +44,23 @@ const TIMER_TYPE_POOL: [TimerType; 3] = [
 const TIMER_TIME_MODULUS: u32 = 1_000_000;
 const MAX_TRACE_OPS: usize = 40;
 const MAX_TRACE_EVENTS: usize = 20;
+
+/// Default TTL bound onto fixture [`CollectionRef`]s by [`collection_ref`].
+///
+/// One-hour duration — `Some(_)` so property runners exercise the
+/// with-TTL query arm. Tests that need to assert the no-TTL arm must
+/// construct `CollectionRef::new(id, None)` inline.
+pub(crate) const TEST_TTL: Option<CompactDuration> = Some(CompactDuration::new(3_600));
+
+/// Mock oracle behavior used by [`run_trace_with_policy`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OraclePolicy {
+    /// Oracle always returns [`super::CommitDecision::Committed`].
+    AlwaysCommitted,
+
+    /// Oracle always returns [`super::CommitDecision::NotCommitted`].
+    AlwaysNotCommitted,
+}
 
 // Bundle traits collapse the four-trait bound carried by every helper in
 // this file. Every body genuinely uses each constituent (the
@@ -79,6 +97,10 @@ impl<T> DirtyBundle for T where
 /// Drives a Value transaction trace in [`CommitMode::Wal`] against a model
 /// and returns `true` when every per-op invariant held.
 ///
+/// Delegates to [`run_trace_with_policy`] with
+/// [`OraclePolicy::AlwaysCommitted`]; for traces without
+/// [`TraceOp::Crash`] the policy is irrelevant.
+///
 /// # Errors
 ///
 /// Propagates store/transaction errors; property mismatches return `Ok(false)`.
@@ -88,7 +110,14 @@ where
     S: DirtyBundle,
     F: Fn() -> S,
 {
-    drive_wal_trace(durable, dirty_factory, trace, false).await
+    drive_wal_trace(
+        durable,
+        dirty_factory,
+        trace,
+        false,
+        OraclePolicy::AlwaysCommitted,
+    )
+    .await
 }
 
 /// Adds to [`run_trace`] an idempotence check: every Commit/Abort that
@@ -109,7 +138,43 @@ where
     S: DirtyBundle,
     F: Fn() -> S,
 {
-    drive_wal_trace(durable, dirty_factory, trace, true).await
+    drive_wal_trace(
+        durable,
+        dirty_factory,
+        trace,
+        true,
+        OraclePolicy::AlwaysCommitted,
+    )
+    .await
+}
+
+/// Drives a trace with a configurable oracle policy. After a
+/// [`TraceOp::Crash`] in the [`ModelPhase::Sealed`] phase, on the next
+/// iteration the runner explicitly invokes
+/// [`DurableWalStore::apply_sealed`] (for [`OraclePolicy::AlwaysCommitted`])
+/// or [`DurableWalStore::rollback_sealed`] (for
+/// [`OraclePolicy::AlwaysNotCommitted`]) so the durable and the model end
+/// up in the same recovered state regardless of whether the durable is
+/// wrapped in [`crate::state::recovering::RecoveringValueStore`]. Crash
+/// outside [`ModelPhase::Sealed`] is treated as abort-without-cleanup: the
+/// dirty workspace is **not** drained because a crash does not get to do
+/// it.
+///
+/// # Errors
+///
+/// Propagates store/transaction errors; property mismatches return `Ok(false)`.
+pub(crate) async fn run_trace_with_policy<D, S, F>(
+    durable: D,
+    dirty_factory: F,
+    trace: Trace,
+    policy: OraclePolicy,
+) -> Result<bool>
+where
+    D: DurableBundle,
+    S: DirtyBundle,
+    F: Fn() -> S,
+{
+    drive_wal_trace(durable, dirty_factory, trace, false, policy).await
 }
 
 /// Drives a direct-mode trace and asserts the partition is never sealed.
@@ -165,11 +230,14 @@ where
 }
 
 pub(crate) fn collection_ref() -> Result<CollectionRef<ValueKind>> {
-    Ok(CollectionRef::new(CollectionId::new(
-        StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-        StateType::Application,
-        StateName::try_new("profile")?,
-    )))
+    Ok(CollectionRef::new(
+        CollectionId::new(
+            StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
+            StateType::Application,
+            StateName::try_new("profile")?,
+        ),
+        TEST_TTL,
+    ))
 }
 
 pub(crate) fn inline(value: u8) -> StoredPayload {
@@ -181,6 +249,7 @@ async fn drive_wal_trace<D, S, F>(
     dirty_factory: F,
     trace: Trace,
     check_idempotence: bool,
+    policy: OraclePolicy,
 ) -> Result<bool>
 where
     D: DurableBundle,
@@ -202,13 +271,26 @@ where
         current_event,
         CommitMode::Wal,
     );
+    let mut just_crashed = false;
 
     for op in ops {
-        if matches!(tx.local_tx(), LocalTx::Finished) {
+        if just_crashed || matches!(tx.local_tx(), LocalTx::Finished) {
+            if let Some((pre_seal, crashed_ops)) = model.crashed_sealed.take() {
+                let crash_event = model.crash_event.take().unwrap_or(current_event);
+                drive_recovery(&durable, &collection_ref, crash_event, &crashed_ops, policy)
+                    .await?;
+                model.applied = match policy {
+                    OraclePolicy::AlwaysCommitted => fold_value_ops(pre_seal, &crashed_ops),
+                    OraclePolicy::AlwaysNotCommitted => pre_seal,
+                };
+            }
+
             tx_id += 1;
             event_idx += 1;
             current_event = build_event_ref(event_at(&events, event_idx), tx_id);
             model.phase = ModelPhase::Clean;
+            model.clear_dirty();
+            model.sealed = None;
             dirty = dirty_factory();
             tx = TransactionValueStore::new(
                 durable.clone(),
@@ -217,6 +299,13 @@ where
                 current_event,
                 CommitMode::Wal,
             );
+            just_crashed = false;
+        }
+
+        if matches!(op, TraceOp::Crash) {
+            apply_trace_crash(&mut model, current_event);
+            just_crashed = true;
+            continue;
         }
 
         if !apply_trace_op(&mut tx, &collection_id, &mut model, op).await? {
@@ -236,6 +325,27 @@ where
     }
 
     Ok(true)
+}
+
+async fn drive_recovery<D>(
+    durable: &D,
+    collection: &CollectionRef<ValueKind>,
+    crash_event: EventRef,
+    _crashed_ops: &[ValueOp],
+    policy: OraclePolicy,
+) -> Result<()>
+where
+    D: DurableBundle,
+{
+    match policy {
+        OraclePolicy::AlwaysCommitted => {
+            durable.apply_sealed(collection, crash_event).await?;
+        }
+        OraclePolicy::AlwaysNotCommitted => {
+            durable.rollback_sealed(collection, crash_event).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn idempotent_resolution<D>(
@@ -275,7 +385,14 @@ where
         return Ok(false);
     }
 
-    if !matches!(model.phase, ModelPhase::Finished) {
+    // Visibility is only checked in Clean and Dirty phases. The Sealed
+    // phase visibility cannot be asserted via `tx.get` because a
+    // recovery-aware durable would resolve the current event's WAL
+    // (oracle policy → apply or rollback) and return a post-recovery
+    // payload that disagrees with the model's pre-seal `applied`. The
+    // durable_applied_state check above still proves the WAL was sealed
+    // without mutating `applied`.
+    if matches!(model.phase, ModelPhase::Clean | ModelPhase::Dirty) {
         let visible = read_applied(tx.get(collection).await?);
         if visible != model.visible() {
             return Ok(false);
@@ -338,6 +455,34 @@ where
         TraceOp::Commit => apply_trace_commit(tx, model).await,
         TraceOp::Abort => apply_trace_abort(tx, model).await,
         TraceOp::Flush => apply_trace_flush(tx, model).await,
+        // Crash is handled by the driver, not dispatched here.
+        TraceOp::Crash => Ok(true),
+    }
+}
+
+/// Applies a [`TraceOp::Crash`] to the model. The runner is responsible
+/// for advancing the transaction afterwards (the model's `crashed_sealed`
+/// bookkeeping drives recovery on the next iteration).
+fn apply_trace_crash(model: &mut Model, current_event: EventRef) {
+    match model.phase {
+        ModelPhase::Clean | ModelPhase::Dirty => {
+            // Outside Sealed: same as Abort but skip dirty cleanup — a crash
+            // does not get to drain the dirty workspace. The next iteration
+            // rebuilds the dirty store from scratch, so the model also
+            // resets `dirty_ops` at advance time.
+            model.phase = ModelPhase::Finished;
+        }
+        ModelPhase::Sealed => {
+            // Capture the sealed event so the next iteration can replay
+            // recovery (apply_sealed / rollback_sealed) on the durable
+            // store under the oracle policy.
+            model.crashed_sealed = model.sealed.take();
+            model.crash_event = Some(current_event);
+            model.phase = ModelPhase::Finished;
+        }
+        ModelPhase::Finished => {
+            // Already finished; second crash has no effect.
+        }
     }
 }
 
@@ -585,17 +730,23 @@ pub(crate) enum TraceOp {
     Commit,
     Abort,
     Flush,
+    /// Simulates a process crash: drops the transaction without driving
+    /// abort/apply/rollback. In the [`ModelPhase::Sealed`] phase this
+    /// leaves a sealed WAL on the durable store; the runner resolves it
+    /// on the next iteration via the configured [`OraclePolicy`].
+    Crash,
 }
 
 impl Arbitrary for TraceOp {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 6 {
+        match u8::arbitrary(g) % 7 {
             0 => Self::Set(u8::arbitrary(g)),
             1 => Self::Clear,
             2 => Self::Seal,
             3 => Self::Commit,
             4 => Self::Abort,
-            _ => Self::Flush,
+            5 => Self::Flush,
+            _ => Self::Crash,
         }
     }
 }
@@ -679,6 +830,16 @@ struct Model {
     dirty_ops: Vec<ValueOp>,
     overlay: ValueOverlay,
     sealed: Option<(Option<StoredPayload>, Vec<ValueOp>)>,
+    /// Sealed snapshot captured by [`TraceOp::Crash`] in
+    /// [`ModelPhase::Sealed`]: `(pre_seal_applied, sealed_ops)`. Consumed
+    /// by the runner on the next iteration to drive
+    /// `apply_sealed` / `rollback_sealed` under the active
+    /// [`OraclePolicy`].
+    crashed_sealed: Option<(Option<StoredPayload>, Vec<ValueOp>)>,
+    /// [`EventRef`] of the transaction that the
+    /// [`TraceOp::Crash`] dropped. Needed because `apply_sealed` /
+    /// `rollback_sealed` take the expected event explicitly.
+    crash_event: Option<EventRef>,
     phase: ModelPhase,
 }
 

@@ -1,21 +1,24 @@
 //! In-memory keyed-state stores.
 
 use super::encoding::{EncodingError, decode_wal};
-use super::pending::PendingIndexStore;
+use super::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
 use super::value::{
     DirectApplyStore, DurableWalStore, PendingOpSource, StoredPayload, ValueKind, ValueOp,
     ValueStore, fold_value_ops,
 };
 use super::{
     CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, PayloadEncoding,
-    PendingOps, Read, SealedCollection, SealedWal, StoreOutcome, WalFormat,
+    PendingOps, Read, SealedCollection, SealedWal, StateKey, StoreOutcome, WalFormat,
 };
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
+use futures::{Stream, stream};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -116,24 +119,37 @@ impl PendingOpSource<ValueKind> for MemoryDirtyValueStore {
 /// Each collection has authoritative applied state and at most one sealed WAL
 /// record. Sealing never mutates applied state; applying or rolling back a
 /// matching sealed event resolves the WAL record.
+///
+/// The store ignores TTL at the write layer (memory has no expiry), but it
+/// still threads its constructor-supplied `default_ttl` through every
+/// [`CollectionRef`] it builds for [`ValueStore::set`] / [`ValueStore::clear`].
+/// This keeps the production pattern symmetric with [`super::cassandra`] so a
+/// careless copy-paste cannot regress to hardcoded `None`.
 #[derive(Clone, Debug)]
 pub struct MemoryDurableValueStore {
     inner: Arc<Mutex<DurableInner>>,
+    default_ttl: Option<CompactDuration>,
 }
 
 impl MemoryDurableValueStore {
-    /// Creates an empty durable Value store.
+    /// Creates an empty durable Value store with a constructor-supplied
+    /// default TTL. The TTL is propagated through every
+    /// [`CollectionRef`] built by [`ValueStore::set`] / [`ValueStore::clear`].
+    /// Pass `None` for indefinite retention (or the Cassandra >20-year
+    /// overflow fallback at the wiring layer).
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Default for MemoryDurableValueStore {
-    fn default() -> Self {
+    pub fn new(default_ttl: Option<CompactDuration>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(DurableInner::default())),
+            default_ttl,
         }
+    }
+
+    /// Test-only convenience: one-hour default TTL.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self::new(Some(CompactDuration::new(3_600)))
     }
 }
 
@@ -157,7 +173,7 @@ impl ValueStore for MemoryDurableValueStore {
         collection: &'a CollectionId<ValueKind>,
         payload: StoredPayload,
     ) -> Result<(), Self::Error> {
-        let collection_ref = CollectionRef::new(collection.clone());
+        let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
         self.direct_apply(&collection_ref, vec![ValueOp::Set { payload }])
             .await?;
         Ok(())
@@ -167,7 +183,7 @@ impl ValueStore for MemoryDurableValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        let collection_ref = CollectionRef::new(collection.clone());
+        let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
         self.direct_apply(&collection_ref, vec![ValueOp::Clear])
             .await?;
         Ok(())
@@ -302,6 +318,32 @@ impl PendingIndexStore for MemoryDurableValueStore {
         K: CollectionKind,
     {
         Ok(())
+    }
+}
+
+impl PendingIndexScanner for MemoryDurableValueStore {
+    type Error = MemoryStateError;
+    type Stream = Pin<Box<dyn Stream<Item = Result<PendingEntry, Self::Error>> + Send>>;
+
+    /// Streams the pending Value entries on `(segment, key)` by walking the
+    /// in-memory durable map and yielding one entry per collection whose
+    /// `wal` slot is non-empty. The snapshot is taken under the inner
+    /// lock; the stream itself is materialized at call time (the memory
+    /// backend has no I/O to incrementalize), which honors the
+    /// "Collection scans are streaming" contract by shape even though the
+    /// underlying data is fully resident.
+    fn scan_pending(&self, state_key: &StateKey) -> Self::Stream {
+        let snapshot: Vec<PendingEntry> = {
+            let inner = self.inner.lock();
+            inner
+                .entries
+                .iter()
+                .filter(|(id, entry)| entry.wal.is_some() && id.state_key() == state_key)
+                .map(|(id, _)| PendingEntry::new(id.state_type(), id.kind(), id.name().clone()))
+                .collect()
+        };
+
+        Box::pin(stream::iter(snapshot.into_iter().map(Ok)))
     }
 }
 

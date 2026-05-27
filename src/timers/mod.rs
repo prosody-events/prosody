@@ -83,8 +83,8 @@ pub mod uncommitted;
 /// Application code should use [`TimerType::Application`] when scheduling
 /// timers via [`crate::consumer::event_context::EventContext::schedule`] or
 /// [`crate::consumer::event_context::EventContext::clear_and_schedule`].
-/// The `DeferredMessage` and `DeferredTimer` variants are reserved for internal
-/// middleware use.
+/// The `DeferredMessage`, `DeferredTimer`, and `StateRecovery` variants are
+/// reserved for internal middleware use.
 #[derive(
     Copy,
     Clone,
@@ -110,6 +110,10 @@ pub enum TimerType {
     DeferredMessage = 1,
     /// Internal: timer scheduled by defer middleware to retry a failed timer.
     DeferredTimer = 2,
+    /// Internal: keyed-state recovery sweep scheduled by the keyed-state
+    /// middleware after seal. Routes back into the middleware on fire and is
+    /// never dispatched to user handlers.
+    StateRecovery = 3,
 }
 
 impl From<TimerType> for i8 {
@@ -126,6 +130,7 @@ impl TryFrom<i8> for TimerType {
             0 => Ok(Self::Application),
             1 => Ok(Self::DeferredMessage),
             2 => Ok(Self::DeferredTimer),
+            3 => Ok(Self::StateRecovery),
             _ => Err(ParseError::UnknownTimerType(value)),
         }
     }

@@ -291,9 +291,31 @@ No local type stores committed collection data. That keeps stale committed state
 
 The application supplies `CollectionRef::ttl` at the handler boundary. Cassandra carries the TTL via `USING TTL ?` on
 every durable write that creates or refreshes a cell. Reads do not return the TTL — recovery callers re-supply it from
-the application's collection-definition registry (Slice 7+); the row does not retain the original TTL value. Identity
+the application's collection-definition registry (Slice 8+); the row does not retain the original TTL value. Identity
 and equality of `CollectionRef<K>` ignore the TTL field: two refs that point at the same collection compare equal even
-when their TTLs differ. `ttl: None` writes without `USING TTL`.
+when their TTLs differ. `ttl: None` writes without `USING TTL` and is a first-class value: it covers (1) indefinite
+retention and (2) the Cassandra over-20-year overflow fallback, where a computed TTL above 630_720_000 seconds collapses
+to `None` at the wiring layer.
+
+**`CollectionDef` registry (Slice 8+).** The middleware also owns a builder-time
+`HashMap<StateName, CollectionDef>` plus a middleware-wide `default_ttl`. `CollectionDef::ttl: Option<CompactDuration>`
+records the per-collection override: `Some(d)` binds `d` on every write to that collection (including recovery
+writes), and `None` is an explicit opt-out — the middleware will not invent a default for that name. Unregistered
+collections use the middleware's `default_ttl`. `ctx.value(name)` resolves the TTL at handle-construction time, so
+seal / `apply_sealed` / `rollback_sealed` see the registered value (or the middleware default) without each store
+having to consult the registry.
+
+**Constructor-supplied `default_ttl`.** Every production keyed-state store (`CassandraValueStore`,
+`MemoryDurableValueStore`, `RecoveringValueStore`) owns a `default_ttl: Option<CompactDuration>` field, set at
+construction. The store threads this value through `ValueStore::set` / `ValueStore::clear` (which build
+`CollectionRef::new(id.clone(), self.default_ttl)` for the underlying `direct_apply` write) and through every recovery
+write it issues (`apply_sealed` / `rollback_sealed`). No store reaches into a sibling type for its TTL: production wiring
+sources `Some(cassandra_store.base_ttl())` (or `None` when a per-collection override or overflow fallback applies) once
+at build time and passes the same value into each store's constructor. The store has a single constructor —
+`CollectionRef::new(id, ttl: Option<CompactDuration>)` — so the TTL choice is always explicit at the callsite; `None` is
+a deliberate value, never a forgotten one. Forgetting the TTL on a write that should carry one corrupts the durable
+retention contract (cells written without `USING TTL` live forever), which is why the keyed-state stores never invent a
+default and the `*_no_ttl` query variants are reachable only when `collection.ttl()` is genuinely `None`.
 
 ---
 
@@ -826,6 +848,40 @@ invalidates that collection's committed entries and coverage. Value can be patch
 
 ---
 
+## Handler API
+
+Handlers reach keyed state through `KeyedStateMiddleware<D, Sc, O, P>`, a
+[`HandlerMiddleware`](src/consumer/middleware/mod.rs) that wraps an inner handler and constructs a
+`KeyedStateContext<C, D>` per event. The wrapped context implements `EventContext` (delegating every method
+to the inner context) and the extension trait `KeyedStateAccess`. Handlers that want to access state add
+`+ KeyedStateAccess` to their context bound:
+
+```rust
+async fn on_message<C>(&self, ctx: C, msg: ConsumerMessage<P>, _: DemandType)
+    -> Result<Self::Output, Self::Error>
+where
+    C: EventContext + KeyedStateAccess,
+{
+    let counter = ctx.value("counter")?;
+    counter.set(StoredPayload::Inline(Bytes::from_static(b"42"))).await?;
+    Ok(())
+}
+```
+
+`ctx.value(name) -> ValueHandle` returns a handle that drives a `TransactionValueStore` for one
+`(event, collection)` pair. Repeated `value(name)` calls in the same dispatch return handles bound to the
+same transaction; dirty ops accumulate across calls. The handle exposes `get`, `set`, and `clear` as
+`async fn`s.
+
+The middleware sits below any rescue, retry, or defer middleware and above the user handler. It owns:
+
+- The composed durable bundle (`Layered<Fjall, Recovering<Cassandra, CommitOracle>>` in production).
+- The read-side `PendingIndexScanner` for `StateRecovery` sweeps.
+- A `CommitOracle` (the existing `CommitManager`).
+- A `CollectionDefRegistry` for per-collection TTL overrides.
+- A `CommitMode` (Wal or Direct, fixed at builder time today).
+- A `recovery_delay: CompactDuration` (default 30s) added to `now()` when scheduling `StateRecovery`.
+
 ## Valid Transitions
 
 Every collection has a fixed commit mode for the lifetime of an `EventScope`:
@@ -926,6 +982,37 @@ pending index row + Idle partition -> delete stale pending index row
 ```
 
 Recovery is triggered by first touch or by the durable `StateRecovery` timer. Both paths run the same transition.
+
+### `StateRecovery` timer lifecycle
+
+`StateRecovery` is `TimerType::StateRecovery = 3`. The middleware schedules at most one per event and only
+in `CommitMode::Wal`:
+
+```text
+Wal handler Ok with >=1 seal:
+  context.schedule(now + recovery_delay, TimerType::StateRecovery)
+
+after_commit(Ok(_)) with sealed list:
+  for each sealed CollectionRef:
+    durable.apply_sealed(collection_ref, event)
+  context.clear_scheduled(TimerType::StateRecovery)
+
+after_commit(Err(_)) / after_abort(*):
+  for each sealed CollectionRef:
+    durable.rollback_sealed(collection_ref, event)
+  context.clear_scheduled(TimerType::StateRecovery)
+
+StateRecovery fires:
+  for entry in scanner.scan_pending(state_key):
+    if entry.kind != Value: WARN and skip   # Slice 9+
+    match durable.read_partition(id):
+      Idle    -> durable.delete_pending(id)         # stale pending row
+      Sealed  -> oracle.resolve(...) -> apply | rollback
+  context.clear_scheduled(TimerType::StateRecovery)
+```
+
+Direct mode has no `StateRecovery` schedule call by construction — the `CommitMode::Direct` branch in the
+middleware does not have access to the helper that schedules it.
 
 ---
 
@@ -1176,9 +1263,30 @@ Implement in thin slices so invariants are testable before full middleware integ
    `LayeredValueStore<FjallValueStore, MemoryDurableValueStore>` (default CI) and
    `LayeredValueStore<FjallValueStore, CassandraValueStore>` (gated on `INTEGRATION_TESTS`) so layering is
    behavior-preserving by construction. The Fjall dirty workspace is deferred to a later slice.
-7. **First-touch integration.** Resolve SEALED Value partitions before reads return.
-8. **Middleware and recovery timer.** Wire handler success/abort hooks and durable `StateRecovery` timers. Recovery
-   timer should not be created for dirty mode.
+7. **First-touch integration.** (**Complete.**) `RecoveringValueStore<Inner, Oracle>` resolves SEALED Value
+   partitions before reads return. The combinator wraps any durable Value store + a `CommitOracle`; `ValueStore::get`
+   reads `inner.read_partition`, dispatches `Sealed { wal, .. }` through the oracle, calls `apply_sealed` or
+   `rollback_sealed` on the inner using a `CollectionRef` built from the wrapper's constructor-supplied `default_ttl`,
+   then returns the resolved value. Every other method passes through. `impl CommitOracle for CommitManager<D, T>`
+   bridges the existing message/timer bool oracles into `CommitDecision`. Production composition stays test-only at
+   this slice; Slice 8 wires the production builder. The slice also threads `default_ttl: Option<CompactDuration>`
+   through every keyed-state store's constructor so production writes stop hardcoding `None` and the `*_no_ttl` query
+   variants fire only when the collection truly opted into indefinite retention (or the overflow fallback applies).
+   The durable `StateRecovery` timer, the `scan_pending` sweep, and the per-collection TTL registry remain Slice 8.
+8. **Middleware and recovery timer.** (**Complete.**) `KeyedStateMiddleware<D, Sc, O, P>` wires handler success
+   and abort hooks to `apply_sealed` / `rollback_sealed`, schedules the durable `StateRecovery` timer after
+   seal in WAL mode, and routes the timer's fire back through `scan_pending` + the commit oracle. The middleware
+   constructs a `KeyedStateContext<C, D>` per event that wraps the inner `EventContext` and exposes
+   `ctx.value(name)` through the extension trait `KeyedStateAccess`. Repeated `value(name)` calls on the same
+   context return handles that share a `TransactionValueStore` so dirty ops accumulate. The middleware owns a
+   `CollectionDefRegistry`: registered collections bind a per-collection TTL on every write; unregistered
+   collections fall back to the middleware-wide `default_ttl`. `CommitMode::Direct` literally cannot schedule
+   the recovery timer — that branch calls `direct_apply` and returns; only the WAL branch calls
+   `context.schedule(TimerType::StateRecovery)`. The recovery handler reads each pending entry's partition; an
+   `Idle` partition is a stale pending row and is removed via `delete_pending`, a `Sealed` partition is
+   resolved via the oracle. Non-Value kinds are logged at WARN and skipped (Slice 9+ plugs them in). The
+   memory and Cassandra durable Value stores both implement the new read-side `PendingIndexScanner` trait that
+   yields a `PendingEntry { state_type, kind, name }` stream for one `(segment, key)` partition.
 9. **Map and Deque.** Add kind-specific modules after the protocol is proven for Value.
 
 Seal writes the full compacted WAL into one Cassandra row mutation. Apply drains the WAL incrementally (see
