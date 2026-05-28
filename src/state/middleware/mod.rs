@@ -1528,7 +1528,7 @@ where
 }
 
 /// Errors raised by the shared state-recovery sweep
-/// [`recover_pending_entries`].
+/// `recover_pending_entries`.
 ///
 /// The sweep only ever fails while scanning the pending index, reading or
 /// mutating durable state, consulting the oracle, or clearing the recovery
