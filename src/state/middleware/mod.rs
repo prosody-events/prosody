@@ -1536,7 +1536,7 @@ where
 /// computes a fire time, so those variants are absent — the production
 /// caller lifts this into [`KeyedStateMiddlewareError`] via `?`.
 #[derive(Debug, Error)]
-pub enum RecoveryError<DurableErr, ScannerErr, OracleErr, TimerErr>
+pub(crate) enum RecoveryError<DurableErr, ScannerErr, OracleErr, TimerErr>
 where
     DurableErr: Error + 'static,
     ScannerErr: Error + 'static,
