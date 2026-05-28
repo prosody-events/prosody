@@ -319,14 +319,9 @@ where
     /// Returns a transaction error if the mode or local state does not permit
     /// sealing, or if either backing store fails.
     pub async fn seal(&mut self) -> Result<SealedCollection<ValueKind>, TxError<S, D>> {
-        if self.mode != CommitMode::Wal {
-            return Err(TransactionValueStoreError::WrongCommitMode {
-                expected: CommitMode::Wal,
-                actual: self.mode,
-            });
-        }
+        self.ensure_mode(CommitMode::Wal)?;
 
-        match self.local_tx_snapshot() {
+        match self.local_tx() {
             LocalTx::Clean(_) => Err(TransactionValueStoreError::NoPendingOps),
             LocalTx::Dirty(_) => {
                 let ops = self
@@ -355,7 +350,7 @@ where
     /// Returns a transaction error if the transaction is finished or durable
     /// storage rejects the sealed event.
     pub async fn apply_sealed(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
-        if self.local_tx_snapshot() == LocalTx::Finished {
+        if self.local_tx() == LocalTx::Finished {
             return Err(TransactionValueStoreError::Finished);
         }
 
@@ -375,7 +370,7 @@ where
     /// Returns a transaction error if the transaction is finished or durable
     /// storage rejects the sealed event.
     pub async fn rollback_sealed(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
-        if self.local_tx_snapshot() == LocalTx::Finished {
+        if self.local_tx() == LocalTx::Finished {
             return Err(TransactionValueStoreError::Finished);
         }
 
@@ -395,7 +390,7 @@ where
     /// Returns a transaction error if the transaction is sealed, finished, or a
     /// backing store fails.
     pub async fn flush(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
-        match self.local_tx_snapshot() {
+        match self.local_tx() {
             LocalTx::Clean(_) => Ok(StoreOutcome::NoOp),
             LocalTx::Dirty(_) => {
                 let outcome = self.apply_dirty_directly().await?;
@@ -414,14 +409,9 @@ where
     /// Returns a transaction error if the mode is not [`CommitMode::Direct`],
     /// the transaction is sealed or finished, or a backing store fails.
     pub async fn direct_apply(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
-        if self.mode != CommitMode::Direct {
-            return Err(TransactionValueStoreError::WrongCommitMode {
-                expected: CommitMode::Direct,
-                actual: self.mode,
-            });
-        }
+        self.ensure_mode(CommitMode::Direct)?;
 
-        let outcome = match self.local_tx_snapshot() {
+        let outcome = match self.local_tx() {
             LocalTx::Clean(_) => StoreOutcome::NoOp,
             LocalTx::Dirty(_) => self.apply_dirty_directly().await?,
             LocalTx::Sealed(_) => return Err(TransactionValueStoreError::AlreadySealed),
@@ -438,7 +428,7 @@ where
     /// Returns a transaction error if a backing store fails or the local state
     /// cannot transition.
     pub async fn abort(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
-        match self.local_tx_snapshot() {
+        match self.local_tx() {
             LocalTx::Clean(_) => {
                 self.set_local_tx(LocalTx::Finished);
                 Ok(StoreOutcome::NoOp)
@@ -488,8 +478,17 @@ where
         Ok(Some(pending.ops.collect()))
     }
 
-    fn local_tx_snapshot(&self) -> LocalTx<ValueKind> {
-        self.tx.lock().clone()
+    /// Returns an error when the transaction's pinned commit mode is not
+    /// `expected`.
+    fn ensure_mode(&self, expected: CommitMode) -> Result<(), TxError<S, D>> {
+        if self.mode == expected {
+            Ok(())
+        } else {
+            Err(TransactionValueStoreError::WrongCommitMode {
+                expected,
+                actual: self.mode,
+            })
+        }
     }
 
     fn set_local_tx(&mut self, tx: LocalTx<ValueKind>) {
@@ -508,7 +507,7 @@ where
     }
 
     fn can_write(&self) -> Result<(), TxError<S, D>> {
-        match self.local_tx_snapshot() {
+        match self.local_tx() {
             LocalTx::Clean(_) | LocalTx::Dirty(_) => Ok(()),
             LocalTx::Sealed(_) => Err(TransactionValueStoreError::AlreadySealed),
             LocalTx::Finished => Err(TransactionValueStoreError::Finished),
@@ -533,7 +532,7 @@ where
         if collection != self.collection.id() {
             return Err(TransactionValueStoreError::WrongCollection);
         }
-        if matches!(self.local_tx_snapshot(), LocalTx::Finished) {
+        if matches!(self.local_tx(), LocalTx::Finished) {
             return Err(TransactionValueStoreError::Finished);
         }
 

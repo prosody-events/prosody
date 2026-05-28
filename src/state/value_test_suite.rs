@@ -449,8 +449,18 @@ where
     S: DirtyBundle,
 {
     match op {
-        TraceOp::Set(byte) => apply_trace_set(tx, collection, model, byte).await,
-        TraceOp::Clear => apply_trace_clear(tx, collection, model).await,
+        TraceOp::Set(byte) => {
+            apply_trace_write(
+                tx,
+                collection,
+                model,
+                ValueOp::Set {
+                    payload: inline(byte),
+                },
+            )
+            .await
+        }
+        TraceOp::Clear => apply_trace_write(tx, collection, model, ValueOp::Clear).await,
         TraceOp::Seal => apply_trace_seal(tx, model).await,
         TraceOp::Commit => apply_trace_commit(tx, model).await,
         TraceOp::Abort => apply_trace_abort(tx, model).await,
@@ -486,59 +496,46 @@ fn apply_trace_crash(model: &mut Model, current_event: EventRef) {
     }
 }
 
-async fn apply_trace_set<D, S>(
+/// Applies a buffering write (`Set` or `Clear`) and advances the model in
+/// lockstep.
+///
+/// The `Finished` phase must not issue the underlying `tx` call — that
+/// matches the per-op handlers this replaced and keeps the model in step
+/// with the store — so the early return guards it before the write fires.
+async fn apply_trace_write<D, S>(
     tx: &mut TransactionValueStore<D, S>,
     collection: &CollectionId<ValueKind>,
     model: &mut Model,
-    byte: u8,
+    op: ValueOp,
 ) -> Result<bool>
 where
     D: DurableBundle,
     S: DirtyBundle,
 {
-    match model.phase {
-        ModelPhase::Clean | ModelPhase::Dirty => {
-            if tx.set(collection, inline(byte)).await.is_err() {
-                return Ok(false);
-            }
-            model.dirty_ops.clear();
-            model.dirty_ops.push(ValueOp::Set {
-                payload: inline(byte),
-            });
-            model.overlay = ValueOverlay::BufferedSet(inline(byte));
-            model.phase = ModelPhase::Dirty;
-            Ok(true)
-        }
-        ModelPhase::Sealed => Ok(matches!(
-            tx.set(collection, inline(byte)).await,
-            Err(TransactionValueStoreError::AlreadySealed)
-        )),
-        ModelPhase::Finished => Ok(false),
+    if matches!(model.phase, ModelPhase::Finished) {
+        return Ok(false);
     }
-}
-
-async fn apply_trace_clear<D, S>(
-    tx: &mut TransactionValueStore<D, S>,
-    collection: &CollectionId<ValueKind>,
-    model: &mut Model,
-) -> Result<bool>
-where
-    D: DurableBundle,
-    S: DirtyBundle,
-{
+    let overlay = match &op {
+        ValueOp::Set { payload } => ValueOverlay::BufferedSet(payload.clone()),
+        ValueOp::Clear => ValueOverlay::BufferedClear,
+    };
+    let result = match &op {
+        ValueOp::Set { payload } => tx.set(collection, payload.clone()).await,
+        ValueOp::Clear => tx.clear(collection).await,
+    };
     match model.phase {
         ModelPhase::Clean | ModelPhase::Dirty => {
-            if tx.clear(collection).await.is_err() {
+            if result.is_err() {
                 return Ok(false);
             }
             model.dirty_ops.clear();
-            model.dirty_ops.push(ValueOp::Clear);
-            model.overlay = ValueOverlay::BufferedClear;
+            model.dirty_ops.push(op);
+            model.overlay = overlay;
             model.phase = ModelPhase::Dirty;
             Ok(true)
         }
         ModelPhase::Sealed => Ok(matches!(
-            tx.clear(collection).await,
+            result,
             Err(TransactionValueStoreError::AlreadySealed)
         )),
         ModelPhase::Finished => Ok(false),
