@@ -30,6 +30,7 @@ pub mod memory;
 pub mod middleware;
 pub mod oracle;
 pub mod pending;
+pub mod production;
 pub mod recovering;
 pub mod value;
 

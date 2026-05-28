@@ -1287,7 +1287,53 @@ Implement in thin slices so invariants are testable before full middleware integ
    resolved via the oracle. Non-Value kinds are logged at WARN and skipped (Slice 9+ plugs them in). The
    memory and Cassandra durable Value stores both implement the new read-side `PendingIndexScanner` trait that
    yields a `PendingEntry { state_type, kind, name }` stream for one `(segment, key)` partition.
-9. **Map and Deque.** Add kind-specific modules after the protocol is proven for Value.
+9. **Fjall dirty workspace + production-complete Value middleware.** (**Complete.**)
+   Lands the Fjall-backed dirty Value workspace and the per-partition
+   lifecycle described in §"Local Workspace":
+   - `FjallDirtyValueStore` implements `ValueStore` +
+     `PendingOpSource<ValueKind>` over three named partitions
+     (`dirty_ops` keyed by `[scope-collection-prefix][seq be-u64]`,
+     `dirty_overlay` keyed by the prefix alone, `dirty_meta` keyed by the
+     prefix and storing `[next_seq u64 LE][op_count u64 LE]` in one
+     16-byte value). Every write batches the three partition updates in
+     a single `fjall::Batch` so a crash mid-write cannot desync ops vs.
+     overlay vs. meta.
+   - `FjallClient` owns a process-wide `fjall::Keyspace` rooted at
+     `cache_dir`. At process startup it walks every `value_*` partition
+     and deletes them — design §"Local Workspace" §"Process restart".
+   - `FjallWorkspace` is the per-Kafka-partition handle bundle; an
+     `AssignmentEpoch` (a `CompactDateTime` of when the workspace was
+     opened) is hashed into every Fjall partition name so a fast
+     assign→revoke→assign cycle cannot collide on `(topic, partition)`.
+     `Drop` runs `keyspace.delete_partition` on each of the four named
+     partitions; failures are logged and the next startup sweeps the
+     leftovers.
+   - `DirtyStoreProvider<K>` is the per-partition factory the middleware
+     calls per event (`for_scope(scope)` returns a fresh per-event store);
+     `DirtyStoreFactory<K>` is the process-wide factory `K::for_partition(topic, partition)`
+     that produces providers at partition-assignment time. Memory and
+     Fjall both have concrete impls; Slice 10 adds Map/Deque kinds via
+     the same trait shape.
+   - `KeyedStateMiddleware<D, Sc, O, F, P>` carries the dirty factory as
+     a generic so callers select Memory vs. Fjall at type-instantiation
+     time. The handler holds the `F::Provider` (one per Kafka partition)
+     and threads `P::Store` through every per-event store call.
+   - `CollectionDef` gains a per-collection `CommitMode`; the
+     middleware drops its process-wide `commit_mode` field. The
+     middleware's apply path is mode-aware per collection:
+     `resolve_per_collection` iterates dirty collections, seals each
+     `Wal` collection and direct-applies each `Direct` collection, and
+     returns the WAL-sealed list. The `StateRecovery` timer is scheduled
+     iff that list is non-empty.
+   - `ValueAccessor` + `ValueHandle` expose `flush()`
+     (`Dirty → flush() → Clean`, `Clean → flush() → Clean`) backed by
+     `TransactionValueStore::flush`.
+   - `production` module exposes `capped_default_ttl` — the Cassandra
+     `USING TTL` overflow fallback (≈20-year ceiling). Production
+     callers feed `CassandraStore::base_ttl()` through this helper
+     before threading the result through the durable bundle and the
+     `Recovering*Store` wrapper.
+10. **Map and Deque.** Add kind-specific modules after the protocol is proven for Value.
 
 Seal writes the full compacted WAL into one Cassandra row mutation. Apply drains the WAL incrementally (see
 §"WAL-Mode Success" — Apply) so even large WALs commit safely, but the initial seal write is one-shot. Oversized seals
@@ -1323,6 +1369,36 @@ Tests should be invariant-driven.
 
 Property-test iteration counts should come from QuickCheck's default environment handling; do not hardcode counts in
 test bodies.
+
+---
+
+## Documented Deviations
+
+Two design-shape choices in this document do not exactly match the
+landed code; the deviations are preserved deliberately and called out
+here so future readers don't reconcile them as bugs.
+
+1. **`CollectionRef<K>` carries `id + ttl`, not `id + ttl + commit_mode + scope`.**
+   `commit_mode` lives on `TransactionValueStore::mode` where the
+   runtime check on `seal` vs. `direct_apply` actually runs;
+   `EventScopeId` lives on `KeyedStateContext::scope` and is consumed by
+   `DirtyStoreProvider<ValueKind>::for_scope`. The design's
+   type-level proof intent is preserved because every code path that
+   hands a `CollectionRef` to a store knows its mode and scope
+   contextually — the runtime fields would duplicate that information.
+
+2. **`Read<T> { Present, Absent, Unknown }`, not `DirtyRead<T> { Hit, Miss }`.**
+   The three-valued shape is strictly more expressive: layered caches
+   need `Unknown` to fall through to backing stores. A two-valued
+   `DirtyRead` cannot survive cache layering — `Miss` would collapse
+   "known absent" and "cache empty" into a single answer, breaking the
+   `Layered<Cache, Backing>` contract.
+
+3. **`OpStream<K>` / `WalOpStream<K>` deferred to Map/Deque slices.**
+   Value's last-writer-wins fold means there is no memory-pressure
+   benefit to streaming over a `WalEnvelope<K>`. The Map/Deque slice
+   that needs it will land the streaming types and rewire apply /
+   recovery to consume them.
 
 ---
 
