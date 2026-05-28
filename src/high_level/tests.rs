@@ -14,11 +14,16 @@ use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use color_eyre::Result;
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
-use std::mem::forget;
+/// Owns the helper-produced mock cluster alongside the producer so the
+/// cluster's Drop runs when the test ends (no `mem::forget` leaks).
+struct ProducerFixture {
+    producer: ProsodyProducer,
+    _cluster: MockCluster<'static, DefaultProducerContext>,
+}
 
 /// Creates a `ProsodyProducer` connected to a mock cluster with specified
 /// topics.
-fn create_producer_with_topics(topics: &[&str]) -> Result<(ProsodyProducer, String)> {
+fn create_producer_with_topics(topics: &[&str]) -> Result<ProducerFixture> {
     let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
     let bootstrap = cluster.bootstrap_servers();
 
@@ -26,21 +31,21 @@ fn create_producer_with_topics(topics: &[&str]) -> Result<(ProsodyProducer, Stri
         cluster.create_topic(topic, 1, 1)?;
     }
 
-    // Keep cluster alive for test duration
-    forget(cluster);
-
     let config = ProducerConfiguration::builder()
-        .bootstrap_servers(vec![bootstrap.clone()])
+        .bootstrap_servers(vec![bootstrap])
         .source_system("test")
         .build()?;
 
     let producer = ProsodyProducer::pipeline_producer(config, Telemetry::new().sender())?;
-    Ok((producer, bootstrap))
+    Ok(ProducerFixture {
+        producer,
+        _cluster: cluster,
+    })
 }
 
 #[test]
 fn test_missing_topics_finds_missing() -> Result<()> {
-    let (producer, _bootstrap) =
+    let fixture =
         create_producer_with_topics(&["existing-topic-1", "existing-topic-2"])?;
 
     let topics = vec![
@@ -50,7 +55,7 @@ fn test_missing_topics_finds_missing() -> Result<()> {
         "another-missing".into(),
     ];
 
-    let result = missing_topics(&producer, topics)?;
+    let result = missing_topics(&fixture.producer, topics)?;
 
     assert_eq!(result.len(), 2);
     assert!(result.contains(&Topic::from("missing-topic")));
@@ -60,7 +65,7 @@ fn test_missing_topics_finds_missing() -> Result<()> {
 
 #[test]
 fn test_missing_topics_ignores_pattern_subscriptions() -> Result<()> {
-    let (producer, _bootstrap) = create_producer_with_topics(&["real-topic"])?;
+    let fixture = create_producer_with_topics(&["real-topic"])?;
 
     let topics = vec![
         "real-topic".into(),
@@ -69,7 +74,7 @@ fn test_missing_topics_ignores_pattern_subscriptions() -> Result<()> {
         "^another-pattern".into(),
     ];
 
-    let result = missing_topics(&producer, topics)?;
+    let result = missing_topics(&fixture.producer, topics)?;
 
     // Pattern topics (starting with ^) should be filtered out
     assert_eq!(result.len(), 1);
@@ -81,11 +86,11 @@ fn test_missing_topics_ignores_pattern_subscriptions() -> Result<()> {
 
 #[test]
 fn test_missing_topics_all_exist() -> Result<()> {
-    let (producer, _bootstrap) = create_producer_with_topics(&["topic-1", "topic-2", "topic-3"])?;
+    let fixture = create_producer_with_topics(&["topic-1", "topic-2", "topic-3"])?;
 
     let topics = vec!["topic-1".into(), "topic-2".into(), "topic-3".into()];
 
-    let result = missing_topics(&producer, topics)?;
+    let result = missing_topics(&fixture.producer, topics)?;
 
     assert!(result.is_empty());
     Ok(())
@@ -93,7 +98,7 @@ fn test_missing_topics_all_exist() -> Result<()> {
 
 #[test]
 fn test_missing_topics_handles_duplicates() -> Result<()> {
-    let (producer, _bootstrap) = create_producer_with_topics(&["existing"])?;
+    let fixture = create_producer_with_topics(&["existing"])?;
 
     let topics = vec![
         "existing".into(),
@@ -102,7 +107,7 @@ fn test_missing_topics_handles_duplicates() -> Result<()> {
         "existing".into(), // Duplicate
     ];
 
-    let result = missing_topics(&producer, topics)?;
+    let result = missing_topics(&fixture.producer, topics)?;
 
     // Should deduplicate and return only unique missing topics
     assert_eq!(result.len(), 1);
@@ -112,11 +117,11 @@ fn test_missing_topics_handles_duplicates() -> Result<()> {
 
 #[test]
 fn test_missing_topics_empty_list() -> Result<()> {
-    let (producer, _bootstrap) = create_producer_with_topics(&["some-topic"])?;
+    let fixture = create_producer_with_topics(&["some-topic"])?;
 
     let topics = vec![];
 
-    let result = missing_topics(&producer, topics)?;
+    let result = missing_topics(&fixture.producer, topics)?;
 
     assert!(result.is_empty());
     Ok(())
@@ -124,11 +129,11 @@ fn test_missing_topics_empty_list() -> Result<()> {
 
 #[test]
 fn test_missing_topics_only_patterns() -> Result<()> {
-    let (producer, _bootstrap) = create_producer_with_topics(&["real-topic"])?;
+    let fixture = create_producer_with_topics(&["real-topic"])?;
 
     let topics = vec!["^pattern1.*".into(), "^pattern2.*".into()];
 
-    let result = missing_topics(&producer, topics)?;
+    let result = missing_topics(&fixture.producer, topics)?;
 
     // All pattern topics should be filtered out
     assert!(result.is_empty());
@@ -137,7 +142,7 @@ fn test_missing_topics_only_patterns() -> Result<()> {
 
 #[test]
 fn test_missing_topics_edge_cases() -> Result<()> {
-    let (producer, _bootstrap) = create_producer_with_topics(&["normal-topic"])?;
+    let fixture = create_producer_with_topics(&["normal-topic"])?;
 
     let topics = vec![
         "normal-topic".into(),
@@ -147,7 +152,7 @@ fn test_missing_topics_edge_cases() -> Result<()> {
         "".into(),                    // Empty string
     ];
 
-    let result = missing_topics(&producer, topics)?;
+    let result = missing_topics(&fixture.producer, topics)?;
 
     // Should filter out ^ and ^a (start with ^), but not missing^not-pattern
     // Empty string should be processed normally
@@ -159,6 +164,13 @@ fn test_missing_topics_edge_cases() -> Result<()> {
     Ok(())
 }
 
+/// Owns the helper-produced mock cluster alongside the
+/// `HighLevelClient` so the cluster's Drop runs at end of test.
+struct ClientFixture {
+    client: HighLevelClient<()>,
+    _cluster: MockCluster<'static, DefaultProducerContext>,
+}
+
 /// Helper function to create a `HighLevelClient` for source system testing.
 ///
 /// # Arguments
@@ -168,14 +180,12 @@ fn test_missing_topics_edge_cases() -> Result<()> {
 ///
 /// # Returns
 ///
-/// A configured `HighLevelClient` instance.
-fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<HighLevelClient<()>> {
+/// A configured `HighLevelClient` instance plus the underlying mock
+/// cluster (kept alive for the test).
+fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<ClientFixture> {
     let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
     let bootstrap = cluster.bootstrap_servers();
     cluster.create_topic("test-topic", 1, 1)?;
-
-    // Keep cluster alive for test duration
-    forget(cluster);
 
     // Create producer configuration
     let mut producer_builder = ProducerConfiguration::builder();
@@ -212,12 +222,16 @@ fn create_test_client(group_id: &str, source_system: Option<&str>) -> Result<Hig
     };
     let cassandra_builder = CassandraConfigurationBuilder::default();
 
-    Ok(HighLevelClient::new(
+    let client = HighLevelClient::new(
         Mode::Pipeline,
         &mut producer_builder,
         &consumer_builders,
         &cassandra_builder,
-    )?)
+    )?;
+    Ok(ClientFixture {
+        client,
+        _cluster: cluster,
+    })
 }
 
 #[test]
@@ -225,10 +239,10 @@ fn test_source_system_defaults_to_consumer_group() -> Result<()> {
     let group_id = "my-test-group";
 
     // Create client WITHOUT specifying source_system
-    let client = create_test_client(group_id, None)?;
+    let fixture = create_test_client(group_id, None)?;
 
     // Verify that source_system() returns the consumer group_id
-    assert_eq!(client.source_system(), group_id);
+    assert_eq!(fixture.client.source_system(), group_id);
     Ok(())
 }
 
@@ -238,10 +252,10 @@ fn test_source_system_explicit_value_preserved() -> Result<()> {
     let group_id = "my-test-group";
 
     // Create client WITH explicit source_system
-    let client = create_test_client(group_id, Some(explicit_source))?;
+    let fixture = create_test_client(group_id, Some(explicit_source))?;
 
     // Verify that source_system() returns the explicit value, NOT group_id
-    assert_eq!(client.source_system(), explicit_source);
-    assert_ne!(client.source_system(), group_id);
+    assert_eq!(fixture.client.source_system(), explicit_source);
+    assert_ne!(fixture.client.source_system(), group_id);
     Ok(())
 }

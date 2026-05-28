@@ -34,6 +34,8 @@ pub mod recovering;
 pub mod value;
 
 #[cfg(test)]
+mod dirty_value_test_suite;
+#[cfg(test)]
 mod encoding_tests;
 #[cfg(test)]
 mod tests;

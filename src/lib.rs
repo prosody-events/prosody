@@ -227,8 +227,9 @@ use fixedstr::Flexstr;
 use internment::Intern;
 use rdkafka::mocking::MockCluster;
 use std::env;
-use std::mem::forget;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, LazyLock};
+use std::thread::{self, park};
 
 pub mod admin;
 pub mod cassandra;
@@ -256,31 +257,53 @@ pub use crate::error::{ClassifyError, ErrorCategory};
 ///
 /// Creates a single shared mock cluster with 3 brokers and topics from the
 /// `PROSODY_SUBSCRIBED_TOPICS` environment variable to facilitate testing
-/// without requiring a real Kafka cluster. The cluster is initialized the first
-/// time it's accessed and persists for the duration of the program.
+/// without requiring a real Kafka cluster. The cluster is initialized the
+/// first time it's accessed and persists for the duration of the program.
+///
+/// `rdkafka::MockCluster` holds a raw `*mut` pointer and is therefore not
+/// `Sync` — it can't live inside a `static`. Instead, a dedicated owner
+/// thread holds the cluster on its stack and parks indefinitely; the
+/// bootstrap servers are returned through a channel. This keeps the
+/// resource owned by a real stack frame (no `mem::forget`, no `Box::leak`,
+/// no `unsafe` Sync impl) while keeping the cluster alive for the lifetime
+/// of the process.
 #[expect(
     clippy::expect_used,
     reason = "LazyLock requires non-fallible closure; test infra cannot recover from failure"
 )]
 static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
-    let cluster = MockCluster::new(3).expect("Failed to create mock Kafka cluster");
-    let bootstrap = cluster.bootstrap_servers();
+    let (tx, rx) = sync_channel::<String>(1);
+    thread::Builder::new()
+        .name("prosody-mock-cluster".into())
+        .spawn(move || {
+            let cluster = MockCluster::new(3).expect("Failed to create mock Kafka cluster");
+            let bootstrap = cluster.bootstrap_servers();
 
-    // Create topics from environment variable if set
-    if let Ok(topics_str) = env::var("PROSODY_SUBSCRIBED_TOPICS") {
-        for topic in topics_str.split(',') {
-            let topic = topic.trim();
-            if !topic.is_empty() {
-                cluster
-                    .create_topic(topic, 3, 3)
-                    .expect("Failed to create mock topic");
+            // Create topics from environment variable if set
+            if let Ok(topics_str) = env::var("PROSODY_SUBSCRIBED_TOPICS") {
+                for topic in topics_str.split(',') {
+                    let topic = topic.trim();
+                    if !topic.is_empty() {
+                        cluster
+                            .create_topic(topic, 3, 3)
+                            .expect("Failed to create mock topic");
+                    }
+                }
             }
-        }
-    }
 
-    // Keep cluster alive for program duration
-    forget(cluster);
-
+            tx.send(bootstrap)
+                .expect("Failed to publish mock cluster bootstrap");
+            // Park indefinitely so the cluster (owned by this stack frame)
+            // outlives every caller. The OS reclaims the thread on process
+            // exit.
+            loop {
+                park();
+            }
+        })
+        .expect("Failed to spawn mock-cluster owner thread");
+    let bootstrap = rx
+        .recv()
+        .expect("mock-cluster owner thread failed to start");
     info!("started mock cluster on {bootstrap}");
     bootstrap
 });

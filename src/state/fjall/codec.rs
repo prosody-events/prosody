@@ -31,7 +31,7 @@
 use super::error::FjallValueStoreError;
 use crate::state::encoding::{PayloadEncoding, decode_payload, encode_payload};
 use crate::state::value::{StoredPayload, ValueKind};
-use crate::state::{CollectionId, CollectionKind, Read, StateType};
+use crate::state::{CollectionId, CollectionKind, EventScopeId, Read, StateType};
 use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -43,6 +43,10 @@ const CACHE_TAG_PRESENT: u8 = 0x01;
 
 /// Payload encoding used for cached `Present` cells.
 const CACHE_PAYLOAD_ENCODING: PayloadEncoding = PayloadEncoding::MsgpackZstdV1;
+
+/// Payload encoding used for dirty op values. Plain `MsgPack` — ops are
+/// small and ephemeral; compressing them adds CPU for no real saving.
+pub(super) const DIRTY_OP_ENCODING: PayloadEncoding = PayloadEncoding::MsgpackV1;
 
 /// Returns the 16-byte collection prefix for a typed collection identity.
 ///
@@ -132,6 +136,75 @@ fn state_type_to_u8(state_type: StateType) -> u8 {
     match state_type {
         StateType::Application => 0,
     }
+}
+
+/// Returns the 16-byte scope-qualified prefix for a dirty workspace key.
+///
+/// The prefix folds the event scope into the cache's existing collection
+/// hash so two concurrent events on the same Kafka partition cannot collide
+/// in the shared dirty workspace.
+#[must_use]
+pub fn scope_collection_prefix<K>(scope: EventScopeId, id: &CollectionId<K>) -> [u8; 16]
+where
+    K: CollectionKind,
+{
+    let collection = collection_prefix(id);
+    let mut buf = [0_u8; 32];
+    buf[..16].copy_from_slice(&scope.get().to_be_bytes());
+    buf[16..].copy_from_slice(&collection);
+    xxh3_128(&buf).to_be_bytes()
+}
+
+/// Returns the `dirty_ops` partition key for `(scope, collection, seq)`.
+///
+/// `seq` is encoded big-endian so the ordered scan over the prefix yields
+/// ops in insertion order.
+#[must_use]
+pub fn dirty_ops_key<K>(scope: EventScopeId, id: &CollectionId<K>, seq: u64) -> [u8; 24]
+where
+    K: CollectionKind,
+{
+    let prefix = scope_collection_prefix(scope, id);
+    let mut buf = [0_u8; 24];
+    buf[..16].copy_from_slice(&prefix);
+    buf[16..].copy_from_slice(&seq.to_be_bytes());
+    buf
+}
+
+/// Returns the `dirty_overlay` / `dirty_meta` partition key for
+/// `(scope, collection)`.
+#[must_use]
+pub fn dirty_collection_key<K>(scope: EventScopeId, id: &CollectionId<K>) -> [u8; 16]
+where
+    K: CollectionKind,
+{
+    scope_collection_prefix(scope, id)
+}
+
+/// Encodes the `dirty_meta` value as `[next_seq u64 LE][op_count u64 LE]`.
+#[must_use]
+pub fn encode_dirty_meta(next_seq: u64, op_count: u64) -> [u8; 16] {
+    let mut buf = [0_u8; 16];
+    buf[..8].copy_from_slice(&next_seq.to_le_bytes());
+    buf[8..].copy_from_slice(&op_count.to_le_bytes());
+    buf
+}
+
+/// Decodes a `dirty_meta` value into `(next_seq, op_count)`.
+///
+/// # Errors
+///
+/// Returns [`FjallValueStoreError::CorruptDirtyMeta`] when the cell does
+/// not have exactly 16 bytes.
+pub fn decode_dirty_meta(bytes: &[u8]) -> Result<(u64, u64), FjallValueStoreError> {
+    let arr: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| FjallValueStoreError::CorruptDirtyMeta(bytes.len()))?;
+    let mut a = [0_u8; 8];
+    let mut b = [0_u8; 8];
+    a.copy_from_slice(&arr[..8]);
+    b.copy_from_slice(&arr[8..]);
+    Ok((u64::from_le_bytes(a), u64::from_le_bytes(b)))
 }
 
 #[cfg(test)]

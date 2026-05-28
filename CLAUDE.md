@@ -36,6 +36,15 @@ If you can't name the invariant, you don't yet understand the code well enough t
 - Propagate errors with `?` unless explicitly authorized to swallow
 - Use `thiserror` for structured errors; box only when Clippy warns
 
+**Memory:**
+
+- **Never leak memory.** `std::mem::forget`, `Box::leak`, and `ManuallyDrop`
+  without an explicit reclamation path are forbidden. If a test or
+  production path needs to simulate "Drop never ran" (e.g. crash
+  simulation), reproduce the on-disk / on-wire state directly — open the
+  underlying store and seed it without going through the type whose Drop
+  would clean up. Forgetting is never the shortcut.
+
 **Code Quality:**
 
 - Clippy must pass for code and tests - zero warnings tolerated

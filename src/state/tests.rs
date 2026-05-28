@@ -1,3 +1,4 @@
+use super::dirty_value_test_suite::{self, DirtyTrace};
 use super::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
 use super::value::{
     DurableWalStore, TransactionValueStore, TransactionValueStoreError, ValueStore, fold_value_ops,
@@ -188,4 +189,17 @@ fn prop_direct_mode_never_creates_wal() {
     }
 
     QuickCheck::new().quickcheck(property as fn(DirectTrace) -> bool);
+}
+
+#[test]
+fn prop_memory_dirty_satisfies_invariants() {
+    fn property(trace: DirtyTrace) -> bool {
+        executor::block_on(dirty_value_test_suite::run_dirty_trace(
+            MemoryDirtyValueStore::new(),
+            trace,
+        ))
+        .unwrap_or(false)
+    }
+
+    QuickCheck::new().quickcheck(property as fn(DirtyTrace) -> bool);
 }

@@ -33,6 +33,11 @@ pub enum FjallValueStoreError {
     /// The blocking task that ran a fjall call failed (panic or cancel).
     #[error("fjall blocking task failed: {0}")]
     BlockingTaskJoin(#[from] JoinError),
+
+    /// A dirty-meta row carried bytes that did not match the
+    /// `[next_seq u64 LE][op_count u64 LE]` layout.
+    #[error("corrupt dirty meta row: expected 16 bytes, got {0}")]
+    CorruptDirtyMeta(usize),
 }
 
 impl From<FjallEngineError> for FjallValueStoreError {
@@ -52,7 +57,8 @@ impl ClassifyError for FjallValueStoreError {
             Self::Encoding(_)
             | Self::UnknownCacheTag(_)
             | Self::EmptyCacheCell
-            | Self::EmptyPresentPayload => ErrorCategory::Permanent,
+            | Self::EmptyPresentPayload
+            | Self::CorruptDirtyMeta(_) => ErrorCategory::Permanent,
         }
     }
 }

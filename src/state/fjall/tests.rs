@@ -9,25 +9,29 @@
 //! `LayeredValueStore<FjallValueStore, CassandraValueStore>` and are
 //! gated on `INTEGRATION_TESTS` like the other Cassandra tests.
 
-use super::FjallValueStore;
+use super::{AssignmentEpoch, FjallClient, FjallDirtyValueStore, FjallValueStore};
 use crate::Key;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::{CassandraValueStore, ValueQueries};
+use crate::state::dirty_value_test_suite::{self, DirtyTrace};
 use crate::state::layered::LayeredValueStore;
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore};
 use crate::state::oracle::CommitOracle;
 use crate::state::recovering::RecoveringValueStore;
-use crate::state::value::{StoredPayload, TransactionValueStore, ValueKind, ValueStore};
+use crate::state::value::{
+    PendingOpSource, StoredPayload, TransactionValueStore, ValueKind, ValueStore,
+};
 use crate::state::value_test_suite::{self, DirectTrace, TEST_TTL, Trace, collection_ref, inline};
 use crate::state::{
-    CollectionId, CommitDecision, CommitMode, EventRef, Read, StateKey, StateName, StateType,
-    StoreOutcome,
+    CollectionId, CommitDecision, CommitMode, EventRef, EventScopeId, Read, StateKey, StateName,
+    StateType, StoreOutcome,
 };
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
+use fjall::{Config, PartitionCreateOptions};
 use parking_lot::Mutex;
 use quickcheck::{QuickCheck, TestResult};
 use std::env;
@@ -45,6 +49,19 @@ fn make_cache() -> Result<(TempDir, FjallValueStore)> {
     let dir = tempfile::tempdir()?;
     let store = FjallValueStore::for_test(&dir)?;
     Ok((dir, store))
+}
+
+fn make_dirty(scope: EventScopeId) -> Result<(TempDir, FjallDirtyValueStore)> {
+    let dir = tempfile::tempdir()?;
+    let keyspace = Arc::new(Config::new(dir.path()).open()?);
+    let ops = keyspace.open_partition("value_dirty_ops", PartitionCreateOptions::default())?;
+    let overlay =
+        keyspace.open_partition("value_dirty_overlay", PartitionCreateOptions::default())?;
+    let meta = keyspace.open_partition("value_dirty_meta", PartitionCreateOptions::default())?;
+    Ok((
+        dir,
+        FjallDirtyValueStore::new(keyspace, ops, overlay, meta, scope),
+    ))
 }
 
 fn key(value: &str) -> Key {
@@ -658,6 +675,223 @@ impl ClassifyError for FaultyError {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Permanent
     }
+}
+
+// ---- FjallDirtyValueStore directed + property tests -------------------------
+
+#[tokio::test]
+async fn fjall_dirty_set_then_get_returns_present() -> Result<()> {
+    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let id = collection_id("present")?;
+    let payload = inline(7);
+    dirty.set(&id, payload.clone()).await?;
+    assert_eq!(dirty.get(&id).await?, Read::Present(payload));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fjall_dirty_clear_then_get_returns_absent() -> Result<()> {
+    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let id = collection_id("absent")?;
+    dirty.clear(&id).await?;
+    assert_eq!(dirty.get(&id).await?, Read::Absent);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fjall_dirty_untouched_collection_returns_unknown() -> Result<()> {
+    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let id = collection_id("untouched")?;
+    assert_eq!(dirty.get(&id).await?, Read::Unknown);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fjall_dirty_two_sets_increment_seq() -> Result<()> {
+    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let id = collection_id("multi")?;
+    dirty.set(&id, inline(1)).await?;
+    dirty.set(&id, inline(2)).await?;
+    let pending = dirty
+        .pending_ops(&id)?
+        .ok_or_else(|| eyre::eyre!("expected Some(pending)"))?;
+    assert_eq!(pending.count.get(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fjall_dirty_clear_pending_ops_removes_overlay_meta_and_ops() -> Result<()> {
+    let (_dir, dirty) = make_dirty(EventScopeId::fresh())?;
+    let id = collection_id("drained")?;
+    dirty.set(&id, inline(1)).await?;
+    dirty.set(&id, inline(2)).await?;
+    dirty.clear_pending_ops(&id)?;
+    assert!(dirty.pending_ops(&id)?.is_none());
+    assert_eq!(dirty.get(&id).await?, Read::Unknown);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fjall_dirty_scope_isolation_two_scopes_dont_interfere() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let keyspace = Arc::new(fjall::Config::new(dir.path()).open()?);
+    let ops = keyspace.open_partition("value_dirty_ops", PartitionCreateOptions::default())?;
+    let overlay =
+        keyspace.open_partition("value_dirty_overlay", PartitionCreateOptions::default())?;
+    let meta = keyspace.open_partition("value_dirty_meta", PartitionCreateOptions::default())?;
+
+    let scope_a = EventScopeId::fresh();
+    let scope_b = EventScopeId::fresh();
+    let dirty_a = FjallDirtyValueStore::new(
+        Arc::clone(&keyspace),
+        ops.clone(),
+        overlay.clone(),
+        meta.clone(),
+        scope_a,
+    );
+    let dirty_b = FjallDirtyValueStore::new(keyspace, ops, overlay, meta, scope_b);
+
+    let id = collection_id("shared")?;
+    dirty_a.set(&id, inline(9)).await?;
+    assert_eq!(dirty_a.get(&id).await?, Read::Present(inline(9)));
+    assert_eq!(dirty_b.get(&id).await?, Read::Unknown);
+    assert!(dirty_b.pending_ops(&id)?.is_none());
+    Ok(())
+}
+
+fn fjall_dirty_property(trace: DirtyTrace) -> bool {
+    let scope = EventScopeId::fresh();
+    let Ok((_dir, dirty)) = make_dirty(scope) else {
+        return false;
+    };
+    TEST_RUNTIME
+        .block_on(dirty_value_test_suite::run_dirty_trace(dirty, trace))
+        .unwrap_or(false)
+}
+
+#[test]
+fn prop_fjall_dirty_satisfies_invariants() {
+    QuickCheck::new().quickcheck(fjall_dirty_property as fn(DirtyTrace) -> bool);
+}
+
+fn fjall_dirty_matches_memory_property(trace: DirtyTrace) -> bool {
+    let scope = EventScopeId::fresh();
+    let Ok((_dir, fjall_dirty)) = make_dirty(scope) else {
+        return false;
+    };
+    let memory_dirty = MemoryDirtyValueStore::new();
+    TEST_RUNTIME
+        .block_on(dirty_value_test_suite::run_dirty_parity(
+            fjall_dirty,
+            memory_dirty,
+            trace,
+        ))
+        .unwrap_or(false)
+}
+
+#[test]
+fn prop_fjall_dirty_matches_memory_dirty() {
+    QuickCheck::new().quickcheck(fjall_dirty_matches_memory_property as fn(DirtyTrace) -> bool);
+}
+
+// ---- FjallClient + FjallWorkspace tests -------------------------------------
+
+use crate::Partition;
+use crate::Topic;
+use crate::state::fjall::FjallConfiguration;
+use crate::timers::datetime::CompactDateTime;
+
+fn make_client(dir: &TempDir) -> Result<Arc<FjallClient>> {
+    let config = FjallConfiguration::builder()
+        .cache_dir(dir.path().to_path_buf())
+        .build()?;
+    Ok(FjallClient::open(&config)?)
+}
+
+#[tokio::test]
+async fn fjall_workspace_drop_deletes_all_four_partitions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = make_client(&dir)?;
+    let topic: Topic = "test-topic".into();
+    let partition: Partition = 7;
+    let epoch = AssignmentEpoch::now()?;
+
+    let before = client.keyspace().partition_count();
+    let ws = client.workspace(topic, partition, epoch)?;
+    let mid = client.keyspace().partition_count();
+    assert_eq!(mid, before + 4, "workspace should add four partitions");
+    drop(ws);
+    // Drop the workspace; fjall delete_partition is synchronous.
+    let after = client.keyspace().partition_count();
+    assert_eq!(
+        after, before,
+        "workspace Drop should delete all four partitions"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fjall_client_open_sweeps_orphaned_partitions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Simulate a crash: open a bare keyspace, create several `value_*`
+    // partitions, then drop the keyspace without going through
+    // `FjallWorkspace::Drop`. The on-disk partitions persist; the next
+    // process startup must reap them.
+    {
+        let keyspace = fjall::Config::new(dir.path()).open()?;
+        for name in [
+            "value_cache_aaaaaa",
+            "value_dirty_ops_aaaaaa",
+            "value_dirty_overlay_aaaaaa",
+            "value_dirty_meta_aaaaaa",
+            "untouched_partition",
+        ] {
+            let _handle = keyspace.open_partition(name, PartitionCreateOptions::default())?;
+        }
+        // `keyspace` goes out of scope here without any `delete_partition`
+        // calls — exactly the state a crashed process leaves behind.
+    }
+
+    // Process restart: opening a FjallClient must wipe the stale
+    // workspaces and leave non-`value_*` partitions alone.
+    let client = make_client(&dir)?;
+    let surviving: Vec<_> = client.keyspace().list_partitions();
+    let value_partitions: Vec<_> = surviving
+        .iter()
+        .filter(|name| name.starts_with("value_"))
+        .collect();
+    assert!(
+        value_partitions.is_empty(),
+        "FjallClient::open must sweep stale value_* partitions; surviving: {value_partitions:?}"
+    );
+    assert!(
+        surviving.iter().any(|name| name.as_ref() == "untouched_partition"),
+        "non-`value_*` partitions must not be swept"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fjall_workspace_distinct_epochs_dont_collide() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = make_client(&dir)?;
+    let topic: Topic = "tt".into();
+    let partition: Partition = 0;
+    let epoch_a = AssignmentEpoch::new(CompactDateTime::from(100_u32));
+    let epoch_b = AssignmentEpoch::new(CompactDateTime::from(200_u32));
+
+    let _ws_a = client.workspace(topic, partition, epoch_a)?;
+    let _ws_b = client.workspace(topic, partition, epoch_b)?;
+    // Each workspace minted four distinct partitions: 8 total.
+    let value_count = client
+        .keyspace()
+        .list_partitions()
+        .into_iter()
+        .filter(|name| name.starts_with("value_"))
+        .count();
+    assert_eq!(value_count, 8);
+    Ok(())
 }
 
 // ---- error conversion helpers -----------------------------------------------

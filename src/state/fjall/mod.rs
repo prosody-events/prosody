@@ -24,13 +24,17 @@
 
 mod codec;
 mod config;
+mod dirty;
 mod error;
+mod workspace;
 
 #[cfg(test)]
 mod tests;
 
 pub use config::{FjallConfiguration, FjallConfigurationBuilder};
+pub use dirty::FjallDirtyValueStore;
 pub use error::FjallValueStoreError;
+pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspace};
 
 use crate::state::value::{StoredPayload, ValueKind, ValueStore};
 use crate::state::{CollectionId, Read};
