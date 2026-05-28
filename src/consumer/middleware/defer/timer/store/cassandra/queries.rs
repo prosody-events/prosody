@@ -25,21 +25,28 @@ pub struct DeferredNextTimer {
 cassandra_queries! {
     /// Container for all prepared Cassandra CQL statements used by the timer defer store.
     pub struct Queries {
-        /// Static-column read (`next_timer` UDT, `retry_count`) — zero clustering scan.
+        /// Static-column read (`next_timer` UDT, `retry_count`).
+        ///
+        /// Selects only static columns. `ORDER BY original_time DESC LIMIT 1`
+        /// resolves the static row on the live tail of the partition —
+        /// FIFO completion leaves a tombstone graveyard at low
+        /// `original_time`, and a forward `LIMIT 1` walks straight
+        /// through it. Reverse scan is the same I/O cost when paired
+        /// with `LIMIT 1` and skips the graveyard.
         get_next_static: (
-            "SELECT next_timer, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            "SELECT next_timer, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? ORDER BY original_time DESC LIMIT 1",
             TABLE_DEFERRED_TIMERS
         ),
 
         /// Successor probe: first clustering row with `original_time > ?`.
         probe_next: (
-            "SELECT original_time, span, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND original_time > ? LIMIT 1",
+            "SELECT original_time, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND original_time > ? LIMIT 1",
             TABLE_DEFERRED_TIMERS
         ),
 
         /// Minimum-row probe for legacy on-read repair: lowest clustering row in the partition.
         probe_min: (
-            "SELECT original_time, span, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            "SELECT original_time, span FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
             TABLE_DEFERRED_TIMERS
         ),
 

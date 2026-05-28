@@ -8,21 +8,28 @@ use crate::cassandra_queries;
 cassandra_queries! {
     /// Container for all prepared Cassandra CQL statements used by the defer store.
     pub struct Queries {
-        /// Static-column read (`next_offset`, `retry_count`) — zero clustering scan.
+        /// Static-column read (`next_offset`, `retry_count`).
+        ///
+        /// Selects only static columns. `ORDER BY offset DESC LIMIT 1`
+        /// resolves the static row on the live tail of the partition —
+        /// FIFO completion leaves a tombstone graveyard at low `offset`,
+        /// and a forward `LIMIT 1` walks straight through it. Reverse
+        /// scan is the same I/O cost when paired with `LIMIT 1` and
+        /// skips the graveyard.
         get_next_static: (
-            "SELECT next_offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ?",
+            "SELECT next_offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? ORDER BY offset DESC LIMIT 1",
             TABLE_DEFERRED_OFFSETS
         ),
 
         /// Successor probe: first clustering row with `offset > ?`.
         probe_next: (
-            "SELECT offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND offset > ? LIMIT 1",
+            "SELECT offset FROM $keyspace.{} WHERE segment_id = ? AND key = ? AND offset > ? LIMIT 1",
             TABLE_DEFERRED_OFFSETS
         ),
 
         /// Minimum-row probe for legacy on-read repair: lowest clustering row in the partition.
         probe_min: (
-            "SELECT offset, retry_count FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            "SELECT offset FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
             TABLE_DEFERRED_OFFSETS
         ),
 
