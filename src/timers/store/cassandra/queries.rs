@@ -38,9 +38,15 @@ cassandra_queries! {
             TABLE_SEGMENTS
         ),
 
-        /// Gets segment metadata by ID
+        /// Gets segment metadata by ID.
+        ///
+        /// Selects only static columns. `ORDER BY slab_id DESC` resolves the
+        /// row on the live tail of the partition — the sweeper (PR #34) leaves
+        /// a tombstone graveyard at low `slab_id`, and a forward `LIMIT 1`
+        /// walks straight through it on every startup. Reverse scan is the
+        /// same I/O cost when paired with `LIMIT 1` and skips the graveyard.
         get_segment: (
-            "SELECT name, slab_size, version FROM $keyspace.{} WHERE id = ? LIMIT 1",
+            "SELECT name, slab_size, version FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
             TABLE_SEGMENTS
         ),
 
@@ -246,15 +252,22 @@ cassandra_queries! {
         // State Column Operations (Inline/Overflow Timer State)
         // =========================================================================
 
-        /// Gets the `state` static map column for a key partition
+        /// Gets the `state` static map column for a key partition.
+        ///
+        /// `ORDER BY timer_type DESC` resolves on the high tail of the
+        /// clustering iterator: fired-row tombstones skew toward low
+        /// `(timer_type, time)`, so reverse scan avoids the same graveyard
+        /// pattern that the segments table exhibits in production.
         get_state: (
-            "SELECT state FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            "SELECT state FROM $keyspace.{} WHERE segment_id = ? AND key = ? ORDER BY timer_type DESC LIMIT 1",
             TABLE_TYPED_KEYS
         ),
 
-        /// Gets a single entry from the `state` static map column for a key partition
+        /// Gets a single entry from the `state` static map column for a key partition.
+        ///
+        /// See `get_state` for the rationale behind the reverse scan.
         get_state_entry: (
-            "SELECT state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ? LIMIT 1",
+            "SELECT state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ? ORDER BY timer_type DESC LIMIT 1",
             TABLE_TYPED_KEYS
         ),
 
@@ -476,8 +489,13 @@ cassandra_queries! {
         ///
         /// Returns `Option<i32>` (Cassandra static columns are NULL until set).
         /// `None` = pre-migration / fresh segment → scheduler scans from `slab_id = 0`.
+        ///
+        /// `ORDER BY slab_id DESC` resolves on the live tail of the partition
+        /// — see `get_segment` for the full rationale; this query is read
+        /// once per scheduler-actor spawn and was a primary source of
+        /// `tombstone_warn_threshold` warnings on Kafka rebalance.
         get_slab_watermark: (
-            "SELECT slab_watermark FROM $keyspace.{} WHERE id = ? LIMIT 1",
+            "SELECT slab_watermark FROM $keyspace.{} WHERE id = ? ORDER BY slab_id DESC LIMIT 1",
             TABLE_SEGMENTS
         ),
 
