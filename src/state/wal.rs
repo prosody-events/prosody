@@ -21,19 +21,13 @@ use thiserror::Error;
 pub struct NonEmptyOps<T> {
     first: T,
     rest: Vec<T>,
-    operation_count: NonZeroU64,
 }
 
 impl<T> NonEmptyOps<T> {
     /// Creates a non-empty operation list.
     #[must_use]
     pub fn new(first: T, rest: Vec<T>) -> Self {
-        let operation_count = NonZeroU64::MIN.saturating_add(rest.len() as u64);
-        Self {
-            first,
-            rest,
-            operation_count,
-        }
+        Self { first, rest }
     }
 
     /// Creates a non-empty operation list from a vector.
@@ -66,9 +60,11 @@ impl<T> NonEmptyOps<T> {
     }
 
     /// Returns the number of operations.
+    ///
+    /// Always `1 + rest.len()` — the list holds `first` plus `rest`.
     #[must_use]
     pub fn len(&self) -> NonZeroU64 {
-        self.operation_count
+        NonZeroU64::MIN.saturating_add(self.rest.len() as u64)
     }
 }
 
