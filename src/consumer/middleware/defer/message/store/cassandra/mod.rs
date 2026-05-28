@@ -2,7 +2,9 @@
 //!
 //! Eliminates tombstone reads by maintaining a `next_offset` static column that
 //! always equals the minimum live offset. `get_next` becomes a single
-//! static-column read with zero clustering scan.
+//! static-column read that resolves on the live tail of the partition
+//! (`ORDER BY offset DESC LIMIT 1`), skipping the FIFO tombstone graveyard at
+//! low `offset`.
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
@@ -134,10 +136,10 @@ impl CassandraMessageDeferStore {
         let row_opt = probe
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(Option<Offset>, Option<i32>)>()
+            .maybe_first_row::<(Option<Offset>,)>()
             .map_err(CassandraStoreError::from)?;
 
-        let Some((Some(min_offset), _)) = row_opt else {
+        let Some((Some(min_offset),)) = row_opt else {
             // No clustering row exists — orphan `retry_count`. `next_offset =
             // NULL` is already the correct state; do not issue a repair.
             return Ok(None);
@@ -176,10 +178,10 @@ impl CassandraMessageDeferStore {
         let row_opt = result
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(Option<Offset>, Option<i32>)>()
+            .maybe_first_row::<(Option<Offset>,)>()
             .map_err(CassandraStoreError::from)?;
 
-        Ok(row_opt.and_then(|(offset_opt, _)| offset_opt))
+        Ok(row_opt.and_then(|(offset_opt,)| offset_opt))
     }
 
     /// Resolves `cur_next` from cache; falls back to a static-column DB read on
@@ -257,7 +259,8 @@ impl MessageDeferStore for CassandraMessageDeferStore {
             return Ok(cached);
         }
 
-        // Cache miss: single static-column read, zero clustering scan
+        // Cache miss: single static-column read, reverse-scan skips the
+        // FIFO tombstone graveyard at low `offset`.
         let segment_id = self.segment_id().await?;
         let result = self.read_next_static(&segment_id, key).await?;
         self.cache.insert(Arc::clone(key), result);
@@ -527,8 +530,8 @@ impl CassandraMessageDeferStore {
             .execute_unpaged(&self.queries.probe_min, (&segment_id, key.as_ref()))
             .await?
             .into_rows_result()?
-            .maybe_first_row::<(Option<Offset>, Option<i32>)>()?;
-        let has_clustering = matches!(probe, Some((Some(_), _)));
+            .maybe_first_row::<(Option<Offset>,)>()?;
+        let has_clustering = matches!(probe, Some((Some(_),)));
 
         Ok((has_clustering, next_set, rc_set))
     }
@@ -1168,6 +1171,108 @@ mod legacy_repair_tests {
         let db_next = store.read_next_offset_for_invariant_check(&k).await?;
         assert_eq!(db_next, None);
         assert_eq!(store.cache.get(k.as_ref()), Some(None));
+        Ok(())
+    }
+}
+
+/// Regression test for `tombstone_warn_threshold` warnings emitted by
+/// `read_next_static` on FIFO-completed partitions.
+///
+/// The query selects only static columns from `deferred_offsets` with
+/// `LIMIT 1`. With no clustering predicate, a forward scan walks the
+/// clustering iterator from the bottom up to materialise the static
+/// row — straight through the tombstone graveyard FIFO completion
+/// leaves at low `offset`. Appending `ORDER BY offset DESC` resolves
+/// on the live tail and skips the graveyard entirely.
+#[cfg(test)]
+mod tombstone_reverse_scan_tests {
+    use super::*;
+    use crate::cassandra::{CassandraConfiguration, CassandraStore};
+    use crate::{ConsumerGroup, Partition, Topic};
+
+    /// Density of the tombstone band — chosen to mimic the post-FIFO
+    /// graveyard observed in production (~5k cells per partition).
+    const TOMBSTONE_COUNT: i64 = 5_000;
+
+    async fn build_store() -> color_eyre::Result<CassandraMessageDeferStore> {
+        let config = CassandraConfiguration::builder()
+            .nodes(vec!["localhost:9042".to_owned()])
+            .keyspace("prosody_test".to_owned())
+            .build()
+            .map_err(|e| color_eyre::eyre::eyre!("Config build failed: {e}"))?;
+        let cassandra_store = CassandraStore::new(&config).await?;
+        let segment_store =
+            CassandraSegmentStore::new(cassandra_store.clone(), "prosody_test").await?;
+        let queries = Arc::new(Queries::new(cassandra_store.session(), "prosody_test").await?);
+        let segment = LazySegment::new(
+            segment_store,
+            Topic::from("test-topic"),
+            Partition::from(0_i32),
+            Arc::from(format!("test-consumer-group-{}", uuid::Uuid::new_v4())) as ConsumerGroup,
+        );
+        Ok(CassandraMessageDeferStore::new(
+            cassandra_store,
+            queries,
+            segment,
+            1_024,
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_get_next_skips_low_offset_tombstones() -> color_eyre::Result<()> {
+        let store = build_store().await?;
+        let k: Key = Arc::from(format!("tombstone-msg-{}", uuid::Uuid::new_v4()));
+        let segment_id = store
+            .segment_id()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let ttl = store.store.base_ttl();
+
+        // Seed the graveyard: INSERT + raw DELETE at low offsets, leaving
+        // tombstones without touching `next_offset`.
+        for offset in 0..TOMBSTONE_COUNT {
+            let offset = Offset::from(offset);
+            store
+                .session()
+                .execute_unpaged(
+                    &store.queries.insert_deferred_message_without_retry_count,
+                    (&segment_id, k.as_ref(), offset, ttl),
+                )
+                .await?;
+            store
+                .session()
+                .execute_unpaged(
+                    &store.queries.remove_deferred_message,
+                    (&segment_id, k.as_ref(), offset),
+                )
+                .await?;
+        }
+
+        // Live row + `next_offset` above the tombstone band — the
+        // post-FIFO-completion shape that triggers the bug.
+        let live_offset = Offset::from(TOMBSTONE_COUNT);
+        store
+            .session()
+            .execute_unpaged(
+                &store.queries.insert_deferred_message_with_retry_count,
+                (
+                    &segment_id,
+                    k.as_ref(),
+                    live_offset,
+                    0_i32,
+                    live_offset,
+                    ttl,
+                ),
+            )
+            .await?;
+        let _ = store.cache.remove(k.as_ref());
+
+        // Forward `LIMIT 1` walked the graveyard; reverse `LIMIT 1`
+        // resolves on the live tail.
+        let got = store.get_next_deferred_message(&k).await?;
+        assert_eq!(got, Some((live_offset, 0)));
+
+        store.delete_key(&k).await?;
         Ok(())
     }
 }

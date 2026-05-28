@@ -2,7 +2,9 @@
 //!
 //! Eliminates tombstone reads by maintaining a `next_timer` static UDT column
 //! that always equals the minimum live timer row. `get_next` becomes a single
-//! static-column read with zero clustering scan.
+//! static-column read that resolves on the live tail of the partition
+//! (`ORDER BY original_time DESC LIMIT 1`), skipping the FIFO tombstone
+//! graveyard at low `original_time`.
 //!
 //! # Year 2038 Note
 //!
@@ -207,14 +209,10 @@ impl CassandraTimerDeferStore {
         let row_opt = probe
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(
-                Option<CompactDateTime>,
-                Option<HashMap<String, String>>,
-                Option<i32>,
-            )>()
+            .maybe_first_row::<(Option<CompactDateTime>, Option<HashMap<String, String>>)>()
             .map_err(CassandraStoreError::from)?;
 
-        let Some((Some(min_time), span_opt, _)) = row_opt else {
+        let Some((Some(min_time), span_opt)) = row_opt else {
             // No clustering row exists — orphan `retry_count`. `next_timer =
             // NULL` is already the correct state; do not issue a repair.
             return Ok(None);
@@ -265,14 +263,10 @@ impl CassandraTimerDeferStore {
         let row_opt = result
             .into_rows_result()
             .map_err(CassandraStoreError::from)?
-            .maybe_first_row::<(
-                Option<CompactDateTime>,
-                Option<HashMap<String, String>>,
-                Option<i32>,
-            )>()
+            .maybe_first_row::<(Option<CompactDateTime>, Option<HashMap<String, String>>)>()
             .map_err(CassandraStoreError::from)?;
 
-        Ok(row_opt.and_then(|(time_opt, span_opt, _)| {
+        Ok(row_opt.and_then(|(time_opt, span_opt)| {
             time_opt.map(|time| DeferredNextTimer {
                 time,
                 span: span_opt.unwrap_or_default(),
@@ -399,7 +393,8 @@ impl TimerDeferStore for CassandraTimerDeferStore {
             }));
         }
 
-        // Cache miss: single static-column + UDT read, zero clustering scan
+        // Cache miss: single static-column + UDT read, reverse-scan skips
+        // the FIFO tombstone graveyard at low `original_time`.
         let segment_id = self.segment_id().await?;
         let entry_opt = self.read_next_static(&segment_id, key).await?;
         self.cache.insert(Arc::clone(key), entry_opt.clone());
@@ -765,12 +760,8 @@ impl CassandraTimerDeferStore {
             .execute_unpaged(&self.queries.probe_min, (&segment_id, key.as_ref()))
             .await?
             .into_rows_result()?
-            .maybe_first_row::<(
-                Option<CompactDateTime>,
-                Option<HashMap<String, String>>,
-                Option<i32>,
-            )>()?;
-        let has_clustering = matches!(probe, Some((Some(_), _, _)));
+            .maybe_first_row::<(Option<CompactDateTime>, Option<HashMap<String, String>>)>()?;
+        let has_clustering = matches!(probe, Some((Some(_), _)));
 
         Ok((has_clustering, next_set, rc_set))
     }
@@ -1640,6 +1631,104 @@ mod ttl_drift_tests {
         let base_ttl_secs: i32 = store.store.base_ttl().seconds().try_into()?;
         assert_ttl_includes_lead_time(ttl, base_ttl_secs, t, &store, "repair_legacy_partition")?;
 
+        Ok(())
+    }
+}
+
+/// Regression test for `tombstone_warn_threshold` warnings emitted by
+/// `read_next_static` on FIFO-completed partitions.
+///
+/// The query selects only static columns from `deferred_timers` with
+/// `LIMIT 1`. With no clustering predicate, a forward scan walks the
+/// clustering iterator from the bottom up to materialise the static
+/// row — straight through the tombstone graveyard FIFO completion
+/// leaves at low `original_time`. Appending `ORDER BY original_time DESC`
+/// resolves on the live tail and skips the graveyard entirely.
+#[cfg(test)]
+mod tombstone_reverse_scan_tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// Density of the tombstone band — chosen to mimic the post-FIFO
+    /// graveyard observed in production (~5k cells per partition).
+    const TOMBSTONE_COUNT: u32 = 5_000;
+
+    fn key() -> Key {
+        Arc::from(format!("tombstone-timer-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn future_time(offset_secs: u32) -> CompactDateTime {
+        let now = u32::try_from(Utc::now().timestamp()).unwrap_or(u32::MAX);
+        CompactDateTime::from(now.saturating_add(offset_secs))
+    }
+
+    #[tokio::test]
+    async fn test_get_next_skips_low_time_tombstones() -> color_eyre::Result<()> {
+        let store = tests::build_test_store().await?;
+        let k = key();
+        let segment_id = store
+            .segment_id()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let empty_span: HashMap<String, String> = HashMap::new();
+
+        // Anchor the graveyard high enough in the future that each
+        // clustering row's TTL is large; the live tail sits above the
+        // band so its `original_time` strictly orders after the
+        // tombstones.
+        let base = future_time(3_600);
+
+        for i in 0..TOMBSTONE_COUNT {
+            let t = CompactDateTime::from(base.epoch_seconds().saturating_add(i));
+            let ttl = store.store.calculate_ttl(t);
+            store
+                .session()
+                .execute_unpaged(
+                    &store.queries.insert_deferred_timer_without_retry_count,
+                    (&segment_id, k.as_ref(), t, &empty_span, ttl),
+                )
+                .await?;
+            store
+                .session()
+                .execute_unpaged(
+                    &store.queries.remove_deferred_timer,
+                    (&segment_id, k.as_ref(), t),
+                )
+                .await?;
+        }
+
+        // Live row + `next_timer` above the tombstone band.
+        let live_time = CompactDateTime::from(base.epoch_seconds().saturating_add(TOMBSTONE_COUNT));
+        let live_ttl = store.store.calculate_ttl(live_time);
+        let next_udt = queries::DeferredNextTimer {
+            time: live_time,
+            span: empty_span.clone(),
+        };
+        store
+            .session()
+            .execute_unpaged(
+                &store.queries.insert_deferred_timer_with_retry_count,
+                (
+                    &segment_id,
+                    k.as_ref(),
+                    live_time,
+                    &empty_span,
+                    0_i32,
+                    &next_udt,
+                    live_ttl,
+                ),
+            )
+            .await?;
+        let _ = store.cache.remove(k.as_ref());
+
+        // Forward `LIMIT 1` walked the graveyard; reverse `LIMIT 1`
+        // resolves on the live tail.
+        let got = store.get_next_deferred_timer(&k).await?;
+        let (trigger, rc) = got.ok_or_else(|| color_eyre::eyre::eyre!("expected timer"))?;
+        assert_eq!(trigger.time, live_time);
+        assert_eq!(rc, 0);
+
+        store.delete_key(&k).await?;
         Ok(())
     }
 }
