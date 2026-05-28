@@ -322,7 +322,7 @@ async fn state_recovery_applies_sealed_when_oracle_says_committed() -> Result<()
 
     let context = MockEventContext::new().with_timer_tracking();
     let registry = registry();
-    run_state_recovery_for_tests(
+    recover_pending_entries(
         &context,
         &durable,
         &durable,
@@ -372,7 +372,7 @@ async fn state_recovery_rolls_back_when_oracle_says_not_committed() -> Result<()
 
     let context = MockEventContext::new();
     let registry = registry();
-    run_state_recovery_for_tests(
+    recover_pending_entries(
         &context,
         &durable,
         &durable,
@@ -402,7 +402,7 @@ async fn state_recovery_with_empty_partition_clears_timer() -> Result<()> {
     let context = MockEventContext::new().with_timer_tracking();
     let registry = registry();
 
-    run_state_recovery_for_tests(
+    recover_pending_entries(
         &context,
         &durable,
         &durable,

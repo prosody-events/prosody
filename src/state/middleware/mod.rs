@@ -77,8 +77,6 @@ use crate::{Partition, Topic};
 use futures::StreamExt;
 use parking_lot::Mutex as SyncMutex;
 use std::collections::HashMap;
-#[cfg(test)]
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -1083,61 +1081,15 @@ where
         C: EventContext,
     {
         let state_key = StateKey::new(self.segment_id, key);
-        let stream = self.scanner.scan_pending(&state_key);
-        futures::pin_mut!(stream);
-        while let Some(entry) = stream.next().await {
-            let entry = entry.map_err(KeyedStateMiddlewareError::Scanner)?;
-            if entry.kind != CollectionKindId::Value {
-                warn!(
-                    kind = ?entry.kind,
-                    name = entry.name.as_str(),
-                    "skipping unsupported pending kind in state recovery"
-                );
-                continue;
-            }
-            let id = CollectionId::<ValueKind>::new(
-                state_key.clone(),
-                entry.state_type,
-                entry.name.clone(),
-            );
-            let ttl = self.registry.ttl_for(&entry.name);
-            let collection_ref = CollectionRef::new(id.clone(), ttl);
-            match DurableWalStore::read_partition(&self.durable, &id)
-                .await
-                .map_err(KeyedStateMiddlewareError::Durable)?
-            {
-                DurableState::Idle { .. } => {
-                    PendingIndexStore::delete_pending::<ValueKind>(&self.durable, &id)
-                        .await
-                        .map_err(KeyedStateMiddlewareError::Durable)?;
-                }
-                DurableState::Sealed { wal, .. } => {
-                    let decision = self
-                        .oracle
-                        .resolve(&id, wal.event())
-                        .await
-                        .map_err(KeyedStateMiddlewareError::Oracle)?;
-                    match decision {
-                        CommitDecision::Committed => {
-                            self.durable
-                                .apply_sealed(&collection_ref, wal.event())
-                                .await
-                                .map_err(KeyedStateMiddlewareError::Durable)?;
-                        }
-                        CommitDecision::NotCommitted => {
-                            self.durable
-                                .rollback_sealed(&collection_ref, wal.event())
-                                .await
-                                .map_err(KeyedStateMiddlewareError::Durable)?;
-                        }
-                    }
-                }
-            }
-        }
-        context
-            .clear_scheduled(TimerType::StateRecovery)
-            .await
-            .map_err(KeyedStateMiddlewareError::Timer)?;
+        recover_pending_entries(
+            context,
+            &self.durable,
+            &self.scanner,
+            &self.oracle,
+            &self.registry,
+            state_key,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1475,10 +1427,22 @@ where
     }
 }
 
-/// Helper used in unit tests: drives the `StateRecovery` timer arm
-/// without a full timer plumbing setup.
-#[cfg(test)]
-pub(crate) async fn run_state_recovery_for_tests<C, D, Sc, O>(
+/// Runs the keyed-state recovery sweep over the `(segment, key)` pending
+/// partition.
+///
+/// Shared by production [`KeyedStateHandler::handle_state_recovery`] and
+/// the middleware recovery tests so both exercise identical logic. For
+/// each Value entry it reads the durable partition and either cleans a
+/// stale pending row over an idle partition
+/// ([`PendingIndexStore::delete_pending`]) or resolves a sealed WAL
+/// against the oracle and dispatches to `apply_sealed` / `rollback_sealed`.
+/// Non-Value kinds are logged at WARN and skipped; future kinds plug in by
+/// extending the dispatch match. The `StateRecovery` timer is cleared once
+/// the partition is drained.
+///
+/// The error type omits the inner-handler slot the loop can never emit;
+/// the production caller lifts it into [`KeyedStateMiddlewareError`] via `?`.
+async fn recover_pending_entries<C, D, Sc, O>(
     context: &C,
     durable: &D,
     scanner: &Sc,
@@ -1487,32 +1451,24 @@ pub(crate) async fn run_state_recovery_for_tests<C, D, Sc, O>(
     state_key: StateKey,
 ) -> Result<
     (),
-    KeyedStateMiddlewareError<
-        Infallible,
-        <D as DurableWalStore<ValueKind>>::Error,
-        <D as DurableWalStore<ValueKind>>::Error,
-        Sc::Error,
-        O::Error,
-        C::Error,
-    >,
+    RecoveryError<<D as DurableWalStore<ValueKind>>::Error, Sc::Error, O::Error, C::Error>,
 >
 where
     C: EventContext,
     D: DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + Clone,
+        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
     Sc: PendingIndexScanner,
     O: CommitOracle,
 {
     let stream = scanner.scan_pending(&state_key);
     futures::pin_mut!(stream);
     while let Some(entry) = stream.next().await {
-        let entry = entry.map_err(KeyedStateMiddlewareError::Scanner)?;
+        let entry = entry.map_err(RecoveryError::Scanner)?;
         if entry.kind != CollectionKindId::Value {
             warn!(
                 kind = ?entry.kind,
-                "skipping unsupported pending kind in test recovery"
+                name = entry.name.as_str(),
+                "skipping unsupported pending kind in state recovery"
             );
             continue;
         }
@@ -1522,30 +1478,30 @@ where
         let collection_ref = CollectionRef::new(id.clone(), ttl);
         match DurableWalStore::read_partition(durable, &id)
             .await
-            .map_err(KeyedStateMiddlewareError::Durable)?
+            .map_err(RecoveryError::Durable)?
         {
             DurableState::Idle { .. } => {
                 PendingIndexStore::delete_pending::<ValueKind>(durable, &id)
                     .await
-                    .map_err(KeyedStateMiddlewareError::Durable)?;
+                    .map_err(RecoveryError::Durable)?;
             }
             DurableState::Sealed { wal, .. } => {
                 let decision = oracle
                     .resolve(&id, wal.event())
                     .await
-                    .map_err(KeyedStateMiddlewareError::Oracle)?;
+                    .map_err(RecoveryError::Oracle)?;
                 match decision {
                     CommitDecision::Committed => {
                         durable
                             .apply_sealed(&collection_ref, wal.event())
                             .await
-                            .map_err(KeyedStateMiddlewareError::Durable)?;
+                            .map_err(RecoveryError::Durable)?;
                     }
                     CommitDecision::NotCommitted => {
                         durable
                             .rollback_sealed(&collection_ref, wal.event())
                             .await
-                            .map_err(KeyedStateMiddlewareError::Durable)?;
+                            .map_err(RecoveryError::Durable)?;
                     }
                 }
             }
@@ -1554,6 +1510,60 @@ where
     context
         .clear_scheduled(TimerType::StateRecovery)
         .await
-        .map_err(KeyedStateMiddlewareError::Timer)?;
+        .map_err(RecoveryError::Timer)?;
     Ok(())
+}
+
+/// Errors raised by the shared state-recovery sweep
+/// [`recover_pending_entries`].
+///
+/// The sweep only ever fails while scanning the pending index, reading or
+/// mutating durable state, consulting the oracle, or clearing the recovery
+/// timer. It never runs the inner handler, drives a transaction, or
+/// computes a fire time, so those variants are absent — the production
+/// caller lifts this into [`KeyedStateMiddlewareError`] via `?`.
+#[derive(Debug, Error)]
+pub enum RecoveryError<DurableErr, ScannerErr, OracleErr, TimerErr>
+where
+    DurableErr: Error + 'static,
+    ScannerErr: Error + 'static,
+    OracleErr: Error + 'static,
+    TimerErr: Error + 'static,
+{
+    /// A durable Value store operation failed.
+    #[error("keyed-state durable store failed")]
+    Durable(#[source] DurableErr),
+
+    /// A scanner pull failed.
+    #[error("keyed-state pending scanner failed")]
+    Scanner(#[source] ScannerErr),
+
+    /// The commit oracle failed.
+    #[error("keyed-state commit oracle failed")]
+    Oracle(#[source] OracleErr),
+
+    /// Clearing the recovery timer failed.
+    #[error("keyed-state recovery timer failed")]
+    Timer(#[source] TimerErr),
+}
+
+impl<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr>
+    From<RecoveryError<DurableErr, ScannerErr, OracleErr, TimerErr>>
+    for KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr>
+where
+    InnerErr: ClassifyError + Error + Send + 'static,
+    DirtyErr: ClassifyError + Error + Send + Sync + 'static,
+    DurableErr: ClassifyError + Error + Send + Sync + 'static,
+    ScannerErr: ClassifyError + Error + Send + Sync + 'static,
+    OracleErr: ClassifyError + Error + Send + Sync + 'static,
+    TimerErr: ClassifyError + Error + Send + Sync + 'static,
+{
+    fn from(err: RecoveryError<DurableErr, ScannerErr, OracleErr, TimerErr>) -> Self {
+        match err {
+            RecoveryError::Durable(e) => Self::Durable(e),
+            RecoveryError::Scanner(e) => Self::Scanner(e),
+            RecoveryError::Oracle(e) => Self::Oracle(e),
+            RecoveryError::Timer(e) => Self::Timer(e),
+        }
+    }
 }
