@@ -254,12 +254,13 @@ cassandra_queries! {
 
         /// Gets the `state` static map column for a key partition.
         ///
-        /// `ORDER BY timer_type DESC` resolves on the high tail of the
-        /// clustering iterator: fired-row tombstones skew toward low
-        /// `(timer_type, time)`, so reverse scan avoids the same graveyard
-        /// pattern that the segments table exhibits in production.
+        /// Clustering order is `(timer_type, time)`. Reversing both lands the
+        /// iterator on the latest pending trigger — live rows skew toward
+        /// high `time`, fired-row tombstones toward low `time` — so the
+        /// static-only `LIMIT 1` read avoids the same graveyard pattern that
+        /// the segments table exhibits in production.
         get_state: (
-            "SELECT state FROM $keyspace.{} WHERE segment_id = ? AND key = ? ORDER BY timer_type DESC LIMIT 1",
+            "SELECT state FROM $keyspace.{} WHERE segment_id = ? AND key = ? ORDER BY timer_type DESC, time DESC LIMIT 1",
             TABLE_TYPED_KEYS
         ),
 
@@ -267,7 +268,7 @@ cassandra_queries! {
         ///
         /// See `get_state` for the rationale behind the reverse scan.
         get_state_entry: (
-            "SELECT state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ? ORDER BY timer_type DESC LIMIT 1",
+            "SELECT state[?] FROM $keyspace.{} WHERE segment_id = ? AND key = ? ORDER BY timer_type DESC, time DESC LIMIT 1",
             TABLE_TYPED_KEYS
         ),
 
