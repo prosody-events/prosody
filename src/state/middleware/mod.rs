@@ -1224,9 +1224,7 @@ where
                         warn!(error = ?error, "apply_sealed failed in after_commit");
                     }
                 }
-                if let Err(error) = context.clear_scheduled(TimerType::StateRecovery).await {
-                    warn!(error = ?error, "failed to clear StateRecovery timer in after_commit");
-                }
+                clear_recovery_timer(&context).await;
                 self.inner.after_commit(context, Ok(inner)).await;
             }
             Ok(KeyedStateOutput::Inner {
@@ -1265,9 +1263,7 @@ where
                         warn!(error = ?error, "rollback_sealed failed in after_abort");
                     }
                 }
-                if let Err(error) = context.clear_scheduled(TimerType::StateRecovery).await {
-                    warn!(error = ?error, "failed to clear StateRecovery timer in after_abort");
-                }
+                clear_recovery_timer(&context).await;
                 self.inner.after_abort(context, Ok(inner)).await;
             }
             Ok(KeyedStateOutput::Inner {
@@ -1424,6 +1420,23 @@ where
             registry: self.registry.clone(),
             recovery_delay: self.recovery_delay,
         }
+    }
+}
+
+/// Best-effort clear of the `StateRecovery` timer after a keyed-state
+/// apply hook resolves its sealed collections.
+///
+/// Shared by the `after_commit` / `after_abort` tails — the apply vs
+/// rollback arm and the inner-hook delegation stay explicit in each hook
+/// because they are semantically opposite; only this clear is symmetric.
+/// A failure here is logged and swallowed: the next dispatch re-clears via
+/// first-touch or a later `StateRecovery` fire.
+async fn clear_recovery_timer<C>(context: &C)
+where
+    C: EventContext,
+{
+    if let Err(error) = context.clear_scheduled(TimerType::StateRecovery).await {
+        warn!(error = ?error, "failed to clear StateRecovery timer in keyed-state apply hook");
     }
 }
 
