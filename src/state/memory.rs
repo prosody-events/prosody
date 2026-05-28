@@ -12,6 +12,7 @@ use super::{
     SealedWal, StateKey, StoreOutcome, WalFormat,
 };
 use crate::{Partition, Topic};
+use std::convert::Infallible;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
@@ -113,9 +114,14 @@ pub struct MemoryDirtyValueStoreFactory;
 
 impl DirtyStoreFactory<ValueKind> for MemoryDirtyValueStoreFactory {
     type Provider = MemoryDirtyValueStoreProvider;
+    type Error = Infallible;
 
-    fn for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Provider {
-        MemoryDirtyValueStoreProvider
+    fn for_partition(
+        &self,
+        _topic: Topic,
+        _partition: Partition,
+    ) -> Result<Self::Provider, Self::Error> {
+        Ok(MemoryDirtyValueStoreProvider)
     }
 }
 

@@ -891,6 +891,12 @@ where
     #[error("keyed-state commit oracle failed")]
     Oracle(#[source] OracleErr),
 
+    /// The dirty-store factory failed at partition assignment time.
+    /// Surfaced on every dispatch for the affected partition until
+    /// revocation.
+    #[error("keyed-state dirty factory failed at partition assignment")]
+    Factory(#[source] BoxedFactoryError),
+
     /// Scheduling or unscheduling the recovery timer failed.
     #[error("keyed-state recovery timer failed")]
     Timer(#[source] TimerErr),
@@ -922,10 +928,42 @@ where
             Self::Durable(e) => e.classify_error(),
             Self::Scanner(e) => e.classify_error(),
             Self::Oracle(e) => e.classify_error(),
+            Self::Factory(e) => e.classify_error(),
             Self::Timer(e) => e.classify_error(),
             Self::Transaction(e) => e.classify_error(),
             Self::DateTime(e) => e.classify_error(),
         }
+    }
+}
+
+/// Factory error captured at partition assignment time and surfaced on
+/// every dispatch for that partition until revocation.
+///
+/// The original `F::Error` is type-erased to a stable boxed shape so the
+/// handler can clone it on each dispatch (the original `F::Error` is not
+/// required to be `Clone`).
+#[derive(Clone, Debug, Error)]
+#[error("keyed-state factory error: {message}")]
+pub struct BoxedFactoryError {
+    message: String,
+    category: ErrorCategory,
+}
+
+impl BoxedFactoryError {
+    fn new<E>(err: &E) -> Self
+    where
+        E: ClassifyError + Error + ?Sized,
+    {
+        Self {
+            message: format!("{err}"),
+            category: err.classify_error(),
+        }
+    }
+}
+
+impl ClassifyError for BoxedFactoryError {
+    fn classify_error(&self) -> ErrorCategory {
+        self.category
     }
 }
 
@@ -948,6 +986,11 @@ type BoxedMiddlewareError<T, D, Sc, O, S> = KeyedStateMiddlewareError<
 >;
 
 /// Per-partition keyed-state handler produced by [`KeyedStateMiddleware`].
+///
+/// `provider` is `Ok` when the factory succeeded at partition assignment
+/// time; `Err` carries a type-erased clone of the factory error so every
+/// subsequent dispatch can surface it via
+/// [`KeyedStateMiddlewareError::Factory`].
 pub struct KeyedStateHandler<T, D, Sc, O, P>
 where
     P: DirtyStoreProvider<ValueKind>,
@@ -956,7 +999,7 @@ where
     durable: D,
     scanner: Sc,
     oracle: O,
-    provider: P,
+    provider: Result<P, BoxedFactoryError>,
     consumer_group: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
     segment_id: SegmentId,
@@ -972,18 +1015,24 @@ where
     P: DirtyStoreProvider<ValueKind>,
     P::Store: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
+    #[allow(clippy::type_complexity, reason = "fully-typed handler bind needs Result<context, full middleware error>; \
+                                                introducing a type alias here would add an opaque indirection without simplifying read")]
     fn build_context<C>(
         &self,
         inner: C,
         key: Key,
         event: EventRef,
-    ) -> KeyedStateContext<C, D, P::Store>
+    ) -> Result<KeyedStateContext<C, D, P::Store>, MiddlewareError<T, D, Sc, O, P::Store, C>>
     where
         C: EventContext + Clone + Send + Sync,
     {
+        let provider = self
+            .provider
+            .as_ref()
+            .map_err(|e| KeyedStateMiddlewareError::Factory(e.clone()))?;
         let scope = EventScopeId::fresh();
-        let dirty = self.provider.for_scope(scope);
-        KeyedStateContext::new(
+        let dirty = provider.for_scope(scope);
+        Ok(KeyedStateContext::new(
             inner,
             self.durable.clone(),
             dirty,
@@ -991,7 +1040,7 @@ where
             StateKey::new(self.segment_id, key),
             event,
             scope,
-        )
+        ))
     }
 
     async fn resolve_seal_results<C>(
@@ -1130,7 +1179,9 @@ where
         let dedup_id = self.derive_dedup_id_for_message(&message);
         let event = EventRef::Message { dedup_id };
         let key = message.key().clone();
-        let wrapped = self.build_context(context.clone(), key, event);
+        let wrapped = self
+            .build_context(context.clone(), key, event)
+            .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
 
         let inner_result = self
             .inner
@@ -1181,7 +1232,9 @@ where
             trigger.tag,
         ));
         let key = trigger.key.clone();
-        let wrapped = self.build_context(context.clone(), key, event);
+        let wrapped = self
+            .build_context(context.clone(), key, event)
+            .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
 
         let inner_result = self
             .inner
@@ -1320,6 +1373,7 @@ where
         KeyedStateMiddlewareError::Durable(e) => KeyedStateMiddlewareError::Durable(e),
         KeyedStateMiddlewareError::Scanner(e) => KeyedStateMiddlewareError::Scanner(e),
         KeyedStateMiddlewareError::Oracle(e) => KeyedStateMiddlewareError::Oracle(e),
+        KeyedStateMiddlewareError::Factory(e) => KeyedStateMiddlewareError::Factory(e),
         KeyedStateMiddlewareError::Timer(e) => {
             let category = e.classify_error();
             KeyedStateMiddlewareError::Timer(BoxedContextError {
@@ -1361,7 +1415,20 @@ where
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let inner = self.inner_provider.handler_for_partition(topic, partition);
         let segment_id = compute_segment_id(topic, partition, &self.consumer_group);
-        let provider = self.factory.for_partition(topic, partition);
+        let provider = self
+            .factory
+            .for_partition(topic, partition)
+            .map_err(|err| {
+                let boxed = BoxedFactoryError::new(&err);
+                tracing::error!(
+                    topic = ?topic,
+                    partition,
+                    error = %err,
+                    "keyed-state factory failed to mint dirty workspace; \
+                     every dispatch on this partition will surface the failure"
+                );
+                boxed
+            });
         KeyedStateHandler {
             inner,
             durable: self.durable.clone(),

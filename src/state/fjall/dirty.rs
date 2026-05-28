@@ -32,17 +32,20 @@ use super::codec::{
 };
 use super::error::FjallValueStoreError;
 use super::workspace::{AssignmentEpoch, FjallClient, FjallWorkspace};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::encoding::{decode_payload, encode_payload};
 use crate::state::value::{PendingOpSource, StoredPayload, ValueKind, ValueOp, ValueStore};
 use crate::state::{
     CollectionId, DirtyStoreFactory, DirtyStoreProvider, EventScopeId, PendingOps, Read,
 };
+use crate::timers::datetime::CompactDateTimeError;
 use crate::{Partition, Topic};
 use educe::Educe;
 use fjall::{Keyspace, PartitionHandle};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::vec::IntoIter;
+use thiserror::Error;
 use tokio::task::spawn_blocking;
 
 /// Fjall-backed dirty Value workspace, scoped to one event.
@@ -249,19 +252,39 @@ impl FjallDirtyValueStoreFactory {
 
 impl DirtyStoreFactory<ValueKind> for FjallDirtyValueStoreFactory {
     type Provider = FjallDirtyValueStoreProvider;
+    type Error = FjallFactoryError;
 
-    #[expect(
-        clippy::expect_used,
-        reason = "process-startup fatal: cache dir is unavailable; \
-                  surfacing through the infallible consumer middleware trait \
-                  matches the LazyLock MockCluster precedent in lib.rs"
-    )]
-    fn for_partition(&self, topic: Topic, partition: Partition) -> Self::Provider {
-        let epoch = AssignmentEpoch::now().expect("Fjall assignment epoch lookup");
+    fn for_partition(
+        &self,
+        topic: Topic,
+        partition: Partition,
+    ) -> Result<Self::Provider, Self::Error> {
+        let epoch = AssignmentEpoch::now().map_err(FjallFactoryError::Epoch)?;
         let workspace = self
             .client
             .workspace(topic, partition, epoch)
-            .expect("Fjall workspace open");
-        FjallDirtyValueStoreProvider::new(Arc::new(workspace))
+            .map_err(FjallFactoryError::Workspace)?;
+        Ok(FjallDirtyValueStoreProvider::new(Arc::new(workspace)))
+    }
+}
+
+/// Errors raised by [`FjallDirtyValueStoreFactory::for_partition`].
+#[derive(Debug, Error)]
+pub enum FjallFactoryError {
+    /// The wall-clock read for [`AssignmentEpoch::now`] failed.
+    #[error("assignment epoch lookup failed")]
+    Epoch(#[source] CompactDateTimeError),
+
+    /// Opening the workspace partitions failed.
+    #[error("fjall workspace open failed")]
+    Workspace(#[source] super::error::FjallValueStoreError),
+}
+
+impl ClassifyError for FjallFactoryError {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Epoch(e) => e.classify_error(),
+            Self::Workspace(e) => e.classify_error(),
+        }
     }
 }

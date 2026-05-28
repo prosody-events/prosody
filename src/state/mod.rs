@@ -47,6 +47,7 @@ pub use encoding::{EncodingError, PayloadEncoding, WalFormat};
 pub use value::{KafkaMessageRef, StoredPayload, ValueApplied, ValueKind, ValueOp, ValueOverlay};
 
 use crate::{Partition, Topic};
+use std::error::Error;
 
 /// Per-partition factory for dirty stores of one collection kind.
 ///
@@ -74,15 +75,16 @@ where
 ///
 /// The keyed-state middleware owns a single `F: DirtyStoreFactory<...>`
 /// at the type level and calls [`Self::for_partition`] inside
-/// `handler_for_partition` (which is infallible) to mint a
-/// partition-scoped provider that stays alive for the lifetime of the
-/// assignment.
+/// `handler_for_partition` to mint a partition-scoped provider that
+/// stays alive for the lifetime of the assignment.
 ///
-/// Fallible backends (e.g. Fjall workspace open) are expected to defer
-/// failures to first event-time use; the trait deliberately commits to
-/// an infallible factory shape so the keyed-state middleware can wire
-/// `Self::Provider` into per-partition handlers without surfacing a
-/// startup error through the consumer middleware trait.
+/// `for_partition` is fallible (e.g. Fjall workspace open can fail on a
+/// missing cache directory) but
+/// [`crate::consumer::middleware::FallibleHandlerProvider::handler_for_partition`]
+/// is not, so the keyed-state middleware captures the `Result` at
+/// assignment time and surfaces failures through
+/// [`crate::state::middleware::KeyedStateMiddlewareError::Factory`] on
+/// the first event dispatch for that partition.
 pub trait DirtyStoreFactory<K>: Clone + Send + Sync + 'static
 where
     K: CollectionKind,
@@ -90,8 +92,22 @@ where
     /// Per-partition provider produced by this factory.
     type Provider: DirtyStoreProvider<K>;
 
+    /// Error returned when a partition's dirty workspace cannot be
+    /// materialized.
+    type Error: ClassifyError + Error + Send + Sync + 'static;
+
     /// Mints a partition-scoped provider for `(topic, partition)`.
-    fn for_partition(&self, topic: Topic, partition: Partition) -> Self::Provider;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the per-partition workspace cannot
+    /// be opened (e.g. Fjall partition open failure on a corrupted or
+    /// missing cache directory).
+    fn for_partition(
+        &self,
+        topic: Topic,
+        partition: Partition,
+    ) -> Result<Self::Provider, Self::Error>;
 }
 
 /// Stable runtime discriminator for a collection kind.
