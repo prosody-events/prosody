@@ -866,7 +866,9 @@ async fn fjall_client_open_sweeps_orphaned_partitions() -> Result<()> {
         "FjallClient::open must sweep stale value_* partitions; surviving: {value_partitions:?}"
     );
     assert!(
-        surviving.iter().any(|name| name.as_ref() == "untouched_partition"),
+        surviving
+            .iter()
+            .any(|name| name.as_ref() == "untouched_partition"),
         "non-`value_*` partitions must not be swept"
     );
     Ok(())

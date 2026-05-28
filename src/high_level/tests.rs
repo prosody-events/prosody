@@ -45,8 +45,7 @@ fn create_producer_with_topics(topics: &[&str]) -> Result<ProducerFixture> {
 
 #[test]
 fn test_missing_topics_finds_missing() -> Result<()> {
-    let fixture =
-        create_producer_with_topics(&["existing-topic-1", "existing-topic-2"])?;
+    let fixture = create_producer_with_topics(&["existing-topic-1", "existing-topic-2"])?;
 
     let topics = vec![
         "existing-topic-1".into(),

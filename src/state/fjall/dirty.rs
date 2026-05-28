@@ -6,8 +6,8 @@
 //! * `dirty_ops`     — one row per buffered op, keyed by `[scope][seq]`.
 //! * `dirty_overlay` — one row per collection, encodes the "next read"
 //!   visibility using the cache codec's tagged-cell format.
-//! * `dirty_meta`    — one row per collection, value is
-//!   `[next_seq u64 LE][op_count u64 LE]`.
+//! * `dirty_meta`    — one row per collection, value is `[next_seq u64
+//!   LE][op_count u64 LE]`.
 //!
 //! All three partitions share the same `[16-byte scope-collection prefix]`
 //! key shape so prefix-scans, prefix-deletes, and overlay/meta point reads
@@ -114,7 +114,11 @@ impl FjallDirtyValueStore {
 
         let mut batch = self.keyspace.batch();
         batch.insert(&self.ops, ops_key.as_ref(), op_bytes.as_ref());
-        batch.insert(&self.overlay, collection_key.as_ref(), overlay_cell.as_ref());
+        batch.insert(
+            &self.overlay,
+            collection_key.as_ref(),
+            overlay_cell.as_ref(),
+        );
         let new_meta = encode_dirty_meta(next_seq.wrapping_add(1), op_count.wrapping_add(1));
         batch.insert(&self.meta, collection_key.as_ref(), new_meta.as_ref());
         batch.commit()?;
@@ -251,8 +255,8 @@ impl FjallDirtyValueStoreFactory {
 }
 
 impl DirtyStoreFactory<ValueKind> for FjallDirtyValueStoreFactory {
-    type Provider = FjallDirtyValueStoreProvider;
     type Error = FjallFactoryError;
+    type Provider = FjallDirtyValueStoreProvider;
 
     fn for_partition(
         &self,

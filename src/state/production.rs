@@ -10,11 +10,11 @@
 //!
 //! The exports here are:
 //!
-//! * [`capped_default_ttl`] — applies the Cassandra
-//!   `USING TTL` ceiling (`630_720_000` seconds, ≈20 years) to a
-//!   configured default TTL. Producers wire this once when they read
-//!   `CassandraStore::base_ttl()`; the result feeds every store and
-//!   wrapper that takes a `default_ttl: Option<CompactDuration>`.
+//! * [`capped_default_ttl`] — applies the Cassandra `USING TTL` ceiling
+//!   (`630_720_000` seconds, ≈20 years) to a configured default TTL. Producers
+//!   wire this once when they read `CassandraStore::base_ttl()`; the result
+//!   feeds every store and wrapper that takes a `default_ttl:
+//!   Option<CompactDuration>`.
 //!
 //! See the [design summary][summary] for the full canonical composition:
 //! `Layered<FjallValueStore, Recovering<CassandraValueStore,

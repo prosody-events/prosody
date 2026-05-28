@@ -833,9 +833,9 @@ async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
 
 // --- Property tests ---
 
-use crate::state::value_test_suite::{self, Trace};
-use crate::state::memory::MemoryDurableValueStore as MemDur;
 use crate::state::memory::MemoryDirtyValueStore as MemDirty;
+use crate::state::memory::MemoryDurableValueStore as MemDur;
+use crate::state::value_test_suite::{self, Trace};
 
 /// Headline middleware integration property: a `KeyedStateMiddleware`
 /// wrapping a memory durable + memory dirty stack drives the same

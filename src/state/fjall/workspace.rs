@@ -298,7 +298,12 @@ fn sweep_orphaned(keyspace: &Arc<Keyspace>) -> Result<(), FjallClientError> {
     Ok(())
 }
 
-fn partition_name(role: &str, topic: Topic, partition: Partition, epoch: AssignmentEpoch) -> String {
+fn partition_name(
+    role: &str,
+    topic: Topic,
+    partition: Partition,
+    epoch: AssignmentEpoch,
+) -> String {
     let mut buf = Vec::with_capacity(
         role.len() + topic.as_ref().len() + 2 * size_of::<i32>() + size_of::<u32>(),
     );

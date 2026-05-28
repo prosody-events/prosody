@@ -11,8 +11,8 @@
 //! 2. After `Clear`: `get` returns `Absent`; `pending_ops` is `Some`.
 //! 3. After `ClearPendingOps`: `get` returns `Unknown`; `pending_ops` is
 //!    `None`.
-//! 4. Fold equivalence: `fold_value_ops(None, pending_ops().ops)`
-//!    converted to `Read<T>` equals `get()`.
+//! 4. Fold equivalence: `fold_value_ops(None, pending_ops().ops)` converted to
+//!    `Read<T>` equals `get()`.
 
 use super::value::{PendingOpSource, StoredPayload, ValueStore, fold_value_ops};
 use super::{CollectionId, Read, StateKey, StateName, StateType, ValueKind};
@@ -104,8 +104,7 @@ where
 
     if let Some(p) = pending {
         let folded = fold_value_ops(None, p.ops.collect::<Vec<_>>().iter());
-        let folded_read: Read<StoredPayload> =
-            folded.map_or(Read::Absent, Read::Present);
+        let folded_read: Read<StoredPayload> = folded.map_or(Read::Absent, Read::Present);
         let actual = store.get(collection).await?;
         if folded_read != actual {
             return Ok(false);

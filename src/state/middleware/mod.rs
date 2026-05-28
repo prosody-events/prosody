@@ -241,9 +241,7 @@ pub trait ValueAccessor: Clone + Send + Sync {
     /// before flush is durable afterwards. `flush()` from the
     /// [`crate::state::CommitMode::Wal`] `Sealed` phase is illegal and
     /// surfaces [`crate::state::value::TransactionValueStoreError::AlreadySealed`].
-    fn flush(
-        &self,
-    ) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send;
+    fn flush(&self) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send;
 }
 
 /// Bundle bound for the dirty Value store the middleware composes with.
@@ -311,8 +309,10 @@ where
     D: DurableValueBundle,
     S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    type Error =
-        TransactionValueStoreError<<S as ValueStore>::Error, <D as DurableWalStore<ValueKind>>::Error>;
+    type Error = TransactionValueStoreError<
+        <S as ValueStore>::Error,
+        <D as DurableWalStore<ValueKind>>::Error,
+    >;
 
     async fn get(&self) -> Result<Option<StoredPayload>, Self::Error> {
         let guard = self.tx.lock().await;
@@ -346,10 +346,8 @@ struct ContextInner<D, S> {
     transactions: SyncMutex<HashMap<StateName, ValueTx<D, S>>>,
 }
 
-type ContextTxError<D, S> = TransactionValueStoreError<
-    <S as ValueStore>::Error,
-    <D as DurableWalStore<ValueKind>>::Error,
->;
+type ContextTxError<D, S> =
+    TransactionValueStoreError<<S as ValueStore>::Error, <D as DurableWalStore<ValueKind>>::Error>;
 
 /// Wraps an inner [`EventContext`] with keyed-state access.
 ///
@@ -473,12 +471,10 @@ where
                     }
                     Err(err) => return Err(err),
                 },
-                CommitMode::Direct => {
-                    match guard.direct_apply().await {
-                        Ok(_) | Err(TransactionValueStoreError::NoPendingOps) => {}
-                        Err(err) => return Err(err),
-                    }
-                }
+                CommitMode::Direct => match guard.direct_apply().await {
+                    Ok(_) | Err(TransactionValueStoreError::NoPendingOps) => {}
+                    Err(err) => return Err(err),
+                },
             }
         }
         Ok(sealed)
@@ -1015,8 +1011,12 @@ where
     P: DirtyStoreProvider<ValueKind>,
     P::Store: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    #[allow(clippy::type_complexity, reason = "fully-typed handler bind needs Result<context, full middleware error>; \
-                                                introducing a type alias here would add an opaque indirection without simplifying read")]
+    #[allow(
+        clippy::type_complexity,
+        reason = "fully-typed handler bind needs Result<context, full middleware error>; \
+                  introducing a type alias here would add an opaque indirection without \
+                  simplifying read"
+    )]
     fn build_context<C>(
         &self,
         inner: C,
@@ -1415,20 +1415,17 @@ where
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let inner = self.inner_provider.handler_for_partition(topic, partition);
         let segment_id = compute_segment_id(topic, partition, &self.consumer_group);
-        let provider = self
-            .factory
-            .for_partition(topic, partition)
-            .map_err(|err| {
-                let boxed = BoxedFactoryError::new(&err);
-                tracing::error!(
-                    topic = ?topic,
-                    partition,
-                    error = %err,
-                    "keyed-state factory failed to mint dirty workspace; \
-                     every dispatch on this partition will surface the failure"
-                );
-                boxed
-            });
+        let provider = self.factory.for_partition(topic, partition).map_err(|err| {
+            let boxed = BoxedFactoryError::new(&err);
+            tracing::error!(
+                topic = ?topic,
+                partition,
+                error = %err,
+                "keyed-state factory failed to mint dirty workspace; \
+                 every dispatch on this partition will surface the failure"
+            );
+            boxed
+        });
         KeyedStateHandler {
             inner,
             durable: self.durable.clone(),

@@ -11,14 +11,14 @@ use super::{
     DurableState, EventRef, EventScopeId, PayloadEncoding, PendingOps, Read, SealedCollection,
     SealedWal, StateKey, StoreOutcome, WalFormat,
 };
-use crate::{Partition, Topic};
-use std::convert::Infallible;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
+use crate::{Partition, Topic};
 use ahash::RandomState;
 use futures::{Stream, stream};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
 use std::pin::Pin;
@@ -113,8 +113,8 @@ impl DirtyStoreProvider<ValueKind> for MemoryDirtyValueStoreProvider {
 pub struct MemoryDirtyValueStoreFactory;
 
 impl DirtyStoreFactory<ValueKind> for MemoryDirtyValueStoreFactory {
-    type Provider = MemoryDirtyValueStoreProvider;
     type Error = Infallible;
+    type Provider = MemoryDirtyValueStoreProvider;
 
     fn for_partition(
         &self,
