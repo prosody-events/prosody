@@ -45,6 +45,54 @@ mod value_test_suite;
 pub use encoding::{EncodingError, PayloadEncoding, WalFormat};
 pub use value::{KafkaMessageRef, StoredPayload, ValueApplied, ValueKind, ValueOp, ValueOverlay};
 
+use crate::{Partition, Topic};
+
+/// Per-partition factory for dirty stores of one collection kind.
+///
+/// A [`DirtyStoreProvider`] is minted *per Kafka partition* — its
+/// [`Self::Store`] type owns whichever partition-scoped state (e.g. Fjall
+/// partition handles) the dirty workspace needs. The middleware calls
+/// [`Self::for_scope`] once per event handler invocation to materialize
+/// the per-event dirty workspace.
+///
+/// To create a partition-scoped provider from a process-wide factory,
+/// use [`DirtyStoreFactory::for_partition`].
+pub trait DirtyStoreProvider<K>: Clone + Send + Sync + 'static
+where
+    K: CollectionKind,
+{
+    /// Per-event dirty workspace this provider mints.
+    type Store: value::PendingOpSource<K> + fmt::Debug + 'static;
+
+    /// Returns a fresh per-event dirty workspace bound to `scope`.
+    fn for_scope(&self, scope: EventScopeId) -> Self::Store;
+}
+
+/// Process-wide factory that produces per-partition
+/// [`DirtyStoreProvider`]s on demand.
+///
+/// The keyed-state middleware owns a single `F: DirtyStoreFactory<...>`
+/// at the type level and calls [`Self::for_partition`] inside
+/// `handler_for_partition` (which is infallible) to mint a
+/// partition-scoped provider that stays alive for the lifetime of the
+/// assignment.
+///
+/// Fallible backends (e.g. Fjall workspace open) are expected to defer
+/// failures to first event-time use; the trait deliberately commits to
+/// an infallible factory shape so the keyed-state middleware can wire
+/// `Self::Provider` into per-partition handlers without surfacing a
+/// startup error through the consumer middleware trait.
+pub trait DirtyStoreFactory<K>: Clone + Send + Sync + 'static
+where
+    K: CollectionKind,
+{
+    /// Per-partition provider produced by this factory.
+    type Provider: DirtyStoreProvider<K>;
+
+    /// Mints a partition-scoped provider for `(topic, partition)`.
+    fn for_partition(&self, topic: Topic, partition: Partition) -> Self::Provider;
+}
+
 /// Stable runtime discriminator for a collection kind.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]

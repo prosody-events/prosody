@@ -7,9 +7,11 @@ use super::value::{
     ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, PayloadEncoding,
-    PendingOps, Read, SealedCollection, SealedWal, StateKey, StoreOutcome, WalFormat,
+    CollectionId, CollectionKind, CollectionRef, DirtyStoreFactory, DirtyStoreProvider,
+    DurableState, EventRef, EventScopeId, PayloadEncoding, PendingOps, Read, SealedCollection,
+    SealedWal, StateKey, StoreOutcome, WalFormat,
 };
+use crate::{Partition, Topic};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
@@ -85,6 +87,35 @@ impl ValueStore for MemoryDirtyValueStore {
         let entry = inner.entries.entry(collection.clone()).or_default();
         entry.op = Some(ValueOp::Clear);
         Ok(())
+    }
+}
+
+/// Per-partition provider for [`MemoryDirtyValueStore`].
+///
+/// In-memory dirty stores have no per-partition state, so the provider
+/// is unit-shaped and `for_scope` returns a fresh
+/// [`MemoryDirtyValueStore`] each call.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryDirtyValueStoreProvider;
+
+impl DirtyStoreProvider<ValueKind> for MemoryDirtyValueStoreProvider {
+    type Store = MemoryDirtyValueStore;
+
+    fn for_scope(&self, _scope: EventScopeId) -> Self::Store {
+        MemoryDirtyValueStore::new()
+    }
+}
+
+/// Process-wide factory that hands out
+/// [`MemoryDirtyValueStoreProvider`]s.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryDirtyValueStoreFactory;
+
+impl DirtyStoreFactory<ValueKind> for MemoryDirtyValueStoreFactory {
+    type Provider = MemoryDirtyValueStoreProvider;
+
+    fn for_partition(&self, _topic: Topic, _partition: Partition) -> Self::Provider {
+        MemoryDirtyValueStoreProvider
     }
 }
 

@@ -31,9 +31,13 @@ use super::codec::{
     encode_dirty_meta, encode_present_cell, scope_collection_prefix,
 };
 use super::error::FjallValueStoreError;
+use super::workspace::{AssignmentEpoch, FjallClient, FjallWorkspace};
 use crate::state::encoding::{decode_payload, encode_payload};
 use crate::state::value::{PendingOpSource, StoredPayload, ValueKind, ValueOp, ValueStore};
-use crate::state::{CollectionId, EventScopeId, PendingOps, Read};
+use crate::state::{
+    CollectionId, DirtyStoreFactory, DirtyStoreProvider, EventScopeId, PendingOps, Read,
+};
+use crate::{Partition, Topic};
 use educe::Educe;
 use fjall::{Keyspace, PartitionHandle};
 use std::num::NonZeroU64;
@@ -188,5 +192,76 @@ impl PendingOpSource<ValueKind> for FjallDirtyValueStore {
         batch.remove(&self.meta, collection_key.as_ref());
         batch.commit()?;
         Ok(())
+    }
+}
+
+/// Per-partition provider for [`FjallDirtyValueStore`].
+///
+/// Owns the partition-scoped [`FjallWorkspace`]; cloning the provider
+/// clones the `Arc<FjallWorkspace>`, so all clones share the same
+/// per-partition state.
+#[derive(Clone, Educe)]
+#[educe(Debug)]
+pub struct FjallDirtyValueStoreProvider {
+    #[educe(Debug(ignore))]
+    workspace: Arc<FjallWorkspace>,
+}
+
+impl FjallDirtyValueStoreProvider {
+    /// Wraps an opened workspace as a provider.
+    #[must_use]
+    pub fn new(workspace: Arc<FjallWorkspace>) -> Self {
+        Self { workspace }
+    }
+}
+
+impl DirtyStoreProvider<ValueKind> for FjallDirtyValueStoreProvider {
+    type Store = FjallDirtyValueStore;
+
+    fn for_scope(&self, scope: EventScopeId) -> FjallDirtyValueStore {
+        FjallDirtyValueStore::new(
+            Arc::clone(self.workspace.keyspace()),
+            self.workspace.dirty_ops_handle().clone(),
+            self.workspace.dirty_overlay_handle().clone(),
+            self.workspace.dirty_meta_handle().clone(),
+            scope,
+        )
+    }
+}
+
+/// Process-wide factory that mints per-partition
+/// [`FjallDirtyValueStoreProvider`]s by opening a fresh
+/// [`FjallWorkspace`] for each Kafka partition assignment.
+#[derive(Clone, Educe)]
+#[educe(Debug)]
+pub struct FjallDirtyValueStoreFactory {
+    #[educe(Debug(ignore))]
+    client: Arc<FjallClient>,
+}
+
+impl FjallDirtyValueStoreFactory {
+    /// Creates a factory that mints workspaces from `client`.
+    #[must_use]
+    pub fn new(client: Arc<FjallClient>) -> Self {
+        Self { client }
+    }
+}
+
+impl DirtyStoreFactory<ValueKind> for FjallDirtyValueStoreFactory {
+    type Provider = FjallDirtyValueStoreProvider;
+
+    #[expect(
+        clippy::expect_used,
+        reason = "process-startup fatal: cache dir is unavailable; \
+                  surfacing through the infallible consumer middleware trait \
+                  matches the LazyLock MockCluster precedent in lib.rs"
+    )]
+    fn for_partition(&self, topic: Topic, partition: Partition) -> Self::Provider {
+        let epoch = AssignmentEpoch::now().expect("Fjall assignment epoch lookup");
+        let workspace = self
+            .client
+            .workspace(topic, partition, epoch)
+            .expect("Fjall workspace open");
+        FjallDirtyValueStoreProvider::new(Arc::new(workspace))
     }
 }

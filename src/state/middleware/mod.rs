@@ -60,12 +60,13 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::oracle::CommitOracle;
 use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::state::value::{
-    DirectApplyStore, DurableWalStore, StoredPayload, TransactionValueStore,
+    DirectApplyStore, DurableWalStore, PendingOpSource, StoredPayload, TransactionValueStore,
     TransactionValueStoreError, ValueKind, ValueStore,
 };
 use crate::state::{
-    CollectionId, CollectionKindId, CollectionRef, CommitDecision, CommitMode, DurableState,
-    EventRef, EventScopeId, Read, StateKey, StateName, StateNameError, StateType, TimerEventRef,
+    CollectionId, CollectionKindId, CollectionRef, CommitDecision, CommitMode, DirtyStoreFactory,
+    DirtyStoreProvider, DurableState, EventRef, EventScopeId, Read, StateKey, StateName,
+    StateNameError, StateType, StoreOutcome, TimerEventRef,
 };
 use crate::timers::TimerType;
 use crate::timers::Trigger;
@@ -87,8 +88,6 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use uuid::Uuid;
-
-use crate::state::memory::{MemoryDirtyValueStore, MemoryStateError};
 
 #[cfg(test)]
 mod tests;
@@ -182,6 +181,59 @@ pub trait ValueAccessor: Clone + Send + Sync {
 
     /// Buffers a clear operation for this collection.
     fn clear(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Drains buffered ops directly to authoritative state and returns
+    /// the transaction to `Clean`.
+    ///
+    /// Mirrors the design's `Dirty → flush() → Clean` and
+    /// `Clean → flush() → Clean` transitions: the visible state observed
+    /// before flush is durable afterwards. `flush()` from the
+    /// [`crate::state::CommitMode::Wal`] `Sealed` phase is illegal and
+    /// surfaces [`crate::state::value::TransactionValueStoreError::AlreadySealed`].
+    fn flush(
+        &self,
+    ) -> impl Future<Output = Result<StoreOutcome, Self::Error>> + Send;
+}
+
+/// Bundle bound for the dirty Value store the middleware composes with.
+///
+/// Pulled out so impl blocks downstream can reference the bound without
+/// repeating the eight individual trait constraints. Both
+/// [`crate::state::memory::MemoryDirtyValueStore`] and
+/// [`crate::state::fjall::FjallDirtyValueStore`] satisfy it.
+pub trait DirtyValueBundle:
+    ValueStore + PendingOpSource<ValueKind, Error = <Self as ValueStore>::Error> + Clone
+{
+}
+
+impl<T> DirtyValueBundle for T where
+    T: ValueStore + PendingOpSource<ValueKind, Error = <T as ValueStore>::Error> + Clone
+{
+}
+
+/// Bundle bound for the durable Value store the middleware composes with.
+pub trait DurableValueBundle:
+    ValueStore<Error = <Self as DurableWalStore<ValueKind>>::Error>
+    + DurableWalStore<ValueKind>
+    + DirectApplyStore<ValueKind, Error = <Self as DurableWalStore<ValueKind>>::Error>
+    + fmt::Debug
+    + Clone
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+impl<T> DurableValueBundle for T where
+    T: ValueStore<Error = <T as DurableWalStore<ValueKind>>::Error>
+        + DurableWalStore<ValueKind>
+        + DirectApplyStore<ValueKind, Error = <T as DurableWalStore<ValueKind>>::Error>
+        + fmt::Debug
+        + Clone
+        + Send
+        + Sync
+        + 'static
+{
 }
 
 /// Shared per-event transaction handle for a single Value collection.
@@ -189,12 +241,12 @@ pub trait ValueAccessor: Clone + Send + Sync {
 /// Multiple `KeyedStateContext` clones share the inner `Arc<Mutex<...>>` so
 /// repeated `ctx.value(name)` calls in the same handler return handles that
 /// accumulate ops into the same transaction.
-pub struct ValueHandle<D> {
-    tx: Arc<AsyncMutex<TransactionValueStore<D, MemoryDirtyValueStore>>>,
+pub struct ValueHandle<D, S> {
+    tx: Arc<AsyncMutex<TransactionValueStore<D, S>>>,
     collection: CollectionId<ValueKind>,
 }
 
-impl<D> Clone for ValueHandle<D> {
+impl<D, S> Clone for ValueHandle<D, S> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
@@ -203,19 +255,13 @@ impl<D> Clone for ValueHandle<D> {
     }
 }
 
-impl<D> ValueAccessor for ValueHandle<D>
+impl<D, S> ValueAccessor for ValueHandle<D, S>
 where
-    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    D: DurableValueBundle,
+    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
     type Error =
-        TransactionValueStoreError<MemoryStateError, <D as DurableWalStore<ValueKind>>::Error>;
+        TransactionValueStoreError<<S as ValueStore>::Error, <D as DurableWalStore<ValueKind>>::Error>;
 
     async fn get(&self) -> Result<Option<StoredPayload>, Self::Error> {
         let guard = self.tx.lock().await;
@@ -235,14 +281,24 @@ where
         let guard = self.tx.lock().await;
         guard.clear(&self.collection).await
     }
+
+    async fn flush(&self) -> Result<StoreOutcome, Self::Error> {
+        let mut guard = self.tx.lock().await;
+        guard.flush().await
+    }
 }
 
-type ValueTx<D> = Arc<AsyncMutex<TransactionValueStore<D, MemoryDirtyValueStore>>>;
+type ValueTx<D, S> = Arc<AsyncMutex<TransactionValueStore<D, S>>>;
 
 #[derive(Default)]
-struct ContextInner<D> {
-    transactions: SyncMutex<HashMap<StateName, ValueTx<D>>>,
+struct ContextInner<D, S> {
+    transactions: SyncMutex<HashMap<StateName, ValueTx<D, S>>>,
 }
+
+type ContextTxError<D, S> = TransactionValueStoreError<
+    <S as ValueStore>::Error,
+    <D as DurableWalStore<ValueKind>>::Error,
+>;
 
 /// Wraps an inner [`EventContext`] with keyed-state access.
 ///
@@ -250,27 +306,30 @@ struct ContextInner<D> {
 /// [`KeyedStateMiddleware`]. Clones share the inner transaction map so
 /// repeated `ctx.value(name)` calls return handles that accumulate into
 /// the same transaction.
-pub struct KeyedStateContext<C, D> {
+pub struct KeyedStateContext<C, D, S> {
     inner: C,
     durable: D,
+    dirty: S,
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     event: EventRef,
     commit_mode: CommitMode,
     #[allow(dead_code)]
     scope: EventScopeId,
-    ctx: Arc<ContextInner<D>>,
+    ctx: Arc<ContextInner<D, S>>,
 }
 
-impl<C, D> Clone for KeyedStateContext<C, D>
+impl<C, D, S> Clone for KeyedStateContext<C, D, S>
 where
     C: Clone,
     D: Clone,
+    S: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             durable: self.durable.clone(),
+            dirty: self.dirty.clone(),
             registry: self.registry.clone(),
             state_key: self.state_key.clone(),
             event: self.event,
@@ -281,34 +340,35 @@ where
     }
 }
 
-impl<C, D> KeyedStateContext<C, D>
+impl<C, D, S> KeyedStateContext<C, D, S>
 where
     C: EventContext,
-    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    D: DurableValueBundle,
+    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "internal middleware-only constructor — refactoring to a builder would obscure the wiring shape"
+    )]
     fn new(
         inner: C,
         durable: D,
+        dirty: S,
         registry: Arc<CollectionDefRegistry>,
         state_key: StateKey,
         event: EventRef,
         commit_mode: CommitMode,
+        scope: EventScopeId,
     ) -> Self {
         Self {
             inner,
             durable,
+            dirty,
             registry,
             state_key,
             event,
             commit_mode,
-            scope: EventScopeId::fresh(),
+            scope,
             ctx: Arc::new(ContextInner {
                 transactions: SyncMutex::new(HashMap::new()),
             }),
@@ -323,7 +383,7 @@ where
         CollectionRef::new(self.collection_id_for(name), self.registry.ttl_for(name))
     }
 
-    fn open_transaction(&self, name: &StateName) -> ValueTx<D> {
+    fn open_transaction(&self, name: &StateName) -> ValueTx<D, S> {
         let mut txs = self.ctx.transactions.lock();
         if let Some(existing) = txs.get(name) {
             return existing.clone();
@@ -332,7 +392,7 @@ where
         let collection = self.collection_ref_for(name);
         let tx = TransactionValueStore::new(
             self.durable.clone(),
-            MemoryDirtyValueStore::new(),
+            self.dirty.clone(),
             collection,
             self.event,
             self.commit_mode,
@@ -351,10 +411,7 @@ where
     /// collection refs. Used by the middleware's WAL-mode success path.
     async fn seal_all(
         &self,
-    ) -> Result<
-        Vec<CollectionRef<ValueKind>>,
-        TransactionValueStoreError<MemoryStateError, <D as DurableWalStore<ValueKind>>::Error>,
-    > {
+    ) -> Result<Vec<CollectionRef<ValueKind>>, ContextTxError<D, S>> {
         let names = self.dirty_collection_names();
         let mut sealed = Vec::new();
         for name in names {
@@ -373,12 +430,7 @@ where
     }
 
     /// Direct-applies every dirty collection.
-    async fn direct_apply_all(
-        &self,
-    ) -> Result<
-        (),
-        TransactionValueStoreError<MemoryStateError, <D as DurableWalStore<ValueKind>>::Error>,
-    > {
+    async fn direct_apply_all(&self) -> Result<(), ContextTxError<D, S>> {
         let names = self.dirty_collection_names();
         for name in names {
             let tx = self.open_transaction(&name);
@@ -389,10 +441,11 @@ where
     }
 }
 
-impl<C, D> TerminationSignals for KeyedStateContext<C, D>
+impl<C, D, S> TerminationSignals for KeyedStateContext<C, D, S>
 where
     C: EventContext + Clone + Send + Sync,
     D: Clone + Send + Sync,
+    S: Clone + Send + Sync,
 {
     fn is_shutdown(&self) -> bool {
         self.inner.is_shutdown()
@@ -411,17 +464,11 @@ where
     }
 }
 
-impl<C, D> EventContext for KeyedStateContext<C, D>
+impl<C, D, S> EventContext for KeyedStateContext<C, D, S>
 where
     C: EventContext + Clone + Send + Sync,
-    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    D: DurableValueBundle,
+    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
     type Error = C::Error;
 
@@ -481,20 +528,14 @@ where
     }
 }
 
-impl<C, D> KeyedStateAccess for KeyedStateContext<C, D>
+impl<C, D, S> KeyedStateAccess for KeyedStateContext<C, D, S>
 where
     C: EventContext + Clone + Send + Sync,
-    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    D: DurableValueBundle,
+    S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
     type ValueError = KeyedStateAccessError;
-    type ValueHandle = ValueHandle<D>;
+    type ValueHandle = ValueHandle<D, S>;
 
     fn value(&self, name: &str) -> Result<Self::ValueHandle, Self::ValueError> {
         let parsed = StateName::try_new(name)?;
@@ -528,13 +569,14 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 
 /// Builder for [`KeyedStateMiddleware`].
 ///
-/// Captures the durable bundle, the scanner, the oracle, the
-/// middleware-wide default TTL, the recovery delay, and any per-collection
-/// definitions before producing the middleware.
-pub struct KeyedStateMiddlewareBuilder<D, Sc, O, P> {
+/// Captures the durable bundle, the scanner, the oracle, the dirty-store
+/// factory, the middleware-wide default TTL, the recovery delay, and any
+/// per-collection definitions before producing the middleware.
+pub struct KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
     durable: Option<D>,
     scanner: Option<Sc>,
     oracle: Option<O>,
+    factory: Option<F>,
     consumer_group: Option<Arc<str>>,
     default_ttl: Option<CompactDuration>,
     commit_mode: CommitMode,
@@ -543,12 +585,13 @@ pub struct KeyedStateMiddlewareBuilder<D, Sc, O, P> {
     _payload: PhantomData<fn() -> P>,
 }
 
-impl<D, Sc, O, P> Default for KeyedStateMiddlewareBuilder<D, Sc, O, P> {
+impl<D, Sc, O, F, P> Default for KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
     fn default() -> Self {
         Self {
             durable: None,
             scanner: None,
             oracle: None,
+            factory: None,
             consumer_group: None,
             default_ttl: None,
             commit_mode: CommitMode::Wal,
@@ -559,7 +602,7 @@ impl<D, Sc, O, P> Default for KeyedStateMiddlewareBuilder<D, Sc, O, P> {
     }
 }
 
-impl<D, Sc, O, P> KeyedStateMiddlewareBuilder<D, Sc, O, P> {
+impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
     /// Sets the durable Value bundle.
     #[must_use]
     pub fn durable(mut self, durable: D) -> Self {
@@ -578,6 +621,19 @@ impl<D, Sc, O, P> KeyedStateMiddlewareBuilder<D, Sc, O, P> {
     #[must_use]
     pub fn oracle(mut self, oracle: O) -> Self {
         self.oracle = Some(oracle);
+        self
+    }
+
+    /// Sets the dirty-store factory.
+    ///
+    /// The factory mints per-Kafka-partition dirty workspaces during
+    /// partition assignment. For in-memory tests pass
+    /// [`crate::state::memory::MemoryDirtyValueStoreFactory::default()`];
+    /// for production pass a `FjallDirtyValueStoreFactory` constructed
+    /// from a shared [`crate::state::fjall::FjallClient`].
+    #[must_use]
+    pub fn dirty_factory(mut self, factory: F) -> Self {
+        self.factory = Some(factory);
         self
     }
 
@@ -627,7 +683,7 @@ impl<D, Sc, O, P> KeyedStateMiddlewareBuilder<D, Sc, O, P> {
     /// field was not supplied.
     pub fn build(
         self,
-    ) -> Result<KeyedStateMiddleware<D, Sc, O, P>, KeyedStateMiddlewareBuildError> {
+    ) -> Result<KeyedStateMiddleware<D, Sc, O, F, P>, KeyedStateMiddlewareBuildError> {
         let durable = self
             .durable
             .ok_or(KeyedStateMiddlewareBuildError::Missing("durable"))?;
@@ -637,6 +693,9 @@ impl<D, Sc, O, P> KeyedStateMiddlewareBuilder<D, Sc, O, P> {
         let oracle = self
             .oracle
             .ok_or(KeyedStateMiddlewareBuildError::Missing("oracle"))?;
+        let factory = self
+            .factory
+            .ok_or(KeyedStateMiddlewareBuildError::Missing("dirty_factory"))?;
         let consumer_group = self
             .consumer_group
             .ok_or(KeyedStateMiddlewareBuildError::Missing("consumer_group"))?;
@@ -648,6 +707,7 @@ impl<D, Sc, O, P> KeyedStateMiddlewareBuilder<D, Sc, O, P> {
             durable,
             scanner,
             oracle,
+            factory,
             consumer_group,
             registry,
             commit_mode: self.commit_mode,
@@ -677,10 +737,11 @@ impl ClassifyError for KeyedStateMiddlewareBuildError {
 /// recovery timer scheduling, and routes apply hooks to
 /// `apply_sealed` / `rollback_sealed`. See the module docs for the hook
 /// lifecycle.
-pub struct KeyedStateMiddleware<D, Sc, O, P> {
+pub struct KeyedStateMiddleware<D, Sc, O, F, P> {
     durable: D,
     scanner: Sc,
     oracle: O,
+    factory: F,
     consumer_group: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
     commit_mode: CommitMode,
@@ -688,17 +749,19 @@ pub struct KeyedStateMiddleware<D, Sc, O, P> {
     _payload: PhantomData<fn() -> P>,
 }
 
-impl<D, Sc, O, P> Clone for KeyedStateMiddleware<D, Sc, O, P>
+impl<D, Sc, O, F, P> Clone for KeyedStateMiddleware<D, Sc, O, F, P>
 where
     D: Clone,
     Sc: Clone,
     O: Clone,
+    F: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             durable: self.durable.clone(),
             scanner: self.scanner.clone(),
             oracle: self.oracle.clone(),
+            factory: self.factory.clone(),
             consumer_group: self.consumer_group.clone(),
             registry: self.registry.clone(),
             commit_mode: self.commit_mode,
@@ -708,7 +771,7 @@ where
     }
 }
 
-impl<D, Sc, O, P> fmt::Debug for KeyedStateMiddleware<D, Sc, O, P> {
+impl<D, Sc, O, F, P> fmt::Debug for KeyedStateMiddleware<D, Sc, O, F, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyedStateMiddleware")
             .field("consumer_group", &self.consumer_group)
@@ -718,10 +781,10 @@ impl<D, Sc, O, P> fmt::Debug for KeyedStateMiddleware<D, Sc, O, P> {
     }
 }
 
-impl<D, Sc, O, P> KeyedStateMiddleware<D, Sc, O, P> {
+impl<D, Sc, O, F, P> KeyedStateMiddleware<D, Sc, O, F, P> {
     /// Returns a fresh builder for the middleware.
     #[must_use]
-    pub fn builder() -> KeyedStateMiddlewareBuilder<D, Sc, O, P> {
+    pub fn builder() -> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
         KeyedStateMiddlewareBuilder::default()
     }
 }
@@ -760,9 +823,10 @@ pub enum KeyedStateOutput<O> {
 
 /// Errors raised by the middleware itself.
 #[derive(Debug, Error)]
-pub enum KeyedStateMiddlewareError<InnerErr, DurableErr, ScannerErr, OracleErr, TimerErr>
+pub enum KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr>
 where
     InnerErr: ClassifyError + Error + Send + 'static,
+    DirtyErr: ClassifyError + Error + Send + Sync + 'static,
     DurableErr: ClassifyError + Error + Send + Sync + 'static,
     ScannerErr: ClassifyError + Error + Send + Sync + 'static,
     OracleErr: ClassifyError + Error + Send + Sync + 'static,
@@ -791,7 +855,7 @@ where
     /// The keyed-state transaction state machine refused the requested
     /// transition (e.g. sealing in direct mode).
     #[error("keyed-state transaction failed")]
-    Transaction(#[source] TransactionValueStoreError<MemoryStateError, DurableErr>),
+    Transaction(#[source] TransactionValueStoreError<DirtyErr, DurableErr>),
 
     /// `CompactDateTime` arithmetic failed when computing the recovery
     /// fire time.
@@ -799,10 +863,11 @@ where
     DateTime(#[from] CompactDateTimeError),
 }
 
-impl<InnerErr, DurableErr, ScannerErr, OracleErr, TimerErr> ClassifyError
-    for KeyedStateMiddlewareError<InnerErr, DurableErr, ScannerErr, OracleErr, TimerErr>
+impl<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr> ClassifyError
+    for KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr>
 where
     InnerErr: ClassifyError + Error + Send + 'static,
+    DirtyErr: ClassifyError + Error + Send + Sync + 'static,
     DurableErr: ClassifyError + Error + Send + Sync + 'static,
     ScannerErr: ClassifyError + Error + Send + Sync + 'static,
     OracleErr: ClassifyError + Error + Send + Sync + 'static,
@@ -821,16 +886,18 @@ where
     }
 }
 
-type MiddlewareError<T, D, Sc, O, C> = KeyedStateMiddlewareError<
+type MiddlewareError<T, D, Sc, O, S, C> = KeyedStateMiddlewareError<
     <T as FallibleHandler>::Error,
+    <S as ValueStore>::Error,
     <D as DurableWalStore<ValueKind>>::Error,
     <Sc as PendingIndexScanner>::Error,
     <O as CommitOracle>::Error,
     <C as EventContext>::Error,
 >;
 
-type BoxedMiddlewareError<T, D, Sc, O> = KeyedStateMiddlewareError<
+type BoxedMiddlewareError<T, D, Sc, O, S> = KeyedStateMiddlewareError<
     <T as FallibleHandler>::Error,
+    <S as ValueStore>::Error,
     <D as DurableWalStore<ValueKind>>::Error,
     <Sc as PendingIndexScanner>::Error,
     <O as CommitOracle>::Error,
@@ -838,11 +905,15 @@ type BoxedMiddlewareError<T, D, Sc, O> = KeyedStateMiddlewareError<
 >;
 
 /// Per-partition keyed-state handler produced by [`KeyedStateMiddleware`].
-pub struct KeyedStateHandler<T, D, Sc, O> {
+pub struct KeyedStateHandler<T, D, Sc, O, P>
+where
+    P: DirtyStoreProvider<ValueKind>,
+{
     inner: T,
     durable: D,
     scanner: Sc,
     oracle: O,
+    provider: P,
     consumer_group: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
     segment_id: SegmentId,
@@ -850,40 +921,46 @@ pub struct KeyedStateHandler<T, D, Sc, O> {
     recovery_delay: CompactDuration,
 }
 
-impl<T, D, Sc, O> KeyedStateHandler<T, D, Sc, O>
+impl<T, D, Sc, O, P> KeyedStateHandler<T, D, Sc, O, P>
 where
     T: FallibleHandler,
-    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
     Sc: PendingIndexScanner,
     O: CommitOracle,
+    P: DirtyStoreProvider<ValueKind>,
+    P::Store: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    fn build_context<C>(&self, inner: C, key: Key, event: EventRef) -> KeyedStateContext<C, D>
+    fn build_context<C>(
+        &self,
+        inner: C,
+        key: Key,
+        event: EventRef,
+    ) -> KeyedStateContext<C, D, P::Store>
     where
         C: EventContext + Clone + Send + Sync,
     {
+        let scope = EventScopeId::fresh();
+        let dirty = self.provider.for_scope(scope);
         KeyedStateContext::new(
             inner,
             self.durable.clone(),
+            dirty,
             self.registry.clone(),
             StateKey::new(self.segment_id, key),
             event,
             self.commit_mode,
+            scope,
         )
     }
 
     async fn resolve_seal_results<C>(
         &self,
-        wrapped: KeyedStateContext<C, D>,
+        wrapped: KeyedStateContext<C, D, P::Store>,
         context: C,
-    ) -> Result<(Vec<CollectionRef<ValueKind>>, Option<EventRef>), MiddlewareError<T, D, Sc, O, C>>
+    ) -> Result<
+        (Vec<CollectionRef<ValueKind>>, Option<EventRef>),
+        MiddlewareError<T, D, Sc, O, P::Store, C>,
+    >
     where
         C: EventContext + Clone + Send + Sync + 'static,
     {
@@ -923,7 +1000,7 @@ where
         &self,
         context: &C,
         key: Key,
-    ) -> Result<(), MiddlewareError<T, D, Sc, O, C>>
+    ) -> Result<(), MiddlewareError<T, D, Sc, O, P::Store, C>>
     where
         C: EventContext,
     {
@@ -999,22 +1076,16 @@ where
     }
 }
 
-impl<T, D, Sc, O> FallibleHandler for KeyedStateHandler<T, D, Sc, O>
+impl<T, D, Sc, O, P> FallibleHandler for KeyedStateHandler<T, D, Sc, O, P>
 where
     T: FallibleHandler,
-    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
     Sc: PendingIndexScanner,
     O: CommitOracle,
+    P: DirtyStoreProvider<ValueKind>,
+    P::Store: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    type Error = BoxedMiddlewareError<T, D, Sc, O>;
+    type Error = BoxedMiddlewareError<T, D, Sc, O, P::Store>;
     type Output = KeyedStateOutput<T::Output>;
     type Payload = T::Payload;
 
@@ -1045,7 +1116,7 @@ where
         let (sealed_collections, sealed_event) = self
             .resolve_seal_results(wrapped, context)
             .await
-            .map_err(box_context_error::<T, D, Sc, O, C>)?;
+            .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
         Ok(KeyedStateOutput::Inner {
             inner: inner_output,
             sealed_event,
@@ -1071,7 +1142,7 @@ where
             // defer middleware).
             self.handle_state_recovery(&context, trigger.key.clone())
                 .await
-                .map_err(box_context_error::<T, D, Sc, O, C>)?;
+                .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
             return Ok(KeyedStateOutput::Recovery);
         }
 
@@ -1096,7 +1167,7 @@ where
         let (sealed_collections, sealed_event) = self
             .resolve_seal_results(wrapped, context)
             .await
-            .map_err(box_context_error::<T, D, Sc, O, C>)?;
+            .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
         Ok(KeyedStateOutput::Inner {
             inner: inner_output,
             sealed_event,
@@ -1204,14 +1275,15 @@ impl ClassifyError for BoxedContextError {
     }
 }
 
-fn box_context_error<T, D, Sc, O, C>(
-    err: MiddlewareError<T, D, Sc, O, C>,
-) -> BoxedMiddlewareError<T, D, Sc, O>
+fn box_context_error<T, D, Sc, O, S, C>(
+    err: MiddlewareError<T, D, Sc, O, S, C>,
+) -> BoxedMiddlewareError<T, D, Sc, O, S>
 where
     T: FallibleHandler,
     D: DurableWalStore<ValueKind>,
     Sc: PendingIndexScanner,
     O: CommitOracle,
+    S: ValueStore,
     C: EventContext,
 {
     match err {
@@ -1232,43 +1304,42 @@ where
 }
 
 /// Per-partition provider for [`KeyedStateMiddleware`].
-pub struct KeyedStateProvider<T, D, Sc, O> {
+pub struct KeyedStateProvider<T, D, Sc, O, F> {
     inner_provider: T,
     durable: D,
     scanner: Sc,
     oracle: O,
+    factory: F,
     consumer_group: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
     commit_mode: CommitMode,
     recovery_delay: CompactDuration,
 }
 
-impl<T, D, Sc, O> FallibleHandlerProvider for KeyedStateProvider<T, D, Sc, O>
+impl<T, D, Sc, O, F> FallibleHandlerProvider for KeyedStateProvider<T, D, Sc, O, F>
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
-    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
     Sc: PendingIndexScanner,
     O: CommitOracle,
+    F: DirtyStoreFactory<ValueKind>,
+    F::Provider: DirtyStoreProvider<ValueKind>,
+    <F::Provider as DirtyStoreProvider<ValueKind>>::Store:
+        DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    type Handler = KeyedStateHandler<T::Handler, D, Sc, O>;
+    type Handler = KeyedStateHandler<T::Handler, D, Sc, O, F::Provider>;
 
     fn handler_for_partition(&self, topic: Topic, partition: Partition) -> Self::Handler {
         let inner = self.inner_provider.handler_for_partition(topic, partition);
         let segment_id = compute_segment_id(topic, partition, &self.consumer_group);
+        let provider = self.factory.for_partition(topic, partition);
         KeyedStateHandler {
             inner,
             durable: self.durable.clone(),
             scanner: self.scanner.clone(),
             oracle: self.oracle.clone(),
+            provider,
             consumer_group: self.consumer_group.clone(),
             registry: self.registry.clone(),
             segment_id,
@@ -1278,23 +1349,19 @@ where
     }
 }
 
-impl<D, Sc, O, P> HandlerMiddleware<P> for KeyedStateMiddleware<D, Sc, O, P>
+impl<D, Sc, O, F, P> HandlerMiddleware<P> for KeyedStateMiddleware<D, Sc, O, F, P>
 where
-    D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>
-        + DirectApplyStore<ValueKind, Error = <D as DurableWalStore<ValueKind>>::Error>
-        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
-        + fmt::Debug
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
     Sc: PendingIndexScanner,
     O: CommitOracle,
+    F: DirtyStoreFactory<ValueKind>,
+    F::Provider: DirtyStoreProvider<ValueKind>,
+    <F::Provider as DirtyStoreProvider<ValueKind>>::Store:
+        DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
     P: Send + Sync + 'static,
 {
     type Provider<T>
-        = KeyedStateProvider<T, D, Sc, O>
+        = KeyedStateProvider<T, D, Sc, O, F>
     where
         T: FallibleHandlerProvider,
         T::Handler: FallibleHandler<Payload = P>;
@@ -1309,6 +1376,7 @@ where
             durable: self.durable.clone(),
             scanner: self.scanner.clone(),
             oracle: self.oracle.clone(),
+            factory: self.factory.clone(),
             consumer_group: self.consumer_group.clone(),
             registry: self.registry.clone(),
             commit_mode: self.commit_mode,
@@ -1331,6 +1399,7 @@ pub(crate) async fn run_state_recovery_for_tests<C, D, Sc, O>(
     (),
     KeyedStateMiddlewareError<
         Infallible,
+        <D as DurableWalStore<ValueKind>>::Error,
         <D as DurableWalStore<ValueKind>>::Error,
         Sc::Error,
         O::Error,

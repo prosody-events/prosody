@@ -12,7 +12,12 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::DurableState;
-use crate::state::memory::MemoryDurableValueStore;
+use crate::state::EventScopeId;
+use crate::state::StoreOutcome;
+use crate::state::memory::{
+    MemoryDirtyValueStore, MemoryDirtyValueStoreFactory, MemoryDirtyValueStoreProvider,
+    MemoryDurableValueStore,
+};
 use crate::state::oracle::CommitOracle;
 use crate::state::value::{
     DirectApplyStore, DurableWalStore, StoredPayload, ValueKind, ValueOp, ValueStore,
@@ -99,7 +104,7 @@ fn build_context<C, D>(
     state_key: StateKey,
     event: EventRef,
     commit_mode: CommitMode,
-) -> KeyedStateContext<C, D>
+) -> KeyedStateContext<C, D, MemoryDirtyValueStore>
 where
     C: EventContext + Clone + Send + Sync + 'static,
     D: ValueStore<Error = <D as DurableWalStore<ValueKind>>::Error>
@@ -111,7 +116,16 @@ where
         + Sync
         + 'static,
 {
-    KeyedStateContext::new(inner, durable, registry, state_key, event, commit_mode)
+    KeyedStateContext::new(
+        inner,
+        durable,
+        MemoryDirtyValueStore::new(),
+        registry,
+        state_key,
+        event,
+        commit_mode,
+        EventScopeId::fresh(),
+    )
 }
 
 /// `ctx.value(name).set(...)` should accumulate dirty ops and
@@ -147,6 +161,48 @@ async fn value_set_then_seal_persists_sealed_wal() -> Result<()> {
         }
         other => Err(eyre!("expected Sealed, got {other:?}")),
     }
+}
+
+/// `flush()` on a `Dirty` transaction drains the dirty ops directly to
+/// durable applied state and returns the transaction to `Clean`.
+#[tokio::test]
+async fn flush_drains_dirty_and_returns_clean() -> Result<()> {
+    let durable = MemoryDurableValueStore::for_tests();
+    let registry = Arc::new(registry());
+    let state_key = make_state_key();
+    let event = EventRef::Message {
+        dedup_id: Uuid::from_u128(42),
+    };
+    let ctx = build_context(
+        MockEventContext::new(),
+        durable.clone(),
+        registry,
+        state_key.clone(),
+        event,
+        CommitMode::Wal,
+    );
+
+    let handle = ctx.value("counter")?;
+    handle.set(inline_bytes(13)).await?;
+    let outcome = handle.flush().await?;
+    assert_eq!(
+        outcome,
+        StoreOutcome::Applied,
+        "flush of Dirty must report Applied"
+    );
+
+    let id = make_collection_id(&state_key, "counter")?;
+    match DurableWalStore::read_partition(&durable, &id).await? {
+        DurableState::Idle { applied } => {
+            assert_eq!(applied, Some(inline_bytes(13)));
+        }
+        other => return Err(eyre!("expected Idle after flush, got {other:?}")),
+    }
+
+    // Second flush is a no-op on Clean.
+    let outcome = handle.flush().await?;
+    assert_eq!(outcome, StoreOutcome::NoOp);
+    Ok(())
 }
 
 /// Two `value(name)` calls return handles that share the same
@@ -387,6 +443,7 @@ fn builder_rejects_missing_fields() -> Result<()> {
         MemoryDurableValueStore,
         MemoryDurableValueStore,
         FixedOracle,
+        MemoryDirtyValueStoreFactory,
         ProbeOutput,
     > = KeyedStateMiddleware::builder();
     let err = builder
@@ -521,12 +578,14 @@ fn build_handler(
     MemoryDurableValueStore,
     MemoryDurableValueStore,
     FixedOracle,
+    MemoryDirtyValueStoreProvider,
 > {
     KeyedStateHandler {
         inner: ValueWritingHandler::new(),
         durable: durable.clone(),
         scanner: durable,
         oracle,
+        provider: MemoryDirtyValueStoreProvider,
         consumer_group: Arc::from("test-group"),
         registry: Arc::new(registry()),
         segment_id: Uuid::new_v4(),
@@ -742,6 +801,7 @@ async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
         durable: durable.clone(),
         scanner: durable,
         oracle: FixedOracle::committed(),
+        provider: MemoryDirtyValueStoreProvider,
         consumer_group: Arc::from("test-group"),
         registry: Arc::new(registry()),
         segment_id: Uuid::new_v4(),
