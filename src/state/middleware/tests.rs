@@ -103,7 +103,6 @@ fn build_context<C, D>(
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     event: EventRef,
-    commit_mode: CommitMode,
 ) -> KeyedStateContext<C, D, MemoryDirtyValueStore>
 where
     C: EventContext + Clone + Send + Sync + 'static,
@@ -123,9 +122,17 @@ where
         registry,
         state_key,
         event,
-        commit_mode,
         EventScopeId::fresh(),
     )
+}
+
+/// Registry that pins `name` to `mode`. Used by tests that exercise a
+/// non-default commit mode without rebuilding the full Builder.
+fn registry_with_mode(name: &str, mode: CommitMode) -> Result<CollectionDefRegistry> {
+    let mut r = CollectionDefRegistry::new(Some(CompactDuration::new(3_600)));
+    let def = CollectionDef::new(Some(CompactDuration::new(3_600))).with_commit_mode(mode);
+    r.insert(StateName::try_new(name)?, def);
+    Ok(r)
 }
 
 /// `ctx.value(name).set(...)` should accumulate dirty ops and
@@ -144,13 +151,12 @@ async fn value_set_then_seal_persists_sealed_wal() -> Result<()> {
         registry,
         state_key.clone(),
         event,
-        CommitMode::Wal,
     );
 
     let handle = ctx.value("counter")?;
     handle.set(inline_bytes(7)).await?;
 
-    let sealed = ctx.seal_all().await?;
+    let sealed = ctx.resolve_per_collection().await?;
     assert_eq!(sealed.len(), 1, "exactly one collection sealed");
 
     let id = make_collection_id(&state_key, "counter")?;
@@ -179,7 +185,6 @@ async fn flush_drains_dirty_and_returns_clean() -> Result<()> {
         registry,
         state_key.clone(),
         event,
-        CommitMode::Wal,
     );
 
     let handle = ctx.value("counter")?;
@@ -221,7 +226,6 @@ async fn repeat_value_call_returns_same_transaction() -> Result<()> {
         registry,
         state_key.clone(),
         event,
-        CommitMode::Wal,
     );
 
     let first = ctx.value("counter")?;
@@ -232,11 +236,12 @@ async fn repeat_value_call_returns_same_transaction() -> Result<()> {
     Ok(())
 }
 
-/// `direct_apply_all` writes ops without producing a sealed WAL.
+/// Direct-mode collections direct-apply via `resolve_per_collection`
+/// without producing a sealed WAL.
 #[tokio::test]
 async fn direct_apply_all_skips_seal() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
-    let registry = Arc::new(registry());
+    let registry = Arc::new(registry_with_mode("counter", CommitMode::Direct)?);
     let state_key = make_state_key();
     let event = EventRef::Message {
         dedup_id: Uuid::from_u128(3),
@@ -247,12 +252,15 @@ async fn direct_apply_all_skips_seal() -> Result<()> {
         registry,
         state_key.clone(),
         event,
-        CommitMode::Direct,
     );
 
     let handle = ctx.value("counter")?;
     handle.set(inline_bytes(9)).await?;
-    ctx.direct_apply_all().await?;
+    let sealed = ctx.resolve_per_collection().await?;
+    assert!(
+        sealed.is_empty(),
+        "direct-mode must not surface sealed entries"
+    );
 
     let id = make_collection_id(&state_key, "counter")?;
     match DurableWalStore::read_partition(&durable, &id).await? {
@@ -580,6 +588,7 @@ fn build_handler(
     FixedOracle,
     MemoryDirtyValueStoreProvider,
 > {
+    let registry = registry().with_default_commit_mode(commit_mode);
     KeyedStateHandler {
         inner: ValueWritingHandler::new(),
         durable: durable.clone(),
@@ -587,9 +596,8 @@ fn build_handler(
         oracle,
         provider: MemoryDirtyValueStoreProvider,
         consumer_group: Arc::from("test-group"),
-        registry: Arc::new(registry()),
+        registry: Arc::new(registry),
         segment_id: Uuid::new_v4(),
-        commit_mode,
         recovery_delay: CompactDuration::new(30),
     }
 }
@@ -805,7 +813,6 @@ async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
         consumer_group: Arc::from("test-group"),
         registry: Arc::new(registry()),
         segment_id: Uuid::new_v4(),
-        commit_mode: CommitMode::Wal,
         recovery_delay: CompactDuration::new(30),
     };
     let context = MockEventContext::new().with_timer_tracking();

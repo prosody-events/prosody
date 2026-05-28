@@ -94,38 +94,80 @@ mod tests;
 
 /// Per-collection metadata that overrides middleware defaults.
 ///
-/// Today `CollectionDef` carries only a TTL. `Some(d)` binds `d` on every
-/// write to this collection. `None` is an explicit opt-out — the middleware
-/// will not invent a default for that collection.
+/// Carries the collection's TTL and [`CommitMode`]. `ttl` is `None` for
+/// "do not bind a TTL" (explicit opt-out / Cassandra over-20-year
+/// overflow fallback). `commit_mode` decides whether handler-side dirty
+/// ops produce a sealed WAL on success ([`CommitMode::Wal`]) or apply
+/// straight to authoritative state ([`CommitMode::Direct`]).
+///
+/// Core Invariant #6: "A collection has one `CommitMode` while a handler
+/// is running" — pinned here at registration time, not at event scope
+/// creation time.
 #[derive(Clone, Debug)]
 pub struct CollectionDef {
     /// Per-collection TTL override.
     pub ttl: Option<CompactDuration>,
+
+    /// Per-collection commit mode.
+    pub commit_mode: CommitMode,
 }
 
 impl CollectionDef {
-    /// Creates a collection definition with the supplied TTL.
+    /// Creates a collection definition with the supplied TTL; commit
+    /// mode defaults to [`CommitMode::Wal`].
     #[must_use]
     pub fn new(ttl: Option<CompactDuration>) -> Self {
-        Self { ttl }
+        Self {
+            ttl,
+            commit_mode: CommitMode::Wal,
+        }
+    }
+
+    /// Builder-style override for the commit mode.
+    #[must_use]
+    pub fn with_commit_mode(mut self, mode: CommitMode) -> Self {
+        self.commit_mode = mode;
+        self
     }
 }
 
-/// Registry of [`CollectionDef`] entries plus the middleware-wide default.
-#[derive(Clone, Debug, Default)]
+/// Registry of [`CollectionDef`] entries plus middleware-wide defaults
+/// for collections that are not explicitly registered.
+#[derive(Clone, Debug)]
 pub struct CollectionDefRegistry {
     defs: HashMap<StateName, CollectionDef>,
     default_ttl: Option<CompactDuration>,
+    default_commit_mode: CommitMode,
+}
+
+impl Default for CollectionDefRegistry {
+    fn default() -> Self {
+        Self {
+            defs: HashMap::new(),
+            default_ttl: None,
+            default_commit_mode: CommitMode::Wal,
+        }
+    }
 }
 
 impl CollectionDefRegistry {
-    /// Creates a registry with the supplied middleware-wide default TTL.
+    /// Creates a registry with the supplied middleware-wide default TTL
+    /// and [`CommitMode::Wal`] as the default commit mode.
     #[must_use]
     pub fn new(default_ttl: Option<CompactDuration>) -> Self {
         Self {
             defs: HashMap::new(),
             default_ttl,
+            default_commit_mode: CommitMode::Wal,
         }
+    }
+
+    /// Overrides the default commit mode used for collections not in the
+    /// registry.
+    #[must_use]
+    pub fn with_default_commit_mode(mut self, mode: CommitMode) -> Self {
+        self.default_commit_mode = mode;
+        self
     }
 
     /// Registers a per-collection definition. Returns the previous value
@@ -139,6 +181,15 @@ impl CollectionDefRegistry {
     #[must_use]
     pub fn ttl_for(&self, name: &StateName) -> Option<CompactDuration> {
         self.defs.get(name).map_or(self.default_ttl, |def| def.ttl)
+    }
+
+    /// Returns the commit mode bound to `name`, falling back to the
+    /// middleware-wide default.
+    #[must_use]
+    pub fn commit_mode_for(&self, name: &StateName) -> CommitMode {
+        self.defs
+            .get(name)
+            .map_or(self.default_commit_mode, |def| def.commit_mode)
     }
 }
 
@@ -313,7 +364,6 @@ pub struct KeyedStateContext<C, D, S> {
     registry: Arc<CollectionDefRegistry>,
     state_key: StateKey,
     event: EventRef,
-    commit_mode: CommitMode,
     #[allow(dead_code)]
     scope: EventScopeId,
     ctx: Arc<ContextInner<D, S>>,
@@ -333,7 +383,6 @@ where
             registry: self.registry.clone(),
             state_key: self.state_key.clone(),
             event: self.event,
-            commit_mode: self.commit_mode,
             scope: self.scope,
             ctx: self.ctx.clone(),
         }
@@ -346,10 +395,6 @@ where
     D: DurableValueBundle,
     S: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "internal middleware-only constructor — refactoring to a builder would obscure the wiring shape"
-    )]
     fn new(
         inner: C,
         durable: D,
@@ -357,7 +402,6 @@ where
         registry: Arc<CollectionDefRegistry>,
         state_key: StateKey,
         event: EventRef,
-        commit_mode: CommitMode,
         scope: EventScopeId,
     ) -> Self {
         Self {
@@ -367,7 +411,6 @@ where
             registry,
             state_key,
             event,
-            commit_mode,
             scope,
             ctx: Arc::new(ContextInner {
                 transactions: SyncMutex::new(HashMap::new()),
@@ -390,12 +433,13 @@ where
         }
 
         let collection = self.collection_ref_for(name);
+        let mode = self.registry.commit_mode_for(name);
         let tx = TransactionValueStore::new(
             self.durable.clone(),
             self.dirty.clone(),
             collection,
             self.event,
-            self.commit_mode,
+            mode,
         );
         let handle = Arc::new(AsyncMutex::new(tx));
         txs.insert(name.clone(), handle.clone());
@@ -407,9 +451,12 @@ where
         self.ctx.transactions.lock().keys().cloned().collect()
     }
 
-    /// Seals every dirty collection and returns the list of sealed
-    /// collection refs. Used by the middleware's WAL-mode success path.
-    async fn seal_all(
+    /// Walks every dirty collection and dispatches based on its
+    /// per-collection commit mode. `Wal` collections seal; `Direct`
+    /// collections direct-apply. Returns the WAL-sealed list so the
+    /// middleware can route apply hooks and decide whether to schedule
+    /// the `StateRecovery` timer.
+    async fn resolve_per_collection(
         &self,
     ) -> Result<Vec<CollectionRef<ValueKind>>, ContextTxError<D, S>> {
         let names = self.dirty_collection_names();
@@ -417,27 +464,24 @@ where
         for name in names {
             let tx = self.open_transaction(&name);
             let mut guard = tx.lock().await;
-            match guard.seal().await {
-                Ok(sealed_collection) => sealed.push(sealed_collection.collection().clone()),
-                Err(TransactionValueStoreError::NoPendingOps) => {
-                    // Touched the collection (e.g. via `get`) but never
-                    // mutated it — nothing to seal.
+            match self.registry.commit_mode_for(&name) {
+                CommitMode::Wal => match guard.seal().await {
+                    Ok(sealed_collection) => sealed.push(sealed_collection.collection().clone()),
+                    Err(TransactionValueStoreError::NoPendingOps) => {
+                        // Touched the collection (e.g. via `get`) but
+                        // never mutated it — nothing to seal.
+                    }
+                    Err(err) => return Err(err),
+                },
+                CommitMode::Direct => {
+                    match guard.direct_apply().await {
+                        Ok(_) | Err(TransactionValueStoreError::NoPendingOps) => {}
+                        Err(err) => return Err(err),
+                    }
                 }
-                Err(err) => return Err(err),
             }
         }
         Ok(sealed)
-    }
-
-    /// Direct-applies every dirty collection.
-    async fn direct_apply_all(&self) -> Result<(), ContextTxError<D, S>> {
-        let names = self.dirty_collection_names();
-        for name in names {
-            let tx = self.open_transaction(&name);
-            let mut guard = tx.lock().await;
-            let _ = guard.direct_apply().await?;
-        }
-        Ok(())
     }
 }
 
@@ -579,7 +623,7 @@ pub struct KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
     factory: Option<F>,
     consumer_group: Option<Arc<str>>,
     default_ttl: Option<CompactDuration>,
-    commit_mode: CommitMode,
+    default_commit_mode: CommitMode,
     recovery_delay: CompactDuration,
     defs: HashMap<StateName, CollectionDef>,
     _payload: PhantomData<fn() -> P>,
@@ -594,7 +638,7 @@ impl<D, Sc, O, F, P> Default for KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
             factory: None,
             consumer_group: None,
             default_ttl: None,
-            commit_mode: CommitMode::Wal,
+            default_commit_mode: CommitMode::Wal,
             recovery_delay: CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS),
             defs: HashMap::new(),
             _payload: PhantomData,
@@ -653,10 +697,12 @@ impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
         self
     }
 
-    /// Sets the commit mode (defaults to [`CommitMode::Wal`]).
+    /// Sets the default [`CommitMode`] applied to collections that are
+    /// not registered via [`Self::collection_def`] (defaults to
+    /// [`CommitMode::Wal`]).
     #[must_use]
-    pub fn commit_mode(mut self, mode: CommitMode) -> Self {
-        self.commit_mode = mode;
+    pub fn default_commit_mode(mut self, mode: CommitMode) -> Self {
+        self.default_commit_mode = mode;
         self
     }
 
@@ -702,6 +748,7 @@ impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
         let registry = Arc::new(CollectionDefRegistry {
             defs: self.defs,
             default_ttl: self.default_ttl,
+            default_commit_mode: self.default_commit_mode,
         });
         Ok(KeyedStateMiddleware {
             durable,
@@ -710,7 +757,6 @@ impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
             factory,
             consumer_group,
             registry,
-            commit_mode: self.commit_mode,
             recovery_delay: self.recovery_delay,
             _payload: PhantomData,
         })
@@ -733,10 +779,10 @@ impl ClassifyError for KeyedStateMiddlewareBuildError {
 
 /// Keyed-state middleware.
 ///
-/// Wires user handlers into the durable Value bundle, drives WAL seal +
-/// recovery timer scheduling, and routes apply hooks to
-/// `apply_sealed` / `rollback_sealed`. See the module docs for the hook
-/// lifecycle.
+/// Wires user handlers into the durable Value bundle, drives per-collection
+/// `Wal` seal + recovery timer scheduling and `Direct` apply, and routes
+/// apply hooks to `apply_sealed` / `rollback_sealed`. See the module docs
+/// for the hook lifecycle.
 pub struct KeyedStateMiddleware<D, Sc, O, F, P> {
     durable: D,
     scanner: Sc,
@@ -744,7 +790,6 @@ pub struct KeyedStateMiddleware<D, Sc, O, F, P> {
     factory: F,
     consumer_group: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
-    commit_mode: CommitMode,
     recovery_delay: CompactDuration,
     _payload: PhantomData<fn() -> P>,
 }
@@ -764,7 +809,6 @@ where
             factory: self.factory.clone(),
             consumer_group: self.consumer_group.clone(),
             registry: self.registry.clone(),
-            commit_mode: self.commit_mode,
             recovery_delay: self.recovery_delay,
             _payload: PhantomData,
         }
@@ -775,7 +819,6 @@ impl<D, Sc, O, F, P> fmt::Debug for KeyedStateMiddleware<D, Sc, O, F, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyedStateMiddleware")
             .field("consumer_group", &self.consumer_group)
-            .field("commit_mode", &self.commit_mode)
             .field("recovery_delay", &self.recovery_delay)
             .finish_non_exhaustive()
     }
@@ -917,7 +960,6 @@ where
     consumer_group: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
     segment_id: SegmentId,
-    commit_mode: CommitMode,
     recovery_delay: CompactDuration,
 }
 
@@ -948,7 +990,6 @@ where
             self.registry.clone(),
             StateKey::new(self.segment_id, key),
             event,
-            self.commit_mode,
             scope,
         )
     }
@@ -964,35 +1005,23 @@ where
     where
         C: EventContext + Clone + Send + Sync + 'static,
     {
-        match self.commit_mode {
-            CommitMode::Wal => {
-                let event = wrapped.event;
-                let sealed = wrapped
-                    .seal_all()
-                    .await
-                    .map_err(KeyedStateMiddlewareError::Transaction)?;
-                if sealed.is_empty() {
-                    Ok((Vec::new(), None))
-                } else {
-                    let now =
-                        CompactDateTime::now().map_err(KeyedStateMiddlewareError::DateTime)?;
-                    let fire = now
-                        .add_duration(self.recovery_delay)
-                        .map_err(KeyedStateMiddlewareError::DateTime)?;
-                    context
-                        .schedule(fire, TimerType::StateRecovery)
-                        .await
-                        .map_err(KeyedStateMiddlewareError::Timer)?;
-                    Ok((sealed, Some(event)))
-                }
-            }
-            CommitMode::Direct => {
-                wrapped
-                    .direct_apply_all()
-                    .await
-                    .map_err(KeyedStateMiddlewareError::Transaction)?;
-                Ok((Vec::new(), None))
-            }
+        let event = wrapped.event;
+        let sealed = wrapped
+            .resolve_per_collection()
+            .await
+            .map_err(KeyedStateMiddlewareError::Transaction)?;
+        if sealed.is_empty() {
+            Ok((Vec::new(), None))
+        } else {
+            let now = CompactDateTime::now().map_err(KeyedStateMiddlewareError::DateTime)?;
+            let fire = now
+                .add_duration(self.recovery_delay)
+                .map_err(KeyedStateMiddlewareError::DateTime)?;
+            context
+                .schedule(fire, TimerType::StateRecovery)
+                .await
+                .map_err(KeyedStateMiddlewareError::Timer)?;
+            Ok((sealed, Some(event)))
         }
     }
 
@@ -1312,7 +1341,6 @@ pub struct KeyedStateProvider<T, D, Sc, O, F> {
     factory: F,
     consumer_group: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
-    commit_mode: CommitMode,
     recovery_delay: CompactDuration,
 }
 
@@ -1343,7 +1371,6 @@ where
             consumer_group: self.consumer_group.clone(),
             registry: self.registry.clone(),
             segment_id,
-            commit_mode: self.commit_mode,
             recovery_delay: self.recovery_delay,
         }
     }
@@ -1379,7 +1406,6 @@ where
             factory: self.factory.clone(),
             consumer_group: self.consumer_group.clone(),
             registry: self.registry.clone(),
-            commit_mode: self.commit_mode,
             recovery_delay: self.recovery_delay,
         }
     }
