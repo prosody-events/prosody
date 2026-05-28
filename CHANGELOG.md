@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/prosody-events/prosody/compare/prosody-v0.3.0...prosody-v0.4.0) (2026-05-15)
+
+
+### Features
+
+* **oracle:** timer tag + CommitManager + dedup cache refactor ([#32](https://github.com/prosody-events/prosody/issues/32)) ([36bc1b2](https://github.com/prosody-events/prosody/commit/36bc1b2654bd5e668e1e7704ecf8d3a012fe67f9))
+* **timers:** skip startup tombstone scan via slab watermark ([#34](https://github.com/prosody-events/prosody/issues/34)) ([e9a6941](https://github.com/prosody-events/prosody/commit/e9a694108d30e30790bc4dcc77ce7cfcb0e2b955))
+
+
+### Bug Fixes
+
+* **timers:** keep duplicate timer metadata consistent ([#35](https://github.com/prosody-events/prosody/issues/35)) ([8013f1b](https://github.com/prosody-events/prosody/commit/8013f1b3883c077951c3b55fdff70abc7b1f32d0))
+* **timers:** keep timer tags internal ([#36](https://github.com/prosody-events/prosody/issues/36)) ([fd8f00a](https://github.com/prosody-events/prosody/commit/fd8f00a393aac51e0c4b7f9d210263245156c0f3))
+* wait for Kafka topic metadata readiness ([#38](https://github.com/prosody-events/prosody/issues/38)) ([8180fb1](https://github.com/prosody-events/prosody/commit/8180fb13e93adef098f2cebbb73b488b6fe5cab7))
+
 ## [0.3.0](https://github.com/prosody-events/prosody/compare/prosody-v0.2.1...prosody-v0.3.0) (2026-05-07)
 
 
