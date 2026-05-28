@@ -234,13 +234,7 @@ impl CassandraValueStore {
         applied: &ValueApplied,
     ) -> Result<(), CassandraValueStoreError> {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        let (data, encoding) = match applied {
-            Some(payload) => {
-                let bytes = encode_payload(payload, VALUE_PAYLOAD_ENCODING)?;
-                (Some(bytes), Some(VALUE_PAYLOAD_ENCODING.as_i16()))
-            }
-            None => (None, None),
-        };
+        let (data, encoding) = encode_applied_payload(applied)?;
         match collection.ttl() {
             Some(ttl) => {
                 let ttl = ttl_to_i32(ttl);
@@ -289,13 +283,7 @@ impl CassandraValueStore {
         applied: &ValueApplied,
     ) -> Result<(), CassandraValueStoreError> {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        let (data, encoding) = match applied {
-            Some(payload) => {
-                let bytes = encode_payload(payload, VALUE_PAYLOAD_ENCODING)?;
-                (Some(bytes), Some(VALUE_PAYLOAD_ENCODING.as_i16()))
-            }
-            None => (None, None),
-        };
+        let (data, encoding) = encode_applied_payload(applied)?;
         match collection.ttl() {
             Some(ttl) => {
                 let ttl = ttl_to_i32(ttl);
@@ -522,6 +510,24 @@ impl PendingIndexStore for CassandraValueStore {
         )
         .await
     }
+}
+
+/// Encodes the authoritative applied payload for a `data` write.
+///
+/// Returns the encoded `data` cell and its `payload_encoding`
+/// discriminator, or `(None, None)` when the applied state is empty (a
+/// cleared cell). Shared by `apply_wal_atomic` and `write_data_only`,
+/// which differ only in the query they bind these values into.
+fn encode_applied_payload(
+    applied: &ValueApplied,
+) -> Result<(Option<Bytes>, Option<i16>), CassandraValueStoreError> {
+    Ok(match applied {
+        Some(payload) => (
+            Some(encode_payload(payload, VALUE_PAYLOAD_ENCODING)?),
+            Some(VALUE_PAYLOAD_ENCODING.as_i16()),
+        ),
+        None => (None, None),
+    })
 }
 
 fn primary_components<K>(id: &CollectionId<K>) -> (&SegmentId, &str, i8, &str)
