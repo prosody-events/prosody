@@ -61,8 +61,8 @@ use crate::state::value::{
     fold_value_ops,
 };
 use crate::state::{
-    CollectionId, CollectionKind, CollectionKindId, CollectionRef, DurableState, EventRef, Read,
-    SealedCollection, StateType, StoreOutcome, WalEnvelope,
+    CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, Read, SealedCollection,
+    StoreOutcome, WalEnvelope,
 };
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
@@ -485,8 +485,8 @@ impl PendingIndexStore for CassandraValueStore {
     {
         let segment_id = id.state_key().segment_id;
         let key = id.state_key().key.as_ref();
-        let state_type = state_type_to_i8(id.state_type());
-        let kind = kind_to_i8(K::ID);
+        let state_type = id.state_type().as_i8();
+        let kind = K::ID.as_i8();
         let name = id.name().as_str();
         self.execute_unpaged(
             &self.queries.insert_pending,
@@ -501,8 +501,8 @@ impl PendingIndexStore for CassandraValueStore {
     {
         let segment_id = id.state_key().segment_id;
         let key = id.state_key().key.as_ref();
-        let state_type = state_type_to_i8(id.state_type());
-        let kind = kind_to_i8(K::ID);
+        let state_type = id.state_type().as_i8();
+        let kind = K::ID.as_i8();
         let name = id.name().as_str();
         self.execute_unpaged(
             &self.queries.delete_pending,
@@ -545,18 +545,8 @@ where
 {
     let segment_id = &id.state_key().segment_id;
     let key = id.state_key().key.as_ref();
-    let state_type = state_type_to_i8(id.state_type());
+    let state_type = id.state_type().as_i8();
     (segment_id, key, state_type)
-}
-
-fn state_type_to_i8(state_type: StateType) -> i8 {
-    match state_type {
-        StateType::Application => 0,
-    }
-}
-
-fn kind_to_i8(kind: CollectionKindId) -> i8 {
-    kind as u8 as i8
 }
 
 fn ttl_to_i32(ttl: CompactDuration) -> i32 {

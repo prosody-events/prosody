@@ -78,7 +78,7 @@ fn decode_row(
     kind_i8: i8,
     name: String,
 ) -> Result<Option<PendingEntry>, ScanPendingError> {
-    let Some(state_type) = state_type_from_i8(state_type_i8) else {
+    let Some(state_type) = StateType::from_i8(state_type_i8) else {
         warn!(
             state_type = state_type_i8,
             "skipping unknown state_type in pending scan"
@@ -86,7 +86,7 @@ fn decode_row(
         return Ok(None);
     };
 
-    let Some(kind) = kind_from_i8(kind_i8) else {
+    let Some(kind) = CollectionKindId::from_i8(kind_i8) else {
         warn!(
             kind = kind_i8,
             "skipping unknown collection kind in pending scan"
@@ -96,20 +96,6 @@ fn decode_row(
 
     let name = StateName::try_new(name)?;
     Ok(Some(PendingEntry::new(state_type, kind, name)))
-}
-
-fn state_type_from_i8(value: i8) -> Option<StateType> {
-    match value {
-        0 => Some(StateType::Application),
-        _ => None,
-    }
-}
-
-fn kind_from_i8(value: i8) -> Option<CollectionKindId> {
-    match value {
-        1 => Some(CollectionKindId::Value),
-        _ => None,
-    }
 }
 
 /// Error type for [`CassandraValueStore::scan_pending`].

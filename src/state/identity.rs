@@ -31,6 +31,27 @@ pub enum CollectionKindId {
     TestSecondary = 2,
 }
 
+impl CollectionKindId {
+    /// Wire discriminator persisted beside durable identity.
+    ///
+    /// Paired with [`Self::from_i8`]; the two are inverses by construction,
+    /// so the on-wire encoding cannot drift from the type it encodes.
+    pub(crate) fn as_i8(self) -> i8 {
+        self as u8 as i8
+    }
+
+    /// Recovers a collection kind from its wire discriminator, or `None`
+    /// for an unknown byte. Inverse of [`Self::as_i8`].
+    pub(crate) fn from_i8(value: i8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Value),
+            #[cfg(test)]
+            2 => Some(Self::TestSecondary),
+            _ => None,
+        }
+    }
+}
+
 /// Type-level marker for a keyed-state collection family.
 pub trait CollectionKind: Clone + Copy + fmt::Debug + Send + Sync + 'static {
     /// Runtime discriminator stored beside durable identity.
@@ -69,6 +90,27 @@ impl StateKey {
 pub enum StateType {
     /// User application state.
     Application,
+}
+
+impl StateType {
+    /// Wire discriminator for the state namespace.
+    ///
+    /// Paired with [`Self::from_i8`]; the two are inverses by construction,
+    /// so the on-wire encoding cannot drift from the type it encodes.
+    pub(crate) fn as_i8(self) -> i8 {
+        match self {
+            Self::Application => 0,
+        }
+    }
+
+    /// Recovers a state namespace from its wire discriminator, or `None`
+    /// for an unknown byte. Inverse of [`Self::as_i8`].
+    pub(crate) fn from_i8(value: i8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Application),
+            _ => None,
+        }
+    }
 }
 
 /// Human-readable state collection name.

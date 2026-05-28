@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::state::TimerEventRef;
 use crate::timers::TimerType;
@@ -48,7 +47,7 @@ fn udt_unknown_kind_rejected() -> Result<()> {
 #[test]
 fn udt_message_missing_dedup_id_rejected() -> Result<()> {
     let raw = RawEventRef {
-        kind: KIND_MESSAGE,
+        kind: EventRef::MESSAGE_KIND,
         msg_dedup_id: None,
         timer_type: None,
         time: None,
@@ -63,7 +62,7 @@ fn udt_message_missing_dedup_id_rejected() -> Result<()> {
 #[test]
 fn udt_message_with_timer_fields_rejected() -> Result<()> {
     let raw = RawEventRef {
-        kind: KIND_MESSAGE,
+        kind: EventRef::MESSAGE_KIND,
         msg_dedup_id: Some(Uuid::from_u128(1)),
         timer_type: Some(TimerType::Application),
         time: None,
@@ -78,7 +77,7 @@ fn udt_message_with_timer_fields_rejected() -> Result<()> {
 #[test]
 fn udt_timer_with_dedup_id_rejected() -> Result<()> {
     let raw = RawEventRef {
-        kind: KIND_TIMER,
+        kind: EventRef::TIMER_KIND,
         msg_dedup_id: Some(Uuid::from_u128(1)),
         timer_type: Some(TimerType::Application),
         time: Some(CompactDateTime::from(0_u32)),
@@ -93,7 +92,7 @@ fn udt_timer_with_dedup_id_rejected() -> Result<()> {
 #[test]
 fn udt_timer_missing_field_rejected() -> Result<()> {
     let raw = RawEventRef {
-        kind: KIND_TIMER,
+        kind: EventRef::TIMER_KIND,
         msg_dedup_id: None,
         timer_type: Some(TimerType::Application),
         time: None,

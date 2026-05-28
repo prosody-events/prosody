@@ -55,6 +55,15 @@ pub enum EventRef {
     Timer(TimerEventRef),
 }
 
+impl EventRef {
+    /// Wire discriminator for the message variant in the Cassandra
+    /// `event_ref` UDT `kind` column.
+    pub(crate) const MESSAGE_KIND: i8 = 0;
+    /// Wire discriminator for the timer variant in the Cassandra
+    /// `event_ref` UDT `kind` column.
+    pub(crate) const TIMER_KIND: i8 = 1;
+}
+
 /// Durable timer identity stored in a sealed WAL.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct TimerEventRef {

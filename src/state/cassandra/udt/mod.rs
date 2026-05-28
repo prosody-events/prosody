@@ -34,9 +34,6 @@ use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
 use uuid::Uuid;
 
-const KIND_MESSAGE: i8 = 0;
-const KIND_TIMER: i8 = 1;
-
 /// On-wire representation of the `event_ref` UDT.
 ///
 /// Private bridge between [`EventRef`] and the scylla derive macros.
@@ -53,14 +50,14 @@ impl RawEventRef {
     fn from_event(event: EventRef) -> Self {
         match event {
             EventRef::Message { dedup_id } => Self {
-                kind: KIND_MESSAGE,
+                kind: EventRef::MESSAGE_KIND,
                 msg_dedup_id: Some(dedup_id),
                 timer_type: None,
                 time: None,
                 tag: None,
             },
             EventRef::Timer(timer) => Self {
-                kind: KIND_TIMER,
+                kind: EventRef::TIMER_KIND,
                 msg_dedup_id: None,
                 timer_type: Some(timer.timer_type),
                 time: Some(timer.time),
@@ -71,7 +68,7 @@ impl RawEventRef {
 
     fn try_into_event(self) -> Result<EventRef, CorruptUdtError> {
         match self.kind {
-            KIND_MESSAGE => {
+            EventRef::MESSAGE_KIND => {
                 if self.timer_type.is_some() || self.time.is_some() || self.tag.is_some() {
                     return Err(CorruptUdtError::MessageHasTimerFields);
                 }
@@ -80,7 +77,7 @@ impl RawEventRef {
                 };
                 Ok(EventRef::Message { dedup_id })
             }
-            KIND_TIMER => {
+            EventRef::TIMER_KIND => {
                 if self.msg_dedup_id.is_some() {
                     return Err(CorruptUdtError::TimerHasDedupId);
                 }

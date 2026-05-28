@@ -31,7 +31,7 @@
 use super::error::FjallValueStoreError;
 use crate::state::encoding::{PayloadEncoding, decode_payload, encode_payload};
 use crate::state::value::{StoredPayload, ValueKind};
-use crate::state::{CollectionId, CollectionKind, EventScopeId, Read, StateType};
+use crate::state::{CollectionId, CollectionKind, EventScopeId, Read};
 use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -58,7 +58,7 @@ where
 {
     let segment_bytes = id.state_key().segment_id.as_bytes();
     let key_bytes = id.state_key().key.as_bytes();
-    let state_type_byte = state_type_to_u8(id.state_type());
+    let state_type_byte = id.state_type().as_i8() as u8;
     let name_bytes = id.name().as_str().as_bytes();
 
     let mut buf = Vec::with_capacity(segment_bytes.len() + key_bytes.len() + name_bytes.len() + 4);
@@ -129,12 +129,6 @@ pub fn decode_cell(bytes: Option<&[u8]>) -> Result<Read<StoredPayload>, FjallVal
             Ok(Read::Present(payload))
         }
         other => Err(FjallValueStoreError::UnknownCacheTag(other)),
-    }
-}
-
-fn state_type_to_u8(state_type: StateType) -> u8 {
-    match state_type {
-        StateType::Application => 0,
     }
 }
 
