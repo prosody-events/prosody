@@ -62,7 +62,8 @@ impl ValueStore for MemoryDirtyValueStore {
             .lock()
             .entries
             .get(collection)
-            .and_then(|entry| entry.op.clone())
+            .cloned()
+            .flatten()
             .map_or(Read::Unknown, |op| match op {
                 ValueOp::Set { payload } => Read::Present(payload),
                 ValueOp::Clear => Read::Absent,
@@ -74,9 +75,10 @@ impl ValueStore for MemoryDirtyValueStore {
         collection: &'a CollectionId<ValueKind>,
         payload: StoredPayload,
     ) -> Result<(), Self::Error> {
-        let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.clone()).or_default();
-        entry.op = Some(ValueOp::Set { payload });
+        self.inner
+            .lock()
+            .entries
+            .insert(collection.clone(), Some(ValueOp::Set { payload }));
         Ok(())
     }
 
@@ -84,9 +86,10 @@ impl ValueStore for MemoryDirtyValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.clone()).or_default();
-        entry.op = Some(ValueOp::Clear);
+        self.inner
+            .lock()
+            .entries
+            .insert(collection.clone(), Some(ValueOp::Clear));
         Ok(())
     }
 }
@@ -133,12 +136,7 @@ impl PendingOpSource<ValueKind> for MemoryDirtyValueStore {
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<Option<PendingOps<Self::Ops<'a>>>, Self::Error> {
-        let op = self
-            .inner
-            .lock()
-            .entries
-            .get(collection)
-            .and_then(|entry| entry.op.clone());
+        let op = self.inner.lock().entries.get(collection).cloned().flatten();
         Ok(op.map(|op| PendingOps {
             count: NonZeroU64::MIN,
             ops: Some(op).into_iter(),
@@ -386,12 +384,7 @@ impl PendingIndexScanner for MemoryDurableValueStore {
 
 #[derive(Debug, Default)]
 struct DirtyInner {
-    entries: HashMap<CollectionId<ValueKind>, DirtyValueEntry, RandomState>,
-}
-
-#[derive(Debug, Default)]
-struct DirtyValueEntry {
-    op: Option<ValueOp>,
+    entries: HashMap<CollectionId<ValueKind>, Option<ValueOp>, RandomState>,
 }
 
 #[derive(Debug, Default)]
