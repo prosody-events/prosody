@@ -350,9 +350,7 @@ where
     /// Returns a transaction error if the transaction is finished or durable
     /// storage rejects the sealed event.
     pub async fn apply_sealed(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
-        if self.local_tx() == LocalTx::Finished {
-            return Err(TransactionValueStoreError::Finished);
-        }
+        self.ensure_not_finished()?;
 
         let outcome = self
             .durable
@@ -370,9 +368,7 @@ where
     /// Returns a transaction error if the transaction is finished or durable
     /// storage rejects the sealed event.
     pub async fn rollback_sealed(&mut self) -> Result<StoreOutcome, TxError<S, D>> {
-        if self.local_tx() == LocalTx::Finished {
-            return Err(TransactionValueStoreError::Finished);
-        }
+        self.ensure_not_finished()?;
 
         let outcome = self
             .durable
@@ -491,6 +487,29 @@ where
         }
     }
 
+    /// Returns an error unless `collection` is the one this transaction owns.
+    ///
+    /// Invariant: a transaction operates only on its own collection.
+    fn ensure_collection(&self, collection: &CollectionId<ValueKind>) -> Result<(), TxError<S, D>> {
+        if collection == self.collection.id() {
+            Ok(())
+        } else {
+            Err(TransactionValueStoreError::WrongCollection)
+        }
+    }
+
+    /// Returns an error when the transaction has already been resolved.
+    ///
+    /// Invariant: [`LocalTx::Finished`] is terminal — no operation
+    /// transitions out of it.
+    fn ensure_not_finished(&self) -> Result<(), TxError<S, D>> {
+        if matches!(self.local_tx(), LocalTx::Finished) {
+            Err(TransactionValueStoreError::Finished)
+        } else {
+            Ok(())
+        }
+    }
+
     fn set_local_tx(&mut self, tx: LocalTx<ValueKind>) {
         *self.tx.get_mut() = tx;
     }
@@ -529,12 +548,8 @@ where
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<Read<StoredPayload>, Self::Error> {
-        if collection != self.collection.id() {
-            return Err(TransactionValueStoreError::WrongCollection);
-        }
-        if matches!(self.local_tx(), LocalTx::Finished) {
-            return Err(TransactionValueStoreError::Finished);
-        }
+        self.ensure_collection(collection)?;
+        self.ensure_not_finished()?;
 
         match self
             .dirty
@@ -557,10 +572,7 @@ where
         collection: &'a CollectionId<ValueKind>,
         payload: StoredPayload,
     ) -> Result<(), Self::Error> {
-        if collection != self.collection.id() {
-            return Err(TransactionValueStoreError::WrongCollection);
-        }
-
+        self.ensure_collection(collection)?;
         self.can_write()?;
         self.dirty
             .set(collection, payload)
@@ -573,10 +585,7 @@ where
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        if collection != self.collection.id() {
-            return Err(TransactionValueStoreError::WrongCollection);
-        }
-
+        self.ensure_collection(collection)?;
         self.can_write()?;
         self.dirty
             .clear(collection)
