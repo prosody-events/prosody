@@ -61,6 +61,25 @@ use thiserror::Error;
 #[cfg(test)]
 mod tests;
 
+/// Bundle bound for the inner store the recovering wrapper drives.
+///
+/// A Value store whose [`ValueStore`] and [`DurableWalStore`] error types
+/// coincide — the single constraint shared verbatim by the wrapper's
+/// [`ValueStore`] and [`DurableWalStore`] impls. Mirrors
+/// [`DurableValueBundle`](super::middleware::DurableValueBundle) but omits
+/// the direct-apply / `Clone` / `Debug` requirements those two impls do not
+/// need, keeping the bound local to what recovery reads require. The
+/// [`DirectApplyStore`] impl adds [`DirectApplyStore`] on top.
+pub(crate) trait RecoverableValueStore:
+    ValueStore<Error = <Self as DurableWalStore<ValueKind>>::Error> + DurableWalStore<ValueKind>
+{
+}
+
+impl<T> RecoverableValueStore for T where
+    T: ValueStore<Error = <T as DurableWalStore<ValueKind>>::Error> + DurableWalStore<ValueKind>
+{
+}
+
 /// First-touch recovery wrapper over an authoritative Value store.
 ///
 /// See the [module docs][self] for the recovery contract and per-method
@@ -109,8 +128,7 @@ impl<Inner, Oracle> RecoveringValueStore<Inner, Oracle> {
 
 impl<Inner, Oracle> ValueStore for RecoveringValueStore<Inner, Oracle>
 where
-    Inner: ValueStore<Error = <Inner as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>,
+    Inner: RecoverableValueStore,
     Oracle: CommitOracle,
 {
     type Error =
@@ -179,8 +197,7 @@ where
 
 impl<Inner, Oracle> DurableWalStore<ValueKind> for RecoveringValueStore<Inner, Oracle>
 where
-    Inner: ValueStore<Error = <Inner as DurableWalStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind>,
+    Inner: RecoverableValueStore,
     Oracle: CommitOracle,
 {
     type Error =
@@ -235,13 +252,12 @@ where
 
 impl<Inner, Oracle> DirectApplyStore<ValueKind> for RecoveringValueStore<Inner, Oracle>
 where
-    Inner: DirectApplyStore<ValueKind>
-        + ValueStore<Error = <Inner as DirectApplyStore<ValueKind>>::Error>
-        + DurableWalStore<ValueKind, Error = <Inner as DirectApplyStore<ValueKind>>::Error>,
+    Inner: RecoverableValueStore
+        + DirectApplyStore<ValueKind, Error = <Inner as DurableWalStore<ValueKind>>::Error>,
     Oracle: CommitOracle,
 {
     type Error =
-        RecoveringValueStoreError<<Inner as DirectApplyStore<ValueKind>>::Error, Oracle::Error>;
+        RecoveringValueStoreError<<Inner as DurableWalStore<ValueKind>>::Error, Oracle::Error>;
 
     async fn direct_apply<'a, I>(
         &'a self,
