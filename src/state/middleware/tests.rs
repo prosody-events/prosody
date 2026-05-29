@@ -7,12 +7,13 @@
 
 #![allow(clippy::wildcard_imports, clippy::match_wildcard_for_single_variants)]
 
+use super::handler::recover_pending_entries;
 use super::*;
+use crate::Key;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::DurableState;
-use crate::state::EventScopeId;
 use crate::state::StoreOutcome;
 use crate::state::memory::{
     MemoryDirtyValueStore, MemoryDirtyValueStoreFactory, MemoryDirtyValueStoreProvider,
@@ -23,9 +24,11 @@ use crate::state::value::{
     DirectApplyStore, DurableWalStore, StoredPayload, ValueKind, ValueOp, ValueStore,
 };
 use crate::state::{
-    CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
+    CollectionId, CollectionRef, CommitDecision, CommitMode, EventRef, StateKey, StateName,
+    StateType,
 };
 use crate::timers::TimerType;
+use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
@@ -124,7 +127,6 @@ where
         registry,
         state_key,
         event,
-        EventScopeId::fresh(),
     )
 }
 
