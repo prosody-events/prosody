@@ -1,4 +1,7 @@
 use super::*;
+use crate::state::EventRef;
+use crate::state::cassandra::error::CorruptUdtError;
+use crate::state::cassandra::udt::RawEventRef;
 use crate::state::encoding::{PayloadEncoding, WalFormat, encode_payload};
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
@@ -8,6 +11,12 @@ fn message_event() -> EventRef {
     EventRef::Message {
         dedup_id: Uuid::from_u128(0x42),
     }
+}
+
+/// The on-wire UDT shape the `wal_event` column deserializes into, for a
+/// well-formed Message event.
+fn message_event_raw() -> RawEventRef {
+    RawEventRef::from_event(message_event())
 }
 
 fn inline_payload(byte: u8) -> StoredPayload {
@@ -58,7 +67,7 @@ fn decodes_sealed_with_data_and_wal() -> Result<()> {
     let state = try_decode_row((
         Some(data),
         Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
-        Some(message_event()),
+        Some(message_event_raw()),
         Some(wal_bytes.clone()),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
     ))?;
@@ -84,7 +93,7 @@ fn decodes_sealed_no_data() -> Result<()> {
     let state = try_decode_row((
         None,
         Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
-        Some(message_event()),
+        Some(message_event_raw()),
         Some(wal_bytes.clone()),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
     ))?;
@@ -131,7 +140,7 @@ fn rejects_payload_encoding_without_data() -> Result<()> {
 
 #[test]
 fn rejects_partial_wal_columns_event_only() -> Result<()> {
-    let result = try_decode_row((None, None, Some(message_event()), None, None));
+    let result = try_decode_row((None, None, Some(message_event_raw()), None, None));
     match result {
         Err(CassandraValueStoreError::CorruptWal {
             reason: CorruptReason::PartialWalColumns { mask },
@@ -182,7 +191,7 @@ fn rejects_sealed_without_payload_encoding() -> Result<()> {
     let result = try_decode_row((
         None,
         None,
-        Some(message_event()),
+        Some(message_event_raw()),
         Some(vec![1_u8]),
         Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
     ));
@@ -192,6 +201,45 @@ fn rejects_sealed_without_payload_encoding() -> Result<()> {
         }) => Ok(()),
         other => Err(eyre::eyre!(
             "expected WalWithoutPayloadEncoding, got {other:?}"
+        )),
+    }
+}
+
+/// B3: a structurally-valid but semantically-corrupt `event_ref` UDT (here
+/// `kind == 7`) on an otherwise well-formed sealed row must decode to a typed
+/// [`CassandraValueStoreError::CorruptUdt`] classified `Permanent` (skip the
+/// row), never the `Terminal` classification scylla's opaque
+/// `DeserializationError` would have produced. The UDT deserializes fine; the
+/// decoder's `try_into_event` post-step is what rejects it.
+#[test]
+fn rejects_corrupt_event_ref_udt_as_permanent() -> Result<()> {
+    use crate::error::{ClassifyError, ErrorCategory};
+
+    let corrupt = RawEventRef {
+        kind: 7,
+        msg_dedup_id: None,
+        timer_type: None,
+        time: None,
+        tag: None,
+    };
+    let result = try_decode_row((
+        None,
+        Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
+        Some(corrupt),
+        Some(vec![1_u8]),
+        Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
+    ));
+    match result {
+        Err(error @ CassandraValueStoreError::CorruptUdt(CorruptUdtError::UnknownKind(7))) => {
+            assert_eq!(
+                error.classify_error(),
+                ErrorCategory::Permanent,
+                "corrupt UDT must classify Permanent (skip), not Terminal"
+            );
+            Ok(())
+        }
+        other => Err(eyre::eyre!(
+            "expected CorruptUdt(UnknownKind(7)), got {other:?}"
         )),
     }
 }

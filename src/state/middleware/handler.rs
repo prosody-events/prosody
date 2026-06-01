@@ -11,7 +11,7 @@ use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::deduplication::dedup_uuid;
+use crate::consumer::middleware::deduplication::dedup_uuid_for_message;
 use crate::consumer::middleware::defer::segment::compute_segment_id;
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::error::{ClassifyError, ErrorCategory};
@@ -27,7 +27,7 @@ use crate::timers::Trigger;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
-use crate::{Partition, Topic};
+use crate::{EventIdentity, Partition, Topic};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
@@ -51,6 +51,7 @@ pub struct KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
     oracle: Option<O>,
     factory: Option<F>,
     consumer_group: Option<Arc<str>>,
+    version: Option<Arc<str>>,
     default_ttl: Option<CompactDuration>,
     default_commit_mode: CommitMode,
     recovery_delay: CompactDuration,
@@ -66,6 +67,7 @@ impl<D, Sc, O, F, P> Default for KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
             oracle: None,
             factory: None,
             consumer_group: None,
+            version: None,
             default_ttl: None,
             default_commit_mode: CommitMode::Wal,
             recovery_delay: CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS),
@@ -115,6 +117,24 @@ impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
     #[must_use]
     pub fn consumer_group(mut self, group: Arc<str>) -> Self {
         self.consumer_group = Some(group);
+        self
+    }
+
+    /// Sets the deduplication hash version used to derive a message's
+    /// dedup id during recovery.
+    ///
+    /// This **must** equal the `version` configured on the deduplication
+    /// middleware (see
+    /// [`DeduplicationConfiguration::version`](crate::consumer::middleware::deduplication::DeduplicationConfiguration)):
+    /// recovery looks a message's committed state up by the dedup id the
+    /// deduplication writer produced, and the version is one of the hashed
+    /// inputs. A composer wires both from the same source — see
+    /// [`DEFAULT_IDEMPOTENCE_VERSION`](crate::consumer::middleware::deduplication::DEFAULT_IDEMPOTENCE_VERSION).
+    /// The field is required so a forgotten wiring fails loud at
+    /// [`Self::build`] rather than silently hashing a different version.
+    #[must_use]
+    pub fn version(mut self, version: Arc<str>) -> Self {
+        self.version = Some(version);
         self
     }
 
@@ -174,6 +194,9 @@ impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
         let consumer_group = self
             .consumer_group
             .ok_or(KeyedStateMiddlewareBuildError::Missing("consumer_group"))?;
+        let version = self
+            .version
+            .ok_or(KeyedStateMiddlewareBuildError::Missing("version"))?;
         let registry = Arc::new(CollectionDefRegistry {
             defs: self.defs,
             default_ttl: self.default_ttl,
@@ -185,6 +208,7 @@ impl<D, Sc, O, F, P> KeyedStateMiddlewareBuilder<D, Sc, O, F, P> {
             oracle,
             factory,
             consumer_group,
+            version,
             registry,
             recovery_delay: self.recovery_delay,
             _payload: PhantomData,
@@ -218,6 +242,7 @@ pub struct KeyedStateMiddleware<D, Sc, O, F, P> {
     oracle: O,
     factory: F,
     consumer_group: Arc<str>,
+    version: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
     recovery_delay: CompactDuration,
     _payload: PhantomData<fn() -> P>,
@@ -237,6 +262,7 @@ where
             oracle: self.oracle.clone(),
             factory: self.factory.clone(),
             consumer_group: self.consumer_group.clone(),
+            version: self.version.clone(),
             registry: self.registry.clone(),
             recovery_delay: self.recovery_delay,
             _payload: PhantomData,
@@ -309,6 +335,7 @@ where
     pub(super) oracle: O,
     pub(super) provider: Result<P, BoxedFactoryError>,
     pub(super) consumer_group: Arc<str>,
+    pub(super) version: Arc<str>,
     pub(super) registry: Arc<CollectionDefRegistry>,
     pub(super) segment_id: SegmentId,
     pub(super) recovery_delay: CompactDuration,
@@ -420,15 +447,17 @@ where
         Ok(())
     }
 
-    fn derive_dedup_id_for_message(&self, message: &ConsumerMessage<T::Payload>) -> Uuid {
-        dedup_uuid(
-            "",
+    pub(super) fn derive_dedup_id_for_message(&self, message: &ConsumerMessage<T::Payload>) -> Uuid
+    where
+        T::Payload: EventIdentity,
+    {
+        let topic = message.topic();
+        dedup_uuid_for_message(
+            self.version.as_ref(),
             self.consumer_group.as_ref(),
-            message.topic().as_ref(),
+            &topic,
             message.partition(),
-            message.key().as_bytes(),
-            None,
-            message.offset(),
+            message,
         )
     }
 }
@@ -436,6 +465,7 @@ where
 impl<T, D, Sc, O, P> FallibleHandler for KeyedStateHandler<T, D, Sc, O, P>
 where
     T: FallibleHandler,
+    T::Payload: EventIdentity,
     D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
     Sc: PendingIndexScanner,
     O: CommitOracle,
@@ -525,12 +555,21 @@ where
                 sealed_event: Some(event),
                 sealed_collections,
             }) => {
+                let mut all_resolved = true;
                 for collection_ref in &sealed_collections {
                     if let Err(error) = self.durable.apply_sealed(collection_ref, event).await {
                         warn!(error = ?error, "apply_sealed failed in after_commit");
+                        all_resolved = false;
                     }
                 }
-                clear_recovery_timer(&context).await;
+                // Only clear the one-shot recovery backstop if every sealed
+                // collection actually resolved. On any apply failure we leave
+                // the timer armed so the `StateRecovery` sweep retries —
+                // otherwise a committed write could be silently lost once the
+                // sealed WAL row's TTL expires.
+                if all_resolved {
+                    clear_recovery_timer(&context).await;
+                }
                 self.inner.after_commit(context, Ok(inner)).await;
             }
             Ok(KeyedStateOutput::Inner {
@@ -564,12 +603,18 @@ where
                 sealed_event: Some(event),
                 sealed_collections,
             }) => {
+                let mut all_resolved = true;
                 for collection_ref in &sealed_collections {
                     if let Err(error) = self.durable.rollback_sealed(collection_ref, event).await {
                         warn!(error = ?error, "rollback_sealed failed in after_abort");
+                        all_resolved = false;
                     }
                 }
-                clear_recovery_timer(&context).await;
+                // Symmetric with `after_commit`: leave the recovery backstop
+                // armed if any rollback failed so the sweep retries.
+                if all_resolved {
+                    clear_recovery_timer(&context).await;
+                }
                 self.inner.after_abort(context, Ok(inner)).await;
             }
             Ok(KeyedStateOutput::Inner {
@@ -600,6 +645,7 @@ pub struct KeyedStateProvider<T, D, Sc, O, F> {
     oracle: O,
     factory: F,
     consumer_group: Arc<str>,
+    version: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
     recovery_delay: CompactDuration,
 }
@@ -608,6 +654,7 @@ impl<T, D, Sc, O, F> FallibleHandlerProvider for KeyedStateProvider<T, D, Sc, O,
 where
     T: FallibleHandlerProvider,
     T::Handler: FallibleHandler,
+    <T::Handler as FallibleHandler>::Payload: EventIdentity,
     D: DurableValueBundle + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>,
     Sc: PendingIndexScanner,
     O: CommitOracle,
@@ -639,6 +686,7 @@ where
             oracle: self.oracle.clone(),
             provider,
             consumer_group: self.consumer_group.clone(),
+            version: self.version.clone(),
             registry: self.registry.clone(),
             segment_id,
             recovery_delay: self.recovery_delay,
@@ -655,7 +703,7 @@ where
     F::Provider: DirtyStoreProvider<ValueKind>,
     <F::Provider as DirtyStoreProvider<ValueKind>>::Store:
         DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
-    P: Send + Sync + 'static,
+    P: Send + Sync + 'static + EventIdentity,
 {
     type Provider<T>
         = KeyedStateProvider<T, D, Sc, O, F>
@@ -675,6 +723,7 @@ where
             oracle: self.oracle.clone(),
             factory: self.factory.clone(),
             consumer_group: self.consumer_group.clone(),
+            version: self.version.clone(),
             registry: self.registry.clone(),
             recovery_delay: self.recovery_delay,
         }

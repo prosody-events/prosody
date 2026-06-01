@@ -17,13 +17,18 @@
 //!    - [`CommitDecision::NotCommitted`] → `inner.rollback_sealed(..)` and
 //!      return `inner.get(..)`.
 //!
-//! Recovery writes use a [`CollectionRef::new(id.clone(), self.default_ttl)`].
-//! Production wiring (Slice 8) supplies the same `default_ttl` to both the
-//! inner store and this wrapper so the two values agree. `None` means
-//! "do not bind a TTL" — passed straight through to the
+//! Recovery writes bind their TTL through a [`CollectionTtl`] resolver `R`,
+//! so first-touch recovery binds the **same per-collection TTL** the
+//! middleware's timer-sweep recovery does. The default resolver
+//! [`ConstTtl`] reproduces the historical single-TTL behavior; production
+//! wiring injects the shared [`Arc<CollectionDefRegistry>`] as `R` so a
+//! per-collection override applies identically on both recovery paths.
+//! `None` means "do not bind a TTL" — passed straight through to the
 //! [`crate::state::cassandra::CassandraValueStore`]'s `*_no_ttl` query
 //! variants. Binding a TTL when the collection opted out would corrupt the
 //! durable retention contract; the wrapper never invents a TTL.
+//!
+//! [`Arc<CollectionDefRegistry>`]: crate::state::middleware::CollectionDefRegistry
 //!
 //! # Concurrency
 //!
@@ -54,12 +59,47 @@ use super::{
     StoreOutcome,
 };
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::middleware::CollectionDefRegistry;
 use crate::timers::duration::CompactDuration;
 use std::error::Error;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(test)]
 mod tests;
+
+/// Resolves the TTL bound onto a recovery write for a given collection.
+///
+/// First-touch recovery ([`RecoveringValueStore::get`]) and the middleware's
+/// timer-sweep recovery must bind the **same** TTL for a collection, or the
+/// two paths corrupt the retention contract in opposite directions (a write
+/// that lives forever via one path and expires early via the other). Sharing
+/// one resolver makes that divergence unrepresentable.
+pub trait CollectionTtl: Clone + Send + Sync + 'static {
+    /// Returns the TTL to bind for `id`, or `None` for indefinite retention
+    /// / the Cassandra over-20-year overflow fallback.
+    fn ttl_for(&self, id: &CollectionId<ValueKind>) -> Option<CompactDuration>;
+}
+
+/// A [`CollectionTtl`] that binds the same TTL for every collection.
+///
+/// The default resolver, preserving the wrapper's historical single-TTL
+/// behavior. Use [`RecoveringValueStore::with_default_ttl`] to construct a
+/// store backed by this resolver.
+#[derive(Clone, Copy, Debug)]
+pub struct ConstTtl(pub Option<CompactDuration>);
+
+impl CollectionTtl for ConstTtl {
+    fn ttl_for(&self, _id: &CollectionId<ValueKind>) -> Option<CompactDuration> {
+        self.0
+    }
+}
+
+impl CollectionTtl for Arc<CollectionDefRegistry> {
+    fn ttl_for(&self, id: &CollectionId<ValueKind>) -> Option<CompactDuration> {
+        CollectionDefRegistry::ttl_for(self, id.name())
+    }
+}
 
 /// Bundle bound for the inner store the recovering wrapper drives.
 ///
@@ -87,30 +127,24 @@ impl<T> RecoverableValueStore for T where
 /// `Layered<Cache, Recovering<Backing, Oracle>>` so the cache populates with
 /// post-recovery applied for free.
 #[derive(Clone, Debug)]
-pub struct RecoveringValueStore<Inner, Oracle> {
+pub struct RecoveringValueStore<Inner, Oracle, R = ConstTtl> {
     inner: Inner,
     oracle: Oracle,
-    default_ttl: Option<CompactDuration>,
+    ttl: R,
 }
 
-impl<Inner, Oracle> RecoveringValueStore<Inner, Oracle> {
-    /// Wraps `inner` with first-touch recovery driven by `oracle`.
+impl<Inner, Oracle, R> RecoveringValueStore<Inner, Oracle, R> {
+    /// Wraps `inner` with first-touch recovery driven by `oracle`, binding
+    /// recovery-write TTLs through the [`CollectionTtl`] resolver `ttl`.
     ///
-    /// `default_ttl` is the TTL bound onto every [`CollectionRef`] this
-    /// wrapper builds for recovery writes (`apply_sealed` /
-    /// `rollback_sealed`). Pass the same value supplied to the inner
-    /// store's constructor so the two stores agree on retention. `None`
-    /// is a first-class choice: indefinite retention or the Cassandra
-    /// over-20-year overflow fallback. The wrapper never silently
-    /// substitutes a default; `None` propagates verbatim into the
-    /// underlying `*_no_ttl` query path.
+    /// Production wiring passes the shared
+    /// [`Arc<CollectionDefRegistry>`](crate::state::middleware::CollectionDefRegistry)
+    /// here so first-touch recovery binds the same per-collection TTL the
+    /// timer-sweep recovery does. For a single fixed TTL, prefer
+    /// [`Self::with_default_ttl`].
     #[must_use]
-    pub fn new(inner: Inner, oracle: Oracle, default_ttl: Option<CompactDuration>) -> Self {
-        Self {
-            inner,
-            oracle,
-            default_ttl,
-        }
+    pub fn new(inner: Inner, oracle: Oracle, ttl: R) -> Self {
+        Self { inner, oracle, ttl }
     }
 
     /// Returns a reference to the wrapped inner store.
@@ -126,10 +160,30 @@ impl<Inner, Oracle> RecoveringValueStore<Inner, Oracle> {
     }
 }
 
-impl<Inner, Oracle> ValueStore for RecoveringValueStore<Inner, Oracle>
+impl<Inner, Oracle> RecoveringValueStore<Inner, Oracle, ConstTtl> {
+    /// Wraps `inner` with first-touch recovery that binds a single fixed
+    /// TTL on every recovery write, via a [`ConstTtl`] resolver.
+    ///
+    /// `default_ttl` is bound onto every [`CollectionRef`] this wrapper
+    /// builds for recovery writes. `None` is a first-class choice:
+    /// indefinite retention or the Cassandra over-20-year overflow
+    /// fallback. The wrapper never silently substitutes a default; `None`
+    /// propagates verbatim into the underlying `*_no_ttl` query path.
+    #[must_use]
+    pub fn with_default_ttl(
+        inner: Inner,
+        oracle: Oracle,
+        default_ttl: Option<CompactDuration>,
+    ) -> Self {
+        Self::new(inner, oracle, ConstTtl(default_ttl))
+    }
+}
+
+impl<Inner, Oracle, R> ValueStore for RecoveringValueStore<Inner, Oracle, R>
 where
     Inner: RecoverableValueStore,
     Oracle: CommitOracle,
+    R: CollectionTtl,
 {
     type Error =
         RecoveringValueStoreError<<Inner as DurableWalStore<ValueKind>>::Error, Oracle::Error>;
@@ -151,7 +205,8 @@ where
                     .resolve(collection, wal.event())
                     .await
                     .map_err(RecoveringValueStoreError::Oracle)?;
-                let recovery_ref = CollectionRef::new(collection.clone(), self.default_ttl);
+                let recovery_ref =
+                    CollectionRef::new(collection.clone(), self.ttl.ttl_for(collection));
                 match decision {
                     CommitDecision::Committed => {
                         self.inner
@@ -195,10 +250,11 @@ where
     }
 }
 
-impl<Inner, Oracle> DurableWalStore<ValueKind> for RecoveringValueStore<Inner, Oracle>
+impl<Inner, Oracle, R> DurableWalStore<ValueKind> for RecoveringValueStore<Inner, Oracle, R>
 where
     Inner: RecoverableValueStore,
     Oracle: CommitOracle,
+    R: CollectionTtl,
 {
     type Error =
         RecoveringValueStoreError<<Inner as DurableWalStore<ValueKind>>::Error, Oracle::Error>;
@@ -250,11 +306,12 @@ where
     }
 }
 
-impl<Inner, Oracle> DirectApplyStore<ValueKind> for RecoveringValueStore<Inner, Oracle>
+impl<Inner, Oracle, R> DirectApplyStore<ValueKind> for RecoveringValueStore<Inner, Oracle, R>
 where
     Inner: RecoverableValueStore
         + DirectApplyStore<ValueKind, Error = <Inner as DurableWalStore<ValueKind>>::Error>,
     Oracle: CommitOracle,
+    R: CollectionTtl,
 {
     type Error =
         RecoveringValueStoreError<<Inner as DurableWalStore<ValueKind>>::Error, Oracle::Error>;

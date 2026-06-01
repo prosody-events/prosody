@@ -7,7 +7,10 @@
 
 use super::{CassandraValueStore, CassandraValueStoreError, ValueQueries};
 use crate::cassandra::{CassandraConfiguration, CassandraStore, TABLE_KEYED_STATE_VALUE};
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::decode::CorruptReason;
+use crate::state::cassandra::error::CorruptUdtError;
+use crate::state::cassandra::udt::RawEventRef;
 use crate::state::memory::MemoryDirtyValueStore;
 use crate::state::pending::PendingIndexStore;
 use crate::state::value::{DurableWalStore, StoredPayload, ValueOp, ValueStore};
@@ -213,6 +216,17 @@ async fn stale_pending_row_after_partial_seal() -> Result<()> {
     }
 }
 
+/// F4 (Cassandra): the shared stale-pending sweep check against the real
+/// Cassandra Value store — the `Idle ⇒ delete_pending` recovery arm run
+/// against a real pending index, not one derived from WAL presence. Mirrors
+/// the memory invocation in `state::tests`.
+#[tokio::test]
+async fn state_recovery_sweeps_stale_pending_row() -> Result<()> {
+    init_test_logging();
+    let store = setup_value_store().await?;
+    value_test_suite::run_stale_pending_index(store).await
+}
+
 #[tokio::test]
 async fn corrupt_partition_returns_corrupt_wal() -> Result<()> {
     init_test_logging();
@@ -256,6 +270,81 @@ async fn corrupt_partition_returns_corrupt_wal() -> Result<()> {
         }
         other => Err(eyre::eyre!("expected CorruptWal, got {other:?}")),
     }
+}
+
+/// B3: a structurally-valid but semantically-corrupt `event_ref` UDT
+/// (`kind = 7`) on an otherwise sealed-shaped row must surface as a typed
+/// `CorruptUdt` classified `Permanent` (skip the row), not the `Terminal`
+/// classification scylla's opaque `DeserializationError` would have produced
+/// when validation lived inside `DeserializeValue`. This exercises the real
+/// scylla deserialize path: the corrupt UDT is written via raw CQL, read
+/// back into `RawEventRef`, and validated in the decoder's post-step.
+#[tokio::test]
+async fn corrupt_event_ref_udt_classifies_permanent() -> Result<()> {
+    init_test_logging();
+    let store = setup_value_store().await?;
+    let collection = collection_ref()?;
+    let id: &CollectionId<ValueKind> = collection.id();
+
+    // Sealed-shaped row: all three WAL columns + payload_encoding set, but
+    // the event_ref UDT carries an unknown discriminator.
+    let corrupt = RawEventRef {
+        kind: 7,
+        msg_dedup_id: None,
+        timer_type: None,
+        time: None,
+        tag: None,
+    };
+    let segment_id = &id.state_key().segment_id;
+    let key = id.state_key().key.as_ref();
+    let state_type = match id.state_type() {
+        StateType::Application => 0_i8,
+    };
+    let name = id.name().as_str();
+    let cql = format!(
+        "UPDATE {keyspace}.{table} SET wal_event = ?, wal_ops = ?, wal_format = ?, \
+         payload_encoding = ? WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
+        keyspace = "prosody_test",
+        table = TABLE_KEYED_STATE_VALUE,
+    );
+    let prepared = store.store.session().prepare(cql).await?;
+    store
+        .store
+        .session()
+        .execute_unpaged(
+            &prepared,
+            (
+                corrupt,
+                vec![1_u8],
+                1_i16,
+                1_i16,
+                segment_id,
+                key,
+                state_type,
+                name,
+            ),
+        )
+        .await?;
+
+    let error = store
+        .read_partition(id)
+        .await
+        .err()
+        .ok_or_else(|| eyre::eyre!("expected CorruptUdt error"))?;
+    match &error {
+        CassandraValueStoreError::CorruptUdt(CorruptUdtError::UnknownKind(7)) => {}
+        other => {
+            return Err(eyre::eyre!(
+                "expected CorruptUdt(UnknownKind(7)), got {other:?}"
+            ));
+        }
+    }
+    assert_eq!(
+        error.classify_error(),
+        ErrorCategory::Permanent,
+        "corrupt UDT must classify Permanent (skip), not Terminal"
+    );
+    Ok(())
 }
 
 /// Constructing `CassandraValueStore` with `default_ttl = Some(_)` must

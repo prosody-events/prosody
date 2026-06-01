@@ -22,17 +22,25 @@ use super::value::{
     TransactionValueStoreError, ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionRef, CommitMode, DurableState, EventRef, LocalTx, Read, StateKey,
-    StateName, StateType, StoreOutcome, TimerEventRef, ValueKind, ValueOp, ValueOverlay,
+    CollectionId, CollectionRef, CommitDecision, CommitMode, DurableState, EventRef, LocalTx, Read,
+    StateKey, StateName, StateType, StoreOutcome, TimerEventRef, ValueKind, ValueOp, ValueOverlay,
 };
+use crate::consumer::middleware::test_support::{MockEventContext, TimerOperation};
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::middleware::{CollectionDefRegistry, recover_pending_entries};
+use crate::state::oracle::CommitOracle;
+use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
+use futures::StreamExt;
 use quickcheck::{Arbitrary, Gen};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use thiserror::Error;
 use uuid::Uuid;
 
 const TIMER_TYPE_POOL: [TimerType; 3] = [
@@ -242,6 +250,132 @@ pub(crate) fn collection_ref() -> Result<CollectionRef<ValueKind>> {
 
 pub(crate) fn inline(value: u8) -> StoredPayload {
     StoredPayload::Inline(Bytes::from(vec![value]))
+}
+
+/// Commit oracle that records every `resolve` call so the stale-pending
+/// sweep can assert it was never consulted — a pending row over an Idle
+/// partition has no sealed event to resolve.
+#[derive(Clone, Default)]
+struct NeverConsultedOracle {
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Error)]
+#[error("commit oracle was unexpectedly consulted")]
+struct NeverConsultedOracleError;
+
+impl ClassifyError for NeverConsultedOracleError {
+    fn classify_error(&self) -> ErrorCategory {
+        ErrorCategory::Permanent
+    }
+}
+
+impl CommitOracle for NeverConsultedOracle {
+    type Error = NeverConsultedOracleError;
+
+    async fn resolve<'a>(
+        &'a self,
+        _collection: &'a CollectionId<ValueKind>,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(CommitDecision::Committed)
+    }
+}
+
+/// Shared crash-recovery check, run from both the memory backend (always)
+/// and Cassandra (integration). A pending-index row written without a WAL
+/// reproduces a crash between `insert_pending` and the WAL write: the
+/// partition is `Idle` but a pending row exists. The `StateRecovery` sweep
+/// must delete that stale row, leave the partition `Idle`, clear the
+/// recovery timer, and **never** consult the oracle (there is no sealed
+/// event to resolve).
+///
+/// Reaching this requires a real pending index — when pending presence is
+/// derived from `wal.is_some()` the crash state is unrepresentable and the
+/// `Idle ⇒ delete_pending` sweep arm is dead code.
+pub(crate) async fn run_stale_pending_index<D>(durable: D) -> Result<()>
+where
+    D: DurableWalStore<ValueKind>
+        + PendingIndexStore<Error = <D as DurableWalStore<ValueKind>>::Error>
+        + PendingIndexScanner,
+{
+    // Fresh segment per run so rows never collide with other iterations or
+    // test functions (the Cassandra keyspace is shared).
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("stale-pending-key"));
+    let id = CollectionId::<ValueKind>::new(
+        state_key.clone(),
+        StateType::Application,
+        StateName::try_new("stale")?,
+    );
+
+    // Crash between insert_pending and write_wal: pending row, Idle partition.
+    PendingIndexStore::insert_pending::<ValueKind>(&durable, &id)
+        .await
+        .map_err(|e| eyre!("insert_pending failed: {e}"))?;
+
+    match DurableWalStore::read_partition(&durable, &id)
+        .await
+        .map_err(|e| eyre!("read_partition failed: {e}"))?
+    {
+        DurableState::Idle { applied: None } => {}
+        other => return Err(eyre!("expected Idle empty before sweep, got {other:?}")),
+    }
+    let before = collect_pending(&durable, &state_key).await?;
+    assert_eq!(before, 1, "exactly one stale pending row before the sweep");
+
+    let oracle = NeverConsultedOracle::default();
+    let context = MockEventContext::new().with_timer_tracking();
+    let registry = CollectionDefRegistry::new(None);
+    recover_pending_entries(
+        &context,
+        &durable,
+        &durable,
+        &oracle,
+        &registry,
+        state_key.clone(),
+    )
+    .await
+    .map_err(|e| eyre!("recovery sweep failed: {e}"))?;
+
+    // Stale row deleted, partition still Idle, oracle untouched, timer cleared.
+    let after = collect_pending(&durable, &state_key).await?;
+    assert_eq!(after, 0, "stale pending row must be deleted by the sweep");
+    match DurableWalStore::read_partition(&durable, &id)
+        .await
+        .map_err(|e| eyre!("read_partition failed: {e}"))?
+    {
+        DurableState::Idle { applied: None } => {}
+        other => return Err(eyre!("expected Idle empty after sweep, got {other:?}")),
+    }
+    assert_eq!(
+        oracle.calls.load(Ordering::Relaxed),
+        0,
+        "oracle must not be consulted for a stale pending row"
+    );
+    assert!(
+        context
+            .timer_operations()
+            .iter()
+            .any(|op| matches!(op, TimerOperation::ClearScheduled(TimerType::StateRecovery))),
+        "the sweep must clear the StateRecovery timer"
+    );
+    Ok(())
+}
+
+/// Counts the pending-index rows on `state_key` via the streamed scanner.
+async fn collect_pending<D>(durable: &D, state_key: &StateKey) -> Result<usize>
+where
+    D: PendingIndexScanner,
+{
+    let stream = durable.scan_pending(state_key);
+    futures::pin_mut!(stream);
+    let mut count = 0_usize;
+    while let Some(entry) = stream.next().await {
+        entry.map_err(|e| eyre!("scan_pending failed: {e}"))?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 async fn drive_wal_trace<D, S, F>(

@@ -6,22 +6,25 @@
 //! [`crate::state::value_test_suite`] runners against
 //! `RecoveringValueStore<MemoryDurableValueStore, MockOracle>`.
 
-use super::{CommitOracle, RecoveringValueStore, RecoveringValueStoreError};
+use super::{CollectionTtl, CommitOracle, RecoveringValueStore, RecoveringValueStoreError};
+use crate::consumer::middleware::test_support::MockEventContext;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::memory::{MemoryDirtyValueStore, MemoryDurableValueStore, MemoryStateError};
+use crate::state::middleware::{CollectionDef, CollectionDefRegistry, recover_pending_entries};
+use crate::state::pending::{PendingEntry, PendingIndexScanner, PendingIndexStore};
 use crate::state::value::{DirectApplyStore, DurableWalStore, StoredPayload, ValueOp, ValueStore};
 use crate::state::value_test_suite::{
     self, DirectTrace, OraclePolicy, TEST_TTL, Trace, collection_ref, inline,
 };
 use crate::state::{
-    CollectionId, CollectionRef, CommitDecision, DurableState, EventRef, Read, SealedCollection,
-    StoreOutcome, ValueKind,
+    CollectionId, CollectionKind, CollectionRef, CommitDecision, DurableState, EventRef, Read,
+    SealedCollection, StateKey, StateName, StoreOutcome, ValueKind,
 };
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::{self, Result};
-use futures::executor;
+use futures::{Stream, executor};
 use parking_lot::Mutex;
-use quickcheck::QuickCheck;
+use quickcheck::{QuickCheck, TestResult};
 use std::error::Error;
 use std::sync::Arc;
 use thiserror::Error;
@@ -130,7 +133,7 @@ where
 async fn get_on_idle_partition_does_not_call_oracle() -> Result<()> {
     let inner = MemoryDurableValueStore::for_tests();
     let (oracle, log) = MockOracle::recording();
-    let store = RecoveringValueStore::new(inner, oracle, TEST_TTL_DURATION);
+    let store = RecoveringValueStore::with_default_ttl(inner, oracle, TEST_TTL_DURATION);
     let id = collection_ref()?.id().clone();
 
     assert_eq!(store.get(&id).await.map_err(into_eyre)?, Read::Absent);
@@ -159,7 +162,7 @@ async fn get_on_sealed_partition_committed_applies_wal() -> Result<()> {
         .await
         .map_err(into_eyre)?;
 
-    let store = RecoveringValueStore::new(
+    let store = RecoveringValueStore::with_default_ttl(
         inner.clone(),
         MockOracle::always_committed(),
         TEST_TTL_DURATION,
@@ -191,7 +194,7 @@ async fn get_on_sealed_partition_not_committed_rolls_back() -> Result<()> {
         .await
         .map_err(into_eyre)?;
 
-    let store = RecoveringValueStore::new(
+    let store = RecoveringValueStore::with_default_ttl(
         inner.clone(),
         MockOracle::always_not_committed(),
         TEST_TTL_DURATION,
@@ -233,7 +236,7 @@ async fn get_on_sealed_partition_not_committed_preserves_prior_applied() -> Resu
         .await
         .map_err(into_eyre)?;
 
-    let store = RecoveringValueStore::new(
+    let store = RecoveringValueStore::with_default_ttl(
         inner.clone(),
         MockOracle::always_not_committed(),
         TEST_TTL_DURATION,
@@ -260,7 +263,7 @@ async fn get_idempotent_after_recovery() -> Result<()> {
         .map_err(into_eyre)?;
 
     let (oracle, log) = MockOracle::recording();
-    let store = RecoveringValueStore::new(inner, oracle, TEST_TTL_DURATION);
+    let store = RecoveringValueStore::with_default_ttl(inner, oracle, TEST_TTL_DURATION);
     let first = store.get(&id).await.map_err(into_eyre)?;
     let second = store.get(&id).await.map_err(into_eyre)?;
     assert_eq!(first, second);
@@ -282,7 +285,8 @@ async fn oracle_error_propagates() -> Result<()> {
         .await
         .map_err(into_eyre)?;
 
-    let store = RecoveringValueStore::new(inner, MockOracle::failing(), TEST_TTL_DURATION);
+    let store =
+        RecoveringValueStore::with_default_ttl(inner, MockOracle::failing(), TEST_TTL_DURATION);
     let err = store
         .get(&id)
         .await
@@ -309,7 +313,7 @@ async fn read_partition_returns_sealed_unchanged() -> Result<()> {
         .await
         .map_err(into_eyre)?;
 
-    let store = RecoveringValueStore::new(
+    let store = RecoveringValueStore::with_default_ttl(
         inner.clone(),
         MockOracle::always_committed(),
         TEST_TTL_DURATION,
@@ -328,7 +332,7 @@ async fn read_partition_returns_sealed_unchanged() -> Result<()> {
 #[tokio::test]
 async fn set_and_clear_pass_through() -> Result<()> {
     let inner = MemoryDurableValueStore::for_tests();
-    let store = RecoveringValueStore::new(
+    let store = RecoveringValueStore::with_default_ttl(
         inner.clone(),
         MockOracle::always_committed(),
         TEST_TTL_DURATION,
@@ -362,8 +366,11 @@ async fn recovery_writes_use_default_ttl() -> Result<()> {
         .map_err(into_eyre)?;
 
     let some_ttl = TEST_TTL_DURATION;
-    let store_some =
-        RecoveringValueStore::new(recording.clone(), MockOracle::always_committed(), some_ttl);
+    let store_some = RecoveringValueStore::with_default_ttl(
+        recording.clone(),
+        MockOracle::always_committed(),
+        some_ttl,
+    );
     store_some.get(&id).await.map_err(into_eyre)?;
     assert_eq!(captures.last_apply(), Some(TtlCapture { ttl: some_ttl }));
 
@@ -377,11 +384,173 @@ async fn recovery_writes_use_default_ttl() -> Result<()> {
         .await
         .map_err(into_eyre)?;
     captures.reset();
-    let store_none =
-        RecoveringValueStore::new(recording.clone(), MockOracle::always_not_committed(), None);
+    let store_none = RecoveringValueStore::with_default_ttl(
+        recording.clone(),
+        MockOracle::always_not_committed(),
+        None,
+    );
     store_none.get(&id).await.map_err(into_eyre)?;
     assert_eq!(captures.last_rollback(), Some(TtlCapture { ttl: None }));
     Ok(())
+}
+
+/// C2: when the resolver is the shared `Arc<CollectionDefRegistry>`, a
+/// first-touch recovery write binds the collection's **per-collection** TTL
+/// override — not the middleware-wide default. This is the same value the
+/// timer-sweep recovery (`recover_pending_entries`) reads from
+/// `registry.ttl_for(name)`, so the two recovery paths can no longer bind
+/// divergent TTLs for the same collection.
+#[tokio::test]
+async fn recovery_writes_use_registry_per_collection_ttl() -> Result<()> {
+    let override_ttl = CompactDuration::new(7_200);
+    let default_ttl = CompactDuration::new(60);
+
+    // `collection_ref()` names the collection "profile"; register an
+    // override distinct from the registry-wide default.
+    let mut registry = CollectionDefRegistry::new(Some(default_ttl));
+    registry.insert(
+        StateName::try_new("profile")?,
+        CollectionDef::new(Some(override_ttl)),
+    );
+    let registry = Arc::new(registry);
+
+    let (recording, captures) = TtlRecordingDurable::new();
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+    recording
+        .seal(
+            &collection,
+            event(20),
+            vec![ValueOp::Set { payload: inline(5) }],
+        )
+        .await
+        .map_err(into_eyre)?;
+
+    let store = RecoveringValueStore::new(
+        recording.clone(),
+        MockOracle::always_committed(),
+        registry.clone(),
+    );
+    store.get(&id).await.map_err(into_eyre)?;
+
+    // The recovery write bound the per-collection override, and it equals
+    // what the resolver reports for this collection.
+    let resolved = CollectionTtl::ttl_for(&registry, &id);
+    assert_eq!(resolved, Some(override_ttl));
+    assert_eq!(captures.last_apply(), Some(TtlCapture { ttl: resolved }));
+    Ok(())
+}
+
+/// T2: the two recovery entry points must agree. First-touch
+/// ([`RecoveringValueStore::get`]) and the timer-sweep
+/// ([`recover_pending_entries`]) are driven over the *same* `Sealed`
+/// partition (same pre-seal applied state, same WAL ops, same commit
+/// decision, same per-collection TTL resolver). The property asserts both
+/// produce **equivalent recovered visible state** and bind the **same TTL**
+/// on the recovery write — the equivalence the C2 resolver guarantees and
+/// that `value_test_suite` previously only example-tested by driving
+/// `apply_sealed`/`rollback_sealed` directly, bypassing both real entry
+/// points. Iteration count comes from `QUICKCHECK_TESTS`.
+#[test]
+fn prop_recovery_entry_points_equivalent() {
+    fn property(seed: Vec<u8>, committed: bool) -> TestResult {
+        match executor::block_on(run_entry_point_equivalence(seed, committed)) {
+            Ok(true) => TestResult::passed(),
+            Ok(false) => TestResult::failed(),
+            Err(e) => TestResult::error(format!("entry-point equivalence errored: {e}")),
+        }
+    }
+    QuickCheck::new().quickcheck(property as fn(Vec<u8>, bool) -> TestResult);
+}
+
+/// Seals one partition (twice, on two recording stores), recovers one via
+/// first-touch and the other via the sweep, and reports whether the
+/// recovered state and the bound TTL agree across the two entry points.
+async fn run_entry_point_equivalence(seed: Vec<u8>, committed: bool) -> Result<bool> {
+    // WAL must be non-empty; derive a deterministic op list from the seed.
+    let ops: Vec<ValueOp> = if seed.is_empty() {
+        vec![ValueOp::Set { payload: inline(0) }]
+    } else {
+        seed.iter()
+            .map(|b| {
+                if b % 5 == 0 {
+                    ValueOp::Clear
+                } else {
+                    ValueOp::Set {
+                        payload: inline(*b),
+                    }
+                }
+            })
+            .collect()
+    };
+    let event = event(0x7202);
+
+    // A per-collection TTL override distinct from the registry-wide default,
+    // so a divergence between the two entry points' TTL binding would show.
+    let override_ttl = CompactDuration::new(4_242);
+    let mut registry = CollectionDefRegistry::new(Some(CompactDuration::new(60)));
+    registry.insert(
+        StateName::try_new("profile")?,
+        CollectionDef::new(Some(override_ttl)),
+    );
+    let registry = Arc::new(registry);
+    let expected_ttl = Some(TtlCapture {
+        ttl: Some(override_ttl),
+    });
+
+    let oracle = if committed {
+        MockOracle::always_committed()
+    } else {
+        MockOracle::always_not_committed()
+    };
+
+    // `collection_ref()` names the collection "profile" (matching the
+    // registry override). A pre-seal applied value lets the not-committed
+    // (rollback) arm assert the prior state is preserved.
+    let collection = collection_ref()?;
+    let id = collection.id().clone();
+
+    // First-touch entry point.
+    let (store_a, caps_a) = TtlRecordingDurable::new();
+    store_a.set(&id, inline(7)).await.map_err(into_eyre)?;
+    store_a
+        .seal(&collection, event, ops.clone())
+        .await
+        .map_err(into_eyre)?;
+    let recovering = RecoveringValueStore::new(store_a, oracle.clone(), registry.clone());
+    let state_a = recovering.get(&id).await.map_err(into_eyre)?;
+    let ttl_a = if committed {
+        caps_a.last_apply()
+    } else {
+        caps_a.last_rollback()
+    };
+
+    // Timer-sweep entry point over an identically-sealed partition.
+    let (store_b, caps_b) = TtlRecordingDurable::new();
+    store_b.set(&id, inline(7)).await.map_err(into_eyre)?;
+    store_b
+        .seal(&collection, event, ops.clone())
+        .await
+        .map_err(into_eyre)?;
+    let context = MockEventContext::new().with_timer_tracking();
+    recover_pending_entries(
+        &context,
+        &store_b,
+        &store_b,
+        &oracle,
+        registry.as_ref(),
+        id.state_key().clone(),
+    )
+    .await
+    .map_err(|e| eyre::eyre!("sweep failed: {e}"))?;
+    let state_b = ValueStore::get(&store_b, &id).await.map_err(into_eyre)?;
+    let ttl_b = if committed {
+        caps_b.last_apply()
+    } else {
+        caps_b.last_rollback()
+    };
+
+    Ok(state_a == state_b && ttl_a == ttl_b && ttl_a == expected_ttl)
 }
 
 #[tokio::test]
@@ -399,8 +568,11 @@ async fn inner_error_during_apply_propagates() -> Result<()> {
         .await
         .map_err(into_eyre)?;
 
-    let store =
-        RecoveringValueStore::new(failing, MockOracle::always_committed(), TEST_TTL_DURATION);
+    let store = RecoveringValueStore::with_default_ttl(
+        failing,
+        MockOracle::always_committed(),
+        TEST_TTL_DURATION,
+    );
     let err = store
         .get(&id)
         .await
@@ -432,7 +604,7 @@ async fn inner_error_during_apply_propagates() -> Result<()> {
 #[test]
 fn prop_recovering_memory_trace() {
     fn property(trace: Trace) -> bool {
-        let durable = RecoveringValueStore::new(
+        let durable = RecoveringValueStore::with_default_ttl(
             MemoryDurableValueStore::for_tests(),
             MockOracle::always_committed(),
             TEST_TTL_DURATION,
@@ -450,7 +622,7 @@ fn prop_recovering_memory_trace() {
 #[test]
 fn prop_recovering_memory_idempotence_trace() {
     fn property(trace: Trace) -> bool {
-        let durable = RecoveringValueStore::new(
+        let durable = RecoveringValueStore::with_default_ttl(
             MemoryDurableValueStore::for_tests(),
             MockOracle::always_committed(),
             TEST_TTL_DURATION,
@@ -468,7 +640,7 @@ fn prop_recovering_memory_idempotence_trace() {
 #[test]
 fn prop_recovering_memory_direct_trace() {
     fn property(trace: DirectTrace) -> bool {
-        let durable = RecoveringValueStore::new(
+        let durable = RecoveringValueStore::with_default_ttl(
             MemoryDurableValueStore::for_tests(),
             MockOracle::always_committed(),
             TEST_TTL_DURATION,
@@ -486,7 +658,7 @@ fn prop_recovering_memory_direct_trace() {
 #[test]
 fn prop_recovering_memory_crash_committed() {
     fn property(trace: Trace) -> bool {
-        let durable = RecoveringValueStore::new(
+        let durable = RecoveringValueStore::with_default_ttl(
             MemoryDurableValueStore::for_tests(),
             MockOracle::always_committed(),
             TEST_TTL_DURATION,
@@ -505,7 +677,7 @@ fn prop_recovering_memory_crash_committed() {
 #[test]
 fn prop_recovering_memory_crash_not_committed() {
     fn property(trace: Trace) -> bool {
-        let durable = RecoveringValueStore::new(
+        let durable = RecoveringValueStore::with_default_ttl(
             MemoryDurableValueStore::for_tests(),
             MockOracle::always_not_committed(),
             TEST_TTL_DURATION,
@@ -661,6 +833,38 @@ impl DirectApplyStore<ValueKind> for TtlRecordingDurable {
         I: IntoIterator<Item = ValueOp> + Send + 'a,
     {
         self.inner.direct_apply(collection, ops).await
+    }
+}
+
+// Delegated so `TtlRecordingDurable` can drive the timer-sweep entry point
+// (`recover_pending_entries`) as well as the first-touch one, letting T2
+// compare both against the same recording store.
+impl PendingIndexStore for TtlRecordingDurable {
+    type Error = <MemoryDurableValueStore as DurableWalStore<ValueKind>>::Error;
+
+    async fn insert_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    where
+        K: CollectionKind,
+    {
+        self.inner.insert_pending(id).await
+    }
+
+    async fn delete_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    where
+        K: CollectionKind,
+    {
+        self.inner.delete_pending(id).await
+    }
+}
+
+impl PendingIndexScanner for TtlRecordingDurable {
+    type Error = <MemoryDurableValueStore as DurableWalStore<ValueKind>>::Error;
+
+    fn scan_pending(
+        &self,
+        state_key: &StateKey,
+    ) -> impl Stream<Item = Result<PendingEntry, Self::Error>> + Send {
+        self.inner.scan_pending(state_key)
     }
 }
 

@@ -170,6 +170,8 @@ mod tests {
 
     use color_eyre::eyre::{Result, eyre};
     use futures::{StreamExt, pin_mut};
+    use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+    use tokio::runtime::Builder;
     use tokio::sync::{Semaphore, watch};
     use tokio::task;
     use tokio::time::{self, advance};
@@ -478,7 +480,7 @@ mod tests {
             .await
             .map_err(|e| eyre!("{e}"))?;
 
-        let store = RecoveringValueStore::new(inner.clone(), oracle, None);
+        let store = RecoveringValueStore::with_default_ttl(inner.clone(), oracle, None);
         let visible = store.get(&id).await.map_err(|e| eyre!("{e}"))?;
         assert_eq!(visible, Read::Present(payload));
 
@@ -521,5 +523,149 @@ mod tests {
             "abort after same-coordinate clear must keep the WAL tag current"
         );
         Ok(())
+    }
+
+    /// The terminal lifecycle state a timer reaches before recovery asks the
+    /// oracle about its WAL tag.
+    #[derive(Clone, Copy, Debug)]
+    enum TimerScenario {
+        /// Scheduled, never fired: `current_tag == wal_tag` → not committed.
+        ScheduledTagMatches,
+        /// Fired and committed without rescheduling: row removed → committed.
+        FiredAndRemoved,
+        /// Fired, rescheduled, committed: tag rotated, so the captured WAL
+        /// tag differs from the live tag → committed.
+        FiredAndRescheduled,
+    }
+
+    impl Arbitrary for TimerScenario {
+        fn arbitrary(g: &mut Gen) -> Self {
+            match u8::arbitrary(g) % 3 {
+                0 => Self::ScheduledTagMatches,
+                1 => Self::FiredAndRemoved,
+                _ => Self::FiredAndRescheduled,
+            }
+        }
+    }
+
+    /// A randomized timer coordinate plus the terminal state to drive it to.
+    #[derive(Clone, Debug)]
+    struct TimerCase {
+        scenario: TimerScenario,
+        key: String,
+        offset: u32,
+    }
+
+    impl Arbitrary for TimerCase {
+        fn arbitrary(g: &mut Gen) -> Self {
+            // A non-empty key and a small, non-zero schedule offset (the
+            // store rejects a zero `CompactDuration`; paused-time `advance`
+            // makes the magnitude free).
+            let key = match g.choose(&["k", "user-1", "abc", "z"]) {
+                Some(k) => (*k).to_owned(),
+                None => "k".to_owned(),
+            };
+            let offset = 1 + (u32::arbitrary(g) % 8);
+            Self {
+                scenario: TimerScenario::arbitrary(g),
+                key,
+                offset,
+            }
+        }
+    }
+
+    /// T3: property over the timer three-state tag logic in
+    /// [`CommitManager::is_timer_committed`]. For a random coordinate driven
+    /// to each terminal lifecycle state through the **real** `TimerManager`
+    /// (schedule / fire / commit / reschedule), the oracle's verdict must
+    /// match the three-state contract: still-scheduled → not committed;
+    /// fired-and-removed → committed; fired-and-rescheduled (tag rotated) →
+    /// committed. Generalizes the three example tests over random
+    /// keys/offsets/scenarios. Iteration count comes from `QUICKCHECK_TESTS`.
+    #[test]
+    fn prop_timer_three_state_tag_logic() {
+        fn property(case: TimerCase) -> TestResult {
+            // A fresh paused-time current-thread runtime per case keeps the
+            // timer firing deterministic, mirroring the `#[tokio::test]`
+            // firing idiom used by the example tests above.
+            let runtime = match Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => return TestResult::error(format!("runtime build failed: {e}")),
+            };
+            let case_dbg = format!("{case:?}");
+            match runtime.block_on(run_timer_case(case)) {
+                Ok(true) => TestResult::passed(),
+                Ok(false) => TestResult::error(format!("oracle verdict wrong for {case_dbg}")),
+                Err(e) => TestResult::error(format!("case {case_dbg} errored: {e}")),
+            }
+        }
+        QuickCheck::new().quickcheck(property as fn(TimerCase) -> TestResult);
+    }
+
+    /// Drives one [`TimerCase`] to its terminal state and returns whether the
+    /// oracle's verdict matches the three-state contract.
+    async fn run_timer_case(case: TimerCase) -> Result<bool> {
+        time::pause();
+        let (stream, manager, _tx) = setup().await?;
+        pin_mut!(stream);
+        let trigger = test_trigger(&case.key, case.offset)?;
+        manager.schedule_trigger(trigger.clone()).await?;
+
+        match case.scenario {
+            TimerScenario::ScheduledTagMatches => {
+                let tag = manager
+                    .current_tag(&trigger.key, trigger.time, trigger.timer_type)
+                    .await?
+                    .ok_or_else(|| eyre!("scheduled timer has no current tag"))?;
+                let oracle = commit_manager(manager);
+                // Correct ⇒ NOT committed (live tag matches the WAL tag).
+                Ok(!oracle
+                    .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, tag)
+                    .await?)
+            }
+            TimerScenario::FiredAndRemoved => {
+                advance(Duration::from_secs(u64::from(case.offset) + 1)).await;
+                task::yield_now().await;
+                let pending = stream
+                    .next()
+                    .await
+                    .ok_or_else(|| eyre!("no pending timer fired"))?;
+                let firing = pending
+                    .fire()
+                    .await
+                    .ok_or_else(|| eyre!("pending not active"))?;
+                let wal_tag = firing.trigger().tag;
+                firing.commit().await; // committed without reschedule → row removed
+                let oracle = commit_manager(manager);
+                // Correct ⇒ committed (row absent).
+                oracle
+                    .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, wal_tag)
+                    .await
+                    .map_err(Into::into)
+            }
+            TimerScenario::FiredAndRescheduled => {
+                advance(Duration::from_secs(u64::from(case.offset) + 1)).await;
+                task::yield_now().await;
+                let pending = stream
+                    .next()
+                    .await
+                    .ok_or_else(|| eyre!("no pending timer fired"))?;
+                let firing = pending
+                    .fire()
+                    .await
+                    .ok_or_else(|| eyre!("pending not active"))?;
+                let wal_tag = firing.trigger().tag;
+                // Re-arm the same coordinate before committing: commit rotates
+                // the tag, so the captured WAL tag is no longer live.
+                manager.schedule_trigger(trigger.clone()).await?;
+                firing.commit().await;
+                let oracle = commit_manager(manager);
+                // Correct ⇒ committed (WAL tag differs from the rotated tag).
+                oracle
+                    .is_timer_committed(&trigger.key, trigger.timer_type, trigger.time, wal_tag)
+                    .await
+                    .map_err(Into::into)
+            }
+        }
     }
 }

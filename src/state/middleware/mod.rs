@@ -69,6 +69,8 @@ pub use context::{
     KeyedStateContext, ValueAccessor, ValueHandle,
 };
 pub use error::{BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareErrorComponent};
+#[cfg(test)]
+pub(crate) use handler::recover_pending_entries;
 pub use handler::{
     KeyedStateHandler, KeyedStateMiddleware, KeyedStateMiddlewareBuildError,
     KeyedStateMiddlewareBuilder, KeyedStateOutput, KeyedStateProvider,

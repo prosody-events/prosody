@@ -198,6 +198,37 @@ where
     Ok(WalBlob::<K>::new(bytes, format))
 }
 
+/// Test-only: builds an uncompressed WAL blob whose header declares
+/// `op_count` ops, followed by `tail` raw bytes (which may be empty,
+/// truncated, or garbage). Lets decoder property tests drive the
+/// untrusted-`op_count` preallocation path directly — `encode_wal` can only
+/// produce headers whose count matches the real op frames.
+///
+/// # Errors
+///
+/// Returns [`EncodingError`] when the header frame fails to serialize.
+#[cfg(test)]
+pub(crate) fn raw_wal_blob_for_test<K>(
+    op_count: NonZeroU64,
+    tail: &[u8],
+) -> Result<WalBlob<K>, EncodingError>
+where
+    K: CollectionKind,
+{
+    let header = WalHeader {
+        version: WAL_HEADER_VERSION,
+        kind: K::ID,
+        op_count,
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    write_named(&mut buf, &header).map_err(EncodingError::BadMsgPackEncode)?;
+    buf.extend_from_slice(tail);
+    Ok(WalBlob::<K>::new(
+        Bytes::from(buf),
+        WalFormat::MsgpackStreamV1,
+    ))
+}
+
 /// Decodes a typed WAL blob into a materialized envelope.
 ///
 /// # Errors
@@ -240,6 +271,17 @@ where
     }
 
     let count = header.op_count.get();
+    // `op_count` is attacker-controlled (it comes straight off the wire) and
+    // is not validated by the header decode. Each op frame is at least one
+    // byte, so a `count` larger than the bytes remaining after the header is
+    // provably corrupt — reject it before it can drive an unbounded
+    // `Vec::with_capacity` (capacity-overflow panic or OOM `abort`).
+    let remaining = raw_len.saturating_sub(cursor.position());
+    if count > remaining {
+        return Err(EncodingError::CorruptWal);
+    }
+    // `remaining` bounds `count`, which bounds the allocation; the `try_from`
+    // cannot truncate because `count <= remaining <= raw.len() <= usize::MAX`.
     let mut ops: Vec<K::Op> = Vec::with_capacity(usize::try_from(count).unwrap_or(usize::MAX));
     for _ in 0..count {
         let op: K::Op = read_frame(&mut cursor)?;

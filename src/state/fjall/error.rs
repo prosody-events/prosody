@@ -35,8 +35,8 @@ pub enum FjallValueStoreError {
     BlockingTaskJoin(#[from] JoinError),
 
     /// A dirty-meta row carried bytes that did not match the
-    /// `[next_seq u64 LE][op_count u64 LE]` layout.
-    #[error("corrupt dirty meta row: expected 16 bytes, got {0}")]
+    /// `[next_seq u64 LE]` layout.
+    #[error("corrupt dirty meta row: expected 8 bytes, got {0}")]
     CorruptDirtyMeta(usize),
 }
 

@@ -6,8 +6,7 @@
 //! * `dirty_ops`     — one row per buffered op, keyed by `[scope][seq]`.
 //! * `dirty_overlay` — one row per collection, encodes the "next read"
 //!   visibility using the cache codec's tagged-cell format.
-//! * `dirty_meta`    — one row per collection, value is `[next_seq u64
-//!   LE][op_count u64 LE]`.
+//! * `dirty_meta`    — one row per collection, value is `[next_seq u64 LE]`.
 //!
 //! All three partitions share the same `[16-byte scope-collection prefix]`
 //! key shape so prefix-scans, prefix-deletes, and overlay/meta point reads
@@ -91,12 +90,11 @@ impl FjallDirtyValueStore {
         self.scope
     }
 
-    fn read_meta(
-        meta: &PartitionHandle,
-        key: &[u8; 16],
-    ) -> Result<(u64, u64), FjallValueStoreError> {
+    /// Reads the collection's `next_seq` sequence counter, defaulting to 0
+    /// for an absent meta row.
+    fn read_meta(meta: &PartitionHandle, key: &[u8; 16]) -> Result<u64, FjallValueStoreError> {
         match meta.get(key)? {
-            None => Ok((0, 0)),
+            None => Ok(0),
             Some(bytes) => decode_dirty_meta(bytes.as_ref()),
         }
     }
@@ -108,7 +106,7 @@ impl FjallDirtyValueStore {
         overlay_cell: &bytes::Bytes,
     ) -> Result<(), FjallValueStoreError> {
         let collection_key = dirty_collection_key(self.scope, collection);
-        let (next_seq, op_count) = Self::read_meta(&self.meta, &collection_key)?;
+        let next_seq = Self::read_meta(&self.meta, &collection_key)?;
         let ops_key = dirty_ops_key(self.scope, collection, next_seq);
         let op_bytes = encode_payload(op, DIRTY_OP_ENCODING)?;
 
@@ -119,7 +117,7 @@ impl FjallDirtyValueStore {
             collection_key.as_ref(),
             overlay_cell.as_ref(),
         );
-        let new_meta = encode_dirty_meta(next_seq.wrapping_add(1), op_count.wrapping_add(1));
+        let new_meta = encode_dirty_meta(next_seq.wrapping_add(1));
         batch.insert(&self.meta, collection_key.as_ref(), new_meta.as_ref());
         batch.commit()?;
         Ok(())

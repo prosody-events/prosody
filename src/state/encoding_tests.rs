@@ -1,6 +1,6 @@
 use super::encoding::{
     EncodableOp, EncodingError, PayloadEncoding, WalFormat, decode_payload, decode_wal,
-    encode_payload, encode_wal,
+    encode_payload, encode_wal, raw_wal_blob_for_test,
 };
 use super::value::{KafkaMessageRef, StoredPayload, ValueKind, ValueOp};
 use super::{CollectionKind, CollectionKindId, NonEmptyOps, WalBlob, WalEnvelope};
@@ -8,6 +8,7 @@ use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU64;
 
 const TOPIC_POOL: &[&str] = &[
     "orders.v1",
@@ -310,4 +311,73 @@ fn zstd_payload_at_most_plain_size_on_compressible_input() -> Result<()> {
 fn encodable_op_is_implemented_for_value_op() {
     fn assert_encodable<T: EncodableOp>() {}
     assert_encodable::<ValueOp>();
+}
+
+/// A WAL header declaring `op_count` ops over `tail` raw bytes. The
+/// `op_count` is drawn from a pool biased toward boundary values so the
+/// generator reliably hits `u64::MAX` — the value that reproduced the B2
+/// capacity-overflow panic.
+#[derive(Clone, Debug)]
+struct ArbRawWal {
+    op_count: u64,
+    tail: Vec<u8>,
+}
+
+impl Arbitrary for ArbRawWal {
+    fn arbitrary(g: &mut Gen) -> Self {
+        const COUNT_POOL: &[u64] = &[
+            1,
+            2,
+            7,
+            256,
+            u32::MAX as u64,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let op_count = *g.choose(COUNT_POOL).unwrap_or(&1);
+        Self {
+            op_count,
+            tail: Vec::<u8>::arbitrary(g),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let op_count = self.op_count;
+        Box::new(self.tail.shrink().map(move |tail| Self { op_count, tail }))
+    }
+}
+
+/// F3: the WAL decoder must never panic or abort on an untrusted header,
+/// regardless of `op_count`. An `op_count` larger than the bytes remaining
+/// after the header is provably corrupt (each op frame is at least one byte),
+/// so it must return the typed [`EncodingError::CorruptWal`] rather than
+/// driving an unbounded `Vec::with_capacity`. Any other input must still
+/// yield a `Result` (a typed error or a decode), never a panic — quickcheck
+/// turns a panic into a test failure. Iteration count comes from
+/// `QUICKCHECK_TESTS`.
+#[test]
+fn prop_decode_wal_rejects_untrusted_op_count_without_panicking() {
+    fn property(input: ArbRawWal) -> bool {
+        let ArbRawWal { op_count, tail } = input;
+        let Some(count) = NonZeroU64::new(op_count) else {
+            return true;
+        };
+        let Ok(blob) = raw_wal_blob_for_test::<ValueKind>(count, &tail) else {
+            return true;
+        };
+
+        let result = decode_wal::<ValueKind>(&blob);
+        if op_count > tail.len() as u64 {
+            // Strictly more op frames claimed than bytes available after the
+            // header: must be rejected as corrupt, never preallocated.
+            matches!(result, Err(EncodingError::CorruptWal))
+        } else {
+            // Reaching here without a panic is the property; the tail is
+            // arbitrary, so a typed decode error is expected and fine.
+            true
+        }
+    }
+
+    QuickCheck::new().quickcheck(property as fn(ArbRawWal) -> bool);
 }

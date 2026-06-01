@@ -7,9 +7,9 @@ use super::value::{
     ValueStore, fold_value_ops,
 };
 use super::{
-    CollectionId, CollectionKind, CollectionRef, DirtyStoreFactory, DirtyStoreProvider,
-    DurableState, EventRef, EventScopeId, PayloadEncoding, PendingOps, Read, SealedCollection,
-    SealedWal, StateKey, StoreOutcome, WalFormat,
+    CollectionId, CollectionKind, CollectionKindId, CollectionRef, DirtyStoreFactory,
+    DirtyStoreProvider, DurableState, EventRef, EventScopeId, PayloadEncoding, PendingOps, Read,
+    SealedCollection, SealedWal, StateKey, StateName, StateType, StoreOutcome, WalFormat,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::timers::duration::CompactDuration;
@@ -17,7 +17,7 @@ use crate::{Partition, Topic};
 use ahash::RandomState;
 use futures::{Stream, stream};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
@@ -259,7 +259,13 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         )
         .map_err(MemoryStateError::Encoding)?;
 
+        // Mirror Cassandra's ordering: record the pending row first, then
+        // write the WAL. Mutate `pending` before borrowing `entries` so the
+        // two `&mut inner` reaches do not overlap (the trait methods are not
+        // called here — the mutex is non-reentrant). See [`PendingKey`].
+        let pending_key = PendingKey::from_id(collection.id());
         let mut inner = self.inner.lock();
+        inner.pending.insert(pending_key);
         let entry = inner.entries.entry(collection.id().clone()).or_default();
         entry.wal = Some(wal);
         Ok(SealedCollection::new(collection.clone(), event))
@@ -270,6 +276,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
+        let pending_key = PendingKey::from_id(collection.id());
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.id().clone()).or_default();
         let Some(sealed) = entry.wal.clone() else {
@@ -286,6 +293,9 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         let ops = envelope.into_ops();
         entry.applied = fold_value_ops(entry.applied.clone(), &ops);
         entry.wal = None;
+        // WAL cleared; drop the pending row last (Cassandra ordering). The
+        // `entry` borrow has ended, so re-borrowing `inner` is sound.
+        inner.pending.remove(&pending_key);
         Ok(StoreOutcome::Applied)
     }
 
@@ -294,6 +304,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
+        let pending_key = PendingKey::from_id(collection.id());
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(collection.id().clone()).or_default();
         let Some(sealed) = entry.wal.clone() else {
@@ -307,6 +318,8 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         }
 
         entry.wal = None;
+        // WAL cleared; drop the pending row last (Cassandra ordering).
+        inner.pending.remove(&pending_key);
         Ok(StoreOutcome::Applied)
     }
 }
@@ -337,20 +350,19 @@ impl DirectApplyStore<ValueKind> for MemoryDurableValueStore {
 impl PendingIndexStore for MemoryDurableValueStore {
     type Error = MemoryStateError;
 
-    async fn insert_pending<'a, K>(&'a self, _id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    async fn insert_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
     where
         K: CollectionKind,
     {
-        // The memory backend's HashMap already encodes pending collections
-        // via `entry.wal.is_some()`; a separate index is unnecessary. Tests
-        // do not inspect the memory pending store directly.
+        self.inner.lock().pending.insert(PendingKey::from_id(id));
         Ok(())
     }
 
-    async fn delete_pending<'a, K>(&'a self, _id: &'a CollectionId<K>) -> Result<(), Self::Error>
+    async fn delete_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
     where
         K: CollectionKind,
     {
+        self.inner.lock().pending.remove(&PendingKey::from_id(id));
         Ok(())
     }
 }
@@ -358,13 +370,19 @@ impl PendingIndexStore for MemoryDurableValueStore {
 impl PendingIndexScanner for MemoryDurableValueStore {
     type Error = MemoryStateError;
 
-    /// Streams the pending Value entries on `(segment, key)` by walking the
-    /// in-memory durable map and yielding one entry per collection whose
-    /// `wal` slot is non-empty. The snapshot is taken under the inner
-    /// lock; the stream itself is materialized at call time (the memory
-    /// backend has no I/O to incrementalize), which honors the
-    /// "Collection scans are streaming" contract by shape even though the
-    /// underlying data is fully resident.
+    /// Streams the pending Value entries on `(segment, key)` from the
+    /// dedicated pending index, yielding one entry per recorded
+    /// `PendingKey` whose segment-qualified key matches `state_key`.
+    ///
+    /// Reading from the real index (rather than deriving from
+    /// `entry.wal.is_some()`) lets the memory backend represent the
+    /// crash state *pending-written / WAL-not-written* — the
+    /// `Idle ⇒ delete_pending` recovery sweep arm that derived presence
+    /// could never reproduce. The snapshot is taken under the inner lock;
+    /// the stream itself is materialized at call time (the memory backend
+    /// has no I/O to incrementalize), which honors the "Collection scans
+    /// are streaming" contract by shape even though the underlying data is
+    /// fully resident.
     fn scan_pending(
         &self,
         state_key: &StateKey,
@@ -372,10 +390,10 @@ impl PendingIndexScanner for MemoryDurableValueStore {
         let snapshot: Vec<PendingEntry> = {
             let inner = self.inner.lock();
             inner
-                .entries
+                .pending
                 .iter()
-                .filter(|(id, entry)| entry.wal.is_some() && id.state_key() == state_key)
-                .map(|(id, _)| PendingEntry::new(id.state_type(), id.kind(), id.name().clone()))
+                .filter(|key| &key.state_key == state_key)
+                .map(|key| PendingEntry::new(key.state_type, key.kind, key.name.clone()))
                 .collect()
         };
 
@@ -391,6 +409,37 @@ struct DirtyInner {
 #[derive(Debug, Default)]
 struct DurableInner {
     entries: HashMap<CollectionId<ValueKind>, DurableValueEntry, RandomState>,
+    pending: HashSet<PendingKey, RandomState>,
+}
+
+/// Untyped key into the in-memory pending-WAL index.
+///
+/// [`PendingIndexStore::insert_pending`] / `delete_pending` are generic over
+/// the collection kind `K`, so the key erases the type-level kind into the
+/// runtime [`CollectionKindId`] discriminator. Storing `kind` lets the
+/// kind-agnostic [`PendingIndexScanner::scan_pending`] mirror Cassandra's
+/// cross-kind scan and keeps the middleware's WARN-and-skip path for
+/// non-Value kinds reachable from memory-backed tests.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PendingKey {
+    state_key: StateKey,
+    state_type: StateType,
+    kind: CollectionKindId,
+    name: StateName,
+}
+
+impl PendingKey {
+    fn from_id<K>(id: &CollectionId<K>) -> Self
+    where
+        K: CollectionKind,
+    {
+        Self {
+            state_key: id.state_key().clone(),
+            state_type: id.state_type(),
+            kind: id.kind(),
+            name: id.name().clone(),
+        }
+    }
 }
 
 /// Authoritative state for one durable Value collection.

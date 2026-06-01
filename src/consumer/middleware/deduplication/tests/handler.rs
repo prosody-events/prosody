@@ -2,11 +2,12 @@
 
 use crate::Topic;
 use crate::consumer::DemandType;
+use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::deduplication::{
     DeduplicationConfiguration, DeduplicationHandler, DeduplicationMiddleware,
-    MemoryDeduplicationStore, MemoryDeduplicationStoreProvider,
+    MemoryDeduplicationStore, MemoryDeduplicationStoreProvider, dedup_uuid, dedup_uuid_for_message,
 };
 use crate::consumer::middleware::test_support::MockEventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, FallibleHandler};
@@ -600,5 +601,59 @@ fn create_handler_apply(
         group_id: Arc::from("test-group"),
         topic: Topic::from("test-topic"),
         partition: 0,
+    }
+}
+
+/// T1: the dedup id a message's *writer* (the deduplication handler) produces
+/// must equal the id any *reader* derives via the canonical
+/// [`dedup_uuid_for_message`] free function — the exact call shape the
+/// keyed-state recovery oracle uses. If these diverged, recovery would look
+/// committed message state up under the wrong id and always read
+/// `NotCommitted`, silently rolling state back.
+///
+/// Exercised with and without an `event_id` because [`dedup_uuid`] selects a
+/// different hash branch (`event_id` vs offset) for each; the regression that
+/// motivated this — a reader hardcoding `version=""` and `event_id=None` —
+/// is pinned by the inequality asserts against the buggy form.
+#[test]
+fn dedup_id_writer_matches_canonical_reader_derivation() {
+    const VERSION: &str = "1";
+    const GROUP: &str = "test-group";
+    const TOPIC: &str = "test-topic";
+    const PARTITION: i32 = 3;
+
+    let handler = create_handler_with(MockHandler::success(), VERSION, GROUP, TOPIC, PARTITION);
+
+    for event_id in [Some("evt-1"), None] {
+        let Some(msg) = create_test_message("key-a", event_id) else {
+            return;
+        };
+
+        let writer_id = handler.dedup_uuid_for_message(&msg);
+        let reader_id = dedup_uuid_for_message(VERSION, GROUP, TOPIC, PARTITION, &msg);
+        assert_eq!(
+            writer_id, reader_id,
+            "writer and canonical reader derivations must agree (event_id = {event_id:?})"
+        );
+
+        // Regression guard: the original buggy reader hardcoded an empty
+        // version and a `None` event_id. For a message carrying an event_id
+        // that takes the wrong hash branch *and* the wrong version, so the
+        // ids must differ — proving the test would have failed on the bug.
+        let buggy_id = dedup_uuid(
+            "",
+            GROUP,
+            TOPIC,
+            PARTITION,
+            msg.key().as_bytes(),
+            None,
+            msg.offset(),
+        );
+        if event_id.is_some() {
+            assert_ne!(
+                writer_id, buggy_id,
+                "the buggy reader derivation must not collide with the writer id"
+            );
+        }
     }
 }

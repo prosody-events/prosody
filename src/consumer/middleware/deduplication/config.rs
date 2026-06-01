@@ -9,6 +9,17 @@ use crate::util::{
     DEFAULT_IDEMPOTENCE_CACHE_SIZE, from_duration_env_with_fallback, from_env_with_fallback,
 };
 
+/// Environment variable controlling the deduplication hash version.
+///
+/// Shared by the deduplication config default and any other component that
+/// must reproduce the same dedup version (e.g. the keyed-state middleware),
+/// so the version can never silently diverge between the writer and a reader.
+pub const IDEMPOTENCE_VERSION_ENV: &str = "PROSODY_IDEMPOTENCE_VERSION";
+
+/// Default deduplication hash version when [`IDEMPOTENCE_VERSION_ENV`] is
+/// unset.
+pub const DEFAULT_IDEMPOTENCE_VERSION: &str = "1";
+
 /// Configuration for the deduplication middleware.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct DeduplicationConfiguration {
@@ -19,9 +30,8 @@ pub struct DeduplicationConfiguration {
     ///
     /// Environment variable: `PROSODY_IDEMPOTENCE_VERSION`
     /// Default: `"1"`
-    #[builder(
-        default = "from_env_with_fallback(\"PROSODY_IDEMPOTENCE_VERSION\", \"1\".to_owned())?"
-    )]
+    #[builder(default = "from_env_with_fallback(IDEMPOTENCE_VERSION_ENV, \
+                         DEFAULT_IDEMPOTENCE_VERSION.to_owned())?")]
     pub version: String,
 
     /// Global shared cache capacity across all partitions. Set to 0 to disable

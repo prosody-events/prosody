@@ -20,6 +20,7 @@ use crate::state::memory::{
     MemoryDurableValueStore,
 };
 use crate::state::oracle::CommitOracle;
+use crate::state::pending::{PendingIndexScanner, PendingIndexStore};
 use crate::state::value::{
     DirectApplyStore, DurableWalStore, StoredPayload, ValueKind, ValueOp, ValueStore,
 };
@@ -32,11 +33,14 @@ use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
+use futures::StreamExt;
 use futures::executor;
-use quickcheck::QuickCheck;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::fmt::Debug;
+use std::iter;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -78,6 +82,40 @@ impl CommitOracle for FixedOracle {
         _collection: &'a CollectionId<ValueKind>,
         _event: EventRef,
     ) -> Result<CommitDecision, Self::Error> {
+        Ok(self.decision)
+    }
+}
+
+/// Oracle that counts `resolve` calls so a test can assert it was never
+/// consulted (the stale-pending sweep arm must not touch the oracle).
+#[derive(Clone)]
+struct CountingOracle {
+    decision: CommitDecision,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CountingOracle {
+    fn new(decision: CommitDecision) -> Self {
+        Self {
+            decision,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl CommitOracle for CountingOracle {
+    type Error = FixedOracleError;
+
+    async fn resolve<'a>(
+        &'a self,
+        _collection: &'a CollectionId<ValueKind>,
+        _event: EventRef,
+    ) -> Result<CommitDecision, Self::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(self.decision)
     }
 }
@@ -350,6 +388,67 @@ async fn state_recovery_applies_sealed_when_oracle_says_committed() -> Result<()
     Ok(())
 }
 
+/// F4: the stale-pending sweep arm. A crash between `insert_pending` and the
+/// WAL write leaves a pending row over an *Idle* partition. Recovery must
+/// delete that row, leave the partition Idle, clear the timer, and **never
+/// consult the oracle** (there is no sealed event to resolve). Before the
+/// real memory pending index (F1), the index was derived from
+/// `entry.wal.is_some()`, so this crash state was unrepresentable and this
+/// branch was dead in every memory-backed test.
+#[tokio::test]
+async fn state_recovery_deletes_stale_pending_over_idle_partition() -> Result<()> {
+    let durable = MemoryDurableValueStore::for_tests();
+    let state_key = make_state_key();
+    let id = make_collection_id(&state_key, "snapshot")?;
+
+    // Seed pending without ever sealing a WAL: the partition is Idle.
+    PendingIndexStore::insert_pending::<ValueKind>(&durable, &id).await?;
+    assert!(matches!(
+        DurableWalStore::read_partition(&durable, &id).await?,
+        DurableState::Idle { .. }
+    ));
+    let pending_before: Vec<_> = durable.scan_pending(&state_key).collect().await;
+    assert_eq!(pending_before.len(), 1, "the stale pending row is present");
+
+    let context = MockEventContext::new().with_timer_tracking();
+    let oracle = CountingOracle::new(CommitDecision::Committed);
+    recover_pending_entries(
+        &context,
+        &durable,
+        &durable,
+        &oracle,
+        &registry(),
+        state_key.clone(),
+    )
+    .await
+    .map_err(|e| eyre!("recovery failed: {e}"))?;
+
+    // The stale row is gone, the partition is still Idle, the oracle was
+    // never consulted, and the recovery timer was cleared.
+    let pending_after: Vec<_> = durable.scan_pending(&state_key).collect().await;
+    assert!(
+        pending_after.is_empty(),
+        "stale pending row must be deleted"
+    );
+    assert!(matches!(
+        DurableWalStore::read_partition(&durable, &id).await?,
+        DurableState::Idle { .. }
+    ));
+    assert_eq!(
+        oracle.call_count(),
+        0,
+        "oracle must not be consulted for a stale pending row"
+    );
+    assert!(
+        context
+            .timer_operations()
+            .iter()
+            .any(|op| matches!(op, TimerOperation::ClearScheduled(TimerType::StateRecovery))),
+        "recovery should clear the StateRecovery timer when done"
+    );
+    Ok(())
+}
+
 /// State recovery rolls a sealed partition back when oracle says not
 /// committed.
 #[tokio::test]
@@ -600,6 +699,7 @@ fn build_handler(
         oracle,
         provider: Ok(MemoryDirtyValueStoreProvider),
         consumer_group: Arc::from("test-group"),
+        version: Arc::from("1"),
         registry: Arc::new(registry),
         segment_id: Uuid::new_v4(),
         recovery_delay: CompactDuration::new(30),
@@ -615,6 +715,35 @@ fn test_message() -> Result<ConsumerMessage<serde_json::Value>> {
         serde_json::Value::Null,
     )
     .map_err(|e| eyre!("for_testing: {e}"))
+}
+
+/// T1 (reader side): the keyed-state handler derives a message's dedup id
+/// through the canonical [`dedup_uuid_for_message`] the deduplication
+/// *writer* uses, threading its configured `version` and `consumer_group`.
+/// A regression to the previous hardcoded `version = ""` / `event_id = None`
+/// form would diverge from the writer, making the recovery oracle read
+/// `NotCommitted` for committed messages and roll their state back. Covered
+/// for payloads with and without an `event_id` so both `dedup_uuid` hash
+/// branches are exercised.
+#[tokio::test]
+async fn derive_dedup_id_matches_canonical_writer_derivation() -> Result<()> {
+    use crate::consumer::middleware::deduplication::dedup_uuid_for_message;
+
+    let durable = MemoryDurableValueStore::for_tests();
+    let handler = build_handler(durable, FixedOracle::committed(), CommitMode::Wal);
+
+    for payload in [serde_json::json!({ "id": "evt-1" }), serde_json::json!({})] {
+        let msg =
+            ConsumerMessage::for_testing(crate::Topic::from("t"), 0, 7, Arc::from("k"), payload)
+                .map_err(|e| eyre!("for_testing: {e}"))?;
+        let derived = handler.derive_dedup_id_for_message(&msg);
+        let expected = dedup_uuid_for_message("1", "test-group", "t", 0, &msg);
+        assert_eq!(
+            derived, expected,
+            "handler derivation must match the canonical writer derivation"
+        );
+    }
+    Ok(())
 }
 
 /// In WAL mode, a `StateRecovery` timer fire returns
@@ -711,6 +840,68 @@ async fn after_commit_with_sealed_list_clears_state_recovery_timer() -> Result<(
         other => return Err(eyre!("expected Idle, got {other:?}")),
     };
     assert_eq!(applied, Some(inline_bytes(7)));
+    Ok(())
+}
+
+/// C1: when an `apply_sealed` fails, `after_commit` must leave the one-shot
+/// `StateRecovery` timer armed so the sweep retries — clearing it would tear
+/// down the only backstop on the exact path where apply just failed, risking
+/// a silently lost committed write once the sealed WAL row's TTL expires. The
+/// failure is induced via an event mismatch: the WAL is sealed under one
+/// event but the apply hook resolves a different one.
+#[tokio::test]
+async fn after_commit_apply_error_leaves_state_recovery_timer_armed() -> Result<()> {
+    let durable = MemoryDurableValueStore::for_tests();
+    let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
+    let context = MockEventContext::new().with_timer_tracking();
+
+    let state_key = StateKey::new(handler.segment_id, Arc::from("u"));
+    let id = make_collection_id(&state_key, "x")?;
+    let collection_ref = CollectionRef::new(id.clone(), None);
+    let sealed_event = EventRef::Message {
+        dedup_id: Uuid::from_u128(200),
+    };
+    durable
+        .seal(
+            &collection_ref,
+            sealed_event,
+            vec![ValueOp::Set {
+                payload: inline_bytes(7),
+            }],
+        )
+        .await?;
+
+    // Resolve a *different* event than the one sealed: apply_sealed returns
+    // EventMismatch, so the hook must not clear the timer.
+    let mismatched_event = EventRef::Message {
+        dedup_id: Uuid::from_u128(201),
+    };
+    handler
+        .after_commit(
+            context.clone(),
+            Ok(KeyedStateOutput::Inner {
+                inner: (),
+                sealed_event: Some(mismatched_event),
+                sealed_collections: vec![collection_ref],
+            }),
+        )
+        .await;
+
+    let cleared = context
+        .timer_operations()
+        .iter()
+        .filter(|op| matches!(op, TimerOperation::ClearScheduled(TimerType::StateRecovery)))
+        .count();
+    assert_eq!(
+        cleared, 0,
+        "apply failure must leave the recovery timer armed"
+    );
+
+    // The WAL is untouched: the partition stays Sealed for the sweep to retry.
+    assert!(matches!(
+        DurableWalStore::read_partition(&durable, &id).await?,
+        DurableState::Sealed { .. }
+    ));
     Ok(())
 }
 
@@ -815,6 +1006,7 @@ async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
         oracle: FixedOracle::committed(),
         provider: Ok(MemoryDirtyValueStoreProvider),
         consumer_group: Arc::from("test-group"),
+        version: Arc::from("1"),
         registry: Arc::new(registry()),
         segment_id: Uuid::new_v4(),
         recovery_delay: CompactDuration::new(30),
@@ -835,32 +1027,149 @@ async fn on_message_inner_error_propagates_as_inner_variant() -> Result<()> {
 
 // --- Property tests ---
 
-use crate::state::memory::MemoryDirtyValueStore as MemDirty;
-use crate::state::memory::MemoryDurableValueStore as MemDur;
-use crate::state::value_test_suite::{self, Trace};
+/// One step of a middleware dispatch trace: a value op plus the event
+/// outcome the apply hook receives.
+#[derive(Clone, Debug)]
+enum MiddlewareStep {
+    Set(u8),
+    Clear,
+}
 
-/// Headline middleware integration property: a `KeyedStateMiddleware`
-/// wrapping a memory durable + memory dirty stack drives the same
-/// `value_test_suite::Trace` invariants the raw transaction store does.
-///
-/// This exercises the per-collection commit-mode dispatch, the
-/// transaction wiring inside `KeyedStateContext`, and the per-event
-/// scope minting end-to-end. Memory backends are used because the
-/// underlying durable + dirty equivalence to Cassandra/Fjall is already
-/// proved at the store layer (Slices 1–6).
-#[test]
-fn prop_middleware_value_trace_matches_durable() {
-    fn property(trace: Trace) -> bool {
-        // Use the existing value_test_suite directly so we drive the
-        // exact same trace against the underlying durable + dirty pair
-        // that the middleware would compose. The runner already covers
-        // Seal / Commit / Abort / Flush / Crash with the model.
-        executor::block_on(value_test_suite::run_trace(
-            MemDur::for_tests(),
-            MemDirty::new,
-            trace,
-        ))
-        .unwrap_or(false)
+#[derive(Clone, Debug)]
+struct MiddlewareEvent {
+    step: MiddlewareStep,
+    commit: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MiddlewareTrace(Vec<MiddlewareEvent>);
+
+impl Arbitrary for MiddlewareStep {
+    fn arbitrary(g: &mut Gen) -> Self {
+        if bool::arbitrary(g) {
+            Self::Set(u8::arbitrary(g))
+        } else {
+            Self::Clear
+        }
     }
-    QuickCheck::new().quickcheck(property as fn(Trace) -> bool);
+}
+
+impl Arbitrary for MiddlewareEvent {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            step: MiddlewareStep::arbitrary(g),
+            commit: bool::arbitrary(g),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let commit = self.commit;
+        Box::new(
+            self.step
+                .clone()
+                .shrink_step()
+                .map(move |step| Self { step, commit }),
+        )
+    }
+}
+
+impl MiddlewareStep {
+    /// Minimal shrink: a `Set` shrinks toward `Clear` and toward smaller bytes.
+    fn shrink_step(self) -> Box<dyn Iterator<Item = Self>> {
+        match self {
+            Self::Clear => Box::new(iter::empty()),
+            Self::Set(b) => Box::new(iter::once(Self::Clear).chain(b.shrink().map(Self::Set))),
+        }
+    }
+}
+
+impl Arbitrary for MiddlewareTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::arbitrary(g) % 12;
+        let events = (0..len).map(|_| MiddlewareEvent::arbitrary(g)).collect();
+        Self(events)
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.0.shrink().map(MiddlewareTrace))
+    }
+}
+
+/// T4 — middleware dispatch property. Drives a sequence of value ops through
+/// the **actual** keyed-state machinery — a real [`KeyedStateContext`], its
+/// `resolve_per_collection` seal, and the `KeyedStateHandler::after_commit` /
+/// `after_abort` apply hooks (the path the C1 fix lives in) — and asserts the
+/// durable visible state tracks a model after each event: a committed event
+/// applies the WAL, an aborted event rolls it back. The previous version of
+/// this test ran `value_test_suite::run_trace` against raw stores and never
+/// constructed a context or handler, so the dispatch path had no coverage.
+///
+/// (A generic `FallibleHandler::on_message<C: EventContext>` cannot statically
+/// recover `KeyedStateAccess`, so the op is performed on the context directly,
+/// exactly as the directed seal tests do; the seal + apply-hook dispatch is
+/// the middleware-specific logic under test.)
+#[test]
+fn prop_middleware_dispatch_matches_durable_model() {
+    fn property(trace: MiddlewareTrace) -> bool {
+        executor::block_on(run_middleware_dispatch(trace)).unwrap_or(false)
+    }
+    QuickCheck::new().quickcheck(property as fn(MiddlewareTrace) -> bool);
+}
+
+async fn run_middleware_dispatch(trace: MiddlewareTrace) -> Result<bool> {
+    let durable = MemoryDurableValueStore::for_tests();
+    let handler = build_handler(durable.clone(), FixedOracle::committed(), CommitMode::Wal);
+    let state_key = make_state_key();
+    let id = make_collection_id(&state_key, "v")?;
+    let registry = Arc::new(registry());
+
+    let mut model: Option<StoredPayload> = None;
+
+    for (idx, event) in trace.0.into_iter().enumerate() {
+        let event_ref = EventRef::Message {
+            dedup_id: Uuid::from_u128(idx as u128 + 1),
+        };
+        // Drive the real per-event context + seal.
+        let ctx = build_context(
+            MockEventContext::new(),
+            durable.clone(),
+            registry.clone(),
+            state_key.clone(),
+            event_ref,
+        );
+        let handle = ctx.value("v")?;
+        let applied_if_committed = match &event.step {
+            MiddlewareStep::Set(byte) => {
+                handle.set(inline_bytes(*byte)).await?;
+                Some(inline_bytes(*byte))
+            }
+            MiddlewareStep::Clear => {
+                handle.clear().await?;
+                None
+            }
+        };
+        let sealed = ctx.resolve_per_collection().await?;
+
+        // Route through the real apply hooks.
+        let output = KeyedStateOutput::Inner {
+            inner: (),
+            sealed_event: Some(event_ref),
+            sealed_collections: sealed,
+        };
+        let mock = MockEventContext::new();
+        if event.commit {
+            handler.after_commit(mock, Ok(output)).await;
+            model = applied_if_committed;
+        } else {
+            handler.after_abort(mock, Ok(output)).await;
+            // Rollback leaves pre-event applied state unchanged.
+        }
+
+        // The WAL must be resolved (Idle) and the applied state must match.
+        match DurableWalStore::read_partition(&durable, &id).await? {
+            DurableState::Idle { applied } if applied == model => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }

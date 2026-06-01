@@ -33,9 +33,10 @@ use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use fjall::{Config, PartitionCreateOptions};
 use parking_lot::Mutex;
-use quickcheck::{QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::env;
 use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -281,87 +282,205 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
 // because every fjall call goes through `tokio::task::spawn_blocking`,
 // which needs a Tokio runtime in scope.
 
-fn prop_layered_memory_wal(trace: Trace) -> bool {
-    let Ok((_dir, cache)) = make_cache() else {
-        return false;
-    };
-    let backing = MemoryDurableValueStore::for_tests();
-    let layered = LayeredValueStore::new(cache, backing);
-    TEST_RUNTIME
-        .block_on(value_test_suite::run_trace(
-            layered,
-            MemoryDirtyValueStore::new,
-            trace,
-        ))
-        .unwrap_or(false)
+/// Maps a property-trace outcome to a [`TestResult`], keeping a store/runtime
+/// error (`Err`) distinct from a legitimate model mismatch (`Ok(false)`) so a
+/// swallowed backend failure can never masquerade as a falsified property.
+/// Mirrors the Cassandra runners above.
+fn finish_layered_trace<E: fmt::Debug>(result: Result<bool, E>, input_dbg: &str) -> TestResult {
+    match result {
+        Ok(true) => TestResult::passed(),
+        Ok(false) => TestResult::error(format!("model mismatch.\nFailing input:\n{input_dbg}")),
+        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
+    }
 }
 
-fn prop_layered_memory_idempotence(trace: Trace) -> bool {
-    let Ok((_dir, cache)) = make_cache() else {
-        return false;
+fn prop_layered_memory_wal(trace: Trace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
+    let (_dir, cache) = match make_cache() {
+        Ok(c) => c,
+        Err(e) => {
+            return TestResult::error(format!(
+                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
     };
     let backing = MemoryDurableValueStore::for_tests();
     let layered = LayeredValueStore::new(cache, backing);
-    TEST_RUNTIME
-        .block_on(value_test_suite::run_idempotence_trace(
-            layered,
-            MemoryDirtyValueStore::new,
-            trace,
-        ))
-        .unwrap_or(false)
+    let result = TEST_RUNTIME.block_on(value_test_suite::run_trace(
+        layered,
+        MemoryDirtyValueStore::new,
+        trace,
+    ));
+    finish_layered_trace(result, &input_dbg)
 }
 
-fn prop_layered_memory_direct(trace: DirectTrace) -> bool {
-    let Ok((_dir, cache)) = make_cache() else {
-        return false;
+fn prop_layered_memory_idempotence(trace: Trace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
+    let (_dir, cache) = match make_cache() {
+        Ok(c) => c,
+        Err(e) => {
+            return TestResult::error(format!(
+                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
     };
     let backing = MemoryDurableValueStore::for_tests();
     let layered = LayeredValueStore::new(cache, backing);
-    TEST_RUNTIME
-        .block_on(value_test_suite::run_direct_trace(
-            layered,
-            MemoryDirtyValueStore::new,
-            trace,
-        ))
-        .unwrap_or(false)
+    let result = TEST_RUNTIME.block_on(value_test_suite::run_idempotence_trace(
+        layered,
+        MemoryDirtyValueStore::new,
+        trace,
+    ));
+    finish_layered_trace(result, &input_dbg)
+}
+
+fn prop_layered_memory_direct(trace: DirectTrace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
+    let (_dir, cache) = match make_cache() {
+        Ok(c) => c,
+        Err(e) => {
+            return TestResult::error(format!(
+                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
+    };
+    let backing = MemoryDurableValueStore::for_tests();
+    let layered = LayeredValueStore::new(cache, backing);
+    let result = TEST_RUNTIME.block_on(value_test_suite::run_direct_trace(
+        layered,
+        MemoryDirtyValueStore::new,
+        trace,
+    ));
+    finish_layered_trace(result, &input_dbg)
 }
 
 #[test]
 fn prop_layered_fjall_memory_trace() {
-    QuickCheck::new().quickcheck(prop_layered_memory_wal as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(prop_layered_memory_wal as fn(Trace) -> TestResult);
 }
 
 #[test]
 fn prop_layered_fjall_memory_idempotence_trace() {
-    QuickCheck::new().quickcheck(prop_layered_memory_idempotence as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(prop_layered_memory_idempotence as fn(Trace) -> TestResult);
 }
 
 #[test]
 fn prop_layered_fjall_memory_direct_trace() {
-    QuickCheck::new().quickcheck(prop_layered_memory_direct as fn(DirectTrace) -> bool);
+    QuickCheck::new().quickcheck(prop_layered_memory_direct as fn(DirectTrace) -> TestResult);
 }
 
 // ---- property runners: Layered<Fjall, Recovering<Memory, AlwaysCommitted>> --
 
-fn prop_layered_fjall_recovering_memory(trace: Trace) -> bool {
-    let Ok((_dir, cache)) = make_cache() else {
-        return false;
+fn prop_layered_fjall_recovering_memory(trace: Trace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
+    let (_dir, cache) = match make_cache() {
+        Ok(c) => c,
+        Err(e) => {
+            return TestResult::error(format!(
+                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
     };
     let inner = MemoryDurableValueStore::for_tests();
-    let recovering = RecoveringValueStore::new(inner, AlwaysCommittedOracle, TEST_TTL);
+    let recovering = RecoveringValueStore::with_default_ttl(inner, AlwaysCommittedOracle, TEST_TTL);
     let layered = LayeredValueStore::new(cache, recovering);
-    TEST_RUNTIME
-        .block_on(value_test_suite::run_trace(
-            layered,
-            MemoryDirtyValueStore::new,
-            trace,
-        ))
-        .unwrap_or(false)
+    let result = TEST_RUNTIME.block_on(value_test_suite::run_trace(
+        layered,
+        MemoryDirtyValueStore::new,
+        trace,
+    ));
+    finish_layered_trace(result, &input_dbg)
 }
 
 #[test]
 fn prop_layered_fjall_recovering_memory_trace() {
-    QuickCheck::new().quickcheck(prop_layered_fjall_recovering_memory as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(prop_layered_fjall_recovering_memory as fn(Trace) -> TestResult);
+}
+
+// ---- F6: LayeredValueStore vs. backing-alone parity -------------------------
+
+/// One `ValueStore`-level operation in an [`F6Trace`].
+#[derive(Clone, Debug)]
+enum CacheOp {
+    Set(u8),
+    Clear,
+    Get,
+}
+
+#[derive(Clone, Debug)]
+struct F6Trace(Vec<CacheOp>);
+
+impl Arbitrary for CacheOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 3 {
+            0 => Self::Set(u8::arbitrary(g)),
+            1 => Self::Clear,
+            _ => Self::Get,
+        }
+    }
+}
+
+impl Arbitrary for F6Trace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::arbitrary(g) % 24;
+        Self((0..len).map(|_| CacheOp::arbitrary(g)).collect())
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.0.shrink().map(F6Trace))
+    }
+}
+
+/// F6: a `LayeredValueStore<FjallValueStore, MemoryDurableValueStore>` must
+/// return the same visible value as the backing store alone for every read,
+/// across cache miss/populate (`Get` after a write went through), cache patch
+/// (`Set`/`Clear` write-through), and the absent path. Drives an identical op
+/// trace against the layered store and a bare backing reference and compares
+/// `get` after every step, so a stale cache serving a wrong value is caught
+/// directly rather than only against the analytical model.
+fn layered_parity_property(trace: F6Trace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
+    let (_dir, cache) = match make_cache() {
+        Ok(c) => c,
+        Err(e) => {
+            return TestResult::error(format!(
+                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
+    };
+    let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
+    let reference = MemoryDurableValueStore::for_tests();
+    let F6Trace(ops) = trace;
+
+    let result: Result<bool> = TEST_RUNTIME.block_on(async {
+        let id = collection_id("parity")?;
+        for op in &ops {
+            match op {
+                CacheOp::Set(byte) => {
+                    layered.set(&id, inline(*byte)).await?;
+                    reference.set(&id, inline(*byte)).await?;
+                }
+                CacheOp::Clear => {
+                    layered.clear(&id).await?;
+                    reference.clear(&id).await?;
+                }
+                CacheOp::Get => {
+                    if layered.get(&id).await? != reference.get(&id).await? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        // Final read parity regardless of the trailing op.
+        Ok(layered.get(&id).await? == reference.get(&id).await?)
+    });
+
+    finish_layered_trace(result, &input_dbg)
+}
+
+#[test]
+fn prop_layered_fjall_memory_parity() {
+    QuickCheck::new().quickcheck(layered_parity_property as fn(F6Trace) -> TestResult);
 }
 
 // ---- property runners: LayeredValueStore<FjallValueStore, Cassandra> --------
@@ -584,7 +703,8 @@ fn cassandra_recovering_wal_property(trace: Trace) -> TestResult {
         }
     };
 
-    let recovering = RecoveringValueStore::new(backing, AlwaysCommittedOracle, TEST_TTL);
+    let recovering =
+        RecoveringValueStore::with_default_ttl(backing, AlwaysCommittedOracle, TEST_TTL);
     let layered = LayeredValueStore::new(cache, recovering);
     let result = runtime.block_on(
         async { value_test_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
@@ -759,39 +879,50 @@ async fn fjall_dirty_scope_isolation_two_scopes_dont_interfere() -> Result<()> {
     Ok(())
 }
 
-fn fjall_dirty_property(trace: DirtyTrace) -> bool {
+fn fjall_dirty_property(trace: DirtyTrace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
     let scope = EventScopeId::fresh();
-    let Ok((_dir, dirty)) = make_dirty(scope) else {
-        return false;
+    let (_dir, dirty) = match make_dirty(scope) {
+        Ok(d) => d,
+        Err(e) => {
+            return TestResult::error(format!(
+                "dirty setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
     };
-    TEST_RUNTIME
-        .block_on(dirty_value_test_suite::run_dirty_trace(dirty, trace))
-        .unwrap_or(false)
+    let result = TEST_RUNTIME.block_on(dirty_value_test_suite::run_dirty_trace(dirty, trace));
+    finish_layered_trace(result, &input_dbg)
 }
 
 #[test]
 fn prop_fjall_dirty_satisfies_invariants() {
-    QuickCheck::new().quickcheck(fjall_dirty_property as fn(DirtyTrace) -> bool);
+    QuickCheck::new().quickcheck(fjall_dirty_property as fn(DirtyTrace) -> TestResult);
 }
 
-fn fjall_dirty_matches_memory_property(trace: DirtyTrace) -> bool {
+fn fjall_dirty_matches_memory_property(trace: DirtyTrace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
     let scope = EventScopeId::fresh();
-    let Ok((_dir, fjall_dirty)) = make_dirty(scope) else {
-        return false;
+    let (_dir, fjall_dirty) = match make_dirty(scope) {
+        Ok(d) => d,
+        Err(e) => {
+            return TestResult::error(format!(
+                "dirty setup failed: {e:?}\nFailing input:\n{input_dbg}"
+            ));
+        }
     };
     let memory_dirty = MemoryDirtyValueStore::new();
-    TEST_RUNTIME
-        .block_on(dirty_value_test_suite::run_dirty_parity(
-            fjall_dirty,
-            memory_dirty,
-            trace,
-        ))
-        .unwrap_or(false)
+    let result = TEST_RUNTIME.block_on(dirty_value_test_suite::run_dirty_parity(
+        fjall_dirty,
+        memory_dirty,
+        trace,
+    ));
+    finish_layered_trace(result, &input_dbg)
 }
 
 #[test]
 fn prop_fjall_dirty_matches_memory_dirty() {
-    QuickCheck::new().quickcheck(fjall_dirty_matches_memory_property as fn(DirtyTrace) -> bool);
+    QuickCheck::new()
+        .quickcheck(fjall_dirty_matches_memory_property as fn(DirtyTrace) -> TestResult);
 }
 
 // ---- FjallClient + FjallWorkspace tests -------------------------------------

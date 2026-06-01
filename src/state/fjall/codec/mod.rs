@@ -175,30 +175,28 @@ where
     scope_collection_prefix(scope, id)
 }
 
-/// Encodes the `dirty_meta` value as `[next_seq u64 LE][op_count u64 LE]`.
+/// Encodes the `dirty_meta` value as `[next_seq u64 LE]`.
+///
+/// `next_seq` is the only field the dirty store reads back; the op count is
+/// derived on demand by iterating the ops prefix (see
+/// [`PendingOpSource::pending_ops`](crate::state::value::PendingOpSource::pending_ops)),
+/// so it is not stored.
 #[must_use]
-pub fn encode_dirty_meta(next_seq: u64, op_count: u64) -> [u8; 16] {
-    let mut buf = [0_u8; 16];
-    buf[..8].copy_from_slice(&next_seq.to_le_bytes());
-    buf[8..].copy_from_slice(&op_count.to_le_bytes());
-    buf
+pub fn encode_dirty_meta(next_seq: u64) -> [u8; 8] {
+    next_seq.to_le_bytes()
 }
 
-/// Decodes a `dirty_meta` value into `(next_seq, op_count)`.
+/// Decodes a `dirty_meta` value into `next_seq`.
 ///
 /// # Errors
 ///
 /// Returns [`FjallValueStoreError::CorruptDirtyMeta`] when the cell does
-/// not have exactly 16 bytes.
-pub fn decode_dirty_meta(bytes: &[u8]) -> Result<(u64, u64), FjallValueStoreError> {
-    let arr: [u8; 16] = bytes
+/// not have exactly 8 bytes.
+pub fn decode_dirty_meta(bytes: &[u8]) -> Result<u64, FjallValueStoreError> {
+    let arr: [u8; 8] = bytes
         .try_into()
         .map_err(|_| FjallValueStoreError::CorruptDirtyMeta(bytes.len()))?;
-    let mut a = [0_u8; 8];
-    let mut b = [0_u8; 8];
-    a.copy_from_slice(&arr[..8]);
-    b.copy_from_slice(&arr[8..]);
-    Ok((u64::from_le_bytes(a), u64::from_le_bytes(b)))
+    Ok(u64::from_le_bytes(arr))
 }
 
 #[cfg(test)]

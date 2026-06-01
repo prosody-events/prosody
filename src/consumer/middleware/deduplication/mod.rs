@@ -49,8 +49,8 @@ use crate::{EventIdentity, Partition, Topic};
 
 pub use self::cassandra::{CassandraDeduplicationStore, CassandraDeduplicationStoreProvider};
 pub use self::config::{
-    DeduplicationConfiguration, DeduplicationConfigurationBuilder,
-    DeduplicationConfigurationBuilderError,
+    DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration, DeduplicationConfigurationBuilder,
+    DeduplicationConfigurationBuilderError, IDEMPOTENCE_VERSION_ENV,
 };
 pub use self::memory::{MemoryDeduplicationStore, MemoryDeduplicationStoreProvider};
 pub use self::store::{DeduplicationStore, DeduplicationStoreProvider};
@@ -209,6 +209,37 @@ pub fn dedup_uuid(
     uuid::Builder::from_custom_bytes(hash.to_le_bytes()).into_uuid()
 }
 
+/// Computes the dedup UUID for a message, assembling the per-message hash
+/// arguments (key, `event_id`, offset) from `message` in one place.
+///
+/// This is the single source of truth for the message → dedup-id mapping.
+/// The deduplication middleware writes a row under this id; any reader that
+/// must look the row up — notably the keyed-state recovery oracle — calls
+/// this same function with the same `(version, group_id, topic, partition)`
+/// so the two derivations cannot drift apart on the `event_id`/offset branch
+/// selection inside [`dedup_uuid`].
+#[must_use]
+pub fn dedup_uuid_for_message<P>(
+    version: &str,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+    message: &ConsumerMessage<P>,
+) -> Uuid
+where
+    P: EventIdentity,
+{
+    dedup_uuid(
+        version,
+        group_id,
+        topic,
+        partition,
+        message.key().as_bytes(),
+        message.payload().event_id().map(str::as_bytes),
+        message.offset(),
+    )
+}
+
 impl<T, S> DeduplicationHandler<T, S>
 where
     T: FallibleHandler,
@@ -216,14 +247,12 @@ where
     S: DeduplicationStore,
 {
     fn dedup_uuid_for_message(&self, message: &ConsumerMessage<T::Payload>) -> Uuid {
-        dedup_uuid(
+        dedup_uuid_for_message(
             &self.version,
             &self.group_id,
             &self.topic,
             self.partition,
-            message.key().as_bytes(),
-            message.payload().event_id().map(str::as_bytes),
-            message.offset(),
+            message,
         )
     }
 }

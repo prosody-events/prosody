@@ -51,6 +51,14 @@ fn value_folding_uses_last_ordered_op() {
     );
 }
 
+/// F4 (memory): the shared stale-pending sweep check against the memory
+/// durable store. Runs always (no broker). The Cassandra counterpart lives
+/// in `state::cassandra::tests` and drives the identical helper.
+#[tokio::test]
+async fn memory_sweep_deletes_stale_pending_index() -> Result<()> {
+    value_test_suite::run_stale_pending_index(MemoryDurableValueStore::for_tests()).await
+}
+
 #[test]
 fn collection_identity_carries_value_kind() -> Result<()> {
     let collection = collection_id()?;
@@ -58,6 +66,35 @@ fn collection_identity_carries_value_kind() -> Result<()> {
 
     let envelope = WalEnvelope::<ValueKind>::try_from_ops(vec![ValueOp::Clear])?;
     assert_eq!(envelope.operation_count().get(), 1);
+    Ok(())
+}
+
+/// `CollectionRef` equality and hashing key on the inner `CollectionId`
+/// only — the TTL is a per-write hint, not part of identity. Two refs to the
+/// same collection with different TTLs must compare equal and hash equal, so
+/// a `CollectionRef` used as a `HashSet`/`HashMap` key is not split by an
+/// incidental TTL difference.
+#[test]
+fn collection_ref_eq_and_hash_ignore_ttl() -> Result<()> {
+    use crate::timers::duration::CompactDuration;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let id = collection_id()?;
+    let with_ttl = CollectionRef::new(id.clone(), Some(CompactDuration::new(3_600)));
+    let without_ttl = CollectionRef::new(id.clone(), None);
+    let other_ttl = CollectionRef::new(id, Some(CompactDuration::new(7_200)));
+
+    assert_eq!(with_ttl, without_ttl);
+    assert_eq!(with_ttl, other_ttl);
+
+    let hash = |r: &CollectionRef<ValueKind>| {
+        let mut h = DefaultHasher::new();
+        r.hash(&mut h);
+        h.finish()
+    };
+    assert_eq!(hash(&with_ttl), hash(&without_ttl));
+    assert_eq!(hash(&with_ttl), hash(&other_ttl));
     Ok(())
 }
 

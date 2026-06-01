@@ -11,18 +11,23 @@
 //! | All columns NULL                                     | `Idle { applied: None }`|
 //! | `data + payload_encoding`, no WAL columns            | `Idle { applied: Some }` |
 //! | `data + payload_encoding + wal_event + wal_ops + wal_format` (any data presence) | `Sealed { applied, wal }` |
+//! | Semantically-corrupt `event_ref` UDT (e.g. `kind == 7`) | `CorruptUdt { .. }` |
 //! | Anything else                                        | `CorruptWal { reason }` |
 //!
 //! The intermediate `Option<...>` tuple [`RawValueRow`] is private to this
 //! module; callers see only the three valid outcomes plus the typed
-//! corruption reason.
+//! corruption reasons. The `wal_event` column deserializes (structurally)
+//! into a [`RawEventRef`] and is validated into an [`EventRef`] here via
+//! [`RawEventRef::try_into_event`] — running that validation in this fallible
+//! post-step (rather than inside scylla's `DeserializeValue`) is what keeps a
+//! corrupt UDT classifiable as `Permanent` (skip the row) instead of
+//! `Terminal` (tear the partition down). See [`super::udt`].
 
 use super::error::CassandraValueStoreError;
+use super::udt::RawEventRef;
 use crate::state::encoding::decode_payload;
 use crate::state::value::ValueKind;
-use crate::state::{
-    DurableState, EventRef, PayloadEncoding, SealedWal, StoredPayload, WalBlob, WalFormat,
-};
+use crate::state::{DurableState, PayloadEncoding, SealedWal, StoredPayload, WalBlob, WalFormat};
 use std::fmt;
 use thiserror::Error;
 
@@ -31,11 +36,11 @@ use thiserror::Error;
 ///
 /// Module-private — callers never observe the intermediate tuple.
 pub(super) type RawValueRow = (
-    Option<Vec<u8>>,  // data
-    Option<i16>,      // payload_encoding
-    Option<EventRef>, // wal_event
-    Option<Vec<u8>>,  // wal_ops
-    Option<i16>,      // wal_format
+    Option<Vec<u8>>,     // data
+    Option<i16>,         // payload_encoding
+    Option<RawEventRef>, // wal_event (validated into EventRef during decode)
+    Option<Vec<u8>>,     // wal_ops
+    Option<i16>,         // wal_format
 );
 
 /// Decodes the value partition columns into a [`DurableState`].
@@ -86,11 +91,12 @@ fn decode_idle(
 fn decode_sealed(
     data: Option<Vec<u8>>,
     payload_encoding: Option<i16>,
-    wal_event: Option<EventRef>,
+    wal_event: Option<RawEventRef>,
     wal_ops: Option<Vec<u8>>,
     wal_format: Option<i16>,
 ) -> Result<DurableState<ValueKind>, CassandraValueStoreError> {
-    let (Some(event), Some(ops_bytes), Some(format_raw)) = (wal_event, wal_ops, wal_format) else {
+    let (Some(raw_event), Some(ops_bytes), Some(format_raw)) = (wal_event, wal_ops, wal_format)
+    else {
         // is_sealed() proved all three are Some; this branch is unreachable
         // but the match-let keeps the variables typed without unwrap.
         return Err(CassandraValueStoreError::CorruptWal {
@@ -99,6 +105,12 @@ fn decode_sealed(
             },
         });
     };
+    // Validate the structurally-decoded UDT into a typed event. A corrupt
+    // shape surfaces as `CorruptUdt` (Permanent → skip), not as a laundered
+    // scylla `DeserializationError` (Terminal → shut down).
+    let event = raw_event
+        .try_into_event()
+        .map_err(CassandraValueStoreError::CorruptUdt)?;
     let Some(encoding_raw) = payload_encoding else {
         return Err(CassandraValueStoreError::CorruptWal {
             reason: CorruptReason::WalWithoutPayloadEncoding,

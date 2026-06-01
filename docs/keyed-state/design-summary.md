@@ -98,7 +98,9 @@ These invariants are load-bearing. Code should name them near the owning types a
 10. **Rollback only rolls back sealed WAL.** Aborting a handler drops unsealed local operations. It rolls back only
     collections that successfully reached the sealed state.
 11. **Direct apply is at-least-once.** `flush()` and `CommitMode::Direct` may be observed more than once if the process
-    loses the storage response and the handler retries. Users opt into this contract.
+    loses the storage response and the handler retries. Users opt into this contract. This is a design-level
+    contract: the owning code (`direct_apply` / `flush`) does not name the invariant, and under last-writer-wins
+    Value semantics a replayed direct apply is idempotent in effect, so it is benign and intentionally unguarded.
 12. **Backend physical metadata is private.** Cassandra static columns belong to Cassandra store implementations.
     Layered caches observe only datatype trait results plus their own coverage metadata.
 13. **Collection scans are streaming.** Range and iteration APIs return async streams. Store implementations must not
@@ -940,26 +942,16 @@ pre-validate WAL size — oversized seals fail with whatever the driver returns,
 After the framework commits the message or timer, `after_commit` calls `store.apply_sealed`. If the framework aborts
 the event, `after_abort` calls `store.rollback_sealed`.
 
-**Apply.** `apply_sealed` drains the WAL incrementally rather than in one mutation:
+**Apply.** For the Value kind, `apply_sealed` is one-shot in every landed backend: it folds the WAL ops over the
+current `data` and writes the folded result while atomically clearing the WAL columns in a single row mutation (memory
+and Cassandra both). This is sound for Value because the WAL is last-writer-wins — the entire fold collapses to one
+value regardless of op count. Rollback is likewise a single `UPDATE` that clears the WAL columns; the entry's `data` is
+the pre-seal authoritative state by construction, so no per-op work is required to roll back.
 
-```text
-loop until wal_ops is empty:
-    peel next batch of N ops off the front of wal_ops
-    in one atomic row mutation:
-        data     = fold(data, peeled)
-        wal_ops  = encode(remaining)
-        when remaining is empty, also clear wal_event and payload_encoding
-```
-
-Every iteration is one row update on the same partition, atomic by virtue of single-row Cassandra semantics. The batch
-size N is chosen so each mutation fits comfortably under the driver's frame size. Apply is naturally restartable: if
-the process dies mid-loop, the durable row is left in `DurableState::Sealed { applied: partial, wal: remaining }`;
-recovery re-asks the oracle (still says `Committed`), and `apply_sealed` resumes from the partial state. Rollback
-remains a single `UPDATE` that clears the WAL columns; the entry's `data` is the pre-seal authoritative state by
-construction, so no per-op work is required to roll back.
-
-The memory store applies in one shot — equivalent to the trivial case of `N = ∞`. Slice 1 establishes the trait
-contract; the chunked loop is a Slice 5 (Cassandra) implementation detail.
+*Future work (collections with unbounded op counts, e.g. Map/Deque):* a chunked, restartable drain — peel `N` ops per
+atomic row mutation until `wal_ops` is empty, leaving `DurableState::Sealed { applied: partial, wal: remaining }` after
+each step so a mid-loop crash resumes from the partial state (the oracle still says `Committed`). This is not yet
+implemented; see Documented Deviation #3.
 
 ### Direct-Mode Success
 
@@ -1175,7 +1167,7 @@ durability boundary and can make their handler logic idempotent at the applicati
 | Process restart                             | Delete old workspaces; Cassandra recovers truth.       |
 | Partition revocation                        | Stop handlers, drop workspace, delete assignment data. |
 | Cache format mismatch                       | Delete workspace and reload from Cassandra.            |
-| Committed-cache corruption                  | Invalidate affected prefix or disable cache.           |
+| Committed-cache corruption                  | Per-cell repair/invalidate on read, plus the startup sweep — not prefix-level. |
 | Dirty implementation corruption before seal | Fail handler; redelivery recomputes dirty ops.         |
 
 Fjall is never a recovery authority.
@@ -1280,9 +1272,10 @@ Implement in thin slices so invariants are testable before full middleware integ
    `ctx.value(name)` through the extension trait `KeyedStateAccess`. Repeated `value(name)` calls on the same
    context return handles that share a `TransactionValueStore` so dirty ops accumulate. The middleware owns a
    `CollectionDefRegistry`: registered collections bind a per-collection TTL on every write; unregistered
-   collections fall back to the middleware-wide `default_ttl`. `CommitMode::Direct` literally cannot schedule
-   the recovery timer — that branch calls `direct_apply` and returns; only the WAL branch calls
-   `context.schedule(TimerType::StateRecovery)`. The recovery handler reads each pending entry's partition; an
+   collections fall back to the middleware-wide `default_ttl`. The recovery timer is scheduled only when the
+   resolved per-collection seal list is non-empty; `CommitMode::Direct` collections `direct_apply` and never
+   enter that list, so in Direct mode the list is empty and `context.schedule(TimerType::StateRecovery)` is
+   never reached. The recovery handler reads each pending entry's partition; an
    `Idle` partition is a stale pending row and is removed via `delete_pending`, a `Sealed` partition is
    resolved via the oracle. Non-Value kinds are logged at WARN and skipped (Slice 9+ plugs them in). The
    memory and Cassandra durable Value stores both implement the new read-side `PendingIndexScanner` trait that
@@ -1294,8 +1287,9 @@ Implement in thin slices so invariants are testable before full middleware integ
      `PendingOpSource<ValueKind>` over three named partitions
      (`dirty_ops` keyed by `[scope-collection-prefix][seq be-u64]`,
      `dirty_overlay` keyed by the prefix alone, `dirty_meta` keyed by the
-     prefix and storing `[next_seq u64 LE][op_count u64 LE]` in one
-     16-byte value). Every write batches the three partition updates in
+     prefix and storing `[next_seq u64 LE]` in one 8-byte value — the op
+     count is derived on demand by iterating the ops prefix, not stored).
+     Every write batches the three partition updates in
      a single `fjall::Batch` so a crash mid-write cannot desync ops vs.
      overlay vs. meta.
    - `FjallClient` owns a process-wide `fjall::Keyspace` rooted at
@@ -1410,6 +1404,7 @@ here so future readers don't reconcile them as bugs.
   optimization can batch those checks at seal time.
 - **Deque size ceiling.** V1 assumes deque partitions fit in memory or Fjall-backed iteration on first touch. Larger
   queues should use Map keyed by sequence number until a streaming deque design exists.
-- **Chunked WAL storage.** `apply_sealed` drains the WAL incrementally (see §"WAL-Mode Success" — Apply), so even
-  large WALs commit safely without splitting storage. Chunked WAL *storage* — one logical WAL spread across multiple
-  rows — is still future work; required if a single seal write would exceed the Cassandra cell ceiling.
+- **Chunked WAL storage.** For the Value kind `apply_sealed` is one-shot (see §"WAL-Mode Success" — Apply); a
+  chunked, restartable *apply* is future work for collections with unbounded op counts. Chunked WAL *storage* — one
+  logical WAL spread across multiple rows — is separately future work, required if a single seal write would exceed
+  the Cassandra cell ceiling.

@@ -13,41 +13,48 @@
 //! );
 //! ```
 //!
-//! [`RawEventRef`] is a private bridge that derives scylla's
-//! `SerializeValue` and `DeserializeValue`. The public [`SerializeValue`]
-//! and [`DeserializeValue`] impls on [`EventRef`] route through it so the
-//! Rust-side enum representation stays decoupled from the Cassandra-side
-//! flat representation.
+//! [`RawEventRef`] is the bridge that derives scylla's `SerializeValue` and
+//! `DeserializeValue`. The [`SerializeValue`] impl on [`EventRef`] routes
+//! through it so the Rust-side enum representation stays decoupled from the
+//! Cassandra-side flat representation.
 //!
-//! The deserializer validates that each variant carries the expected
-//! fields and rejects anything else with a [`CorruptUdtError`]. That keeps
-//! "kind == 0 but `msg_dedup_id` is NULL" out of the type system.
+//! Reads deserialize into [`RawEventRef`] (structural only) and validate it
+//! into an [`EventRef`] with [`RawEventRef::try_into_event`] in a fallible
+//! post-step run by the row decoder, **not** inside scylla's
+//! `DeserializeValue`. A semantically-corrupt UDT (e.g. `kind == 7`, or a
+//! Message-kind row with timer fields set) deserializes fine but fails
+//! validation with a typed [`CorruptUdtError`]; routing that through the
+//! decoder keeps the typed error classifiable as `Permanent` (skip the
+//! message) instead of being laundered into scylla's opaque
+//! `DeserializationError`, which classifies `Terminal` (shut the partition
+//! down). That keeps "kind == 0 but `msg_dedup_id` is NULL" out of the type
+//! system without tearing down a consumer over one bad row.
 
-use super::error::{CassandraValueStoreError, CorruptUdtError};
+use super::error::CorruptUdtError;
 use crate::state::{EventRef, TimerEventRef};
 use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
-use scylla::deserialize::value::DeserializeValue;
-use scylla::deserialize::{DeserializationError, FrameSlice, TypeCheckError};
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
 use uuid::Uuid;
 
 /// On-wire representation of the `event_ref` UDT.
 ///
-/// Private bridge between [`EventRef`] and the scylla derive macros.
+/// Bridge between [`EventRef`] and the scylla derive macros. Crate-internal
+/// to the Cassandra Value store so the row decoder can validate it into an
+/// [`EventRef`] after scylla has done the structural deserialization.
 #[derive(Clone, Debug, scylla::DeserializeValue, scylla::SerializeValue)]
-struct RawEventRef {
-    kind: i8,
-    msg_dedup_id: Option<Uuid>,
-    timer_type: Option<TimerType>,
-    time: Option<CompactDateTime>,
-    tag: Option<i32>,
+pub(in crate::state::cassandra) struct RawEventRef {
+    pub(in crate::state::cassandra) kind: i8,
+    pub(in crate::state::cassandra) msg_dedup_id: Option<Uuid>,
+    pub(in crate::state::cassandra) timer_type: Option<TimerType>,
+    pub(in crate::state::cassandra) time: Option<CompactDateTime>,
+    pub(in crate::state::cassandra) tag: Option<i32>,
 }
 
 impl RawEventRef {
-    fn from_event(event: EventRef) -> Self {
+    pub(in crate::state::cassandra) fn from_event(event: EventRef) -> Self {
         match event {
             EventRef::Message { dedup_id } => Self {
                 kind: EventRef::MESSAGE_KIND,
@@ -66,7 +73,7 @@ impl RawEventRef {
         }
     }
 
-    fn try_into_event(self) -> Result<EventRef, CorruptUdtError> {
+    pub(in crate::state::cassandra) fn try_into_event(self) -> Result<EventRef, CorruptUdtError> {
         match self.kind {
             EventRef::MESSAGE_KIND => {
                 if self.timer_type.is_some() || self.time.is_some() || self.tag.is_some() {
@@ -100,21 +107,6 @@ impl SerializeValue for EventRef {
         writer: CellWriter<'b>,
     ) -> Result<WrittenCellProof<'b>, SerializationError> {
         RawEventRef::from_event(*self).serialize(typ, writer)
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for EventRef {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        <RawEventRef as DeserializeValue>::type_check(typ)
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        let raw = RawEventRef::deserialize(typ, v)?;
-        raw.try_into_event()
-            .map_err(|err| DeserializationError::new(CassandraValueStoreError::CorruptUdt(err)))
     }
 }
 
