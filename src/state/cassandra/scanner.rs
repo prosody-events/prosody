@@ -16,23 +16,24 @@ use crate::state::pending::{PendingEntry, PendingIndexScanner};
 use crate::state::{CollectionKindId, StateKey, StateName, StateNameError, StateType};
 use crate::timers::store::SegmentId;
 use async_stream::try_stream;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 use scylla::statement::prepared::PreparedStatement;
-use std::pin::Pin;
 use tokio::task::coop::cooperative;
 use tracing::warn;
 
 impl PendingIndexScanner for CassandraValueStore {
     type Error = ScanPendingError;
-    type Stream = Pin<Box<dyn Stream<Item = Result<PendingEntry, Self::Error>> + Send>>;
 
-    fn scan_pending(&self, state_key: &StateKey) -> Self::Stream {
+    fn scan_pending(
+        &self,
+        state_key: &StateKey,
+    ) -> impl Stream<Item = Result<PendingEntry, Self::Error>> + Send {
         let store = self.store.clone();
         let statement = self.queries.scan_pending.clone();
         let segment_id = state_key.segment_id;
         let key = state_key.key.clone();
 
-        scan_stream(store, statement, segment_id, key.as_ref().to_owned()).boxed()
+        scan_stream(store, statement, segment_id, key.as_ref().to_owned())
     }
 }
 

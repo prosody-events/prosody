@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::num::NonZeroU64;
 use std::option::IntoIter as OptionIntoIter;
-use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -358,7 +357,6 @@ impl PendingIndexStore for MemoryDurableValueStore {
 
 impl PendingIndexScanner for MemoryDurableValueStore {
     type Error = MemoryStateError;
-    type Stream = Pin<Box<dyn Stream<Item = Result<PendingEntry, Self::Error>> + Send>>;
 
     /// Streams the pending Value entries on `(segment, key)` by walking the
     /// in-memory durable map and yielding one entry per collection whose
@@ -367,7 +365,10 @@ impl PendingIndexScanner for MemoryDurableValueStore {
     /// backend has no I/O to incrementalize), which honors the
     /// "Collection scans are streaming" contract by shape even though the
     /// underlying data is fully resident.
-    fn scan_pending(&self, state_key: &StateKey) -> Self::Stream {
+    fn scan_pending(
+        &self,
+        state_key: &StateKey,
+    ) -> impl Stream<Item = Result<PendingEntry, Self::Error>> + Send {
         let snapshot: Vec<PendingEntry> = {
             let inner = self.inner.lock();
             inner
@@ -378,7 +379,7 @@ impl PendingIndexScanner for MemoryDurableValueStore {
                 .collect()
         };
 
-        Box::pin(stream::iter(snapshot.into_iter().map(Ok)))
+        stream::iter(snapshot.into_iter().map(Ok))
     }
 }
 

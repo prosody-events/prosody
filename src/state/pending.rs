@@ -63,11 +63,11 @@ pub trait PendingIndexScanner: Clone + Send + Sync + 'static {
     /// Error type for streamed pending-index scans.
     type Error: ClassifyError + Error + Send + Sync + 'static;
 
-    /// Streamed scan result.
-    type Stream: Stream<Item = Result<PendingEntry, Self::Error>> + Send;
-
     /// Streams the pending-index rows for one `(segment, key)` partition.
-    fn scan_pending(&self, state_key: &StateKey) -> Self::Stream;
+    fn scan_pending(
+        &self,
+        state_key: &StateKey,
+    ) -> impl Stream<Item = Result<PendingEntry, Self::Error>> + Send;
 }
 
 /// One row from the pending index.
