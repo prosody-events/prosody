@@ -1,7 +1,7 @@
 //! Error types and aliases raised by the keyed-state middleware.
 
 use super::context::KeyedStateContext;
-use crate::consumer::event_context::EventContext;
+use crate::consumer::event_context::BoxEventContextError;
 use crate::consumer::middleware::FallibleHandler;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::oracle::CommitOracle;
@@ -22,14 +22,13 @@ impl<T> MiddlewareErrorComponent for T where T: ClassifyError + Error + Send + S
 
 /// Errors raised by the middleware itself.
 #[derive(Debug, Error)]
-pub enum KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr>
+pub enum KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr>
 where
     InnerErr: ClassifyError + Error + Send + 'static,
     DirtyErr: MiddlewareErrorComponent,
     DurableErr: MiddlewareErrorComponent,
     ScannerErr: MiddlewareErrorComponent,
     OracleErr: MiddlewareErrorComponent,
-    TimerErr: MiddlewareErrorComponent,
 {
     /// The wrapped handler returned an error.
     #[error("wrapped handler failed")]
@@ -54,8 +53,12 @@ where
     Factory(#[source] BoxedFactoryError),
 
     /// Scheduling or unscheduling the recovery timer failed.
-    #[error("keyed-state recovery timer failed")]
-    Timer(#[source] TimerErr),
+    ///
+    /// Carries the type-erased context error (`C::Error` is a per-method
+    /// generic the impl-level `Error` cannot name), matching the defer
+    /// middleware's `DeferError::Timer(BoxEventContextError)`.
+    #[error("keyed-state recovery timer failed: {0:#}")]
+    Timer(BoxEventContextError),
 
     /// The keyed-state transaction state machine refused the requested
     /// transition (e.g. sealing in direct mode).
@@ -68,15 +71,14 @@ where
     DateTime(#[from] CompactDateTimeError),
 }
 
-impl<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr> ClassifyError
-    for KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr>
+impl<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr> ClassifyError
+    for KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr>
 where
     InnerErr: ClassifyError + Error + Send + 'static,
     DirtyErr: MiddlewareErrorComponent,
     DurableErr: MiddlewareErrorComponent,
     ScannerErr: MiddlewareErrorComponent,
     OracleErr: MiddlewareErrorComponent,
-    TimerErr: MiddlewareErrorComponent,
 {
     fn classify_error(&self) -> ErrorCategory {
         match self {
@@ -123,77 +125,19 @@ impl ClassifyError for BoxedFactoryError {
     }
 }
 
-pub(super) type MiddlewareError<T, D, Sc, O, S, C> = KeyedStateMiddlewareError<
+pub(super) type MiddlewareError<T, D, Sc, O, S> = KeyedStateMiddlewareError<
     <T as FallibleHandler>::Error,
     <S as ValueStore>::Error,
     <D as DurableWalStore<ValueKind>>::Error,
     <Sc as PendingIndexScanner>::Error,
     <O as CommitOracle>::Error,
-    <C as EventContext>::Error,
->;
-
-pub(super) type BoxedMiddlewareError<T, D, Sc, O, S> = KeyedStateMiddlewareError<
-    <T as FallibleHandler>::Error,
-    <S as ValueStore>::Error,
-    <D as DurableWalStore<ValueKind>>::Error,
-    <Sc as PendingIndexScanner>::Error,
-    <O as CommitOracle>::Error,
-    BoxedContextError,
 >;
 
 /// The `build_context` result: the wrapped context or a fully-typed
 /// middleware error. Named so the handler signature reads cleanly without a
 /// `clippy::type_complexity` allow.
 pub(super) type BuildContextResult<C, T, D, Sc, O, S> =
-    Result<KeyedStateContext<C, D, S>, MiddlewareError<T, D, Sc, O, S, C>>;
-
-/// Boxed context-error type used inside [`KeyedStateMiddlewareError::Timer`].
-///
-/// `FallibleHandler::Error` cannot depend on the wrapping `C` lifetime so
-/// timer failures from the inner context are boxed into a stable error
-/// type.
-#[derive(Debug, Error)]
-#[error("boxed context error")]
-pub struct BoxedContextError {
-    #[source]
-    source: Box<dyn Error + Send + Sync + 'static>,
-    category: ErrorCategory,
-}
-
-impl ClassifyError for BoxedContextError {
-    fn classify_error(&self) -> ErrorCategory {
-        self.category
-    }
-}
-
-pub(super) fn box_context_error<T, D, Sc, O, S, C>(
-    err: MiddlewareError<T, D, Sc, O, S, C>,
-) -> BoxedMiddlewareError<T, D, Sc, O, S>
-where
-    T: FallibleHandler,
-    D: DurableWalStore<ValueKind>,
-    Sc: PendingIndexScanner,
-    O: CommitOracle,
-    S: ValueStore,
-    C: EventContext,
-{
-    match err {
-        KeyedStateMiddlewareError::Inner(e) => KeyedStateMiddlewareError::Inner(e),
-        KeyedStateMiddlewareError::Durable(e) => KeyedStateMiddlewareError::Durable(e),
-        KeyedStateMiddlewareError::Scanner(e) => KeyedStateMiddlewareError::Scanner(e),
-        KeyedStateMiddlewareError::Oracle(e) => KeyedStateMiddlewareError::Oracle(e),
-        KeyedStateMiddlewareError::Factory(e) => KeyedStateMiddlewareError::Factory(e),
-        KeyedStateMiddlewareError::Timer(e) => {
-            let category = e.classify_error();
-            KeyedStateMiddlewareError::Timer(BoxedContextError {
-                source: Box::new(e),
-                category,
-            })
-        }
-        KeyedStateMiddlewareError::Transaction(e) => KeyedStateMiddlewareError::Transaction(e),
-        KeyedStateMiddlewareError::DateTime(e) => KeyedStateMiddlewareError::DateTime(e),
-    }
-}
+    Result<KeyedStateContext<C, D, S>, MiddlewareError<T, D, Sc, O, S>>;
 
 /// Errors raised by the shared state-recovery sweep
 /// `recover_pending_entries`.
@@ -204,12 +148,11 @@ where
 /// computes a fire time, so those variants are absent — the production
 /// caller lifts this into [`KeyedStateMiddlewareError`] via `?`.
 #[derive(Debug, Error)]
-pub(crate) enum RecoveryError<DurableErr, ScannerErr, OracleErr, TimerErr>
+pub(crate) enum RecoveryError<DurableErr, ScannerErr, OracleErr>
 where
     DurableErr: Error + 'static,
     ScannerErr: Error + 'static,
     OracleErr: Error + 'static,
-    TimerErr: Error + 'static,
 {
     /// A durable Value store operation failed.
     #[error("keyed-state durable store failed")]
@@ -223,23 +166,22 @@ where
     #[error("keyed-state commit oracle failed")]
     Oracle(#[source] OracleErr),
 
-    /// Clearing the recovery timer failed.
-    #[error("keyed-state recovery timer failed")]
-    Timer(#[source] TimerErr),
+    /// Clearing the recovery timer failed (type-erased context error).
+    #[error("keyed-state recovery timer failed: {0:#}")]
+    Timer(BoxEventContextError),
 }
 
-impl<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr>
-    From<RecoveryError<DurableErr, ScannerErr, OracleErr, TimerErr>>
-    for KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr, TimerErr>
+impl<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr>
+    From<RecoveryError<DurableErr, ScannerErr, OracleErr>>
+    for KeyedStateMiddlewareError<InnerErr, DirtyErr, DurableErr, ScannerErr, OracleErr>
 where
     InnerErr: ClassifyError + Error + Send + 'static,
     DirtyErr: MiddlewareErrorComponent,
     DurableErr: MiddlewareErrorComponent,
     ScannerErr: MiddlewareErrorComponent,
     OracleErr: MiddlewareErrorComponent,
-    TimerErr: MiddlewareErrorComponent,
 {
-    fn from(err: RecoveryError<DurableErr, ScannerErr, OracleErr, TimerErr>) -> Self {
+    fn from(err: RecoveryError<DurableErr, ScannerErr, OracleErr>) -> Self {
         match err {
             RecoveryError::Durable(e) => Self::Durable(e),
             RecoveryError::Scanner(e) => Self::Scanner(e),

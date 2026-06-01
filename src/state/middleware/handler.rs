@@ -2,8 +2,8 @@
 
 use super::context::{DirtyValueBundle, DurableValueBundle, KeyedStateContext};
 use super::error::{
-    BoxedFactoryError, BoxedMiddlewareError, BuildContextResult, KeyedStateMiddlewareError,
-    MiddlewareError, RecoveryError, box_context_error,
+    BoxedFactoryError, BuildContextResult, KeyedStateMiddlewareError, MiddlewareError,
+    RecoveryError,
 };
 use super::registry::{CollectionDef, CollectionDefRegistry};
 use crate::Key;
@@ -353,7 +353,7 @@ where
         context: C,
     ) -> Result<
         (Vec<CollectionRef<ValueKind>>, Option<EventRef>),
-        MiddlewareError<T, D, Sc, O, P::Store, C>,
+        MiddlewareError<T, D, Sc, O, P::Store>,
     >
     where
         C: EventContext + Clone + Send + Sync + 'static,
@@ -373,7 +373,7 @@ where
             context
                 .schedule(fire, TimerType::StateRecovery)
                 .await
-                .map_err(KeyedStateMiddlewareError::Timer)?;
+                .map_err(|e| KeyedStateMiddlewareError::Timer(Box::new(e)))?;
             Ok((sealed, Some(event)))
         }
     }
@@ -386,14 +386,12 @@ where
         wrapped: KeyedStateContext<C, D, P::Store>,
         context: C,
         inner_output: T::Output,
-    ) -> Result<KeyedStateOutput<T::Output>, BoxedMiddlewareError<T, D, Sc, O, P::Store>>
+    ) -> Result<KeyedStateOutput<T::Output>, MiddlewareError<T, D, Sc, O, P::Store>>
     where
         C: EventContext + Clone + Send + Sync + 'static,
     {
-        let (sealed_collections, sealed_event) = self
-            .resolve_seal_results(wrapped, context)
-            .await
-            .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
+        let (sealed_collections, sealed_event) =
+            self.resolve_seal_results(wrapped, context).await?;
         Ok(KeyedStateOutput::Inner {
             inner: inner_output,
             sealed_event,
@@ -405,7 +403,7 @@ where
         &self,
         context: &C,
         key: Key,
-    ) -> Result<(), MiddlewareError<T, D, Sc, O, P::Store, C>>
+    ) -> Result<(), MiddlewareError<T, D, Sc, O, P::Store>>
     where
         C: EventContext,
     {
@@ -444,7 +442,7 @@ where
     P: DirtyStoreProvider<ValueKind>,
     P::Store: DirtyValueBundle + fmt::Debug + Send + Sync + 'static,
 {
-    type Error = BoxedMiddlewareError<T, D, Sc, O, P::Store>;
+    type Error = MiddlewareError<T, D, Sc, O, P::Store>;
     type Output = KeyedStateOutput<T::Output>;
     type Payload = T::Payload;
 
@@ -460,9 +458,7 @@ where
         let dedup_id = self.derive_dedup_id_for_message(&message);
         let event = EventRef::Message { dedup_id };
         let key = message.key().clone();
-        let wrapped = self
-            .build_context(context.clone(), key, event)
-            .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
+        let wrapped = self.build_context(context.clone(), key, event)?;
 
         let inner_result = self
             .inner
@@ -494,8 +490,7 @@ where
             // the [`TimerDeferOutput::NoInner`] precedent in the timer
             // defer middleware).
             self.handle_state_recovery(&context, trigger.key.clone())
-                .await
-                .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
+                .await?;
             return Ok(KeyedStateOutput::Recovery);
         }
 
@@ -505,9 +500,7 @@ where
             trigger.tag,
         ));
         let key = trigger.key.clone();
-        let wrapped = self
-            .build_context(context.clone(), key, event)
-            .map_err(box_context_error::<T, D, Sc, O, P::Store, C>)?;
+        let wrapped = self.build_context(context.clone(), key, event)?;
 
         let inner_result = self
             .inner
@@ -727,10 +720,7 @@ pub(crate) async fn recover_pending_entries<C, D, Sc, O>(
     oracle: &O,
     registry: &CollectionDefRegistry,
     state_key: StateKey,
-) -> Result<
-    (),
-    RecoveryError<<D as DurableWalStore<ValueKind>>::Error, Sc::Error, O::Error, C::Error>,
->
+) -> Result<(), RecoveryError<<D as DurableWalStore<ValueKind>>::Error, Sc::Error, O::Error>>
 where
     C: EventContext,
     D: DurableWalStore<ValueKind>
@@ -788,6 +778,6 @@ where
     context
         .clear_scheduled(TimerType::StateRecovery)
         .await
-        .map_err(RecoveryError::Timer)?;
+        .map_err(|e| RecoveryError::Timer(Box::new(e)))?;
     Ok(())
 }

@@ -68,9 +68,7 @@ pub use context::{
     DirtyValueBundle, DurableValueBundle, KeyedStateAccess, KeyedStateAccessError,
     KeyedStateContext, ValueAccessor, ValueHandle,
 };
-pub use error::{
-    BoxedContextError, BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareErrorComponent,
-};
+pub use error::{BoxedFactoryError, KeyedStateMiddlewareError, MiddlewareErrorComponent};
 pub use handler::{
     KeyedStateHandler, KeyedStateMiddleware, KeyedStateMiddlewareBuildError,
     KeyedStateMiddlewareBuilder, KeyedStateOutput, KeyedStateProvider,
