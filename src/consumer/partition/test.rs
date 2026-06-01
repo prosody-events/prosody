@@ -277,22 +277,17 @@ async fn test_partition_manager_is_stalled() {
         "Message send should succeed"
     );
 
-    // Wait longer than the stall threshold to detect stall
-    sleep(stall_threshold * 2).await;
-
-    assert!(
-        partition_manager.is_stalled(),
-        "PartitionManager should report as stalled"
-    );
+    wait_for_partition_stalled(&partition_manager, true, Duration::from_secs(2))
+        .await
+        .expect("PartitionManager should report as stalled");
 
     wait_for_processed_offsets(&handler, 1, Duration::from_secs(3))
         .await
         .expect("Message should be processed");
 
-    assert!(
-        !partition_manager.is_stalled(),
-        "PartitionManager should no longer report as stalled"
-    );
+    wait_for_partition_stalled(&partition_manager, false, Duration::from_secs(2))
+        .await
+        .expect("PartitionManager should no longer report as stalled");
 
     partition_manager.shutdown().await;
 }
@@ -386,6 +381,37 @@ where
             () = notified => {},
             () = sleep_until(deadline) => {
                 return Err(format!("Timeout waiting for {expected_count} messages"));
+            }
+        }
+    }
+}
+
+/// Waits for partition stall state to match `expected` or times out.
+async fn wait_for_partition_stalled<P>(
+    partition_manager: &PartitionManager<P>,
+    expected: bool,
+    timeout: Duration,
+) -> Result<(), String>
+where
+    P: Send + 'static,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let actual = partition_manager.is_stalled();
+        if actual == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Timeout waiting for partition stalled state {expected}; last state was {actual}"
+            ));
+        }
+        tokio::select! {
+            () = sleep(Duration::from_millis(10)) => {},
+            () = sleep_until(deadline) => {
+                return Err(format!(
+                    "Timeout waiting for partition stalled state {expected}; last state was {actual}"
+                ));
             }
         }
     }
