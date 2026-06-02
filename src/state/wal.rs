@@ -36,9 +36,9 @@ impl<T> NonEmptyOps<T> {
     ///
     /// Returns [`EmptyOperationsError`] when `ops` is empty.
     pub fn try_from_vec(ops: Vec<T>) -> Result<Self, EmptyOperationsError> {
-        let mut iter = ops.into_iter();
-        let first = iter.next().ok_or(EmptyOperationsError)?;
-        Ok(Self::new(first, iter.collect()))
+        let mut items = ops.into_iter();
+        let first = items.next().ok_or(EmptyOperationsError)?;
+        Ok(Self::new(first, items.collect()))
     }
 
     /// Returns ordered operations.

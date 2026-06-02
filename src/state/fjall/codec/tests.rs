@@ -32,13 +32,9 @@ fn absent_round_trip() -> Result<()> {
 
 #[test]
 fn present_round_trip() -> Result<()> {
-    use color_eyre::eyre::eyre;
     let payload = inline(7);
     let bytes = encode_present_cell(&payload)?;
-    let Read::Present(decoded) = decode_cell(Some(bytes.as_ref()))? else {
-        return Err(eyre!("expected Present"));
-    };
-    assert_eq!(decoded, payload);
+    assert_eq!(decode_cell(Some(bytes.as_ref()))?, Read::Present(payload));
     Ok(())
 }
 

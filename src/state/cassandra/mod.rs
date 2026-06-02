@@ -30,16 +30,17 @@
 //! read-modify-write inside `apply_sealed` is safe because of that
 //! invariant; this store never needs LWTs or distributed locks.
 //!
-//! # Slice 4 scope
+//! # Apply shape
 //!
 //! Value's fold is last-writer-wins, so a one-shot `UPDATE` is the
-//! correct shape for apply. Map/Deque chunking and the recovery scanner
-//! land in later slices.
+//! correct shape for apply. Chunked collection kinds (Map/Deque) and their
+//! recovery scanner are future work.
 
 mod decode;
 mod error;
 mod queries;
 mod scanner;
+mod serialize;
 mod udt;
 
 #[cfg(test)]
@@ -61,8 +62,8 @@ use crate::state::value::{
     fold_value_ops,
 };
 use crate::state::{
-    CollectionId, CollectionKind, CollectionRef, DurableState, EventRef, Read, SealedCollection,
-    StoreOutcome, WalEnvelope,
+    CollectionId, CollectionKind, CollectionKindId, CollectionRef, DurableState, EventRef, Read,
+    SealedCollection, SealedWal, StateType, StoreOutcome, WalEnvelope,
 };
 use crate::timers::duration::CompactDuration;
 use crate::timers::store::SegmentId;
@@ -169,8 +170,8 @@ impl CassandraValueStore {
         ops_bytes: &[u8],
     ) -> Result<(), CassandraValueStoreError> {
         let (segment_id, key, state_type, name) = primary_components(collection.id());
-        let payload_encoding = VALUE_PAYLOAD_ENCODING.as_i16();
-        let wal_format = VALUE_WAL_FORMAT.as_i16();
+        let payload_encoding = VALUE_PAYLOAD_ENCODING;
+        let wal_format = VALUE_WAL_FORMAT;
         match collection.ttl() {
             Some(ttl) => {
                 let ttl = ttl_to_i32(ttl);
@@ -327,6 +328,33 @@ impl CassandraValueStore {
             DurableState::Idle { applied } | DurableState::Sealed { applied, .. } => applied,
         })
     }
+
+    /// Reads the durable state and resolves it against `expected_event`,
+    /// the shared prefix of [`apply_sealed`](Self::apply_sealed) and
+    /// [`rollback_sealed`](Self::rollback_sealed):
+    ///
+    /// - `Ok(None)` — the partition is `Idle` (no WAL); the caller returns
+    ///   [`StoreOutcome::NoOp`].
+    /// - `Ok(Some((applied, wal)))` — a WAL is sealed and its event matches.
+    /// - `Err(EventMismatch)` — a WAL is sealed for a different event.
+    async fn read_sealed_matching(
+        &self,
+        id: &CollectionId<ValueKind>,
+        expected_event: EventRef,
+    ) -> Result<Option<(ValueApplied, SealedWal<ValueKind>)>, CassandraValueStoreError> {
+        match self.read_durable_state(id).await? {
+            DurableState::Idle { .. } => Ok(None),
+            DurableState::Sealed { applied, wal } => {
+                if wal.event() != expected_event {
+                    return Err(CassandraValueStoreError::EventMismatch {
+                        expected: expected_event,
+                        actual: wal.event(),
+                    });
+                }
+                Ok(Some((applied, wal)))
+            }
+        }
+    }
 }
 
 impl ValueStore for CassandraValueStore {
@@ -405,23 +433,18 @@ impl DurableWalStore<ValueKind> for CassandraValueStore {
         collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
-        match self.read_durable_state(collection.id()).await? {
-            DurableState::Idle { .. } => Ok(StoreOutcome::NoOp),
-            DurableState::Sealed { applied, wal } => {
-                if wal.event() != expected_event {
-                    return Err(CassandraValueStoreError::EventMismatch {
-                        expected: expected_event,
-                        actual: wal.event(),
-                    });
-                }
-                let envelope = decode_wal::<ValueKind>(wal.wal())?;
-                let folded = fold_value_ops(applied, envelope.ops().iter());
+        let Some((applied, wal)) = self
+            .read_sealed_matching(collection.id(), expected_event)
+            .await?
+        else {
+            return Ok(StoreOutcome::NoOp);
+        };
+        let envelope = decode_wal::<ValueKind>(wal.wal())?;
+        let folded = fold_value_ops(applied, envelope.ops().iter());
 
-                self.apply_wal_atomic(collection, &folded).await?;
-                self.delete_pending::<ValueKind>(collection.id()).await?;
-                Ok(StoreOutcome::Applied)
-            }
-        }
+        self.apply_wal_atomic(collection, &folded).await?;
+        self.delete_pending::<ValueKind>(collection.id()).await?;
+        Ok(StoreOutcome::Applied)
     }
 
     /// Rolls back a sealed WAL when it matches `expected_event`. Clears
@@ -433,21 +456,16 @@ impl DurableWalStore<ValueKind> for CassandraValueStore {
         collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
-        match self.read_durable_state(collection.id()).await? {
-            DurableState::Idle { .. } => Ok(StoreOutcome::NoOp),
-            DurableState::Sealed { applied, wal } => {
-                if wal.event() != expected_event {
-                    return Err(CassandraValueStoreError::EventMismatch {
-                        expected: expected_event,
-                        actual: wal.event(),
-                    });
-                }
-                self.clear_wal_columns(collection.id(), applied.is_some())
-                    .await?;
-                self.delete_pending::<ValueKind>(collection.id()).await?;
-                Ok(StoreOutcome::Applied)
-            }
-        }
+        let Some((applied, _)) = self
+            .read_sealed_matching(collection.id(), expected_event)
+            .await?
+        else {
+            return Ok(StoreOutcome::NoOp);
+        };
+        self.clear_wal_columns(collection.id(), applied.is_some())
+            .await?;
+        self.delete_pending::<ValueKind>(collection.id()).await?;
+        Ok(StoreOutcome::Applied)
     }
 }
 
@@ -483,32 +501,16 @@ impl PendingIndexStore for CassandraValueStore {
     where
         K: CollectionKind,
     {
-        let segment_id = id.state_key().segment_id;
-        let key = id.state_key().key.as_ref();
-        let state_type = id.state_type().as_i8();
-        let kind = K::ID.as_i8();
-        let name = id.name().as_str();
-        self.execute_unpaged(
-            &self.queries.insert_pending,
-            (segment_id, key, state_type, kind, name),
-        )
-        .await
+        self.execute_unpaged(&self.queries.insert_pending, pending_components(id))
+            .await
     }
 
     async fn delete_pending<'a, K>(&'a self, id: &'a CollectionId<K>) -> Result<(), Self::Error>
     where
         K: CollectionKind,
     {
-        let segment_id = id.state_key().segment_id;
-        let key = id.state_key().key.as_ref();
-        let state_type = id.state_type().as_i8();
-        let kind = K::ID.as_i8();
-        let name = id.name().as_str();
-        self.execute_unpaged(
-            &self.queries.delete_pending,
-            (segment_id, key, state_type, kind, name),
-        )
-        .await
+        self.execute_unpaged(&self.queries.delete_pending, pending_components(id))
+            .await
     }
 }
 
@@ -520,17 +522,17 @@ impl PendingIndexStore for CassandraValueStore {
 /// which differ only in the query they bind these values into.
 fn encode_applied_payload(
     applied: &ValueApplied,
-) -> Result<(Option<Bytes>, Option<i16>), CassandraValueStoreError> {
+) -> Result<(Option<Bytes>, Option<PayloadEncoding>), CassandraValueStoreError> {
     Ok(match applied {
         Some(payload) => (
             Some(encode_payload(payload, VALUE_PAYLOAD_ENCODING)?),
-            Some(VALUE_PAYLOAD_ENCODING.as_i16()),
+            Some(VALUE_PAYLOAD_ENCODING),
         ),
         None => (None, None),
     })
 }
 
-fn primary_components<K>(id: &CollectionId<K>) -> (&SegmentId, &str, i8, &str)
+fn primary_components<K>(id: &CollectionId<K>) -> (&SegmentId, &str, StateType, &str)
 where
     K: CollectionKind,
 {
@@ -539,13 +541,26 @@ where
     (segment_id, key, state_type, name)
 }
 
-fn primary_read_components<K>(id: &CollectionId<K>) -> (&SegmentId, &str, i8)
+/// Primary-key components for the `keyed_state_pending` table: the value
+/// primary key minus `name`'s position, plus the collection `kind`
+/// discriminator. Shared by `insert_pending` and `delete_pending`.
+fn pending_components<K>(
+    id: &CollectionId<K>,
+) -> (&SegmentId, &str, StateType, CollectionKindId, &str)
+where
+    K: CollectionKind,
+{
+    let (segment_id, key, state_type) = primary_read_components(id);
+    (segment_id, key, state_type, K::ID, id.name().as_str())
+}
+
+fn primary_read_components<K>(id: &CollectionId<K>) -> (&SegmentId, &str, StateType)
 where
     K: CollectionKind,
 {
     let segment_id = &id.state_key().segment_id;
     let key = id.state_key().key.as_ref();
-    let state_type = id.state_type().as_i8();
+    let state_type = id.state_type();
     (segment_id, key, state_type)
 }
 

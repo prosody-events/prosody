@@ -54,11 +54,7 @@ pub struct CollectionDefRegistry {
 
 impl Default for CollectionDefRegistry {
     fn default() -> Self {
-        Self {
-            defs: HashMap::new(),
-            default_ttl: None,
-            default_commit_mode: CommitMode::Wal,
-        }
+        Self::new(None)
     }
 }
 

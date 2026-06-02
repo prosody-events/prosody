@@ -188,55 +188,51 @@ async fn finished_transaction_rejects_further_transitions() -> Result<()> {
 
 #[test]
 fn prop_value_transaction_trace_matches_model() {
-    fn property(trace: Trace) -> bool {
+    fn property(trace: Trace) -> Result<bool> {
         executor::block_on(value_test_suite::run_trace(
             MemoryDurableValueStore::for_tests(),
             MemoryDirtyValueStore::new,
             trace,
         ))
-        .unwrap_or(false)
     }
 
-    QuickCheck::new().quickcheck(property as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
 }
 
 #[test]
 fn prop_durable_resolution_is_idempotent() {
-    fn property(trace: Trace) -> bool {
+    fn property(trace: Trace) -> Result<bool> {
         executor::block_on(value_test_suite::run_idempotence_trace(
             MemoryDurableValueStore::for_tests(),
             MemoryDirtyValueStore::new,
             trace,
         ))
-        .unwrap_or(false)
     }
 
-    QuickCheck::new().quickcheck(property as fn(Trace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(Trace) -> Result<bool>);
 }
 
 #[test]
 fn prop_direct_mode_never_creates_wal() {
-    fn property(trace: DirectTrace) -> bool {
+    fn property(trace: DirectTrace) -> Result<bool> {
         executor::block_on(value_test_suite::run_direct_trace(
             MemoryDurableValueStore::for_tests(),
             MemoryDirtyValueStore::new,
             trace,
         ))
-        .unwrap_or(false)
     }
 
-    QuickCheck::new().quickcheck(property as fn(DirectTrace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(DirectTrace) -> Result<bool>);
 }
 
 #[test]
 fn prop_memory_dirty_satisfies_invariants() {
-    fn property(trace: DirtyTrace) -> bool {
+    fn property(trace: DirtyTrace) -> Result<bool> {
         executor::block_on(dirty_value_test_suite::run_dirty_trace(
             MemoryDirtyValueStore::new(),
             trace,
         ))
-        .unwrap_or(false)
     }
 
-    QuickCheck::new().quickcheck(property as fn(DirtyTrace) -> bool);
+    QuickCheck::new().quickcheck(property as fn(DirtyTrace) -> Result<bool>);
 }

@@ -53,30 +53,27 @@ where
     S: DirtyStore,
 {
     let collection = collection_id()?;
-    let mut model = DirtyModel::default();
+    let mut overlay = Read::Unknown;
 
     for op in trace.ops {
         match op {
             DirtyTraceOp::Set(byte) => {
                 let payload = inline(byte);
                 store.set(&collection, payload.clone()).await?;
-                model.overlay = Visible::Present(payload);
-                model.has_pending = true;
+                overlay = Read::Present(payload);
             }
             DirtyTraceOp::Clear => {
                 store.clear(&collection).await?;
-                model.overlay = Visible::Absent;
-                model.has_pending = true;
+                overlay = Read::Absent;
             }
             DirtyTraceOp::Get | DirtyTraceOp::PendingOps => { /* assertions below */ }
             DirtyTraceOp::ClearPendingOps => {
                 store.clear_pending_ops(&collection)?;
-                model.overlay = Visible::Unknown;
-                model.has_pending = false;
+                overlay = Read::Unknown;
             }
         }
 
-        if !check_invariants(&store, &collection, &model).await? {
+        if !check_invariants(&store, &collection, &overlay).await? {
             return Ok(false);
         }
     }
@@ -87,39 +84,31 @@ where
 async fn check_invariants<S>(
     store: &S,
     collection: &CollectionId<ValueKind>,
-    model: &DirtyModel,
+    overlay: &Read<StoredPayload>,
 ) -> Result<bool>
 where
     S: DirtyStore,
 {
     let read = store.get(collection).await?;
-    if !visibility_matches(&read, &model.overlay) {
+    if &read != overlay {
         return Ok(false);
     }
 
+    // Pending ops exist iff the overlay has observed a value (Set or Clear).
     let pending = store.pending_ops(collection)?;
-    if pending.is_some() != model.has_pending {
+    if pending.is_some() == matches!(overlay, Read::Unknown) {
         return Ok(false);
     }
 
     if let Some(p) = pending {
         let folded = fold_value_ops(None, p.ops.collect::<Vec<_>>().iter());
         let folded_read: Read<StoredPayload> = folded.map_or(Read::Absent, Read::Present);
-        let actual = store.get(collection).await?;
-        if folded_read != actual {
+        if folded_read != read {
             return Ok(false);
         }
     }
 
     Ok(true)
-}
-
-fn visibility_matches(read: &Read<StoredPayload>, model: &Visible) -> bool {
-    match (read, model) {
-        (Read::Present(a), Visible::Present(b)) => a == b,
-        (Read::Absent, Visible::Absent) | (Read::Unknown, Visible::Unknown) => true,
-        _ => false,
-    }
 }
 
 fn collection_id() -> Result<CollectionId<ValueKind>> {
@@ -223,18 +212,4 @@ impl Arbitrary for DirtyTraceOp {
             _ => Self::ClearPendingOps,
         }
     }
-}
-
-#[derive(Default)]
-struct DirtyModel {
-    overlay: Visible,
-    has_pending: bool,
-}
-
-#[derive(Default, PartialEq, Eq)]
-enum Visible {
-    #[default]
-    Unknown,
-    Absent,
-    Present(StoredPayload),
 }

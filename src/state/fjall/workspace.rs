@@ -1,7 +1,7 @@
 //! Per-process Fjall client + per-Kafka-partition workspace.
 //!
-//! Slice 9 introduces `FjallClient` and `FjallWorkspace` as the local
-//! workspace described by `docs/keyed-state/design-summary.md`. One
+//! `FjallClient` and `FjallWorkspace` are the local workspace described by
+//! `docs/keyed-state/design-summary.md`. One
 //! `FjallClient` owns a shared `fjall::Keyspace` rooted at the configured
 //! `cache_dir`; per Kafka partition assignment the client mints a
 //! `FjallWorkspace` carrying four named Fjall partitions tagged with an

@@ -28,6 +28,22 @@ fn encoded_payload(byte: u8) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Asserts a decode rejected the row as
+/// [`CassandraValueStoreError::CorruptWal`] with exactly `expected`.
+/// `CorruptReason` (and the `WalColumnMask` it carries) derive `PartialEq`, so
+/// passing a full `PartialWalColumns { mask }` checks the mask too.
+fn assert_corrupt_wal(
+    result: Result<DurableState<ValueKind>, CassandraValueStoreError>,
+    expected: CorruptReason,
+) -> Result<()> {
+    match result {
+        Err(CassandraValueStoreError::CorruptWal { reason }) if reason == expected => Ok(()),
+        other => Err(eyre::eyre!(
+            "expected CorruptWal {expected:?}, got {other:?}"
+        )),
+    }
+}
+
 #[test]
 fn decodes_idle_no_data() -> Result<()> {
     let state = try_decode_row((None, None, None, None, None))?;
@@ -108,101 +124,72 @@ fn decodes_sealed_no_data() -> Result<()> {
 
 #[test]
 fn rejects_data_without_payload_encoding() -> Result<()> {
-    let result = try_decode_row((Some(vec![0_u8]), None, None, None, None));
-    match result {
-        Err(CassandraValueStoreError::CorruptWal {
-            reason: CorruptReason::MissingPayloadEncodingWithData,
-        }) => Ok(()),
-        other => Err(eyre::eyre!(
-            "expected MissingPayloadEncodingWithData, got {other:?}"
-        )),
-    }
+    assert_corrupt_wal(
+        try_decode_row((Some(vec![0_u8]), None, None, None, None)),
+        CorruptReason::MissingPayloadEncodingWithData,
+    )
 }
 
 #[test]
 fn rejects_payload_encoding_without_data() -> Result<()> {
-    let result = try_decode_row((
-        None,
-        Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
-        None,
-        None,
-        None,
-    ));
-    match result {
-        Err(CassandraValueStoreError::CorruptWal {
-            reason: CorruptReason::PayloadEncodingWithoutData,
-        }) => Ok(()),
-        other => Err(eyre::eyre!(
-            "expected PayloadEncodingWithoutData, got {other:?}"
+    assert_corrupt_wal(
+        try_decode_row((
+            None,
+            Some(PayloadEncoding::MsgpackZstdV1.as_i16()),
+            None,
+            None,
+            None,
         )),
-    }
+        CorruptReason::PayloadEncodingWithoutData,
+    )
 }
 
 #[test]
 fn rejects_partial_wal_columns_event_only() -> Result<()> {
-    let result = try_decode_row((None, None, Some(message_event_raw()), None, None));
-    match result {
-        Err(CassandraValueStoreError::CorruptWal {
-            reason: CorruptReason::PartialWalColumns { mask },
-        }) => {
-            assert_eq!(
-                mask,
-                WalColumnMask {
-                    event: true,
-                    ops: false,
-                    format: false
-                }
-            );
-            Ok(())
-        }
-        other => Err(eyre::eyre!("expected PartialWalColumns, got {other:?}")),
-    }
+    assert_corrupt_wal(
+        try_decode_row((None, None, Some(message_event_raw()), None, None)),
+        CorruptReason::PartialWalColumns {
+            mask: WalColumnMask {
+                event: true,
+                ops: false,
+                format: false,
+            },
+        },
+    )
 }
 
 #[test]
 fn rejects_partial_wal_columns_ops_and_format_only() -> Result<()> {
-    let result = try_decode_row((
-        None,
-        None,
-        None,
-        Some(vec![1_u8]),
-        Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
-    ));
-    match result {
-        Err(CassandraValueStoreError::CorruptWal {
-            reason: CorruptReason::PartialWalColumns { mask },
-        }) => {
-            assert_eq!(
-                mask,
-                WalColumnMask {
-                    event: false,
-                    ops: true,
-                    format: true
-                }
-            );
-            Ok(())
-        }
-        other => Err(eyre::eyre!("expected PartialWalColumns, got {other:?}")),
-    }
+    assert_corrupt_wal(
+        try_decode_row((
+            None,
+            None,
+            None,
+            Some(vec![1_u8]),
+            Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
+        )),
+        CorruptReason::PartialWalColumns {
+            mask: WalColumnMask {
+                event: false,
+                ops: true,
+                format: true,
+            },
+        },
+    )
 }
 
 #[test]
 fn rejects_sealed_without_payload_encoding() -> Result<()> {
-    let result = try_decode_row((
-        None,
-        None,
-        Some(message_event_raw()),
-        Some(vec![1_u8]),
-        Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
-    ));
-    match result {
-        Err(CassandraValueStoreError::CorruptWal {
-            reason: CorruptReason::WalWithoutPayloadEncoding,
-        }) => Ok(()),
-        other => Err(eyre::eyre!(
-            "expected WalWithoutPayloadEncoding, got {other:?}"
+    assert_corrupt_wal(
+        try_decode_row((
+            None,
+            None,
+            Some(message_event_raw()),
+            Some(vec![1_u8]),
+            Some(WalFormat::MsgpackStreamZstdV1.as_i16()),
         )),
-    }
+        CorruptReason::WalWithoutPayloadEncoding,
+    )
 }
 
 /// B3: a structurally-valid but semantically-corrupt `event_ref` UDT (here

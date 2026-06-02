@@ -170,7 +170,6 @@ where
 
 type ValueTx<D, S> = Arc<AsyncMutex<TransactionValueStore<D, S>>>;
 
-#[derive(Default)]
 struct ContextInner<D, S> {
     transactions: SyncMutex<HashMap<StateName, ValueTx<D, S>>>,
 }
@@ -269,11 +268,6 @@ where
         handle
     }
 
-    /// Returns the names of every collection touched by this event.
-    fn dirty_collection_names(&self) -> Vec<StateName> {
-        self.ctx.transactions.lock().keys().cloned().collect()
-    }
-
     /// Walks every dirty collection and dispatches based on its
     /// per-collection commit mode. `Wal` collections seal; `Direct`
     /// collections direct-apply. Returns the WAL-sealed list so the
@@ -282,10 +276,15 @@ where
     pub(super) async fn resolve_per_collection(
         &self,
     ) -> Result<Vec<CollectionRef<ValueKind>>, ContextTxError<D, S>> {
-        let names = self.dirty_collection_names();
+        // Snapshot every touched collection under one lock, then drop the
+        // sync guard before awaiting — the per-event map only grows, so
+        // every name already maps to its open transaction.
+        let transactions: Vec<(StateName, ValueTx<D, S>)> = {
+            let txs = self.ctx.transactions.lock();
+            txs.iter().map(|(n, tx)| (n.clone(), tx.clone())).collect()
+        };
         let mut sealed = Vec::new();
-        for name in names {
-            let tx = self.open_transaction(&name);
+        for (name, tx) in transactions {
             let mut guard = tx.lock().await;
             match self.registry.commit_mode_for(&name) {
                 CommitMode::Wal => match guard.seal().await {

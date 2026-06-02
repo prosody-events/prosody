@@ -11,7 +11,7 @@ use tokio::task::JoinError;
 pub enum FjallValueStoreError {
     /// Underlying fjall engine error.
     #[error("fjall engine error: {0}")]
-    Engine(#[source] FjallEngineError),
+    Engine(#[from] FjallEngineError),
 
     /// Cache codec error (payload encode/decode failed).
     #[error(transparent)]
@@ -38,12 +38,6 @@ pub enum FjallValueStoreError {
     /// `[next_seq u64 LE]` layout.
     #[error("corrupt dirty meta row: expected 8 bytes, got {0}")]
     CorruptDirtyMeta(usize),
-}
-
-impl From<FjallEngineError> for FjallValueStoreError {
-    fn from(value: FjallEngineError) -> Self {
-        Self::Engine(value)
-    }
 }
 
 impl ClassifyError for FjallValueStoreError {

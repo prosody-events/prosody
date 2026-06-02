@@ -4,7 +4,7 @@
 //!
 //! 1. **Point reads (Value).** Cheap, well-defined lookups by full collection
 //!    identifier.
-//! 2. **Prefix scans (Map/Deque, later slices).** "All entries for one
+//! 2. **Prefix scans (Map/Deque, future work).** "All entries for one
 //!    collection" must be a contiguous range; range queries within a collection
 //!    must preserve user ordering.
 //!
@@ -14,9 +14,9 @@
 //!   state_type || 0x00 || name)`, serialized **big-endian** for stable
 //!   cross-platform ordering.
 //! - For **Value**, the inner key is empty.
-//! - For **Map** (future slice), the inner key is the user's `EncodedMapKey`
+//! - For **Map** (future work), the inner key is the user's `EncodedMapKey`
 //!   (order-preserving by trait contract).
-//! - For **Deque** (future slice), the inner key is the index as 8 big-endian
+//! - For **Deque** (future work), the inner key is the index as 8 big-endian
 //!   bytes.
 //!
 //! Collision probability for `xxh3_128` is ≈ 2⁻⁶⁴ (birthday bound) — well
@@ -52,7 +52,7 @@ pub(super) const DIRTY_OP_ENCODING: PayloadEncoding = PayloadEncoding::MsgpackV1
 ///
 /// See module docs for the field layout and rationale.
 #[must_use]
-pub fn collection_prefix<K>(id: &CollectionId<K>) -> [u8; 16]
+pub(super) fn collection_prefix<K>(id: &CollectionId<K>) -> [u8; 16]
 where
     K: CollectionKind,
 {

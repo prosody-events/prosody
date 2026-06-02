@@ -7,7 +7,7 @@ use super::{CollectionKind, CollectionKindId, NonEmptyOps, WalBlob, WalEnvelope}
 use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::num::NonZeroU64;
 
 const TOPIC_POOL: &[&str] = &[
@@ -16,6 +16,17 @@ const TOPIC_POOL: &[&str] = &[
     "telemetry",
     "shipments.outbound",
 ];
+
+/// A hand-rolled WAL header, serialized to craft inputs the production
+/// encoder would never emit (a zero `op_count`, an unsupported `version`).
+/// `op_count` is a plain `u64` here — not the production `NonZeroU64` — so a
+/// crafted zero survives serialization and is rejected only at decode time.
+#[derive(Serialize)]
+struct CraftedHeader {
+    version: u16,
+    kind: CollectionKindId,
+    op_count: u64,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct SecondaryKind;
@@ -240,13 +251,6 @@ fn prop_wal_truncated_bytes_fail_decode() {
 
 #[test]
 fn wal_empty_stream_rejected_by_msgpack() -> Result<()> {
-    #[derive(Serialize, Deserialize)]
-    struct CraftedHeader {
-        version: u16,
-        kind: CollectionKindId,
-        op_count: u64,
-    }
-
     let header = CraftedHeader {
         version: 1,
         kind: CollectionKindId::Value,
@@ -265,13 +269,6 @@ fn wal_empty_stream_rejected_by_msgpack() -> Result<()> {
 
 #[test]
 fn wal_unsupported_header_version_is_rejected() -> Result<()> {
-    #[derive(Serialize)]
-    struct CraftedHeader {
-        version: u16,
-        kind: CollectionKindId,
-        op_count: u64,
-    }
-
     let header = CraftedHeader {
         version: 2,
         kind: CollectionKindId::Value,

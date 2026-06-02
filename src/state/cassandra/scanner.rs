@@ -31,9 +31,9 @@ impl PendingIndexScanner for CassandraValueStore {
         let store = self.store.clone();
         let statement = self.queries.scan_pending.clone();
         let segment_id = state_key.segment_id;
-        let key = state_key.key.clone();
+        let key = state_key.key.as_ref().to_owned();
 
-        scan_stream(store, statement, segment_id, key.as_ref().to_owned())
+        scan_stream(store, statement, segment_id, key)
     }
 }
 
@@ -48,17 +48,14 @@ fn scan_stream(
             .session()
             .execute_iter(statement, (segment_id, key.as_str()))
             .await
-            .map_err(CassandraStoreError::from)
-            .map_err(ScanPendingError::Database)?
+            .map_err(db_err)?
             .rows_stream::<(i8, i8, String)>()
-            .map_err(CassandraStoreError::from)
-            .map_err(ScanPendingError::Database)?;
+            .map_err(db_err)?;
 
         futures::pin_mut!(rows);
         while let Some((state_type_i8, kind_i8, name)) = cooperative(rows.try_next())
             .await
-            .map_err(CassandraStoreError::from)
-            .map_err(ScanPendingError::Database)?
+            .map_err(db_err)?
         {
             let Some(entry) = decode_row(state_type_i8, kind_i8, name)? else {
                 continue;
@@ -97,6 +94,13 @@ fn decode_row(
 
     let name = StateName::try_new(name)?;
     Ok(Some(PendingEntry::new(state_type, kind, name)))
+}
+
+/// Wraps any scylla driver error as a [`ScanPendingError::Database`], folding
+/// the two-step `CassandraStoreError::from` conversion the scan path repeats
+/// at every `execute_iter` / `rows_stream` / `try_next` boundary.
+fn db_err<E: Into<CassandraStoreError>>(error: E) -> ScanPendingError {
+    ScanPendingError::Database(error.into())
 }
 
 /// Error type for [`CassandraValueStore::scan_pending`].

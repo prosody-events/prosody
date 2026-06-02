@@ -220,8 +220,7 @@ where
 /// threads it through `ValueStore::set` / `clear` and through recovery
 /// writes. `None` is therefore a deliberate value, not a forgotten one.
 /// Reads do not see the TTL; recovery callers re-supply it from the
-/// store-owned default (Slice 7+; per-collection registry overrides land
-/// in Slice 8).
+/// store-owned default. Per-collection registry overrides are future work.
 ///
 /// # Identity invariant
 ///

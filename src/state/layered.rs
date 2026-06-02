@@ -57,6 +57,10 @@ impl<Cache, Backing> LayeredValueStore<Cache, Backing> {
         Self { cache, backing }
     }
 
+    // TODO: audit `cache()`/`backing()` against the public interface once the
+    // composition stabilizes; drop them if no consumer materializes
+    // (re-addable non-breakingly).
+
     /// Returns a reference to the cache store.
     #[must_use]
     pub fn cache(&self) -> &Cache {
@@ -124,8 +128,7 @@ where
             }
         };
         match cache_read {
-            Read::Present(payload) => Ok(Read::Present(payload)),
-            Read::Absent => Ok(Read::Absent),
+            hit @ (Read::Present(_) | Read::Absent) => Ok(hit),
             Read::Unknown => {
                 let backing_read = self.backing.get(collection).await?;
                 let to_patch = match &backing_read {

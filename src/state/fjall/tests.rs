@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use thiserror::Error;
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 use uuid::Uuid;
 
 // ---- shared helpers ---------------------------------------------------------
@@ -283,19 +283,31 @@ async fn cache_failure_after_backing_success_is_invalidated() -> Result<()> {
 // which needs a Tokio runtime in scope.
 
 /// Maps a property-trace outcome to a [`TestResult`], keeping a store/runtime
-/// error (`Err`) distinct from a legitimate model mismatch (`Ok(false)`) so a
+/// error (`Err`) distinct from a falsified property (`Ok(false)`) so a
 /// swallowed backend failure can never masquerade as a falsified property.
-/// Mirrors the Cassandra runners above.
-fn finish_layered_trace<E: fmt::Debug>(result: Result<bool, E>, input_dbg: &str) -> TestResult {
+/// `falsified` is the diagnostic shown when the property does not hold (e.g.
+/// `"model mismatch"`, `"idempotence violated"`).
+fn finish_trace<E: fmt::Debug>(
+    result: Result<bool, E>,
+    falsified: &str,
+    input_dbg: &str,
+) -> TestResult {
     match result {
         Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!("model mismatch.\nFailing input:\n{input_dbg}")),
+        Ok(false) => TestResult::error(format!("{falsified}.\nFailing input:\n{input_dbg}")),
         Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
     }
 }
 
-fn prop_layered_memory_wal(trace: Trace) -> TestResult {
-    let input_dbg = format!("{trace:#?}");
+/// Builds a fresh fjall cache, runs `run` against it, and maps the outcome to a
+/// [`TestResult`] — folding the `make_cache` setup, the `"cache setup failed"`
+/// early-return, and the [`finish_trace`] mapping shared by every broker-free
+/// runner. The `TempDir` stays alive until `run` returns.
+fn run_layered_property<E: fmt::Debug>(
+    falsified: &str,
+    input_dbg: &str,
+    run: impl FnOnce(FjallValueStore) -> Result<bool, E>,
+) -> TestResult {
     let (_dir, cache) = match make_cache() {
         Ok(c) => c,
         Err(e) => {
@@ -304,54 +316,43 @@ fn prop_layered_memory_wal(trace: Trace) -> TestResult {
             ));
         }
     };
-    let backing = MemoryDurableValueStore::for_tests();
-    let layered = LayeredValueStore::new(cache, backing);
-    let result = TEST_RUNTIME.block_on(value_test_suite::run_trace(
-        layered,
-        MemoryDirtyValueStore::new,
-        trace,
-    ));
-    finish_layered_trace(result, &input_dbg)
+    finish_trace(run(cache), falsified, input_dbg)
+}
+
+fn prop_layered_memory_wal(trace: Trace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
+    run_layered_property("model mismatch", &input_dbg, |cache| {
+        let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
+        TEST_RUNTIME.block_on(value_test_suite::run_trace(
+            layered,
+            MemoryDirtyValueStore::new,
+            trace,
+        ))
+    })
 }
 
 fn prop_layered_memory_idempotence(trace: Trace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
-    let (_dir, cache) = match make_cache() {
-        Ok(c) => c,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-    let backing = MemoryDurableValueStore::for_tests();
-    let layered = LayeredValueStore::new(cache, backing);
-    let result = TEST_RUNTIME.block_on(value_test_suite::run_idempotence_trace(
-        layered,
-        MemoryDirtyValueStore::new,
-        trace,
-    ));
-    finish_layered_trace(result, &input_dbg)
+    run_layered_property("model mismatch", &input_dbg, |cache| {
+        let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
+        TEST_RUNTIME.block_on(value_test_suite::run_idempotence_trace(
+            layered,
+            MemoryDirtyValueStore::new,
+            trace,
+        ))
+    })
 }
 
 fn prop_layered_memory_direct(trace: DirectTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
-    let (_dir, cache) = match make_cache() {
-        Ok(c) => c,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-    let backing = MemoryDurableValueStore::for_tests();
-    let layered = LayeredValueStore::new(cache, backing);
-    let result = TEST_RUNTIME.block_on(value_test_suite::run_direct_trace(
-        layered,
-        MemoryDirtyValueStore::new,
-        trace,
-    ));
-    finish_layered_trace(result, &input_dbg)
+    run_layered_property("model mismatch", &input_dbg, |cache| {
+        let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
+        TEST_RUNTIME.block_on(value_test_suite::run_direct_trace(
+            layered,
+            MemoryDirtyValueStore::new,
+            trace,
+        ))
+    })
 }
 
 #[test]
@@ -373,23 +374,17 @@ fn prop_layered_fjall_memory_direct_trace() {
 
 fn prop_layered_fjall_recovering_memory(trace: Trace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
-    let (_dir, cache) = match make_cache() {
-        Ok(c) => c,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-    let inner = MemoryDurableValueStore::for_tests();
-    let recovering = RecoveringValueStore::with_default_ttl(inner, AlwaysCommittedOracle, TEST_TTL);
-    let layered = LayeredValueStore::new(cache, recovering);
-    let result = TEST_RUNTIME.block_on(value_test_suite::run_trace(
-        layered,
-        MemoryDirtyValueStore::new,
-        trace,
-    ));
-    finish_layered_trace(result, &input_dbg)
+    run_layered_property("model mismatch", &input_dbg, |cache| {
+        let inner = MemoryDurableValueStore::for_tests();
+        let recovering =
+            RecoveringValueStore::with_default_ttl(inner, AlwaysCommittedOracle, TEST_TTL);
+        let layered = LayeredValueStore::new(cache, recovering);
+        TEST_RUNTIME.block_on(value_test_suite::run_trace(
+            layered,
+            MemoryDirtyValueStore::new,
+            trace,
+        ))
+    })
 }
 
 #[test]
@@ -440,42 +435,33 @@ impl Arbitrary for F6Trace {
 /// directly rather than only against the analytical model.
 fn layered_parity_property(trace: F6Trace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
-    let (_dir, cache) = match make_cache() {
-        Ok(c) => c,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cache setup failed: {e:?}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-    let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
-    let reference = MemoryDurableValueStore::for_tests();
     let F6Trace(ops) = trace;
-
-    let result: Result<bool> = TEST_RUNTIME.block_on(async {
-        let id = collection_id("parity")?;
-        for op in &ops {
-            match op {
-                CacheOp::Set(byte) => {
-                    layered.set(&id, inline(*byte)).await?;
-                    reference.set(&id, inline(*byte)).await?;
-                }
-                CacheOp::Clear => {
-                    layered.clear(&id).await?;
-                    reference.clear(&id).await?;
-                }
-                CacheOp::Get => {
-                    if layered.get(&id).await? != reference.get(&id).await? {
-                        return Ok(false);
+    run_layered_property("model mismatch", &input_dbg, |cache| -> Result<bool> {
+        let layered = LayeredValueStore::new(cache, MemoryDurableValueStore::for_tests());
+        let reference = MemoryDurableValueStore::for_tests();
+        TEST_RUNTIME.block_on(async {
+            let id = collection_id("parity")?;
+            for op in &ops {
+                match op {
+                    CacheOp::Set(byte) => {
+                        layered.set(&id, inline(*byte)).await?;
+                        reference.set(&id, inline(*byte)).await?;
+                    }
+                    CacheOp::Clear => {
+                        layered.clear(&id).await?;
+                        reference.clear(&id).await?;
+                    }
+                    CacheOp::Get => {
+                        if layered.get(&id).await? != reference.get(&id).await? {
+                            return Ok(false);
+                        }
                     }
                 }
             }
-        }
-        // Final read parity regardless of the trailing op.
-        Ok(layered.get(&id).await? == reference.get(&id).await?)
-    });
-
-    finish_layered_trace(result, &input_dbg)
+            // Final read parity regardless of the trailing op.
+            Ok(layered.get(&id).await? == reference.get(&id).await?)
+        })
+    })
 }
 
 #[test]
@@ -511,10 +497,19 @@ async fn setup_cassandra_value_store() -> Result<CassandraValueStore> {
     Ok(CassandraValueStore::new(cassandra, queries, TEST_TTL))
 }
 
-fn cassandra_wal_property(trace: Trace) -> TestResult {
-    let runtime = &*TEST_RUNTIME;
-    let span = tracing::Span::current();
-    let input_dbg = format!("{trace:#?}");
+/// Builds a fresh fjall cache plus a live `CassandraValueStore` backing, hands
+/// both to `run` (along with the current span for instrumenting the trace), and
+/// maps the outcome to a [`TestResult`]. Folds the tempdir,
+/// cache-open, and cassandra-setup early-returns shared by every Cassandra
+/// runner; the `TempDir` is kept alive until `run` returns and dropped
+/// afterwards. `falsified` is the diagnostic shown when the property is
+/// violated.
+fn run_cassandra_property<E: fmt::Debug>(
+    falsified: &str,
+    input_dbg: &str,
+    run: impl FnOnce(Span, FjallValueStore, CassandraValueStore) -> Result<bool, E>,
+) -> TestResult {
+    let span = Span::current();
     let dir = match tempfile::tempdir() {
         Ok(d) => d,
         Err(e) => {
@@ -529,8 +524,7 @@ fn cassandra_wal_property(trace: Trace) -> TestResult {
             ));
         }
     };
-
-    let backing = match runtime
+    let backing = match TEST_RUNTIME
         .block_on(async { setup_cassandra_value_store().await }.instrument(span.clone()))
     {
         Ok(s) => s,
@@ -540,113 +534,60 @@ fn cassandra_wal_property(trace: Trace) -> TestResult {
             ));
         }
     };
-
-    let layered = LayeredValueStore::new(cache, backing);
-    let result = runtime.block_on(
-        async { value_test_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
-            .instrument(span),
-    );
+    let result = run(span, cache, backing);
     drop(dir);
-    match result {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!("model mismatch.\nFailing input:\n{input_dbg}")),
-        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
-    }
+    finish_trace(result, falsified, input_dbg)
+}
+
+fn cassandra_wal_property(trace: Trace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
+    run_cassandra_property("model mismatch", &input_dbg, |span, cache, backing| {
+        let layered = LayeredValueStore::new(cache, backing);
+        TEST_RUNTIME.block_on(
+            async { value_test_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
+                .instrument(span),
+        )
+    })
 }
 
 fn cassandra_idempotence_property(trace: Trace) -> TestResult {
-    let runtime = &*TEST_RUNTIME;
-    let span = tracing::Span::current();
     let input_dbg = format!("{trace:#?}");
-    let dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            return TestResult::error(format!("tempdir failed: {e}\nFailing input:\n{input_dbg}"));
-        }
-    };
-    let cache = match FjallValueStore::for_test(&dir) {
-        Ok(c) => c,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cache open failed: {e}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-
-    let backing = match runtime
-        .block_on(async { setup_cassandra_value_store().await }.instrument(span.clone()))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cassandra setup failed: {e:?}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-
-    let layered = LayeredValueStore::new(cache, backing);
-    let result = runtime.block_on(
-        async {
-            value_test_suite::run_idempotence_trace(layered, MemoryDirtyValueStore::new, trace)
-                .await
-        }
-        .instrument(span),
-    );
-    drop(dir);
-    match result {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!(
-            "idempotence violated.\nFailing input:\n{input_dbg}"
-        )),
-        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
-    }
+    run_cassandra_property(
+        "idempotence violated",
+        &input_dbg,
+        |span, cache, backing| {
+            let layered = LayeredValueStore::new(cache, backing);
+            TEST_RUNTIME.block_on(
+                async {
+                    value_test_suite::run_idempotence_trace(
+                        layered,
+                        MemoryDirtyValueStore::new,
+                        trace,
+                    )
+                    .await
+                }
+                .instrument(span),
+            )
+        },
+    )
 }
 
 fn cassandra_direct_property(trace: DirectTrace) -> TestResult {
-    let runtime = &*TEST_RUNTIME;
-    let span = tracing::Span::current();
     let input_dbg = format!("{trace:#?}");
-    let dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            return TestResult::error(format!("tempdir failed: {e}\nFailing input:\n{input_dbg}"));
-        }
-    };
-    let cache = match FjallValueStore::for_test(&dir) {
-        Ok(c) => c,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cache open failed: {e}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-
-    let backing = match runtime
-        .block_on(async { setup_cassandra_value_store().await }.instrument(span.clone()))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cassandra setup failed: {e:?}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-
-    let layered = LayeredValueStore::new(cache, backing);
-    let result = runtime.block_on(
-        async {
-            value_test_suite::run_direct_trace(layered, MemoryDirtyValueStore::new, trace).await
-        }
-        .instrument(span),
-    );
-    drop(dir);
-    match result {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!(
-            "partition sealed under direct mode.\nFailing input:\n{input_dbg}"
-        )),
-        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
-    }
+    run_cassandra_property(
+        "partition sealed under direct mode",
+        &input_dbg,
+        |span, cache, backing| {
+            let layered = LayeredValueStore::new(cache, backing);
+            TEST_RUNTIME.block_on(
+                async {
+                    value_test_suite::run_direct_trace(layered, MemoryDirtyValueStore::new, trace)
+                        .await
+                }
+                .instrument(span),
+            )
+        },
+    )
 }
 
 #[test]
@@ -674,48 +615,16 @@ fn prop_layered_fjall_cassandra_direct_trace() {
 }
 
 fn cassandra_recovering_wal_property(trace: Trace) -> TestResult {
-    let runtime = &*TEST_RUNTIME;
-    let span = tracing::Span::current();
     let input_dbg = format!("{trace:#?}");
-    let dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            return TestResult::error(format!("tempdir failed: {e}\nFailing input:\n{input_dbg}"));
-        }
-    };
-    let cache = match FjallValueStore::for_test(&dir) {
-        Ok(c) => c,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cache open failed: {e}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-
-    let backing = match runtime
-        .block_on(async { setup_cassandra_value_store().await }.instrument(span.clone()))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return TestResult::error(format!(
-                "cassandra setup failed: {e:?}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-
-    let recovering =
-        RecoveringValueStore::with_default_ttl(backing, AlwaysCommittedOracle, TEST_TTL);
-    let layered = LayeredValueStore::new(cache, recovering);
-    let result = runtime.block_on(
-        async { value_test_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
-            .instrument(span),
-    );
-    drop(dir);
-    match result {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!("model mismatch.\nFailing input:\n{input_dbg}")),
-        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
-    }
+    run_cassandra_property("model mismatch", &input_dbg, |span, cache, backing| {
+        let recovering =
+            RecoveringValueStore::with_default_ttl(backing, AlwaysCommittedOracle, TEST_TTL);
+        let layered = LayeredValueStore::new(cache, recovering);
+        TEST_RUNTIME.block_on(
+            async { value_test_suite::run_trace(layered, MemoryDirtyValueStore::new, trace).await }
+                .instrument(span),
+        )
+    })
 }
 
 #[test]
@@ -854,7 +763,7 @@ async fn fjall_dirty_clear_pending_ops_removes_overlay_meta_and_ops() -> Result<
 #[tokio::test]
 async fn fjall_dirty_scope_isolation_two_scopes_dont_interfere() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let keyspace = Arc::new(fjall::Config::new(dir.path()).open()?);
+    let keyspace = Arc::new(Config::new(dir.path()).open()?);
     let ops = keyspace.open_partition("value_dirty_ops", PartitionCreateOptions::default())?;
     let overlay =
         keyspace.open_partition("value_dirty_overlay", PartitionCreateOptions::default())?;
@@ -879,10 +788,16 @@ async fn fjall_dirty_scope_isolation_two_scopes_dont_interfere() -> Result<()> {
     Ok(())
 }
 
-fn fjall_dirty_property(trace: DirtyTrace) -> TestResult {
-    let input_dbg = format!("{trace:#?}");
-    let scope = EventScopeId::fresh();
-    let (_dir, dirty) = match make_dirty(scope) {
+/// Builds a fresh `FjallDirtyValueStore` in its own scope, runs `run` against
+/// it, and maps the outcome to a [`TestResult`] — folding the `make_dirty`
+/// setup and the `"dirty setup failed"` early-return shared by the dirty
+/// runners. The `TempDir` stays alive until `run` returns.
+fn run_dirty_property<E: fmt::Debug>(
+    falsified: &str,
+    input_dbg: &str,
+    run: impl FnOnce(FjallDirtyValueStore) -> Result<bool, E>,
+) -> TestResult {
+    let (_dir, dirty) = match make_dirty(EventScopeId::fresh()) {
         Ok(d) => d,
         Err(e) => {
             return TestResult::error(format!(
@@ -890,8 +805,14 @@ fn fjall_dirty_property(trace: DirtyTrace) -> TestResult {
             ));
         }
     };
-    let result = TEST_RUNTIME.block_on(dirty_value_test_suite::run_dirty_trace(dirty, trace));
-    finish_layered_trace(result, &input_dbg)
+    finish_trace(run(dirty), falsified, input_dbg)
+}
+
+fn fjall_dirty_property(trace: DirtyTrace) -> TestResult {
+    let input_dbg = format!("{trace:#?}");
+    run_dirty_property("model mismatch", &input_dbg, |dirty| {
+        TEST_RUNTIME.block_on(dirty_value_test_suite::run_dirty_trace(dirty, trace))
+    })
 }
 
 #[test]
@@ -901,22 +822,13 @@ fn prop_fjall_dirty_satisfies_invariants() {
 
 fn fjall_dirty_matches_memory_property(trace: DirtyTrace) -> TestResult {
     let input_dbg = format!("{trace:#?}");
-    let scope = EventScopeId::fresh();
-    let (_dir, fjall_dirty) = match make_dirty(scope) {
-        Ok(d) => d,
-        Err(e) => {
-            return TestResult::error(format!(
-                "dirty setup failed: {e:?}\nFailing input:\n{input_dbg}"
-            ));
-        }
-    };
-    let memory_dirty = MemoryDirtyValueStore::new();
-    let result = TEST_RUNTIME.block_on(dirty_value_test_suite::run_dirty_parity(
-        fjall_dirty,
-        memory_dirty,
-        trace,
-    ));
-    finish_layered_trace(result, &input_dbg)
+    run_dirty_property("model mismatch", &input_dbg, |fjall_dirty| {
+        TEST_RUNTIME.block_on(dirty_value_test_suite::run_dirty_parity(
+            fjall_dirty,
+            MemoryDirtyValueStore::new(),
+            trace,
+        ))
+    })
 }
 
 #[test]
@@ -970,7 +882,7 @@ async fn fjall_client_open_sweeps_orphaned_partitions() -> Result<()> {
     // `FjallWorkspace::Drop`. The on-disk partitions persist; the next
     // process startup must reap them.
     {
-        let keyspace = fjall::Config::new(dir.path()).open()?;
+        let keyspace = Config::new(dir.path()).open()?;
         for name in [
             "value_cache_aaaaaa",
             "value_dirty_ops_aaaaaa",

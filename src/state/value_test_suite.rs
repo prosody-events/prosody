@@ -2,8 +2,8 @@
 //!
 //! The trace runners are parametric over any [`DurableWalStore<ValueKind>`] +
 //! [`DirectApplyStore<ValueKind>`] and any [`ValueStore`] +
-//! [`PendingOpSource<ValueKind>`], so Slice 5's Cassandra backend can share
-//! the property-test machinery the memory backend uses today.
+//! [`PendingOpSource<ValueKind>`], so every backend (memory, Cassandra,
+//! Fjall) can share the same property-test machinery.
 //!
 //! Three runners are exposed:
 //!
@@ -409,8 +409,7 @@ where
 
     for op in ops {
         if just_crashed || matches!(tx.local_tx(), LocalTx::Finished) {
-            if let Some((pre_seal, crashed_ops)) = model.crashed_sealed.take() {
-                let crash_event = model.crash_event.take().unwrap_or(current_event);
+            if let Some((pre_seal, crashed_ops, crash_event)) = model.crashed_sealed.take() {
                 drive_recovery(&durable, &collection_ref, crash_event, &crashed_ops, policy)
                     .await?;
                 model.applied = match policy {
@@ -617,11 +616,14 @@ fn apply_trace_crash(model: &mut Model, current_event: EventRef) {
             model.phase = ModelPhase::Finished;
         }
         ModelPhase::Sealed => {
-            // Capture the sealed event so the next iteration can replay
-            // recovery (apply_sealed / rollback_sealed) on the durable
-            // store under the oracle policy.
-            model.crashed_sealed = model.sealed.take();
-            model.crash_event = Some(current_event);
+            // Capture the sealed snapshot plus the crashed event so the next
+            // iteration can replay recovery (apply_sealed / rollback_sealed)
+            // on the durable store under the oracle policy. `sealed` is
+            // always `Some` in the Sealed phase, so the snapshot is present.
+            model.crashed_sealed = model
+                .sealed
+                .take()
+                .map(|(applied, ops)| (applied, ops, current_event));
             model.phase = ModelPhase::Finished;
         }
         ModelPhase::Finished => {
@@ -962,15 +964,13 @@ struct Model {
     overlay: ValueOverlay,
     sealed: Option<(Option<StoredPayload>, Vec<ValueOp>)>,
     /// Sealed snapshot captured by [`TraceOp::Crash`] in
-    /// [`ModelPhase::Sealed`]: `(pre_seal_applied, sealed_ops)`. Consumed
-    /// by the runner on the next iteration to drive
-    /// `apply_sealed` / `rollback_sealed` under the active
-    /// [`OraclePolicy`].
-    crashed_sealed: Option<(Option<StoredPayload>, Vec<ValueOp>)>,
-    /// [`EventRef`] of the transaction that the
-    /// [`TraceOp::Crash`] dropped. Needed because `apply_sealed` /
-    /// `rollback_sealed` take the expected event explicitly.
-    crash_event: Option<EventRef>,
+    /// [`ModelPhase::Sealed`]: `(pre_seal_applied, sealed_ops, crash_event)`.
+    /// Consumed by the runner on the next iteration to drive
+    /// `apply_sealed` / `rollback_sealed` under the active [`OraclePolicy`].
+    /// The event ref is carried because those APIs take the expected event
+    /// explicitly. Both halves are always set and consumed together, so
+    /// they live in one field.
+    crashed_sealed: Option<(Option<StoredPayload>, Vec<ValueOp>, EventRef)>,
     phase: ModelPhase,
 }
 

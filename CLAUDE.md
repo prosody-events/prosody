@@ -223,6 +223,8 @@ These invariants are why LWTs, distributed locks, and optimistic concurrency are
 
 **Batching:** When multiple statements target the **same partition (same row key)**, group them into an `UNLOGGED BATCH` whenever possible. Same-partition unlogged batches are atomic on the replica and execute as a single mutation, eliminating extra coordinator round-trips. Never use `LOGGED BATCH` for performance reasons, and never batch across partitions to "reduce round-trips" — that's an anti-pattern that overloads the coordinator.
 
+**Bind persisted types directly via their scylla serdes.** Pass persisted types to the driver through their `SerializeValue`/`DeserializeValue` impls; never hand-convert to a driver primitive (`i8`/`i16`/etc.) at the call site. When you persist a type, define its scylla serde (delegating to the type's own discriminator method, e.g. `self.as_i8().serialize(...)` — see `TimerType`, `StateType`, `CollectionKindId`, `PayloadEncoding`, `WalFormat`). Reads may keep deserializing the raw primitive and validating it in a fallible post-step **only** when a bad value must classify `Permanent` (or be skipped for forward-compat) rather than become scylla's `Terminal` `DeserializationError` — as the `EventRef` UDT and the discriminators above do. In that case the serde is serialize-only by design; document the read-side validator it pairs with.
+
 **Handling NULLs from static columns:**
 
 ```rust

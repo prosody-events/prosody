@@ -3,14 +3,14 @@
 use crate::util::from_env_with_fallback;
 use derive_builder::Builder;
 use std::path::{Path, PathBuf};
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 const DEFAULT_CACHE_DIR: &str = "/var/cache/prosody";
 
 /// Configuration for the fjall-backed Value cache.
 ///
-/// Slice 6 exposes only the on-disk root. Production deployments mount this
-/// at an emptyDir-type volume; on partition revocation the per-partition
+/// This currently exposes only the on-disk root. Production deployments mount
+/// this at an emptyDir-type volume; on partition revocation the per-partition
 /// keyspace is dropped; on process restart the whole root is wiped because
 /// Cassandra is authoritative.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -36,9 +36,9 @@ impl FjallConfiguration {
     }
 }
 
-fn validate_cache_dir(cache_dir: &Path) -> Result<(), validator::ValidationError> {
+fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
     if cache_dir.as_os_str().is_empty() {
-        return Err(validator::ValidationError::new("empty_cache_dir"));
+        return Err(ValidationError::new("empty_cache_dir"));
     }
     Ok(())
 }

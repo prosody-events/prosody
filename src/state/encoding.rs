@@ -2,7 +2,7 @@
 //!
 //! Stored payload cells use [`PayloadEncoding`]; WAL blobs use
 //! [`WalFormat`]. Both discriminators round-trip via `i16` so durable
-//! Cassandra columns map cleanly onto them in Slice 5.
+//! Cassandra columns map cleanly onto them.
 //!
 //! WAL stream layout (logical):
 //!
@@ -133,11 +133,7 @@ where
     let raw = rmp_serde::to_vec_named(payload).map_err(EncodingError::BadMsgPackEncode)?;
     match encoding {
         PayloadEncoding::MsgpackV1 => Ok(Bytes::from(raw)),
-        PayloadEncoding::MsgpackZstdV1 => {
-            let compressed =
-                encode_all(raw.as_slice(), ZSTD_LEVEL).map_err(EncodingError::BadZstd)?;
-            Ok(Bytes::from(compressed))
-        }
+        PayloadEncoding::MsgpackZstdV1 => compress(&raw),
     }
 }
 
@@ -156,7 +152,7 @@ where
             rmp_serde::from_slice(bytes).map_err(EncodingError::BadMsgPack)
         }
         PayloadEncoding::MsgpackZstdV1 => {
-            let raw = decode_all(bytes).map_err(EncodingError::BadZstd)?;
+            let raw = decompress(bytes)?;
             rmp_serde::from_slice(&raw).map_err(EncodingError::BadMsgPack)
         }
     }
@@ -189,8 +185,7 @@ where
     }
 
     let bytes = if format.is_compressed() {
-        let compressed = encode_all(buf.as_slice(), ZSTD_LEVEL).map_err(EncodingError::BadZstd)?;
-        Bytes::from(compressed)
+        compress(&buf)?
     } else {
         Bytes::from(buf)
     };
@@ -242,7 +237,7 @@ where
     K::Op: EncodableOp,
 {
     if blob.format().is_compressed() {
-        let raw = decode_all(blob.bytes().as_ref()).map_err(EncodingError::BadZstd)?;
+        let raw = decompress(blob.bytes().as_ref())?;
         decode_wal_stream::<K>(&raw)
     } else {
         decode_wal_stream::<K>(blob.bytes().as_ref())
@@ -301,6 +296,20 @@ where
 {
     let mut deserializer = Deserializer::new(&mut *cursor);
     T::deserialize(&mut deserializer).map_err(EncodingError::BadMsgPack)
+}
+
+/// Compresses `raw` at [`ZSTD_LEVEL`], the single source of both the level
+/// and the [`EncodingError::BadZstd`] mapping for every encode path.
+fn compress(raw: &[u8]) -> Result<Bytes, EncodingError> {
+    encode_all(raw, ZSTD_LEVEL)
+        .map(Bytes::from)
+        .map_err(EncodingError::BadZstd)
+}
+
+/// Decompresses zstd `bytes`, the single source of the
+/// [`EncodingError::BadZstd`] mapping for every decode path.
+fn decompress(bytes: &[u8]) -> Result<Vec<u8>, EncodingError> {
+    decode_all(bytes).map_err(EncodingError::BadZstd)
 }
 
 /// Error returned by the encoding module.

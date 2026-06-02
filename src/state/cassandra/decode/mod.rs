@@ -57,9 +57,14 @@ pub(super) fn try_decode_row(
     let mask =
         WalColumnMask::from_options(wal_event.as_ref(), wal_ops.as_ref(), wal_format.as_ref());
 
-    match (mask.is_sealed(), mask.is_idle()) {
-        (true, _) => decode_sealed(data, payload_encoding, wal_event, wal_ops, wal_format),
-        (_, true) => decode_idle(data, payload_encoding),
+    // Match the WAL triple by-move: the only valid shapes are all-Some
+    // (sealed) and all-None (idle). `mask` was computed by reference above, so
+    // it survives the move for the partial-shape diagnostic.
+    match (wal_event, wal_ops, wal_format) {
+        (Some(event), Some(ops), Some(format)) => {
+            decode_sealed(data, payload_encoding, event, ops, format)
+        }
+        (None, None, None) => decode_idle(data, payload_encoding),
         _ => Err(CassandraValueStoreError::CorruptWal {
             reason: CorruptReason::PartialWalColumns { mask },
         }),
@@ -91,26 +96,14 @@ fn decode_idle(
 fn decode_sealed(
     data: Option<Vec<u8>>,
     payload_encoding: Option<i16>,
-    wal_event: Option<RawEventRef>,
-    wal_ops: Option<Vec<u8>>,
-    wal_format: Option<i16>,
+    raw_event: RawEventRef,
+    ops_bytes: Vec<u8>,
+    format_raw: i16,
 ) -> Result<DurableState<ValueKind>, CassandraValueStoreError> {
-    let (Some(raw_event), Some(ops_bytes), Some(format_raw)) = (wal_event, wal_ops, wal_format)
-    else {
-        // is_sealed() proved all three are Some; this branch is unreachable
-        // but the match-let keeps the variables typed without unwrap.
-        return Err(CassandraValueStoreError::CorruptWal {
-            reason: CorruptReason::PartialWalColumns {
-                mask: WalColumnMask::sealed(),
-            },
-        });
-    };
     // Validate the structurally-decoded UDT into a typed event. A corrupt
     // shape surfaces as `CorruptUdt` (Permanent → skip), not as a laundered
     // scylla `DeserializationError` (Terminal → shut down).
-    let event = raw_event
-        .try_into_event()
-        .map_err(CassandraValueStoreError::CorruptUdt)?;
+    let event = raw_event.try_into_event()?;
     let Some(encoding_raw) = payload_encoding else {
         return Err(CassandraValueStoreError::CorruptWal {
             reason: CorruptReason::WalWithoutPayloadEncoding,
@@ -156,24 +149,6 @@ impl WalColumnMask {
             ops: ops.is_some(),
             format: format.is_some(),
         }
-    }
-
-    /// All WAL columns are non-NULL — the row is sealed.
-    #[must_use]
-    pub fn sealed() -> Self {
-        Self {
-            event: true,
-            ops: true,
-            format: true,
-        }
-    }
-
-    fn is_sealed(self) -> bool {
-        self.event && self.ops && self.format
-    }
-
-    fn is_idle(self) -> bool {
-        !self.event && !self.ops && !self.format
     }
 }
 

@@ -14,8 +14,8 @@ use uuid::Uuid;
 ///
 /// The keyed-state middleware mints a fresh scope per handler invocation
 /// (via [`Self::fresh`]) so dirty workspaces can be keyed by scope without
-/// colliding across events. The Fjall dirty workspace will key on
-/// [`EventScopeId`] in a later slice; today this identity is consumed by
+/// colliding across events. Keying the Fjall dirty workspace on
+/// [`EventScopeId`] is future work; today this identity is consumed by
 /// the in-memory middleware workspace and is sufficient to distinguish
 /// concurrent events at the type level.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]

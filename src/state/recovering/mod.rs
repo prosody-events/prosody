@@ -44,7 +44,7 @@
 //! | [`ValueStore::get`]          | **Yes**   |
 //! | [`ValueStore::set`]          | No (pass) |
 //! | [`ValueStore::clear`]        | No (pass) |
-//! | `DurableWalStore::read_partition` | No (pass) — raw visibility for the future Slice 8 scanner |
+//! | `DurableWalStore::read_partition` | No (pass) — raw visibility for the future recovery scanner |
 //! | `DurableWalStore::seal`            | No (pass) — recovery itself runs through this method |
 //! | `DurableWalStore::apply_sealed`    | No (pass) |
 //! | `DurableWalStore::rollback_sealed` | No (pass) |
@@ -123,7 +123,7 @@ impl<T> RecoverableValueStore for T where
 /// First-touch recovery wrapper over an authoritative Value store.
 ///
 /// See the [module docs][self] for the recovery contract and per-method
-/// behavior. Production wiring (Slice 8) composes
+/// behavior. Production wiring composes
 /// `Layered<Cache, Recovering<Backing, Oracle>>` so the cache populates with
 /// post-recovery applied for free.
 #[derive(Clone, Debug)]
@@ -146,6 +146,10 @@ impl<Inner, Oracle, R> RecoveringValueStore<Inner, Oracle, R> {
     pub fn new(inner: Inner, oracle: Oracle, ttl: R) -> Self {
         Self { inner, oracle, ttl }
     }
+
+    // TODO: audit `inner()`/`oracle()` against the public interface once the
+    // composition stabilizes; drop them if no consumer materializes
+    // (re-addable non-breakingly).
 
     /// Returns a reference to the wrapped inner store.
     #[must_use]
@@ -209,18 +213,13 @@ where
                     CollectionRef::new(collection.clone(), self.ttl.ttl_for(collection));
                 match decision {
                     CommitDecision::Committed => {
-                        self.inner
-                            .apply_sealed(&recovery_ref, wal.event())
-                            .await
-                            .map_err(RecoveringValueStoreError::Inner)?;
+                        self.inner.apply_sealed(&recovery_ref, wal.event()).await
                     }
                     CommitDecision::NotCommitted => {
-                        self.inner
-                            .rollback_sealed(&recovery_ref, wal.event())
-                            .await
-                            .map_err(RecoveringValueStoreError::Inner)?;
+                        self.inner.rollback_sealed(&recovery_ref, wal.event()).await
                     }
                 }
+                .map_err(RecoveringValueStoreError::Inner)?;
                 ValueStore::get(&self.inner, collection)
                     .await
                     .map_err(RecoveringValueStoreError::Inner)

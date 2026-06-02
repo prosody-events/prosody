@@ -120,6 +120,20 @@ fn event(id: u128) -> EventRef {
     }
 }
 
+/// A `RecoveringValueStore` over a fresh in-memory backing store with the
+/// shared one-hour TTL, driven by `oracle`. Shared by the property runners,
+/// each of which differs only in the oracle policy and the suite runner it
+/// drives.
+fn recovering_memory(
+    oracle: MockOracle,
+) -> RecoveringValueStore<MemoryDurableValueStore, MockOracle> {
+    RecoveringValueStore::with_default_ttl(
+        MemoryDurableValueStore::for_tests(),
+        oracle,
+        TEST_TTL_DURATION,
+    )
+}
+
 fn into_eyre<E>(e: E) -> eyre::Report
 where
     E: Error + Send + Sync + 'static,
@@ -604,13 +618,8 @@ async fn inner_error_during_apply_propagates() -> Result<()> {
 #[test]
 fn prop_recovering_memory_trace() {
     fn property(trace: Trace) -> bool {
-        let durable = RecoveringValueStore::with_default_ttl(
-            MemoryDurableValueStore::for_tests(),
-            MockOracle::always_committed(),
-            TEST_TTL_DURATION,
-        );
         executor::block_on(value_test_suite::run_trace(
-            durable,
+            recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
         ))
@@ -622,13 +631,8 @@ fn prop_recovering_memory_trace() {
 #[test]
 fn prop_recovering_memory_idempotence_trace() {
     fn property(trace: Trace) -> bool {
-        let durable = RecoveringValueStore::with_default_ttl(
-            MemoryDurableValueStore::for_tests(),
-            MockOracle::always_committed(),
-            TEST_TTL_DURATION,
-        );
         executor::block_on(value_test_suite::run_idempotence_trace(
-            durable,
+            recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
         ))
@@ -640,13 +644,8 @@ fn prop_recovering_memory_idempotence_trace() {
 #[test]
 fn prop_recovering_memory_direct_trace() {
     fn property(trace: DirectTrace) -> bool {
-        let durable = RecoveringValueStore::with_default_ttl(
-            MemoryDurableValueStore::for_tests(),
-            MockOracle::always_committed(),
-            TEST_TTL_DURATION,
-        );
         executor::block_on(value_test_suite::run_direct_trace(
-            durable,
+            recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
         ))
@@ -658,13 +657,8 @@ fn prop_recovering_memory_direct_trace() {
 #[test]
 fn prop_recovering_memory_crash_committed() {
     fn property(trace: Trace) -> bool {
-        let durable = RecoveringValueStore::with_default_ttl(
-            MemoryDurableValueStore::for_tests(),
-            MockOracle::always_committed(),
-            TEST_TTL_DURATION,
-        );
         executor::block_on(value_test_suite::run_trace_with_policy(
-            durable,
+            recovering_memory(MockOracle::always_committed()),
             MemoryDirtyValueStore::new,
             trace,
             OraclePolicy::AlwaysCommitted,
@@ -677,13 +671,8 @@ fn prop_recovering_memory_crash_committed() {
 #[test]
 fn prop_recovering_memory_crash_not_committed() {
     fn property(trace: Trace) -> bool {
-        let durable = RecoveringValueStore::with_default_ttl(
-            MemoryDurableValueStore::for_tests(),
-            MockOracle::always_not_committed(),
-            TEST_TTL_DURATION,
-        );
         executor::block_on(value_test_suite::run_trace_with_policy(
-            durable,
+            recovering_memory(MockOracle::always_not_committed()),
             MemoryDirtyValueStore::new,
             trace,
             OraclePolicy::AlwaysNotCommitted,

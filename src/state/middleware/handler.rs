@@ -374,40 +374,10 @@ where
         ))
     }
 
-    async fn resolve_seal_results<C>(
-        &self,
-        wrapped: KeyedStateContext<C, D, P::Store>,
-        context: C,
-    ) -> Result<
-        (Vec<CollectionRef<ValueKind>>, Option<EventRef>),
-        MiddlewareError<T, D, Sc, O, P::Store>,
-    >
-    where
-        C: EventContext + Clone + Send + Sync + 'static,
-    {
-        let event = wrapped.event;
-        let sealed = wrapped
-            .resolve_per_collection()
-            .await
-            .map_err(KeyedStateMiddlewareError::Transaction)?;
-        if sealed.is_empty() {
-            Ok((Vec::new(), None))
-        } else {
-            let now = CompactDateTime::now().map_err(KeyedStateMiddlewareError::DateTime)?;
-            let fire = now
-                .add_duration(self.recovery_delay)
-                .map_err(KeyedStateMiddlewareError::DateTime)?;
-            context
-                .schedule(fire, TimerType::StateRecovery)
-                .await
-                .map_err(|e| KeyedStateMiddlewareError::Timer(Box::new(e)))?;
-            Ok((sealed, Some(event)))
-        }
-    }
-
     /// Shared tail of `on_message` / `on_timer`: resolve the per-collection
     /// seals for the wrapped context and package them into
-    /// [`KeyedStateOutput::Inner`] for the apply hooks.
+    /// [`KeyedStateOutput::Inner`] for the apply hooks. When any collection
+    /// sealed, arms the `StateRecovery` backstop timer.
     async fn finalize_inner<C>(
         &self,
         wrapped: KeyedStateContext<C, D, P::Store>,
@@ -417,8 +387,24 @@ where
     where
         C: EventContext + Clone + Send + Sync + 'static,
     {
-        let (sealed_collections, sealed_event) =
-            self.resolve_seal_results(wrapped, context).await?;
+        let event = wrapped.event;
+        let sealed_collections = wrapped
+            .resolve_per_collection()
+            .await
+            .map_err(KeyedStateMiddlewareError::Transaction)?;
+        let sealed_event = if sealed_collections.is_empty() {
+            None
+        } else {
+            let now = CompactDateTime::now().map_err(KeyedStateMiddlewareError::DateTime)?;
+            let fire = now
+                .add_duration(self.recovery_delay)
+                .map_err(KeyedStateMiddlewareError::DateTime)?;
+            context
+                .schedule(fire, TimerType::StateRecovery)
+                .await
+                .map_err(|e| KeyedStateMiddlewareError::Timer(Box::new(e)))?;
+            Some(event)
+        };
         Ok(KeyedStateOutput::Inner {
             inner: inner_output,
             sealed_event,
@@ -490,15 +476,11 @@ where
         let key = message.key().clone();
         let wrapped = self.build_context(context.clone(), key, event)?;
 
-        let inner_result = self
+        let inner_output = self
             .inner
             .on_message(wrapped.clone(), message, demand_type)
-            .await;
-
-        let inner_output = match inner_result {
-            Ok(output) => output,
-            Err(error) => return Err(KeyedStateMiddlewareError::Inner(error)),
-        };
+            .await
+            .map_err(KeyedStateMiddlewareError::Inner)?;
 
         self.finalize_inner(wrapped, context, inner_output).await
     }
@@ -532,15 +514,11 @@ where
         let key = trigger.key.clone();
         let wrapped = self.build_context(context.clone(), key, event)?;
 
-        let inner_result = self
+        let inner_output = self
             .inner
             .on_timer(wrapped.clone(), trigger, demand_type)
-            .await;
-
-        let inner_output = match inner_result {
-            Ok(output) => output,
-            Err(error) => return Err(KeyedStateMiddlewareError::Inner(error)),
-        };
+            .await
+            .map_err(KeyedStateMiddlewareError::Inner)?;
 
         self.finalize_inner(wrapped, context, inner_output).await
     }

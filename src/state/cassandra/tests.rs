@@ -23,86 +23,64 @@ use bytes::Bytes;
 use color_eyre::eyre::{self, Result};
 use quickcheck::{QuickCheck, TestResult};
 use std::env;
+use std::fmt::Debug;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::Instrument;
 use uuid::Uuid;
 
-fn wal_property(trace: Trace) -> TestResult {
+/// Keyspace shared by every test in this module; created out of band.
+const TEST_KEYSPACE: &str = "prosody_test";
+
+/// Sets up a fresh Cassandra Value store, drives `run` over the trace within
+/// the current span, and folds the outcome into a [`TestResult`]. `input_dbg`
+/// is captured before `trace` is moved so failures always print the input.
+fn run_cassandra_property<T, Fut>(
+    trace: T,
+    mismatch_msg: &str,
+    run: impl FnOnce(CassandraValueStore, T) -> Fut,
+) -> TestResult
+where
+    T: Debug,
+    Fut: Future<Output = Result<bool>>,
+{
     let runtime = &*TEST_RUNTIME;
     let span = tracing::Span::current();
     let input_dbg = format!("{trace:#?}");
 
-    let store = match runtime.block_on(async { setup_value_store().await }.instrument(span.clone()))
-    {
+    let store = match runtime.block_on(setup_value_store().instrument(span.clone())) {
         Ok(s) => s,
         Err(e) => {
             return TestResult::error(format!("setup failed: {e:?}\nFailing input:\n{input_dbg}"));
         }
     };
 
-    match runtime.block_on(
-        async { value_test_suite::run_trace(store, MemoryDirtyValueStore::new, trace).await }
-            .instrument(span),
-    ) {
+    match runtime.block_on(run(store, trace).instrument(span)) {
         Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!("model mismatch.\nFailing input:\n{input_dbg}")),
+        Ok(false) => TestResult::error(format!("{mismatch_msg}\nFailing input:\n{input_dbg}")),
         Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
     }
+}
+
+fn wal_property(trace: Trace) -> TestResult {
+    run_cassandra_property(trace, "model mismatch.", |store, trace| {
+        value_test_suite::run_trace(store, MemoryDirtyValueStore::new, trace)
+    })
 }
 
 fn idempotence_property(trace: Trace) -> TestResult {
-    let runtime = &*TEST_RUNTIME;
-    let span = tracing::Span::current();
-    let input_dbg = format!("{trace:#?}");
-
-    let store = match runtime.block_on(async { setup_value_store().await }.instrument(span.clone()))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return TestResult::error(format!("setup failed: {e:?}\nFailing input:\n{input_dbg}"));
-        }
-    };
-
-    match runtime.block_on(
-        async {
-            value_test_suite::run_idempotence_trace(store, MemoryDirtyValueStore::new, trace).await
-        }
-        .instrument(span),
-    ) {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!(
-            "idempotence violated.\nFailing input:\n{input_dbg}"
-        )),
-        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
-    }
+    run_cassandra_property(trace, "idempotence violated.", |store, trace| {
+        value_test_suite::run_idempotence_trace(store, MemoryDirtyValueStore::new, trace)
+    })
 }
 
 fn direct_property(trace: DirectTrace) -> TestResult {
-    let runtime = &*TEST_RUNTIME;
-    let span = tracing::Span::current();
-    let input_dbg = format!("{trace:#?}");
-
-    let store = match runtime.block_on(async { setup_value_store().await }.instrument(span.clone()))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return TestResult::error(format!("setup failed: {e:?}\nFailing input:\n{input_dbg}"));
-        }
-    };
-
-    match runtime.block_on(
-        async {
-            value_test_suite::run_direct_trace(store, MemoryDirtyValueStore::new, trace).await
-        }
-        .instrument(span),
-    ) {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::error(format!(
-            "partition was sealed under direct mode.\nFailing input:\n{input_dbg}"
-        )),
-        Err(e) => TestResult::error(format!("runtime error: {e:?}\nFailing input:\n{input_dbg}")),
-    }
+    run_cassandra_property(
+        trace,
+        "partition was sealed under direct mode.",
+        |store, trace| value_test_suite::run_direct_trace(store, MemoryDirtyValueStore::new, trace),
+    )
 }
 
 fn test_cassandra_config(keyspace: &str) -> CassandraConfiguration {
@@ -131,7 +109,7 @@ async fn setup_value_store() -> Result<CassandraValueStore> {
 async fn setup_value_store_with_ttl(
     default_ttl: Option<CompactDuration>,
 ) -> Result<CassandraValueStore> {
-    let config = test_cassandra_config("prosody_test");
+    let config = test_cassandra_config(TEST_KEYSPACE);
     let cassandra = CassandraStore::new(&config).await?;
     let queries = Arc::new(ValueQueries::new(cassandra.session(), &config.keyspace).await?);
     Ok(CassandraValueStore::new(cassandra, queries, default_ttl))
@@ -246,10 +224,8 @@ async fn corrupt_partition_returns_corrupt_wal() -> Result<()> {
     };
     let name = id.name().as_str();
     let cql = format!(
-        "UPDATE {keyspace}.{table} SET wal_event = ? WHERE segment_id = ? AND key = ? AND \
-         state_type = ? AND name = ?",
-        keyspace = "prosody_test",
-        table = TABLE_KEYED_STATE_VALUE,
+        "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} SET wal_event = ? WHERE segment_id = ? \
+         AND key = ? AND state_type = ? AND name = ?",
     );
     let prepared = store.store.session().prepare(cql).await?;
     store
@@ -302,10 +278,9 @@ async fn corrupt_event_ref_udt_classifies_permanent() -> Result<()> {
     };
     let name = id.name().as_str();
     let cql = format!(
-        "UPDATE {keyspace}.{table} SET wal_event = ?, wal_ops = ?, wal_format = ?, \
-         payload_encoding = ? WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ?",
-        keyspace = "prosody_test",
-        table = TABLE_KEYED_STATE_VALUE,
+        "UPDATE {TEST_KEYSPACE}.{TABLE_KEYED_STATE_VALUE} SET wal_event = ?, wal_ops = ?, \
+         wal_format = ?, payload_encoding = ? WHERE segment_id = ? AND key = ? AND state_type = ? \
+         AND name = ?",
     );
     let prepared = store.store.session().prepare(cql).await?;
     store
@@ -364,7 +339,7 @@ async fn set_with_default_ttl_some_writes_via_ttl_arm() -> Result<()> {
 
 /// Constructing `CassandraValueStore` with `default_ttl = None` must
 /// route `ValueStore::set` through the no-TTL query arm. This would have
-/// caught the pre-Slice-7 bug where production writes hardcoded `None`
+/// caught an earlier bug where production writes hardcoded `None`
 /// (and so always used the no-TTL arm even when a TTL was configured).
 #[tokio::test]
 async fn set_with_default_ttl_none_writes_via_no_ttl_arm() -> Result<()> {

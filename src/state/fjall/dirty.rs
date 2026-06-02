@@ -26,8 +26,8 @@
 //! [`EventScopeId`] is baked into the prefix.
 
 use super::codec::{
-    DIRTY_OP_ENCODING, decode_dirty_meta, dirty_collection_key, dirty_ops_key, encode_absent_cell,
-    encode_dirty_meta, encode_present_cell, scope_collection_prefix,
+    DIRTY_OP_ENCODING, decode_cell, decode_dirty_meta, dirty_collection_key, dirty_ops_key,
+    encode_absent_cell, encode_dirty_meta, encode_present_cell, scope_collection_prefix,
 };
 use super::error::FjallValueStoreError;
 use super::workspace::{AssignmentEpoch, FjallClient, FjallWorkspace};
@@ -134,7 +134,7 @@ impl ValueStore for FjallDirtyValueStore {
         let key = dirty_collection_key(self.scope, collection);
         let overlay = self.overlay.clone();
         let raw = spawn_blocking(move || overlay.get(key)).await??;
-        super::codec::decode_cell(raw.as_deref())
+        decode_cell(raw.as_deref())
     }
 
     async fn set<'a>(

@@ -136,6 +136,44 @@ fn inline_bytes(b: u8) -> StoredPayload {
     StoredPayload::Inline(Bytes::from(vec![b]))
 }
 
+/// A `Message` event keyed by a fixed dedup id; the tests only need
+/// distinct, reproducible events.
+fn msg_event(dedup_id: u128) -> EventRef {
+    EventRef::Message {
+        dedup_id: Uuid::from_u128(dedup_id),
+    }
+}
+
+/// Seal a single `Set` op out-of-band so apply/rollback paths have work.
+async fn seal_set(
+    durable: &MemoryDurableValueStore,
+    collection_ref: &CollectionRef<ValueKind>,
+    event: EventRef,
+    byte: u8,
+) -> Result<()> {
+    durable
+        .seal(
+            collection_ref,
+            event,
+            vec![ValueOp::Set {
+                payload: inline_bytes(byte),
+            }],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Read a partition expected to be `Idle`, returning its applied payload.
+async fn read_idle_applied(
+    durable: &MemoryDurableValueStore,
+    id: &CollectionId<ValueKind>,
+) -> Result<Option<StoredPayload>> {
+    match DurableWalStore::read_partition(durable, id).await? {
+        DurableState::Idle { applied } => Ok(applied),
+        other => Err(eyre!("expected Idle, got {other:?}")),
+    }
+}
+
 fn registry() -> CollectionDefRegistry {
     CollectionDefRegistry::new(Some(CompactDuration::new(3_600)))
 }
@@ -184,9 +222,7 @@ async fn value_set_then_seal_persists_sealed_wal() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let registry = Arc::new(registry());
     let state_key = make_state_key();
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(1),
-    };
+    let event = msg_event(1);
     let ctx = build_context(
         MockEventContext::new(),
         durable.clone(),
@@ -218,9 +254,7 @@ async fn flush_drains_dirty_and_returns_clean() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let registry = Arc::new(registry());
     let state_key = make_state_key();
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(42),
-    };
+    let event = msg_event(42);
     let ctx = build_context(
         MockEventContext::new(),
         durable.clone(),
@@ -239,12 +273,10 @@ async fn flush_drains_dirty_and_returns_clean() -> Result<()> {
     );
 
     let id = make_collection_id(&state_key, "counter")?;
-    match DurableWalStore::read_partition(&durable, &id).await? {
-        DurableState::Idle { applied } => {
-            assert_eq!(applied, Some(inline_bytes(13)));
-        }
-        other => return Err(eyre!("expected Idle after flush, got {other:?}")),
-    }
+    assert_eq!(
+        read_idle_applied(&durable, &id).await?,
+        Some(inline_bytes(13))
+    );
 
     // Second flush is a no-op on Clean.
     let outcome = handle.flush().await?;
@@ -259,9 +291,7 @@ async fn repeat_value_call_returns_same_transaction() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let registry = Arc::new(registry());
     let state_key = make_state_key();
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(2),
-    };
+    let event = msg_event(2);
     let ctx = build_context(
         MockEventContext::new(),
         durable.clone(),
@@ -285,9 +315,7 @@ async fn direct_apply_all_skips_seal() -> Result<()> {
     let durable = MemoryDurableValueStore::for_tests();
     let registry = Arc::new(registry_with_mode("counter", CommitMode::Direct)?);
     let state_key = make_state_key();
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(3),
-    };
+    let event = msg_event(3);
     let ctx = build_context(
         MockEventContext::new(),
         durable.clone(),
@@ -305,13 +333,11 @@ async fn direct_apply_all_skips_seal() -> Result<()> {
     );
 
     let id = make_collection_id(&state_key, "counter")?;
-    match DurableWalStore::read_partition(&durable, &id).await? {
-        DurableState::Idle { applied } => {
-            assert_eq!(applied, Some(inline_bytes(9)));
-            Ok(())
-        }
-        other => Err(eyre!("expected Idle, got {other:?}")),
-    }
+    assert_eq!(
+        read_idle_applied(&durable, &id).await?,
+        Some(inline_bytes(9))
+    );
+    Ok(())
 }
 
 /// The collection-def registry returns the per-collection TTL when
@@ -345,20 +371,10 @@ async fn state_recovery_applies_sealed_when_oracle_says_committed() -> Result<()
     let state_key = make_state_key();
     let id = make_collection_id(&state_key, "snapshot")?;
     let collection_ref = CollectionRef::new(id.clone(), None);
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(42),
-    };
+    let event = msg_event(42);
 
     // Seal a WAL out-of-band; the recovery handler should apply it.
-    durable
-        .seal(
-            &collection_ref,
-            event,
-            vec![ValueOp::Set {
-                payload: inline_bytes(11),
-            }],
-        )
-        .await?;
+    seal_set(&durable, &collection_ref, event, 11).await?;
 
     let context = MockEventContext::new().with_timer_tracking();
     let registry = registry();
@@ -373,11 +389,10 @@ async fn state_recovery_applies_sealed_when_oracle_says_committed() -> Result<()
     .await
     .map_err(|e| eyre!("recovery failed: {e}"))?;
 
-    let applied = match DurableWalStore::read_partition(&durable, &id).await? {
-        DurableState::Idle { applied } => applied,
-        other => return Err(eyre!("expected Idle, got {other:?}")),
-    };
-    assert_eq!(applied, Some(inline_bytes(11)));
+    assert_eq!(
+        read_idle_applied(&durable, &id).await?,
+        Some(inline_bytes(11))
+    );
     assert!(
         context
             .timer_operations()
@@ -457,19 +472,9 @@ async fn state_recovery_rolls_back_when_oracle_says_not_committed() -> Result<()
     let state_key = make_state_key();
     let id = make_collection_id(&state_key, "snapshot")?;
     let collection_ref = CollectionRef::new(id.clone(), None);
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(43),
-    };
+    let event = msg_event(43);
 
-    durable
-        .seal(
-            &collection_ref,
-            event,
-            vec![ValueOp::Set {
-                payload: inline_bytes(99),
-            }],
-        )
-        .await?;
+    seal_set(&durable, &collection_ref, event, 99).await?;
 
     let context = MockEventContext::new();
     let registry = registry();
@@ -484,11 +489,11 @@ async fn state_recovery_rolls_back_when_oracle_says_not_committed() -> Result<()
     .await
     .map_err(|e| eyre!("recovery failed: {e}"))?;
 
-    let applied = match DurableWalStore::read_partition(&durable, &id).await? {
-        DurableState::Idle { applied } => applied,
-        other => return Err(eyre!("expected Idle, got {other:?}")),
-    };
-    assert_eq!(applied, None, "rollback restored pre-seal state");
+    assert_eq!(
+        read_idle_applied(&durable, &id).await?,
+        None,
+        "rollback restored pre-seal state"
+    );
     Ok(())
 }
 
@@ -800,19 +805,9 @@ async fn after_commit_with_sealed_list_clears_state_recovery_timer() -> Result<(
     let state_key = StateKey::new(handler.segment_id, Arc::from("u"));
     let id = make_collection_id(&state_key, "x")?;
     let collection_ref = CollectionRef::new(id.clone(), None);
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(100),
-    };
+    let event = msg_event(100);
     // Seal a WAL out-of-band so apply_sealed has work to do.
-    durable
-        .seal(
-            &collection_ref,
-            event,
-            vec![ValueOp::Set {
-                payload: inline_bytes(7),
-            }],
-        )
-        .await?;
+    seal_set(&durable, &collection_ref, event, 7).await?;
 
     handler
         .after_commit(
@@ -835,11 +830,10 @@ async fn after_commit_with_sealed_list_clears_state_recovery_timer() -> Result<(
         "exactly one clear_scheduled(StateRecovery) fires"
     );
 
-    let applied = match DurableWalStore::read_partition(&durable, &id).await? {
-        DurableState::Idle { applied } => applied,
-        other => return Err(eyre!("expected Idle, got {other:?}")),
-    };
-    assert_eq!(applied, Some(inline_bytes(7)));
+    assert_eq!(
+        read_idle_applied(&durable, &id).await?,
+        Some(inline_bytes(7))
+    );
     Ok(())
 }
 
@@ -858,24 +852,12 @@ async fn after_commit_apply_error_leaves_state_recovery_timer_armed() -> Result<
     let state_key = StateKey::new(handler.segment_id, Arc::from("u"));
     let id = make_collection_id(&state_key, "x")?;
     let collection_ref = CollectionRef::new(id.clone(), None);
-    let sealed_event = EventRef::Message {
-        dedup_id: Uuid::from_u128(200),
-    };
-    durable
-        .seal(
-            &collection_ref,
-            sealed_event,
-            vec![ValueOp::Set {
-                payload: inline_bytes(7),
-            }],
-        )
-        .await?;
+    let sealed_event = msg_event(200);
+    seal_set(&durable, &collection_ref, sealed_event, 7).await?;
 
     // Resolve a *different* event than the one sealed: apply_sealed returns
     // EventMismatch, so the hook must not clear the timer.
-    let mismatched_event = EventRef::Message {
-        dedup_id: Uuid::from_u128(201),
-    };
+    let mismatched_event = msg_event(201);
     handler
         .after_commit(
             context.clone(),
@@ -916,18 +898,8 @@ async fn after_abort_with_sealed_list_rolls_back() -> Result<()> {
     let state_key = StateKey::new(handler.segment_id, Arc::from("u"));
     let id = make_collection_id(&state_key, "x")?;
     let collection_ref = CollectionRef::new(id.clone(), None);
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(101),
-    };
-    durable
-        .seal(
-            &collection_ref,
-            event,
-            vec![ValueOp::Set {
-                payload: inline_bytes(13),
-            }],
-        )
-        .await?;
+    let event = msg_event(101);
+    seal_set(&durable, &collection_ref, event, 13).await?;
 
     handler
         .after_abort(
@@ -947,11 +919,11 @@ async fn after_abort_with_sealed_list_rolls_back() -> Result<()> {
             .any(|op| matches!(op, TimerOperation::ClearScheduled(TimerType::StateRecovery)))
     );
 
-    let applied = match DurableWalStore::read_partition(&durable, &id).await? {
-        DurableState::Idle { applied } => applied,
-        other => return Err(eyre!("expected Idle, got {other:?}")),
-    };
-    assert_eq!(applied, None, "rollback restored pre-seal state");
+    assert_eq!(
+        read_idle_applied(&durable, &id).await?,
+        None,
+        "rollback restored pre-seal state"
+    );
     Ok(())
 }
 
@@ -1126,9 +1098,7 @@ async fn run_middleware_dispatch(trace: MiddlewareTrace) -> Result<bool> {
     let mut model: Option<StoredPayload> = None;
 
     for (idx, event) in trace.0.into_iter().enumerate() {
-        let event_ref = EventRef::Message {
-            dedup_id: Uuid::from_u128(idx as u128 + 1),
-        };
+        let event_ref = msg_event(idx as u128 + 1);
         // Drive the real per-event context + seal.
         let ctx = build_context(
             MockEventContext::new(),

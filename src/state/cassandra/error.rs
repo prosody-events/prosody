@@ -2,7 +2,8 @@
 //!
 //! Most failures are wrapped Cassandra driver errors (network, timeout,
 //! schema mismatch) whose `ClassifyError` impl already returns the right
-//! retry category. The few keyed-state-specific errors —
+//! retry category. The keyed-state-specific errors —
+//! [`CassandraValueStoreError::Encoding`],
 //! [`CassandraValueStoreError::CorruptWal`],
 //! [`CassandraValueStoreError::CorruptUdt`],
 //! [`CassandraValueStoreError::EventMismatch`] — are all permanent
@@ -28,15 +29,16 @@ pub enum CassandraValueStoreError {
     Encoding(#[from] EncodingError),
 
     /// The value partition columns formed a shape the decoder rejects.
-    #[error("Cassandra row corrupted: {reason}")]
+    #[error("Cassandra value row is corrupt: {reason}")]
     CorruptWal {
-        /// Specific corruption shape.
+        /// Specific corruption shape; also the `source()` of this error.
+        #[from]
         reason: CorruptReason,
     },
 
     /// The `event_ref` UDT was not in a shape this build understands.
     #[error("Cassandra event_ref UDT is corrupt: {0}")]
-    CorruptUdt(#[source] CorruptUdtError),
+    CorruptUdt(#[from] CorruptUdtError),
 
     /// The sealed WAL referenced a different event than the caller asked
     /// to resolve.

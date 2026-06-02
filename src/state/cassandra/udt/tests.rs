@@ -5,28 +5,29 @@ use crate::timers::datetime::CompactDateTime;
 use color_eyre::eyre::{self, Result};
 use uuid::Uuid;
 
-#[test]
-fn round_trips_message_variant() -> Result<()> {
-    let event = EventRef::Message {
-        dedup_id: Uuid::from_u128(0xdead_beef),
-    };
-    let raw = RawEventRef::from_event(event);
-    let decoded = raw.try_into_event().map_err(|e| eyre::eyre!("{e}"))?;
+/// Invariant: `from_event` followed by `try_into_event` recovers the original.
+fn assert_round_trips(event: EventRef) -> Result<()> {
+    let decoded = RawEventRef::from_event(event)
+        .try_into_event()
+        .map_err(|e| eyre::eyre!("{e}"))?;
     assert_eq!(decoded, event);
     Ok(())
 }
 
 #[test]
+fn round_trips_message_variant() -> Result<()> {
+    assert_round_trips(EventRef::Message {
+        dedup_id: Uuid::from_u128(0xdead_beef),
+    })
+}
+
+#[test]
 fn round_trips_timer_variant() -> Result<()> {
-    let event = EventRef::Timer(TimerEventRef::new(
+    assert_round_trips(EventRef::Timer(TimerEventRef::new(
         TimerType::Application,
         CompactDateTime::from(123_456_u32),
         42,
-    ));
-    let raw = RawEventRef::from_event(event);
-    let decoded = raw.try_into_event().map_err(|e| eyre::eyre!("{e}"))?;
-    assert_eq!(decoded, event);
-    Ok(())
+    )))
 }
 
 #[test]

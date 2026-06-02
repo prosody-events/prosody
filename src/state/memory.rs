@@ -185,6 +185,56 @@ impl MemoryDurableValueStore {
     pub fn for_tests() -> Self {
         Self::new(Some(CompactDuration::new(3_600)))
     }
+
+    /// Applies a single op via [`DirectApplyStore`], threading the
+    /// constructor-supplied `default_ttl` through the built [`CollectionRef`].
+    /// Backs the [`ValueStore::set`] / [`ValueStore::clear`] impls.
+    async fn apply_one(
+        &self,
+        collection: &CollectionId<ValueKind>,
+        op: ValueOp,
+    ) -> Result<(), MemoryStateError> {
+        let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
+        self.direct_apply(&collection_ref, vec![op]).await?;
+        Ok(())
+    }
+
+    /// Resolves a sealed event, running `resolve` over the matched WAL before
+    /// clearing it. Shared by `apply_sealed` (folds the decoded ops into
+    /// `applied`) and `rollback_sealed` (a no-op resolution). The whole body is
+    /// synchronous, so the `parking_lot` guard is never held across an await.
+    ///
+    /// `resolve` runs *before* the WAL is cleared, so a failing resolution
+    /// (e.g. a WAL decode error) leaves both `applied` and `wal` intact.
+    fn resolve_sealed(
+        &self,
+        collection: &CollectionRef<ValueKind>,
+        expected_event: EventRef,
+        resolve: impl FnOnce(
+            &mut DurableValueEntry,
+            &SealedWal<ValueKind>,
+        ) -> Result<(), MemoryStateError>,
+    ) -> Result<StoreOutcome, MemoryStateError> {
+        let pending_key = PendingKey::from_id(collection.id());
+        let mut inner = self.inner.lock();
+        let entry = inner.entries.entry(collection.id().clone()).or_default();
+        let Some(sealed) = entry.wal.clone() else {
+            return Ok(StoreOutcome::NoOp);
+        };
+        if sealed.event() != expected_event {
+            return Err(MemoryStateError::EventMismatch {
+                expected: expected_event,
+                actual: sealed.event(),
+            });
+        }
+
+        resolve(entry, &sealed)?;
+        entry.wal = None;
+        // WAL cleared; drop the pending row last (Cassandra ordering). The
+        // `entry` borrow has ended, so re-borrowing `inner` is sound.
+        inner.pending.remove(&pending_key);
+        Ok(StoreOutcome::Applied)
+    }
 }
 
 impl ValueStore for MemoryDurableValueStore {
@@ -207,20 +257,14 @@ impl ValueStore for MemoryDurableValueStore {
         collection: &'a CollectionId<ValueKind>,
         payload: StoredPayload,
     ) -> Result<(), Self::Error> {
-        let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
-        self.direct_apply(&collection_ref, vec![ValueOp::Set { payload }])
-            .await?;
-        Ok(())
+        self.apply_one(collection, ValueOp::Set { payload }).await
     }
 
     async fn clear<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        let collection_ref = CollectionRef::new(collection.clone(), self.default_ttl);
-        self.direct_apply(&collection_ref, vec![ValueOp::Clear])
-            .await?;
-        Ok(())
+        self.apply_one(collection, ValueOp::Clear).await
     }
 }
 
@@ -276,27 +320,15 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
-        let pending_key = PendingKey::from_id(collection.id());
-        let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.id().clone()).or_default();
-        let Some(sealed) = entry.wal.clone() else {
-            return Ok(StoreOutcome::NoOp);
-        };
-        if sealed.event() != expected_event {
-            return Err(MemoryStateError::EventMismatch {
-                expected: expected_event,
-                actual: sealed.event(),
-            });
-        }
-
-        let envelope = decode_wal::<ValueKind>(sealed.wal()).map_err(MemoryStateError::Encoding)?;
-        let ops = envelope.into_ops();
-        entry.applied = fold_value_ops(entry.applied.clone(), &ops);
-        entry.wal = None;
-        // WAL cleared; drop the pending row last (Cassandra ordering). The
-        // `entry` borrow has ended, so re-borrowing `inner` is sound.
-        inner.pending.remove(&pending_key);
-        Ok(StoreOutcome::Applied)
+        // Sync resolution: nothing awaits under the lock, and `decode_wal`
+        // running before the WAL is cleared keeps a decode failure
+        // non-destructive (state survives intact on `Err`).
+        self.resolve_sealed(collection, expected_event, |entry, sealed| {
+            let envelope =
+                decode_wal::<ValueKind>(sealed.wal()).map_err(MemoryStateError::Encoding)?;
+            entry.applied = fold_value_ops(entry.applied.clone(), &envelope.into_ops());
+            Ok(())
+        })
     }
 
     async fn rollback_sealed<'a>(
@@ -304,23 +336,7 @@ impl DurableWalStore<ValueKind> for MemoryDurableValueStore {
         collection: &'a CollectionRef<ValueKind>,
         expected_event: EventRef,
     ) -> Result<StoreOutcome, Self::Error> {
-        let pending_key = PendingKey::from_id(collection.id());
-        let mut inner = self.inner.lock();
-        let entry = inner.entries.entry(collection.id().clone()).or_default();
-        let Some(sealed) = entry.wal.clone() else {
-            return Ok(StoreOutcome::NoOp);
-        };
-        if sealed.event() != expected_event {
-            return Err(MemoryStateError::EventMismatch {
-                expected: expected_event,
-                actual: sealed.event(),
-            });
-        }
-
-        entry.wal = None;
-        // WAL cleared; drop the pending row last (Cassandra ordering).
-        inner.pending.remove(&pending_key);
-        Ok(StoreOutcome::Applied)
+        self.resolve_sealed(collection, expected_event, |_, _| Ok(()))
     }
 }
 

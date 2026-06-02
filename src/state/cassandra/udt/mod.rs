@@ -63,12 +63,16 @@ impl RawEventRef {
                 time: None,
                 tag: None,
             },
-            EventRef::Timer(timer) => Self {
+            EventRef::Timer(TimerEventRef {
+                timer_type,
+                time,
+                tag,
+            }) => Self {
                 kind: EventRef::TIMER_KIND,
                 msg_dedup_id: None,
-                timer_type: Some(timer.timer_type),
-                time: Some(timer.time),
-                tag: Some(timer.tag),
+                timer_type: Some(timer_type),
+                time: Some(time),
+                tag: Some(tag),
             },
         }
     }

@@ -1,7 +1,7 @@
 //! Fjall-backed Value cache.
 //!
 //! `FjallValueStore` implements [`ValueStore`] by storing a per-collection
-//! cell in a fjall partition. Slice 6 wires it as the **cache** half of
+//! cell in a fjall partition. It is wired as the **cache** half of
 //! [`LayeredValueStore`](crate::state::layered::LayeredValueStore); the
 //! dirty Value workspace remains the in-memory
 //! [`MemoryDirtyValueStore`](crate::state::memory::MemoryDirtyValueStore).
@@ -41,6 +41,7 @@ pub use workspace::{AssignmentEpoch, FjallClient, FjallClientError, FjallWorkspa
 
 use crate::state::value::{StoredPayload, ValueKind, ValueStore};
 use crate::state::{CollectionId, Read};
+use bytes::Bytes;
 use educe::Educe;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use std::sync::Arc;
@@ -91,6 +92,19 @@ impl FjallValueStore {
             }),
         })
     }
+
+    /// Writes an encoded cache cell at `collection`'s key, dispatching the
+    /// blocking fjall insert off the async runtime.
+    async fn insert_cell(
+        &self,
+        collection: &CollectionId<ValueKind>,
+        value: Bytes,
+    ) -> Result<(), FjallValueStoreError> {
+        let key = codec::value_cache_key(collection);
+        let inner = Arc::clone(&self.inner);
+        spawn_blocking(move || inner.partition.insert(key, value.as_ref())).await??;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -128,21 +142,15 @@ impl ValueStore for FjallValueStore {
         collection: &'a CollectionId<ValueKind>,
         payload: StoredPayload,
     ) -> Result<(), Self::Error> {
-        let key = codec::value_cache_key(collection);
-        let value = codec::encode_present_cell(&payload)?;
-        let inner = Arc::clone(&self.inner);
-        spawn_blocking(move || inner.partition.insert(key, value.as_ref())).await??;
-        Ok(())
+        self.insert_cell(collection, codec::encode_present_cell(&payload)?)
+            .await
     }
 
     async fn clear<'a>(
         &'a self,
         collection: &'a CollectionId<ValueKind>,
     ) -> Result<(), Self::Error> {
-        let key = codec::value_cache_key(collection);
-        let value = codec::encode_absent_cell();
-        let inner = Arc::clone(&self.inner);
-        spawn_blocking(move || inner.partition.insert(key, value.as_ref())).await??;
-        Ok(())
+        self.insert_cell(collection, codec::encode_absent_cell())
+            .await
     }
 }

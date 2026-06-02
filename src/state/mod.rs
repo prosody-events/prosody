@@ -5,15 +5,19 @@
 //! [`ValueKind`], but collection identities carry the kind both statically and
 //! at runtime so future collection families cannot share state by accident.
 //!
-//! The shapes themselves live in four leaf-to-root submodules and are
+//! The shapes themselves live in leaf-to-root submodules and are
 //! re-exported flat below, so consumers keep importing `crate::state::X`:
 //!
 //! * [`identity`] — typed collection identity ([`CollectionId`],
 //!   [`CollectionRef`], [`StateKey`], [`CollectionKind`], …).
 //! * [`event_ref`] — event identity and verdicts ([`EventRef`],
 //!   [`CommitDecision`], [`StoreOutcome`], …).
+//! * [`encoding`] — payload/WAL encoding selectors ([`PayloadEncoding`],
+//!   [`WalFormat`], [`EncodingError`]).
 //! * [`wal`] — write-ahead-log payloads ([`WalEnvelope`], [`WalBlob`],
 //!   [`SealedWal`], [`NonEmptyOps`], …).
+//! * [`value`] — the Value collection kind ([`ValueKind`], [`ValueOp`],
+//!   [`StoredPayload`], [`ValueOverlay`], …).
 //! * [`transaction`] — transaction-side state ([`DurableState`], [`LocalTx`],
 //!   [`CommitMode`], [`SealedCollection`], …).
 //!
